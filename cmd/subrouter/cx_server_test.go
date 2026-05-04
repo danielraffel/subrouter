@@ -142,6 +142,7 @@ func TestCXServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		publicInstallScriptURL,
 		"SUBROUTER_VERSION='0.1.2'",
 		"/usr/local/bin/sr install-systemd",
+		"until curl -fsS http://127.0.0.1:31415/_subrouter/health",
 		"tailscale up",
 	} {
 		if !strings.Contains(installCommand, want) {

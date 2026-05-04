@@ -302,7 +302,7 @@ func (r cxRunner) serverInstall(ctx context.Context, store cxServerStore, args [
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
 		"sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(*cxSwitchInterval) + " --extra-args " + shellQuote(*extraArgs),
 		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --ssh --accept-routes=false --accept-dns=false; fi",
-		"curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null",
+		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
 	}, "\n")
 	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--command", remoteCommand}
