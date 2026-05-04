@@ -1,0 +1,290 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/internal/transcript"
+)
+
+func main() {
+	program := filepath.Base(os.Args[0])
+	if program == "cx" {
+		if err := cx(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "cx:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if err := runForProgram(program, os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "subrouter:", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	return runForProgram("subrouter", args)
+}
+
+func runForProgram(program string, args []string) error {
+	if len(args) == 0 {
+		if program == "sr" {
+			return cx(nil)
+		}
+		usage()
+		return nil
+	}
+
+	switch args[0] {
+	case "serve":
+		return serve(args[1:])
+	case "accounts":
+		return listAccounts()
+	case "codex":
+		return codex(args[1:])
+	case "cx":
+		return cx(args[1:])
+	case "install-daemon":
+		return installDaemon(args[1:])
+	case "help", "-h", "--help":
+		usage()
+		return nil
+	default:
+		if isDirectCXCommand(args[0]) || strings.Contains(args[0], "@") {
+			return cx(args)
+		}
+		if program == "sr" {
+			return fmt.Errorf("unknown command %q; use 'sr help' for Subrouter commands or 'sr cx help' for account commands", args[0])
+		}
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func isDirectCXCommand(command string) bool {
+	switch command {
+	case "add", "login", "add-key", "add-api-key", "import", "list", "ls", "switch", "use", "gui-switch", "gui-use", "remove", "rm", "status", "usage", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project", "server", "servers", "claude", "gemini":
+		return true
+	default:
+		return false
+	}
+}
+
+func serve(args []string) error {
+	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
+	upstreamRaw := flags.String("upstream", "", "force one upstream base URL for all accounts")
+	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
+	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
+	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
+	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
+	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
+	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
+	cxSwitchInterval := flags.Duration("cx-switch-interval", defaultCXSwitchInterval, "interval for switching active cx account to the best OAuth account; 0 disables")
+	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
+	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	var upstream *url.URL
+	if *upstreamRaw != "" {
+		var err error
+		upstream, err = url.Parse(*upstreamRaw)
+		if err != nil {
+			return err
+		}
+	}
+	codexUpstream, err := url.Parse(*codexUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	apiUpstream, err := url.Parse(*apiUpstreamRaw)
+	if err != nil {
+		return err
+	}
+
+	store, err := session.NewStore(*sessionPath)
+	if err != nil {
+		return err
+	}
+
+	codexAccounts, err := accounts.DefaultCodexStore().List()
+	if err != nil {
+		return err
+	}
+	scores := fallbackScores(codexAccounts)
+	if *fetchUsage {
+		scores = fetchCodexScores(context.Background(), codexAccounts)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(scores))
+
+	server := proxy.Server{
+		Upstream:      upstream,
+		CodexUpstream: codexUpstream,
+		APIUpstream:   apiUpstream,
+		Accounts:      codexAccounts,
+		Sessions:      store,
+		SchedulerRef:  schedulerRef,
+		Logger:        slog.Default(),
+		MaxBodyBytes:  *maxBodyBytes,
+		Transcripts:   transcript.NewRecorder(*transcriptDir),
+	}
+	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
+		SourceDir:   *transcriptDir,
+		Destination: *transcriptGCSURI,
+		Interval:    *transcriptGCSSyncInterval,
+		Logger:      slog.Default(),
+	})
+	if transcriptGCSSyncer.Enabled() {
+		go transcriptGCSSyncer.Run(context.Background())
+	}
+	if *cxSwitchInterval > 0 && *fetchUsage {
+		go runCXAutoSwitch(context.Background(), cxAutoSwitchConfig{
+			Interval:     *cxSwitchInterval,
+			Accounts:     codexAccounts,
+			Sessions:     store,
+			SchedulerRef: schedulerRef,
+			Logger:       slog.Default(),
+		})
+	} else if *cxSwitchInterval > 0 {
+		slog.Info("cx auto-switch disabled because usage fetching is disabled", "interval", cxSwitchInterval.String())
+	}
+
+	httpServer := &http.Server{
+		Addr:              *addr,
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	if upstream != nil {
+		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "accounts", len(codexAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+	} else {
+		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "accounts", len(codexAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+	}
+	return httpServer.ListenAndServe()
+}
+
+func fetchCodexScores(ctx context.Context, codexAccounts []accounts.Account) []selectacct.Score {
+	scores, _ := fetchCodexScoresWithSuccess(ctx, codexAccounts)
+	return scores
+}
+
+func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	scores := fallbackScores(codexAccounts)
+	scoreByID := make(map[string]int, len(scores))
+	for i, score := range scores {
+		scoreByID[score.AccountID] = i
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	successful := 0
+	for _, account := range codexAccounts {
+		if account.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		wg.Add(1)
+		go func(account accounts.Account) {
+			defer wg.Done()
+			windows, err := accounts.FetchCodexUsage(ctx, client, account)
+			if err != nil {
+				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
+				mu.Lock()
+				if idx, ok := scoreByID[account.ID]; ok {
+					scores[idx] = selectacct.Score{AccountID: account.ID, Headroom: 0}
+				}
+				mu.Unlock()
+				return
+			}
+			limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+			for _, window := range windows {
+				limitWindows = append(limitWindows, selectacct.LimitWindow{
+					Name:               window.Name,
+					UsedPercent:        window.UsedPercent,
+					LimitWindowSeconds: window.LimitWindowSeconds,
+					ResetAfterSeconds:  window.ResetAfterSeconds,
+				})
+			}
+			score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
+			mu.Lock()
+			if idx, ok := scoreByID[account.ID]; ok {
+				scores[idx] = score
+				successful++
+			}
+			mu.Unlock()
+		}(account)
+	}
+	wg.Wait()
+
+	for _, score := range scores {
+		slog.Info("account score", "account", score.AccountID, "headroom", score.Headroom)
+	}
+	return scores, successful
+}
+
+func fallbackScores(codexAccounts []accounts.Account) []selectacct.Score {
+	scores := make([]selectacct.Score, 0, len(codexAccounts))
+	for _, account := range codexAccounts {
+		headroom := 1.0
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			headroom = 0.01
+		}
+		scores = append(scores, selectacct.Score{AccountID: account.ID, Headroom: headroom, ShortHeadroom: headroom})
+	}
+	return scores
+}
+
+func listAccounts() error {
+	codexAccounts, err := accounts.DefaultCodexStore().List()
+	if err != nil {
+		return err
+	}
+	if len(codexAccounts) == 0 {
+		fmt.Println("No Codex accounts found. Run: subrouter cx add")
+		return nil
+	}
+	for _, account := range codexAccounts {
+		fmt.Printf("%s\t%s\t%s\n", account.ID, account.Provider, account.AuthMode)
+	}
+	return nil
+}
+
+func usage() {
+	fmt.Println(`subrouter routes AI coding-agent traffic across subscription accounts.
+
+Usage:
+  subrouter serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--transcripts ~/.subrouter/transcripts] [--transcript-gcs-uri gs://bucket/prefix]
+  subrouter accounts
+  subrouter codex [codex args...]
+  subrouter cx [cx args...]
+  subrouter status
+  subrouter add
+  subrouter switch [email]
+  subrouter server [server args...]
+  subrouter install-daemon [--start=true]
+
+The same account commands also work through sr, for example sr status and sr server login.
+
+Session stickiness:
+  Prefer sending X-Subrouter-Session per conversation.
+  Send X-Subrouter-Agent when the client is not Codex.
+  Send X-Subrouter-User-Email for teammate-level observability.
+  Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
+  Subrouter switches active cx account every 10m by default; set --cx-switch-interval=0 to disable.
+  For subrouter codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
+  The proxy also checks common session headers, query params, and small JSON bodies.`)
+}

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "subrouter"
+version = "0.1.0"
+description = "Routes AI coding-agent traffic across subscription accounts and API keys."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Manaflow" }]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Go",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development"
+]
+
+[project.urls]
+Homepage = "https://github.com/manaflow-ai/subrouter"
+Repository = "https://github.com/manaflow-ai/subrouter"
+Issues = "https://github.com/manaflow-ai/subrouter/issues"
+
+[project.scripts]
+subrouter = "subrouter_cli:subrouter"
+sr = "subrouter_cli:sr"
+cx = "subrouter_cli:cx"
+
+[tool.hatch.build.targets.wheel]
+packages = ["subrouter_cli"]

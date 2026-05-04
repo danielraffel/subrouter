@@ -1,0 +1,25 @@
+{
+  "name": "subrouter",
+  "version": "0.1.0",
+  "description": "Routes AI coding-agent traffic across subscription accounts and API keys.",
+  "license": "MIT",
+  "homepage": "https://github.com/manaflow-ai/subrouter#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manaflow-ai/subrouter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/manaflow-ai/subrouter/issues"
+  },
+  "bin": {
+    "subrouter": "npm/bin/subrouter.js",
+    "sr": "npm/bin/sr.js",
+    "cx": "npm/bin/cx.js"
+  },
+  "files": [
+    "npm/bin/*.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

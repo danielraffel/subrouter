@@ -1,0 +1,11 @@
+.DS_Store
+/subrouter
+bin/
+!npm/bin/
+!npm/bin/*.js
+*.test
+coverage.out
+.venv/
+__pycache__/
+dist/
+*.egg-info/

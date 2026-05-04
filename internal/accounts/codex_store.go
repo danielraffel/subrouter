@@ -1,0 +1,291 @@
+package accounts
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+type CodexStore struct {
+	Dir string
+}
+
+type StoredCodexAccount struct {
+	Email         string        `json:"email"`
+	AddedAt       string        `json:"addedAt"`
+	Auth          CodexAuthFile `json:"auth"`
+	ProjectID     string        `json:"projectId,omitempty"`
+	ProjectName   string        `json:"projectName,omitempty"`
+	AdminKeyLabel string        `json:"adminKeyLabel,omitempty"`
+}
+
+type CodexAuthFile struct {
+	Tokens       *CodexTokens `json:"tokens,omitempty"`
+	LastRefresh  string       `json:"last_refresh,omitempty"`
+	AuthMode     string       `json:"auth_mode,omitempty"`
+	OpenAIAPIKey string       `json:"OPENAI_API_KEY,omitempty"`
+}
+
+type CodexTokens struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
+	AccountID    string `json:"account_id,omitempty"`
+}
+
+func DefaultCodexStore() CodexStore {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return CodexStore{Dir: ".codex-accounts/accounts"}
+	}
+	return CodexStore{Dir: filepath.Join(home, ".codex-accounts", "accounts")}
+}
+
+func (s CodexStore) StoreDir() string {
+	return filepath.Dir(s.Dir)
+}
+
+func (s CodexStore) List() ([]Account, error) {
+	stored, err := s.ListStored()
+	if err != nil {
+		return nil, err
+	}
+	accounts := make([]Account, 0, len(stored))
+	for _, item := range stored {
+		account, ok := item.toAccount(item.SourcePath(s))
+		if ok {
+			accounts = append(accounts, account)
+		}
+	}
+	sort.Slice(accounts, func(i, j int) bool {
+		return accounts[i].ID < accounts[j].ID
+	})
+	return accounts, nil
+}
+
+func (s CodexStore) ListStored() ([]StoredCodexAccount, error) {
+	files, err := os.ReadDir(s.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	accounts := make([]StoredCodexAccount, 0, len(files))
+	for _, file := range files {
+		if file.IsDir() || strings.HasPrefix(file.Name(), ".") || !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+
+		path := filepath.Join(s.Dir, file.Name())
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+
+		var stored StoredCodexAccount
+		if err := json.Unmarshal(body, &stored); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		if strings.TrimSpace(stored.Email) != "" {
+			accounts = append(accounts, stored)
+		}
+	}
+
+	sort.Slice(accounts, func(i, j int) bool {
+		return accounts[i].Email < accounts[j].Email
+	})
+	return accounts, nil
+}
+
+func (a StoredCodexAccount) SourcePath(s CodexStore) string {
+	return filepath.Join(s.Dir, emailToFilename(a.Email))
+}
+
+func (a StoredCodexAccount) IsAPIKey() bool {
+	return a.Auth.AuthMode == "apikey" || a.Auth.OpenAIAPIKey != ""
+}
+
+func (a StoredCodexAccount) APIKeyLabel() string {
+	return strings.TrimPrefix(a.Email, "apikey:")
+}
+
+func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
+	id := strings.TrimSpace(a.Email)
+	if id == "" {
+		return Account{}, false
+	}
+
+	addedAt, _ := time.Parse(time.RFC3339, a.AddedAt)
+	out := Account{
+		ID:       id,
+		Provider: ProviderCodex,
+		Label:    id,
+		Email:    id,
+		AddedAt:  addedAt,
+		Source:   source,
+	}
+
+	if a.IsAPIKey() {
+		out.AuthMode = AuthModeAPIKey
+		out.Token = a.Auth.OpenAIAPIKey
+		return out, out.Token != ""
+	}
+
+	if a.Auth.Tokens == nil || a.Auth.Tokens.AccessToken == "" {
+		return Account{}, false
+	}
+
+	out.AuthMode = AuthModeOAuth
+	out.Token = a.Auth.Tokens.AccessToken
+	out.AccountID = a.Auth.Tokens.AccountID
+	return out, true
+}
+
+func (s CodexStore) SaveStored(account StoredCodexAccount) error {
+	if strings.TrimSpace(account.Email) == "" {
+		return errors.New("account email is required")
+	}
+	lock, err := s.lockStoredAccount(account.Email)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	return s.saveStoredUnlocked(account)
+}
+
+func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
+	if strings.TrimSpace(account.Email) == "" {
+		return errors.New("account email is required")
+	}
+	if account.AddedAt == "" {
+		account.AddedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(account, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	return writeFileAtomic(filepath.Join(s.Dir, emailToFilename(account.Email)), body, 0o600)
+}
+
+func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, error) {
+	needle := strings.TrimSpace(identifier)
+	if needle == "" {
+		return StoredCodexAccount{}, false, nil
+	}
+	directPath := filepath.Join(s.Dir, emailToFilename(needle))
+	if body, err := os.ReadFile(directPath); err == nil {
+		var account StoredCodexAccount
+		if err := json.Unmarshal(body, &account); err != nil {
+			return StoredCodexAccount{}, false, err
+		}
+		return account, true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, err
+	}
+
+	if !strings.HasPrefix(needle, "apikey:") && !strings.Contains(needle, "@") {
+		if account, ok, err := s.FindStored("apikey:" + needle); err != nil || ok {
+			return account, ok, err
+		}
+	}
+
+	all, err := s.ListStored()
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	lower := strings.ToLower(needle)
+	var matches []StoredCodexAccount
+	for _, account := range all {
+		if strings.Contains(strings.ToLower(account.Email), lower) {
+			matches = append(matches, account)
+		}
+	}
+	if len(matches) == 0 {
+		return StoredCodexAccount{}, false, nil
+	}
+	if len(matches) > 1 {
+		names := make([]string, 0, len(matches))
+		for _, match := range matches {
+			names = append(names, match.Email)
+		}
+		return StoredCodexAccount{}, false, fmt.Errorf("multiple accounts match %q: %s", identifier, strings.Join(names, ", "))
+	}
+	return matches[0], true, nil
+}
+
+func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, error) {
+	account, ok, err := s.FindStored(identifier)
+	if err != nil || !ok {
+		return account, ok, err
+	}
+	if err := os.Remove(filepath.Join(s.Dir, emailToFilename(account.Email))); err != nil {
+		return account, false, err
+	}
+	return account, true, nil
+}
+
+func emailToFilename(email string) string {
+	var b strings.Builder
+	for _, r := range email {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '@' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String() + ".json"
+}
+
+func writeFileAtomic(path string, body []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
+}
