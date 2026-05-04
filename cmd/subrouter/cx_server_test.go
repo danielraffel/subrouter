@@ -107,6 +107,52 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	}
 }
 
+func TestCXServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAILSCALE_AUTH_KEY", "tailscale-auth-test-secret")
+	store := accounts.DefaultCodexStore()
+
+	var out bytes.Buffer
+	fake := &recordingCXCommandRunner{}
+	runner := cxRunner{store: store, out: &out, errOut: &out, cmd: fake}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "community",
+		"--url", "http://100.64.0.1:31415",
+		"--gcp-instance", "subrouter-community",
+		"--gcp-zone", "us-central1-a",
+		"--gcp-project", "example-project",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.run(context.Background(), []string{"server", "install", "community", "--version", "0.1.2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !fake.hasCommandPrefix("gcloud", "compute", "ssh", "subrouter-community") {
+		t.Fatalf("missing gcloud ssh install command: %#v", fake.commands)
+	}
+	joined := strings.Join(fake.commands[0], " ")
+	if strings.Contains(joined, "tailscale-auth-test-secret") {
+		t.Fatalf("tailscale auth key leaked into command: %s", joined)
+	}
+	installCommand := strings.Join(fake.commands[len(fake.commands)-1], " ")
+	for _, want := range []string{
+		publicInstallScriptURL,
+		"SUBROUTER_VERSION='0.1.2'",
+		"/usr/local/bin/sr install-systemd",
+		"tailscale up",
+	} {
+		if !strings.Contains(installCommand, want) {
+			t.Fatalf("install command missing %q:\n%s", want, installCommand)
+		}
+	}
+	if !strings.Contains(out.String(), "Installed Subrouter server: community") {
+		t.Fatalf("missing install message:\n%s", out.String())
+	}
+}
+
 type recordingCXCommandRunner struct {
 	loginAuth accounts.CodexAuthFile
 	commands  [][]string

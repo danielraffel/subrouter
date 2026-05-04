@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-
 instance_name="${INSTANCE_NAME:-subrouter-community}"
+server_name="${SERVER_NAME:-community}"
 zone="${ZONE:-us-central1-a}"
-tailscale_hostname="${TAILSCALE_HOSTNAME:-subrouter-community}"
+tailscale_hostname="${TAILSCALE_HOSTNAME:-${instance_name}}"
+server_url="${SERVER_URL:-http://${tailscale_hostname}:31415}"
+subrouter_version="${SUBROUTER_VERSION:-latest}"
+sr_bin="${SR_BIN:-sr}"
+
+if ! command -v "${sr_bin}" >/dev/null 2>&1; then
+  echo "sr is required. Install it with:" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sh" >&2
+  exit 1
+fi
 
 if ! command -v gcloud >/dev/null 2>&1; then
   echo "gcloud is required. Install Google Cloud CLI first." >&2
@@ -24,28 +32,21 @@ if [[ -z "${project_id}" || "${project_id}" == "(unset)" ]]; then
   exit 1
 fi
 
-cd "${repo_root}"
-make build-linux
+"${sr_bin}" server add "${server_name}" \
+  --url "${server_url}" \
+  --gcp-instance "${instance_name}" \
+  --gcp-zone "${zone}" \
+  --gcp-project "${project_id}"
 
-gcloud compute scp bin/subrouter-linux-amd64 "${instance_name}:/tmp/subrouter" \
-  --project "${project_id}" \
-  --zone "${zone}"
+"${sr_bin}" server install "${server_name}" \
+  --version "${subrouter_version}" \
+  --tailscale-hostname "${tailscale_hostname}"
 
-gcloud compute ssh "${instance_name}" \
-  --project "${project_id}" \
-  --zone "${zone}" \
-  --command "sudo install -o root -g root -m 0755 /tmp/subrouter /usr/local/bin/subrouter && sudo ln -sf /usr/local/bin/subrouter /usr/local/bin/cx && sudo systemctl daemon-reload && sudo systemctl enable --now subrouter && sudo systemctl restart subrouter && sudo systemctl --no-pager --full status subrouter"
-
-if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
-  printf '%s\n' "${TAILSCALE_AUTH_KEY}" | gcloud compute ssh "${instance_name}" \
-    --project "${project_id}" \
-    --zone "${zone}" \
-    --command "read -r tailscale_auth_key && sudo tailscale up --auth-key \"\${tailscale_auth_key}\" --hostname \"${tailscale_hostname}\" --ssh --accept-routes=false --accept-dns=false && tailscale ip -4"
-else
-  echo "TAILSCALE_AUTH_KEY is not set. To join the VM to Tailscale:"
-  echo "  export TAILSCALE_AUTH_KEY=tskey-auth-..."
+if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
+  echo "TAILSCALE_AUTH_KEY is not set. To join or rejoin the VM to Tailscale:"
+  echo "  export TAILSCALE_AUTH_KEY=<tailscale-auth-key>"
   echo "  deploy/gcp/publish-subrouter.sh"
 fi
 
 echo "Health check from the tailnet:"
-echo "  curl http://<tailscale-ip>:31415/_subrouter/health"
+echo "  curl ${server_url}/_subrouter/health"

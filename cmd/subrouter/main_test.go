@@ -77,7 +77,7 @@ func TestDirectCXCommandNames(t *testing.T) {
 			t.Fatalf("%s should be a direct cx command", command)
 		}
 	}
-	for _, command := range []string{"serve", "codex", "install-daemon"} {
+	for _, command := range []string{"serve", "codex", "install-daemon", "install-systemd"} {
 		if isDirectCXCommand(command) {
 			t.Fatalf("%s should stay a subrouter command", command)
 		}
@@ -94,6 +94,7 @@ func TestUsageShowsAccountCommandsAtTopLevel(t *testing.T) {
 		"sr add-admin-key",
 		"sr claude",
 		"sr serve",
+		"sr install-systemd",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("usage missing %q:\n%s", want, got)

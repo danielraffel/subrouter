@@ -22,45 +22,51 @@ gcloud auth login
 gcloud config set project <project-id>
 ```
 
+Install `sr` locally:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sh
+```
+
 Create the VM:
 
 ```bash
 deploy/gcp/create-subrouter-vm.sh
 ```
 
-Build and publish the binary:
+Install or upgrade Subrouter on the VM:
 
 ```bash
 deploy/gcp/publish-subrouter.sh
 ```
 
-Join the host to Tailscale with an auth key:
+The publish script configures the server with `sr server add`, then runs `sr server install`. The VM downloads the public release with the same curl installer and runs `sr install-systemd`; no locally built binary is copied to the server.
+
+Join or rejoin the host to Tailscale with an auth key:
 
 ```bash
-export TAILSCALE_AUTH_KEY=tskey-auth-...
+export TAILSCALE_AUTH_KEY=<tailscale-auth-key>
 deploy/gcp/publish-subrouter.sh
 ```
 
 The publish script joins with `--accept-routes=false --accept-dns=false` so the VM does not use tailnet routes or tailnet DNS for its own outbound traffic.
 The VM also installs a host firewall rule that rejects new outbound connections from `tailscale0` to tailnet IP ranges while still allowing replies to inbound requests.
 
-Move Codex account auth to the VM when it should route real Codex traffic:
+Add a server-owned Codex OAuth account when the VM should route real Codex traffic:
 
 ```bash
-deploy/gcp/upload-codex-accounts.sh --move --account bob@example.com
+sr server login community --device-auth
 ```
 
-OAuth refresh tokens rotate on use, so do not keep the same OAuth account active on both a laptop and the server. The upload script writes selected account files into `/var/lib/subrouter/.codex-accounts/accounts`, restarts Subrouter, then moves the selected local files into `~/.codex-accounts/uploaded-to-subrouter/<timestamp>/accounts`.
+OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, uploads only that fresh account to `/var/lib/subrouter/.codex-accounts/accounts`, restarts Subrouter, then restores your previous local auth so only the server owns the new refresh-token chain.
 
-To replace the server pool with the selected local accounts:
+The old account-file upload helper is kept only as a compatibility wrapper:
 
 ```bash
-deploy/gcp/upload-codex-accounts.sh --move --replace-remote --account bob@example.com --account lc@example.com
+deploy/gcp/upload-codex-accounts.sh community --device-auth
 ```
 
-Use `--all` only when intentionally transferring every local account file to the VM.
-
-`--copy-unsafe` exists only for API-key accounts or break-glass cases where duplicate rotating OAuth refresh tokens are intentional.
+It delegates to `sr server login` and rejects the previous `--move` and `--copy-unsafe` paths.
 
 ## Client usage
 

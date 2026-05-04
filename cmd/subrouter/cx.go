@@ -53,6 +53,7 @@ Usage:
 
   cx server             Manage Subrouter servers
   cx server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
+  cx server install <name>
   cx server login <name> [--device-auth]
 
   cx admin-keys         List stored OpenAI admin keys

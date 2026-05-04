@@ -12,60 +12,8 @@ fi
 
 systemctl enable --now tailscaled
 
-if ! id -u subrouter >/dev/null 2>&1; then
-  useradd --system --home-dir /var/lib/subrouter --create-home --shell /usr/sbin/nologin subrouter
-fi
-
-install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter
-install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/transcripts
-install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/.codex
-install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/.codex-accounts/accounts
-install -d -o subrouter -g subrouter -m 0750 /var/log/subrouter
-
-subrouter_extra_args=""
-if [[ -f /etc/default/subrouter ]]; then
-  # Preserve optional deployment-specific flags such as GCS mirroring.
-  # shellcheck disable=SC1091
-  . /etc/default/subrouter
-  subrouter_extra_args="${SUBROUTER_EXTRA_ARGS:-}"
-fi
-
-cat >/etc/default/subrouter <<CONFIG
-SUBROUTER_ADDR=0.0.0.0:31415
-SUBROUTER_SESSIONS=/var/lib/subrouter/sessions.json
-SUBROUTER_TRANSCRIPTS=/var/lib/subrouter/transcripts
-SUBROUTER_CX_SWITCH_INTERVAL=10m
-SUBROUTER_EXTRA_ARGS="${subrouter_extra_args}"
-CONFIG
-
-cat >/etc/systemd/system/subrouter.service <<'UNIT'
-[Unit]
-Description=Subrouter AI agent router
-Wants=network-online.target tailscaled.service
-After=network-online.target tailscaled.service
-
-[Service]
-Type=simple
-User=subrouter
-Group=subrouter
-WorkingDirectory=/var/lib/subrouter
-Environment=HOME=/var/lib/subrouter
-EnvironmentFile=-/etc/default/subrouter
-ExecStart=/usr/local/bin/subrouter serve --addr ${SUBROUTER_ADDR} --sessions ${SUBROUTER_SESSIONS} --transcripts ${SUBROUTER_TRANSCRIPTS} --cx-switch-interval ${SUBROUTER_CX_SWITCH_INTERVAL} $SUBROUTER_EXTRA_ARGS
-Restart=on-failure
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-ReadWritePaths=/var/lib/subrouter /var/log/subrouter
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable subrouter
+curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | env SUBROUTER_VERSION="${SUBROUTER_VERSION:-latest}" sh
+/usr/local/bin/sr install-systemd --addr 0.0.0.0:31415 --cx-switch-interval 10m
 
 cat >/usr/local/sbin/subrouter-tailnet-egress-block <<'SCRIPT'
 #!/bin/sh
@@ -94,10 +42,4 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 UNIT
 
-systemctl daemon-reload
 systemctl enable --now subrouter-tailnet-egress-block.service
-
-if [[ -x /usr/local/bin/subrouter ]]; then
-  ln -sf /usr/local/bin/subrouter /usr/local/bin/cx
-  systemctl restart subrouter
-fi

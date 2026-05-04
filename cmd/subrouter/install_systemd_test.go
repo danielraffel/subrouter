@@ -1,0 +1,51 @@
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestSystemdUnitUsesServerDefaults(t *testing.T) {
+	config := systemdConfig{
+		ServiceName:      defaultSystemdServiceName,
+		User:             "subrouter",
+		Group:            "subrouter",
+		Home:             "/var/lib/subrouter",
+		Addr:             "0.0.0.0:31415",
+		InstallPath:      "/usr/local/bin/subrouter",
+		SessionsPath:     "/var/lib/subrouter/sessions.json",
+		TranscriptsDir:   "/var/lib/subrouter/transcripts",
+		CXSwitchInterval: "10m",
+	}
+	unit, err := systemdUnit(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"User=subrouter",
+		"Group=subrouter",
+		"WorkingDirectory=/var/lib/subrouter",
+		"Environment=HOME=/var/lib/subrouter",
+		"EnvironmentFile=-/etc/default/subrouter",
+		"ExecStart=/usr/local/bin/subrouter serve --addr ${SUBROUTER_ADDR}",
+		"ReadWritePaths=/var/lib/subrouter /var/log/subrouter",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit missing %q:\n%s", want, unit)
+		}
+	}
+}
+
+func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
+	config := systemdConfig{
+		Addr:             "0.0.0.0:31415",
+		SessionsPath:     "/var/lib/subrouter/sessions.json",
+		TranscriptsDir:   "/var/lib/subrouter/transcripts",
+		CXSwitchInterval: "10m",
+		ExtraArgs:        "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
+	}
+	defaults := systemdDefaults(config)
+	if !strings.Contains(defaults, `SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false"`) {
+		t.Fatalf("defaults did not quote extra args:\n%s", defaults)
+	}
+}

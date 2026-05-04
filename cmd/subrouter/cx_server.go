@@ -28,9 +28,12 @@ Usage:
   cx server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
   cx server remove <name>
   cx server status <name>
+  cx server install <name> [--version latest]
   cx server login <name> [--device-auth]
 
 `
+
+const publicInstallScriptURL = "https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh"
 
 type cxServerStore struct {
 	Path string
@@ -69,6 +72,8 @@ func (r cxRunner) server(ctx context.Context, args []string) error {
 			return fmt.Errorf("usage: cx server status <name>")
 		}
 		return r.serverStatus(ctx, store, args[1])
+	case "install":
+		return r.serverInstall(ctx, store, args[1:])
 	case "login", "add-account", "add-auth":
 		return r.serverLogin(ctx, store, args[1:])
 	case "help", "-h", "--help":
@@ -258,6 +263,61 @@ func (r cxRunner) serverStatus(ctx context.Context, store cxServerStore, name st
 		fmt.Fprintln(r.out)
 	}
 	return err
+}
+
+func (r cxRunner) serverInstall(ctx context.Context, store cxServerStore, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: cx server install <name> [--version latest]")
+	}
+	name := args[0]
+	flags := flag.NewFlagSet("cx server install", flag.ContinueOnError)
+	flags.SetOutput(r.errOut)
+	version := flags.String("version", "latest", "Subrouter release version to install")
+	addr := flags.String("addr", "0.0.0.0:31415", "server listen address")
+	cxSwitchInterval := flags.String("cx-switch-interval", "10m", "cx auto-switch interval; 0 disables")
+	extraArgs := flags.String("extra-args", "", "extra arguments appended to subrouter serve")
+	tailscaleHostname := flags.String("tailscale-hostname", "", "hostname for tailscale up when TAILSCALE_AUTH_KEY is set")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	server, ok, err := store.find(name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("server %q not found", name)
+	}
+	if server.GCPInstance == "" || server.GCPZone == "" {
+		return fmt.Errorf("server %s has no GCP target", server.Name)
+	}
+	hostname := *tailscaleHostname
+	if hostname == "" {
+		hostname = server.GCPInstance
+	}
+	tailscaleAuthKey := strings.TrimSpace(os.Getenv("TAILSCALE_AUTH_KEY"))
+	remoteCommand := strings.Join([]string{
+		"set -eu",
+		"tailscale_auth_key=''",
+		"read -r tailscale_auth_key || true",
+		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
+		"sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(*cxSwitchInterval) + " --extra-args " + shellQuote(*extraArgs),
+		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --ssh --accept-routes=false --accept-dns=false; fi",
+		"curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null",
+		"/usr/local/bin/sr --help >/dev/null",
+	}, "\n")
+	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--command", remoteCommand}
+	if server.GCPProject != "" {
+		sshArgs = append(sshArgs, "--project", server.GCPProject)
+	}
+	stdin := strings.NewReader(tailscaleAuthKey + "\n")
+	if err := r.commandRunner().Run(ctx, "gcloud", sshArgs, stdin, r.out, r.errOut); err != nil {
+		return fmt.Errorf("install server: %w", err)
+	}
+	fmt.Fprintf(r.out, "Installed Subrouter server: %s\n", server.Name)
+	if tailscaleAuthKey != "" {
+		fmt.Fprintf(r.out, "Joined Tailscale as: %s\n", hostname)
+	}
+	return nil
 }
 
 func (r cxRunner) serverLogin(ctx context.Context, store cxServerStore, args []string) error {

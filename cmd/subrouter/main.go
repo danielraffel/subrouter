@@ -59,6 +59,8 @@ func runForProgram(program string, args []string) error {
 		return cx(args[1:])
 	case "install-daemon":
 		return installDaemon(args[1:])
+	case "install-systemd":
+		return installSystemd(args[1:])
 	case "help", "-h", "--help":
 		usage(program)
 		return nil
@@ -284,6 +286,7 @@ Usage:
 
   %[1]s server             Manage Subrouter servers
   %[1]s server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
+  %[1]s server install <name>
   %[1]s server login <name> [--device-auth]
 
   %[1]s admin-keys         List stored OpenAI admin keys
@@ -297,7 +300,8 @@ Usage:
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--transcripts ~/.subrouter/transcripts] [--transcript-gcs-uri gs://bucket/prefix]
   %[1]s accounts
   %[1]s codex [codex args...]
-  %[1]s install-daemon [--start=true]
+  %[1]s install-daemon [--start=true]       macOS LaunchAgent
+  %[1]s install-systemd [--start=true]      Linux systemd service
 
 Session stickiness:
   Prefer sending X-Subrouter-Session per conversation.
