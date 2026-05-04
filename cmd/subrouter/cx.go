@@ -63,7 +63,8 @@ Usage:
   cx claude             Manage Claude Code profiles
   cx gemini             Manage Gemini profiles
 
-The same commands also work as subrouter cx, subrouter <command>, and sr <command>.
+These account commands also work at top level as subrouter <command> and sr <command>.
+The subrouter cx <command> form is kept as a compatibility alias.
 `
 
 type cxRunner struct {
@@ -142,7 +143,7 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 		return r.switchAccount(ctx, selector, opts)
 	case "remove", "rm":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: subrouter cx remove <email>")
+			return fmt.Errorf("usage: subrouter remove <email>")
 		}
 		return r.remove(args[1])
 	case "status":
@@ -163,12 +164,12 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 		return r.listAdminKeys()
 	case "remove-admin-key":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: subrouter cx remove-admin-key <label>")
+			return fmt.Errorf("usage: subrouter remove-admin-key <label>")
 		}
 		return r.removeAdminKey(args[1])
 	case "attach-project":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: subrouter cx attach-project <api-key-label> [--project-id <id-or-name>]")
+			return fmt.Errorf("usage: subrouter attach-project <api-key-label> [--project-id <id-or-name>]")
 		}
 		projectID := ""
 		if idx := indexOf(args, "--project-id"); idx >= 0 && idx+1 < len(args) {
@@ -188,7 +189,7 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 		if strings.Contains(args[0], "@") {
 			return r.statusOne(ctx, args[0])
 		}
-		return fmt.Errorf("unknown subrouter cx command %q\n%s", args[0], cxHelp)
+		return fmt.Errorf("unknown account command %q\n%s", args[0], cxHelp)
 	}
 }
 
@@ -295,7 +296,7 @@ func (r cxRunner) list() error {
 		return err
 	}
 	if len(all) == 0 {
-		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter cx add' to add one.")
+		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter add' to add one.")
 		return nil
 	}
 	fmt.Fprintln(r.out)
@@ -354,7 +355,7 @@ func (r cxRunner) defaultInteractive(ctx context.Context, opts cxSwitchOptions) 
 		return err
 	}
 	if len(rows) == 0 {
-		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter cx add' to add one.")
+		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter add' to add one.")
 		return nil
 	}
 	switched, err := r.autoSwitchExhaustedActive(ctx, rows, opts)
@@ -505,13 +506,13 @@ func (r cxRunner) fetchUsageRows(ctx context.Context) ([]cxUsageRow, error) {
 
 func (r cxRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accounts.AdminKeyEntry) string {
 	if len(admins) == 0 {
-		return "no admin key, run 'subrouter cx add-admin-key' to enable spend display"
+		return "no admin key, run 'subrouter add-admin-key' to enable spend display"
 	}
 	admin, ok, err := r.store.PickAdminKeyFor(account)
 	if err != nil || !ok {
 		return "no admin key linked"
 	}
-	return fmt.Sprintf("no cached usage, run 'subrouter cx usage' (admin: %s)", admin.Label)
+	return fmt.Sprintf("no cached usage, run 'subrouter usage' (admin: %s)", admin.Label)
 }
 
 func (r cxRunner) switchAccount(ctx context.Context, selector string, opts cxSwitchOptions) error {
@@ -621,7 +622,7 @@ func (r cxRunner) listAdminKeys() error {
 		return err
 	}
 	if len(all) == 0 {
-		fmt.Fprintln(r.out, "No admin keys. Run 'subrouter cx add-admin-key' to add one.")
+		fmt.Fprintln(r.out, "No admin keys. Run 'subrouter add-admin-key' to add one.")
 		return nil
 	}
 	fmt.Fprintln(r.out)
@@ -664,7 +665,7 @@ func (r cxRunner) attachProject(ctx context.Context, apiKeyLabel, projectID stri
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("no admin key configured, run 'subrouter cx add-admin-key' first")
+		return fmt.Errorf("no admin key configured, run 'subrouter add-admin-key' first")
 	}
 	projects, err := accounts.ListOpenAIProjects(ctx, r.client, admin.Key)
 	if err != nil {
@@ -733,7 +734,7 @@ func (r cxRunner) usage(ctx context.Context, days int) error {
 		}
 	}
 	if len(apiAccounts) == 0 {
-		fmt.Fprintln(r.out, "No API-key accounts. Run 'subrouter cx add-key' first.")
+		fmt.Fprintln(r.out, "No API-key accounts. Run 'subrouter add-key' first.")
 		return nil
 	}
 	admins, err := r.store.ListAdminKeys()
@@ -741,7 +742,7 @@ func (r cxRunner) usage(ctx context.Context, days int) error {
 		return err
 	}
 	if len(admins) == 0 {
-		return fmt.Errorf("no admin keys. Run 'subrouter cx add-admin-key' first")
+		return fmt.Errorf("no admin keys. Run 'subrouter add-admin-key' first")
 	}
 
 	fmt.Fprintf(r.out, "Fetching %d-day usage for %d API-key account(s)...\n\n", days, len(apiAccounts))
@@ -1061,7 +1062,7 @@ func gtoReason(row cxUsageRow) string {
 
 func displayUsageRows(out io.Writer, rows []cxUsageRow, numbered bool) {
 	if len(rows) == 0 {
-		fmt.Fprintln(out, "No accounts configured. Run 'subrouter cx add' to add one.")
+		fmt.Fprintln(out, "No accounts configured. Run 'subrouter add' to add one.")
 		return
 	}
 	colored := colorEnabled(out)

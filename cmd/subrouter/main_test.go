@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -46,7 +47,32 @@ func TestSRDefaultRunsAccountPicker(t *testing.T) {
 }
 
 func TestDirectCXCommandNames(t *testing.T) {
-	for _, command := range []string{"status", "add", "server", "claude", "gemini"} {
+	for _, command := range []string{
+		"add",
+		"add-admin-key",
+		"add-api-key",
+		"add-key",
+		"admin-keys",
+		"attach-project",
+		"claude",
+		"gemini",
+		"gui-switch",
+		"gui-use",
+		"import",
+		"list",
+		"list-admin-keys",
+		"login",
+		"ls",
+		"remove",
+		"remove-admin-key",
+		"rm",
+		"server",
+		"servers",
+		"status",
+		"switch",
+		"usage",
+		"use",
+	} {
 		if !isDirectCXCommand(command) {
 			t.Fatalf("%s should be a direct cx command", command)
 		}
@@ -55,5 +81,25 @@ func TestDirectCXCommandNames(t *testing.T) {
 		if isDirectCXCommand(command) {
 			t.Fatalf("%s should stay a subrouter command", command)
 		}
+	}
+}
+
+func TestUsageShowsAccountCommandsAtTopLevel(t *testing.T) {
+	got := usageText("sr")
+	for _, want := range []string{
+		"sr add",
+		"sr add-key",
+		"sr switch [email]",
+		"sr server",
+		"sr add-admin-key",
+		"sr claude",
+		"sr serve",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("usage missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "sr cx [cx args...]") {
+		t.Fatalf("usage should not present cx as the primary nested command:\n%s", got)
 	}
 }

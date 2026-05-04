@@ -153,17 +153,14 @@ Subrouter has a native Go implementation of the Codex account manager. It reads 
 Account-management commands are built into the `subrouter` binary:
 
 ```bash
-go run ./cmd/subrouter cx add
-go run ./cmd/subrouter cx import
-go run ./cmd/subrouter cx list
-go run ./cmd/subrouter cx status
-
-# direct aliases also work
+go run ./cmd/subrouter add
+go run ./cmd/subrouter import
+go run ./cmd/subrouter list
 go run ./cmd/subrouter status
 sr status
 ```
 
-The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `gui-switch`, `remove`, `status`, `usage`, `add-admin-key`, `admin-keys`, `remove-admin-key`, and `attach-project`.
+The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `gui-switch`, `remove`, `status`, `usage`, `server`, `add-admin-key`, `admin-keys`, `remove-admin-key`, `attach-project`, `claude`, and `gemini`. The older `subrouter cx <command>` form remains as a compatibility alias.
 
 `cx switch` also syncs compatible ChatGPT Codex credentials into:
 

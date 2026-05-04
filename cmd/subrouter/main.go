@@ -44,7 +44,7 @@ func runForProgram(program string, args []string) error {
 		if program == "sr" {
 			return cx(nil)
 		}
-		usage()
+		usage(program)
 		return nil
 	}
 
@@ -60,14 +60,11 @@ func runForProgram(program string, args []string) error {
 	case "install-daemon":
 		return installDaemon(args[1:])
 	case "help", "-h", "--help":
-		usage()
+		usage(program)
 		return nil
 	default:
 		if isDirectCXCommand(args[0]) || strings.Contains(args[0], "@") {
 			return cx(args)
-		}
-		if program == "sr" {
-			return fmt.Errorf("unknown command %q; use 'sr help' for Subrouter commands or 'sr cx help' for account commands", args[0])
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -254,7 +251,7 @@ func listAccounts() error {
 		return err
 	}
 	if len(codexAccounts) == 0 {
-		fmt.Println("No Codex accounts found. Run: subrouter cx add")
+		fmt.Println("No Codex accounts found. Run: subrouter add")
 		return nil
 	}
 	for _, account := range codexAccounts {
@@ -263,21 +260,44 @@ func listAccounts() error {
 	return nil
 }
 
-func usage() {
-	fmt.Println(`subrouter routes AI coding-agent traffic across subscription accounts.
+func usage(program string) {
+	fmt.Print(usageText(program))
+}
+
+func usageText(program string) string {
+	if program == "" {
+		program = "subrouter"
+	}
+	return fmt.Sprintf(`%[1]s routes AI coding-agent traffic across subscription accounts.
 
 Usage:
-  subrouter serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--transcripts ~/.subrouter/transcripts] [--transcript-gcs-uri gs://bucket/prefix]
-  subrouter accounts
-  subrouter codex [codex args...]
-  subrouter cx [cx args...]
-  subrouter status
-  subrouter add
-  subrouter switch [email]
-  subrouter server [server args...]
-  subrouter install-daemon [--start=true]
+  %[1]s                    Show Codex usage for all accounts and switch
+  %[1]s add                Add a new Codex account (opens OAuth login)
+  %[1]s add-key            Add a Codex API key account
+  %[1]s import             Import current ~/.codex/auth.json account
+  %[1]s list               List all Codex accounts
+  %[1]s switch [email]     Switch active Codex account and sync OpenCode/pi
+  %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
+  %[1]s remove <email>     Remove a Codex account
+  %[1]s status             Show Codex usage (non-interactive)
+  %[1]s usage [days]       Refresh and show API-key spend
 
-The same account commands also work through sr, for example sr status and sr server login.
+  %[1]s server             Manage Subrouter servers
+  %[1]s server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
+  %[1]s server login <name> [--device-auth]
+
+  %[1]s admin-keys         List stored OpenAI admin keys
+  %[1]s add-admin-key      Add an sk-admin-* key
+  %[1]s remove-admin-key <label>
+  %[1]s attach-project <api-key-label> [--project-id <id-or-name>]
+
+  %[1]s claude             Manage Claude Code profiles
+  %[1]s gemini             Manage Gemini profiles
+
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--transcripts ~/.subrouter/transcripts] [--transcript-gcs-uri gs://bucket/prefix]
+  %[1]s accounts
+  %[1]s codex [codex args...]
+  %[1]s install-daemon [--start=true]
 
 Session stickiness:
   Prefer sending X-Subrouter-Session per conversation.
@@ -285,6 +305,7 @@ Session stickiness:
   Send X-Subrouter-User-Email for teammate-level observability.
   Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
   Subrouter switches active cx account every 10m by default; set --cx-switch-interval=0 to disable.
-  For subrouter codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
-  The proxy also checks common session headers, query params, and small JSON bodies.`)
+  For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
+  The proxy also checks common session headers, query params, and small JSON bodies.
+`, program)
 }

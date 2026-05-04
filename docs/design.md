@@ -118,7 +118,7 @@ Codex:
 - Read accounts from `~/.codex-accounts/accounts/*.json`.
 - OAuth accounts provide `tokens.access_token` and optional `tokens.account_id`.
 - API-key accounts provide `OPENAI_API_KEY`.
-- Login, imports, switching, API-key accounts, and admin-key usage are native Go commands under `cx` and `subrouter cx`.
+- Login, imports, switching, API-key accounts, server auth upload, and admin-key usage are native Go commands under `cx`, `subrouter`, and `sr`. The older `subrouter cx` form remains as a compatibility alias.
 
 Claude Code:
 
