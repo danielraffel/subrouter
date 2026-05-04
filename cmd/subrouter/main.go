@@ -156,7 +156,7 @@ func serve(args []string) error {
 	if *cxSwitchInterval > 0 && *fetchUsage {
 		go runCXAutoSwitch(context.Background(), cxAutoSwitchConfig{
 			Interval:     *cxSwitchInterval,
-			Accounts:     codexAccounts,
+			AccountsFunc: accountRef.All,
 			Sessions:     store,
 			SchedulerRef: schedulerRef,
 			Logger:       slog.Default(),

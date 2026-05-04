@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -68,6 +70,20 @@ func (r *AccountRef) All() []accounts.Account {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]accounts.Account(nil), r.accounts...)
+}
+
+func (r *AccountRef) Reload() ([]accounts.Account, error) {
+	if r == nil {
+		return nil, nil
+	}
+	loaded, err := r.store.List()
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.accounts = append([]accounts.Account(nil), loaded...)
+	return append([]accounts.Account(nil), loaded...), nil
 }
 
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
@@ -171,6 +187,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/accounts", s.handleAccounts)
 	mux.HandleFunc("/_subrouter/account-status", s.handleAccountStatus)
+	mux.HandleFunc("/_subrouter/reload-accounts", s.handleReloadAccounts)
 	mux.HandleFunc("/_subrouter/sessions", s.handleSessions)
 	mux.HandleFunc("/_subrouter/dashboard", s.handleDashboard)
 	mux.HandleFunc("/_subrouter/transcripts", s.handleTranscriptList)
@@ -228,6 +245,125 @@ func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, out)
+}
+
+func (s Server) handleReloadAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLoopbackRemote(r.RemoteAddr) {
+		http.Error(w, "reload-accounts is only available from loopback", http.StatusForbidden)
+		return
+	}
+	loaded, scored, err := s.reloadAccounts(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":              true,
+		"accounts":        loaded,
+		"usage_refreshed": scored,
+	})
+}
+
+func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
+	if s.AccountRef == nil {
+		return 0, 0, fmt.Errorf("account reload is not configured")
+	}
+	loaded, err := s.AccountRef.Reload()
+	if err != nil {
+		return 0, 0, err
+	}
+	if s.SchedulerRef == nil {
+		return len(loaded), 0, nil
+	}
+	scores, scored := s.scoreAccounts(ctx, loaded)
+	scheduler := selectacct.NewScheduler(scores)
+	if s.Sessions != nil {
+		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+	}
+	s.SchedulerRef.Set(scheduler)
+	return len(loaded), scored, nil
+}
+
+func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
+	scores := make([]selectacct.Score, 0, len(available))
+	scoreByID := make(map[string]int, len(available))
+	for _, account := range available {
+		headroom := 1.0
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			headroom = 0.01
+		}
+		scoreByID[account.ID] = len(scores)
+		scores = append(scores, selectacct.Score{
+			AccountID:     account.ID,
+			Headroom:      headroom,
+			ShortHeadroom: headroom,
+		})
+	}
+
+	client := (*http.Client)(nil)
+	if s.AccountRef != nil {
+		client = s.AccountRef.client
+	}
+	if client == nil {
+		client = &http.Client{Timeout: defaultUsageFetchTimeout}
+	}
+	scored := 0
+	for _, account := range available {
+		if account.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		refreshed, err := s.refreshAccount(ctx, account)
+		if err != nil {
+			if s.Logger != nil {
+				s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)
+			}
+			setZeroScore(scores, scoreByID, account.ID)
+			continue
+		}
+		windows, err := accounts.FetchCodexUsage(ctx, client, refreshed)
+		if err != nil {
+			if s.Logger != nil {
+				s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
+			}
+			setZeroScore(scores, scoreByID, account.ID)
+			continue
+		}
+		limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+		for _, window := range windows {
+			limitWindows = append(limitWindows, selectacct.LimitWindow{
+				Name:               window.Name,
+				UsedPercent:        window.UsedPercent,
+				LimitWindowSeconds: window.LimitWindowSeconds,
+				ResetAfterSeconds:  window.ResetAfterSeconds,
+			})
+		}
+		if idx, ok := scoreByID[account.ID]; ok {
+			scores[idx] = selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
+			scored++
+		}
+	}
+	return scores, scored
+}
+
+const defaultUsageFetchTimeout = 10 * time.Second
+
+func setZeroScore(scores []selectacct.Score, scoreByID map[string]int, accountID string) {
+	if idx, ok := scoreByID[accountID]; ok {
+		scores[idx] = selectacct.Score{AccountID: accountID, Headroom: 0, ShortHeadroom: 0}
+	}
+}
+
+func isLoopbackRemote(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {

@@ -16,6 +16,7 @@ const defaultCXSwitchInterval = 10 * time.Minute
 type cxAutoSwitchConfig struct {
 	Interval     time.Duration
 	Accounts     []accounts.Account
+	AccountsFunc func() []accounts.Account
 	Sessions     *session.Store
 	SchedulerRef *selectacct.SchedulerRef
 	Logger       *slog.Logger
@@ -79,7 +80,11 @@ func cxAutoSwitchOnce(ctx context.Context, cfg cxAutoSwitchConfig) (string, erro
 		}
 	}
 
-	candidates := oauthAccounts(cfg.Accounts)
+	allAccounts := cfg.Accounts
+	if cfg.AccountsFunc != nil {
+		allAccounts = cfg.AccountsFunc()
+	}
+	candidates := oauthAccounts(allAccounts)
 	if len(candidates) == 0 {
 		return "", fmt.Errorf("no OAuth Codex accounts available for cx auto-switch")
 	}

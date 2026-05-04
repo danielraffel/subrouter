@@ -203,8 +203,14 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 		t.Fatalf("missing gcloud upload/install commands: %#v", fake.commands)
 	}
 	uploadCommand := strings.Join(fake.commands[len(fake.commands)-1], " ")
-	if !strings.Contains(uploadCommand, ">/dev/null 2>&1") {
-		t.Fatalf("upload health retry should suppress expected curl noise:\n%s", uploadCommand)
+	if strings.Contains(uploadCommand, "systemctl restart subrouter") {
+		t.Fatalf("upload should hot-reload instead of restarting:\n%s", uploadCommand)
+	}
+	if !strings.Contains(uploadCommand, "reload_status=$(curl") {
+		t.Fatalf("upload should preflight hot-reload support before writing files:\n%s", uploadCommand)
+	}
+	if !strings.Contains(uploadCommand, "POST http://127.0.0.1:31415/_subrouter/reload-accounts") {
+		t.Fatalf("upload should hot-reload accounts:\n%s", uploadCommand)
 	}
 	if !strings.Contains(out.String(), "server owns the new refresh-token chain") {
 		t.Fatalf("missing ownership message:\n%s", out.String())

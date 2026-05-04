@@ -308,6 +308,98 @@ func TestAccountStatusEndpointValidatesRefreshToken(t *testing.T) {
 	}
 }
 
+func TestReloadAccountsHotLoadsNewAccountWithoutRestart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	accountStore := accounts.CodexStore{Dir: t.TempDir()}
+	initial := proxyStoredOAuthAccount("old@example.com", "old", time.Now().Add(time.Hour))
+	added := proxyStoredOAuthAccount("new@example.com", "new", time.Now().Add(time.Hour))
+	if err := accountStore.SaveStored(initial); err != nil {
+		t.Fatal(err)
+	}
+	initialAccount, ok := initial.Account(initial.SourcePath(accountStore))
+	if !ok {
+		t.Fatal("initial account did not convert")
+	}
+	upstreamAuthorizations := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuthorizations <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	codexUpstream, err := url.Parse(upstream.URL + "/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountRef := NewAccountRef(accountStore, []accounts.Account{initialAccount}, nil)
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "old@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
+	}))
+	handler := Server{
+		CodexUpstream: codexUpstream,
+		AccountRef:    accountRef,
+		Sessions:      sessionStore,
+		SchedulerRef:  schedulerRef,
+		MaxBodyBytes:  1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	if err := accountStore.SaveStored(added); err != nil {
+		t.Fatal(err)
+	}
+	reloadReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/_subrouter/reload-accounts", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadResp, err := http.DefaultClient.Do(reloadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloadResp.StatusCode != http.StatusOK {
+		defer reloadResp.Body.Close()
+		body, _ := io.ReadAll(reloadResp.Body)
+		t.Fatalf("reload status = %d, body = %s", reloadResp.StatusCode, string(body))
+	}
+	var payload struct {
+		OK       bool `json:"ok"`
+		Accounts int  `json:"accounts"`
+	}
+	if err := json.NewDecoder(reloadResp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloadResp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.OK || payload.Accounts != 2 {
+		t.Fatalf("reload payload = %+v, want 2 accounts", payload)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "new-session")
+	req.Header.Set("X-Subrouter-Account-ID", "new@example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if got := <-upstreamAuthorizations; got != "Bearer "+added.Auth.Tokens.AccessToken {
+		t.Fatalf("Authorization = %q, want new account token", got)
+	}
+}
+
 func TestHandlerMapsV1WebSocketRequestsToCodexBackendPaths(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -912,13 +912,14 @@ func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig
 	}
 	remoteCommand := strings.Join([]string{
 		"set -euo pipefail",
+		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
+		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
 		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/.codex-accounts/accounts",
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
 		"sudo find /var/lib/subrouter/.codex-accounts -name '._*' -delete",
 		"sudo chown -R subrouter:subrouter /var/lib/subrouter/.codex-accounts",
 		"sudo rm -f " + shellQuote(remotePath),
-		"sudo systemctl restart subrouter",
-		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
+		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")
 	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--command", remoteCommand}
 	if server.GCPProject != "" {

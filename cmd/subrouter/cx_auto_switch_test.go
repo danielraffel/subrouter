@@ -65,6 +65,36 @@ func TestCXAutoSwitchPicksBestOAuthAccount(t *testing.T) {
 	}
 }
 
+func TestCXAutoSwitchUsesLiveAccountsFunc(t *testing.T) {
+	var switchedTo string
+	picked, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
+		Accounts: []accounts.Account{
+			{ID: "old@example.com", AuthMode: accounts.AuthModeOAuth},
+		},
+		AccountsFunc: func() []accounts.Account {
+			return []accounts.Account{
+				{ID: "new@example.com", AuthMode: accounts.AuthModeOAuth},
+			}
+		},
+		FetchScores: func(_ context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+			if len(candidates) != 1 || candidates[0].ID != "new@example.com" {
+				t.Fatalf("candidates = %#v, want live account", candidates)
+			}
+			return []selectacct.Score{{AccountID: "new@example.com", Headroom: 0.90, ShortHeadroom: 0.90}}, 1
+		},
+		SwitchActive: func(_ context.Context, accountID string) error {
+			switchedTo = accountID
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked != "new@example.com" || switchedTo != "new@example.com" {
+		t.Fatalf("picked=%q switched=%q, want new@example.com", picked, switchedTo)
+	}
+}
+
 func TestCXAutoSwitchSkipsWhenUsageUnavailable(t *testing.T) {
 	ran := false
 	_, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
