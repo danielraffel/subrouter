@@ -44,10 +44,17 @@ esac
 
 if [ "$version" = "latest" ]; then
   version="$(
-    curl -fsSL "https://api.github.com/repos/$repo/releases/latest" |
-      sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' |
+    curl -fsSIL -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest" |
+      sed -n 's#.*/tag/v\{0,1\}\([^/?#]*\).*#\1#p' |
       head -n 1
   )"
+  if [ -z "$version" ]; then
+    version="$(
+      curl -fsSL "https://api.github.com/repos/$repo/releases/latest" |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' |
+        head -n 1
+    )"
+  fi
 fi
 
 if [ -z "$version" ]; then
