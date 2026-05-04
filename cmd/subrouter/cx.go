@@ -21,6 +21,7 @@ import (
 )
 
 const cxUsageCacheTTL = time.Hour
+const cxUsageGridMinWidth = 140
 
 const (
 	ansiReset    = "\x1b[0m"
@@ -1076,6 +1077,30 @@ func displayUsageRows(out io.Writer, rows []cxUsageRow, numbered bool) {
 		return
 	}
 	colored := colorEnabled(out)
+	if shouldDisplayUsageGrid(out) {
+		displayUsageRowsGrid(out, rows, numbered, colored)
+		return
+	}
+	displayUsageRowsDetailed(out, rows, numbered, colored)
+}
+
+func shouldDisplayUsageGrid(out io.Writer) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SR_USAGE_GRID"))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CX_USAGE_GRID"))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return terminalColumns(out) >= cxUsageGridMinWidth
+}
+
+func displayUsageRowsDetailed(out io.Writer, rows []cxUsageRow, numbered bool, colored bool) {
 	width := 0
 	for _, row := range rows {
 		if row.gtoReason != "" {
@@ -1157,6 +1182,213 @@ func displayUsageRows(out io.Writer, rows []cxUsageRow, numbered bool) {
 		}
 		fmt.Fprintln(out)
 	}
+}
+
+func displayUsageRowsGrid(out io.Writer, rows []cxUsageRow, numbered bool, colored bool) {
+	columns := usageGridColumns(out)
+	fmt.Fprintln(out)
+	printUsageGridLine(out, columns, func(col usageGridColumn) string { return col.Title }, colored, true)
+	printUsageGridSeparator(out, columns)
+	for i, row := range rows {
+		rowIndex := ""
+		if numbered {
+			rowIndex = strconv.Itoa(i + 1)
+		}
+		values := map[string]string{
+			"#":        rowIndex,
+			"Account":  displayAccountName(row.email),
+			"Plan":     row.planType,
+			"State":    usageGridState(row),
+			"Pick":     firstNonEmpty(row.gtoReason, usageGridError(row)),
+			"5h":       usageGridWindow(row.windows, isShortQuotaWindow),
+			"7d":       usageGridWindow(row.windows, isLongQuotaWindow),
+			"Spark":    usageGridNamedWindow(row.windows, false),
+			"Spark wk": usageGridNamedWindow(row.windows, true),
+			"Credits":  usageGridCredits(row),
+		}
+		printUsageGridLine(out, columns, func(col usageGridColumn) string {
+			return values[col.Title]
+		}, colored, false)
+	}
+	fmt.Fprintln(out)
+	if usageRowsHaveErrors(rows) {
+		for _, row := range rows {
+			if row.err != nil {
+				fmt.Fprintf(out, "  %s: %s\n", displayAccountName(row.email), row.err.Error())
+			}
+		}
+		fmt.Fprintln(out)
+	}
+}
+
+func usageGridColumns(out io.Writer) []usageGridColumn {
+	columns := []usageGridColumn{
+		{Title: "#", Width: 3},
+		{Title: "Account", Width: 24},
+		{Title: "Plan", Width: 7},
+		{Title: "State", Width: 14},
+		{Title: "Pick", Width: 24},
+		{Title: "5h", Width: 10},
+		{Title: "7d", Width: 10},
+		{Title: "Spark", Width: 10},
+		{Title: "Spark wk", Width: 10},
+		{Title: "Credits", Width: 8},
+	}
+	extra := terminalColumns(out) - usageGridWidth(columns)
+	if extra <= 0 {
+		return columns
+	}
+	extra = widenUsageGridColumn(columns, "Account", extra, 36)
+	extra = widenUsageGridColumn(columns, "Pick", extra, 42)
+	_ = widenUsageGridColumn(columns, "State", extra, 22)
+	return columns
+}
+
+type usageGridColumn struct {
+	Title string
+	Width int
+}
+
+func usageGridWidth(columns []usageGridColumn) int {
+	if len(columns) == 0 {
+		return 0
+	}
+	width := 2 * (len(columns) - 1)
+	for _, col := range columns {
+		width += col.Width
+	}
+	return width
+}
+
+func widenUsageGridColumn(columns []usageGridColumn, title string, extra int, maxWidth int) int {
+	if extra <= 0 {
+		return 0
+	}
+	for i := range columns {
+		if columns[i].Title != title {
+			continue
+		}
+		add := min(extra, maxWidth-columns[i].Width)
+		if add > 0 {
+			columns[i].Width += add
+			extra -= add
+		}
+		return extra
+	}
+	return extra
+}
+
+func printUsageGridLine(out io.Writer, columns []usageGridColumn, value func(usageGridColumn) string, colored bool, header bool) {
+	for i, col := range columns {
+		if i > 0 {
+			fmt.Fprint(out, "  ")
+		}
+		cell := fitCell(value(col), col.Width)
+		if header {
+			cell = style(colored, ansiDim, cell)
+		}
+		fmt.Fprint(out, cell)
+	}
+	fmt.Fprintln(out)
+}
+
+func printUsageGridSeparator(out io.Writer, columns []usageGridColumn) {
+	for i, col := range columns {
+		if i > 0 {
+			fmt.Fprint(out, "  ")
+		}
+		fmt.Fprint(out, strings.Repeat("-", col.Width))
+	}
+	fmt.Fprintln(out)
+}
+
+func usageGridState(row cxUsageRow) string {
+	var states []string
+	if row.active {
+		states = append(states, "active")
+	}
+	if row.gtoRecommended {
+		states = append(states, "recommended")
+	}
+	if row.cooked {
+		states = append(states, "cooked")
+	} else if row.tempCooked {
+		states = append(states, "temporarily cooked")
+	}
+	if row.err != nil {
+		states = append(states, "error")
+	}
+	return strings.Join(states, ", ")
+}
+
+func usageGridError(row cxUsageRow) string {
+	if row.err == nil {
+		return ""
+	}
+	return "error"
+}
+
+func usageGridWindow(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) string {
+	for _, window := range windows {
+		if match(window) && !strings.Contains(strings.ToLower(window.Name), "codex-spark") {
+			return compactWindowStatus(window)
+		}
+	}
+	return ""
+}
+
+func usageGridNamedWindow(windows []accounts.UsageWindow, weekly bool) string {
+	for _, window := range windows {
+		name := strings.ToLower(windowLabel(window))
+		if !strings.Contains(name, "codex-spark") {
+			continue
+		}
+		isWeekly := strings.Contains(name, "weekly")
+		if isWeekly == weekly {
+			return compactWindowStatus(window)
+		}
+	}
+	return ""
+}
+
+func compactWindowStatus(window accounts.UsageWindow) string {
+	left := compactPercentLeft(window.UsedPercent)
+	if window.ResetAfterSeconds <= 0 {
+		return left
+	}
+	return left + "/" + strings.ReplaceAll(formatDuration(window.ResetAfterSeconds), " ", "")
+}
+
+func compactPercentLeft(used float64) string {
+	left := 100 - used
+	if left < 0 {
+		left = 0
+	}
+	return fmt.Sprintf("%.0f%%", left)
+}
+
+func usageGridCredits(row cxUsageRow) string {
+	if row.credits != nil {
+		if row.credits.Unlimited {
+			return "unlimited"
+		}
+		if row.credits.Balance != "" {
+			return "$" + row.credits.Balance
+		}
+	}
+	if row.apiKeySpend != nil {
+		return fmtUSD(row.apiKeySpend.WeekUSD) + "/7d"
+	}
+	return ""
+}
+
+func usageRowsHaveErrors(rows []cxUsageRow) bool {
+	for _, row := range rows {
+		if row.err != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func displayAPIKeySpend(out io.Writer, snapshot *accounts.APIKeyUsageSnapshot, width int, colored bool) {
@@ -1448,6 +1680,20 @@ func maskSecret(value string) string {
 func pad(value string, width int) string {
 	if width <= len(value) {
 		return value
+	}
+	return value + strings.Repeat(" ", width-len(value))
+}
+
+func fitCell(value string, width int) string {
+	value = strings.ReplaceAll(strings.TrimSpace(value), "\n", " ")
+	if width <= 0 {
+		return ""
+	}
+	if len(value) > width {
+		if width <= 3 {
+			return value[:width]
+		}
+		return value[:width-3] + "..."
 	}
 	return value + strings.Repeat(" ", width-len(value))
 }

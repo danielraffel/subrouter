@@ -684,6 +684,58 @@ func TestRenderBarSupportsANSIColors(t *testing.T) {
 	}
 }
 
+func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
+	t.Setenv("SR_USAGE_GRID", "1")
+	t.Setenv("COLUMNS", "200")
+	var out bytes.Buffer
+	displayUsageRows(&out, []cxUsageRow{
+		{
+			email:          "lawrence@cmux.com",
+			planType:       "pro",
+			active:         true,
+			gtoRecommended: true,
+			gtoReason:      "45% bottleneck left, 5h resets in 1h",
+			authMode:       accounts.AuthModeOAuth,
+			windows: []accounts.UsageWindow{
+				{Name: "primary", UsedPercent: 55, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Hour / time.Second)},
+				{Name: "secondary", UsedPercent: 20, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((4 * 24 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 8, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((30 * time.Minute) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((6 * 24 * time.Hour) / time.Second)},
+			},
+			credits: &accounts.CreditsInfo{Balance: "0"},
+		},
+	}, true)
+
+	got := out.String()
+	if !strings.Contains(got, "Account") || !strings.Contains(got, "Spark wk") {
+		t.Fatalf("grid header missing:\n%s", got)
+	}
+	if !strings.Contains(got, "lawrence@cmux.com") || !strings.Contains(got, "active, recommended") {
+		t.Fatalf("grid row missing state:\n%s", got)
+	}
+	if strings.Contains(got, "pick") {
+		t.Fatalf("forced grid should not render detailed pick label:\n%s", got)
+	}
+}
+
+func TestDisplayUsageRowsDetailedCanBeForced(t *testing.T) {
+	t.Setenv("SR_USAGE_GRID", "0")
+	t.Setenv("COLUMNS", "200")
+	var out bytes.Buffer
+	displayUsageRows(&out, []cxUsageRow{
+		{
+			email:     "a@example.com",
+			gtoReason: "80% bottleneck left",
+			authMode:  accounts.AuthModeOAuth,
+		},
+	}, true)
+
+	got := out.String()
+	if !strings.Contains(got, "1) a@example.com") || !strings.Contains(got, "pick") {
+		t.Fatalf("forced detailed output missing expected labels:\n%s", got)
+	}
+}
+
 func TestParseCXSwitchArgs(t *testing.T) {
 	selector, opts, err := parseCXSwitchArgs([]string{"a@example.com", "--restart-gui"}, cxSwitchOptions{})
 	if err != nil {
