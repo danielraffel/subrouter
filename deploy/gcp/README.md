@@ -40,7 +40,7 @@ Install or upgrade Subrouter on the VM:
 deploy/gcp/publish-subrouter.sh
 ```
 
-The publish script configures the server with `sr server add`, then runs `sr server install`. The VM downloads the public release with the same curl installer and runs `sr install-systemd`; no locally built binary is copied to the server.
+The publish script configures the server with `sr server add`, then runs `sr server install`. The VM downloads the public release with the same curl installer and runs `sr install-systemd`; no locally built binary is copied to the server. If legacy `switchboard` or `gateway` services exist on the VM, the systemd installer disables them and migrates their state into `/var/lib/subrouter`.
 
 Join or rejoin the host to Tailscale with an auth key:
 

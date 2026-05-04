@@ -80,6 +80,8 @@ This creates a `subrouter` system user, stores state under `/var/lib/subrouter`,
 /usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --transcripts /var/lib/subrouter/transcripts --cx-switch-interval 10m
 ```
 
+If legacy `switchboard` or `gateway` services exist, `sr install-systemd` stops and disables them, merges their `/var/lib/...` state into `/var/lib/subrouter`, and preserves their extra service args.
+
 Useful endpoints:
 
 ```text

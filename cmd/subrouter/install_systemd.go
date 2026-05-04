@@ -30,6 +30,7 @@ type systemdConfig struct {
 	Start            bool
 	DryRun           bool
 	InstallAliases   bool
+	ReplaceLegacy    bool
 }
 
 func installSystemd(args []string) error {
@@ -48,6 +49,7 @@ func installSystemd(args []string) error {
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
 	flags.BoolVar(&config.InstallAliases, "install-aliases", true, "install sr and cx symlinks to the subrouter binary")
+	flags.BoolVar(&config.ReplaceLegacy, "replace-legacy", true, "stop legacy switchboard/gateway services and migrate their state")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -56,6 +58,9 @@ func installSystemd(args []string) error {
 	}
 	if config.ExtraArgs == "" {
 		config.ExtraArgs = readSystemdDefaultExtraArgs(config)
+		if config.ExtraArgs == "" && config.ReplaceLegacy {
+			config.ExtraArgs = readLegacySystemdExtraArgs()
+		}
 	}
 	return installSystemdWithConfig(config, commandRunner{})
 }
@@ -77,6 +82,9 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		return errors.New("install-systemd must run as root; use sudo")
 	}
 
+	if config.ReplaceLegacy {
+		stopLegacySystemdServices(runner)
+	}
 	if err := ensureSystemUser(config, runner); err != nil {
 		return err
 	}
@@ -91,6 +99,9 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return err
 		}
+	}
+	if config.ReplaceLegacy {
+		migrateLegacySystemdState(config, runner)
 	}
 	if err := installCurrentExecutable(config.InstallPath); err != nil {
 		return err
@@ -184,13 +195,32 @@ func ensureSystemUser(config systemdConfig, runner commandRunner) error {
 }
 
 func readSystemdDefaultExtraArgs(config systemdConfig) string {
-	body, err := os.ReadFile(systemdDefaultPath(config))
+	return readDefaultValue(systemdDefaultPath(config), "SUBROUTER_EXTRA_ARGS")
+}
+
+func readLegacySystemdExtraArgs() string {
+	for _, legacy := range []struct {
+		path string
+		key  string
+	}{
+		{"/etc/default/switchboard", "SWITCHBOARD_EXTRA_ARGS"},
+		{"/etc/default/gateway", "GATEWAY_EXTRA_ARGS"},
+	} {
+		if value := readDefaultValue(legacy.path, legacy.key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func readDefaultValue(path, keyName string) string {
+	body, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
 	for _, line := range strings.Split(string(body), "\n") {
 		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "SUBROUTER_EXTRA_ARGS" {
+		if !ok || strings.TrimSpace(key) != keyName {
 			continue
 		}
 		value = strings.TrimSpace(value)
@@ -198,6 +228,24 @@ func readSystemdDefaultExtraArgs(config systemdConfig) string {
 		return value
 	}
 	return ""
+}
+
+func stopLegacySystemdServices(runner commandRunner) {
+	for _, service := range []string{"switchboard", "gateway"} {
+		_ = runner.Run("systemctl", "disable", "--now", service)
+	}
+}
+
+func migrateLegacySystemdState(config systemdConfig, runner commandRunner) {
+	for _, legacyHome := range []string{"/var/lib/switchboard", "/var/lib/gateway"} {
+		if legacyHome == config.Home {
+			continue
+		}
+		if info, err := os.Stat(legacyHome); err != nil || !info.IsDir() {
+			continue
+		}
+		_ = runner.Run("cp", "-a", "-n", legacyHome+"/.", config.Home+"/")
+	}
 }
 
 func systemdDefaultPath(config systemdConfig) string {

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -47,5 +49,17 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	defaults := systemdDefaults(config)
 	if !strings.Contains(defaults, `SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false"`) {
 		t.Fatalf("defaults did not quote extra args:\n%s", defaults)
+	}
+}
+
+func TestReadDefaultValueUnquotesEnvFileValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subrouter")
+	if err := os.WriteFile(path, []byte("SUBROUTER_EXTRA_ARGS=\"--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := readDefaultValue(path, "SUBROUTER_EXTRA_ARGS")
+	want := "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false"
+	if got != want {
+		t.Fatalf("extra args = %q, want %q", got, want)
 	}
 }
