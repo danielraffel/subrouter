@@ -202,6 +202,10 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if !fake.hasCommandPrefix("gcloud", "compute", "scp") || !fake.hasCommandPrefix("gcloud", "compute", "ssh") {
 		t.Fatalf("missing gcloud upload/install commands: %#v", fake.commands)
 	}
+	uploadCommand := strings.Join(fake.commands[len(fake.commands)-1], " ")
+	if !strings.Contains(uploadCommand, ">/dev/null 2>&1") {
+		t.Fatalf("upload health retry should suppress expected curl noise:\n%s", uploadCommand)
+	}
 	if !strings.Contains(out.String(), "server owns the new refresh-token chain") {
 		t.Fatalf("missing ownership message:\n%s", out.String())
 	}
@@ -487,6 +491,7 @@ func TestCXServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 		"SUBROUTER_VERSION='0.1.2'",
 		"/usr/local/bin/sr install-systemd",
 		"until curl -fsS http://127.0.0.1:31415/_subrouter/health",
+		">/dev/null 2>&1",
 		"tailscale up",
 	} {
 		if !strings.Contains(installCommand, want) {
