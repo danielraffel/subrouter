@@ -52,10 +52,12 @@ Usage:
   cx usage [days]       Refresh and show API-key spend
 
   cx server             Manage Subrouter servers
-  cx server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
+  cx server add <name> --url <url> [--default]
+  cx server use <name>
+  cx server rename <old> <new>
   cx server install <name>
   cx server login <name> [--device-auth]
-  cx server sync <name> [--device-auth]
+  cx server sync <name> [--device-auth] [--yes]
 
   cx admin-keys         List stored OpenAI admin keys
   cx add-admin-key      Add an sk-admin-* key
@@ -70,12 +72,13 @@ The subrouter cx <command> form is kept as a compatibility alias.
 `
 
 type cxRunner struct {
-	store  accounts.CodexStore
-	in     io.Reader
-	out    io.Writer
-	errOut io.Writer
-	client *http.Client
-	cmd    cxCommandRunner
+	program string
+	store   accounts.CodexStore
+	in      io.Reader
+	out     io.Writer
+	errOut  io.Writer
+	client  *http.Client
+	cmd     cxCommandRunner
 }
 
 type cxSwitchOptions struct {
@@ -102,12 +105,17 @@ type cxUsageRow struct {
 }
 
 func cx(args []string) error {
+	return cxForProgram("cx", args)
+}
+
+func cxForProgram(program string, args []string) error {
 	runner := cxRunner{
-		store:  accounts.DefaultCodexStore(),
-		in:     os.Stdin,
-		out:    os.Stdout,
-		errOut: os.Stderr,
-		client: &http.Client{Timeout: 120 * time.Second},
+		program: program,
+		store:   accounts.DefaultCodexStore(),
+		in:      os.Stdin,
+		out:     os.Stdout,
+		errOut:  os.Stderr,
+		client:  &http.Client{Timeout: 120 * time.Second},
 	}
 	return runner.run(context.Background(), args)
 }

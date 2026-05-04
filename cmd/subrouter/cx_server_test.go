@@ -45,6 +45,105 @@ func TestCXServerAddStoresGCPServer(t *testing.T) {
 	}
 }
 
+func TestCXServerAddAllowsURLOnlyServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	var out bytes.Buffer
+	runner := cxRunner{store: store, out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "team",
+		"--url", "http://100.64.0.1:31415",
+		"--default",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := defaultCXServerStore(store).load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Default != "team" {
+		t.Fatalf("default = %q, want team", file.Default)
+	}
+	server, ok := file.find("team")
+	if !ok {
+		t.Fatal("missing team server")
+	}
+	if server.GCPInstance != "" || server.GCPZone != "" {
+		t.Fatalf("unexpected GCP metadata: %+v", server)
+	}
+}
+
+func TestCXServerUseSetsExplicitDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	var out bytes.Buffer
+	runner := cxRunner{store: store, out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "community",
+		"--url", "http://100.64.0.1:31415",
+		"--gcp-instance", "subrouter-community",
+		"--gcp-zone", "us-central1-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.run(context.Background(), []string{"server", "use", "community"}); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := defaultCXServerStore(store).load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Default != "community" {
+		t.Fatalf("default = %q, want community", file.Default)
+	}
+	out.Reset()
+	if err := runner.run(context.Background(), []string{"server", "list"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "(default)") {
+		t.Fatalf("list did not mark default:\n%s", out.String())
+	}
+}
+
+func TestCXServerRenameUpdatesDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	var out bytes.Buffer
+	runner := cxRunner{program: "sr", store: store, out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "community",
+		"--url", "http://100.64.0.1:31415",
+		"--default",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.run(context.Background(), []string{"server", "rename", "community", "team"}); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := defaultCXServerStore(store).load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Default != "team" {
+		t.Fatalf("default = %q, want team", file.Default)
+	}
+	if _, ok := file.find("community"); ok {
+		t.Fatal("old server name still exists")
+	}
+	if _, ok := file.find("team"); !ok {
+		t.Fatal("new server name missing")
+	}
+}
+
 func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -184,12 +283,15 @@ func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 		errOut: &out,
 		cmd:    fake,
 		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/_subrouter/accounts" {
+			if req.URL.Path != "/_subrouter/account-status" {
 				t.Fatalf("unexpected path: %s", req.URL.Path)
 			}
-			body, _ := json.Marshal([]remoteServerAccount{
-				{ID: "bob@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "bob@example.com"},
-				{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com"},
+			if req.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", req.Method)
+			}
+			body, _ := json.Marshal([]remoteServerAccountStatus{
+				{ID: "bob@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "bob@example.com", AuthChecked: true, AuthValid: true},
+				{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com", AuthChecked: true, AuthValid: true},
 				{ID: "apikey:paid", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeAPIKey, Email: "apikey:paid"},
 			})
 			return &http.Response{
@@ -209,7 +311,7 @@ func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runner.run(context.Background(), []string{"server", "sync", "community", "--device-auth"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "sync", "community", "--device-auth", "--yes"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -217,6 +319,7 @@ func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 	for _, want := range []string{
 		"Missing on server:\n  alice@example.com",
 		"Already on server:\n  bob@example.com",
+		"Invalid on server: none",
 		"Server-only OAuth accounts:\n  old@example.com",
 		"Synced 1 server-owned OAuth account(s) to community",
 	} {
@@ -259,6 +362,9 @@ func TestCXServerSyncDryRunDoesNotLogin(t *testing.T) {
 		errOut: &out,
 		cmd:    fake,
 		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/account-status" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     make(http.Header),
@@ -283,6 +389,65 @@ func TestCXServerSyncDryRunDoesNotLogin(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Would reauth on server:\n  alice@example.com") {
 		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestCXServerSyncPromptsForInvalidServerAccount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	active := testCodexAuth("active@example.com", "acct_active")
+	invalidFresh := testCodexAuth("old@example.com", "acct_old_fresh")
+	if err := accounts.WriteActiveCodexAuth(active); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fake := &recordingCXCommandRunner{loginAuths: []accounts.CodexAuthFile{invalidFresh}}
+	runner := cxRunner{
+		store:  store,
+		in:     strings.NewReader("yes\n"),
+		out:    &out,
+		errOut: &out,
+		cmd:    fake,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/account-status" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			body, _ := json.Marshal([]remoteServerAccountStatus{
+				{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com", AuthChecked: true, AuthValid: false, Error: "token refresh failed (401): refresh_token_reused"},
+			})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "community",
+		"--url", "http://100.64.0.1:31415",
+		"--gcp-instance", "subrouter-community",
+		"--gcp-zone", "us-central1-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.run(context.Background(), []string{"server", "sync", "community", "--device-auth"}); err != nil {
+		t.Fatal(err)
+	}
+	output := out.String()
+	for _, want := range []string{
+		"Invalid on server:\n  old@example.com: token refresh failed",
+		"Reauth 1 account(s) on server community?",
+		"Synced 1 server-owned OAuth account(s) to community",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+	if fake.countCommand("codex", "login", "--device-auth") != 1 {
+		t.Fatalf("login command count mismatch: %#v", fake.commands)
 	}
 }
 

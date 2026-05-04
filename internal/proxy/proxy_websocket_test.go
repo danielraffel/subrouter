@@ -139,6 +139,44 @@ func TestHandlerMapsV1RequestsToCodexBackendPaths(t *testing.T) {
 	}
 }
 
+func TestHandlerDoesNotProxyUnknownInternalSubrouterPaths(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	codexUpstream, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		CodexUpstream: codexUpstream,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/newer-cli-endpoint", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", recorder.Code)
+	}
+	if upstreamCalled {
+		t.Fatal("unknown internal path was proxied upstream")
+	}
+}
+
 func TestHandlerRefreshesExpiredOAuthBeforeProxying(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.CodexStore{Dir: t.TempDir()}
@@ -217,6 +255,56 @@ func TestHandlerRefreshesExpiredOAuthBeforeProxying(t *testing.T) {
 	}
 	if !ok || stored.Auth.Tokens.RefreshToken != fresh.Auth.Tokens.RefreshToken {
 		t.Fatalf("stored refresh token was not updated")
+	}
+}
+
+func TestAccountStatusEndpointValidatesRefreshToken(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	stale := proxyStoredOAuthAccount("codex@example.com", "old", time.Now().Add(-time.Hour))
+	fresh := proxyStoredOAuthAccount("codex@example.com", "new", time.Now().Add(time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+	staleAccount, ok := stale.Account(stale.SourcePath(store))
+	if !ok {
+		t.Fatal("stale account did not convert")
+	}
+	refreshClient := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := json.Marshal(map[string]string{
+			"access_token":  fresh.Auth.Tokens.AccessToken,
+			"refresh_token": fresh.Auth.Tokens.RefreshToken,
+			"id_token":      fresh.Auth.Tokens.IDToken,
+		})
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+	sessionStore, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts:     []accounts.Account{staleAccount},
+		AccountRef:   NewAccountRef(store, []accounts.Account{staleAccount}, refreshClient),
+		Sessions:     sessionStore,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/account-status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var statuses []AccountStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &statuses); err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || !statuses[0].AuthValid || !statuses[0].Refreshed {
+		t.Fatalf("unexpected statuses: %+v", statuses)
 	}
 }
 

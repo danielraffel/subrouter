@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-instance_name="${INSTANCE_NAME:-subrouter-community}"
+instance_name="${INSTANCE_NAME:-subrouter-team}"
 zone="${ZONE:-us-central1-a}"
 machine_type="${MACHINE_TYPE:-e2-micro}"
 disk_size="${DISK_SIZE:-10GB}"

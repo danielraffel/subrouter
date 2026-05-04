@@ -149,10 +149,18 @@ func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, erro
 }
 
 func (s CodexStore) RefreshStoredIfExpired(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
+	return s.refreshStored(ctx, client, account, false)
+}
+
+func (s CodexStore) RefreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
+	return s.refreshStored(ctx, client, account, true)
+}
+
+func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount, force bool) (StoredCodexAccount, bool, error) {
 	if account.Auth.Tokens == nil {
 		return account, false, nil
 	}
-	if !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
 		return account, false, nil
 	}
 
@@ -172,16 +180,16 @@ func (s CodexStore) RefreshStoredIfExpired(ctx context.Context, client *http.Cli
 	if account.Auth.Tokens == nil {
 		return account, false, nil
 	}
-	if !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
 		return account, false, nil
 	}
 
-	auth, refreshed, err := RefreshCodexAuthIfExpired(ctx, client, account.Auth)
-	if err != nil || !refreshed {
+	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
+	if err != nil {
 		if recovered, ok := s.recoverRefreshedAccount(account); ok {
 			return recovered, false, nil
 		}
-		return account, refreshed, err
+		return account, false, err
 	}
 	account.Auth = auth
 	if err := s.saveStoredUnlocked(account); err != nil {
@@ -253,6 +261,14 @@ func RefreshCodexAuthIfExpired(ctx context.Context, client *http.Client, auth Co
 	if !IsJWTExpired(auth.Tokens.AccessToken, 60*time.Second) {
 		return auth, false, nil
 	}
+	refreshed, err := RefreshCodexAuth(ctx, client, auth)
+	return refreshed, err == nil, err
+}
+
+func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFile) (CodexAuthFile, error) {
+	if auth.Tokens == nil {
+		return auth, nil
+	}
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
@@ -264,22 +280,22 @@ func RefreshCodexAuthIfExpired(ctx context.Context, client *http.Client, auth Co
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return auth, false, err
+		return auth, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexOAuthTokenURL, bytes.NewReader(body))
 	if err != nil {
-		return auth, false, err
+		return auth, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	res, err := client.Do(req)
 	if err != nil {
-		return auth, false, err
+		return auth, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(res.Body)
-		return auth, false, fmt.Errorf("token refresh failed (%d): %s", res.StatusCode, strings.TrimSpace(buf.String()))
+		return auth, fmt.Errorf("token refresh failed (%d): %s", res.StatusCode, strings.TrimSpace(buf.String()))
 	}
 	var refreshed struct {
 		AccessToken  string `json:"access_token"`
@@ -287,16 +303,16 @@ func RefreshCodexAuthIfExpired(ctx context.Context, client *http.Client, auth Co
 		IDToken      string `json:"id_token"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&refreshed); err != nil {
-		return auth, false, err
+		return auth, err
 	}
 	if refreshed.AccessToken == "" || refreshed.RefreshToken == "" || refreshed.IDToken == "" {
-		return auth, false, fmt.Errorf("token refresh response missing required fields")
+		return auth, fmt.Errorf("token refresh response missing required fields")
 	}
 	auth.Tokens.AccessToken = refreshed.AccessToken
 	auth.Tokens.RefreshToken = refreshed.RefreshToken
 	auth.Tokens.IDToken = refreshed.IDToken
 	auth.LastRefresh = time.Now().UTC().Format(time.RFC3339)
-	return auth, true, nil
+	return auth, nil
 }
 
 func DecodeJWTClaims(token string) (map[string]any, error) {

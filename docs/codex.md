@@ -69,6 +69,7 @@ OPENAI_API_KEY=dummy codex exec \
 ## Env Vars
 
 - `SUBROUTER_CODEX_BASE_URL`: base URL injected by `subrouter codex`; defaults to `http://127.0.0.1:31415/v1`.
+- `SUBROUTER_CODEX_SERVER`: named server from `sr server add`; ignored when `SUBROUTER_CODEX_BASE_URL` is set.
 - `SUBROUTER_CODEX_BIN`: Codex binary used by the wrapper; defaults to `codex`.
 - `SUBROUTER_CODEX_USER_EMAIL`: optional self-reported user email. When set, the wrapper sends `X-Subrouter-Agent: codex` and `X-Subrouter-User-Email` through a custom Subrouter provider.
 - `SUBROUTER_CODEX_ACCOUNT_ID`: optional Subrouter account id or API-key label. When set, the wrapper sends `X-Subrouter-Account-ID` and Subrouter forces that account for the session.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-instance_name="${INSTANCE_NAME:-subrouter-community}"
-server_name="${SERVER_NAME:-community}"
+instance_name="${INSTANCE_NAME:-subrouter-team}"
+server_name="${SERVER_NAME:-team}"
 zone="${ZONE:-us-central1-a}"
 tailscale_hostname="${TAILSCALE_HOSTNAME:-${instance_name}}"
 server_url="${SERVER_URL:-http://${tailscale_hostname}:31415}"
@@ -33,10 +33,11 @@ if [[ -z "${project_id}" || "${project_id}" == "(unset)" ]]; then
 fi
 
 "${sr_bin}" server add "${server_name}" \
-  --url "${server_url}" \
-  --gcp-instance "${instance_name}" \
-  --gcp-zone "${zone}" \
-  --gcp-project "${project_id}"
+	--url "${server_url}" \
+	--gcp-instance "${instance_name}" \
+	--gcp-zone "${zone}" \
+	--gcp-project "${project_id}" \
+	--default
 
 "${sr_bin}" server install "${server_name}" \
   --version "${subrouter_version}" \

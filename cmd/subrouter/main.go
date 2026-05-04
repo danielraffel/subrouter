@@ -42,7 +42,7 @@ func run(args []string) error {
 func runForProgram(program string, args []string) error {
 	if len(args) == 0 {
 		if program == "sr" {
-			return cx(nil)
+			return cxForProgram(program, nil)
 		}
 		usage(program)
 		return nil
@@ -66,7 +66,7 @@ func runForProgram(program string, args []string) error {
 		return nil
 	default:
 		if isDirectCXCommand(args[0]) || strings.Contains(args[0], "@") {
-			return cx(args)
+			return cxForProgram(program, args)
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -127,7 +127,7 @@ func serve(args []string) error {
 	}
 	scores := fallbackScores(codexAccounts)
 	if *fetchUsage {
-		scores = fetchCodexScores(context.Background(), codexAccounts)
+		scores, _ = fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
 	}
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(scores))
 	accountRef := proxy.NewAccountRef(codexStore, codexAccounts, &http.Client{Timeout: 15 * time.Second})
@@ -185,6 +185,10 @@ func fetchCodexScores(ctx context.Context, codexAccounts []accounts.Account) []s
 }
 
 func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	return fetchCodexScoresWithStore(ctx, accounts.DefaultCodexStore(), codexAccounts)
+}
+
+func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	scores := fallbackScores(codexAccounts)
 	scoreByID := make(map[string]int, len(scores))
@@ -202,6 +206,14 @@ func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.A
 		wg.Add(1)
 		go func(account accounts.Account) {
 			defer wg.Done()
+			stored, ok, err := store.FindStored(account.ID)
+			if err != nil || !ok {
+				slog.Warn("account refresh lookup failed", "account", account.ID, "error", err)
+			} else if refreshed, _, err := store.RefreshStoredIfExpired(ctx, client, stored); err != nil {
+				slog.Warn("account refresh failed", "account", account.ID, "error", err)
+			} else if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
+				account = refreshedAccount
+			}
 			windows, err := accounts.FetchCodexUsage(ctx, client, account)
 			if err != nil {
 				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
@@ -288,10 +300,12 @@ Usage:
   %[1]s usage [days]       Refresh and show API-key spend
 
   %[1]s server             Manage Subrouter servers
-  %[1]s server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
+  %[1]s server add <name> --url <url> [--default]
+  %[1]s server use <name>
+  %[1]s server rename <old> <new>
   %[1]s server install <name>
   %[1]s server login <name> [--device-auth]
-  %[1]s server sync <name> [--device-auth]
+  %[1]s server sync <name> [--device-auth] [--yes]
 
   %[1]s admin-keys         List stored OpenAI admin keys
   %[1]s add-admin-key      Add an sk-admin-* key

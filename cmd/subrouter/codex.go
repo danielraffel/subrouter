@@ -3,24 +3,21 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
-const defaultSubrouterHealthURL = "http://127.0.0.1:31415/_subrouter/health"
 
 func codex(args []string) error {
-	baseURL := os.Getenv("SUBROUTER_CODEX_BASE_URL")
-	if baseURL == "" {
-		baseURL = defaultCodexBaseURLFor(defaultSubrouterHealthURL, defaultCXServerStore(accounts.DefaultCodexStore()), &http.Client{Timeout: 500 * time.Millisecond})
+	baseURL, err := codexBaseURL(defaultCXServerStore(accounts.DefaultCodexStore()))
+	if err != nil {
+		return err
 	}
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
@@ -45,31 +42,43 @@ func codex(args []string) error {
 	return cmd.Run()
 }
 
-func defaultCodexBaseURLFor(localHealthURL string, store cxServerStore, client *http.Client) string {
-	if subrouterHealthOK(localHealthURL, client) {
-		return defaultCodexBaseURL
+func codexBaseURL(store cxServerStore) (string, error) {
+	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
+		return baseURL, nil
 	}
-	file, err := store.load()
-	if err != nil || len(file.Servers) != 1 {
-		return defaultCodexBaseURL
+	if serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); serverName != "" {
+		return codexBaseURLForNamedServer(store, serverName)
 	}
-	return codexBaseURLForServer(file.Servers[0])
+	return defaultCodexBaseURLFor(store)
 }
 
-func subrouterHealthOK(healthURL string, client *http.Client) bool {
-	if client == nil {
-		client = &http.Client{Timeout: 500 * time.Millisecond}
-	}
-	req, err := http.NewRequest(http.MethodGet, healthURL, nil)
+func defaultCodexBaseURLFor(store cxServerStore) (string, error) {
+	file, err := store.load()
 	if err != nil {
-		return false
+		return "", err
 	}
-	res, err := client.Do(req)
+	if strings.TrimSpace(file.Default) == "" {
+		return defaultCodexBaseURL, nil
+	}
+	server, ok := file.find(file.Default)
+	if !ok {
+		return "", fmt.Errorf("default Subrouter server %q not found; run sr server use <name> or sr server clear-default", file.Default)
+	}
+	return codexBaseURLForServer(server), nil
+}
+
+func codexBaseURLForNamedServer(store cxServerStore, name string) (string, error) {
+	if name == "local" || name == "localhost" {
+		return defaultCodexBaseURL, nil
+	}
+	server, ok, err := store.find(name)
 	if err != nil {
-		return false
+		return "", err
 	}
-	defer res.Body.Close()
-	return res.StatusCode >= 200 && res.StatusCode < 300
+	if !ok {
+		return "", fmt.Errorf("Subrouter server %q not found", name)
+	}
+	return codexBaseURLForServer(server), nil
 }
 
 func codexBaseURLForServer(server cxServerConfig) string {

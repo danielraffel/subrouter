@@ -87,6 +87,7 @@ Useful endpoints:
 ```text
 GET /_subrouter/health
 GET /_subrouter/accounts
+POST /_subrouter/account-status
 GET /_subrouter/sessions
 GET /_subrouter/dashboard
 GET /_subrouter/transcripts
@@ -156,7 +157,14 @@ It does not edit Codex config or set auth environment variables. Do not set a du
 
 Override the subrouter URL with `SUBROUTER_CODEX_BASE_URL` if needed. See [docs/codex.md](docs/codex.md) for details and the custom-provider fallback.
 
-If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:31415` when it is a healthy Subrouter. If that local listener is missing or stale and exactly one server is configured with `sr server add`, `sr codex` uses that server instead.
+If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:31415/v1`. To make `sr codex` use a remote Subrouter by default, register and select a named server:
+
+```bash
+sr server add team --url http://100.64.0.1:31415 --default
+```
+
+The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_CODEX_SERVER=team`.
+Rename a local server nickname with `sr server rename <old> <new>`.
 
 Set `SUBROUTER_CODEX_USER_EMAIL` to attribute Codex traffic to a teammate:
 
@@ -181,19 +189,19 @@ Subrouter has a native Go implementation of the Codex account manager. It reads 
 ~/.codex-accounts/accounts/*.json
 ```
 
-Server-owned OAuth accounts must be created with fresh logins because Codex refresh tokens rotate. Do not copy local OAuth account files to a server. To compare local OAuth emails with a configured server and reauth missing accounts on the server, run:
+Server-owned OAuth accounts must be created with fresh logins because Codex refresh tokens rotate. Do not copy local OAuth account files to a server. To compare local OAuth emails with a configured server, validate server refresh-token chains, and reauth missing or invalid accounts on the server, run:
 
 ```bash
-sr server sync community --device-auth
+sr server sync team --device-auth
 ```
 
 To only show the diff:
 
 ```bash
-sr server diff community
+sr server diff team
 ```
 
-Use `--email you@example.com` to reauth one local email, or `--all` to replace every local OAuth email on the server with a new server-owned refresh-token chain.
+`sr server sync` prints the plan and asks before opening login. Use `--yes` for unattended sync, `--email you@example.com` to reauth one email, or `--all` to replace every local OAuth email on the server with a new server-owned refresh-token chain. The server status check may refresh valid server-owned OAuth chains in place because Codex refresh tokens rotate.
 
 Account-management commands are built into the `subrouter` binary:
 

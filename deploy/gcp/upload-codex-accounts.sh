@@ -17,7 +17,8 @@ USAGE
 }
 
 sr_bin="${SR_BIN:-sr}"
-server_name="${SERVER_NAME:-community}"
+default_server_name="${SERVER_NAME:-team}"
+server_name="${default_server_name}"
 args=()
 
 while [[ "$#" -gt 0 ]]; do
@@ -36,7 +37,7 @@ while [[ "$#" -gt 0 ]]; do
       shift
       ;;
     *)
-      if [[ "${server_name}" == "${SERVER_NAME:-community}" ]]; then
+      if [[ "${server_name}" == "${default_server_name}" ]]; then
         server_name="$1"
         shift
       else

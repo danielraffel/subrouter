@@ -4,7 +4,8 @@ This deploys Subrouter as `subrouter` on a small Debian VM and exposes the servi
 
 Defaults:
 
-- Instance: `subrouter-community`
+- Instance: `subrouter-team`
+- Local server name: `team`
 - Zone: `us-central1-a`
 - Machine: `e2-micro`
 - Disk: 10 GB standard persistent disk
@@ -55,7 +56,7 @@ The VM also installs a host firewall rule that rejects new outbound connections 
 Add a server-owned Codex OAuth account when the VM should route real Codex traffic:
 
 ```bash
-sr server login community --device-auth
+sr server login team --device-auth
 ```
 
 OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, uploads only that fresh account to `/var/lib/subrouter/.codex-accounts/accounts`, restarts Subrouter, then restores your previous local auth so only the server owns the new refresh-token chain.
@@ -63,15 +64,15 @@ OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-tok
 To compare local OAuth emails with the server and reauth every missing local email on the server, run:
 
 ```bash
-sr server sync community --device-auth
+sr server sync team --device-auth
 ```
 
-This walks through one fresh login per missing email. Use `sr server diff community` to inspect the diff without logging in, `--email you@example.com` for a single account, or `--all` to replace every server copy.
+This validates the server refresh-token chains, shows missing or invalid accounts, asks for confirmation, then walks through one fresh login per selected email. Use `sr server diff team` to inspect the diff without logging in, `--email you@example.com` for a single account, `--all` to replace every server copy, or `--yes` to skip the confirmation prompt. The status check may refresh valid server-owned OAuth chains in place because Codex refresh tokens rotate.
 
 The old account-file upload helper is kept only as a compatibility wrapper:
 
 ```bash
-deploy/gcp/upload-codex-accounts.sh community --device-auth
+deploy/gcp/upload-codex-accounts.sh team --device-auth
 ```
 
 It delegates to `sr server login` and rejects the previous `--move` and `--copy-unsafe` paths.
@@ -84,6 +85,13 @@ Use the Tailscale IP or MagicDNS name:
 export SUBROUTER_CODEX_BASE_URL=http://<tailscale-ip>:31415/v1
 export SUBROUTER_CODEX_USER_EMAIL=alice@example.com
 subrouter codex
+```
+
+Or select the named server as your default Codex route:
+
+```bash
+sr server use team
+sr codex
 ```
 
 Traffic attribution is self-reported with `X-Subrouter-User-Email`, or through `SUBROUTER_CODEX_USER_EMAIL` when using `subrouter codex`.

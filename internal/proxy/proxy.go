@@ -41,6 +41,18 @@ type AccountRef struct {
 	client   *http.Client
 }
 
+type AccountStatus struct {
+	ID          string            `json:"id"`
+	Provider    accounts.Provider `json:"provider"`
+	AuthMode    accounts.AuthMode `json:"auth_mode"`
+	Email       string            `json:"email,omitempty"`
+	Source      string            `json:"source"`
+	AuthChecked bool              `json:"auth_checked"`
+	AuthValid   bool              `json:"auth_valid"`
+	Refreshed   bool              `json:"refreshed,omitempty"`
+	Error       string            `json:"error,omitempty"`
+}
+
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
 	return &AccountRef{
 		accounts: append([]accounts.Account(nil), initial...),
@@ -90,14 +102,80 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	return next, nil
 }
 
+func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountStatus {
+	if r == nil {
+		return nil
+	}
+	storedAccounts, err := r.store.ListStored()
+	if err != nil {
+		return []AccountStatus{{
+			Provider:    accounts.ProviderCodex,
+			AuthChecked: true,
+			AuthValid:   false,
+			Error:       err.Error(),
+		}}
+	}
+	out := make([]AccountStatus, 0, len(storedAccounts))
+	for _, stored := range storedAccounts {
+		status := AccountStatus{
+			ID:       stored.Email,
+			Provider: accounts.ProviderCodex,
+			Email:    stored.Email,
+			Source:   stored.SourcePath(r.store),
+		}
+		if stored.IsAPIKey() {
+			status.AuthMode = accounts.AuthModeAPIKey
+			out = append(out, status)
+			continue
+		}
+		status.AuthMode = accounts.AuthModeOAuth
+		status.AuthChecked = true
+		refreshed := stored
+		didRefresh := false
+		var refreshErr error
+		if forceRefresh {
+			refreshed, didRefresh, refreshErr = r.store.RefreshStored(ctx, r.client, stored)
+		} else {
+			refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpired(ctx, r.client, stored)
+		}
+		if refreshErr != nil {
+			status.AuthValid = false
+			status.Error = refreshErr.Error()
+			out = append(out, status)
+			continue
+		}
+		status.AuthValid = true
+		status.Refreshed = didRefresh
+		if account, ok := refreshed.Account(refreshed.SourcePath(r.store)); ok {
+			r.replace(account)
+		}
+		out = append(out, status)
+	}
+	return out
+}
+
+func (r *AccountRef) replace(account accounts.Account) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.accounts {
+		if accountMatches(r.accounts[i], account.ID) {
+			r.accounts[i] = account
+			return
+		}
+	}
+	r.accounts = append(r.accounts, account)
+}
+
 func (s Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/accounts", s.handleAccounts)
+	mux.HandleFunc("/_subrouter/account-status", s.handleAccountStatus)
 	mux.HandleFunc("/_subrouter/sessions", s.handleSessions)
 	mux.HandleFunc("/_subrouter/dashboard", s.handleDashboard)
 	mux.HandleFunc("/_subrouter/transcripts", s.handleTranscriptList)
 	mux.HandleFunc("/_subrouter/transcripts/", s.handleTranscriptDetail)
+	mux.HandleFunc("/_subrouter/", http.NotFound)
 	mux.Handle("/", s.proxyHandler())
 	return mux
 }
@@ -118,6 +196,30 @@ func (s Server) handleAccounts(w http.ResponseWriter, _ *http.Request) {
 	out := make([]safeAccount, 0, len(availableAccounts))
 	for _, account := range availableAccounts {
 		out = append(out, safeAccount{
+			ID:       account.ID,
+			Provider: account.Provider,
+			AuthMode: account.AuthMode,
+			Email:    account.Email,
+			Source:   account.Source,
+		})
+	}
+	writeJSON(w, out)
+}
+
+func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	forceRefresh := r.Method == http.MethodPost
+	if s.AccountRef != nil {
+		writeJSON(w, s.AccountRef.Statuses(r.Context(), forceRefresh))
+		return
+	}
+	accounts := s.accountList()
+	out := make([]AccountStatus, 0, len(accounts))
+	for _, account := range accounts {
+		out = append(out, AccountStatus{
 			ID:       account.ID,
 			Provider: account.Provider,
 			AuthMode: account.AuthMode,
