@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,12 +25,69 @@ type Server struct {
 	CodexUpstream *url.URL
 	APIUpstream   *url.URL
 	Accounts      []accounts.Account
+	AccountRef    *AccountRef
 	Sessions      *session.Store
 	Scheduler     selectacct.Scheduler
 	SchedulerRef  *selectacct.SchedulerRef
 	Logger        *slog.Logger
 	MaxBodyBytes  int64
 	Transcripts   *transcript.Recorder
+}
+
+type AccountRef struct {
+	mu       sync.RWMutex
+	accounts []accounts.Account
+	store    accounts.CodexStore
+	client   *http.Client
+}
+
+func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
+	return &AccountRef{
+		accounts: append([]accounts.Account(nil), initial...),
+		store:    store,
+		client:   client,
+	}
+}
+
+func (r *AccountRef) All() []accounts.Account {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]accounts.Account(nil), r.accounts...)
+}
+
+func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+	if r == nil || account.AuthMode != accounts.AuthModeOAuth {
+		return account, nil
+	}
+	stored, ok, err := r.store.FindStored(account.ID)
+	if err != nil || !ok {
+		return account, err
+	}
+	refreshed, _, err := r.store.RefreshStoredIfExpired(ctx, r.client, stored)
+	if err != nil {
+		return account, err
+	}
+	next, ok := refreshed.Account(refreshed.SourcePath(r.store))
+	if !ok {
+		return account, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	replaced := false
+	for i := range r.accounts {
+		if accountMatches(r.accounts[i], account.ID) {
+			r.accounts[i] = next
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		r.accounts = append(r.accounts, next)
+	}
+	return next, nil
 }
 
 func (s Server) Handler() http.Handler {
@@ -56,8 +114,9 @@ func (s Server) handleAccounts(w http.ResponseWriter, _ *http.Request) {
 		Email    string            `json:"email,omitempty"`
 		Source   string            `json:"source"`
 	}
-	out := make([]safeAccount, 0, len(s.Accounts))
-	for _, account := range s.Accounts {
+	availableAccounts := s.accountList()
+	out := make([]safeAccount, 0, len(availableAccounts))
+	for _, account := range availableAccounts {
 		out = append(out, safeAccount{
 			ID:       account.ID,
 			Provider: account.Provider,
@@ -79,6 +138,11 @@ func (s Server) proxyHandler() http.Handler {
 		account, sessionID, userEmail, err := s.accountFor(agentType, r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		account, err = s.refreshAccount(r.Context(), account)
+		if err != nil {
+			http.Error(w, "refresh selected account: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
@@ -396,8 +460,9 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 	sessionID := session.ExtractID(r, s.MaxBodyBytes)
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := session.ExtractAccountID(r)
+	availableAccounts := s.accountList()
 	if forcedAccountID != "" {
-		account, ok := findAccount(s.Accounts, forcedAccountID)
+		account, ok := findAccount(availableAccounts, forcedAccountID)
 		if !ok {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q not found", forcedAccountID)
 		}
@@ -419,14 +484,14 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 		if userEmail == "" {
 			userEmail = assignment.UserEmail
 		}
-		if account, ok := findAccount(s.Accounts, assignment.AccountID); ok {
+		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
 			if !scheduler.Exhausted(account.ID) {
 				return account, sessionID, userEmail, nil
 			}
 		}
 	}
 
-	account, err := scheduler.Pick(s.Accounts)
+	account, err := scheduler.Pick(availableAccounts)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
 	}
@@ -438,6 +503,20 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 		return accounts.Account{}, sessionID, userEmail, err
 	}
 	return account, sessionID, assignment.UserEmail, nil
+}
+
+func (s Server) accountList() []accounts.Account {
+	if s.AccountRef != nil {
+		return s.AccountRef.All()
+	}
+	return append([]accounts.Account(nil), s.Accounts...)
+}
+
+func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+	if s.AccountRef == nil {
+		return account, nil
+	}
+	return s.AccountRef.Refresh(ctx, account)
 }
 
 func (s Server) scheduler() selectacct.Scheduler {

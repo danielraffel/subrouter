@@ -1,6 +1,9 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -10,6 +13,63 @@ func TestCodexArgsInjectsSubrouterBaseURLAsGlobalConfig(t *testing.T) {
 	want := []string{"exec", "-c", `openai_base_url="http://127.0.0.1:31415/v1"`, "--cd", "/tmp", "prompt"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestDefaultCodexBaseURLUsesConfiguredServerWhenLocalHealthFails(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "old gateway", http.StatusForbidden)
+	}))
+	t.Cleanup(local.Close)
+	store := cxServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(cxServerFile{Servers: []cxServerConfig{{
+		Name: "community",
+		URL:  "http://100.99.8.37:31415",
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := defaultCodexBaseURLFor(local.URL+"/_subrouter/health", store, local.Client())
+	if got != "http://100.99.8.37:31415/v1" {
+		t.Fatalf("base URL = %q", got)
+	}
+}
+
+func TestDefaultCodexBaseURLKeepsLocalWhenLocalHealthWorks(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(local.Close)
+	store := cxServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(cxServerFile{Servers: []cxServerConfig{{
+		Name: "community",
+		URL:  "http://100.99.8.37:31415",
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := defaultCodexBaseURLFor(local.URL+"/_subrouter/health", store, local.Client())
+	if got != defaultCodexBaseURL {
+		t.Fatalf("base URL = %q, want %q", got, defaultCodexBaseURL)
+	}
+}
+
+func TestDefaultCodexBaseURLDoesNotGuessWhenMultipleServersAreConfigured(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "old gateway", http.StatusForbidden)
+	}))
+	t.Cleanup(local.Close)
+	store := cxServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(cxServerFile{Servers: []cxServerConfig{
+		{Name: "community", URL: "http://100.99.8.37:31415"},
+		{Name: "other", URL: "http://100.99.8.38:31415"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := defaultCodexBaseURLFor(local.URL+"/_subrouter/health", store, local.Client())
+	if got != defaultCodexBaseURL {
+		t.Fatalf("base URL = %q, want %q", got, defaultCodexBaseURL)
 	}
 }
 

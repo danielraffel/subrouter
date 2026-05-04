@@ -148,6 +148,10 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	return out, true
 }
 
+func (a StoredCodexAccount) Account(source string) (Account, bool) {
+	return a.toAccount(source)
+}
+
 func (s CodexStore) SaveStored(account StoredCodexAccount) error {
 	if strings.TrimSpace(account.Email) == "" {
 		return errors.New("account email is required")

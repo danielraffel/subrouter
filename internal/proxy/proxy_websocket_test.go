@@ -139,6 +139,87 @@ func TestHandlerMapsV1RequestsToCodexBackendPaths(t *testing.T) {
 	}
 }
 
+func TestHandlerRefreshesExpiredOAuthBeforeProxying(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	stale := proxyStoredOAuthAccount("codex@example.com", "old", time.Now().Add(-time.Hour))
+	fresh := proxyStoredOAuthAccount("codex@example.com", "new", time.Now().Add(time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+	staleAccount, ok := stale.Account(stale.SourcePath(store))
+	if !ok {
+		t.Fatal("stale account did not convert")
+	}
+	freshAccount, ok := fresh.Account(fresh.SourcePath(store))
+	if !ok {
+		t.Fatal("fresh account did not convert")
+	}
+
+	refreshClient := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			t.Fatalf("refresh method = %s", req.Method)
+		}
+		body, _ := json.Marshal(map[string]string{
+			"access_token":  fresh.Auth.Tokens.AccessToken,
+			"refresh_token": fresh.Auth.Tokens.RefreshToken,
+			"id_token":      fresh.Auth.Tokens.IDToken,
+		})
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != freshAccount.AuthorizationHeader() {
+			t.Fatalf("Authorization = %q, want refreshed token", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	codexUpstream, err := url.Parse(upstream.URL + "/backend-api/codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := Server{
+		CodexUpstream: codexUpstream,
+		Accounts:      []accounts.Account{staleAccount},
+		AccountRef:    NewAccountRef(store, []accounts.Account{staleAccount}, refreshClient),
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		MaxBodyBytes:  1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	response, err := http.Post(subrouter.URL+"/v1/responses", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+
+	stored, ok, err := store.FindStored("codex@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || stored.Auth.Tokens.RefreshToken != fresh.Auth.Tokens.RefreshToken {
+		t.Fatalf("stored refresh token was not updated")
+	}
+}
+
 func TestHandlerMapsV1WebSocketRequestsToCodexBackendPaths(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +276,37 @@ func TestHandlerMapsV1WebSocketRequestsToCodexBackendPaths(t *testing.T) {
 	if string(body) != "ok" {
 		t.Fatalf("message = %q, want ok", string(body))
 	}
+}
+
+type proxyRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f proxyRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.StoredCodexAccount {
+	return accounts.StoredCodexAccount{
+		Email:   email,
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+			AccessToken:  proxyTestCodexJWT(email, tokenPrefix+"-access", exp),
+			RefreshToken: tokenPrefix + "-refresh",
+			IDToken:      proxyTestCodexJWT(email, tokenPrefix+"-id", exp),
+		}},
+	}
+}
+
+func proxyTestCodexJWT(email, jwtID string, exp time.Time) string {
+	header, _ := json.Marshal(map[string]string{"alg": "none", "typ": "JWT"})
+	payload, _ := json.Marshal(map[string]any{
+		"exp": exp.Unix(),
+		"iat": time.Now().Add(-time.Minute).Unix(),
+		"jti": jwtID,
+		"https://api.openai.com/profile": map[string]any{
+			"email": email,
+		},
+	})
+	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 }
 
 func TestHandlerMapsBareRequestsToOpenAIV1Paths(t *testing.T) {

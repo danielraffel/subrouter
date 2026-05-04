@@ -3,18 +3,25 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
+const defaultSubrouterHealthURL = "http://127.0.0.1:31415/_subrouter/health"
 
 func codex(args []string) error {
-	baseURL := envOrDefault("SUBROUTER_CODEX_BASE_URL", defaultCodexBaseURL)
+	baseURL := os.Getenv("SUBROUTER_CODEX_BASE_URL")
+	if baseURL == "" {
+		baseURL = defaultCodexBaseURLFor(defaultSubrouterHealthURL, defaultCXServerStore(accounts.DefaultCodexStore()), &http.Client{Timeout: 500 * time.Millisecond})
+	}
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
@@ -36,6 +43,41 @@ func codex(args []string) error {
 	}
 	cmd.Env = env
 	return cmd.Run()
+}
+
+func defaultCodexBaseURLFor(localHealthURL string, store cxServerStore, client *http.Client) string {
+	if subrouterHealthOK(localHealthURL, client) {
+		return defaultCodexBaseURL
+	}
+	file, err := store.load()
+	if err != nil || len(file.Servers) != 1 {
+		return defaultCodexBaseURL
+	}
+	return codexBaseURLForServer(file.Servers[0])
+}
+
+func subrouterHealthOK(healthURL string, client *http.Client) bool {
+	if client == nil {
+		client = &http.Client{Timeout: 500 * time.Millisecond}
+	}
+	req, err := http.NewRequest(http.MethodGet, healthURL, nil)
+	if err != nil {
+		return false
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	return res.StatusCode >= 200 && res.StatusCode < 300
+}
+
+func codexBaseURLForServer(server cxServerConfig) string {
+	baseURL := strings.TrimRight(server.URL, "/")
+	if strings.HasSuffix(baseURL, "/v1") {
+		return baseURL
+	}
+	return baseURL + "/v1"
 }
 
 func codexArgs(args []string, baseURL, userEmail, accountID string) []string {

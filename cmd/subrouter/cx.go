@@ -55,6 +55,7 @@ Usage:
   cx server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
   cx server install <name>
   cx server login <name> [--device-auth]
+  cx server sync <name> [--device-auth]
 
   cx admin-keys         List stored OpenAI admin keys
   cx add-admin-key      Add an sk-admin-* key

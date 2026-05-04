@@ -60,6 +60,14 @@ sr server login community --device-auth
 
 OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, uploads only that fresh account to `/var/lib/subrouter/.codex-accounts/accounts`, restarts Subrouter, then restores your previous local auth so only the server owns the new refresh-token chain.
 
+To compare local OAuth emails with the server and reauth every missing local email on the server, run:
+
+```bash
+sr server sync community --device-auth
+```
+
+This walks through one fresh login per missing email. Use `sr server diff community` to inspect the diff without logging in, `--email you@example.com` for a single account, or `--all` to replace every server copy.
+
 The old account-file upload helper is kept only as a compatibility wrapper:
 
 ```bash

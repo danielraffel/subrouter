@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,6 +108,184 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	}
 }
 
+func TestCXServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	oldLocal := testCodexAuth("alice@example.com", "acct_old_local")
+	wrongLogin := testCodexAuth("wrong@example.com", "acct_wrong")
+	if err := accounts.WriteActiveCodexAuth(oldLocal); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fake := &recordingCXCommandRunner{loginAuth: wrongLogin}
+	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	server := cxServerConfig{
+		Name:        "community",
+		URL:         "http://100.64.0.1:31415",
+		GCPInstance: "subrouter-community",
+		GCPZone:     "us-central1-a",
+	}
+
+	err := runner.serverLoginOne(context.Background(), server, true, "alice@example.com")
+	if err == nil || !strings.Contains(err.Error(), "expected alice@example.com") {
+		t.Fatalf("error = %v", err)
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || active.Tokens.RefreshToken != oldLocal.Tokens.RefreshToken {
+		t.Fatalf("active auth was not restored")
+	}
+	if fake.hasCommandPrefix("gcloud") {
+		t.Fatalf("unexpected upload command after wrong login: %#v", fake.commands)
+	}
+}
+
+func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	active := testCodexAuth("active@example.com", "acct_active")
+	alice := testCodexAuth("alice@example.com", "acct_alice")
+	bob := testCodexAuth("bob@example.com", "acct_bob")
+	if err := accounts.WriteActiveCodexAuth(active); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		email string
+		auth  accounts.CodexAuthFile
+	}{
+		{"alice@example.com", alice},
+		{"bob@example.com", bob},
+	} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:   item.email,
+			AddedAt: time.Now().UTC().Format(time.RFC3339),
+			Auth:    item.auth,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := store.AddAPIKey("paid", "sk-test-paid"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fake := &recordingCXCommandRunner{loginAuths: []accounts.CodexAuthFile{alice}}
+	runner := cxRunner{
+		store:  store,
+		in:     strings.NewReader(""),
+		out:    &out,
+		errOut: &out,
+		cmd:    fake,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/accounts" {
+				t.Fatalf("unexpected path: %s", req.URL.Path)
+			}
+			body, _ := json.Marshal([]remoteServerAccount{
+				{ID: "bob@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "bob@example.com"},
+				{ID: "old@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "old@example.com"},
+				{ID: "apikey:paid", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeAPIKey, Email: "apikey:paid"},
+			})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "community",
+		"--url", "http://100.64.0.1:31415",
+		"--gcp-instance", "subrouter-community",
+		"--gcp-zone", "us-central1-a",
+		"--gcp-project", "example-project",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.run(context.Background(), []string{"server", "sync", "community", "--device-auth"}); err != nil {
+		t.Fatal(err)
+	}
+
+	output := out.String()
+	for _, want := range []string{
+		"Missing on server:\n  alice@example.com",
+		"Already on server:\n  bob@example.com",
+		"Server-only OAuth accounts:\n  old@example.com",
+		"Synced 1 server-owned OAuth account(s) to community",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+	if fake.countCommand("codex", "login", "--device-auth") != 1 {
+		t.Fatalf("login command count mismatch: %#v", fake.commands)
+	}
+	if !fake.hasCommandPrefix("gcloud", "compute", "scp") || !fake.hasCommandPrefix("gcloud", "compute", "ssh") {
+		t.Fatalf("missing gcloud upload/install commands: %#v", fake.commands)
+	}
+	restored, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || restored.Tokens.RefreshToken != active.Tokens.RefreshToken {
+		t.Fatalf("active auth was not restored")
+	}
+}
+
+func TestCXServerSyncDryRunDoesNotLogin(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "alice@example.com",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("alice@example.com", "acct_alice"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fake := &recordingCXCommandRunner{}
+	runner := cxRunner{
+		store:  store,
+		out:    &out,
+		errOut: &out,
+		cmd:    fake,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`[]`)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "community",
+		"--url", "http://100.64.0.1:31415",
+		"--gcp-instance", "subrouter-community",
+		"--gcp-zone", "us-central1-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.run(context.Background(), []string{"server", "sync", "community", "--dry-run"}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.hasCommandPrefix("codex") || fake.hasCommandPrefix("gcloud") {
+		t.Fatalf("dry-run ran commands: %#v", fake.commands)
+	}
+	if !strings.Contains(out.String(), "Would reauth on server:\n  alice@example.com") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
 func TestCXServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -155,15 +334,21 @@ func TestCXServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 }
 
 type recordingCXCommandRunner struct {
-	loginAuth accounts.CodexAuthFile
-	commands  [][]string
+	loginAuth  accounts.CodexAuthFile
+	loginAuths []accounts.CodexAuthFile
+	commands   [][]string
 }
 
 func (r *recordingCXCommandRunner) Run(_ context.Context, name string, args []string, _ io.Reader, _ io.Writer, _ io.Writer) error {
 	command := append([]string{name}, args...)
 	r.commands = append(r.commands, command)
 	if name == "codex" && len(args) > 0 && args[0] == "login" {
-		body, err := jsonMarshalIndent(r.loginAuth)
+		loginAuth := r.loginAuth
+		if len(r.loginAuths) > 0 {
+			loginAuth = r.loginAuths[0]
+			r.loginAuths = r.loginAuths[1:]
+		}
+		body, err := jsonMarshalIndent(loginAuth)
 		if err != nil {
 			return err
 		}
@@ -197,6 +382,26 @@ func (r *recordingCXCommandRunner) hasCommand(parts ...string) bool {
 		}
 	}
 	return false
+}
+
+func (r *recordingCXCommandRunner) countCommand(parts ...string) int {
+	count := 0
+	for _, command := range r.commands {
+		if len(command) != len(parts) {
+			continue
+		}
+		matches := true
+		for i := range parts {
+			if command[i] != parts[i] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			count++
+		}
+	}
+	return count
 }
 
 func (r *recordingCXCommandRunner) hasCommandPrefix(parts ...string) bool {

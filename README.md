@@ -156,6 +156,8 @@ It does not edit Codex config or set auth environment variables. Do not set a du
 
 Override the subrouter URL with `SUBROUTER_CODEX_BASE_URL` if needed. See [docs/codex.md](docs/codex.md) for details and the custom-provider fallback.
 
+If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:31415` when it is a healthy Subrouter. If that local listener is missing or stale and exactly one server is configured with `sr server add`, `sr codex` uses that server instead.
+
 Set `SUBROUTER_CODEX_USER_EMAIL` to attribute Codex traffic to a teammate:
 
 ```bash
@@ -178,6 +180,20 @@ Subrouter has a native Go implementation of the Codex account manager. It reads 
 ```text
 ~/.codex-accounts/accounts/*.json
 ```
+
+Server-owned OAuth accounts must be created with fresh logins because Codex refresh tokens rotate. Do not copy local OAuth account files to a server. To compare local OAuth emails with a configured server and reauth missing accounts on the server, run:
+
+```bash
+sr server sync community --device-auth
+```
+
+To only show the diff:
+
+```bash
+sr server diff community
+```
+
+Use `--email you@example.com` to reauth one local email, or `--all` to replace every local OAuth email on the server with a new server-owned refresh-token chain.
 
 Account-management commands are built into the `subrouter` binary:
 

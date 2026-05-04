@@ -120,7 +120,8 @@ func serve(args []string) error {
 		return err
 	}
 
-	codexAccounts, err := accounts.DefaultCodexStore().List()
+	codexStore := accounts.DefaultCodexStore()
+	codexAccounts, err := codexStore.List()
 	if err != nil {
 		return err
 	}
@@ -129,12 +130,14 @@ func serve(args []string) error {
 		scores = fetchCodexScores(context.Background(), codexAccounts)
 	}
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(scores))
+	accountRef := proxy.NewAccountRef(codexStore, codexAccounts, &http.Client{Timeout: 15 * time.Second})
 
 	server := proxy.Server{
 		Upstream:      upstream,
 		CodexUpstream: codexUpstream,
 		APIUpstream:   apiUpstream,
 		Accounts:      codexAccounts,
+		AccountRef:    accountRef,
 		Sessions:      store,
 		SchedulerRef:  schedulerRef,
 		Logger:        slog.Default(),
@@ -288,6 +291,7 @@ Usage:
   %[1]s server add <name> --url <url> --gcp-instance <name> --gcp-zone <zone> [--gcp-project <project>]
   %[1]s server install <name>
   %[1]s server login <name> [--device-auth]
+  %[1]s server sync <name> [--device-auth]
 
   %[1]s admin-keys         List stored OpenAI admin keys
   %[1]s add-admin-key      Add an sk-admin-* key
