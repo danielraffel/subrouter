@@ -203,6 +203,8 @@ sr server diff team
 
 `sr server sync` prints the plan and asks before opening login. Use `--yes` for unattended sync, `--email you@example.com` to reauth one email, or `--all` to replace every local OAuth email on the server with a new server-owned refresh-token chain. The server status check may refresh valid server-owned OAuth chains in place because Codex refresh tokens rotate.
 
+Account uploads hot-reload the live server process after writing the new server-owned account file. Existing proxy and WebSocket connections keep running.
+
 Account-management commands are built into the `subrouter` binary:
 
 ```bash

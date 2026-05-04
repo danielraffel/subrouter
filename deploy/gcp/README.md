@@ -59,7 +59,7 @@ Add a server-owned Codex OAuth account when the VM should route real Codex traff
 sr server login team --device-auth
 ```
 
-OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, uploads only that fresh account to `/var/lib/subrouter/.codex-accounts/accounts`, restarts Subrouter, then restores your previous local auth so only the server owns the new refresh-token chain.
+OAuth refresh tokens rotate on use, so do not copy an existing OAuth refresh-token file to the server. `sr server login` performs a fresh Codex login, uploads only that fresh account to `/var/lib/subrouter/.codex-accounts/accounts`, asks the live Subrouter process to reload accounts in place, then restores your previous local auth so only the server owns the new refresh-token chain. Existing proxy and WebSocket connections keep running.
 
 To compare local OAuth emails with the server and reauth every missing local email on the server, run:
 
