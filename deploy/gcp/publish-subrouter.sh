@@ -11,7 +11,7 @@ sr_bin="${SR_BIN:-sr}"
 
 if ! command -v "${sr_bin}" >/dev/null 2>&1; then
   echo "sr is required. Install it with:" >&2
-  echo "  curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sh" >&2
+  echo "  curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh" >&2
   exit 1
 fi
 

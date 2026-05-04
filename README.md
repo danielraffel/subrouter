@@ -25,13 +25,13 @@ This repo sets `CGO_ENABLED=0` in `Makefile` because the local macOS Go 1.22 too
 Install the released Go binary directly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sh
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
 ```
 
 On a Linux server, install to `/usr/local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sudo sh
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
 ```
 
 Install with npm:
@@ -70,7 +70,7 @@ The 10 minute `cx` auto-switch interval is the default. Override it with `subrou
 On a Linux server, install the binary and service:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sudo sh
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
 sudo sr install-systemd --addr 0.0.0.0:31415
 ```
 

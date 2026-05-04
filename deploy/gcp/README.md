@@ -25,7 +25,7 @@ gcloud config set project <project-id>
 Install `sr` locally:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sh
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
 ```
 
 Create the VM:

@@ -12,7 +12,7 @@ fi
 
 systemctl enable --now tailscaled
 
-curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | env SUBROUTER_VERSION="${SUBROUTER_VERSION:-latest}" sh
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | env SUBROUTER_VERSION="${SUBROUTER_VERSION:-latest}" sh
 /usr/local/bin/sr install-systemd --addr 0.0.0.0:31415 --cx-switch-interval 10m
 
 cat >/usr/local/sbin/subrouter-tailnet-egress-block <<'SCRIPT'

@@ -112,7 +112,7 @@ gcloud compute instances describe "${instance_name}" \
 
 echo
 echo "Next:"
-echo "  curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh | sh"
+echo "  curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh"
 echo "  deploy/gcp/publish-subrouter.sh"
 echo
 echo "Subrouter listens on port 31415. This script does not open that port publicly."

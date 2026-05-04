@@ -9,7 +9,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 
 def _go_platform() -> str:

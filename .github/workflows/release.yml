@@ -81,6 +81,9 @@ jobs:
       - name: Build Go release binaries
         run: scripts/build-release.sh "${{ steps.version.outputs.version }}"
 
+      - name: Copy shell installer into release assets
+        run: cp install.sh dist/release/install.sh
+
       - name: Check npm package
         run: npm pack --dry-run
 

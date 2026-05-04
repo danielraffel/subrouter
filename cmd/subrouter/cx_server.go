@@ -33,7 +33,7 @@ Usage:
 
 `
 
-const publicInstallScriptURL = "https://raw.githubusercontent.com/manaflow-ai/subrouter/main/install.sh"
+const publicInstallScriptURL = "https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh"
 
 type cxServerStore struct {
 	Path string
