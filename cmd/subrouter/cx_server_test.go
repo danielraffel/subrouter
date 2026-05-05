@@ -212,6 +212,12 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if !strings.Contains(uploadCommand, "POST http://127.0.0.1:31415/_subrouter/reload-accounts") {
 		t.Fatalf("upload should hot-reload accounts:\n%s", uploadCommand)
 	}
+	if !strings.Contains(uploadCommand, "/var/lib/subrouter/codex/accounts") {
+		t.Fatalf("upload should install accounts into subrouter state dir:\n%s", uploadCommand)
+	}
+	if strings.Contains(uploadCommand, "/var/lib/subrouter/.codex-accounts") {
+		t.Fatalf("upload should not use legacy account path:\n%s", uploadCommand)
+	}
 	if !strings.Contains(out.String(), "server owns the new refresh-token chain") {
 		t.Fatalf("missing ownership message:\n%s", out.String())
 	}

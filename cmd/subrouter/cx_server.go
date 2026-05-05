@@ -878,7 +878,7 @@ func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	relPath := filepath.Join(".codex-accounts", "accounts", cxAccountFilename(account.Email))
+	relPath := filepath.Join("codex", "accounts", cxAccountFilename(account.Email))
 	body, err := json.MarshalIndent(account, "", "  ")
 	if err != nil {
 		return err
@@ -914,10 +914,10 @@ func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig
 		"set -euo pipefail",
 		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
 		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/.codex-accounts/accounts",
+		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/codex/accounts",
 		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find /var/lib/subrouter/.codex-accounts -name '._*' -delete",
-		"sudo chown -R subrouter:subrouter /var/lib/subrouter/.codex-accounts",
+		"sudo find /var/lib/subrouter/codex -name '._*' -delete",
+		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex",
 		"sudo rm -f " + shellQuote(remotePath),
 		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
 	}, " && ")

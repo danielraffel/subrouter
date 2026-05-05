@@ -183,11 +183,13 @@ When either variable is set, the wrapper uses a custom `subrouter` provider with
 
 ## Codex accounts
 
-Subrouter has a native Go implementation of the Codex account manager. It reads and writes the existing `cx` store format:
+Subrouter has a native Go implementation of the Codex account manager. It reads and writes its account store under Subrouter's data directory:
 
 ```text
-~/.codex-accounts/accounts/*.json
+~/.subrouter/codex/accounts/*.json
 ```
+
+On first run, Subrouter migrates legacy `~/.codex-accounts` state into `~/.subrouter/codex`. Codex's own active auth file remains `~/.codex/auth.json`.
 
 Server-owned OAuth accounts must be created with fresh logins because Codex refresh tokens rotate. Do not copy local OAuth account files to a server. To compare local OAuth emails with a configured server, validate server refresh-token chains, and reauth missing or invalid accounts on the server, run:
 
@@ -227,7 +229,7 @@ The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch
 
 OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `PI_CODING_AGENT_DIR` when set. Existing unrelated provider credentials in those files are preserved.
 
-Claude profiles are also native Go and use the existing `~/.codex-accounts/claude.json` format:
+Claude profiles are also native Go and use the same Subrouter store:
 
 ```bash
 cx claude list
@@ -255,4 +257,4 @@ See [docs/saturation.md](docs/saturation.md) for the 5h/7d placement strategy an
 
 - Bind to `127.0.0.1` unless explicitly exposed.
 - Do not log tokens, refresh tokens, API keys, request bodies, or full Authorization headers.
-- Keep `~/.codex-accounts` credentials as the canonical local store.
+- Keep Subrouter-managed credentials under `~/.subrouter/codex` locally and `/var/lib/subrouter/codex` on systemd servers.

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 const defaultSystemdServiceName = "subrouter"
@@ -91,7 +93,6 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	for _, dir := range []string{
 		config.Home,
 		filepath.Join(config.Home, ".codex"),
-		filepath.Join(config.Home, ".codex-accounts", "accounts"),
 		filepath.Dir(config.SessionsPath),
 		config.TranscriptsDir,
 		"/var/log/subrouter",
@@ -102,6 +103,9 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	}
 	if config.ReplaceLegacy {
 		migrateLegacySystemdState(config, runner)
+	}
+	if err := os.MkdirAll(filepath.Join(config.Home, "codex", "accounts"), 0o750); err != nil {
+		return err
 	}
 	if err := installCurrentExecutable(config.InstallPath); err != nil {
 		return err
@@ -246,6 +250,7 @@ func migrateLegacySystemdState(config systemdConfig, runner commandRunner) {
 		}
 		_ = runner.Run("cp", "-a", "-n", legacyHome+"/.", config.Home+"/")
 	}
+	_ = storepath.MigrateCodexDir(filepath.Join(config.Home, "codex"), filepath.Join(config.Home, ".codex-accounts"))
 }
 
 func systemdDefaultPath(config systemdConfig) string {
@@ -258,11 +263,12 @@ func systemdUnitPath(config systemdConfig) string {
 
 func systemdDefaults(config systemdConfig) string {
 	return fmt.Sprintf(`SUBROUTER_ADDR=%s
+SUBROUTER_STATE_DIR=%s
 SUBROUTER_SESSIONS=%s
 SUBROUTER_TRANSCRIPTS=%s
 SUBROUTER_CX_SWITCH_INTERVAL=%s
 SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.SessionsPath, config.TranscriptsDir, config.CXSwitchInterval, config.ExtraArgs)
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, config.CXSwitchInterval, config.ExtraArgs)
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

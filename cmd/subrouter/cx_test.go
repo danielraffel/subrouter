@@ -135,7 +135,7 @@ func TestCXSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 		"exp":   time.Now().Add(time.Hour).Unix(),
 		"email": "sync@example.com",
 	})
-	store := accounts.CodexStore{Dir: filepath.Join(home, ".codex-accounts", "accounts")}
+	store := accounts.DefaultCodexStore()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
 		Email:   "sync@example.com",
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
@@ -294,6 +294,155 @@ func TestCXAutoSwitchesWhenActiveAccountIsExhausted(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "Switch to (#):") {
 		t.Fatalf("prompt should be skipped after auto-switch:\n%s", out.String())
+	}
+}
+
+func TestCXPickSwitchesToRecommendedAccount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store := accounts.DefaultCodexStore()
+	activeAuth := testCodexAuth("alice@example.com", "acct_active")
+	bestAuth := testCodexAuth("bob@example.com", "acct_best")
+	for email, auth := range map[string]accounts.CodexAuthFile{
+		"alice@example.com": activeAuth,
+		"bob@example.com":   bestAuth,
+	} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:   email,
+			AddedAt: time.Now().UTC().Format(time.RFC3339),
+			Auth:    auth,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+		t.Fatal(err)
+	}
+
+	usageByToken := map[string]float64{
+		activeAuth.Tokens.AccessToken: 80,
+		bestAuth.Tokens.AccessToken:   1,
+	}
+	var out bytes.Buffer
+	runner := cxRunner{
+		store:  store,
+		in:     strings.NewReader(""),
+		out:    &out,
+		errOut: &out,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			used := usageByToken[strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")]
+			return usageResponse(used), nil
+		})},
+	}
+
+	if err := runner.run(context.Background(), []string{"pick"}); err != nil {
+		t.Fatal(err)
+	}
+
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing active auth")
+	}
+	email, err := accounts.ExtractEmailFromJWT(active.Tokens.IDToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email != "bob@example.com" {
+		t.Fatalf("active email = %q, want bob@example.com", email)
+	}
+	if !strings.Contains(out.String(), "Picked recommended account: bob@example.com") {
+		t.Fatalf("missing pick confirmation:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "alice@example.com") {
+		t.Fatalf("successful pick should only display the picked row:\n%s", out.String())
+	}
+}
+
+func TestCXPickSucceedsWhenRecommendedActiveHasQuota(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store := accounts.DefaultCodexStore()
+	activeAuth := testCodexAuth("alice@example.com", "acct_active")
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "alice@example.com",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    activeAuth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := cxRunner{
+		store:  store,
+		in:     strings.NewReader(""),
+		out:    &out,
+		errOut: &out,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return usageResponseWindows(20, 20), nil
+		})},
+	}
+
+	if err := runner.run(context.Background(), []string{"pick"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Already using recommended account: alice@example.com") {
+		t.Fatalf("missing already using confirmation:\n%s", out.String())
+	}
+}
+
+func TestCXPickFailsWhenNoRecommendedAccountHasQuota(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	store := accounts.DefaultCodexStore()
+	activeAuth := testCodexAuth("alice@example.com", "acct_active")
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "alice@example.com",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    activeAuth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := cxRunner{
+		store:  store,
+		in:     strings.NewReader(""),
+		out:    &out,
+		errOut: &out,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return usageResponseWindows(100, 100), nil
+		})},
+	}
+
+	err := runner.run(context.Background(), []string{"pick"})
+	if err == nil || !strings.Contains(err.Error(), "no recommended account has quota") {
+		t.Fatalf("err = %v, want no quota failure", err)
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing active auth")
+	}
+	email, err := accounts.ExtractEmailFromJWT(active.Tokens.IDToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email != "alice@example.com" {
+		t.Fatalf("active email = %q, want alice@example.com", email)
 	}
 }
 
@@ -710,11 +859,55 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	if !strings.Contains(got, "Account") || !strings.Contains(got, "Spark wk") {
 		t.Fatalf("grid header missing:\n%s", got)
 	}
-	if !strings.Contains(got, "lawrence@cmux.com") || !strings.Contains(got, "active, recommended") {
+	if !strings.Contains(got, "lawrence@cmux.com") || !strings.Contains(got, "active rec") {
 		t.Fatalf("grid row missing state:\n%s", got)
 	}
 	if strings.Contains(got, "pick") {
 		t.Fatalf("forced grid should not render detailed pick label:\n%s", got)
+	}
+}
+
+func TestDisplayUsageRowsGridColorsWhenForced(t *testing.T) {
+	t.Setenv("SR_USAGE_GRID", "1")
+	t.Setenv("FORCE_COLOR", "1")
+	t.Setenv("COLUMNS", "200")
+	var out bytes.Buffer
+	displayUsageRows(&out, []cxUsageRow{
+		{
+			email:          "ok@example.com",
+			gtoRecommended: true,
+			gtoReason:      "90% bottleneck left",
+			authMode:       accounts.AuthModeOAuth,
+			score:          selectacct.Score{AccountID: "ok@example.com", Headroom: 0.9, ShortHeadroom: 0.9},
+			windows:        []accounts.UsageWindow{{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+		},
+		{
+			email:            "temp@example.com",
+			gtoReason:        "temporarily cooked, cannot start new session",
+			authMode:         accounts.AuthModeOAuth,
+			tempCooked:       true,
+			tempCookedReason: "5h limit fully consumed",
+			windows:          []accounts.UsageWindow{{Name: "primary", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+		},
+		{
+			email:        "cooked@example.com",
+			gtoReason:    "cooked, cannot switch",
+			authMode:     accounts.AuthModeOAuth,
+			cooked:       true,
+			windows:      []accounts.UsageWindow{{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)}},
+			planType:     "pro",
+			cookedReason: "7d limit fully consumed",
+		},
+	}, true)
+
+	got := out.String()
+	for _, code := range []string{ansiGreen, ansiYellow, ansiRed, ansiBold + ansiWhite, ansiDim} {
+		if !strings.Contains(got, code) {
+			t.Fatalf("grid output missing color %q:\n%q", code, got)
+		}
+	}
+	if strings.Contains(got, "\x1b[32mok@example.com") {
+		t.Fatalf("account column should keep account styling separate from state colors:\n%q", got)
 	}
 }
 

@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 const (
@@ -94,11 +96,7 @@ type ProfileInfo struct {
 }
 
 func DefaultStore() Store {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return Store{Dir: ".codex-accounts"}
-	}
-	return Store{Dir: filepath.Join(home, ".codex-accounts")}
+	return Store{Dir: storepath.CodexDir()}
 }
 
 func (s Store) ProfilesPath() string {

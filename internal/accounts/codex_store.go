@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 type CodexStore struct {
@@ -39,11 +41,7 @@ type CodexTokens struct {
 }
 
 func DefaultCodexStore() CodexStore {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return CodexStore{Dir: ".codex-accounts/accounts"}
-	}
-	return CodexStore{Dir: filepath.Join(home, ".codex-accounts", "accounts")}
+	return CodexStore{Dir: filepath.Join(storepath.CodexDir(), "accounts")}
 }
 
 func (s CodexStore) StoreDir() string {

@@ -74,7 +74,7 @@ func runForProgram(program string, args []string) error {
 
 func isDirectCXCommand(command string) bool {
 	switch command {
-	case "add", "login", "add-key", "add-api-key", "import", "list", "ls", "switch", "use", "gui-switch", "gui-use", "remove", "rm", "status", "usage", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project", "server", "servers", "claude", "gemini":
+	case "add", "login", "add-key", "add-api-key", "import", "list", "ls", "switch", "use", "gui-switch", "gui-use", "remove", "rm", "status", "pick", "usage", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project", "server", "servers", "claude", "gemini":
 		return true
 	default:
 		return false
@@ -297,6 +297,7 @@ Usage:
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s remove <email>     Remove a Codex account
   %[1]s status             Show Codex usage (non-interactive)
+  %[1]s pick               Switch to the recommended account, failing if none has quota
   %[1]s usage [days]       Refresh and show API-key spend
 
   %[1]s server             Manage Subrouter servers

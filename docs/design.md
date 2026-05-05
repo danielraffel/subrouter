@@ -115,20 +115,20 @@ Daemon `cx` auto-switching uses the same score refresh on an interval. It only c
 
 Codex:
 
-- Read accounts from `~/.codex-accounts/accounts/*.json`.
+- Read accounts from `~/.subrouter/codex/accounts/*.json`.
 - OAuth accounts provide `tokens.access_token` and optional `tokens.account_id`.
 - API-key accounts provide `OPENAI_API_KEY`.
 - Login, imports, switching, API-key accounts, server install/login, and admin-key usage are native Go commands under `cx`, `subrouter`, and `sr`. The older `subrouter cx` form remains as a compatibility alias.
 
 Claude Code:
 
-- Read profile metadata from `~/.codex-accounts/claude.json`.
-- Read per-profile credentials from `~/.codex-accounts/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
+- Read profile metadata from `~/.subrouter/codex/claude.json`.
+- Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
 - Profile switching, env output, run, remove, and OAuth login are native Go commands under `cx claude`.
 
 Gemini:
 
-- Use a separate `~/.codex-accounts/gemini.json` namespace.
+- Use a separate `~/.subrouter/codex/gemini.json` namespace.
 - Keep routing/session state separate from Codex and Claude even before Gemini credential import is fully implemented.
 
 ## Proxy behavior
