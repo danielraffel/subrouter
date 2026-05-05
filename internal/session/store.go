@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -48,10 +49,11 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 	if normalizedAgent == "" {
 		normalizedAgent = "codex"
 	}
-	key := ScopedSessionKey(normalizedAgent, sessionID)
+	stickySessionID := StickySessionID(normalizedAgent, sessionID)
+	key := ScopedSessionKey(normalizedAgent, stickySessionID)
 	assignment := Assignment{
 		AgentType: normalizedAgent,
-		SessionID: sessionID,
+		SessionID: stickySessionID,
 		AccountID: accountID,
 		UserEmail: NormalizeUserEmail(userEmail),
 		CreatedAt: now,
@@ -132,7 +134,21 @@ func ScopedSessionKey(agentType, sessionID string) string {
 	if normalizedAgent == "" {
 		normalizedAgent = "codex"
 	}
-	return normalizedAgent + ":" + sessionID
+	return normalizedAgent + ":" + StickySessionID(normalizedAgent, sessionID)
+}
+
+func StickySessionID(agentType, sessionID string) string {
+	if NormalizeAgentType(agentType) == "codex" {
+		return BaseSessionID(sessionID)
+	}
+	return sessionID
+}
+
+func BaseSessionID(sessionID string) string {
+	if before, _, ok := strings.Cut(sessionID, ":"); ok {
+		return before
+	}
+	return sessionID
 }
 
 func (s *Store) migrateLoadedAssignments() {
@@ -148,7 +164,12 @@ func (s *Store) migrateLoadedAssignments() {
 		} else {
 			assignment.AgentType = "codex"
 		}
-		migrated[ScopedSessionKey(assignment.AgentType, assignment.SessionID)] = assignment
+		assignment.SessionID = StickySessionID(assignment.AgentType, assignment.SessionID)
+		nextKey := ScopedSessionKey(assignment.AgentType, assignment.SessionID)
+		if existing, ok := migrated[nextKey]; ok && existing.UpdatedAt.After(assignment.UpdatedAt) {
+			continue
+		}
+		migrated[nextKey] = assignment
 	}
 	s.data = migrated
 }

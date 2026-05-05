@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -726,6 +727,79 @@ func TestHandlerPreservesResponseBodyBytes(t *testing.T) {
 	}
 }
 
+func TestHandlerLogsUpstreamResponseStreamReadErrors(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("response writer cannot hijack")
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		defer conn.Close()
+		if _, err := rw.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"); err != nil {
+			t.Fatalf("write partial chunked response: %v", err)
+		}
+		if err := rw.Flush(); err != nil {
+			t.Fatalf("flush partial chunked response: %v", err)
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "a@example.com",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "a-token",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "codex-session:7")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(io.Discard, response.Body)
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if copyErr == nil {
+		t.Fatal("copy error = nil, want truncated upstream response error")
+	}
+
+	gotLogs := logs.String()
+	if !strings.Contains(gotLogs, "proxy response stream read failed") {
+		t.Fatalf("logs missing stream read failure:\n%s", gotLogs)
+	}
+	if !strings.Contains(gotLogs, "path=/v1/responses/compact") {
+		t.Fatalf("logs missing compact path:\n%s", gotLogs)
+	}
+	if strings.Contains(gotLogs, "a-token") {
+		t.Fatalf("logs leaked token:\n%s", gotLogs)
+	}
+}
+
 func TestHandlerPreservesWebSocketMessageBytes(t *testing.T) {
 	payload := []byte{0x00, 0x01, 0x02, 0xfe, 0xff, 'c', 'm', 'u', 'x'}
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
@@ -1208,6 +1282,72 @@ func TestHandlerScopesStickySessionsByAgentType(t *testing.T) {
 	}
 	if _, ok := store.Get("claude", "same-session"); !ok {
 		t.Fatal("missing claude assignment")
+	}
+}
+
+func TestHandlerKeepsCodexTurnIDsOnSameAccount(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth, Token: "a-token"},
+			{ID: "b@example.com", AuthMode: accounts.AuthModeOAuth, Token: "b-token"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "a@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+			{AccountID: "b@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	for _, sessionID := range []string{"codex-session:4", "codex-session:7"} {
+		req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Subrouter-Session", sessionID)
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			t.Fatal(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := []string{"Bearer a-token", "Bearer a-token"}
+	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+	assignment, ok := store.Get("codex", "codex-session:9")
+	if !ok {
+		t.Fatal("missing base codex assignment")
+	}
+	if assignment.SessionID != "codex-session" {
+		t.Fatalf("SessionID = %q, want codex-session", assignment.SessionID)
+	}
+	if assignment.AccountID != "a@example.com" {
+		t.Fatalf("AccountID = %q, want a@example.com", assignment.AccountID)
 	}
 }
 

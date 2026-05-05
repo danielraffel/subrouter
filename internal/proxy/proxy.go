@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -419,8 +420,23 @@ func (s Server) proxyHandler() http.Handler {
 			r.Host = upstream.Host
 		}
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, agentType, sessionID)
+			s.captureResponseBody(response, agentType, sessionID, account.ID, proxyRequest.URL.Path)
 			return nil
+		}
+		if s.Logger != nil {
+			rp.ErrorLog = log.New(proxyErrorWriter{
+				logger:   s.Logger,
+				agent:    agentType,
+				session:  sessionID,
+				account:  account.ID,
+				method:   r.Method,
+				path:     proxyRequest.URL.Path,
+				upstream: upstream.Host,
+			}, "", 0)
+			rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+				s.Logger.Error("proxy request failed", "agent", agentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
+				http.Error(w, "upstream request failed", http.StatusBadGateway)
+			}
 		}
 
 		if s.Logger != nil {
@@ -617,41 +633,81 @@ func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string)
 	s.Transcripts.RecordPayload(agentType, sessionID, "http_body", "client_to_upstream", body, map[string]any{})
 }
 
-func (s Server) captureResponseBody(response *http.Response, agentType, sessionID string) {
-	if s.Transcripts == nil || response.Body == nil {
+func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID, path string) {
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil) {
 		return
 	}
-	response.Body = &recordingReadCloser{
-		ReadCloser: response.Body,
-		onClose: func(body []byte) {
+	var onClose func([]byte)
+	if s.Transcripts != nil {
+		onClose = func(body []byte) {
 			s.Transcripts.RecordPayload(agentType, sessionID, "http_body", "upstream_to_client", body, map[string]any{
 				"status": response.StatusCode,
 			})
+		}
+	}
+	response.Body = &recordingReadCloser{
+		ReadCloser: response.Body,
+		onReadError: func(err error, bytesRead int) {
+			if s.Logger != nil {
+				s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err)
+			}
 		},
+		onClose: onClose,
 	}
 }
 
 type recordingReadCloser struct {
 	io.ReadCloser
-	buf     bytes.Buffer
-	onClose func([]byte)
-	once    sync.Once
+	buf         bytes.Buffer
+	bytesRead   int
+	onReadError func(error, int)
+	onClose     func([]byte)
+	closeOnce   sync.Once
+	readErrOnce sync.Once
 }
 
 func (r *recordingReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	if n > 0 {
+		r.bytesRead += n
+	}
+	if n > 0 && r.onClose != nil {
 		_, _ = r.buf.Write(p[:n])
+	}
+	if err != nil && err != io.EOF && r.onReadError != nil {
+		r.readErrOnce.Do(func() {
+			r.onReadError(err, r.bytesRead)
+		})
 	}
 	return n, err
 }
 
 func (r *recordingReadCloser) Close() error {
 	err := r.ReadCloser.Close()
-	r.once.Do(func() {
-		r.onClose(r.buf.Bytes())
+	r.closeOnce.Do(func() {
+		if r.onClose != nil {
+			r.onClose(r.buf.Bytes())
+		}
 	})
 	return err
+}
+
+type proxyErrorWriter struct {
+	logger   *slog.Logger
+	agent    string
+	session  string
+	account  string
+	method   string
+	path     string
+	upstream string
+}
+
+func (w proxyErrorWriter) Write(p []byte) (int, error) {
+	message := strings.TrimSpace(string(p))
+	if message != "" && w.logger != nil {
+		w.logger.Error("reverse proxy error", "agent", w.agent, "session", w.session, "account", w.account, "method", w.method, "path", w.path, "upstream", w.upstream, "message", message)
+	}
+	return len(p), nil
 }
 
 func (s Server) upstreamFor(account accounts.Account) *url.URL {

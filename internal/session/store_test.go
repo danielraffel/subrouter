@@ -48,6 +48,44 @@ func TestPutPreservesExistingUserEmailWhenMissing(t *testing.T) {
 	}
 }
 
+func TestCodexTurnScopedIDsUseOneStickyAssignment(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "codex-session:4", "account-a", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	assignment, ok := store.Get("codex", "codex-session:7")
+	if !ok {
+		t.Fatal("missing sticky assignment for later codex turn")
+	}
+	if assignment.SessionID != "codex-session" {
+		t.Fatalf("SessionID = %q, want codex-session", assignment.SessionID)
+	}
+	if assignment.AccountID != "account-a" {
+		t.Fatalf("AccountID = %q, want account-a", assignment.AccountID)
+	}
+	counts := store.CountByAccount()
+	if counts["account-a"] != 1 {
+		t.Fatalf("account-a count = %d, want 1", counts["account-a"])
+	}
+}
+
+func TestNonCodexColonIDsStayDistinct(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "claude-session:4", "account-a", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Get("claude", "claude-session:7"); ok {
+		t.Fatal("claude colon-suffixed IDs should not be collapsed")
+	}
+}
+
 func TestStoreScopesAssignmentsByAgentType(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
@@ -99,5 +137,42 @@ func TestStoreMigratesUnscopedAssignmentsToCodex(t *testing.T) {
 	}
 	if assignment.AgentType != "codex" {
 		t.Fatalf("AgentType = %q, want codex", assignment.AgentType)
+	}
+}
+
+func TestStoreMigratesCodexTurnAssignmentsToLatestBaseSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	if err := os.WriteFile(path, []byte(`{
+  "codex:codex-session:4": {
+    "agent_type": "codex",
+    "session_id": "codex-session:4",
+    "account_id": "account-a",
+    "created_at": "2026-04-28T00:00:00Z",
+    "updated_at": "2026-04-28T00:01:00Z"
+  },
+  "codex:codex-session:7": {
+    "agent_type": "codex",
+    "session_id": "codex-session:7",
+    "account_id": "account-b",
+    "created_at": "2026-04-28T00:00:00Z",
+    "updated_at": "2026-04-28T00:02:00Z"
+  }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assignment, ok := store.Get("codex", "codex-session:8")
+	if !ok {
+		t.Fatal("missing migrated base assignment")
+	}
+	if assignment.SessionID != "codex-session" {
+		t.Fatalf("SessionID = %q, want codex-session", assignment.SessionID)
+	}
+	if assignment.AccountID != "account-b" {
+		t.Fatalf("AccountID = %q, want latest account-b", assignment.AccountID)
 	}
 }
