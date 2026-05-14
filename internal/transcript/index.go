@@ -2,7 +2,6 @@ package transcript
 
 import (
 	"bufio"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -142,12 +141,18 @@ func summarizeFile(root, path string) (Summary, error) {
 
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
+	chunks := bodyChunkAccumulator{}
 	for scanner.Scan() {
 		var event Event
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			return Summary{}, err
 		}
 		applyEvent(&summary, event)
+		if body, ok := chunks.bodyFromEvent(event); ok {
+			for _, record := range extractUsageRecords(body) {
+				summary.Usage.add(record.Usage)
+			}
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return Summary{}, err
@@ -184,13 +189,8 @@ func applyEvent(summary *Summary, event Event) {
 	if _, ok := event.Payload["body_base64"]; ok {
 		summary.HasBodies = true
 	}
-	if encoded, ok := stringValue(event.Payload["body_base64"]); ok {
-		body, err := base64.StdEncoding.DecodeString(encoded)
-		if err == nil {
-			for _, record := range extractUsageRecords(body) {
-				summary.Usage.add(record.Usage)
-			}
-		}
+	if boolField(event.Payload, "body_chunked") || boolField(event.Payload, "body_chunk") {
+		summary.HasBodies = true
 	}
 }
 

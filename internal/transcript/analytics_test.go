@@ -65,3 +65,41 @@ func TestReadRawSessionDecodesTextBodies(t *testing.T) {
 		t.Fatalf("BodyBase64 = %q", events[0].BodyBase64)
 	}
 }
+
+func TestChunkedPayloadsReassembleForRawSessionAndAnalytics(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "transcripts")
+	recorder := NewRecorder(dir)
+	body := []byte("data: {\"response\":{\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12}}}\n\ndata: [DONE]\n")
+
+	recorder.RecordMeta("codex", "session-1:0", map[string]any{
+		"user":    "user@example.com",
+		"account": "account@example.com",
+	})
+	recorder.RecordPayloadChunk("codex", "session-1:0", "http_body", "upstream_to_client", "stream-1", 0, 0, body[:40], map[string]any{"status": 200})
+	recorder.RecordPayloadChunk("codex", "session-1:0", "http_body", "upstream_to_client", "stream-1", 1, 40, body[40:], map[string]any{"status": 200})
+	recorder.RecordPayloadSummary("codex", "session-1:0", "http_body", "upstream_to_client", "stream-1", int64(len(body)), "sha", 2, map[string]any{"status": 200})
+
+	events, err := ReadRawSession(dir, "codex", "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := events[len(events)-1].BodyText; got != string(body) {
+		t.Fatalf("BodyText = %q, want %q", got, string(body))
+	}
+
+	summaries, err := ListSummaries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].Usage.TotalTokens != 12 || !summaries[0].HasBodies {
+		t.Fatalf("Summaries = %+v, want chunked 12-token summary", summaries)
+	}
+
+	analytics, err := Analyze(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if analytics.Totals.TotalTokens != 12 || analytics.Totals.Requests != 1 {
+		t.Fatalf("Totals = %+v, want one 12-token request", analytics.Totals)
+	}
+}

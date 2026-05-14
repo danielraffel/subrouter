@@ -1,9 +1,12 @@
 package claude
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
@@ -93,5 +96,40 @@ func TestReadCredentialFile(t *testing.T) {
 	}
 	if credential.AccessToken != "tok" {
 		t.Fatalf("access token = %q, want tok", credential.AccessToken)
+	}
+}
+
+func TestListAccountsReadsProfilesWithCredentials(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(instancePath, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"tok","subscriptionType":"max","expiresAt":4102444800000}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(got))
+	}
+	account := got[0]
+	if account.ID != "work" {
+		t.Fatalf("ID = %q, want work", account.ID)
+	}
+	if account.Provider != accounts.ProviderClaude {
+		t.Fatalf("Provider = %q, want claude", account.Provider)
+	}
+	if account.AuthMode != accounts.AuthModeOAuth {
+		t.Fatalf("AuthMode = %q, want oauth", account.AuthMode)
+	}
+	if account.Token != "tok" {
+		t.Fatalf("Token = %q, want tok", account.Token)
+	}
+	if account.Source != filepath.Clean(instancePath) {
+		t.Fatalf("Source = %q, want %q", account.Source, filepath.Clean(instancePath))
 	}
 }

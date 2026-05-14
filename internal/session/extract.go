@@ -21,6 +21,7 @@ var headerCandidates = []string{
 	"X-Conversation-ID",
 	"X-Codex-Session-ID",
 	"X-Claude-Session-ID",
+	"X-Claude-Code-Session-Id",
 	"X-Gemini-Session-ID",
 	"X-Gemini-Conversation-ID",
 	"OpenAI-Conversation-ID",
@@ -50,6 +51,7 @@ var codexAgentHeaderCandidates = []string{
 
 var claudeAgentHeaderCandidates = []string{
 	"X-Claude-Session-ID",
+	"X-Claude-Code-Session-Id",
 	"Anthropic-Conversation-ID",
 }
 
@@ -69,6 +71,9 @@ func ExtractAgentType(r *http.Request) string {
 	if explicit := NormalizeAgentType(r.Header.Get("X-Subrouter-Agent")); explicit != "" {
 		return explicit
 	}
+	if claudeCodeUserAgent(r.UserAgent()) {
+		return "claude"
+	}
 	if hasAnyHeader(r, claudeAgentHeaderCandidates) {
 		return "claude"
 	}
@@ -79,6 +84,11 @@ func ExtractAgentType(r *http.Request) string {
 		return "codex"
 	}
 	return "codex"
+}
+
+func claudeCodeUserAgent(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "claude-cli") || strings.Contains(lower, "claude-code")
 }
 
 func NormalizeAgentType(value string) string {

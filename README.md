@@ -103,7 +103,7 @@ To persist raw Subrouter transcripts, pass a transcript directory:
 subrouter serve --transcripts ~/.subrouter/transcripts
 ```
 
-Transcripts are JSONL files keyed by agent type and session id under `by-agent/<agent-type>/by-session/<agent-session-id>.jsonl`. They include Subrouter metadata, redacted headers, HTTP bodies, SSE bodies, and WebSocket message payloads as base64 with byte counts and SHA-256 hashes. Each event includes `agent_type` and `agent_session_id`; Codex events also include `codex_session_id` for matching `~/.codex/sessions` JSONL files. This is intentionally storage-heavy and can contain sensitive request/response payloads. Authorization-style headers are redacted, but bodies are stored in full.
+Transcripts are JSONL files keyed by agent type and session id under `by-agent/<agent-type>/by-session/<agent-session-id>.jsonl`. They include Subrouter metadata, redacted headers, HTTP/SSE body chunks, HTTP/SSE body summaries, and WebSocket message payloads as base64 with byte counts and SHA-256 hashes. Each event includes `agent_type` and `agent_session_id`; Codex events also include `codex_session_id` for matching `~/.codex/sessions` JSONL files. This is intentionally storage-heavy and can contain sensitive request/response payloads. Authorization-style headers are redacted, but bodies are stored in full.
 
 When transcript recording is enabled, `/_subrouter/dashboard` serves an internal HTML dashboard over the same Subrouter listener. It shows token usage over time, usage by user email, usage by selected account, session assignments, transcript summaries, and links to sanitized transcript event JSON under `/_subrouter/transcripts/<agent-type>/<session-id>`. Raw internal trajectory JSON with decoded body text is available under `/_subrouter/transcripts/<agent-type>/<session-id>/raw`.
 
@@ -153,7 +153,7 @@ The wrapper injects this config override into the child Codex process:
 openai_base_url = "http://127.0.0.1:31415/v1"
 ```
 
-It does not edit Codex config or set auth environment variables. Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Leave Codex logged in the same way it already is. If Codex is in ChatGPT auth mode, `/model` keeps the subscription model picker. Subrouter replaces outbound credentials with the selected `cx` account before forwarding.
+It does not edit Codex config or set auth environment variables. Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Leave Codex logged in the same way it already is. If Codex is in ChatGPT auth mode, `/model` keeps the subscription model picker. Subrouter replaces outbound credentials with the selected `cx` account before forwarding. Responses and realtime WebSocket requests are proxied through the same route.
 
 Override the subrouter URL with `SUBROUTER_CODEX_BASE_URL` if needed. See [docs/codex.md](docs/codex.md) for details and the custom-provider fallback.
 
@@ -180,6 +180,8 @@ SUBROUTER_CODEX_ACCOUNT_ID=apikey:team-codex-1 subrouter codex exec "your prompt
 ```
 
 When either variable is set, the wrapper uses a custom `subrouter` provider with WebSockets enabled so Codex can send `X-Subrouter-User-Email` and `X-Subrouter-Account-ID`. Subrouter still replaces outbound credentials before forwarding upstream. `SUBROUTER_CODEX_USER_EMAIL` is only teammate observability metadata; account selection belongs in `SUBROUTER_CODEX_ACCOUNT_ID`.
+
+Codex Desktop is separate from the CLI wrapper. Its app-server reads `CODEX_HOME/config.toml`, and its Electron shell reads `CODEX_API_BASE_URL` at process start. See [docs/codex.md](docs/codex.md) for the desktop routing setup.
 
 ## Codex accounts
 

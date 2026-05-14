@@ -115,6 +115,32 @@ func TestCXAutoSwitchSkipsWhenUsageUnavailable(t *testing.T) {
 	}
 }
 
+func TestCXAutoSwitchUsesBestNonExhaustedOAuthBelowProtectedHeadroom(t *testing.T) {
+	var switchedTo string
+	picked, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
+		Accounts: []accounts.Account{
+			{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth},
+			{ID: "b@example.com", AuthMode: accounts.AuthModeOAuth},
+		},
+		FetchScores: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
+			return []selectacct.Score{
+				{AccountID: "a@example.com", Headroom: 0.12, ShortHeadroom: 0.12},
+				{AccountID: "b@example.com", Headroom: 0.39, ShortHeadroom: 0.39},
+			}, 2
+		},
+		SwitchActive: func(_ context.Context, accountID string) error {
+			switchedTo = accountID
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked != "b@example.com" || switchedTo != "b@example.com" {
+		t.Fatalf("picked=%q switchedTo=%q, want b@example.com", picked, switchedTo)
+	}
+}
+
 func TestCXAutoSwitchSkipsWhenOAuthAccountsExhausted(t *testing.T) {
 	ran := false
 	_, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
@@ -125,7 +151,7 @@ func TestCXAutoSwitchSkipsWhenOAuthAccountsExhausted(t *testing.T) {
 		FetchScores: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
 			return []selectacct.Score{
 				{AccountID: "a@example.com", Headroom: 0, ShortHeadroom: 0},
-				{AccountID: "b@example.com", Headroom: 0.05, ShortHeadroom: 0.05},
+				{AccountID: "b@example.com", Headroom: 0, ShortHeadroom: 0},
 			}, 2
 		},
 		SwitchActive: func(context.Context, string) error {

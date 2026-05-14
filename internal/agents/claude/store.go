@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
@@ -149,6 +150,40 @@ func (s Store) ListProfiles() []Profile {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+func (s Store) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
+	profiles := s.ListProfiles()
+	out := make([]accounts.Account, 0, len(profiles))
+	for _, profile := range profiles {
+		configDir := s.ClaudeConfigDir(profile.Name)
+		credential, err := s.ReadCredential(ctx, configDir)
+		if err != nil {
+			return nil, err
+		}
+		if credential == nil || credential.AccessToken == "" {
+			continue
+		}
+		addedAt, _ := time.Parse(time.RFC3339, profile.CreatedAt)
+		email := ""
+		if strings.Contains(profile.Name, "@") {
+			email = profile.Name
+		}
+		out = append(out, accounts.Account{
+			ID:       profile.Name,
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth,
+			Label:    profile.Name,
+			Email:    email,
+			AddedAt:  addedAt,
+			Token:    credential.AccessToken,
+			Source:   configDir,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
 }
 
 func (s Store) FindProfile(name string) (Profile, bool) {

@@ -16,6 +16,15 @@ func TestExtractIDFromHeader(t *testing.T) {
 	}
 }
 
+func TestExtractIDFromClaudeCodeHeader(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	req.Header.Set("X-Claude-Code-Session-Id", "claude-session")
+
+	if got := ExtractID(req, 1024); got != "claude-session" {
+		t.Fatalf("got %q, want claude-session", got)
+	}
+}
+
 func TestExtractIDFromJSONAndRestoresBody(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{"metadata":{"session_id":"s1"},"input":"hello"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -78,6 +87,7 @@ func TestExtractAgentTypeFromProviderHeaders(t *testing.T) {
 	}{
 		{name: "codex", header: "X-Codex-Window-ID", want: "codex"},
 		{name: "claude", header: "Anthropic-Conversation-ID", want: "claude"},
+		{name: "claude-code", header: "X-Claude-Code-Session-Id", want: "claude"},
 		{name: "gemini", header: "X-Gemini-Session-ID", want: "gemini"},
 	}
 	for _, test := range tests {
@@ -89,6 +99,15 @@ func TestExtractAgentTypeFromProviderHeaders(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestExtractAgentTypeFromClaudeCodeUserAgent(t *testing.T) {
+	req := httptest.NewRequest("HEAD", "/", nil)
+	req.Header.Set("User-Agent", "claude-cli/2.1.141 (external, sdk-cli)")
+
+	if got := ExtractAgentType(req); got != "claude" {
+		t.Fatalf("got %q, want claude", got)
 	}
 }
 

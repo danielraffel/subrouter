@@ -3,8 +3,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"log/slog"
@@ -14,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,17 +29,21 @@ import (
 )
 
 type Server struct {
-	Upstream      *url.URL
-	CodexUpstream *url.URL
-	APIUpstream   *url.URL
-	Accounts      []accounts.Account
-	AccountRef    *AccountRef
-	Sessions      *session.Store
-	Scheduler     selectacct.Scheduler
-	SchedulerRef  *selectacct.SchedulerRef
-	Logger        *slog.Logger
-	MaxBodyBytes  int64
-	Transcripts   *transcript.Recorder
+	Upstream       *url.URL
+	CodexUpstream  *url.URL
+	APIUpstream    *url.URL
+	ClaudeUpstream *url.URL
+	Accounts       []accounts.Account
+	AccountRef     *AccountRef
+	Sessions       *session.Store
+	Scheduler      selectacct.Scheduler
+	SchedulerRef   *selectacct.SchedulerRef
+	UsageScoreTTL  time.Duration
+	ScoreAccounts  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
+	Transport      http.RoundTripper
+	Logger         *slog.Logger
+	MaxBodyBytes   int64
+	Transcripts    *transcript.Recorder
 }
 
 type AccountRef struct {
@@ -88,7 +97,7 @@ func (r *AccountRef) Reload() ([]accounts.Account, error) {
 }
 
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
-	if r == nil || account.AuthMode != accounts.AuthModeOAuth {
+	if r == nil || account.AuthMode != accounts.AuthModeOAuth || (account.Provider != "" && account.Provider != accounts.ProviderCodex) {
 		return account, nil
 	}
 	stored, ok, err := r.store.FindStored(account.ID)
@@ -281,6 +290,12 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 		return len(loaded), 0, nil
 	}
 	scores, scored := s.scoreAccounts(ctx, loaded)
+	if scored == 0 {
+		if s.Logger != nil {
+			s.Logger.Warn("account reload usage score update skipped", "reason", "no fresh OAuth usage scores")
+		}
+		return len(loaded), scored, nil
+	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
@@ -373,6 +388,10 @@ func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if baseURLProbeRequest(r) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		agentType := session.ExtractAgentType(r)
 		account, sessionID, userEmail, err := s.accountFor(agentType, r)
 		if err != nil {
@@ -391,12 +410,9 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 
-		r.Header.Set("Authorization", auth)
-		if account.AccountID != "" {
-			r.Header.Set("ChatGPT-Account-ID", account.AccountID)
-		}
+		setAccountAuthHeaders(r.Header, account)
 
-		upstream := s.upstreamFor(account)
+		upstream := s.upstreamForRequest(r.URL.Path, account)
 		if upstream == nil {
 			http.Error(w, "no upstream configured", http.StatusServiceUnavailable)
 			return
@@ -410,10 +426,43 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
+		retryPost := retryableResponsesPostRequest(proxyRequest)
+		postReplayable := false
+		if retryPost {
+			var replayErr error
+			postReplayable, replayErr = makeRequestBodyReplayable(proxyRequest, replayablePostMaxBodyBytes)
+			if replayErr != nil {
+				http.Error(w, "buffer retryable request body: "+replayErr.Error(), http.StatusBadGateway)
+				return
+			}
+			if !postReplayable && s.Logger != nil {
+				s.Logger.Warn("retryable request body exceeds retry buffer", "agent", agentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "content_length", r.ContentLength, "max_bytes", replayablePostMaxBodyBytes)
+			}
+		}
 		s.recordHTTPMeta(proxyRequest, agentType, sessionID, userEmail, account, upstream)
-		s.captureRequestBody(proxyRequest, agentType, sessionID)
+		if retryPost && postReplayable {
+			s.recordReplayableRequestBody(proxyRequest, agentType, sessionID)
+		} else {
+			s.captureRequestBody(proxyRequest, agentType, sessionID)
+		}
 
 		rp := httputil.NewSingleHostReverseProxy(upstream)
+		transport := s.transport()
+		if retryPost && postReplayable {
+			transport = replayablePostRetryTransport{
+				base:        transport,
+				logger:      s.Logger,
+				agent:       agentType,
+				session:     sessionID,
+				account:     account.ID,
+				method:      r.Method,
+				path:        proxyRequest.URL.Path,
+				upstream:    upstream.Host,
+				maxAttempts: replayablePostMaxAttempts,
+				limiter:     replayablePostUploadLimiter,
+			}
+		}
+		rp.Transport = transport
 		originalDirector := rp.Director
 		rp.Director = func(r *http.Request) {
 			originalDirector(r)
@@ -446,6 +495,10 @@ func (s Server) proxyHandler() http.Handler {
 	})
 }
 
+func baseURLProbeRequest(r *http.Request) bool {
+	return r.Method == http.MethodHead && (r.URL.Path == "" || r.URL.Path == "/")
+}
+
 func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail string, upstream *url.URL) {
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
@@ -456,10 +509,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	headers := r.Header.Clone()
 	stripWebSocketDialHeaders(headers)
 	session.StripSubrouterHeaders(headers)
-	headers.Set("Authorization", account.AuthorizationHeader())
-	if account.AccountID != "" {
-		headers.Set("ChatGPT-Account-ID", account.AccountID)
-	}
+	setAccountAuthHeaders(headers, account)
 	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
 	upstreamConn, response, err := websocket.DefaultDialer.Dial(upstreamURL.String(), headers)
@@ -494,12 +544,12 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, "client_to_upstream", clientConn, upstreamConn)
+		s.copyWebSocketMessages(agentType, sessionID, account.ID, "client_to_upstream", clientConn, upstreamConn)
 		_ = upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, "upstream_to_client", upstreamConn, clientConn)
+		s.copyWebSocketMessages(agentType, sessionID, account.ID, "upstream_to_client", upstreamConn, clientConn)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -534,7 +584,7 @@ func cloneWebSocketResponseHeaders(headers http.Header) http.Header {
 	return out
 }
 
-func (s Server) copyWebSocketMessages(agentType, sessionID, direction string, src, dst *websocket.Conn) {
+func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction string, src, dst *websocket.Conn) {
 	for {
 		messageType, body, err := src.ReadMessage()
 		if err != nil {
@@ -545,10 +595,59 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, direction string, sr
 				"opcode": websocketMessageType(messageType),
 			})
 		}
+		if direction == "upstream_to_client" && messageType == websocket.TextMessage && usageLimitJSON(body) {
+			s.markAccountExhausted(accountID)
+		}
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
 		}
 	}
+}
+
+func (s Server) markAccountExhausted(accountID string) {
+	if s.SchedulerRef != nil {
+		s.SchedulerRef.MarkExhausted(accountID)
+	}
+}
+
+func usageLimitJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return usageLimitMap(event)
+}
+
+func usageLimitMap(event map[string]any) bool {
+	if usageLimitCode(stringField(event, "type")) || usageLimitCode(stringField(event, "code")) {
+		return true
+	}
+	if usageLimitMessage(stringField(event, "message")) {
+		return true
+	}
+	switch value := event["error"].(type) {
+	case map[string]any:
+		return usageLimitMap(value)
+	case string:
+		return usageLimitMessage(value)
+	default:
+		return false
+	}
+}
+
+func usageLimitCode(value string) bool {
+	return strings.EqualFold(value, "usage_limit_reached")
+}
+
+func usageLimitMessage(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "usage limit") &&
+		(strings.Contains(lower, "reached") || strings.Contains(lower, "hit") || strings.Contains(lower, "exceeded"))
+}
+
+func stringField(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return value
 }
 
 func websocketScheme(scheme string) string {
@@ -623,56 +722,154 @@ func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string)
 	if s.Transcripts == nil || r.Body == nil {
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		r.Body = io.NopCloser(bytes.NewReader(nil))
+	r.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
+		ReadCloser: r.Body,
+		Recorder:   s.Transcripts,
+		AgentType:  agentType,
+		SessionID:  sessionID,
+		EventType:  "http_body",
+		Direction:  "client_to_upstream",
+		StreamID:   nextTranscriptStreamID(),
+	})
+}
+
+func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionID string) {
+	if s.Transcripts == nil || r.GetBody == nil || !s.Transcripts.Enabled() {
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	s.Transcripts.RecordPayload(agentType, sessionID, "http_body", "client_to_upstream", body, map[string]any{})
+	body, err := r.GetBody()
+	if err != nil {
+		return
+	}
+	defer body.Close()
+	streamID := nextTranscriptStreamID()
+	hasher := sha256.New()
+	buffer := make([]byte, transcriptHTTPChunkBytes)
+	var bytesRead int64
+	chunks := 0
+	for {
+		n, readErr := body.Read(buffer)
+		if n > 0 {
+			chunk := buffer[:n]
+			_, _ = hasher.Write(chunk)
+			s.Transcripts.RecordPayloadChunk(agentType, sessionID, "http_body", "client_to_upstream", streamID, chunks, bytesRead, chunk, nil)
+			bytesRead += int64(n)
+			chunks++
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return
+		}
+	}
+	s.Transcripts.RecordPayloadSummary(agentType, sessionID, "http_body", "client_to_upstream", streamID, bytesRead, hex.EncodeToString(hasher.Sum(nil)), chunks, nil)
 }
 
 func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID, path string) {
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil) {
+	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit) {
 		return
 	}
-	var onClose func([]byte)
-	if s.Transcripts != nil {
-		onClose = func(body []byte) {
-			s.Transcripts.RecordPayload(agentType, sessionID, "http_body", "upstream_to_client", body, map[string]any{
-				"status": response.StatusCode,
-			})
+	payload := map[string]any{"status": response.StatusCode}
+	var inspect func([]byte)
+	if inspectUsageLimit {
+		inspect = func(body []byte) {
+			if usageLimitJSON(body) {
+				s.markAccountExhausted(accountID)
+			}
 		}
 	}
-	response.Body = &recordingReadCloser{
+	response.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
 		ReadCloser: response.Body,
+		Recorder:   s.Transcripts,
+		AgentType:  agentType,
+		SessionID:  sessionID,
+		EventType:  "http_body",
+		Direction:  "upstream_to_client",
+		StreamID:   nextTranscriptStreamID(),
+		Payload:    payload,
+		InspectMax: usageLimitInspectMaxBytes,
+		OnInspect:  inspect,
 		onReadError: func(err error, bytesRead int) {
 			if s.Logger != nil {
 				s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err)
 			}
 		},
-		onClose: onClose,
+	})
+}
+
+func responseStatusCanExhaust(status int) bool {
+	return status >= 400 && status < 500
+}
+
+const transcriptHTTPChunkBytes = 64 * 1024
+const usageLimitInspectMaxBytes = 1 << 20
+
+var transcriptStreamCounter atomic.Uint64
+
+func nextTranscriptStreamID() string {
+	return fmt.Sprintf("body-%d", transcriptStreamCounter.Add(1))
+}
+
+type streamingTranscriptConfig struct {
+	ReadCloser  io.ReadCloser
+	Recorder    *transcript.Recorder
+	AgentType   string
+	SessionID   string
+	EventType   string
+	Direction   string
+	StreamID    string
+	Payload     map[string]any
+	InspectMax  int64
+	OnInspect   func([]byte)
+	onReadError func(error, int)
+}
+
+func newStreamingTranscriptReadCloser(config streamingTranscriptConfig) io.ReadCloser {
+	return &streamingTranscriptReadCloser{
+		ReadCloser:  config.ReadCloser,
+		recorder:    config.Recorder,
+		agentType:   config.AgentType,
+		sessionID:   config.SessionID,
+		eventType:   config.EventType,
+		direction:   config.Direction,
+		streamID:    config.StreamID,
+		payload:     config.Payload,
+		inspectMax:  config.InspectMax,
+		onInspect:   config.OnInspect,
+		onReadError: config.onReadError,
+		hasher:      sha256.New(),
 	}
 }
 
-type recordingReadCloser struct {
+type streamingTranscriptReadCloser struct {
 	io.ReadCloser
-	buf         bytes.Buffer
+	recorder    *transcript.Recorder
+	agentType   string
+	sessionID   string
+	eventType   string
+	direction   string
+	streamID    string
+	payload     map[string]any
+	inspect     []byte
+	inspectMax  int64
+	onInspect   func([]byte)
+	hasher      hash.Hash
 	bytesRead   int
+	chunks      int
 	onReadError func(error, int)
-	onClose     func([]byte)
 	closeOnce   sync.Once
 	readErrOnce sync.Once
 }
 
-func (r *recordingReadCloser) Read(p []byte) (int, error) {
+func (r *streamingTranscriptReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	if n > 0 {
 		r.bytesRead += n
 	}
-	if n > 0 && r.onClose != nil {
-		_, _ = r.buf.Write(p[:n])
+	if n > 0 {
+		r.recordChunk(p[:n])
 	}
 	if err != nil && err != io.EOF && r.onReadError != nil {
 		r.readErrOnce.Do(func() {
@@ -682,11 +879,45 @@ func (r *recordingReadCloser) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (r *recordingReadCloser) Close() error {
+func (r *streamingTranscriptReadCloser) recordChunk(body []byte) {
+	_, _ = r.hasher.Write(body)
+	r.captureInspectBytes(body)
+	if r.recorder == nil || !r.recorder.Enabled() {
+		return
+	}
+	offset := int64(r.bytesRead - len(body))
+	for len(body) > 0 {
+		chunk := body
+		if len(chunk) > transcriptHTTPChunkBytes {
+			chunk = body[:transcriptHTTPChunkBytes]
+		}
+		r.recorder.RecordPayloadChunk(r.agentType, r.sessionID, r.eventType, r.direction, r.streamID, r.chunks, offset, chunk, r.payload)
+		r.chunks++
+		offset += int64(len(chunk))
+		body = body[len(chunk):]
+	}
+}
+
+func (r *streamingTranscriptReadCloser) captureInspectBytes(body []byte) {
+	if r.onInspect == nil || r.inspectMax <= 0 || int64(len(r.inspect)) >= r.inspectMax {
+		return
+	}
+	remaining := int(r.inspectMax) - len(r.inspect)
+	if remaining > len(body) {
+		remaining = len(body)
+	}
+	r.inspect = append(r.inspect, body[:remaining]...)
+}
+
+func (r *streamingTranscriptReadCloser) Close() error {
 	err := r.ReadCloser.Close()
 	r.closeOnce.Do(func() {
-		if r.onClose != nil {
-			r.onClose(r.buf.Bytes())
+		sum := hex.EncodeToString(r.hasher.Sum(nil))
+		if r.recorder != nil && r.recorder.Enabled() {
+			r.recorder.RecordPayloadSummary(r.agentType, r.sessionID, r.eventType, r.direction, r.streamID, int64(r.bytesRead), sum, r.chunks, r.payload)
+		}
+		if r.onInspect != nil {
+			r.onInspect(r.inspect)
 		}
 	})
 	return err
@@ -710,12 +941,47 @@ func (w proxyErrorWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (s Server) upstreamFor(account accounts.Account) *url.URL {
+const claudeOAuthBetaHeader = "oauth-2025-04-20"
+
+func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
+	headers.Set("Authorization", account.AuthorizationHeader())
+	switch account.Provider {
+	case accounts.ProviderClaude:
+		headers.Del("X-Api-Key")
+		ensureCommaHeaderValue(headers, "Anthropic-Beta", claudeOAuthBetaHeader)
+	case accounts.ProviderCodex, "":
+		if account.AccountID != "" {
+			headers.Set("ChatGPT-Account-ID", account.AccountID)
+		}
+	}
+}
+
+func ensureCommaHeaderValue(headers http.Header, key, value string) {
+	existing := headers.Get(key)
+	if existing == "" {
+		headers.Set(key, value)
+		return
+	}
+	for _, part := range strings.Split(existing, ",") {
+		if strings.TrimSpace(part) == value {
+			return
+		}
+	}
+	headers.Set(key, existing+","+value)
+}
+
+func (s Server) upstreamForRequest(path string, account accounts.Account) *url.URL {
 	if s.Upstream != nil {
 		return s.Upstream
 	}
+	if account.Provider == accounts.ProviderClaude {
+		return s.ClaudeUpstream
+	}
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return s.APIUpstream
+	}
+	if chatGPTBackendPath(path) {
+		return chatGPTBackendUpstream(s.CodexUpstream)
 	}
 	return s.CodexUpstream
 }
@@ -726,6 +992,14 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 	}
 	if path == "" {
 		path = "/"
+	}
+	if account.Provider == accounts.ProviderClaude {
+		return path
+	}
+	if account.AuthMode == accounts.AuthModeOAuth {
+		if stripped, ok := stripChatGPTBackendPath(path); ok {
+			return stripped
+		}
 	}
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		if path == "/v1" || strings.HasPrefix(path, "/v1/") {
@@ -742,6 +1016,29 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 	return path
 }
 
+func chatGPTBackendUpstream(codexUpstream *url.URL) *url.URL {
+	upstream := cloneURL(codexUpstream)
+	if upstream == nil {
+		return nil
+	}
+	path := strings.TrimRight(upstream.Path, "/")
+	if strings.HasSuffix(path, "/backend-api/codex") {
+		upstream.Path = strings.TrimSuffix(path, "/codex")
+	}
+	return upstream
+}
+
+func stripChatGPTBackendPath(path string) (string, bool) {
+	const prefix = "/backend-api"
+	if path == prefix {
+		return "/", true
+	}
+	if strings.HasPrefix(path, prefix+"/") {
+		return strings.TrimPrefix(path, prefix), true
+	}
+	return path, false
+}
+
 func cloneURL(value *url.URL) *url.URL {
 	if value == nil {
 		return nil
@@ -754,17 +1051,27 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 	sessionID := session.ExtractID(r, s.MaxBodyBytes)
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := session.ExtractAccountID(r)
-	availableAccounts := s.accountList()
+	provider := providerForAgent(agentType)
+	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
 	if forcedAccountID != "" {
 		account, ok := findAccount(availableAccounts, forcedAccountID)
 		if !ok {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q not found", forcedAccountID)
+		}
+		if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
+			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q cannot be used for ChatGPT backend paths", forcedAccountID)
 		}
 		assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
 		}
 		return account, sessionID, assignment.UserEmail, nil
+	}
+	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
+		availableAccounts = oauthAccounts(availableAccounts)
+	}
+	if provider == accounts.ProviderCodex {
+		s.refreshUsageScoresIfStale(r.Context(), availableAccounts)
 	}
 	scheduler := s.scheduler().WithSessionCounts(s.Sessions.CountByAccount())
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
@@ -790,7 +1097,12 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 		return accounts.Account{}, sessionID, userEmail, err
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.ID) {
-		return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no usable OAuth Codex accounts available")
+		if scheduler.Exhausted(account.ID) {
+			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no usable OAuth %s accounts available", provider)
+		}
+		if provider == accounts.ProviderCodex && s.Logger != nil {
+			s.Logger.Warn("selected OAuth Codex account below new-session headroom threshold", "account", account.ID, "threshold", selectacct.MinNewSessionHeadroom)
+		}
 	}
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
@@ -799,18 +1111,234 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 	return account, sessionID, assignment.UserEmail, nil
 }
 
-func (s Server) accountList() []accounts.Account {
-	if s.AccountRef != nil {
-		return s.AccountRef.All()
+func (s Server) refreshUsageScoresIfStale(ctx context.Context, availableAccounts []accounts.Account) {
+	if s.SchedulerRef == nil || s.UsageScoreTTL <= 0 || !s.SchedulerRef.Stale(s.UsageScoreTTL) {
+		return
 	}
-	return append([]accounts.Account(nil), s.Accounts...)
+	scoreAccounts := s.ScoreAccounts
+	if scoreAccounts == nil {
+		scoreAccounts = s.scoreAccounts
+	}
+	scores, scored := scoreAccounts(ctx, availableAccounts)
+	if scored == 0 {
+		s.SchedulerRef.Touch()
+		if s.Logger != nil {
+			s.Logger.Warn("usage score refresh skipped", "reason", "no fresh OAuth usage scores")
+		}
+		return
+	}
+	scheduler := selectacct.NewScheduler(scores)
+	if s.Sessions != nil {
+		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+	}
+	s.SchedulerRef.Set(scheduler)
+	if s.Logger != nil {
+		s.Logger.Debug("usage scores refreshed before account selection", "accounts", len(availableAccounts), "scored", scored)
+	}
+}
+
+func chatGPTBackendPath(path string) bool {
+	_, ok := stripChatGPTBackendPath(path)
+	return ok
+}
+
+func oauthAccounts(all []accounts.Account) []accounts.Account {
+	filtered := make([]accounts.Account, 0, len(all))
+	for _, account := range all {
+		if account.AuthMode == accounts.AuthModeOAuth {
+			filtered = append(filtered, account)
+		}
+	}
+	return filtered
+}
+
+func providerForAgent(agentType string) accounts.Provider {
+	switch session.NormalizeAgentType(agentType) {
+	case "claude":
+		return accounts.ProviderClaude
+	default:
+		return accounts.ProviderCodex
+	}
+}
+
+func filterAccountsForProvider(all []accounts.Account, provider accounts.Provider) []accounts.Account {
+	filtered := make([]accounts.Account, 0, len(all))
+	legacy := make([]accounts.Account, 0)
+	for _, account := range all {
+		if account.Provider == provider {
+			filtered = append(filtered, account)
+			continue
+		}
+		if account.Provider == "" {
+			legacy = append(legacy, account)
+		}
+	}
+	if len(filtered) > 0 {
+		return filtered
+	}
+	return legacy
+}
+
+func (s Server) accountList() []accounts.Account {
+	out := append([]accounts.Account(nil), s.Accounts...)
+	if s.AccountRef != nil {
+		out = append(out, s.AccountRef.All()...)
+	}
+	return out
 }
 
 func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (accounts.Account, error) {
-	if s.AccountRef == nil {
+	if s.AccountRef == nil || (account.Provider != "" && account.Provider != accounts.ProviderCodex) {
 		return account, nil
 	}
 	return s.AccountRef.Refresh(ctx, account)
+}
+
+const replayablePostMaxBodyBytes = 128 << 20
+const replayablePostMaxAttempts = 6
+const replayablePostMaxConcurrentUploads = 4
+
+var replayablePostUploadLimiter = make(chan struct{}, replayablePostMaxConcurrentUploads)
+
+func retryableResponsesPostRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodPost {
+		return false
+	}
+	path := r.URL.Path
+	return path == "/responses" ||
+		path == "/v1/responses" ||
+		path == "/responses/compact" ||
+		path == "/v1/responses/compact"
+}
+
+func makeRequestBodyReplayable(r *http.Request, maxBytes int64) (bool, error) {
+	if r.Body == nil || r.GetBody != nil {
+		return true, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	if err != nil {
+		return false, err
+	}
+	if int64(len(body)) > maxBytes {
+		r.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), r.Body),
+			Closer: r.Body,
+		}
+		return false, nil
+	}
+	if err := r.Body.Close(); err != nil {
+		return false, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	r.ContentLength = int64(len(body))
+	return true, nil
+}
+
+type prefixReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+type replayablePostRetryTransport struct {
+	base        http.RoundTripper
+	logger      *slog.Logger
+	agent       string
+	session     string
+	account     string
+	method      string
+	path        string
+	upstream    string
+	maxAttempts int
+	limiter     chan struct{}
+}
+
+func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	maxAttempts := t.maxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	attemptReq := req
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		response, err := t.roundTrip(attemptReq)
+		if err == nil || !retryablePostTransportError(err) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts {
+			return response, err
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return response, err
+		}
+		attemptReq = req.Clone(req.Context())
+		attemptReq.Body = body
+		attemptReq.GetBody = req.GetBody
+		attemptReq.ContentLength = req.ContentLength
+		if t.logger != nil {
+			t.logger.Warn("retrying replayable upstream request after transport failure", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
+		}
+	}
+	return t.roundTrip(req)
+}
+
+func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Response, error) {
+	if t.limiter == nil {
+		return t.base.RoundTrip(req)
+	}
+	select {
+	case t.limiter <- struct{}{}:
+		defer func() { <-t.limiter }()
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
+	return t.base.RoundTrip(req)
+}
+
+func retryablePostTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "use of closed network connection") ||
+		strings.Contains(message, "tls: bad record MAC") ||
+		strings.Contains(message, "connection reset by peer") ||
+		strings.Contains(message, "unexpected EOF")
+}
+
+func (s Server) transport() http.RoundTripper {
+	if s.Transport != nil {
+		return s.Transport
+	}
+	return http.DefaultTransport
+}
+
+func NewOutboundTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Keep ChatGPT traffic on IPv4 and pooled HTTP/1.1 connections. HTTP/2
+	// multiplexing lets one upstream TLS failure tear down unrelated streams.
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", addr)
+	}
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	return transport
 }
 
 func (s Server) scheduler() selectacct.Scheduler {

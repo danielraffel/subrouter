@@ -2,6 +2,7 @@ package transcript
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -78,6 +79,7 @@ func ReadRawSession(dir, agentType, sessionID string) ([]RawEvent, error) {
 	defer file.Close()
 
 	var events []RawEvent
+	chunks := bodyChunkAccumulator{}
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	for scanner.Scan() {
@@ -90,13 +92,12 @@ func ReadRawSession(dir, agentType, sessionID string) ([]RawEvent, error) {
 			Type:      event.Type,
 			Payload:   clonePayload(event.Payload),
 		}
-		if encoded, ok := stringValue(raw.Payload["body_base64"]); ok {
-			delete(raw.Payload, "body_base64")
-			decoded, err := base64.StdEncoding.DecodeString(encoded)
-			if err == nil && utf8.Valid(decoded) {
-				raw.BodyText = string(decoded)
+		delete(raw.Payload, "body_base64")
+		if body, ok := chunks.bodyFromEvent(event); ok {
+			if utf8.Valid(body) {
+				raw.BodyText = string(body)
 			} else {
-				raw.BodyBase64 = encoded
+				raw.BodyBase64 = base64.StdEncoding.EncodeToString(body)
 			}
 		}
 		events = append(events, raw)
@@ -148,6 +149,7 @@ func usageRecordsFromFile(path string) ([]usageRecord, error) {
 	var records []usageRecord
 	var user string
 	var account string
+	chunks := bodyChunkAccumulator{}
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	for scanner.Scan() {
@@ -161,12 +163,8 @@ func usageRecordsFromFile(path string) ([]usageRecord, error) {
 		if nextAccount, ok := stringValue(event.Payload["account"]); ok {
 			account = nextAccount
 		}
-		encoded, ok := stringValue(event.Payload["body_base64"])
+		body, ok := chunks.bodyFromEvent(event)
 		if !ok {
-			continue
-		}
-		body, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
 			continue
 		}
 		eventTime, _ := time.Parse(time.RFC3339Nano, event.Timestamp)
@@ -199,6 +197,90 @@ func extractUsageRecords(body []byte) []usageRecord {
 		}
 	}
 	return records
+}
+
+type bodyChunkAccumulator struct {
+	streams map[string]*bodyChunkStream
+}
+
+type bodyChunkStream struct {
+	chunks map[int][]byte
+	order  []int
+}
+
+func (a *bodyChunkAccumulator) bodyFromEvent(event Event) ([]byte, bool) {
+	if encoded, ok := stringValue(event.Payload["body_base64"]); ok {
+		body, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, false
+		}
+		if isBodyChunk(event) {
+			a.addChunk(event, body)
+			return nil, false
+		}
+		return body, true
+	}
+	if isBodyChunkedSummary(event) {
+		streamID, ok := stringValue(event.Payload["stream_id"])
+		if !ok {
+			return nil, false
+		}
+		return a.take(streamID)
+	}
+	return nil, false
+}
+
+func (a *bodyChunkAccumulator) addChunk(event Event, body []byte) {
+	streamID, ok := stringValue(event.Payload["stream_id"])
+	if !ok {
+		return
+	}
+	if a.streams == nil {
+		a.streams = map[string]*bodyChunkStream{}
+	}
+	stream := a.streams[streamID]
+	if stream == nil {
+		stream = &bodyChunkStream{chunks: map[int][]byte{}}
+		a.streams[streamID] = stream
+	}
+	index := len(stream.order)
+	if value, ok := numericValue(event.Payload["chunk_index"]); ok {
+		index = int(value)
+	}
+	if _, exists := stream.chunks[index]; !exists {
+		stream.order = append(stream.order, index)
+	}
+	stream.chunks[index] = append([]byte(nil), body...)
+}
+
+func (a *bodyChunkAccumulator) take(streamID string) ([]byte, bool) {
+	if a.streams == nil {
+		return nil, false
+	}
+	stream := a.streams[streamID]
+	if stream == nil {
+		return nil, false
+	}
+	delete(a.streams, streamID)
+	sort.Ints(stream.order)
+	var body bytes.Buffer
+	for _, index := range stream.order {
+		body.Write(stream.chunks[index])
+	}
+	return body.Bytes(), true
+}
+
+func isBodyChunk(event Event) bool {
+	return boolField(event.Payload, "body_chunk") || strings.HasSuffix(event.Type, "_chunk")
+}
+
+func isBodyChunkedSummary(event Event) bool {
+	return boolField(event.Payload, "body_chunked")
+}
+
+func boolField(values map[string]any, key string) bool {
+	value, _ := values[key].(bool)
+	return value
 }
 
 func jsonPayloads(body []byte) []map[string]any {

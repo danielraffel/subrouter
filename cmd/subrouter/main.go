@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 	"github.com/manaflow-ai/subrouter/internal/session"
@@ -87,11 +88,13 @@ func serve(args []string) error {
 	upstreamRaw := flags.String("upstream", "", "force one upstream base URL for all accounts")
 	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
 	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
+	claudeUpstreamRaw := flags.String("claude-upstream", "https://api.anthropic.com", "Claude subscription upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
 	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
 	cxSwitchInterval := flags.Duration("cx-switch-interval", defaultCXSwitchInterval, "interval for switching active cx account to the best OAuth account; 0 disables")
+	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	if err := flags.Parse(args); err != nil {
@@ -114,6 +117,10 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	claudeUpstream, err := url.Parse(*claudeUpstreamRaw)
+	if err != nil {
+		return err
+	}
 
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
@@ -125,24 +132,41 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	claudeAccounts, err := agentclaude.DefaultStore().ListAccounts(context.Background())
+	if err != nil {
+		slog.Warn("Claude accounts skipped", "error", err)
+		claudeAccounts = nil
+	}
 	scores := fallbackScores(codexAccounts)
 	if *fetchUsage {
-		scores, _ = fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
+		fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
+		if successful > 0 {
+			scores = fetchedScores
+		} else {
+			slog.Warn("initial usage score fetch skipped", "reason", "no fresh OAuth usage scores")
+		}
 	}
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(scores))
-	accountRef := proxy.NewAccountRef(codexStore, codexAccounts, &http.Client{Timeout: 15 * time.Second})
+	outboundTransport := proxy.NewOutboundTransport()
+	accountRef := proxy.NewAccountRef(codexStore, codexAccounts, &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: outboundTransport,
+	})
 
 	server := proxy.Server{
-		Upstream:      upstream,
-		CodexUpstream: codexUpstream,
-		APIUpstream:   apiUpstream,
-		Accounts:      codexAccounts,
-		AccountRef:    accountRef,
-		Sessions:      store,
-		SchedulerRef:  schedulerRef,
-		Logger:        slog.Default(),
-		MaxBodyBytes:  *maxBodyBytes,
-		Transcripts:   transcript.NewRecorder(*transcriptDir),
+		Upstream:       upstream,
+		CodexUpstream:  codexUpstream,
+		APIUpstream:    apiUpstream,
+		ClaudeUpstream: claudeUpstream,
+		Accounts:       claudeAccounts,
+		AccountRef:     accountRef,
+		Sessions:       store,
+		SchedulerRef:   schedulerRef,
+		UsageScoreTTL:  usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		Transport:      outboundTransport,
+		Logger:         slog.Default(),
+		MaxBodyBytes:   *maxBodyBytes,
+		Transcripts:    transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:   *transcriptDir,
@@ -172,11 +196,18 @@ func serve(args []string) error {
 	}
 
 	if upstream != nil {
-		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "accounts", len(codexAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "upstream", upstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	} else {
-		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "accounts", len(codexAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
+		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return httpServer.ListenAndServe()
+}
+
+func usageScoreTTLForServe(fetchUsage bool, ttl time.Duration) time.Duration {
+	if !fetchUsage {
+		return 0
+	}
+	return ttl
 }
 
 func fetchCodexScores(ctx context.Context, codexAccounts []accounts.Account) []selectacct.Score {
@@ -189,7 +220,10 @@ func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.A
 }
 
 func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: proxy.NewOutboundTransport(),
+	}
 	scores := fallbackScores(codexAccounts)
 	scoreByID := make(map[string]int, len(scores))
 	for i, score := range scores {
@@ -316,7 +350,7 @@ Usage:
   %[1]s claude             Manage Claude Code profiles
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--transcripts ~/.subrouter/transcripts] [--transcript-gcs-uri gs://bucket/prefix]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--transcripts ~/.subrouter/transcripts] [--transcript-gcs-uri gs://bucket/prefix]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

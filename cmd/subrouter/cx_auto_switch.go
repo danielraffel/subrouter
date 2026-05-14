@@ -107,7 +107,10 @@ func cxAutoSwitchOnce(ctx context.Context, cfg cxAutoSwitchConfig) (string, erro
 		return "", err
 	}
 	if !scheduler.UsableForNewSession(picked.ID) {
-		return "", fmt.Errorf("no usable OAuth Codex accounts available")
+		if scheduler.Exhausted(picked.ID) {
+			return "", fmt.Errorf("no usable OAuth Codex accounts available")
+		}
+		logCXAutoSwitch(cfg.Logger, slog.LevelWarn, "cx auto-switch selected account below new-session headroom threshold", "account", picked.ID, "threshold", selectacct.MinNewSessionHeadroom)
 	}
 	if err := switchActive(ctx, picked.ID); err != nil {
 		return "", err

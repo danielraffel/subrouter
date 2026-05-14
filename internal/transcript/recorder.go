@@ -64,6 +64,45 @@ func (r *Recorder) RecordPayload(agentType, sessionID, eventType, direction stri
 	})
 }
 
+func (r *Recorder) RecordPayloadChunk(agentType, sessionID, eventType, direction, streamID string, chunkIndex int, offset int64, body []byte, payload map[string]any) {
+	if !r.Enabled() {
+		return
+	}
+	sum := sha256.Sum256(body)
+	enriched := withSession(agentType, sessionID, payload)
+	enriched["direction"] = direction
+	enriched["stream_id"] = streamID
+	enriched["body_chunk"] = true
+	enriched["chunk_index"] = chunkIndex
+	enriched["offset"] = offset
+	enriched["chunk_bytes"] = len(body)
+	enriched["chunk_sha256"] = hex.EncodeToString(sum[:])
+	enriched["body_base64"] = base64.StdEncoding.EncodeToString(body)
+	r.write(agentType, sessionID, Event{
+		Timestamp: now(),
+		Type:      eventType + "_chunk",
+		Payload:   enriched,
+	})
+}
+
+func (r *Recorder) RecordPayloadSummary(agentType, sessionID, eventType, direction, streamID string, bytesRead int64, sha256Hex string, chunks int, payload map[string]any) {
+	if !r.Enabled() {
+		return
+	}
+	enriched := withSession(agentType, sessionID, payload)
+	enriched["direction"] = direction
+	enriched["stream_id"] = streamID
+	enriched["body_chunked"] = true
+	enriched["bytes"] = bytesRead
+	enriched["sha256"] = sha256Hex
+	enriched["chunks"] = chunks
+	r.write(agentType, sessionID, Event{
+		Timestamp: now(),
+		Type:      eventType,
+		Payload:   enriched,
+	})
+}
+
 func (r *Recorder) PathForSession(agentType, sessionID string) string {
 	agent := safeFilename(normalizeAgentType(agentType))
 	base := BaseSessionID(sessionID)

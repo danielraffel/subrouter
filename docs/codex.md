@@ -20,8 +20,25 @@ openai_base_url = "http://127.0.0.1:31415/v1"
 ```
 
 Subrouter supports Codex WebSocket requests, so the built-in provider can keep its normal transport behavior.
+This includes Responses WebSockets at `/v1/responses` and realtime WebSockets at `/v1/realtime`.
 
 Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Codex should stay logged in normally, ideally with ChatGPT auth. Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers with the selected `cx` account.
+
+## Codex Desktop
+
+Codex Desktop has two outbound paths:
+
+- The Rust `app-server` sends model traffic, including Responses WebSockets. It reads `CODEX_HOME/config.toml`, so `openai_base_url = "http://127.0.0.1:31415/v1"` routes that traffic through Subrouter.
+- The same `app-server` reads account usage and sends add-credit nudges through `chatgpt_base_url`. Set `chatgpt_base_url = "http://127.0.0.1:31415/backend-api"` if Desktop UI state should reflect the selected Subrouter OAuth account.
+- The Electron shell sends ChatGPT backend requests with `electron.net.fetch`. It reads `CODEX_API_BASE_URL` at process start. Use `CODEX_API_BASE_URL=http://127.0.0.1:31415/backend-api` so Electron requests for `/codex/...` reach Subrouter as `/backend-api/codex/...`.
+
+`subrouter codex app` intentionally does not inject routing flags. Current Codex accepts `-c` on `codex app`, but the app launcher opens the installed desktop app through the OS and does not carry those overrides into the running app-server. To test desktop routing, start Codex Desktop in an isolated launch environment with the env var above and an isolated `CODEX_HOME` containing the config overrides. Subrouter maps `/backend-api/...` back to the normal ChatGPT backend for OAuth accounts and will not route those backend paths through API-key accounts.
+
+Optional realtime voice routing can be pinned explicitly in the same config:
+
+```toml
+experimental_realtime_ws_base_url = "http://127.0.0.1:31415/v1"
+```
 
 ## User Attribution
 

@@ -33,6 +33,18 @@ func NewScheduler(scores []Score) Scheduler {
 	return Scheduler{scores: byID}
 }
 
+func (s Scheduler) WithScore(score Score) Scheduler {
+	next := Scheduler{
+		scores:        make(map[string]Score, len(s.scores)+1),
+		sessionCounts: s.sessionCounts,
+	}
+	for accountID, existing := range s.scores {
+		next.scores[accountID] = existing
+	}
+	next.scores[score.AccountID] = score
+	return next
+}
+
 func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 	next := Scheduler{
 		scores:        s.scores,

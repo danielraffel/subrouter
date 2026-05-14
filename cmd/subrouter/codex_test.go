@@ -121,6 +121,14 @@ func TestCodexArgsInjectsSubrouterBaseURLIntoAppServer(t *testing.T) {
 	}
 }
 
+func TestCodexArgsDoesNotInjectIntoDesktopAppLauncher(t *testing.T) {
+	got := codexArgs([]string{"app", "/tmp/project"}, "http://127.0.0.1:31415/v1", "", "")
+	want := []string{"app", "/tmp/project"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 func TestCodexArgsTreatsUnknownCommandAsInteractivePrompt(t *testing.T) {
 	got := codexArgs([]string{"write", "tests"}, "http://127.0.0.1:31415/v1", "", "")
 	want := []string{"-c", `openai_base_url="http://127.0.0.1:31415/v1"`, "write", "tests"}

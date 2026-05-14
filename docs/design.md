@@ -85,10 +85,11 @@ The `agent_session_id` is the base provider session id from Subrouter's session 
 Transcript events include:
 
 - `subrouter_meta`: account, user email, transport, path, upstream, and redacted headers.
-- `http_body`: full HTTP or SSE body as base64 with byte count and SHA-256.
+- `http_body_chunk`: chunked HTTP or SSE body bytes as base64 with stream id, chunk index, offset, chunk byte count, and chunk SHA-256.
+- `http_body`: final HTTP or SSE body summary with stream id, total byte count, total SHA-256, and chunk count.
 - `websocket_message`: full WebSocket message payload as base64 with byte count, SHA-256, opcode, and direction.
 
-This stores full payloads by design. Authorization-style headers are redacted, but bodies may contain sensitive plaintext or encrypted Codex transcript material.
+This stores full payloads by design, but HTTP bodies are recorded as bounded chunks while the proxy streams them. Authorization-style headers are redacted, but bodies may contain sensitive plaintext or encrypted Codex transcript material.
 
 ## Scheduling
 
