@@ -199,8 +199,11 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if !fake.hasCommand("codex", "login", "--device-auth") {
 		t.Fatalf("missing device-auth login command: %#v", fake.commands)
 	}
-	if !fake.hasCommandPrefix("gcloud", "compute", "scp") || !fake.hasCommandPrefix("gcloud", "compute", "ssh") {
-		t.Fatalf("missing gcloud upload/install commands: %#v", fake.commands)
+	if !fake.hasCommandPrefix("ssh", "-o", "BatchMode=yes") {
+		t.Fatalf("missing direct ssh upload/install command: %#v", fake.commands)
+	}
+	if fake.hasCommandPrefix("gcloud", "compute", "scp") {
+		t.Fatalf("unexpected gcloud scp for tailnet server: %#v", fake.commands)
 	}
 	uploadCommand := strings.Join(fake.commands[len(fake.commands)-1], " ")
 	if strings.Contains(uploadCommand, "systemctl restart subrouter") {
@@ -346,8 +349,69 @@ func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 	if fake.countCommand("codex", "login", "--device-auth") != 1 {
 		t.Fatalf("login command count mismatch: %#v", fake.commands)
 	}
-	if !fake.hasCommandPrefix("gcloud", "compute", "scp") || !fake.hasCommandPrefix("gcloud", "compute", "ssh") {
-		t.Fatalf("missing gcloud upload/install commands: %#v", fake.commands)
+	if !fake.hasCommandPrefix("ssh", "-o", "BatchMode=yes") {
+		t.Fatalf("missing direct ssh upload/install command: %#v", fake.commands)
+	}
+	if fake.hasCommandPrefix("gcloud", "compute", "scp") {
+		t.Fatalf("unexpected gcloud scp for tailnet server: %#v", fake.commands)
+	}
+	restored, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || restored.Tokens.RefreshToken != active.Tokens.RefreshToken {
+		t.Fatalf("active auth was not restored")
+	}
+}
+
+func TestCXServerSyncURLOnlyServerUsesDirectSSHUpload(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	active := testCodexAuth("active@example.com", "acct_active")
+	fresh := testCodexAuth("alice@example.com", "acct_alice_fresh")
+	if err := accounts.WriteActiveCodexAuth(active); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "alice@example.com",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("alice@example.com", "acct_alice"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fake := &recordingCXCommandRunner{loginAuth: fresh}
+	runner := cxRunner{
+		store:  store,
+		out:    &out,
+		errOut: &out,
+		cmd:    fake,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, _ := json.Marshal([]remoteServerAccountStatus{})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "team",
+		"--url", "http://100.64.0.1:31415",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.run(context.Background(), []string{"server", "sync", "team", "--yes"}); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.hasCommandPrefix("ssh", "-o", "BatchMode=yes") {
+		t.Fatalf("missing direct ssh upload/install command: %#v", fake.commands)
+	}
+	if fake.hasCommandPrefix("gcloud") {
+		t.Fatalf("URL-only server used gcloud: %#v", fake.commands)
 	}
 	restored, ok, err := accounts.ReadActiveCodexAuth()
 	if err != nil {

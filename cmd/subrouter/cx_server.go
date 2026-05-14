@@ -870,9 +870,6 @@ func restoreActiveCodexAuth(previous accounts.CodexAuthFile, hadPrevious bool) e
 }
 
 func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig, account accounts.StoredCodexAccount) error {
-	if server.GCPInstance == "" || server.GCPZone == "" {
-		return fmt.Errorf("server %s has no GCP target", server.Name)
-	}
 	tmpDir, err := os.MkdirTemp("", "cx-server-auth-*")
 	if err != nil {
 		return err
@@ -902,6 +899,22 @@ func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig
 	if err := os.WriteFile(archivePath, archive.Bytes(), 0o600); err != nil {
 		return err
 	}
+
+	if host := sshHostForServer(server); host != "" {
+		if err := r.uploadServerAccountSSH(ctx, server, host, archive.Bytes()); err == nil {
+			return nil
+		} else if server.GCPInstance == "" || server.GCPZone == "" {
+			return err
+		} else {
+			if r.errOut != nil {
+				fmt.Fprintf(r.errOut, "direct server upload failed, falling back to gcloud: %v\n", err)
+			}
+		}
+	}
+
+	if server.GCPInstance == "" || server.GCPZone == "" {
+		return fmt.Errorf("server %s has no GCP target", server.Name)
+	}
 	remotePath := fmt.Sprintf("/tmp/cx-server-auth-%d.tgz", time.Now().UnixNano())
 	scpArgs := []string{"compute", "scp", archivePath, server.GCPInstance + ":" + remotePath, "--zone", server.GCPZone}
 	if server.GCPProject != "" {
@@ -929,6 +942,49 @@ func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig
 		return fmt.Errorf("install account on server: %w", err)
 	}
 	return nil
+}
+
+func (r cxRunner) uploadServerAccountSSH(ctx context.Context, server cxServerConfig, host string, archive []byte) error {
+	remotePath := fmt.Sprintf("/tmp/cx-server-auth-%d.tgz", time.Now().UnixNano())
+	remoteCommand := strings.Join([]string{
+		"set -euo pipefail",
+		"cat > " + shellQuote(remotePath),
+		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
+		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
+		"sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/codex/accounts",
+		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
+		"sudo find /var/lib/subrouter/codex -name '._*' -delete",
+		"sudo chown -R subrouter:subrouter /var/lib/subrouter/codex",
+		"sudo rm -f " + shellQuote(remotePath),
+		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
+	}, " && ")
+	args := []string{
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=15",
+		"-o", "LogLevel=ERROR",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		host,
+		remoteCommand,
+	}
+	uploadCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if err := r.commandRunner().Run(uploadCtx, "ssh", args, bytes.NewReader(archive), r.out, r.errOut); err != nil {
+		return fmt.Errorf("install account on server over ssh: %w", err)
+	}
+	return nil
+}
+
+func sshHostForServer(server cxServerConfig) string {
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		return ""
+	}
+	host := strings.TrimSpace(parsed.Hostname())
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return ""
+	}
+	return host
 }
 
 func cxAccountFilename(email string) string {
