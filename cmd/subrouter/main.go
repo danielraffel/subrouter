@@ -81,6 +81,7 @@ var directCXCommands = map[string]struct{}{
 	"admin-keys":       {},
 	"attach-project":   {},
 	"claude":           {},
+	"g":                {},
 	"gemini":           {},
 	"gui":              {},
 	"gui-switch":       {},
@@ -353,6 +354,7 @@ Usage:
   %[1]s import             Import current ~/.codex/auth.json account
   %[1]s list               List all Codex accounts
   %[1]s switch [email]     Switch active Codex account and sync OpenCode/pi
+  %[1]s g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s remove <email>     Remove a Codex account

@@ -219,7 +219,7 @@ go run ./cmd/subrouter status
 sr status
 ```
 
-The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `gui`, `gui-switch`, `remove`, `status`, `usage`, `server`, `add-admin-key`, `admin-keys`, `remove-admin-key`, `attach-project`, `claude`, and `gemini`. The older `subrouter cx <command>` form remains as a compatibility alias.
+The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `g`, `gui`, `gui-switch`, `remove`, `status`, `usage`, `server`, `add-admin-key`, `admin-keys`, `remove-admin-key`, `attach-project`, `claude`, and `gemini`. The older `subrouter cx <command>` form remains as a compatibility alias.
 
 `cx switch` also syncs compatible ChatGPT Codex credentials into:
 
