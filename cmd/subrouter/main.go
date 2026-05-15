@@ -75,7 +75,7 @@ func runForProgram(program string, args []string) error {
 
 func isDirectCXCommand(command string) bool {
 	switch command {
-	case "add", "login", "add-key", "add-api-key", "import", "list", "ls", "switch", "use", "gui-switch", "gui-use", "remove", "rm", "status", "pick", "usage", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project", "server", "servers", "claude", "gemini":
+	case "add", "login", "add-key", "add-api-key", "import", "list", "ls", "switch", "use", "gui", "gui-switch", "gui-use", "remove", "rm", "status", "pick", "usage", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project", "server", "servers", "claude", "gemini":
 		return true
 	default:
 		return false
@@ -328,6 +328,7 @@ Usage:
   %[1]s import             Import current ~/.codex/auth.json account
   %[1]s list               List all Codex accounts
   %[1]s switch [email]     Switch active Codex account and sync OpenCode/pi
+  %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s remove <email>     Remove a Codex account
   %[1]s status             Show Codex usage (non-interactive)

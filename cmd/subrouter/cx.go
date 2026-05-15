@@ -47,6 +47,7 @@ Usage:
   cx import             Import current ~/.codex/auth.json account
   cx list               List all Codex accounts
   cx switch [email]     Switch active Codex account and sync OpenCode/pi
+  cx gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   cx gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   cx remove <email>     Remove a Codex account
   cx status             Show Codex usage (non-interactive)
@@ -144,7 +145,7 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 			return r.defaultInteractive(ctx, opts)
 		}
 		return r.switchAccount(ctx, selector, opts)
-	case "gui-switch", "gui-use":
+	case "gui", "gui-switch", "gui-use":
 		selector, opts, err := parseCXSwitchArgs(args[1:], cxSwitchOptions{restartCodexGUI: true})
 		if err != nil {
 			return err
