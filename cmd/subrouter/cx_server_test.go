@@ -475,6 +475,7 @@ func TestCXServerSyncDryRunDoesNotLogin(t *testing.T) {
 func TestCXServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("FORCE_COLOR", "1")
 	store := accounts.DefaultCodexStore()
 	active := testCodexAuth("active@example.com", "acct_active")
 	invalidFresh := testCodexAuth("old@example.com", "acct_old_fresh")
@@ -520,6 +521,7 @@ func TestCXServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 	for _, want := range []string{
 		"Invalid on server:\n  old@example.com: token refresh failed",
 		"Reauth 1 account(s) on server community?",
+		"Sign in as " + ansiBold + ansiMagenta + "old@example.com" + ansiReset + " for server community.",
 		"Synced 1 server-owned OAuth account(s) to community",
 	} {
 		if !strings.Contains(output, want) {

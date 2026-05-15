@@ -707,8 +707,9 @@ func (r cxRunner) serverSync(ctx context.Context, store cxServerStore, args []st
 		}
 	}
 	fmt.Fprintln(r.out, "Each login below creates a fresh server-owned OAuth refresh-token chain. Existing local refresh tokens are not uploaded.")
+	colored := colorEnabled(r.out)
 	for _, email := range targets {
-		fmt.Fprintf(r.out, "\nSign in as %s for server %s.\n", email, server.Name)
+		fmt.Fprintf(r.out, "\nSign in as %s for server %s.\n", style(colored, ansiBold+ansiMagenta, email), server.Name)
 		if err := r.serverLoginOne(ctx, server, *deviceAuth, email); err != nil {
 			return err
 		}
