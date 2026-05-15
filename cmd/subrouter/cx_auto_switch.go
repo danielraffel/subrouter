@@ -62,7 +62,8 @@ func cxAutoSwitchOnce(ctx context.Context, cfg cxAutoSwitchConfig) (string, erro
 			if !ok {
 				return fmt.Errorf("account %q not found", accountID)
 			}
-			refreshed, _, err := store.RefreshStoredIfExpired(ctx, nil, stored)
+			refreshCtx := accounts.WithCodexRefreshReason(ctx, "cx-auto-switch")
+			refreshed, _, err := store.RefreshStoredIfExpired(refreshCtx, nil, stored)
 			if err == nil {
 				stored = refreshed
 			} else {

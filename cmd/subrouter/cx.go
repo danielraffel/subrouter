@@ -535,7 +535,8 @@ func (r cxRunner) fetchUsageRows(ctx context.Context) ([]cxUsageRow, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			refreshed, _, refreshErr := r.store.RefreshStoredIfExpired(ctx, r.client, account)
+			refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr.status")
+			refreshed, _, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, account)
 			if refreshErr != nil {
 				rows[i].err = refreshErr
 				rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0, ShortHeadroom: 0}
@@ -583,7 +584,8 @@ func (r cxRunner) switchAccount(ctx context.Context, selector string, opts cxSwi
 	if err := r.store.SyncActiveToStore(); err != nil {
 		return err
 	}
-	refreshed, didRefresh, err := r.store.RefreshStoredIfExpired(ctx, r.client, account)
+	refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr.switch")
+	refreshed, didRefresh, err := r.store.RefreshStoredIfExpired(refreshCtx, r.client, account)
 	if err != nil {
 		fmt.Fprintf(r.errOut, "Warning: token refresh failed, using cached tokens: %s\n", err)
 		refreshed = account

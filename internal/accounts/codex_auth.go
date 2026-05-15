@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -14,6 +16,21 @@ import (
 
 const codexOAuthTokenURL = "https://auth.openai.com/oauth/token"
 const codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+type codexRefreshReasonKey struct{}
+
+func WithCodexRefreshReason(ctx context.Context, reason string) context.Context {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, codexRefreshReasonKey{}, reason)
+}
+
+func CodexRefreshReason(ctx context.Context) string {
+	reason, _ := ctx.Value(codexRefreshReasonKey{}).(string)
+	return reason
+}
 
 func ReadActiveCodexAuth() (CodexAuthFile, bool, error) {
 	body, err := os.ReadFile(DefaultCodexAuthPath())
@@ -158,46 +175,58 @@ func (s CodexStore) RefreshStored(ctx context.Context, client *http.Client, acco
 
 func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount, force bool) (StoredCodexAccount, bool, error) {
 	if account.Auth.Tokens == nil {
+		logCodexRefreshSkipped(ctx, account, force, "missing_tokens")
 		return account, false, nil
 	}
 	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+		logCodexRefreshSkipped(ctx, account, force, "access_token_fresh")
 		return account, false, nil
 	}
 
 	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
+		logCodexRefreshFailed(ctx, account, force, err)
 		return account, false, err
 	}
 	defer lock.Close()
 
 	latest, found, err := s.FindStored(account.Email)
 	if err != nil {
+		logCodexRefreshFailed(ctx, account, force, err)
 		return account, false, err
 	}
 	if found {
 		account = latest
 	}
 	if account.Auth.Tokens == nil {
+		logCodexRefreshSkipped(ctx, account, force, "missing_tokens_after_lock")
 		return account, false, nil
 	}
 	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+		logCodexRefreshSkipped(ctx, account, force, "access_token_fresh_after_lock")
 		return account, false, nil
 	}
 
+	logCodexRefreshStart(ctx, account, force)
 	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {
 		if recovered, ok := s.recoverRefreshedAccount(account); ok {
+			logCodexRefreshRecovered(ctx, account, recovered, force, err)
 			return recovered, false, nil
 		}
+		logCodexRefreshFailed(ctx, account, force, err)
 		return account, false, err
 	}
 	account.Auth = auth
 	if err := s.saveStoredUnlocked(account); err != nil {
+		logCodexRefreshFailed(ctx, account, force, err)
 		return account, true, err
 	}
 	if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
+		logCodexRefreshFailed(ctx, account, force, err)
 		return account, true, err
 	}
+	logCodexRefreshSucceeded(ctx, account, force)
 	return account, true, nil
 }
 
@@ -295,7 +324,7 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(res.Body)
-		return auth, fmt.Errorf("token refresh failed (%d): %s", res.StatusCode, strings.TrimSpace(buf.String()))
+		return auth, newCodexAuthRefreshError(res.StatusCode, strings.TrimSpace(buf.String()))
 	}
 	var refreshed struct {
 		AccessToken  string `json:"access_token"`
@@ -313,6 +342,123 @@ func RefreshCodexAuth(ctx context.Context, client *http.Client, auth CodexAuthFi
 	auth.Tokens.IDToken = refreshed.IDToken
 	auth.LastRefresh = time.Now().UTC().Format(time.RFC3339)
 	return auth, nil
+}
+
+type CodexAuthRefreshError struct {
+	StatusCode      int
+	Body            string
+	ProviderType    string
+	ProviderCode    string
+	ProviderMessage string
+}
+
+func newCodexAuthRefreshError(statusCode int, body string) *CodexAuthRefreshError {
+	err := &CodexAuthRefreshError{
+		StatusCode: statusCode,
+		Body:       body,
+	}
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &payload) == nil {
+		err.ProviderMessage = payload.Error.Message
+		err.ProviderType = payload.Error.Type
+		err.ProviderCode = payload.Error.Code
+	}
+	return err
+}
+
+func (e *CodexAuthRefreshError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if strings.TrimSpace(e.Body) == "" {
+		return fmt.Sprintf("token refresh failed (%d)", e.StatusCode)
+	}
+	return fmt.Sprintf("token refresh failed (%d): %s", e.StatusCode, e.Body)
+}
+
+func logCodexRefreshStart(ctx context.Context, account StoredCodexAccount, force bool) {
+	slog.Info("codex oauth refresh start", codexRefreshLogAttrs(ctx, account, force)...)
+}
+
+func logCodexRefreshSucceeded(ctx context.Context, account StoredCodexAccount, force bool) {
+	slog.Info("codex oauth refresh succeeded", codexRefreshLogAttrs(ctx, account, force)...)
+}
+
+func logCodexRefreshRecovered(ctx context.Context, previous, recovered StoredCodexAccount, force bool, err error) {
+	attrs := codexRefreshLogAttrs(ctx, previous, force)
+	attrs = append(attrs,
+		"recovered_access_exp", codexAccessExpiryForLog(recovered),
+	)
+	appendCodexRefreshErrorAttrs(&attrs, err)
+	slog.Warn("codex oauth refresh recovered from concurrent update", attrs...)
+}
+
+func logCodexRefreshFailed(ctx context.Context, account StoredCodexAccount, force bool, err error) {
+	attrs := codexRefreshLogAttrs(ctx, account, force)
+	appendCodexRefreshErrorAttrs(&attrs, err)
+	slog.Warn("codex oauth refresh failed", attrs...)
+}
+
+func logCodexRefreshSkipped(ctx context.Context, account StoredCodexAccount, force bool, reason string) {
+	attrs := codexRefreshLogAttrs(ctx, account, force)
+	attrs = append(attrs, "skip_reason", reason)
+	slog.Debug("codex oauth refresh skipped", attrs...)
+}
+
+func codexRefreshLogAttrs(ctx context.Context, account StoredCodexAccount, force bool) []any {
+	reason := CodexRefreshReason(ctx)
+	if reason == "" {
+		reason = "unspecified"
+	}
+	return []any{
+		"account", account.Email,
+		"reason", reason,
+		"force", force,
+		"last_refresh", account.Auth.LastRefresh,
+		"access_exp", codexAccessExpiryForLog(account),
+		"access_expired", codexAccessExpiredForLog(account),
+	}
+}
+
+func codexAccessExpiryForLog(account StoredCodexAccount) string {
+	if account.Auth.Tokens == nil {
+		return ""
+	}
+	expMillis, ok := JWTExpiryMillis(account.Auth.Tokens.AccessToken)
+	if !ok {
+		return ""
+	}
+	return time.UnixMilli(expMillis).UTC().Format(time.RFC3339)
+}
+
+func codexAccessExpiredForLog(account StoredCodexAccount) bool {
+	if account.Auth.Tokens == nil {
+		return false
+	}
+	return IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second)
+}
+
+func appendCodexRefreshErrorAttrs(attrs *[]any, err error) {
+	if err == nil {
+		return
+	}
+	var refreshErr *CodexAuthRefreshError
+	if errors.As(err, &refreshErr) {
+		*attrs = append(*attrs,
+			"status", refreshErr.StatusCode,
+			"provider_type", refreshErr.ProviderType,
+			"provider_code", refreshErr.ProviderCode,
+			"provider_message", refreshErr.ProviderMessage,
+		)
+		return
+	}
+	*attrs = append(*attrs, "error", err)
 }
 
 func DecodeJWTClaims(token string) (map[string]any, error) {

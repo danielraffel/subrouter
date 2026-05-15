@@ -100,6 +100,9 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	if r == nil || account.AuthMode != accounts.AuthModeOAuth || (account.Provider != "" && account.Provider != accounts.ProviderCodex) {
 		return account, nil
 	}
+	if accounts.CodexRefreshReason(ctx) == "" {
+		ctx = accounts.WithCodexRefreshReason(ctx, "proxy.account-refresh")
+	}
 	stored, ok, err := r.store.FindStored(account.ID)
 	if err != nil || !ok {
 		return account, err
@@ -156,13 +159,17 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 		}
 		status.AuthMode = accounts.AuthModeOAuth
 		status.AuthChecked = true
+		refreshCtx := accounts.WithCodexRefreshReason(ctx, "account-status.if-expired")
+		if forceRefresh {
+			refreshCtx = accounts.WithCodexRefreshReason(ctx, "account-status.force")
+		}
 		refreshed := stored
 		didRefresh := false
 		var refreshErr error
 		if forceRefresh {
-			refreshed, didRefresh, refreshErr = r.store.RefreshStored(ctx, r.client, stored)
+			refreshed, didRefresh, refreshErr = r.store.RefreshStored(refreshCtx, r.client, stored)
 		} else {
-			refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpired(ctx, r.client, stored)
+			refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
 		}
 		if refreshErr != nil {
 			status.AuthValid = false
@@ -332,7 +339,8 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		refreshed, err := s.refreshAccount(ctx, account)
+		refreshCtx := accounts.WithCodexRefreshReason(ctx, "proxy.score-accounts")
+		refreshed, err := s.refreshAccount(refreshCtx, account)
 		if err != nil {
 			if s.Logger != nil {
 				s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)

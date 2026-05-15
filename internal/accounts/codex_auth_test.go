@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -113,6 +114,31 @@ func TestRefreshStoredIfExpiredRecoversFromRefreshTokenReuseAfterExternalWrite(t
 	}
 	if got.Auth.Tokens.RefreshToken != "new-refresh" {
 		t.Fatalf("refresh token = %q, want new-refresh", got.Auth.Tokens.RefreshToken)
+	}
+}
+
+func TestRefreshStoredIfExpiredReturnsProviderRefreshError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusUnauthorized, `{"error":{"message":"invalidated","type":"invalid_request_error","code":"refresh_token_invalidated"}}`), nil
+	})}
+
+	_, _, err := store.RefreshStoredIfExpired(context.Background(), client, stale)
+	if err == nil {
+		t.Fatal("expected refresh error")
+	}
+	var refreshErr *CodexAuthRefreshError
+	if !errors.As(err, &refreshErr) {
+		t.Fatalf("error type = %T, want CodexAuthRefreshError", err)
+	}
+	if refreshErr.StatusCode != http.StatusUnauthorized || refreshErr.ProviderCode != "refresh_token_invalidated" || refreshErr.ProviderType != "invalid_request_error" {
+		t.Fatalf("unexpected refresh error: %+v", refreshErr)
 	}
 }
 
