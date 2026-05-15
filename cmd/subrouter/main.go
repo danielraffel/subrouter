@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -18,11 +19,13 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 )
 
 func main() {
 	program := filepath.Base(os.Args[0])
+	configureDefaultLogger(program, os.Args[1:])
 	if program == "cx" {
 		if err := cx(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "cx:", err)
@@ -34,6 +37,31 @@ func main() {
 		fmt.Fprintln(os.Stderr, "subrouter:", err)
 		os.Exit(1)
 	}
+}
+
+func configureDefaultLogger(program string, args []string) {
+	if shouldUseProcessLogger(program, args) {
+		return
+	}
+	path := filepath.Join(storepath.StateDir(), "logs", "subrouter-cli.log")
+	handler := newCLIFileLogHandler(path)
+	slog.SetDefault(slog.New(handler))
+}
+
+func shouldUseProcessLogger(_ string, args []string) bool {
+	return len(args) > 0 && args[0] == "serve"
+}
+
+func newCLIFileLogHandler(path string) slog.Handler {
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return slog.NewTextHandler(io.Discard, opts)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return slog.NewTextHandler(io.Discard, opts)
+	}
+	return slog.NewTextHandler(file, opts)
 }
 
 func run(args []string) error {

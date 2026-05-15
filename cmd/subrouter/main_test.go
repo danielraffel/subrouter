@@ -1,6 +1,9 @@
 package main
 
 import (
+	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -8,6 +11,39 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestConfigureDefaultLoggerWritesCLIToStateLog(t *testing.T) {
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+
+	stateDir := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+
+	configureDefaultLogger("sr", []string{"status"})
+	slog.Info("cli log test", "account", "test@example.com")
+
+	data, err := os.ReadFile(filepath.Join(stateDir, "logs", "subrouter-cli.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "cli log test") || !strings.Contains(got, "test@example.com") {
+		t.Fatalf("cli log file missing log record:\n%s", got)
+	}
+}
+
+func TestConfigureDefaultLoggerLeavesServeLoggerAlone(t *testing.T) {
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+
+	sentinel := slog.New(slog.NewTextHandler(io.Discard, nil))
+	slog.SetDefault(sentinel)
+
+	configureDefaultLogger("subrouter", []string{"serve"})
+	if slog.Default() != sentinel {
+		t.Fatal("serve should keep the process logger")
+	}
+}
 
 func TestRunAcceptsDirectCXCommands(t *testing.T) {
 	home := t.TempDir()
