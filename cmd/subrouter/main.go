@@ -73,13 +73,38 @@ func runForProgram(program string, args []string) error {
 	}
 }
 
+var directCXCommands = map[string]struct{}{
+	"add":              {},
+	"add-admin-key":    {},
+	"add-api-key":      {},
+	"add-key":          {},
+	"admin-keys":       {},
+	"attach-project":   {},
+	"claude":           {},
+	"gemini":           {},
+	"gui":              {},
+	"gui-switch":       {},
+	"gui-use":          {},
+	"import":           {},
+	"list":             {},
+	"list-admin-keys":  {},
+	"login":            {},
+	"ls":               {},
+	"pick":             {},
+	"remove":           {},
+	"remove-admin-key": {},
+	"rm":               {},
+	"server":           {},
+	"servers":          {},
+	"status":           {},
+	"switch":           {},
+	"usage":            {},
+	"use":              {},
+}
+
 func isDirectCXCommand(command string) bool {
-	switch command {
-	case "add", "login", "add-key", "add-api-key", "import", "list", "ls", "switch", "use", "gui", "gui-switch", "gui-use", "remove", "rm", "status", "pick", "usage", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project", "server", "servers", "claude", "gemini":
-		return true
-	default:
-		return false
-	}
+	_, ok := directCXCommands[command]
+	return ok
 }
 
 func serve(args []string) error {
