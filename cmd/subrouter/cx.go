@@ -37,6 +37,7 @@ const (
 	ansiBGYellow = "\x1b[43m"
 	ansiBGRed    = "\x1b[41m"
 	ansiBGGray   = "\x1b[100m"
+	ansiBGRowAlt = "\x1b[48;5;236m"
 )
 
 const cxHelp = `cx - Manage multiple Codex accounts
@@ -1238,7 +1239,7 @@ func displayUsageRowsGrid(out io.Writer, rows []cxUsageRow, numbered bool, color
 	fmt.Fprintln(out)
 	printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 		return usageGridCell{Text: col.Title, Style: ansiDim}
-	}, colored)
+	}, colored, "")
 	printUsageGridSeparator(out, columns, colored)
 	for i, row := range rows {
 		rowIndex := ""
@@ -1259,7 +1260,7 @@ func displayUsageRowsGrid(out io.Writer, rows []cxUsageRow, numbered bool, color
 		}
 		printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 			return values[col.Title]
-		}, colored)
+		}, colored, usageGridRowStyle(i))
 	}
 	fmt.Fprintln(out)
 	if usageRowsHaveErrors(rows) {
@@ -1336,19 +1337,26 @@ func widenUsageGridColumn(columns []usageGridColumn, title string, extra int, ma
 	return extra
 }
 
-func printUsageGridLine(out io.Writer, columns []usageGridColumn, value func(usageGridColumn) usageGridCell, colored bool) {
+func printUsageGridLine(out io.Writer, columns []usageGridColumn, value func(usageGridColumn) usageGridCell, colored bool, rowStyle string) {
 	for i, col := range columns {
 		if i > 0 {
-			fmt.Fprint(out, "  ")
+			fmt.Fprint(out, style(colored, rowStyle, "  "))
 		}
 		cell := value(col)
 		text := fitCell(cell.Text, col.Width)
-		if cell.Style != "" {
-			text = style(colored, cell.Style, text)
+		if cell.Style != "" || rowStyle != "" {
+			text = style(colored, rowStyle+cell.Style, text)
 		}
 		fmt.Fprint(out, text)
 	}
 	fmt.Fprintln(out)
+}
+
+func usageGridRowStyle(rowIndex int) string {
+	if rowIndex%2 == 1 {
+		return ansiBGRowAlt
+	}
+	return ""
 }
 
 func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored bool) {

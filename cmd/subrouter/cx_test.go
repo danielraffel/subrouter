@@ -901,7 +901,7 @@ func TestDisplayUsageRowsGridColorsWhenForced(t *testing.T) {
 	}, true)
 
 	got := out.String()
-	for _, code := range []string{ansiGreen, ansiYellow, ansiRed, ansiBold + ansiWhite, ansiDim} {
+	for _, code := range []string{ansiGreen, ansiYellow, ansiRed, ansiBold + ansiWhite, ansiDim, ansiBGRowAlt} {
 		if !strings.Contains(got, code) {
 			t.Fatalf("grid output missing color %q:\n%q", code, got)
 		}
