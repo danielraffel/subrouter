@@ -865,6 +865,10 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	if strings.Contains(got, "pick") {
 		t.Fatalf("forced grid should not render detailed pick label:\n%s", got)
 	}
+	lines := strings.Split(got, "\n")
+	if len(lines) < 3 || !strings.Contains(lines[2], "===") || strings.Contains(lines[2], "---") {
+		t.Fatalf("grid separator should be a solid equals rule:\n%s", got)
+	}
 }
 
 func TestDisplayUsageRowsGridColorsWhenForced(t *testing.T) {

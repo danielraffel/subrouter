@@ -1364,7 +1364,7 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 		if i > 0 {
 			fmt.Fprint(out, "  ")
 		}
-		fmt.Fprint(out, style(colored, ansiDim, strings.Repeat("-", col.Width)))
+		fmt.Fprint(out, style(colored, ansiBold, strings.Repeat("=", col.Width)))
 	}
 	fmt.Fprintln(out)
 }
