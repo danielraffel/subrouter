@@ -42,8 +42,47 @@ type Server struct {
 	ScoreAccounts  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
 	Transport      http.RoundTripper
 	Logger         *slog.Logger
+	ActiveSessions *ActiveSessions
 	MaxBodyBytes   int64
 	Transcripts    *transcript.Recorder
+}
+
+type ActiveSessions struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func NewActiveSessions() *ActiveSessions {
+	return &ActiveSessions{counts: map[string]int{}}
+}
+
+func (a *ActiveSessions) Begin(agentType, sessionID string) func() {
+	if a == nil || sessionID == "" {
+		return func() {}
+	}
+	key := session.ScopedSessionKey(agentType, sessionID)
+	a.mu.Lock()
+	a.counts[key]++
+	a.mu.Unlock()
+	return func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.counts[key] <= 1 {
+			delete(a.counts, key)
+			return
+		}
+		a.counts[key]--
+	}
+}
+
+func (a *ActiveSessions) Active(agentType, sessionID string) bool {
+	if a == nil || sessionID == "" {
+		return false
+	}
+	key := session.ScopedSessionKey(agentType, sessionID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.counts[key] > 0
 }
 
 type AccountRef struct {
@@ -200,6 +239,9 @@ func (r *AccountRef) replace(account accounts.Account) {
 }
 
 func (s Server) Handler() http.Handler {
+	if s.ActiveSessions == nil {
+		s.ActiveSessions = NewActiveSessions()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/accounts", s.handleAccounts)
@@ -416,6 +458,12 @@ func (s Server) proxyHandler() http.Handler {
 		if auth == "" {
 			http.Error(w, "selected account has no usable credential", http.StatusServiceUnavailable)
 			return
+		}
+
+		endActive := func() {}
+		if activeSessionRequest(agentType, r) {
+			endActive = s.ActiveSessions.Begin(agentType, sessionID)
+			defer endActive()
 		}
 
 		setAccountAuthHeaders(r.Header, account)
@@ -1094,8 +1142,19 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 			userEmail = assignment.UserEmail
 		}
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
-			if !scheduler.Exhausted(account.ID) {
+			if s.reuseStickyAssignment(agentType, sessionID, account, scheduler) {
+				s.logStickyReuse(agentType, sessionID, account, scheduler)
 				return account, sessionID, userEmail, nil
+			}
+			if s.Logger != nil {
+				s.Logger.Info("rerouting cold sticky session from constrained account",
+					"agent", agentType,
+					"session", sessionID,
+					"account", account.ID,
+					"active", s.activeSession(agentType, sessionID),
+					"usable_for_new_session", scheduler.UsableForNewSession(account.ID),
+					"exhausted", scheduler.Exhausted(account.ID),
+				)
 			}
 		}
 	}
@@ -1117,6 +1176,62 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 		return accounts.Account{}, sessionID, userEmail, err
 	}
 	return account, sessionID, assignment.UserEmail, nil
+}
+
+func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) {
+	if s.Logger == nil || providerForAgent(agentType) != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
+		return
+	}
+	if scheduler.UsableForNewSession(account.ID) || scheduler.Exhausted(account.ID) || !s.activeSession(agentType, sessionID) {
+		return
+	}
+	s.Logger.Info("keeping active sticky session on constrained account",
+		"agent", agentType,
+		"session", sessionID,
+		"account", account.ID,
+		"usable_for_new_session", false,
+		"exhausted", false,
+	)
+}
+
+func (s Server) reuseStickyAssignment(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) bool {
+	if s.activeSession(agentType, sessionID) {
+		return true
+	}
+	if scheduler.Exhausted(account.ID) {
+		return false
+	}
+	if providerForAgent(agentType) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
+		return scheduler.UsableForNewSession(account.ID)
+	}
+	return true
+}
+
+func (s Server) activeSession(agentType, sessionID string) bool {
+	return s.ActiveSessions != nil && s.ActiveSessions.Active(agentType, sessionID)
+}
+
+func activeSessionRequest(agentType string, r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if websocket.IsWebSocketUpgrade(r) {
+		return true
+	}
+	if session.NormalizeAgentType(agentType) != "codex" || r.Method != http.MethodPost {
+		return false
+	}
+	return codexResponsePath(r.URL.Path)
+}
+
+func codexResponsePath(path string) bool {
+	switch path {
+	case "/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact",
+		"/backend-api/codex/responses", "/backend-api/codex/responses/compact":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s Server) refreshUsageScoresIfStale(ctx context.Context, availableAccounts []accounts.Account) {

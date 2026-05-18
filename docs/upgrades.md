@@ -6,6 +6,8 @@ Use this runbook for local macOS daemon upgrades when Codex is already pointed a
 
 This path has a short listener restart. Existing in-flight requests can fail once, but future Codex requests reconnect to the same URL. Do not change client base URLs for a local binary upgrade.
 
+On macOS, use the new binary's `install-daemon` path so launchd re-registers the LaunchAgent. Modern launchd can attach launch constraints to the binary it bootstrapped; a plain `mv` plus `launchctl kickstart -k` can fail with `OS_REASON_CODESIGNING | Launch Constraint Violation`.
+
 Run from the Subrouter checkout:
 
 ```bash
@@ -17,19 +19,54 @@ service="gui/$(id -u)/$label"
 health_url="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 backup="$bin.backup-$(date +%Y%m%d-%H%M%S)"
 next="$(mktemp "$bin.next.XXXXXX")"
+smoke_log="${TMPDIR:-/tmp}/subrouter-upgrade-smoke.log"
+
+rollback() {
+  if [ -x "$backup" ]; then
+    "$backup" install-daemon \
+      --addr 127.0.0.1:31415 \
+      --transcripts "$HOME/.subrouter/transcripts" \
+      --cx-switch-interval 10m \
+      --working-directory "$PWD"
+  fi
+}
 
 go build -ldflags=-linkmode=external -o "$next" ./cmd/subrouter
 chmod 0755 "$next"
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - "$next" >/dev/null
+  codesign --verify --verbose=4 "$next"
+fi
 "$next" help >/dev/null
 curl -fsS "$health_url" >/dev/null
+
+rm -f "$smoke_log"
+"$next" serve --addr 127.0.0.1:31416 --fetch-usage=false --cx-switch-interval 0 >"$smoke_log" 2>&1 &
+smoke_pid="$!"
+smoke_ok=0
+for _ in $(seq 1 40); do
+  if curl -fsS http://127.0.0.1:31416/_subrouter/health >/dev/null; then
+    smoke_ok=1
+    break
+  fi
+  sleep 0.25
+done
+kill "$smoke_pid" >/dev/null 2>&1 || true
+wait "$smoke_pid" >/dev/null 2>&1 || true
+if [ "$smoke_ok" != 1 ]; then
+  cat "$smoke_log" >&2
+  exit 1
+fi
 
 before_pid="$(launchctl print "$service" | awk '/pid =/ {print $3; exit}')"
 before_sha="$(shasum -a 256 "$bin" | awk '{print $1}')"
 
 cp -p "$bin" "$backup"
-mv "$next" "$bin"
-
-launchctl kickstart -k "$service"
+"$next" install-daemon \
+  --addr 127.0.0.1:31415 \
+  --transcripts "$HOME/.subrouter/transcripts" \
+  --cx-switch-interval 10m \
+  --working-directory "$PWD"
 
 ok=0
 for _ in $(seq 1 80); do
@@ -48,10 +85,12 @@ printf 'before_pid=%s\nafter_pid=%s\nbefore_sha=%s\nafter_sha=%s\nbackup=%s\nhea
 cat /tmp/subrouter-health.json
 
 if [ "$ok" != 1 ]; then
+  rollback
   exit 1
 fi
 if [ "${before_pid:-}" = "${after_pid:-}" ]; then
   echo "subrouter pid did not change" >&2
+  rollback
   exit 1
 fi
 ```
@@ -62,20 +101,21 @@ Rollback uses the printed backup path:
 set -euo pipefail
 
 backup="<printed-backup-path>"
-bin="${SUBROUTER_BIN:-$HOME/bin/subrouter}"
-service="gui/$(id -u)/${SUBROUTER_LABEL:-ai.manaflow.subrouter}"
 
-cp -p "$backup" "$bin"
-launchctl kickstart -k "$service"
+"$backup" install-daemon \
+  --addr 127.0.0.1:31415 \
+  --transcripts "$HOME/.subrouter/transcripts" \
+  --cx-switch-interval 10m \
+  --working-directory "$(pwd)"
 curl -fsS http://127.0.0.1:31415/_subrouter/health
 ```
 
 ## Rules
 
 - Keep the public URL stable. Codex desktop and long-running CLI processes do not reliably adopt a new base URL mid-session.
-- Replace the binary atomically with `mv`, then restart the supervisor. Do not edit the live binary in place.
-- Use `launchctl kickstart -k`, not `kill -9`. Launchd owns restart policy and environment.
-- Do not run `install-daemon` for ordinary binary upgrades. It rewrites the LaunchAgent and does a heavier bootout/bootstrap flow.
+- Use `install-daemon` for local macOS binary upgrades so launchd refreshes its launch constraint for the new binary.
+- Do not edit the live binary in place. Build a separate binary, smoke-test it, then let `install-daemon` copy it into place.
+- Do not use `kill -9`. Launchd owns restart policy and environment.
 - Keep a backup binary until the new daemon has served real traffic.
 - Do not work around upstream write failures by globally disabling connection pooling. Keep the outbound transport pooled, keep ChatGPT traffic on HTTP/1.1 to avoid HTTP/2 stream fanout, limit concurrent replayable `/responses` uploads, and handle transient `broken pipe`, `closed network connection`, `connection reset`, `unexpected EOF`, and TLS record errors with several replay attempts for buffered `/responses` and `/responses/compact` POSTs.
 

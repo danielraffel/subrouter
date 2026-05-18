@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1903,6 +1905,219 @@ func TestHandlerReroutesStickySessionWhenAssignedAccountExhausted(t *testing.T) 
 
 	if strings.Join(auths, "\x00") != "Bearer healthy-token" {
 		t.Fatalf("auths = %#v, want healthy account", auths)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("missing session-1 assignment")
+	}
+	if assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+}
+
+func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowHeadroom(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "low@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "low@example.com", AuthMode: accounts.AuthModeOAuth, Token: "low-token"},
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "low@example.com", Headroom: 0.10, ShortHeadroom: 0.10},
+			{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+
+	if strings.Join(auths, "\x00") != "Bearer healthy-token" {
+		t.Fatalf("auths = %#v, want healthy account", auths)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("missing session-1 assignment")
+	}
+	if assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+}
+
+func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowHeadroom(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+
+		block := false
+		if r.URL.Path == "/v1/responses" {
+			firstOnce.Do(func() {
+				block = true
+				close(firstStarted)
+			})
+		}
+		if block {
+			<-releaseFirst
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "low@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "low@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
+		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "low@example.com", AuthMode: accounts.AuthModeOAuth, Token: "low-token"},
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	firstReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReq.Header.Set("X-Subrouter-Session", "session-1")
+	firstErr := make(chan error, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(firstReq)
+		if err != nil {
+			firstErr <- err
+			return
+		}
+		defer response.Body.Close()
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			firstErr <- err
+			return
+		}
+		if response.StatusCode != http.StatusNoContent {
+			firstErr <- fmt.Errorf("first status = %d, want 204", response.StatusCode)
+			return
+		}
+		firstErr <- nil
+	}()
+
+	select {
+	case <-firstStarted:
+	case err := <-firstErr:
+		t.Fatalf("first request finished before becoming active: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first request to become active")
+	}
+
+	schedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "low@example.com", Headroom: 0.10, ShortHeadroom: 0.10},
+		{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
+	}))
+
+	secondReq, err := http.NewRequest(http.MethodGet, subrouter.URL+"/backend-api/codex/analytics-events/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReq.Header.Set("X-Subrouter-Session", "session-1")
+	secondResp, err := http.DefaultClient.Do(secondReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, secondResp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondResp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if secondResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("second status = %d, want 204", secondResp.StatusCode)
+	}
+
+	close(releaseFirst)
+	if err := <-firstErr; err != nil {
+		t.Fatal(err)
+	}
+
+	thirdReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdReq.Header.Set("X-Subrouter-Session", "session-1")
+	thirdResp, err := http.DefaultClient.Do(thirdReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, thirdResp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := thirdResp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if thirdResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("third status = %d, want 204", thirdResp.StatusCode)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), auths...)
+	mu.Unlock()
+	want := []string{"Bearer low-token", "Bearer low-token", "Bearer healthy-token"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", got, want)
 	}
 	assignment, ok := store.Get("codex", "session-1")
 	if !ok {
