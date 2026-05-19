@@ -1,11 +1,13 @@
 package accounts
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -251,6 +253,54 @@ func TestRefreshStoredIfExpiredSyncsActiveAuthWhenActiveAccountRefreshes(t *test
 	}
 	if active.Tokens.RefreshToken != "new-refresh" {
 		t.Fatalf("active refresh token = %q, want new-refresh", active.Tokens.RefreshToken)
+	}
+}
+
+func TestRefreshStoredIfExpiredLogsRefreshFingerprints(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(previousLogger)
+
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return refreshResponse("new", "founders@example.com", time.Now().Add(time.Hour)), nil
+	})}
+
+	ctx := WithCodexRefreshReason(context.Background(), "test.refresh")
+	if _, _, err := store.RefreshStoredIfExpired(ctx, client, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	out := logs.String()
+	oldRefreshFP := codexTokenFingerprint("old-refresh")
+	newRefreshFP := codexTokenFingerprint("new-refresh")
+	for _, want := range []string{
+		"msg=\"codex oauth refresh start\"",
+		"msg=\"codex oauth refresh succeeded\"",
+		"reason=test.refresh",
+		"refresh_fp=" + oldRefreshFP,
+		"old_refresh_fp=" + oldRefreshFP,
+		"new_refresh_fp=" + newRefreshFP,
+		"host=",
+		"pid=",
+		"store_dir=",
+		"source_path=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("logs missing %q:\n%s", want, out)
+		}
+	}
+	for _, secret := range []string{"old-refresh", "new-refresh"} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("logs leaked refresh token %q:\n%s", secret, out)
+		}
 	}
 }
 
