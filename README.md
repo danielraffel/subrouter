@@ -82,6 +82,79 @@ This creates a `subrouter` system user, stores state under `/var/lib/subrouter`,
 
 If legacy `switchboard` or `gateway` services exist, `sr install-systemd` stops and disables them, merges their `/var/lib/...` state into `/var/lib/subrouter`, and preserves their extra service args.
 
+## Production setup with an agent
+
+Subrouter is production-ready when it is private to your tailnet or VPC, has an admin token for non-loopback admin endpoints, uses server-owned OAuth refresh-token chains, and passes health, readiness, account-status, and log checks.
+
+Paste this into Claude, Codex, or another coding agent that has SSH access to your server and a local browser for OAuth:
+
+```text
+Set up Subrouter as a shared production service.
+
+Inputs:
+- Server SSH target: <user@host>
+- Server URL reachable from my machine: http://<tailnet-ip-or-dns>:31415
+- Local server nickname: team
+
+Rules:
+- Do not copy ~/.codex/auth.json or local ~/.subrouter/codex/accounts/*.json to the server.
+- Server OAuth accounts must be created with fresh server-owned login flows.
+- Do not print access tokens, refresh tokens, API keys, id tokens, or admin tokens.
+- Keep the listener private to Tailscale/VPC. Do not expose it to the public internet.
+- Use the released Subrouter binary unless I explicitly ask you to build from source.
+
+Steps:
+1. On this local machine, create an admin token variable without printing it:
+   TOKEN="$(openssl rand -hex 32)"
+2. Install the release on the server:
+   ssh <user@host> 'curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh'
+3. Install the systemd service with the local admin token and verify it over loopback:
+   ssh <user@host> "sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token '$TOKEN'"
+   ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/health'
+   ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/ready'
+4. Save the same admin token locally in Subrouter server config without printing it:
+   sr server add team --url http://<tailnet-ip-or-dns>:31415 --admin-token "$TOKEN" --default
+5. Create server-owned Codex OAuth chains:
+   sr server sync team --device-auth
+   Follow each OAuth flow. Do not upload local refresh tokens.
+6. Verify:
+   sr server status team
+   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/health
+   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/ready
+   ssh <user@host> 'journalctl -u subrouter --since "30 min ago" --no-pager | grep -Ei "WARN|ERROR|failed|401|502|503|no usable|refresh_token" | tail -n 200 || true'
+7. Report:
+   - systemd active/running status
+   - health and readiness result
+   - number of registered Codex OAuth accounts
+   - any warning/error log lines, without secrets
+   - the exact command I should use for Codex through Subrouter
+```
+
+For local-only use on macOS, paste this instead:
+
+```text
+Set up Subrouter locally for Codex.
+
+Rules:
+- Do not print tokens.
+- Do not edit Codex config by hand unless Subrouter docs say so.
+
+Steps:
+1. Install:
+   curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
+2. Install and verify the LaunchAgent:
+   sr install-daemon
+   curl -fsS http://127.0.0.1:31415/_subrouter/health
+   curl -fsS http://127.0.0.1:31415/_subrouter/ready
+3. Add Codex accounts:
+   sr add
+   Repeat as needed.
+4. Verify:
+   sr status
+5. Report the command I should use:
+   sr codex
+```
+
 Useful endpoints:
 
 ```text
