@@ -299,6 +299,12 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 				slog.Warn("account refresh lookup failed", "account", account.ID, "error", err)
 			} else if refreshed, _, err := store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored); err != nil {
 				slog.Warn("account refresh failed", "account", account.ID, "error", err)
+				mu.Lock()
+				if idx, ok := scoreByID[account.ID]; ok {
+					scores[idx] = selectacct.Score{AccountID: account.ID, Headroom: 0, ShortHeadroom: 0}
+				}
+				mu.Unlock()
+				return
 			} else if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
 				account = refreshedAccount
 			}
