@@ -6,9 +6,10 @@ import (
 )
 
 type SchedulerRef struct {
-	mu        sync.RWMutex
-	scheduler Scheduler
-	updatedAt time.Time
+	mu         sync.RWMutex
+	scheduler  Scheduler
+	updatedAt  time.Time
+	refreshing bool
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
@@ -52,6 +53,29 @@ func (r *SchedulerRef) Stale(ttl time.Duration) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.updatedAt.IsZero() || time.Since(r.updatedAt) >= ttl
+}
+
+func (r *SchedulerRef) BeginRefreshIfStale(ttl time.Duration) bool {
+	if ttl <= 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.refreshing || (!r.updatedAt.IsZero() && time.Since(r.updatedAt) < ttl) {
+		return false
+	}
+	r.refreshing = true
+	return true
+}
+
+func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if update {
+		r.scheduler = scheduler
+	}
+	r.updatedAt = time.Now()
+	r.refreshing = false
 }
 
 func (r *SchedulerRef) Touch() {

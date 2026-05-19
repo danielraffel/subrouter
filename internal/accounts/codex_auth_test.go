@@ -142,6 +142,87 @@ func TestRefreshStoredIfExpiredReturnsProviderRefreshError(t *testing.T) {
 	}
 }
 
+func TestRefreshStoredIfExpiredCachesTerminalRefreshError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return jsonResponse(http.StatusUnauthorized, `{"error":{"message":"Your refresh token has already been used to generate a new access token. Please try signing in again.","type":"invalid_request_error","code":"refresh_token_reused"}}`), nil
+	})}
+
+	if _, _, err := store.RefreshStoredIfExpired(context.Background(), client, stale); err == nil {
+		t.Fatal("expected first refresh error")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("refresh calls after first attempt = %d, want 1", calls.Load())
+	}
+	stored, ok, err := store.FindStored("founders@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || stored.Auth.RefreshFailure == nil {
+		t.Fatal("missing cached refresh failure")
+	}
+	if stored.Auth.RefreshFailure.ProviderCode != "refresh_token_reused" {
+		t.Fatalf("cached provider code = %q, want refresh_token_reused", stored.Auth.RefreshFailure.ProviderCode)
+	}
+
+	if _, _, err := store.RefreshStoredIfExpired(context.Background(), client, stale); err == nil {
+		t.Fatal("expected cached refresh error")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("refresh calls after cached attempt = %d, want 1", calls.Load())
+	}
+}
+
+func TestRefreshStoredIfExpiredDoesNotCacheTransientRefreshError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return jsonResponse(http.StatusInternalServerError, `{}`), nil
+		}
+		return refreshResponse("new", "founders@example.com", time.Now().Add(time.Hour)), nil
+	})}
+
+	if _, _, err := store.RefreshStoredIfExpired(context.Background(), client, stale); err == nil {
+		t.Fatal("expected transient refresh error")
+	}
+	stored, ok, err := store.FindStored("founders@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing stored account")
+	}
+	if stored.Auth.RefreshFailure != nil {
+		t.Fatalf("unexpected cached refresh failure: %+v", stored.Auth.RefreshFailure)
+	}
+
+	got, _, err := store.RefreshStoredIfExpired(context.Background(), client, stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("refresh calls = %d, want 2", calls.Load())
+	}
+	if got.Auth.Tokens.RefreshToken != "new-refresh" {
+		t.Fatalf("refresh token = %q, want new-refresh", got.Auth.Tokens.RefreshToken)
+	}
+}
+
 func TestRefreshStoredIfExpiredSyncsActiveAuthWhenActiveAccountRefreshes(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

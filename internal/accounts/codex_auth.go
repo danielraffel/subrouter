@@ -182,6 +182,10 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshSkipped(ctx, account, force, "access_token_fresh")
 		return account, false, nil
 	}
+	if err := terminalStoredRefreshFailure(account); err != nil {
+		logCodexRefreshSkipped(ctx, account, force, "terminal_refresh_failure")
+		return account, false, err
+	}
 
 	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
@@ -206,6 +210,10 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshSkipped(ctx, account, force, "access_token_fresh_after_lock")
 		return account, false, nil
 	}
+	if err := terminalStoredRefreshFailure(account); err != nil {
+		logCodexRefreshSkipped(ctx, account, force, "terminal_refresh_failure_after_lock")
+		return account, false, err
+	}
 
 	logCodexRefreshStart(ctx, account, force)
 	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
@@ -214,9 +222,16 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 			logCodexRefreshRecovered(ctx, account, recovered, force, err)
 			return recovered, false, nil
 		}
+		if failure, ok := codexRefreshFailureFromError(err); ok {
+			account.Auth.RefreshFailure = failure
+			if saveErr := s.saveStoredUnlocked(account); saveErr != nil {
+				logCodexRefreshFailed(ctx, account, force, saveErr)
+			}
+		}
 		logCodexRefreshFailed(ctx, account, force, err)
 		return account, false, err
 	}
+	auth.RefreshFailure = nil
 	account.Auth = auth
 	if err := s.saveStoredUnlocked(account); err != nil {
 		logCodexRefreshFailed(ctx, account, force, err)
@@ -244,6 +259,64 @@ func (s CodexStore) recoverRefreshedAccount(previous StoredCodexAccount) (Stored
 		return StoredCodexAccount{}, false
 	}
 	return latest, true
+}
+
+type CodexStoredRefreshFailureError struct {
+	Failure CodexRefreshFailure
+}
+
+func (e *CodexStoredRefreshFailureError) Error() string {
+	if e == nil {
+		return ""
+	}
+	parts := []string{"token refresh previously failed"}
+	if e.Failure.StatusCode != 0 {
+		parts[0] = fmt.Sprintf("%s (%d)", parts[0], e.Failure.StatusCode)
+	}
+	if e.Failure.ProviderCode != "" {
+		parts = append(parts, e.Failure.ProviderCode)
+	}
+	if e.Failure.ProviderMessage != "" {
+		parts = append(parts, e.Failure.ProviderMessage)
+	}
+	if e.Failure.At != "" {
+		parts = append(parts, "reauth required; recorded at "+e.Failure.At)
+	} else {
+		parts = append(parts, "reauth required")
+	}
+	return strings.Join(parts, ": ")
+}
+
+func terminalStoredRefreshFailure(account StoredCodexAccount) error {
+	failure := account.Auth.RefreshFailure
+	if failure == nil || !isTerminalCodexRefreshFailure(failure.StatusCode, failure.ProviderCode, failure.ProviderMessage) {
+		return nil
+	}
+	return &CodexStoredRefreshFailureError{Failure: *failure}
+}
+
+func codexRefreshFailureFromError(err error) (*CodexRefreshFailure, bool) {
+	var refreshErr *CodexAuthRefreshError
+	if !errors.As(err, &refreshErr) ||
+		!isTerminalCodexRefreshFailure(refreshErr.StatusCode, refreshErr.ProviderCode, refreshErr.ProviderMessage) {
+		return nil, false
+	}
+	return &CodexRefreshFailure{
+		At:              time.Now().UTC().Format(time.RFC3339),
+		StatusCode:      refreshErr.StatusCode,
+		ProviderType:    refreshErr.ProviderType,
+		ProviderCode:    refreshErr.ProviderCode,
+		ProviderMessage: refreshErr.ProviderMessage,
+	}, true
+}
+
+func isTerminalCodexRefreshFailure(statusCode int, providerCode, providerMessage string) bool {
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusUnauthorized {
+		return false
+	}
+	providerCode = strings.ToLower(strings.TrimSpace(providerCode))
+	providerMessage = strings.ToLower(providerMessage)
+	return strings.Contains(providerCode, "refresh_token") || strings.Contains(providerMessage, "refresh token")
 }
 
 func accountAuthNewerThanIncoming(stored, incoming CodexAuthFile) bool {

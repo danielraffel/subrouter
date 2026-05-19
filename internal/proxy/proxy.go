@@ -1235,7 +1235,7 @@ func codexResponsePath(path string) bool {
 }
 
 func (s Server) refreshUsageScoresIfStale(ctx context.Context, availableAccounts []accounts.Account) {
-	if s.SchedulerRef == nil || s.UsageScoreTTL <= 0 || !s.SchedulerRef.Stale(s.UsageScoreTTL) {
+	if s.SchedulerRef == nil || !s.SchedulerRef.BeginRefreshIfStale(s.UsageScoreTTL) {
 		return
 	}
 	scoreAccounts := s.ScoreAccounts
@@ -1244,7 +1244,7 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context, availableAccounts
 	}
 	scores, scored := scoreAccounts(ctx, availableAccounts)
 	if scored == 0 {
-		s.SchedulerRef.Touch()
+		s.SchedulerRef.FinishRefresh(selectacct.Scheduler{}, false)
 		if s.Logger != nil {
 			s.Logger.Warn("usage score refresh skipped", "reason", "no fresh OAuth usage scores")
 		}
@@ -1254,7 +1254,7 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context, availableAccounts
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
-	s.SchedulerRef.Set(scheduler)
+	s.SchedulerRef.FinishRefresh(scheduler, true)
 	if s.Logger != nil {
 		s.Logger.Debug("usage scores refreshed before account selection", "accounts", len(availableAccounts), "scored", scored)
 	}

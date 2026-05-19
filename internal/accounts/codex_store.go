@@ -27,10 +27,11 @@ type StoredCodexAccount struct {
 }
 
 type CodexAuthFile struct {
-	Tokens       *CodexTokens `json:"tokens,omitempty"`
-	LastRefresh  string       `json:"last_refresh,omitempty"`
-	AuthMode     string       `json:"auth_mode,omitempty"`
-	OpenAIAPIKey string       `json:"OPENAI_API_KEY,omitempty"`
+	Tokens         *CodexTokens         `json:"tokens,omitempty"`
+	LastRefresh    string               `json:"last_refresh,omitempty"`
+	AuthMode       string               `json:"auth_mode,omitempty"`
+	OpenAIAPIKey   string               `json:"OPENAI_API_KEY,omitempty"`
+	RefreshFailure *CodexRefreshFailure `json:"refresh_failure,omitempty"`
 }
 
 type CodexTokens struct {
@@ -38,6 +39,14 @@ type CodexTokens struct {
 	RefreshToken string `json:"refresh_token"`
 	IDToken      string `json:"id_token"`
 	AccountID    string `json:"account_id,omitempty"`
+}
+
+type CodexRefreshFailure struct {
+	At              string `json:"at"`
+	StatusCode      int    `json:"status_code,omitempty"`
+	ProviderType    string `json:"provider_type,omitempty"`
+	ProviderCode    string `json:"provider_code,omitempty"`
+	ProviderMessage string `json:"provider_message,omitempty"`
 }
 
 func DefaultCodexStore() CodexStore {
