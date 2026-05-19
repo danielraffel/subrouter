@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -43,6 +44,8 @@ type Server struct {
 	Transport      http.RoundTripper
 	Logger         *slog.Logger
 	ActiveSessions *ActiveSessions
+	Lifecycle      *Lifecycle
+	AdminToken     string
 	MaxBodyBytes   int64
 	Transcripts    *transcript.Recorder
 }
@@ -83,6 +86,57 @@ func (a *ActiveSessions) Active(agentType, sessionID string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.counts[key] > 0
+}
+
+type Lifecycle struct {
+	startedAt time.Time
+	draining  atomic.Bool
+	active    atomic.Int64
+}
+
+func NewLifecycle() *Lifecycle {
+	return &Lifecycle{startedAt: time.Now().UTC()}
+}
+
+func (l *Lifecycle) BeginProxyRequest() func() {
+	if l == nil {
+		return func() {}
+	}
+	l.active.Add(1)
+	return func() {
+		l.active.Add(-1)
+	}
+}
+
+func (l *Lifecycle) Drain() {
+	if l != nil {
+		l.draining.Store(true)
+	}
+}
+
+func (l *Lifecycle) Draining() bool {
+	return l != nil && l.draining.Load()
+}
+
+func (l *Lifecycle) ActiveProxyRequests() int64 {
+	if l == nil {
+		return 0
+	}
+	return l.active.Load()
+}
+
+func (l *Lifecycle) Status() map[string]any {
+	if l == nil {
+		return map[string]any{
+			"draining":              false,
+			"active_proxy_requests": int64(0),
+		}
+	}
+	return map[string]any{
+		"draining":              l.Draining(),
+		"active_proxy_requests": l.ActiveProxyRequests(),
+		"started_at":            l.startedAt.Format(time.RFC3339),
+	}
 }
 
 type AccountRef struct {
@@ -242,15 +296,21 @@ func (s Server) Handler() http.Handler {
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
+	if s.Lifecycle == nil {
+		s.Lifecycle = NewLifecycle()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
-	mux.HandleFunc("/_subrouter/accounts", s.handleAccounts)
-	mux.HandleFunc("/_subrouter/account-status", s.handleAccountStatus)
-	mux.HandleFunc("/_subrouter/reload-accounts", s.handleReloadAccounts)
-	mux.HandleFunc("/_subrouter/sessions", s.handleSessions)
-	mux.HandleFunc("/_subrouter/dashboard", s.handleDashboard)
-	mux.HandleFunc("/_subrouter/transcripts", s.handleTranscriptList)
-	mux.HandleFunc("/_subrouter/transcripts/", s.handleTranscriptDetail)
+	mux.HandleFunc("/_subrouter/ready", s.handleReady)
+	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
+	mux.HandleFunc("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus))
+	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
+	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
+	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
+	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
+	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
+	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
+	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	mux.Handle("/", s.proxyHandler())
 	return mux
@@ -258,6 +318,46 @@ func (s Server) Handler() http.Handler {
 
 func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if s.Lifecycle != nil && s.Lifecycle.Draining() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"ok": false, "draining": true})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "draining": false})
+}
+
+func (s Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLoopbackRemote(r.RemoteAddr) {
+		http.Error(w, "drain is only available from loopback", http.StatusForbidden)
+		return
+	}
+	if s.Lifecycle != nil {
+		s.Lifecycle.Drain()
+	}
+	writeJSON(w, s.lifecycleStatus(true))
+}
+
+func (s Server) handleDrainStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.lifecycleStatus(false))
+}
+
+func (s Server) lifecycleStatus(ok bool) map[string]any {
+	status := map[string]any{"ok": ok}
+	for key, value := range s.Lifecycle.Status() {
+		status[key] = value
+	}
+	return status
 }
 
 func (s Server) handleAccounts(w http.ResponseWriter, _ *http.Request) {
@@ -432,6 +532,37 @@ func isLoopbackRemote(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.authorizeAdmin(r) {
+			next(w, r)
+			return
+		}
+		http.Error(w, "admin token required", http.StatusUnauthorized)
+	}
+}
+
+func (s Server) authorizeAdmin(r *http.Request) bool {
+	if isLoopbackRemote(r.RemoteAddr) {
+		return true
+	}
+	token := strings.TrimSpace(s.AdminToken)
+	if token == "" {
+		return true
+	}
+	got := strings.TrimSpace(r.Header.Get("X-Subrouter-Admin-Token"))
+	if got == "" {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if before, after, ok := strings.Cut(auth, " "); ok && strings.EqualFold(before, "Bearer") {
+			got = strings.TrimSpace(after)
+		}
+	}
+	if got == "" || len(got) != len(token) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
 func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, s.Sessions.All())
 }
@@ -443,7 +574,14 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		agentType := session.ExtractAgentType(r)
-		account, sessionID, userEmail, err := s.accountFor(agentType, r)
+		sessionID := session.ExtractID(r, s.MaxBodyBytes)
+		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
+			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
+			return
+		}
+		endProxyRequest := s.Lifecycle.BeginProxyRequest()
+		defer endProxyRequest()
+		account, sessionID, userEmail, err := s.accountForSession(agentType, sessionID, r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -1104,7 +1242,10 @@ func cloneURL(value *url.URL) *url.URL {
 }
 
 func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account, string, string, error) {
-	sessionID := session.ExtractID(r, s.MaxBodyBytes)
+	return s.accountForSession(agentType, session.ExtractID(r, s.MaxBodyBytes), r)
+}
+
+func (s Server) accountForSession(agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := session.ExtractAccountID(r)
 	provider := providerForAgent(agentType)
@@ -1209,6 +1350,17 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 
 func (s Server) activeSession(agentType, sessionID string) bool {
 	return s.ActiveSessions != nil && s.ActiveSessions.Active(agentType, sessionID)
+}
+
+func (s Server) allowDrainingProxyRequest(agentType, sessionID string) bool {
+	if s.activeSession(agentType, sessionID) {
+		return true
+	}
+	if s.Sessions == nil {
+		return false
+	}
+	_, ok := s.Sessions.Get(agentType, sessionID)
+	return ok
 }
 
 func activeSessionRequest(agentType string, r *http.Request) bool {

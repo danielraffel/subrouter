@@ -4,7 +4,7 @@ Use this runbook for local macOS daemon upgrades when Codex is already pointed a
 
 ## Current safe handoff
 
-This path has a short listener restart. Existing in-flight requests can fail once, but future Codex requests reconnect to the same URL. Do not change client base URLs for a local binary upgrade.
+This path has a listener restart. New builds enter drain mode and wait for in-flight proxy requests on SIGTERM/SIGINT, but clients can still see a short connection gap because the same process owns the public listener. Do not change client base URLs for a local binary upgrade.
 
 On macOS, use the new binary's `install-daemon` path so launchd re-registers the LaunchAgent. Modern launchd can attach launch constraints to the binary it bootstrapped; a plain `mv` plus `launchctl kickstart -k` can fail with `OS_REASON_CODESIGNING | Launch Constraint Violation`.
 
@@ -113,6 +113,8 @@ curl -fsS http://127.0.0.1:31415/_subrouter/health
 ## Rules
 
 - Keep the public URL stable. Codex desktop and long-running CLI processes do not reliably adopt a new base URL mid-session.
+- Check `/_subrouter/ready` before sending traffic to a process. A draining process returns 503.
+- Use `POST /_subrouter/drain` from loopback before controlled shutdowns when you can.
 - Use `install-daemon` for local macOS binary upgrades so launchd refreshes its launch constraint for the new binary.
 - Do not edit the live binary in place. Build a separate binary, smoke-test it, then let `install-daemon` copy it into place.
 - Do not use `kill -9`. Launchd owns restart policy and environment.

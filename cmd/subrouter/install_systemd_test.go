@@ -30,6 +30,7 @@ func TestSystemdUnitUsesServerDefaults(t *testing.T) {
 		"Environment=HOME=/var/lib/subrouter",
 		"EnvironmentFile=-/etc/default/subrouter",
 		"ExecStart=/usr/local/bin/subrouter serve --addr ${SUBROUTER_ADDR}",
+		"TimeoutStopSec=10min",
 		"ReadWritePaths=/var/lib/subrouter /var/log/subrouter",
 	} {
 		if !strings.Contains(unit, want) {
@@ -45,6 +46,7 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 		SessionsPath:     "/var/lib/subrouter/sessions.json",
 		TranscriptsDir:   "/var/lib/subrouter/transcripts",
 		CXSwitchInterval: "10m",
+		AdminToken:       "secret-token",
 		ExtraArgs:        "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
 	}
 	defaults := systemdDefaults(config)
@@ -53,6 +55,9 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	}
 	if !strings.Contains(defaults, `SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false"`) {
 		t.Fatalf("defaults did not quote extra args:\n%s", defaults)
+	}
+	if !strings.Contains(defaults, `SUBROUTER_ADMIN_TOKEN="secret-token"`) {
+		t.Fatalf("defaults did not quote admin token:\n%s", defaults)
 	}
 }
 

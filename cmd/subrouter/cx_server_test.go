@@ -45,6 +45,107 @@ func TestCXServerAddStoresGCPServer(t *testing.T) {
 	}
 }
 
+func TestCXServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	var out bytes.Buffer
+	runner := cxRunner{store: store, out: &out, errOut: &out}
+	err := runner.run(context.Background(), []string{
+		"server", "add", "team",
+		"--url", "http://100.64.0.1:31415",
+		"--admin-token", "secret-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server, ok, err := defaultCXServerStore(store).find("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing configured server")
+	}
+	if server.AdminToken != "secret-token" {
+		t.Fatalf("admin token = %q", server.AdminToken)
+	}
+}
+
+func TestCXServerStatusSendsAdminToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	server := cxServerConfig{
+		Name:       "team",
+		URL:        "http://100.64.0.1:31415",
+		AdminToken: "secret-token",
+	}
+	if err := defaultCXServerStore(store).save(cxServerFile{Servers: []cxServerConfig{server}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := cxRunner{
+		store:  store,
+		out:    &out,
+		errOut: &out,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
+				t.Fatalf("Authorization = %q", got)
+			}
+			body, _ := json.Marshal([]remoteServerAccount{{ID: "acct", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth}})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{"server", "status", "team"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCXServerAddPreservesExistingAdminTokenWhenUpdatingMetadata(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	var out bytes.Buffer
+	runner := cxRunner{store: store, out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "team",
+		"--url", "http://100.64.0.1:31415",
+		"--admin-token", "secret-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "team",
+		"--url", "http://100.64.0.2:31415",
+		"--gcp-instance", "subrouter-team",
+		"--gcp-zone", "us-south1-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, ok, err := defaultCXServerStore(store).find("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing configured server")
+	}
+	if server.URL != "http://100.64.0.2:31415" {
+		t.Fatalf("url = %q", server.URL)
+	}
+	if server.AdminToken != "secret-token" {
+		t.Fatalf("admin token = %q", server.AdminToken)
+	}
+}
+
 func TestCXServerAddAllowsURLOnlyServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

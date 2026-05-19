@@ -28,6 +28,7 @@ type systemdConfig struct {
 	SessionsPath     string
 	TranscriptsDir   string
 	CXSwitchInterval string
+	AdminToken       string
 	ExtraArgs        string
 	Start            bool
 	DryRun           bool
@@ -47,6 +48,7 @@ func installSystemd(args []string) error {
 	flags.StringVar(&config.SessionsPath, "sessions", "/var/lib/subrouter/sessions.json", "session assignment store")
 	flags.StringVar(&config.TranscriptsDir, "transcripts", "/var/lib/subrouter/transcripts", "transcript directory")
 	flags.StringVar(&config.CXSwitchInterval, "cx-switch-interval", "10m", "cx auto-switch interval; 0 disables")
+	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token required for non-loopback _subrouter endpoints; preserves existing SUBROUTER_ADMIN_TOKEN by default")
 	flags.StringVar(&config.ExtraArgs, "extra-args", "", "extra arguments appended to subrouter serve")
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
@@ -63,6 +65,9 @@ func installSystemd(args []string) error {
 		if config.ExtraArgs == "" && config.ReplaceLegacy {
 			config.ExtraArgs = readLegacySystemdExtraArgs()
 		}
+	}
+	if config.AdminToken == "" {
+		config.AdminToken = readDefaultValue(systemdDefaultPath(config), "SUBROUTER_ADMIN_TOKEN")
 	}
 	return installSystemdWithConfig(config, commandRunner{})
 }
@@ -117,7 +122,11 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 			}
 		}
 	}
-	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), 0o644); err != nil {
+	defaultMode := os.FileMode(0o644)
+	if config.AdminToken != "" {
+		defaultMode = 0o600
+	}
+	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
 		return err
 	}
 	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
@@ -267,8 +276,9 @@ SUBROUTER_STATE_DIR=%s
 SUBROUTER_SESSIONS=%s
 SUBROUTER_TRANSCRIPTS=%s
 SUBROUTER_CX_SWITCH_INTERVAL=%s
+SUBROUTER_ADMIN_TOKEN=%q
 SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, config.CXSwitchInterval, config.ExtraArgs)
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, config.CXSwitchInterval, config.AdminToken, config.ExtraArgs)
 }
 
 func systemdUnit(config systemdConfig) (string, error) {
@@ -309,6 +319,7 @@ EnvironmentFile=-{{.DefaultPath}}
 ExecStart={{.InstallPath}} serve --addr ${SUBROUTER_ADDR} --sessions ${SUBROUTER_SESSIONS} --transcripts ${SUBROUTER_TRANSCRIPTS} --cx-switch-interval ${SUBROUTER_CX_SWITCH_INTERVAL} $SUBROUTER_EXTRA_ARGS
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=10min
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

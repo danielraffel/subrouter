@@ -34,7 +34,7 @@ func cxServerHelp(command string) string {
 
 Usage:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name>
   %[1]s current
   %[1]s clear-default
@@ -60,6 +60,7 @@ type cxServerConfig struct {
 	GCPProject  string `json:"gcpProject,omitempty"`
 	GCPZone     string `json:"gcpZone,omitempty"`
 	GCPInstance string `json:"gcpInstance,omitempty"`
+	AdminToken  string `json:"adminToken,omitempty"`
 }
 
 type cxServerFile struct {
@@ -208,7 +209,7 @@ func (r cxRunner) serverList(store cxServerStore) error {
 func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]", command)
+		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]", command)
 	}
 	name := args[0]
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
@@ -217,10 +218,17 @@ func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 	gcpProject := flags.String("gcp-project", "", "GCP project; defaults to current gcloud project")
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
+	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
+	adminTokenSet := false
+	flags.Visit(func(flag *flag.Flag) {
+		if flag.Name == "admin-token" {
+			adminTokenSet = true
+		}
+	})
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("server name is required")
 	}
@@ -240,10 +248,14 @@ func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 		GCPProject:  *gcpProject,
 		GCPZone:     *gcpZone,
 		GCPInstance: *gcpInstance,
+		AdminToken:  *adminToken,
 	}
 	replaced := false
 	for i := range file.Servers {
 		if file.Servers[i].Name == name {
+			if !adminTokenSet {
+				next.AdminToken = file.Servers[i].AdminToken
+			}
 			file.Servers[i] = next
 			replaced = true
 			break
@@ -429,6 +441,7 @@ func (r cxRunner) fetchServerAccountsResponse(ctx context.Context, server cxServ
 	if err != nil {
 		return nil, err
 	}
+	addServerAdminAuth(req, server)
 	client := r.client
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
@@ -462,6 +475,7 @@ func (r cxRunner) fetchServerAccountStatuses(ctx context.Context, server cxServe
 	if err != nil {
 		return nil, false, err
 	}
+	addServerAdminAuth(req, server)
 	client := r.client
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
@@ -494,6 +508,13 @@ func (r cxRunner) fetchServerAccountStatuses(ctx context.Context, server cxServe
 		})
 	}
 	return out, false, nil
+}
+
+func addServerAdminAuth(req *http.Request, server cxServerConfig) {
+	if strings.TrimSpace(server.AdminToken) == "" {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+server.AdminToken)
 }
 
 func (r cxRunner) serverInstall(ctx context.Context, store cxServerStore, args []string) error {

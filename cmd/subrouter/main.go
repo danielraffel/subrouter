@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,9 +10,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -149,10 +152,15 @@ func serve(args []string) error {
 	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
 	cxSwitchInterval := flags.Duration("cx-switch-interval", defaultCXSwitchInterval, "interval for switching active cx account to the best OAuth account; 0 disables")
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
+	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
+	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *adminToken == "" {
+		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
 	}
 
 	var upstream *url.URL
@@ -219,6 +227,8 @@ func serve(args []string) error {
 		UsageScoreTTL:  usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
 		Transport:      outboundTransport,
 		Logger:         slog.Default(),
+		Lifecycle:      proxy.NewLifecycle(),
+		AdminToken:     *adminToken,
 		MaxBodyBytes:   *maxBodyBytes,
 		Transcripts:    transcript.NewRecorder(*transcriptDir),
 	}
@@ -254,7 +264,47 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return httpServer.ListenAndServe()
+	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+}
+
+func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger) error {
+	errCh := make(chan error, 1)
+	go func() {
+		err := server.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		errCh <- err
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case err := <-errCh:
+		return err
+	case sig := <-sigCh:
+		if lifecycle != nil {
+			lifecycle.Drain()
+		}
+		if logger != nil {
+			logger.Info("subrouter shutdown signal received", "signal", sig.String(), "timeout", shutdownTimeout.String())
+		}
+		if shutdownTimeout < 0 {
+			shutdownTimeout = 0
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			if logger != nil {
+				logger.Error("subrouter graceful shutdown failed", "error", err)
+			}
+			_ = server.Close()
+			return err
+		}
+		return <-errCh
+	}
 }
 
 func usageScoreTTLForServe(fetchUsage bool, ttl time.Duration) time.Duration {

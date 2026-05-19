@@ -86,6 +86,9 @@ Useful endpoints:
 
 ```text
 GET /_subrouter/health
+GET /_subrouter/ready
+POST /_subrouter/drain
+GET /_subrouter/drain-status
 GET /_subrouter/accounts
 POST /_subrouter/account-status
 GET /_subrouter/sessions
@@ -93,9 +96,22 @@ GET /_subrouter/dashboard
 GET /_subrouter/transcripts
 ```
 
+`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue.
+
+For servers that listen on a non-loopback address, set an admin token before exposing account, session, dashboard, or transcript endpoints:
+
+```bash
+TOKEN="$(openssl rand -hex 32)"
+sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token "$TOKEN"
+sr server add team --url http://100.64.0.1:31415 --admin-token "$TOKEN" --default
+```
+
+When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted so server-local hot reloads continue to work.
+
 ## GCP deployment
 
 See [deploy/gcp/README.md](deploy/gcp/README.md) for the small GCP + Tailscale Subrouter deployment flow.
+See [docs/production.md](docs/production.md) for the production checklist before running a shared server.
 
 To persist raw Subrouter transcripts, pass a transcript directory:
 
