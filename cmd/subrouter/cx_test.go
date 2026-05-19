@@ -57,6 +57,67 @@ func TestCXListReadsNativeCodexStore(t *testing.T) {
 	}
 }
 
+func TestCXTraceShowsOAuthBreadcrumbs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "a@example.com",
+		AddedAt: "2026-04-28T00:00:00Z",
+		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+			AccessToken:  "access-token",
+			RefreshToken: "raw-refresh-token",
+			IDToken:      "id-token",
+			AccountID:    "acct_123",
+		}},
+		Breadcrumbs: []accounts.CodexAuthBreadcrumb{{
+			At:              "2026-05-19T08:00:00Z",
+			Event:           "refresh_terminal_failure",
+			Source:          "oauth_refresh",
+			Reason:          "proxy.score-accounts",
+			Host:            "subrouter-team",
+			PID:             123,
+			PPID:            1,
+			Executable:      "/usr/local/bin/subrouter",
+			WorkingDir:      "/var/lib/subrouter",
+			SourcePath:      "/var/lib/subrouter/codex/accounts/a@example.com.json",
+			RefreshFP:       "refreshfp",
+			OldRefreshFP:    "oldrefreshfp",
+			StatusCode:      http.StatusUnauthorized,
+			ProviderType:    "invalid_request_error",
+			ProviderCode:    "refresh_token_reused",
+			ProviderMessage: "Your refresh token has already been used to generate a new access token. Please try signing in again.",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{"trace", "a@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := out.String()
+	for _, want := range []string{
+		"OAuth breadcrumbs for a@example.com",
+		"refresh_terminal_failure",
+		"reason=\"proxy.score-accounts\"",
+		"host=\"subrouter-team\"",
+		"pid=\"123\"",
+		"refresh=\"refreshfp\"",
+		"old_refresh=\"oldrefreshfp\"",
+		"provider_code=\"refresh_token_reused\"",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("trace output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "raw-refresh-token") {
+		t.Fatalf("trace output leaked raw refresh token:\n%s", got)
+	}
+}
+
 func TestCXSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

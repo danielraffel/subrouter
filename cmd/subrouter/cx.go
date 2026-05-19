@@ -56,6 +56,7 @@ Usage:
   cx status             Show Codex usage (non-interactive)
   cx pick               Switch to the recommended account, failing if none has quota
   cx usage [days]       Refresh and show API-key spend
+  cx trace <email>      Show OAuth refresh breadcrumbs for an account
 
   cx server             Manage Subrouter servers
   cx server add <name> --url <url> [--default]
@@ -176,6 +177,11 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 			days = parsed
 		}
 		return r.usage(ctx, days)
+	case "trace", "breadcrumbs", "why":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: subrouter trace <email>")
+		}
+		return r.trace(args[1])
 	case "add-admin-key":
 		return r.addAdminKey(ctx)
 	case "list-admin-keys", "admin-keys":
@@ -328,6 +334,99 @@ func (r cxRunner) list() error {
 	fmt.Fprintln(r.out)
 	fmt.Fprintln(r.out, "* = currently active in ~/.codex/auth.json")
 	return nil
+}
+
+func (r cxRunner) trace(selector string) error {
+	account, ok, err := r.store.FindStored(selector)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no account found matching %q", selector)
+	}
+	fmt.Fprintf(r.out, "\nOAuth breadcrumbs for %s\n\n", displayAccountName(account.Email))
+	if len(account.Breadcrumbs) == 0 {
+		fmt.Fprintln(r.out, "  none")
+		return nil
+	}
+	for _, crumb := range account.Breadcrumbs {
+		fmt.Fprintf(r.out, "  %s  %s\n", crumb.At, crumb.Event)
+		fmt.Fprintf(r.out, "    where: %s\n", formatBreadcrumbWhere(crumb))
+		fmt.Fprintf(r.out, "    why: %s\n", formatBreadcrumbWhy(crumb))
+		fmt.Fprintf(r.out, "    token: %s\n", formatBreadcrumbToken(crumb))
+		if errLine := formatBreadcrumbError(crumb); errLine != "" {
+			fmt.Fprintf(r.out, "    error: %s\n", errLine)
+		}
+		if crumb.SourcePath != "" {
+			fmt.Fprintf(r.out, "    file: %s\n", crumb.SourcePath)
+		}
+	}
+	return nil
+}
+
+func formatBreadcrumbWhere(crumb accounts.CodexAuthBreadcrumb) string {
+	parts := []string{}
+	appendKV(&parts, "host", crumb.Host)
+	if crumb.PID != 0 {
+		appendKV(&parts, "pid", strconv.Itoa(crumb.PID))
+	}
+	if crumb.PPID != 0 {
+		appendKV(&parts, "ppid", strconv.Itoa(crumb.PPID))
+	}
+	appendKV(&parts, "exe", crumb.Executable)
+	appendKV(&parts, "cwd", crumb.WorkingDir)
+	if len(parts) == 0 {
+		return "unknown"
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatBreadcrumbWhy(crumb accounts.CodexAuthBreadcrumb) string {
+	parts := []string{}
+	appendKV(&parts, "source", crumb.Source)
+	appendKV(&parts, "reason", crumb.Reason)
+	appendKV(&parts, "force", strconv.FormatBool(crumb.Force))
+	appendKV(&parts, "last_refresh", crumb.LastRefresh)
+	appendKV(&parts, "access_exp", crumb.AccessExp)
+	appendKV(&parts, "access_expired", strconv.FormatBool(crumb.AccessExpired))
+	if len(parts) == 0 {
+		return "unknown"
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatBreadcrumbToken(crumb accounts.CodexAuthBreadcrumb) string {
+	parts := []string{}
+	appendKV(&parts, "refresh", crumb.RefreshFP)
+	appendKV(&parts, "old_refresh", crumb.OldRefreshFP)
+	appendKV(&parts, "new_refresh", crumb.NewRefreshFP)
+	appendKV(&parts, "recovered_refresh", crumb.RecoveredRefreshFP)
+	appendKV(&parts, "account_id", crumb.AccountID)
+	appendKV(&parts, "old_account_id", crumb.OldAccountID)
+	appendKV(&parts, "new_account_id", crumb.NewAccountID)
+	appendKV(&parts, "recovered_account_id", crumb.RecoveredAccountID)
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatBreadcrumbError(crumb accounts.CodexAuthBreadcrumb) string {
+	parts := []string{}
+	if crumb.StatusCode != 0 {
+		appendKV(&parts, "status", strconv.Itoa(crumb.StatusCode))
+	}
+	appendKV(&parts, "provider_type", crumb.ProviderType)
+	appendKV(&parts, "provider_code", crumb.ProviderCode)
+	appendKV(&parts, "provider_message", crumb.ProviderMessage)
+	return strings.Join(parts, " ")
+}
+
+func appendKV(parts *[]string, key, value string) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	*parts = append(*parts, key+"="+strconv.Quote(value))
 }
 
 func (r cxRunner) status(ctx context.Context) error {

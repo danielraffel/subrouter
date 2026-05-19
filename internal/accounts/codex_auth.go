@@ -18,6 +18,7 @@ import (
 
 const codexOAuthTokenURL = "https://auth.openai.com/oauth/token"
 const codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+const codexAuthBreadcrumbLimit = 50
 
 type codexRefreshReasonKey struct{}
 
@@ -113,6 +114,7 @@ func (s CodexStore) SyncActiveToStore() error {
 	}
 	previous := account
 	account.Auth = auth
+	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_synced", "active_auth", false, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		return err
 	}
@@ -144,6 +146,7 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	}
 	previous := account
 	account.Auth = auth
+	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_imported", "active_auth", false, &previous, &account, nil, nil)
 	err = s.SaveStored(account)
 	if err == nil {
 		logCodexAuthStoreUpdated("codex oauth active auth imported", s, previous, account, "active_auth")
@@ -233,11 +236,16 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {
 		if recovered, ok := s.recoverRefreshedAccount(account); ok {
+			appendCodexAuthBreadcrumb(ctx, s, &recovered, "refresh_recovered_concurrent_update", "oauth_refresh", force, &previous, nil, &recovered, err)
+			if saveErr := s.saveStoredUnlocked(recovered); saveErr != nil {
+				logCodexRefreshFailed(ctx, s, recovered, force, saveErr)
+			}
 			logCodexRefreshRecovered(ctx, s, account, recovered, force, err)
 			return recovered, false, nil
 		}
 		if failure, ok := codexRefreshFailureFromError(err); ok {
 			account.Auth.RefreshFailure = failure
+			appendCodexAuthBreadcrumb(ctx, s, &account, "refresh_terminal_failure", "oauth_refresh", force, &previous, nil, nil, err)
 			if saveErr := s.saveStoredUnlocked(account); saveErr != nil {
 				logCodexRefreshFailed(ctx, s, account, force, saveErr)
 			}
@@ -247,6 +255,7 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	}
 	auth.RefreshFailure = nil
 	account.Auth = auth
+	appendCodexAuthBreadcrumb(ctx, s, &account, "refresh_succeeded", "oauth_refresh", force, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, true, err
@@ -565,6 +574,88 @@ func logCodexAuthStoreSkipped(message string, store CodexStore, account StoredCo
 		"access_exp", codexAccessExpiryForLog(account),
 	)
 	slog.Debug(message, attrs...)
+}
+
+func appendCodexAuthBreadcrumb(ctx context.Context, store CodexStore, account *StoredCodexAccount, event, source string, force bool, old, next, recovered *StoredCodexAccount, err error) {
+	if account == nil {
+		return
+	}
+	event = strings.TrimSpace(event)
+	if event == "" {
+		event = "unknown"
+	}
+	host, _ := os.Hostname()
+	executable, _ := os.Executable()
+	workingDir, _ := os.Getwd()
+	crumb := CodexAuthBreadcrumb{
+		At:            time.Now().UTC().Format(time.RFC3339Nano),
+		Event:         event,
+		Source:        strings.TrimSpace(source),
+		Reason:        codexRefreshReasonOrUnspecified(ctx),
+		Host:          host,
+		PID:           os.Getpid(),
+		PPID:          os.Getppid(),
+		Executable:    executable,
+		WorkingDir:    workingDir,
+		StoreDir:      store.Dir,
+		SourcePath:    account.SourcePath(store),
+		Force:         force,
+		LastRefresh:   account.Auth.LastRefresh,
+		AccessExp:     codexAccessExpiryForLog(*account),
+		AccessExpired: codexAccessExpiredForLog(*account),
+		AccessFP:      codexAccessFingerprintForLog(*account),
+		RefreshFP:     codexRefreshFingerprintForLog(*account),
+		AccountID:     codexAccountIDForLog(*account),
+	}
+	if old != nil && old.Auth.Tokens != nil {
+		crumb.OldAccessExp = codexAccessExpiryForLog(*old)
+		crumb.OldAccessFP = codexAccessFingerprintForLog(*old)
+		crumb.OldRefreshFP = codexRefreshFingerprintForLog(*old)
+		crumb.OldAccountID = codexAccountIDForLog(*old)
+	}
+	if next != nil && next.Auth.Tokens != nil {
+		crumb.NewAccessExp = codexAccessExpiryForLog(*next)
+		crumb.NewAccessFP = codexAccessFingerprintForLog(*next)
+		crumb.NewRefreshFP = codexRefreshFingerprintForLog(*next)
+		crumb.NewAccountID = codexAccountIDForLog(*next)
+	}
+	if recovered != nil && recovered.Auth.Tokens != nil {
+		crumb.RecoveredAccessExp = codexAccessExpiryForLog(*recovered)
+		crumb.RecoveredAccessFP = codexAccessFingerprintForLog(*recovered)
+		crumb.RecoveredRefreshFP = codexRefreshFingerprintForLog(*recovered)
+		crumb.RecoveredAccountID = codexAccountIDForLog(*recovered)
+	}
+	appendCodexRefreshErrorToBreadcrumb(&crumb, err)
+
+	account.Breadcrumbs = append(account.Breadcrumbs, crumb)
+	if len(account.Breadcrumbs) > codexAuthBreadcrumbLimit {
+		account.Breadcrumbs = account.Breadcrumbs[len(account.Breadcrumbs)-codexAuthBreadcrumbLimit:]
+	}
+}
+
+func codexRefreshReasonOrUnspecified(ctx context.Context) string {
+	if ctx == nil {
+		return "unspecified"
+	}
+	reason := CodexRefreshReason(ctx)
+	if strings.TrimSpace(reason) == "" {
+		return "unspecified"
+	}
+	return reason
+}
+
+func appendCodexRefreshErrorToBreadcrumb(crumb *CodexAuthBreadcrumb, err error) {
+	if crumb == nil || err == nil {
+		return
+	}
+	var refreshErr *CodexAuthRefreshError
+	if !errors.As(err, &refreshErr) {
+		return
+	}
+	crumb.StatusCode = refreshErr.StatusCode
+	crumb.ProviderType = refreshErr.ProviderType
+	crumb.ProviderCode = refreshErr.ProviderCode
+	crumb.ProviderMessage = refreshErr.ProviderMessage
 }
 
 func codexAuthCorrelationAttrs(store CodexStore, account StoredCodexAccount) []any {

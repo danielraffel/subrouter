@@ -174,6 +174,16 @@ func TestRefreshStoredIfExpiredCachesTerminalRefreshError(t *testing.T) {
 	if stored.Auth.RefreshFailure.ProviderCode != "refresh_token_reused" {
 		t.Fatalf("cached provider code = %q, want refresh_token_reused", stored.Auth.RefreshFailure.ProviderCode)
 	}
+	if len(stored.Breadcrumbs) != 1 {
+		t.Fatalf("breadcrumbs = %d, want 1", len(stored.Breadcrumbs))
+	}
+	failureCrumb := stored.Breadcrumbs[0]
+	if failureCrumb.Event != "refresh_terminal_failure" || failureCrumb.ProviderCode != "refresh_token_reused" || failureCrumb.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unexpected failure breadcrumb: %+v", failureCrumb)
+	}
+	if failureCrumb.RefreshFP != codexTokenFingerprint("old-refresh") || failureCrumb.OldRefreshFP != codexTokenFingerprint("old-refresh") {
+		t.Fatalf("unexpected failure breadcrumb fingerprints: %+v", failureCrumb)
+	}
 
 	if _, _, err := store.RefreshStoredIfExpired(context.Background(), client, stale); err == nil {
 		t.Fatal("expected cached refresh error")
@@ -300,6 +310,36 @@ func TestRefreshStoredIfExpiredLogsRefreshFingerprints(t *testing.T) {
 	for _, secret := range []string{"old-refresh", "new-refresh"} {
 		if strings.Contains(out, secret) {
 			t.Fatalf("logs leaked refresh token %q:\n%s", secret, out)
+		}
+	}
+
+	stored, ok, err := store.FindStored("founders@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing stored account")
+	}
+	if len(stored.Breadcrumbs) != 1 {
+		t.Fatalf("breadcrumbs = %d, want 1", len(stored.Breadcrumbs))
+	}
+	crumb := stored.Breadcrumbs[0]
+	if crumb.Event != "refresh_succeeded" || crumb.Source != "oauth_refresh" || crumb.Reason != "test.refresh" {
+		t.Fatalf("unexpected breadcrumb identity: %+v", crumb)
+	}
+	if crumb.OldRefreshFP != oldRefreshFP || crumb.NewRefreshFP != newRefreshFP || crumb.RefreshFP != newRefreshFP {
+		t.Fatalf("unexpected breadcrumb fingerprints: %+v", crumb)
+	}
+	if crumb.Host == "" || crumb.PID == 0 || crumb.PPID == 0 || crumb.Executable == "" || crumb.StoreDir == "" || crumb.SourcePath == "" {
+		t.Fatalf("breadcrumb missing process/store context: %+v", crumb)
+	}
+	crumbBody, err := json.Marshal(crumb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"old-refresh", "new-refresh"} {
+		if strings.Contains(string(crumbBody), secret) {
+			t.Fatalf("breadcrumb leaked refresh token %q:\n%s", secret, string(crumbBody))
 		}
 	}
 }

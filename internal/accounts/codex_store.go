@@ -18,12 +18,13 @@ type CodexStore struct {
 }
 
 type StoredCodexAccount struct {
-	Email         string        `json:"email"`
-	AddedAt       string        `json:"addedAt"`
-	Auth          CodexAuthFile `json:"auth"`
-	ProjectID     string        `json:"projectId,omitempty"`
-	ProjectName   string        `json:"projectName,omitempty"`
-	AdminKeyLabel string        `json:"adminKeyLabel,omitempty"`
+	Email         string                `json:"email"`
+	AddedAt       string                `json:"addedAt"`
+	Auth          CodexAuthFile         `json:"auth"`
+	ProjectID     string                `json:"projectId,omitempty"`
+	ProjectName   string                `json:"projectName,omitempty"`
+	AdminKeyLabel string                `json:"adminKeyLabel,omitempty"`
+	Breadcrumbs   []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
 }
 
 type CodexAuthFile struct {
@@ -47,6 +48,43 @@ type CodexRefreshFailure struct {
 	ProviderType    string `json:"provider_type,omitempty"`
 	ProviderCode    string `json:"provider_code,omitempty"`
 	ProviderMessage string `json:"provider_message,omitempty"`
+}
+
+type CodexAuthBreadcrumb struct {
+	At                 string `json:"at"`
+	Event              string `json:"event"`
+	Source             string `json:"source,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+	Host               string `json:"host,omitempty"`
+	PID                int    `json:"pid,omitempty"`
+	PPID               int    `json:"ppid,omitempty"`
+	Executable         string `json:"executable,omitempty"`
+	WorkingDir         string `json:"working_dir,omitempty"`
+	StoreDir           string `json:"store_dir,omitempty"`
+	SourcePath         string `json:"source_path,omitempty"`
+	Force              bool   `json:"force"`
+	LastRefresh        string `json:"last_refresh,omitempty"`
+	AccessExp          string `json:"access_exp,omitempty"`
+	AccessExpired      bool   `json:"access_expired"`
+	AccessFP           string `json:"access_fp,omitempty"`
+	RefreshFP          string `json:"refresh_fp,omitempty"`
+	AccountID          string `json:"account_id,omitempty"`
+	OldAccessExp       string `json:"old_access_exp,omitempty"`
+	OldAccessFP        string `json:"old_access_fp,omitempty"`
+	OldRefreshFP       string `json:"old_refresh_fp,omitempty"`
+	OldAccountID       string `json:"old_account_id,omitempty"`
+	NewAccessExp       string `json:"new_access_exp,omitempty"`
+	NewAccessFP        string `json:"new_access_fp,omitempty"`
+	NewRefreshFP       string `json:"new_refresh_fp,omitempty"`
+	NewAccountID       string `json:"new_account_id,omitempty"`
+	RecoveredAccessExp string `json:"recovered_access_exp,omitempty"`
+	RecoveredAccessFP  string `json:"recovered_access_fp,omitempty"`
+	RecoveredRefreshFP string `json:"recovered_refresh_fp,omitempty"`
+	RecoveredAccountID string `json:"recovered_account_id,omitempty"`
+	StatusCode         int    `json:"status_code,omitempty"`
+	ProviderType       string `json:"provider_type,omitempty"`
+	ProviderCode       string `json:"provider_code,omitempty"`
+	ProviderMessage    string `json:"provider_message,omitempty"`
 }
 
 func DefaultCodexStore() CodexStore {

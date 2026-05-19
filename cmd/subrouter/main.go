@@ -111,6 +111,7 @@ var directCXCommands = map[string]struct{}{
 	"add-key":          {},
 	"admin-keys":       {},
 	"attach-project":   {},
+	"breadcrumbs":      {},
 	"claude":           {},
 	"g":                {},
 	"gemini":           {},
@@ -130,8 +131,10 @@ var directCXCommands = map[string]struct{}{
 	"servers":          {},
 	"status":           {},
 	"switch":           {},
+	"trace":            {},
 	"usage":            {},
 	"use":              {},
+	"why":              {},
 }
 
 func isDirectCXCommand(command string) bool {
@@ -445,6 +448,7 @@ Usage:
   %[1]s status             Show Codex usage (non-interactive)
   %[1]s pick               Switch to the recommended account, failing if none has quota
   %[1]s usage [days]       Refresh and show API-key spend
+  %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
 
   %[1]s server             Manage Subrouter servers
   %[1]s server add <name> --url <url> [--default]

@@ -91,6 +91,7 @@ func TestDirectCXCommandNames(t *testing.T) {
 		"add-key",
 		"admin-keys",
 		"attach-project",
+		"breadcrumbs",
 		"claude",
 		"g",
 		"gemini",
@@ -110,8 +111,10 @@ func TestDirectCXCommandNames(t *testing.T) {
 		"servers",
 		"status",
 		"switch",
+		"trace",
 		"usage",
 		"use",
+		"why",
 	}
 	sort.Strings(expected)
 	actual := make([]string, 0, len(directCXCommands))
