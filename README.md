@@ -11,80 +11,9 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 - Pick a fresh account for a new conversation based on available rate-limit headroom.
 - Provide the Codex account manager and daemon in one Go binary.
 
-## Current shape
-
-```bash
-make accounts
-make run
-```
-
-This repo sets `CGO_ENABLED=0` in `Makefile` because the local macOS Go 1.22 toolchain is currently producing cgo test binaries that fail before startup with `missing LC_UUID load command`.
-
 ## Install
 
-Install the released Go binary directly:
-
-```bash
-curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
-```
-
-On a Linux server, install to `/usr/local/bin`:
-
-```bash
-curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
-```
-
-Install with npm:
-
-```bash
-npm install -g subrouter
-```
-
-Install with Python:
-
-```bash
-pipx install subrouter
-```
-
-All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappers download the matching Go release binary for macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD on amd64, arm64, or supported 32-bit variants. Set `SUBROUTER_BIN` to use a local binary instead.
-
-## Local macOS daemon
-
-On macOS, install Subrouter as a localhost-only LaunchAgent:
-
-```bash
-make build
-./bin/subrouter install-daemon
-```
-
-This installs the binary to `~/bin/subrouter`, installs `~/bin/cx` as a symlink to the same Go binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, creates `~/.subrouter/transcripts`, starts the service, and runs:
-
-```bash
-~/bin/subrouter serve --addr 127.0.0.1:31415 --transcripts ~/.subrouter/transcripts --cx-switch-interval 10m
-```
-
-The 10 minute `cx` auto-switch interval is the default. Override it with `subrouter install-daemon --cx-switch-interval 5m`, or disable it with `--cx-switch-interval 0`.
-
-## Linux systemd service
-
-On a Linux server, install the binary and service:
-
-```bash
-curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
-sudo sr install-systemd --addr 0.0.0.0:31415
-```
-
-This creates a `subrouter` system user, stores state under `/var/lib/subrouter`, writes `/etc/systemd/system/subrouter.service`, installs `subrouter`, `sr`, and `cx` in `/usr/local/bin`, and starts:
-
-```bash
-/usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --transcripts /var/lib/subrouter/transcripts --cx-switch-interval 10m
-```
-
-If legacy `switchboard` or `gateway` services exist, `sr install-systemd` stops and disables them, merges their `/var/lib/...` state into `/var/lib/subrouter`, and preserves their extra service args.
-
-## Production setup with an agent
-
-Subrouter is production-ready when it is private to your tailnet or VPC, has an admin token for non-loopback admin endpoints, uses server-owned OAuth refresh-token chains, and passes health, readiness, account-status, and log checks.
+### Agent setup prompt
 
 Paste this into Claude, Codex, or another coding agent that has SSH access to your server and a local browser for OAuth:
 
@@ -154,6 +83,68 @@ Steps:
 5. Report the command I should use:
    sr codex
 ```
+
+### Manual install
+
+Install the released Go binary directly:
+
+```bash
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sh
+```
+
+On a Linux server, install to `/usr/local/bin`:
+
+```bash
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
+```
+
+Install with npm:
+
+```bash
+npm install -g subrouter
+```
+
+Install with Python:
+
+```bash
+pipx install subrouter
+```
+
+All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappers download the matching Go release binary for macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD on amd64, arm64, or supported 32-bit variants. Set `SUBROUTER_BIN` to use a local binary instead.
+
+### Local macOS daemon
+
+On macOS, install Subrouter as a localhost-only LaunchAgent:
+
+```bash
+make build
+./bin/subrouter install-daemon
+```
+
+This installs the binary to `~/bin/subrouter`, installs `~/bin/cx` as a symlink to the same Go binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, creates `~/.subrouter/transcripts`, starts the service, and runs:
+
+```bash
+~/bin/subrouter serve --addr 127.0.0.1:31415 --transcripts ~/.subrouter/transcripts --cx-switch-interval 10m
+```
+
+The 10 minute `cx` auto-switch interval is the default. Override it with `subrouter install-daemon --cx-switch-interval 5m`, or disable it with `--cx-switch-interval 0`.
+
+### Linux systemd service
+
+On a Linux server, install the binary and service:
+
+```bash
+curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh
+sudo sr install-systemd --addr 0.0.0.0:31415
+```
+
+This creates a `subrouter` system user, stores state under `/var/lib/subrouter`, writes `/etc/systemd/system/subrouter.service`, installs `subrouter`, `sr`, and `cx` in `/usr/local/bin`, and starts:
+
+```bash
+/usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --transcripts /var/lib/subrouter/transcripts --cx-switch-interval 10m
+```
+
+If legacy `switchboard` or `gateway` services exist, `sr install-systemd` stops and disables them, merges their `/var/lib/...` state into `/var/lib/subrouter`, and preserves their extra service args.
 
 Useful endpoints:
 
