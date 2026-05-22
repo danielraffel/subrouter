@@ -158,6 +158,14 @@ type AccountStatus struct {
 	Error       string            `json:"error,omitempty"`
 }
 
+type AccountUsageStatus struct {
+	AccountStatus
+	Active   bool                   `json:"active,omitempty"`
+	PlanType string                 `json:"plan_type,omitempty"`
+	Windows  []accounts.UsageWindow `json:"windows,omitempty"`
+	Credits  *accounts.CreditsInfo  `json:"credits,omitempty"`
+}
+
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
 	return &AccountRef{
 		accounts: append([]accounts.Account(nil), initial...),
@@ -280,6 +288,81 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 	return out
 }
 
+func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
+	if r == nil {
+		return nil
+	}
+	storedAccounts, err := r.store.ListStored()
+	if err != nil {
+		return []AccountUsageStatus{{
+			AccountStatus: AccountStatus{
+				Provider:    accounts.ProviderCodex,
+				AuthChecked: true,
+				AuthValid:   false,
+				Error:       err.Error(),
+			},
+		}}
+	}
+	active, _ := r.store.DetectActiveAccount()
+	out := make([]AccountUsageStatus, len(storedAccounts))
+	var wg sync.WaitGroup
+	for i, stored := range storedAccounts {
+		i, stored := i, stored
+		status := AccountUsageStatus{
+			AccountStatus: AccountStatus{
+				ID:       stored.Email,
+				Provider: accounts.ProviderCodex,
+				Email:    stored.Email,
+				Source:   stored.SourcePath(r.store),
+			},
+			Active: stored.Email == active,
+		}
+		if stored.IsAPIKey() {
+			status.AuthMode = accounts.AuthModeAPIKey
+			status.PlanType = "api key"
+			out[i] = status
+			continue
+		}
+		status.AuthMode = accounts.AuthModeOAuth
+		status.AuthChecked = true
+		out[i] = status
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			refreshCtx := accounts.WithCodexRefreshReason(ctx, "usage-status.if-expired")
+			refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
+			next := out[i]
+			next.Refreshed = didRefresh
+			if refreshErr != nil {
+				next.AuthValid = false
+				next.Error = refreshErr.Error()
+				out[i] = next
+				return
+			}
+			next.AuthValid = true
+			account, ok := refreshed.Account(refreshed.SourcePath(r.store))
+			if !ok {
+				next.Error = "account has no access token"
+				out[i] = next
+				return
+			}
+			r.replace(account)
+			details, err := accounts.FetchCodexUsageDetails(ctx, r.client, account)
+			if err != nil {
+				next.Error = err.Error()
+				out[i] = next
+				return
+			}
+			next.PlanType = details.PlanType
+			next.Windows = details.Windows
+			next.Credits = details.Credits
+			out[i] = next
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
 func (r *AccountRef) replace(account accounts.Account) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -306,6 +389,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus))
 	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
 	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
+	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
@@ -401,6 +485,31 @@ func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 			AuthMode: account.AuthMode,
 			Email:    account.Email,
 			Source:   account.Source,
+		})
+	}
+	writeJSON(w, out)
+}
+
+func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.AccountRef != nil {
+		writeJSON(w, s.AccountRef.UsageStatuses(r.Context()))
+		return
+	}
+	accounts := s.accountList()
+	out := make([]AccountUsageStatus, 0, len(accounts))
+	for _, account := range accounts {
+		out = append(out, AccountUsageStatus{
+			AccountStatus: AccountStatus{
+				ID:       account.ID,
+				Provider: account.Provider,
+				AuthMode: account.AuthMode,
+				Email:    account.Email,
+				Source:   account.Source,
+			},
 		})
 	}
 	writeJSON(w, out)

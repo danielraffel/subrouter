@@ -1,6 +1,6 @@
 # Codex CLI Integration
 
-Current Codex does not use an `OPENAI_BASE_URL` environment variable for the built-in OpenAI provider. Use the Subrouter wrapper.
+Current Codex does not use an `OPENAI_BASE_URL` environment variable for the built-in OpenAI provider. Use the Subrouter wrapper, or let `sr server use <name>` write the Codex config file.
 
 ## Recommended
 
@@ -23,6 +23,25 @@ Subrouter supports Codex WebSocket requests, so the built-in provider can keep i
 This includes Responses WebSockets at `/v1/responses` and realtime WebSockets at `/v1/realtime`.
 
 Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Codex should stay logged in normally, ideally with ChatGPT auth. Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers with the selected `cx` account.
+
+## Server Switching
+
+Register and select a remote server:
+
+```bash
+sr server add team --url http://100.64.0.1:31415 --default
+sr server use team
+```
+
+Both commands write the selected routing defaults to `CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset:
+
+```toml
+openai_base_url = "http://100.64.0.1:31415/v1"
+chatgpt_base_url = "http://100.64.0.1:31415/backend-api"
+experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
+```
+
+Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to restore local routing. When a remote server is selected, bare `sr` and `sr status` render that server's usage table.
 
 ## Codex Desktop
 

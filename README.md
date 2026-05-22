@@ -41,7 +41,7 @@ Steps:
    ssh <user@host> "sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token '$TOKEN'"
    ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/health'
    ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/ready'
-4. Save the same admin token locally in Subrouter server config without printing it:
+4. Save the same admin token locally in Subrouter server config without printing it. This also writes Codex routing defaults to `CODEX_HOME/config.toml` or `~/.codex/config.toml`:
    sr server add team --url http://<tailnet-ip-or-dns>:31415 --admin-token "$TOKEN" --default
 5. Create server-owned Codex OAuth chains:
    sr server sync team --device-auth
@@ -154,13 +154,15 @@ GET /_subrouter/ready
 POST /_subrouter/drain
 GET /_subrouter/drain-status
 GET /_subrouter/accounts
+GET /_subrouter/account-status
 POST /_subrouter/account-status
+GET /_subrouter/usage-status
 GET /_subrouter/sessions
 GET /_subrouter/dashboard
 GET /_subrouter/transcripts
 ```
 
-`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue.
+`/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns the read-only account usage data rendered by `sr server status <name>`.
 
 For servers that listen on a non-loopback address, set an admin token before exposing account, session, dashboard, or transcript endpoints:
 
@@ -237,11 +239,21 @@ It does not edit Codex config or set auth environment variables. Do not set a du
 
 Override the subrouter URL with `SUBROUTER_CODEX_BASE_URL` if needed. See [docs/codex.md](docs/codex.md) for details and the custom-provider fallback.
 
-If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:31415/v1`. To make `sr codex` use a remote Subrouter by default, register and select a named server:
+If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:31415/v1`. To make `sr codex`, Codex Desktop's app-server, and the default `sr` usage view use a remote Subrouter, register and select a named server:
 
 ```bash
 sr server add team --url http://100.64.0.1:31415 --default
 ```
+
+`sr server add --default` and `sr server use <name>` write these top-level keys in `CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset:
+
+```toml
+openai_base_url = "http://100.64.0.1:31415/v1"
+chatgpt_base_url = "http://100.64.0.1:31415/backend-api"
+experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
+```
+
+Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to return to the local daemon and rewrite Codex config to `127.0.0.1:31415`.
 
 The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_CODEX_SERVER=team`.
 Rename a local server nickname with `sr server rename <old> <new>`.

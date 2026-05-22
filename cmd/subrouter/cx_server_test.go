@@ -92,10 +92,21 @@ func TestCXServerStatusSendsAdminToken(t *testing.T) {
 		out:    &out,
 		errOut: &out,
 		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/usage-status" {
+				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
+			}
 			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
 				t.Fatalf("Authorization = %q", got)
 			}
-			body, _ := json.Marshal([]remoteServerAccount{{ID: "acct", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth}})
+			body, _ := json.Marshal([]remoteServerUsageStatus{{
+				ID:        "acct@example.com",
+				Provider:  accounts.ProviderCodex,
+				AuthMode:  accounts.AuthModeOAuth,
+				Email:     "acct@example.com",
+				AuthValid: true,
+				PlanType:  "pro",
+				Windows:   []accounts.UsageWindow{{UsedPercent: 20, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+			}})
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     make(http.Header),
@@ -105,6 +116,9 @@ func TestCXServerStatusSendsAdminToken(t *testing.T) {
 	}
 	if err := runner.run(context.Background(), []string{"server", "status", "team"}); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "acct@example.com") {
+		t.Fatalf("status did not render usage table:\n%s", out.String())
 	}
 }
 
@@ -180,6 +194,7 @@ func TestCXServerAddAllowsURLOnlyServer(t *testing.T) {
 func TestCXServerUseSetsExplicitDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
@@ -203,12 +218,114 @@ func TestCXServerUseSetsExplicitDefault(t *testing.T) {
 	if file.Default != "community" {
 		t.Fatalf("default = %q, want community", file.Default)
 	}
+	configBody, err := os.ReadFile(filepath.Join(home, "codex-home", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`openai_base_url = "http://100.64.0.1:31415/v1"`,
+		`chatgpt_base_url = "http://100.64.0.1:31415/backend-api"`,
+		`experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"`,
+	} {
+		if !strings.Contains(string(configBody), want) {
+			t.Fatalf("missing %q in config:\n%s", want, string(configBody))
+		}
+	}
 	out.Reset()
 	if err := runner.run(context.Background(), []string{"server", "list"}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "(default)") {
 		t.Fatalf("list did not mark default:\n%s", out.String())
+	}
+}
+
+func TestCXServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
+	store := accounts.DefaultCodexStore()
+	serverStore := defaultCXServerStore(store)
+	if err := serverStore.save(cxServerFile{
+		Default: "team",
+		Servers: []cxServerConfig{{
+			Name: "team",
+			URL:  "http://100.64.0.1:31415",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := cxRunner{program: "sr", store: store, out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{"server", "use", "local"}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := serverStore.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Default != "" {
+		t.Fatalf("default = %q, want local", file.Default)
+	}
+	configBody, err := os.ReadFile(filepath.Join(home, "codex-home", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(configBody), `openai_base_url = "http://127.0.0.1:31415/v1"`) {
+		t.Fatalf("local config not written:\n%s", string(configBody))
+	}
+}
+
+func TestCXDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := defaultCXServerStore(store).save(cxServerFile{
+		Default: "team",
+		Servers: []cxServerConfig{{
+			Name:       "team",
+			URL:        "http://100.64.0.1:31415",
+			AdminToken: "secret-token",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := cxRunner{
+		program: "sr",
+		store:   store,
+		out:     &out,
+		errOut:  &out,
+		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/usage-status" {
+				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
+			}
+			body, _ := json.Marshal([]remoteServerUsageStatus{{
+				ID:        "remote@example.com",
+				Provider:  accounts.ProviderCodex,
+				AuthMode:  accounts.AuthModeOAuth,
+				Email:     "remote@example.com",
+				AuthValid: true,
+				PlanType:  "pro",
+				Windows:   []accounts.UsageWindow{{UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)}},
+			}})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Server: team") || !strings.Contains(out.String(), "remote@example.com") {
+		t.Fatalf("default output did not render remote server status:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "Switch to (#)") {
+		t.Fatalf("remote status should not show local switch prompt:\n%s", out.String())
 	}
 }
 
@@ -406,8 +523,8 @@ func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 			if req.URL.Path != "/_subrouter/account-status" {
 				t.Fatalf("unexpected path: %s", req.URL.Path)
 			}
-			if req.Method != http.MethodPost {
-				t.Fatalf("method = %s, want POST", req.Method)
+			if req.Method != http.MethodGet {
+				t.Fatalf("method = %s, want GET", req.Method)
 			}
 			body, _ := json.Marshal([]remoteServerAccountStatus{
 				{ID: "bob@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Email: "bob@example.com", AuthChecked: true, AuthValid: true},

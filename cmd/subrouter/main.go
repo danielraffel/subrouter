@@ -452,7 +452,7 @@ Usage:
 
   %[1]s server             Manage Subrouter servers
   %[1]s server add <name> --url <url> [--default]
-  %[1]s server use <name>
+  %[1]s server use <name|local> [--no-codex-config]
   %[1]s server rename <old> <new>
   %[1]s server install <name>
   %[1]s server login <name> [--device-auth]

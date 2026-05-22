@@ -60,7 +60,7 @@ Usage:
 
   cx server             Manage Subrouter servers
   cx server add <name> --url <url> [--default]
-  cx server use <name>
+  cx server use <name|local> [--no-codex-config]
   cx server rename <old> <new>
   cx server install <name>
   cx server login <name> [--device-auth]
@@ -430,6 +430,11 @@ func appendKV(parts *[]string, key, value string) {
 }
 
 func (r cxRunner) status(ctx context.Context) error {
+	if server, ok, err := r.defaultRemoteServer(); err != nil {
+		return err
+	} else if ok {
+		return r.serverStatus(ctx, defaultCXServerStore(r.store), server.Name)
+	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
 	}
@@ -496,6 +501,11 @@ func (r cxRunner) pick(ctx context.Context, opts cxSwitchOptions) error {
 }
 
 func (r cxRunner) defaultInteractive(ctx context.Context, opts cxSwitchOptions) error {
+	if server, ok, err := r.defaultRemoteServer(); err != nil {
+		return err
+	} else if ok {
+		return r.serverStatus(ctx, defaultCXServerStore(r.store), server.Name)
+	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
 	}

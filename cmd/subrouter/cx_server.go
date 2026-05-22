@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/selectacct"
 )
 
 func (r cxRunner) serverCommand() string {
@@ -35,7 +36,7 @@ func cxServerHelp(command string) string {
 Usage:
   %[1]s list
   %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
-  %[1]s use <name>
+  %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
   %[1]s rename <old> <new>
@@ -81,14 +82,11 @@ func (r cxRunner) server(ctx context.Context, args []string) error {
 	case "add":
 		return r.serverAdd(store, args[1:])
 	case "use":
-		if len(args) != 2 {
-			return fmt.Errorf("usage: %s use <name>", command)
-		}
-		return r.serverUse(store, args[1])
+		return r.serverUse(store, args[1:])
 	case "current", "default":
 		return r.serverCurrent(store)
 	case "clear-default", "unset":
-		return r.serverClearDefault(store)
+		return r.serverClearDefault(store, args[1:])
 	case "rename", "mv":
 		if len(args) != 3 {
 			return fmt.Errorf("usage: %s rename <old> <new>", command)
@@ -209,7 +207,7 @@ func (r cxRunner) serverList(store cxServerStore) error {
 func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]", command)
+		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	}
 	name := args[0]
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
@@ -220,6 +218,7 @@ func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
 	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
+	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -277,16 +276,41 @@ func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 	}
 	if *makeDefault {
 		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
+		if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
+			path, err := writeCodexConfigForServer(next)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(r.out, "Codex config: %s\n", path)
+		}
 	}
 	return nil
 }
 
-func (r cxRunner) serverUse(store cxServerStore, name string) error {
+func (r cxRunner) serverUse(store cxServerStore, args []string) error {
+	command := r.serverCommand()
+	if len(args) == 0 {
+		return fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
+	}
+	name := strings.TrimSpace(args[0])
+	flags := flag.NewFlagSet(command+" use", flag.ContinueOnError)
+	flags.SetOutput(r.errOut)
+	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if isLocalServerName(name) {
+		return r.clearDefaultServer(store, shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig))
+	}
 	file, err := store.load()
 	if err != nil {
 		return err
 	}
-	if _, ok := file.find(name); !ok {
+	server, ok := file.find(name)
+	if !ok {
 		return fmt.Errorf("server %q not found", name)
 	}
 	file.Default = name
@@ -294,6 +318,13 @@ func (r cxRunner) serverUse(store cxServerStore, name string) error {
 		return err
 	}
 	fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
+	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
+		path, err := writeCodexConfigForServer(server)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "Codex config: %s\n", path)
+	}
 	return nil
 }
 
@@ -314,7 +345,21 @@ func (r cxRunner) serverCurrent(store cxServerStore) error {
 	return nil
 }
 
-func (r cxRunner) serverClearDefault(store cxServerStore) error {
+func (r cxRunner) serverClearDefault(store cxServerStore, args []string) error {
+	command := r.serverCommand()
+	flags := flag.NewFlagSet(command+" clear-default", flag.ContinueOnError)
+	flags.SetOutput(r.errOut)
+	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	return r.clearDefaultServer(store, shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig))
+}
+
+func (r cxRunner) clearDefaultServer(store cxServerStore, updateCodexConfig bool) error {
 	file, err := store.load()
 	if err != nil {
 		return err
@@ -324,7 +369,56 @@ func (r cxRunner) serverClearDefault(store cxServerStore) error {
 		return err
 	}
 	fmt.Fprintln(r.out, "Default Codex server: local")
+	if updateCodexConfig {
+		path, err := writeCodexConfigForLocal()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "Codex config: %s\n", path)
+	}
 	return nil
+}
+
+func addCodexConfigSwitchFlags(flags *flag.FlagSet) (*bool, *bool) {
+	writeCodexConfig := flags.Bool("codex-config", true, "write CODEX_HOME/config.toml routing defaults")
+	noCodexConfig := flags.Bool("no-codex-config", false, "do not modify CODEX_HOME/config.toml")
+	return writeCodexConfig, noCodexConfig
+}
+
+func shouldWriteCodexConfig(writeCodexConfig, noCodexConfig bool) bool {
+	return writeCodexConfig && !noCodexConfig
+}
+
+func isLocalServerName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "local", "localhost":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r cxRunner) defaultRemoteServer() (cxServerConfig, bool, error) {
+	store := defaultCXServerStore(r.store)
+	file, err := store.load()
+	if err != nil {
+		return cxServerConfig{}, false, err
+	}
+	if strings.TrimSpace(file.Default) == "" {
+		return cxServerConfig{}, false, nil
+	}
+	server, ok := file.find(file.Default)
+	if !ok {
+		return cxServerConfig{}, false, fmt.Errorf("default server %q not found; run %s server use local or %s server clear-default", file.Default, r.programOrSubrouter(), r.programOrSubrouter())
+	}
+	return server, true, nil
+}
+
+func (r cxRunner) programOrSubrouter() string {
+	if strings.TrimSpace(r.program) != "" {
+		return r.program
+	}
+	return "subrouter"
 }
 
 func (r cxRunner) serverRename(store cxServerStore, oldName, newName string) error {
@@ -401,6 +495,16 @@ func (r cxRunner) serverStatus(ctx context.Context, store cxServerStore, name st
 	if !ok {
 		return fmt.Errorf("server %q not found", name)
 	}
+	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	if err != nil {
+		return err
+	}
+	if available {
+		rows := usageRowsFromServerUsageStatuses(usage)
+		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+		displayUsageRows(r.out, rows, false)
+		return nil
+	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)
 	if err != nil {
 		return err
@@ -434,6 +538,22 @@ type remoteServerAccountStatus struct {
 	AuthValid   bool              `json:"auth_valid"`
 	Refreshed   bool              `json:"refreshed,omitempty"`
 	Error       string            `json:"error,omitempty"`
+}
+
+type remoteServerUsageStatus struct {
+	ID          string                 `json:"id"`
+	Provider    accounts.Provider      `json:"provider"`
+	AuthMode    accounts.AuthMode      `json:"auth_mode"`
+	Email       string                 `json:"email,omitempty"`
+	Source      string                 `json:"source"`
+	AuthChecked bool                   `json:"auth_checked"`
+	AuthValid   bool                   `json:"auth_valid"`
+	Refreshed   bool                   `json:"refreshed,omitempty"`
+	Error       string                 `json:"error,omitempty"`
+	Active      bool                   `json:"active,omitempty"`
+	PlanType    string                 `json:"plan_type,omitempty"`
+	Windows     []accounts.UsageWindow `json:"windows,omitempty"`
+	Credits     *accounts.CreditsInfo  `json:"credits,omitempty"`
 }
 
 func (r cxRunner) fetchServerAccountsResponse(ctx context.Context, server cxServerConfig) (*http.Response, error) {
@@ -508,6 +628,72 @@ func (r cxRunner) fetchServerAccountStatuses(ctx context.Context, server cxServe
 		})
 	}
 	return out, false, nil
+}
+
+func (r cxRunner) fetchServerUsageStatuses(ctx context.Context, server cxServerConfig) ([]remoteServerUsageStatus, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/usage-status", nil)
+	if err != nil {
+		return nil, false, err
+	}
+	addServerAdminAuth(req, server)
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 200 && res.StatusCode < 300 {
+		var out []remoteServerUsageStatus
+		if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+			return nil, true, err
+		}
+		return out, true, nil
+	}
+	_, _ = io.Copy(io.Discard, res.Body)
+	if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed {
+		return nil, false, nil
+	}
+	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
+}
+
+func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []cxUsageRow {
+	rows := make([]cxUsageRow, 0, len(statuses))
+	for _, status := range statuses {
+		if status.Provider != "" && status.Provider != accounts.ProviderCodex {
+			continue
+		}
+		email := accountEmail(status.ID, status.Email)
+		if email == "" {
+			continue
+		}
+		row := cxUsageRow{
+			email:    email,
+			active:   status.Active,
+			authMode: status.AuthMode,
+			planType: status.PlanType,
+			windows:  status.Windows,
+			credits:  status.Credits,
+		}
+		if status.Error != "" {
+			row.err = errors.New(status.Error)
+			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+		} else if status.AuthMode == accounts.AuthModeAPIKey {
+			row.score = selectacct.Score{AccountID: email, Headroom: 0.01, ShortHeadroom: 0.01}
+			if row.planType == "" {
+				row.planType = "api key"
+			}
+		} else {
+			row.score = scoreFromWindows(email, status.Windows)
+			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+		}
+		rows = append(rows, row)
+	}
+	rankUsageRows(rows)
+	return rows
 }
 
 func addServerAdminAuth(req *http.Request, server cxServerConfig) {
@@ -626,7 +812,7 @@ func (r cxRunner) serverSync(ctx context.Context, store cxServerStore, args []st
 	if err != nil {
 		return err
 	}
-	remoteAccounts, statusAvailable, err := r.fetchServerAccountStatuses(ctx, server, true)
+	remoteAccounts, statusAvailable, err := r.fetchServerAccountStatuses(ctx, server, false)
 	if err != nil {
 		return err
 	}

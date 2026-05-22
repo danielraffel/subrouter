@@ -804,6 +804,69 @@ func TestAccountStatusEndpointValidatesRefreshToken(t *testing.T) {
 	}
 }
 
+func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	fresh := proxyStoredOAuthAccount("codex@example.com", "fresh", time.Now().Add(time.Hour))
+	if err := store.SaveStored(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.WriteActiveCodexAuth(fresh.Auth); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := fresh.Account(fresh.SourcePath(store))
+	if !ok {
+		t.Fatal("fresh account did not convert")
+	}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "auth.openai.com" {
+			t.Fatalf("usage-status should not force OAuth refresh for a fresh access token")
+		}
+		if req.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("unexpected path: %s", req.URL.Path)
+		}
+		body, _ := json.Marshal(map[string]any{
+			"plan_type": "pro",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         float64(20),
+					"limit_window_seconds": int64((5 * time.Hour) / time.Second),
+					"reset_after_seconds":  int64(time.Hour / time.Second),
+				},
+			},
+		})
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+	sessionStore, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts:     []accounts.Account{account},
+		AccountRef:   NewAccountRef(store, []accounts.Account{account}, client),
+		Sessions:     sessionStore,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var statuses []AccountUsageStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &statuses); err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || !statuses[0].AuthValid || statuses[0].Refreshed || statuses[0].PlanType != "pro" || !statuses[0].Active {
+		t.Fatalf("unexpected statuses: %+v", statuses)
+	}
+}
+
 func TestReloadAccountsHotLoadsNewAccountWithoutRestart(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	accountStore := accounts.CodexStore{Dir: t.TempDir()}
