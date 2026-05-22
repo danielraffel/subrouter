@@ -329,6 +329,21 @@ func TestCXDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	}
 }
 
+func TestUsageRowsFromServerUsageStatusesKeepsServerErrorWithoutEmail(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		Provider:    accounts.ProviderCodex,
+		AuthChecked: true,
+		AuthValid:   false,
+		Error:       "read account store: permission denied",
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want one server error row", rows)
+	}
+	if rows[0].email != "server" || rows[0].err == nil || rows[0].err.Error() != "read account store: permission denied" {
+		t.Fatalf("row = %+v", rows[0])
+	}
+}
+
 func TestCXServerRenameUpdatesDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

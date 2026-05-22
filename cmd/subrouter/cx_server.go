@@ -667,7 +667,10 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []cxUs
 		}
 		email := accountEmail(status.ID, status.Email)
 		if email == "" {
-			continue
+			if status.Error == "" {
+				continue
+			}
+			email = "server"
 		}
 		row := cxUsageRow{
 			email:    email,

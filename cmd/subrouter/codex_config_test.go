@@ -38,6 +38,16 @@ func TestUpdateTopLevelTomlStringsPreservesTables(t *testing.T) {
 	}
 }
 
+func TestUpdateTopLevelTomlStringsSeparatesMissingKeysAfterUnterminatedLine(t *testing.T) {
+	got := updateTopLevelTomlStrings(`model = "gpt-5"`, map[string]string{
+		"openai_base_url": "http://team.example/v1",
+	})
+	want := "model = \"gpt-5\"\nopenai_base_url = \"http://team.example/v1\"\n"
+	if got != want {
+		t.Fatalf("config = %q, want %q", got, want)
+	}
+}
+
 func TestWriteCodexConfigValuesCreatesBackup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte("model = \"gpt-5\"\n"), 0o600); err != nil {

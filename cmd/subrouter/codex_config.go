@@ -125,6 +125,12 @@ func updateTopLevelTomlStrings(text string, values map[string]string) string {
 }
 
 func appendMissingTomlStrings(out []string, remaining map[string]string) []string {
+	if len(remaining) == 0 {
+		return out
+	}
+	if len(out) > 0 && !strings.HasSuffix(out[len(out)-1], "\n") {
+		out[len(out)-1] += "\n"
+	}
 	keys := make([]string, 0, len(remaining))
 	for _, key := range codexRoutingConfigKeys {
 		if _, ok := remaining[key]; ok {
