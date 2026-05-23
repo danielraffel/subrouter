@@ -154,6 +154,24 @@ func TestPickFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
 	}
 }
 
+func TestPickKeepsConstrainedOAuthBeforeExhaustedOAuth(t *testing.T) {
+	scheduler := NewScheduler([]Score{
+		{AccountID: "short-empty@example.com", Headroom: 0.79, ShortHeadroom: 0},
+		{AccountID: "near-threshold@example.com", Headroom: 0.39, ShortHeadroom: 0.39},
+	})
+
+	got, err := scheduler.Pick([]accounts.Account{
+		{ID: "short-empty@example.com", AuthMode: accounts.AuthModeOAuth},
+		{ID: "near-threshold@example.com", AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "near-threshold@example.com" {
+		t.Fatalf("got %q, want constrained but non-exhausted OAuth account", got.ID)
+	}
+}
+
 // API-key accounts are still picked when no OAuth candidate exists.
 func TestPickFallsBackToAPIKeyWhenNoOAuth(t *testing.T) {
 	scheduler := NewScheduler(nil)

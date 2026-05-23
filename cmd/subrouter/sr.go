@@ -1438,9 +1438,9 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, color
 			"Plan":     {Text: row.planType, Style: ansiDim},
 			"State":    {Text: usageGridState(row), Style: usageGridStateColor(row)},
 			"Pick":     {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-			"5h":       usageGridWindowCell(row.windows, isShortQuotaWindow),
+			"5h":       usageGridShortWindowCell(row),
 			"7d":       usageGridWindowCell(row.windows, isLongQuotaWindow),
-			"Spark":    usageGridNamedWindowCell(row.windows, false),
+			"Spark":    usageGridShortNamedWindowCell(row),
 			"Spark wk": usageGridNamedWindowCell(row.windows, true),
 			"Credits":  usageGridCreditsCell(row),
 		}
@@ -1634,6 +1634,20 @@ func compactPickReason(row srUsageRow) string {
 		return fmt.Sprintf("%s, 5h reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
 	}
 	return left
+}
+
+func usageGridShortWindowCell(row srUsageRow) usageGridCell {
+	if row.cooked {
+		return usageGridCell{}
+	}
+	return usageGridWindowCell(row.windows, isShortQuotaWindow)
+}
+
+func usageGridShortNamedWindowCell(row srUsageRow) usageGridCell {
+	if row.cooked {
+		return usageGridCell{}
+	}
+	return usageGridNamedWindowCell(row.windows, false)
 }
 
 func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) usageGridCell {

@@ -104,10 +104,13 @@ func selectionTier(account accounts.Account, score Score) int {
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return 1
 	}
-	if account.AuthMode == accounts.AuthModeOAuth {
+	if account.AuthMode == accounts.AuthModeOAuth && !score.exhausted() {
 		return 2
 	}
-	return 3
+	if account.AuthMode == accounts.AuthModeOAuth {
+		return 3
+	}
+	return 4
 }
 
 func (s Scheduler) score(accountID string) Score {

@@ -976,6 +976,30 @@ func TestDisplayUsageRowsGridColorsWhenForced(t *testing.T) {
 	}
 }
 
+func TestUsageGridSuppressesShortWindowsForCookedRows(t *testing.T) {
+	windows := []accounts.UsageWindow{
+		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+	}
+	cooked := srUsageRow{cooked: true, windows: windows}
+	if cell := usageGridShortWindowCell(cooked); cell.Text != "" {
+		t.Fatalf("short window cell = %q, want blank for cooked row", cell.Text)
+	}
+	if cell := usageGridShortNamedWindowCell(cooked); cell.Text != "" {
+		t.Fatalf("short named window cell = %q, want blank for cooked row", cell.Text)
+	}
+
+	tempCooked := srUsageRow{tempCooked: true, windows: windows}
+	if cell := usageGridShortWindowCell(tempCooked); cell.Text == "" {
+		t.Fatal("temporarily cooked row should still show the short window")
+	}
+	if cell := usageGridShortNamedWindowCell(tempCooked); cell.Text == "" {
+		t.Fatal("temporarily cooked row should still show the short named window")
+	}
+}
+
 func TestDisplayUsageRowsDetailedCanBeForced(t *testing.T) {
 	t.Setenv("SR_USAGE_GRID", "0")
 	t.Setenv("COLUMNS", "200")

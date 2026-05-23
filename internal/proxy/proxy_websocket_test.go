@@ -2520,6 +2520,66 @@ func TestHandlerDoesNotAssignNewSessionToExhaustedOAuthAccount(t *testing.T) {
 	}
 }
 
+func TestHandlerUsesConstrainedOAuthInsteadOfExhaustedOAuth(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "short-empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "short-empty-token"},
+			{ID: "near-threshold@example.com", AuthMode: accounts.AuthModeOAuth, Token: "near-threshold-token"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "short-empty@example.com", Headroom: 0.79, ShortHeadroom: 0},
+			{AccountID: "near-threshold@example.com", Headroom: 0.39, ShortHeadroom: 0.39},
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+	if len(auths) != 1 || auths[0] != "Bearer near-threshold-token" {
+		t.Fatalf("upstream auths = %#v, want constrained OAuth account", auths)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("missing session assignment")
+	}
+	if assignment.AccountID != "near-threshold@example.com" {
+		t.Fatalf("AccountID = %q, want near-threshold@example.com", assignment.AccountID)
+	}
+}
+
 func TestHandlerScopesStickySessionsByAgentType(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
