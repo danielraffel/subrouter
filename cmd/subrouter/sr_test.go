@@ -17,7 +17,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 )
 
-func TestCXListReadsNativeCodexStore(t *testing.T) {
+func TestSRListReadsNativeCodexStore(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -43,7 +43,7 @@ func TestCXListReadsNativeCodexStore(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{"list"}); err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestCXListReadsNativeCodexStore(t *testing.T) {
 	}
 }
 
-func TestCXTraceShowsOAuthBreadcrumbs(t *testing.T) {
+func TestSRTraceShowsOAuthBreadcrumbs(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -93,7 +93,7 @@ func TestCXTraceShowsOAuthBreadcrumbs(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{"trace", "a@example.com"}); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestCXTraceShowsOAuthBreadcrumbs(t *testing.T) {
 	}
 }
 
-func TestCXSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
+func TestSRSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -135,7 +135,7 @@ func TestCXSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{"switch", "paid"}); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestCXSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	}
 }
 
-func TestCXSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
+func TestSRSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	home := t.TempDir()
 	xdgData := t.TempDir()
 	piDir := filepath.Join(home, "pi-agent")
@@ -210,7 +210,7 @@ func TestCXSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{"switch", "sync@example.com"}); err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestCXSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	}
 }
 
-func TestCXAddRestoresPreviouslyActiveAccount(t *testing.T) {
+func TestSRAddRestoresPreviouslyActiveAccount(t *testing.T) {
 	home := t.TempDir()
 	xdgData := t.TempDir()
 	piDir := filepath.Join(home, "pi-agent")
@@ -264,7 +264,7 @@ func TestCXAddRestoresPreviouslyActiveAccount(t *testing.T) {
 	installFakeCodexLogin(t, home, addedAuth)
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{"add"}); err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestCXAddRestoresPreviouslyActiveAccount(t *testing.T) {
 	}
 }
 
-func TestCXAutoSwitchesWhenActiveAccountIsExhausted(t *testing.T) {
+func TestSRAutoSwitchesWhenActiveAccountIsExhausted(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -321,12 +321,12 @@ func TestCXAutoSwitchesWhenActiveAccountIsExhausted(t *testing.T) {
 		bestAuth.Tokens.AccessToken:   1,
 	}
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			used := usageByToken[strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")]
 			return usageResponse(used), nil
 		})},
@@ -358,7 +358,7 @@ func TestCXAutoSwitchesWhenActiveAccountIsExhausted(t *testing.T) {
 	}
 }
 
-func TestCXPickSwitchesToRecommendedAccount(t *testing.T) {
+func TestSRPickSwitchesToRecommendedAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -386,12 +386,12 @@ func TestCXPickSwitchesToRecommendedAccount(t *testing.T) {
 		bestAuth.Tokens.AccessToken:   1,
 	}
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			used := usageByToken[strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")]
 			return usageResponse(used), nil
 		})},
@@ -423,7 +423,7 @@ func TestCXPickSwitchesToRecommendedAccount(t *testing.T) {
 	}
 }
 
-func TestCXPickSucceedsWhenRecommendedActiveHasQuota(t *testing.T) {
+func TestSRPickSucceedsWhenRecommendedActiveHasQuota(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -441,12 +441,12 @@ func TestCXPickSucceedsWhenRecommendedActiveHasQuota(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return usageResponseWindows(20, 20), nil
 		})},
 	}
@@ -459,7 +459,7 @@ func TestCXPickSucceedsWhenRecommendedActiveHasQuota(t *testing.T) {
 	}
 }
 
-func TestCXPickFailsWhenNoRecommendedAccountHasQuota(t *testing.T) {
+func TestSRPickFailsWhenNoRecommendedAccountHasQuota(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -477,12 +477,12 @@ func TestCXPickFailsWhenNoRecommendedAccountHasQuota(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return usageResponseWindows(100, 100), nil
 		})},
 	}
@@ -507,7 +507,7 @@ func TestCXPickFailsWhenNoRecommendedAccountHasQuota(t *testing.T) {
 	}
 }
 
-func TestCXDefaultShowsCookedAccountAndDoesNotPromptWhenAllCooked(t *testing.T) {
+func TestSRDefaultShowsCookedAccountAndDoesNotPromptWhenAllCooked(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -525,12 +525,12 @@ func TestCXDefaultShowsCookedAccountAndDoesNotPromptWhenAllCooked(t *testing.T) 
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return usageResponseWindows(0, 100), nil
 		})},
 	}
@@ -551,7 +551,7 @@ func TestCXDefaultShowsCookedAccountAndDoesNotPromptWhenAllCooked(t *testing.T) 
 	}
 }
 
-func TestCXDefaultShowsTemporarilyCookedAccountWhenShortWindowConsumed(t *testing.T) {
+func TestSRDefaultShowsTemporarilyCookedAccountWhenShortWindowConsumed(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -569,12 +569,12 @@ func TestCXDefaultShowsTemporarilyCookedAccountWhenShortWindowConsumed(t *testin
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader("\n"),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return usageResponseWindows(100, 55), nil
 		})},
 	}
@@ -601,7 +601,7 @@ func TestCXDefaultShowsTemporarilyCookedAccountWhenShortWindowConsumed(t *testin
 	}
 }
 
-func TestCXInteractiveRefusesTemporarilyCookedSelection(t *testing.T) {
+func TestSRInteractiveRefusesTemporarilyCookedSelection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -625,12 +625,12 @@ func TestCXInteractiveRefusesTemporarilyCookedSelection(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader("2\n"),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
 			if token == tempCookedAuth.Tokens.AccessToken {
 				return usageResponseWindows(100, 20), nil
@@ -660,7 +660,7 @@ func TestCXInteractiveRefusesTemporarilyCookedSelection(t *testing.T) {
 	}
 }
 
-func TestCXInteractiveRefusesCookedSelection(t *testing.T) {
+func TestSRInteractiveRefusesCookedSelection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -684,12 +684,12 @@ func TestCXInteractiveRefusesCookedSelection(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader("2\n"),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
 			if token == cookedAuth.Tokens.AccessToken {
 				return usageResponseWindows(0, 100), nil
@@ -719,7 +719,7 @@ func TestCXInteractiveRefusesCookedSelection(t *testing.T) {
 	}
 }
 
-func TestCXSwitchRefusesCookedAccount(t *testing.T) {
+func TestSRSwitchRefusesCookedAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -743,12 +743,12 @@ func TestCXSwitchRefusesCookedAccount(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return usageResponseWindows(0, 100), nil
 		})},
 	}
@@ -774,8 +774,8 @@ func TestCXSwitchRefusesCookedAccount(t *testing.T) {
 	}
 }
 
-func TestCXRankRowsKeepsAPIKeyAsFallback(t *testing.T) {
-	rows := []cxUsageRow{
+func TestSRRankRowsKeepsAPIKeyAsFallback(t *testing.T) {
+	rows := []srUsageRow{
 		{
 			email:    "apikey:paid",
 			authMode: accounts.AuthModeAPIKey,
@@ -818,8 +818,8 @@ func TestCXRankRowsKeepsAPIKeyAsFallback(t *testing.T) {
 	}
 }
 
-func TestCXRankRowsFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
-	rows := []cxUsageRow{
+func TestSRRankRowsFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
+	rows := []srUsageRow{
 		{
 			email:    "empty@example.com",
 			authMode: accounts.AuthModeOAuth,
@@ -842,8 +842,8 @@ func TestCXRankRowsFallsBackToAPIKeyBeforeExhaustedOAuth(t *testing.T) {
 	}
 }
 
-func TestCXRankRowsKeepsTemporarilyCookedAboveCooked(t *testing.T) {
-	rows := []cxUsageRow{
+func TestSRRankRowsKeepsTemporarilyCookedAboveCooked(t *testing.T) {
+	rows := []srUsageRow{
 		{
 			email:        "cooked@example.com",
 			authMode:     accounts.AuthModeOAuth,
@@ -898,7 +898,7 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	t.Setenv("SR_USAGE_GRID", "1")
 	t.Setenv("COLUMNS", "200")
 	var out bytes.Buffer
-	displayUsageRows(&out, []cxUsageRow{
+	displayUsageRows(&out, []srUsageRow{
 		{
 			email:          "lawrence@cmux.com",
 			planType:       "pro",
@@ -937,7 +937,7 @@ func TestDisplayUsageRowsGridColorsWhenForced(t *testing.T) {
 	t.Setenv("FORCE_COLOR", "1")
 	t.Setenv("COLUMNS", "200")
 	var out bytes.Buffer
-	displayUsageRows(&out, []cxUsageRow{
+	displayUsageRows(&out, []srUsageRow{
 		{
 			email:          "ok@example.com",
 			gtoRecommended: true,
@@ -980,7 +980,7 @@ func TestDisplayUsageRowsDetailedCanBeForced(t *testing.T) {
 	t.Setenv("SR_USAGE_GRID", "0")
 	t.Setenv("COLUMNS", "200")
 	var out bytes.Buffer
-	displayUsageRows(&out, []cxUsageRow{
+	displayUsageRows(&out, []srUsageRow{
 		{
 			email:     "a@example.com",
 			gtoReason: "80% bottleneck left",
@@ -994,8 +994,8 @@ func TestDisplayUsageRowsDetailedCanBeForced(t *testing.T) {
 	}
 }
 
-func TestParseCXSwitchArgs(t *testing.T) {
-	selector, opts, err := parseCXSwitchArgs([]string{"a@example.com", "--restart-gui"}, cxSwitchOptions{})
+func TestParseSRSwitchArgs(t *testing.T) {
+	selector, opts, err := parseSRSwitchArgs([]string{"a@example.com", "--restart-gui"}, srSwitchOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1067,9 +1067,9 @@ func installFakeCodexLogin(t *testing.T, home string, auth accounts.CodexAuthFil
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-type cxRoundTripFunc func(*http.Request) (*http.Response, error)
+type srRoundTripFunc func(*http.Request) (*http.Response, error)
 
-func (f cxRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+func (f srRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 

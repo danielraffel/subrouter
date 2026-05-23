@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,8 +21,8 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 )
 
-const cxUsageCacheTTL = time.Hour
-const cxUsageGridMinWidth = 140
+const srUsageCacheTTL = time.Hour
+const srUsageGridMinWidth = 140
 
 const (
 	ansiReset    = "\x1b[0m"
@@ -40,59 +41,59 @@ const (
 	ansiBGRowAlt = "\x1b[48;5;236m"
 )
 
-const cxHelp = `cx - Manage multiple Codex accounts
+const srHelp = `sr - Manage multiple Codex accounts
 
 Usage:
-  cx                    Show Codex usage for all accounts and switch
-  cx add                Add a new Codex account (opens OAuth login)
-  cx add-key            Add a Codex API key account
-  cx import             Import current ~/.codex/auth.json account
-  cx list               List all Codex accounts
-  cx switch [email]     Switch active Codex account and sync OpenCode/pi
-  cx g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
-  cx gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
-  cx gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  cx remove <email>     Remove a Codex account
-  cx status             Show Codex usage (non-interactive)
-  cx pick               Switch to the recommended account, failing if none has quota
-  cx usage [days]       Refresh and show API-key spend
-  cx trace <email>      Show OAuth refresh breadcrumbs for an account
+  sr                    Show Codex usage for all accounts and switch
+  sr add                Add a new Codex account (opens OAuth login)
+  sr add-key            Add a Codex API key account
+  sr import             Import current ~/.codex/auth.json account
+  sr list               List all Codex accounts
+  sr switch [email]     Switch active Codex account and sync OpenCode/pi
+  sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
+  sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
+  sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
+  sr remove <email>     Remove a Codex account
+  sr status             Show Codex usage (non-interactive)
+  sr pick               Switch to the recommended account, failing if none has quota
+  sr usage [days]       Refresh and show API-key spend
+  sr trace <email>      Show OAuth refresh breadcrumbs for an account
 
-  cx server             Manage Subrouter servers
-  cx server add <name> --url <url> [--default]
-  cx server use <name|local> [--no-codex-config]
-  cx server rename <old> <new>
-  cx server install <name>
-  cx server login <name> [--device-auth]
-  cx server sync <name> [--device-auth] [--yes]
+  sr server             Manage Subrouter servers
+  sr server add <name> --url <url> [--default]
+  sr server use <name|local> [--no-codex-config]
+  sr server rename <old> <new>
+  sr server install <name>
+  sr server login <name> [--device-auth]
+  sr server sync <name> [--device-auth] [--yes]
 
-  cx admin-keys         List stored OpenAI admin keys
-  cx add-admin-key      Add an sk-admin-* key
-  cx remove-admin-key <label>
-  cx attach-project <api-key-label> [--project-id <id-or-name>]
+  sr admin-keys         List stored OpenAI admin keys
+  sr add-admin-key      Add an sk-admin-* key
+  sr remove-admin-key <label>
+  sr attach-project <api-key-label> [--project-id <id-or-name>]
 
-  cx claude             Manage Claude Code profiles
-  cx gemini             Manage Gemini profiles
+  sr claude             Manage Claude Code profiles
+  sr gemini             Manage Gemini profiles
 
 These account commands also work at top level as subrouter <command> and sr <command>.
 The subrouter cx <command> form is kept as a compatibility alias.
 `
 
-type cxRunner struct {
+type srRunner struct {
 	program string
 	store   accounts.CodexStore
 	in      io.Reader
 	out     io.Writer
 	errOut  io.Writer
 	client  *http.Client
-	cmd     cxCommandRunner
+	cmd     srCommandRunner
 }
 
-type cxSwitchOptions struct {
+type srSwitchOptions struct {
 	restartCodexGUI bool
 }
 
-type cxUsageRow struct {
+type srUsageRow struct {
 	email            string
 	active           bool
 	planType         string
@@ -111,12 +112,12 @@ type cxUsageRow struct {
 	authMode         accounts.AuthMode
 }
 
-func cx(args []string) error {
-	return cxForProgram("cx", args)
+func cxAlias(args []string) error {
+	return srForProgram("cx", args)
 }
 
-func cxForProgram(program string, args []string) error {
-	runner := cxRunner{
+func srForProgram(program string, args []string) error {
+	runner := srRunner{
 		program: program,
 		store:   accounts.DefaultCodexStore(),
 		in:      os.Stdin,
@@ -127,9 +128,16 @@ func cxForProgram(program string, args []string) error {
 	return runner.run(context.Background(), args)
 }
 
-func (r cxRunner) run(ctx context.Context, args []string) error {
+func (r srRunner) run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return r.defaultInteractive(ctx, cxSwitchOptions{})
+		return r.defaultInteractive(ctx, srSwitchOptions{})
+	}
+	if shouldRouteSRCommand(args[0]) {
+		if server, ok, err := r.selectedRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.runRemoteAccountCommand(ctx, server, args)
+		}
 	}
 	switch args[0] {
 	case "add", "login":
@@ -141,7 +149,7 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 	case "list", "ls":
 		return r.list()
 	case "switch", "use":
-		selector, opts, err := parseCXSwitchArgs(args[1:], cxSwitchOptions{})
+		selector, opts, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {
 			return err
 		}
@@ -150,7 +158,7 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 		}
 		return r.switchAccount(ctx, selector, opts)
 	case "g", "gui", "gui-switch", "gui-use":
-		selector, opts, err := parseCXSwitchArgs(args[1:], cxSwitchOptions{restartCodexGUI: true})
+		selector, opts, err := parseSRSwitchArgs(args[1:], srSwitchOptions{restartCodexGUI: true})
 		if err != nil {
 			return err
 		}
@@ -166,7 +174,7 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 	case "status":
 		return r.status(ctx)
 	case "pick":
-		return r.pick(ctx, cxSwitchOptions{})
+		return r.pick(ctx, srSwitchOptions{})
 	case "usage":
 		days := 30
 		if len(args) > 1 {
@@ -203,7 +211,7 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 	case "server", "servers":
 		return r.server(ctx, args[1:])
 	case "help", "-h", "--help":
-		fmt.Fprint(r.out, cxHelp)
+		fmt.Fprint(r.out, srHelp)
 		return nil
 	case "claude":
 		return r.claude(ctx, args[1:])
@@ -213,11 +221,80 @@ func (r cxRunner) run(ctx context.Context, args []string) error {
 		if strings.Contains(args[0], "@") {
 			return r.statusOne(ctx, args[0])
 		}
-		return fmt.Errorf("unknown account command %q\n%s", args[0], cxHelp)
+		return fmt.Errorf("unknown account command %q\n%s", args[0], srHelp)
 	}
 }
 
-func (r cxRunner) add(ctx context.Context) error {
+func shouldRouteSRCommand(command string) bool {
+	switch command {
+	case "server", "servers", "claude", "gemini", "help", "-h", "--help":
+		return false
+	default:
+		return true
+	}
+}
+
+func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerConfig, args []string) error {
+	command := args[0]
+	switch command {
+	case "add", "login":
+		deviceAuth, err := parseRemoteAddArgs(command, args[1:])
+		if err != nil {
+			return err
+		}
+		return r.serverLoginOne(ctx, server, deviceAuth, "")
+	case "add-key", "add-api-key":
+		return r.addKeyToServer(ctx, server)
+	case "list", "ls":
+		return r.listServerAccounts(ctx, server)
+	case "status":
+		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	case "usage":
+		if len(args) > 1 {
+			return fmt.Errorf("remote usage does not accept a day count; use %s server status %s", r.programOrSubrouter(), server.Name)
+		}
+		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	case "pick":
+		return r.pickRemoteAccount(ctx, server)
+	case "switch", "use", "g", "gui", "gui-switch", "gui-use":
+		selector, _, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
+		if err != nil {
+			return err
+		}
+		if selector == "" {
+			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
+		return r.unsupportedRemoteCommand(command, server, "remote servers select accounts per session; use SUBROUTER_CODEX_ACCOUNT_ID for a one-off forced account")
+	case "import":
+		return r.unsupportedRemoteCommand(command, server, "copying a local refresh-token chain to a server is unsafe; use "+r.programOrSubrouter()+" add or "+r.programOrSubrouter()+" server sync "+server.Name)
+	case "remove", "rm", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "admin-keys", "remove-admin-key", "attach-project":
+		return r.unsupportedRemoteCommand(command, server, "this command has no remote-safe implementation yet")
+	default:
+		if strings.Contains(command, "@") {
+			return r.statusOneRemote(ctx, server, command)
+		}
+		return fmt.Errorf("unknown account command %q\n%s", command, srHelp)
+	}
+}
+
+func parseRemoteAddArgs(command string, args []string) (bool, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	deviceAuth := flags.Bool("device-auth", false, "use codex login --device-auth")
+	if err := flags.Parse(args); err != nil {
+		return false, err
+	}
+	if flags.NArg() != 0 {
+		return false, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	return *deviceAuth, nil
+}
+
+func (r srRunner) unsupportedRemoteCommand(command string, server srServerConfig, detail string) error {
+	return fmt.Errorf("%s is configured to use server %s (%s), so %s will not edit local Codex state; %s", r.programOrSubrouter(), server.Name, server.URL, r.programOrSubrouter()+" "+command, detail)
+}
+
+func (r srRunner) add(ctx context.Context) error {
 	previousActive, err := r.store.DetectActiveAccount()
 	if err != nil {
 		return err
@@ -260,7 +337,7 @@ func (r cxRunner) add(ctx context.Context) error {
 	return nil
 }
 
-func (r cxRunner) addKey() error {
+func (r srRunner) addKey() error {
 	if err := r.store.SyncActiveToStore(); err != nil {
 		return err
 	}
@@ -285,7 +362,7 @@ func (r cxRunner) addKey() error {
 	return nil
 }
 
-func (r cxRunner) importActive() error {
+func (r srRunner) importActive() error {
 	account, existed, err := r.store.ImportActive()
 	if err != nil {
 		return err
@@ -298,7 +375,7 @@ func (r cxRunner) importActive() error {
 	return nil
 }
 
-func (r cxRunner) autoImportIfEmpty() error {
+func (r srRunner) autoImportIfEmpty() error {
 	all, err := r.store.ListStored()
 	if err != nil || len(all) > 0 {
 		return err
@@ -310,7 +387,7 @@ func (r cxRunner) autoImportIfEmpty() error {
 	return nil
 }
 
-func (r cxRunner) list() error {
+func (r srRunner) list() error {
 	all, err := r.store.ListStored()
 	if err != nil {
 		return err
@@ -336,7 +413,7 @@ func (r cxRunner) list() error {
 	return nil
 }
 
-func (r cxRunner) trace(selector string) error {
+func (r srRunner) trace(selector string) error {
 	account, ok, err := r.store.FindStored(selector)
 	if err != nil {
 		return err
@@ -429,11 +506,11 @@ func appendKV(parts *[]string, key, value string) {
 	*parts = append(*parts, key+"="+strconv.Quote(value))
 }
 
-func (r cxRunner) status(ctx context.Context) error {
+func (r srRunner) status(ctx context.Context) error {
 	if server, ok, err := r.defaultRemoteServer(); err != nil {
 		return err
 	} else if ok {
-		return r.serverStatus(ctx, defaultCXServerStore(r.store), server.Name)
+		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
@@ -446,7 +523,7 @@ func (r cxRunner) status(ctx context.Context) error {
 	return nil
 }
 
-func (r cxRunner) statusOne(ctx context.Context, selector string) error {
+func (r srRunner) statusOne(ctx context.Context, selector string) error {
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
 	}
@@ -454,7 +531,7 @@ func (r cxRunner) statusOne(ctx context.Context, selector string) error {
 	if err != nil {
 		return err
 	}
-	var matches []cxUsageRow
+	var matches []srUsageRow
 	lower := strings.ToLower(selector)
 	for _, row := range all {
 		if strings.Contains(strings.ToLower(row.email), lower) {
@@ -468,7 +545,7 @@ func (r cxRunner) statusOne(ctx context.Context, selector string) error {
 	return nil
 }
 
-func (r cxRunner) pick(ctx context.Context, opts cxSwitchOptions) error {
+func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
 	}
@@ -485,14 +562,14 @@ func (r cxRunner) pick(ctx context.Context, opts cxSwitchOptions) error {
 		return fmt.Errorf("no recommended account has quota for a new session")
 	}
 	if target.active {
-		displayUsageRows(r.out, []cxUsageRow{*target}, false)
+		displayUsageRows(r.out, []srUsageRow{*target}, false)
 		fmt.Fprintf(r.out, "Already using recommended account: %s\n", target.email)
 		return nil
 	}
 	if err := ensureUsageRowSwitchable(*target); err != nil {
 		return err
 	}
-	displayUsageRows(r.out, []cxUsageRow{*target}, false)
+	displayUsageRows(r.out, []srUsageRow{*target}, false)
 	if err := r.switchAccount(ctx, target.email, opts); err != nil {
 		return err
 	}
@@ -500,11 +577,11 @@ func (r cxRunner) pick(ctx context.Context, opts cxSwitchOptions) error {
 	return nil
 }
 
-func (r cxRunner) defaultInteractive(ctx context.Context, opts cxSwitchOptions) error {
+func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) error {
 	if server, ok, err := r.defaultRemoteServer(); err != nil {
 		return err
 	} else if ok {
-		return r.serverStatus(ctx, defaultCXServerStore(r.store), server.Name)
+		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
@@ -531,10 +608,10 @@ func (r cxRunner) defaultInteractive(ctx context.Context, opts cxSwitchOptions) 
 	allBlocked := allOAuthRowsBlockedForNewSession(rows)
 	if allCooked {
 		fmt.Fprintln(r.out)
-		fmt.Fprintln(r.out, "All of your OAuth accounts are cooked. Every usable 7d window is fully consumed, so cx will keep the current active account and will not switch.")
+		fmt.Fprintln(r.out, "All of your OAuth accounts are cooked. Every usable 7d window is fully consumed, so sr will keep the current active account and will not switch.")
 	} else if allBlocked {
 		fmt.Fprintln(r.out)
-		fmt.Fprintln(r.out, "All of your OAuth accounts are unavailable for new sessions. Usable windows are exhausted, so cx will keep the current active account and will not switch.")
+		fmt.Fprintln(r.out, "All of your OAuth accounts are unavailable for new sessions. Usable windows are exhausted, so sr will keep the current active account and will not switch.")
 	}
 	displayUsageRows(r.out, rows, true)
 	if switched {
@@ -563,7 +640,7 @@ func (r cxRunner) defaultInteractive(ctx context.Context, opts cxSwitchOptions) 
 	return r.switchAccount(ctx, answer, opts)
 }
 
-func (r cxRunner) autoSwitchExhaustedActive(ctx context.Context, rows []cxUsageRow, opts cxSwitchOptions) (bool, error) {
+func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageRow, opts srSwitchOptions) (bool, error) {
 	active := activeUsageRow(rows)
 	if active == nil || active.err != nil || active.authMode != accounts.AuthModeOAuth || !exhaustedForNewSession(active.score) {
 		return false, nil
@@ -579,7 +656,7 @@ func (r cxRunner) autoSwitchExhaustedActive(ctx context.Context, rows []cxUsageR
 	return true, nil
 }
 
-func activeUsageRow(rows []cxUsageRow) *cxUsageRow {
+func activeUsageRow(rows []srUsageRow) *srUsageRow {
 	for i := range rows {
 		if rows[i].active {
 			return &rows[i]
@@ -588,7 +665,7 @@ func activeUsageRow(rows []cxUsageRow) *cxUsageRow {
 	return nil
 }
 
-func recommendedUsableOAuthRow(rows []cxUsageRow) *cxUsageRow {
+func recommendedUsableOAuthRow(rows []srUsageRow) *srUsageRow {
 	for i := range rows {
 		if rows[i].gtoRecommended && recommendedForNewSession(rows[i]) && rows[i].authMode == accounts.AuthModeOAuth {
 			return &rows[i]
@@ -597,7 +674,7 @@ func recommendedUsableOAuthRow(rows []cxUsageRow) *cxUsageRow {
 	return nil
 }
 
-func recommendedUsableUsageRow(rows []cxUsageRow) *cxUsageRow {
+func recommendedUsableUsageRow(rows []srUsageRow) *srUsageRow {
 	for i := range rows {
 		if rows[i].gtoRecommended && recommendedForNewSession(rows[i]) {
 			return &rows[i]
@@ -606,7 +683,7 @@ func recommendedUsableUsageRow(rows []cxUsageRow) *cxUsageRow {
 	return nil
 }
 
-func (r cxRunner) fetchUsageRows(ctx context.Context) ([]cxUsageRow, error) {
+func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	all, err := r.store.ListStored()
 	if err != nil {
 		return nil, err
@@ -620,18 +697,18 @@ func (r cxRunner) fetchUsageRows(ctx context.Context) ([]cxUsageRow, error) {
 		return nil, err
 	}
 
-	rows := make([]cxUsageRow, len(all))
+	rows := make([]srUsageRow, len(all))
 	var wg sync.WaitGroup
 	for i, account := range all {
 		i, account := i, account
-		rows[i] = cxUsageRow{email: account.Email, active: account.Email == active}
+		rows[i] = srUsageRow{email: account.Email, active: account.Email == active}
 		if account.IsAPIKey() {
 			rows[i].authMode = accounts.AuthModeAPIKey
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
 			rows[i].planType = "api key"
 			rows[i].apiKeyHint = r.apiKeyHint(account, admins)
 			if admin, ok, err := r.store.PickAdminKeyFor(account); err == nil && ok {
-				if fresh, ok, err := r.store.ReadUsageCache(admin.Label, account.ProjectID, cxUsageCacheTTL); err == nil && ok {
+				if fresh, ok, err := r.store.ReadUsageCache(admin.Label, account.ProjectID, srUsageCacheTTL); err == nil && ok {
 					rows[i].apiKeySpend = &fresh
 					rows[i].apiKeyHint = ""
 				} else if stale, ok, err := r.store.ReadUsageCacheStale(admin.Label, account.ProjectID); err == nil && ok {
@@ -673,7 +750,7 @@ func (r cxRunner) fetchUsageRows(ctx context.Context) ([]cxUsageRow, error) {
 	return rows, nil
 }
 
-func (r cxRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accounts.AdminKeyEntry) string {
+func (r srRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accounts.AdminKeyEntry) string {
 	if len(admins) == 0 {
 		return "no admin key, run 'subrouter add-admin-key' to enable spend display"
 	}
@@ -684,7 +761,7 @@ func (r cxRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accou
 	return fmt.Sprintf("no cached usage, run 'subrouter usage' (admin: %s)", admin.Label)
 }
 
-func (r cxRunner) switchAccount(ctx context.Context, selector string, opts cxSwitchOptions) error {
+func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwitchOptions) error {
 	account, ok, err := r.store.FindStored(selector)
 	if err != nil {
 		return err
@@ -724,7 +801,7 @@ func (r cxRunner) switchAccount(ctx context.Context, selector string, opts cxSwi
 	return nil
 }
 
-func (r cxRunner) reportCodexGUIRestart(ctx context.Context) error {
+func (r srRunner) reportCodexGUIRestart(ctx context.Context) error {
 	status, err := restartCodexGUI(ctx)
 	if err != nil {
 		fmt.Fprintf(r.errOut, "Warning: %s\n", err)
@@ -742,7 +819,7 @@ func (r cxRunner) reportCodexGUIRestart(ctx context.Context) error {
 	return nil
 }
 
-func (r cxRunner) remove(selector string) error {
+func (r srRunner) remove(selector string) error {
 	account, ok, err := r.store.RemoveStored(selector)
 	if err != nil {
 		return err
@@ -754,7 +831,7 @@ func (r cxRunner) remove(selector string) error {
 	return nil
 }
 
-func (r cxRunner) addAdminKey(ctx context.Context) error {
+func (r srRunner) addAdminKey(ctx context.Context) error {
 	reader := bufio.NewReader(r.in)
 	label, err := promptLine(r.out, reader, "Label (e.g. work): ")
 	if err != nil {
@@ -786,7 +863,7 @@ func (r cxRunner) addAdminKey(ctx context.Context) error {
 	return nil
 }
 
-func (r cxRunner) listAdminKeys() error {
+func (r srRunner) listAdminKeys() error {
 	all, err := r.store.ListAdminKeys()
 	if err != nil {
 		return err
@@ -803,7 +880,7 @@ func (r cxRunner) listAdminKeys() error {
 	return nil
 }
 
-func (r cxRunner) removeAdminKey(label string) error {
+func (r srRunner) removeAdminKey(label string) error {
 	removed, err := r.store.RemoveAdminKey(label)
 	if err != nil {
 		return err
@@ -815,7 +892,7 @@ func (r cxRunner) removeAdminKey(label string) error {
 	return nil
 }
 
-func (r cxRunner) attachProject(ctx context.Context, apiKeyLabel, projectID string) error {
+func (r srRunner) attachProject(ctx context.Context, apiKeyLabel, projectID string) error {
 	selector := apiKeyLabel
 	if !strings.HasPrefix(selector, "apikey:") {
 		selector = "apikey:" + selector
@@ -892,7 +969,7 @@ func (r cxRunner) attachProject(ctx context.Context, apiKeyLabel, projectID stri
 	return nil
 }
 
-func (r cxRunner) usage(ctx context.Context, days int) error {
+func (r srRunner) usage(ctx context.Context, days int) error {
 	all, err := r.store.ListStored()
 	if err != nil {
 		return err
@@ -917,11 +994,11 @@ func (r cxRunner) usage(ctx context.Context, days int) error {
 
 	fmt.Fprintf(r.out, "Fetching %d-day usage for %d API-key account(s)...\n\n", days, len(apiAccounts))
 	active, _ := r.store.DetectActiveAccount()
-	rows := make([]cxUsageRow, len(apiAccounts))
+	rows := make([]srUsageRow, len(apiAccounts))
 	var wg sync.WaitGroup
 	for i, account := range apiAccounts {
 		i, account := i, account
-		rows[i] = cxUsageRow{email: account.Email, active: account.Email == active, planType: "api key", authMode: accounts.AuthModeAPIKey}
+		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, planType: "api key", authMode: accounts.AuthModeAPIKey}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1047,7 +1124,7 @@ func clampUsagePercent(value float64) float64 {
 	}
 }
 
-func allOAuthRowsCooked(rows []cxUsageRow) bool {
+func allOAuthRowsCooked(rows []srUsageRow) bool {
 	seenOAuth := false
 	for _, row := range rows {
 		if row.err != nil || row.authMode == accounts.AuthModeAPIKey {
@@ -1064,7 +1141,7 @@ func allOAuthRowsCooked(rows []cxUsageRow) bool {
 	return seenOAuth
 }
 
-func allOAuthRowsBlockedForNewSession(rows []cxUsageRow) bool {
+func allOAuthRowsBlockedForNewSession(rows []srUsageRow) bool {
 	seenOAuth := false
 	for _, row := range rows {
 		if row.err != nil || row.authMode == accounts.AuthModeAPIKey {
@@ -1081,7 +1158,7 @@ func allOAuthRowsBlockedForNewSession(rows []cxUsageRow) bool {
 	return seenOAuth
 }
 
-func hasSwitchableUsageRows(rows []cxUsageRow) bool {
+func hasSwitchableUsageRows(rows []srUsageRow) bool {
 	for _, row := range rows {
 		if row.err != nil {
 			continue
@@ -1096,7 +1173,7 @@ func hasSwitchableUsageRows(rows []cxUsageRow) bool {
 	return false
 }
 
-func ensureUsageRowSwitchable(row cxUsageRow) error {
+func ensureUsageRowSwitchable(row srUsageRow) error {
 	if row.cooked {
 		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", row.email, row.cookedReason)
 	}
@@ -1106,7 +1183,7 @@ func ensureUsageRowSwitchable(row cxUsageRow) error {
 	return nil
 }
 
-func (r cxRunner) ensureSwitchableForFreshUsage(ctx context.Context, account accounts.StoredCodexAccount) error {
+func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account accounts.StoredCodexAccount) error {
 	if account.IsAPIKey() {
 		return nil
 	}
@@ -1128,7 +1205,7 @@ func (r cxRunner) ensureSwitchableForFreshUsage(ctx context.Context, account acc
 	return nil
 }
 
-func rankUsageRows(rows []cxUsageRow) {
+func rankUsageRows(rows []srUsageRow) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i], rows[j]
 		if (a.err != nil) != (b.err != nil) {
@@ -1170,7 +1247,7 @@ func rankUsageRows(rows []cxUsageRow) {
 	}
 }
 
-func usageRowTier(row cxUsageRow) int {
+func usageRowTier(row srUsageRow) int {
 	if row.authMode == accounts.AuthModeOAuth && usableForNewSession(row.score) {
 		return 0
 	}
@@ -1189,7 +1266,7 @@ func usageRowTier(row cxUsageRow) int {
 	return 5
 }
 
-func recommendedForNewSession(row cxUsageRow) bool {
+func recommendedForNewSession(row srUsageRow) bool {
 	if row.err != nil || row.cooked || row.tempCooked {
 		return false
 	}
@@ -1207,7 +1284,7 @@ func exhaustedForNewSession(score selectacct.Score) bool {
 	return score.Headroom <= 0 || score.ShortHeadroom <= 0
 }
 
-func gtoReason(row cxUsageRow) string {
+func gtoReason(row srUsageRow) string {
 	if row.err != nil {
 		return "usage unavailable"
 	}
@@ -1230,7 +1307,7 @@ func gtoReason(row cxUsageRow) string {
 	return left
 }
 
-func displayUsageRows(out io.Writer, rows []cxUsageRow, numbered bool) {
+func displayUsageRows(out io.Writer, rows []srUsageRow, numbered bool) {
 	if len(rows) == 0 {
 		fmt.Fprintln(out, "No accounts configured. Run 'subrouter add' to add one.")
 		return
@@ -1256,10 +1333,10 @@ func shouldDisplayUsageGrid(out io.Writer) bool {
 	case "0", "false", "no", "off":
 		return false
 	}
-	return terminalColumns(out) >= cxUsageGridMinWidth
+	return terminalColumns(out) >= srUsageGridMinWidth
 }
 
-func displayUsageRowsDetailed(out io.Writer, rows []cxUsageRow, numbered bool, colored bool) {
+func displayUsageRowsDetailed(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
 	width := 0
 	for _, row := range rows {
 		if row.gtoReason != "" {
@@ -1343,7 +1420,7 @@ func displayUsageRowsDetailed(out io.Writer, rows []cxUsageRow, numbered bool, c
 	}
 }
 
-func displayUsageRowsGrid(out io.Writer, rows []cxUsageRow, numbered bool, colored bool) {
+func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
 	columns := usageGridColumns(out)
 	fmt.Fprintln(out)
 	printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
@@ -1478,7 +1555,7 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 	fmt.Fprintln(out)
 }
 
-func usageGridState(row cxUsageRow) string {
+func usageGridState(row srUsageRow) string {
 	var states []string
 	if row.active && row.gtoRecommended {
 		states = append(states, "active rec")
@@ -1501,7 +1578,7 @@ func usageGridState(row cxUsageRow) string {
 	return strings.Join(states, ", ")
 }
 
-func usageGridStateColor(row cxUsageRow) string {
+func usageGridStateColor(row srUsageRow) string {
 	switch {
 	case row.err != nil || row.cooked:
 		return ansiRed
@@ -1516,7 +1593,7 @@ func usageGridStateColor(row cxUsageRow) string {
 	}
 }
 
-func usageGridPickColor(row cxUsageRow) string {
+func usageGridPickColor(row srUsageRow) string {
 	switch {
 	case row.err != nil || row.cooked:
 		return ansiRed
@@ -1529,14 +1606,14 @@ func usageGridPickColor(row cxUsageRow) string {
 	}
 }
 
-func usageGridError(row cxUsageRow) string {
+func usageGridError(row srUsageRow) string {
 	if row.err == nil {
 		return ""
 	}
 	return "error"
 }
 
-func compactPickReason(row cxUsageRow) string {
+func compactPickReason(row srUsageRow) string {
 	if row.err != nil {
 		return "usage unavailable"
 	}
@@ -1602,7 +1679,7 @@ func compactPercentLeft(used float64) string {
 	return fmt.Sprintf("%.0f%%", left)
 }
 
-func usageGridCreditsCell(row cxUsageRow) usageGridCell {
+func usageGridCreditsCell(row srUsageRow) usageGridCell {
 	if row.credits != nil {
 		if row.credits.Unlimited {
 			return usageGridCell{Text: "unlimited", Style: ansiGreen}
@@ -1617,7 +1694,7 @@ func usageGridCreditsCell(row cxUsageRow) usageGridCell {
 	return usageGridCell{}
 }
 
-func usageRowsHaveErrors(rows []cxUsageRow) bool {
+func usageRowsHaveErrors(rows []srUsageRow) bool {
 	for _, row := range rows {
 		if row.err != nil {
 			return true
@@ -1644,7 +1721,7 @@ func displayAPIKeySpend(out io.Writer, snapshot *accounts.APIKeyUsageSnapshot, w
 	}
 }
 
-func parseCXSwitchArgs(args []string, defaults cxSwitchOptions) (string, cxSwitchOptions, error) {
+func parseSRSwitchArgs(args []string, defaults srSwitchOptions) (string, srSwitchOptions, error) {
 	opts := defaults
 	selector := ""
 	for _, arg := range args {
@@ -1753,6 +1830,9 @@ func windowLabel(window accounts.UsageWindow) string {
 }
 
 func colorEnabled(out io.Writer) bool {
+	if os.Getenv("SR_NO_COLOR") != "" {
+		return false
+	}
 	if os.Getenv("CX_NO_COLOR") != "" {
 		return false
 	}

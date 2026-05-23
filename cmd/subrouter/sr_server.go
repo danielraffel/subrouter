@@ -23,14 +23,17 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 )
 
-func (r cxRunner) serverCommand() string {
-	if r.program == "" || r.program == "cx" {
+func (r srRunner) serverCommand() string {
+	if r.program == "cx" {
 		return "cx server"
+	}
+	if r.program == "" {
+		return "sr server"
 	}
 	return r.program + " server"
 }
 
-func cxServerHelp(command string) string {
+func srServerHelp(command string) string {
 	return fmt.Sprintf(`%[1]s - Manage Subrouter servers
 
 Usage:
@@ -51,11 +54,11 @@ Usage:
 
 const publicInstallScriptURL = "https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh"
 
-type cxServerStore struct {
+type srServerStore struct {
 	Path string
 }
 
-type cxServerConfig struct {
+type srServerConfig struct {
 	Name        string `json:"name"`
 	URL         string `json:"url"`
 	GCPProject  string `json:"gcpProject,omitempty"`
@@ -64,15 +67,15 @@ type cxServerConfig struct {
 	AdminToken  string `json:"adminToken,omitempty"`
 }
 
-type cxServerFile struct {
-	Servers []cxServerConfig `json:"servers"`
+type srServerFile struct {
+	Servers []srServerConfig `json:"servers"`
 	Default string           `json:"default,omitempty"`
 }
 
-func (r cxRunner) server(ctx context.Context, args []string) error {
-	store := defaultCXServerStore(r.store)
+func (r srRunner) server(ctx context.Context, args []string) error {
+	store := defaultSRServerStore(r.store)
 	if len(args) == 0 {
-		fmt.Fprint(r.out, cxServerHelp(r.serverCommand()))
+		fmt.Fprint(r.out, srServerHelp(r.serverCommand()))
 		return nil
 	}
 	command := r.serverCommand()
@@ -115,28 +118,28 @@ func (r cxRunner) server(ctx context.Context, args []string) error {
 		syncArgs := append([]string{args[1], "--dry-run"}, args[2:]...)
 		return r.serverSync(ctx, store, syncArgs)
 	case "help", "-h", "--help":
-		fmt.Fprint(r.out, cxServerHelp(command))
+		fmt.Fprint(r.out, srServerHelp(command))
 		return nil
 	default:
-		return fmt.Errorf("unknown server command %q\n%s", args[0], cxServerHelp(command))
+		return fmt.Errorf("unknown server command %q\n%s", args[0], srServerHelp(command))
 	}
 }
 
-func defaultCXServerStore(store accounts.CodexStore) cxServerStore {
-	return cxServerStore{Path: filepath.Join(store.StoreDir(), "servers.json")}
+func defaultSRServerStore(store accounts.CodexStore) srServerStore {
+	return srServerStore{Path: filepath.Join(store.StoreDir(), "servers.json")}
 }
 
-func (s cxServerStore) load() (cxServerFile, error) {
+func (s srServerStore) load() (srServerFile, error) {
 	body, err := os.ReadFile(s.Path)
 	if errors.Is(err, os.ErrNotExist) {
-		return cxServerFile{}, nil
+		return srServerFile{}, nil
 	}
 	if err != nil {
-		return cxServerFile{}, err
+		return srServerFile{}, err
 	}
-	var file cxServerFile
+	var file srServerFile
 	if err := json.Unmarshal(body, &file); err != nil {
-		return cxServerFile{}, err
+		return srServerFile{}, err
 	}
 	sort.Slice(file.Servers, func(i, j int) bool {
 		return file.Servers[i].Name < file.Servers[j].Name
@@ -144,7 +147,7 @@ func (s cxServerStore) load() (cxServerFile, error) {
 	return file, nil
 }
 
-func (s cxServerStore) save(file cxServerFile) error {
+func (s srServerStore) save(file srServerFile) error {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
 		return err
 	}
@@ -163,29 +166,29 @@ func (s cxServerStore) save(file cxServerFile) error {
 	return os.Rename(tmp, s.Path)
 }
 
-func (s cxServerStore) find(name string) (cxServerConfig, bool, error) {
+func (s srServerStore) find(name string) (srServerConfig, bool, error) {
 	file, err := s.load()
 	if err != nil {
-		return cxServerConfig{}, false, err
+		return srServerConfig{}, false, err
 	}
 	for _, server := range file.Servers {
 		if server.Name == name {
 			return server, true, nil
 		}
 	}
-	return cxServerConfig{}, false, nil
+	return srServerConfig{}, false, nil
 }
 
-func (f cxServerFile) find(name string) (cxServerConfig, bool) {
+func (f srServerFile) find(name string) (srServerConfig, bool) {
 	for _, server := range f.Servers {
 		if server.Name == name {
 			return server, true
 		}
 	}
-	return cxServerConfig{}, false
+	return srServerConfig{}, false
 }
 
-func (r cxRunner) serverList(store cxServerStore) error {
+func (r srRunner) serverList(store srServerStore) error {
 	file, err := store.load()
 	if err != nil {
 		return err
@@ -204,7 +207,7 @@ func (r cxRunner) serverList(store cxServerStore) error {
 	return nil
 }
 
-func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
+func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
 		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
@@ -241,7 +244,7 @@ func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 	if err != nil {
 		return err
 	}
-	next := cxServerConfig{
+	next := srServerConfig{
 		Name:        name,
 		URL:         strings.TrimRight(*serverURL, "/"),
 		GCPProject:  *gcpProject,
@@ -287,7 +290,7 @@ func (r cxRunner) serverAdd(store cxServerStore, args []string) error {
 	return nil
 }
 
-func (r cxRunner) serverUse(store cxServerStore, args []string) error {
+func (r srRunner) serverUse(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
 		return fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
@@ -328,7 +331,7 @@ func (r cxRunner) serverUse(store cxServerStore, args []string) error {
 	return nil
 }
 
-func (r cxRunner) serverCurrent(store cxServerStore) error {
+func (r srRunner) serverCurrent(store srServerStore) error {
 	file, err := store.load()
 	if err != nil {
 		return err
@@ -345,7 +348,7 @@ func (r cxRunner) serverCurrent(store cxServerStore) error {
 	return nil
 }
 
-func (r cxRunner) serverClearDefault(store cxServerStore, args []string) error {
+func (r srRunner) serverClearDefault(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	flags := flag.NewFlagSet(command+" clear-default", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
@@ -359,7 +362,7 @@ func (r cxRunner) serverClearDefault(store cxServerStore, args []string) error {
 	return r.clearDefaultServer(store, shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig))
 }
 
-func (r cxRunner) clearDefaultServer(store cxServerStore, updateCodexConfig bool) error {
+func (r srRunner) clearDefaultServer(store srServerStore, updateCodexConfig bool) error {
 	file, err := store.load()
 	if err != nil {
 		return err
@@ -398,30 +401,47 @@ func isLocalServerName(name string) bool {
 	}
 }
 
-func (r cxRunner) defaultRemoteServer() (cxServerConfig, bool, error) {
-	store := defaultCXServerStore(r.store)
+func (r srRunner) defaultRemoteServer() (srServerConfig, bool, error) {
+	return r.selectedRemoteServer()
+}
+
+func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
+	store := defaultSRServerStore(r.store)
+	if serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); serverName != "" {
+		if isLocalServerName(serverName) {
+			return srServerConfig{}, false, nil
+		}
+		server, ok, err := store.find(serverName)
+		if err != nil {
+			return srServerConfig{}, false, err
+		}
+		if !ok {
+			return srServerConfig{}, false, fmt.Errorf("Subrouter server %q not found", serverName)
+		}
+		return server, true, nil
+	}
 	file, err := store.load()
 	if err != nil {
-		return cxServerConfig{}, false, err
+		return srServerConfig{}, false, err
 	}
 	if strings.TrimSpace(file.Default) == "" {
-		return cxServerConfig{}, false, nil
+		return srServerConfig{}, false, nil
 	}
 	server, ok := file.find(file.Default)
 	if !ok {
-		return cxServerConfig{}, false, fmt.Errorf("default server %q not found; run %s server use local or %s server clear-default", file.Default, r.programOrSubrouter(), r.programOrSubrouter())
+		return srServerConfig{}, false, fmt.Errorf("default server %q not found; run %s server use local or %s server clear-default", file.Default, r.programOrSubrouter(), r.programOrSubrouter())
 	}
 	return server, true, nil
 }
 
-func (r cxRunner) programOrSubrouter() string {
+func (r srRunner) programOrSubrouter() string {
 	if strings.TrimSpace(r.program) != "" {
 		return r.program
 	}
 	return "subrouter"
 }
 
-func (r cxRunner) serverRename(store cxServerStore, oldName, newName string) error {
+func (r srRunner) serverRename(store srServerStore, oldName, newName string) error {
 	oldName = strings.TrimSpace(oldName)
 	newName = strings.TrimSpace(newName)
 	if oldName == "" || newName == "" {
@@ -459,7 +479,7 @@ func (r cxRunner) serverRename(store cxServerStore, oldName, newName string) err
 	return nil
 }
 
-func (r cxRunner) serverRemove(store cxServerStore, name string) error {
+func (r srRunner) serverRemove(store srServerStore, name string) error {
 	file, err := store.load()
 	if err != nil {
 		return err
@@ -487,7 +507,7 @@ func (r cxRunner) serverRemove(store cxServerStore, name string) error {
 	return nil
 }
 
-func (r cxRunner) serverStatus(ctx context.Context, store cxServerStore, name string) error {
+func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name string) error {
 	server, ok, err := store.find(name)
 	if err != nil {
 		return err
@@ -518,6 +538,141 @@ func (r cxRunner) serverStatus(ctx context.Context, store cxServerStore, name st
 		fmt.Fprintln(r.out)
 	}
 	return err
+}
+
+func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig) error {
+	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+	if len(remoteAccounts) == 0 {
+		fmt.Fprintln(r.out, "No accounts configured on server.")
+		return nil
+	}
+	fmt.Fprintln(r.out)
+	for _, account := range remoteAccounts {
+		name := accountEmail(account.ID, account.Email)
+		if name == "" {
+			name = account.ID
+		}
+		provider := string(account.Provider)
+		if provider == "" {
+			provider = string(accounts.ProviderCodex)
+		}
+		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), provider, account.AuthMode)
+	}
+	return nil
+}
+
+func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig) error {
+	reader := bufio.NewReader(r.in)
+	label, err := promptLine(r.out, reader, "Label (e.g. work, personal): ")
+	if err != nil {
+		return err
+	}
+	key, err := promptLine(r.out, reader, "API key (sk-...): ")
+	if err != nil {
+		return err
+	}
+	label = strings.TrimSpace(label)
+	key = strings.TrimSpace(key)
+	if label == "" {
+		return fmt.Errorf("label is required")
+	}
+	if !strings.HasPrefix(key, "sk-") {
+		return fmt.Errorf("invalid API key format, expected sk-...")
+	}
+	account := accounts.StoredCodexAccount{
+		Email:   "apikey:" + label,
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: key,
+		},
+	}
+	if err := r.uploadServerAccount(ctx, server, account); err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Added server API-key account %s to %s\n", account.APIKeyLabel(), server.Name)
+	return nil
+}
+
+func (r srRunner) pickRemoteAccount(ctx context.Context, server srServerConfig) error {
+	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return fmt.Errorf("server %s does not support remote pick; upgrade the server so /_subrouter/usage-status is available", server.Name)
+	}
+	rows := usageRowsFromServerUsageStatuses(usage)
+	if len(rows) == 0 {
+		return fmt.Errorf("no Codex accounts configured on server %s", server.Name)
+	}
+	target := recommendedUsableUsageRow(rows)
+	if target == nil {
+		displayUsageRows(r.out, rows, false)
+		return fmt.Errorf("no recommended server account has quota for a new session")
+	}
+	displayUsageRows(r.out, []srUsageRow{*target}, false)
+	fmt.Fprintf(r.out, "Server %s recommended for new sessions: %s\n", server.Name, target.email)
+	return nil
+}
+
+func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, selector string) error {
+	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	if err != nil {
+		return err
+	}
+	if available {
+		rows := usageRowsFromServerUsageStatuses(usage)
+		matches := make([]srUsageRow, 0)
+		lower := strings.ToLower(selector)
+		for _, row := range rows {
+			if strings.Contains(strings.ToLower(row.email), lower) {
+				matches = append(matches, row)
+			}
+		}
+		if len(matches) == 0 {
+			return fmt.Errorf("no server account found for %s", selector)
+		}
+		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+		displayUsageRows(r.out, matches, false)
+		return nil
+	}
+	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
+	if err != nil {
+		return err
+	}
+	lower := strings.ToLower(selector)
+	matches := make([]remoteServerAccount, 0)
+	for _, account := range remoteAccounts {
+		if remoteAccountMatches(account, lower) {
+			matches = append(matches, account)
+		}
+	}
+	if len(matches) == 0 {
+		return fmt.Errorf("no server account found for %s", selector)
+	}
+	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+	for _, account := range matches {
+		name := accountEmail(account.ID, account.Email)
+		if name == "" {
+			name = account.ID
+		}
+		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), account.Provider, account.AuthMode)
+	}
+	return nil
+}
+
+func remoteAccountMatches(account remoteServerAccount, lowerSelector string) bool {
+	for _, value := range []string{account.ID, account.Email} {
+		if strings.Contains(strings.ToLower(value), lowerSelector) {
+			return true
+		}
+	}
+	return false
 }
 
 type remoteServerAccount struct {
@@ -556,7 +711,7 @@ type remoteServerUsageStatus struct {
 	Credits     *accounts.CreditsInfo  `json:"credits,omitempty"`
 }
 
-func (r cxRunner) fetchServerAccountsResponse(ctx context.Context, server cxServerConfig) (*http.Response, error) {
+func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/accounts", nil)
 	if err != nil {
 		return nil, err
@@ -569,7 +724,7 @@ func (r cxRunner) fetchServerAccountsResponse(ctx context.Context, server cxServ
 	return client.Do(req)
 }
 
-func (r cxRunner) fetchServerAccounts(ctx context.Context, server cxServerConfig) ([]remoteServerAccount, error) {
+func (r srRunner) fetchServerAccounts(ctx context.Context, server srServerConfig) ([]remoteServerAccount, error) {
 	res, err := r.fetchServerAccountsResponse(ctx, server)
 	if err != nil {
 		return nil, err
@@ -585,7 +740,7 @@ func (r cxRunner) fetchServerAccounts(ctx context.Context, server cxServerConfig
 	return out, nil
 }
 
-func (r cxRunner) fetchServerAccountStatuses(ctx context.Context, server cxServerConfig, forceRefresh bool) ([]remoteServerAccountStatus, bool, error) {
+func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServerConfig, forceRefresh bool) ([]remoteServerAccountStatus, bool, error) {
 	statusURL := server.URL + "/_subrouter/account-status"
 	method := http.MethodGet
 	if forceRefresh {
@@ -630,7 +785,7 @@ func (r cxRunner) fetchServerAccountStatuses(ctx context.Context, server cxServe
 	return out, false, nil
 }
 
-func (r cxRunner) fetchServerUsageStatuses(ctx context.Context, server cxServerConfig) ([]remoteServerUsageStatus, bool, error) {
+func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/usage-status", nil)
 	if err != nil {
 		return nil, false, err
@@ -659,8 +814,8 @@ func (r cxRunner) fetchServerUsageStatuses(ctx context.Context, server cxServerC
 	return nil, true, fmt.Errorf("server usage status failed: %s", res.Status)
 }
 
-func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []cxUsageRow {
-	rows := make([]cxUsageRow, 0, len(statuses))
+func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
+	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
 		if status.Provider != "" && status.Provider != accounts.ProviderCodex {
 			continue
@@ -672,7 +827,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []cxUs
 			}
 			email = "server"
 		}
-		row := cxUsageRow{
+		row := srUsageRow{
 			email:    email,
 			active:   status.Active,
 			authMode: status.AuthMode,
@@ -699,14 +854,14 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []cxUs
 	return rows
 }
 
-func addServerAdminAuth(req *http.Request, server cxServerConfig) {
+func addServerAdminAuth(req *http.Request, server srServerConfig) {
 	if strings.TrimSpace(server.AdminToken) == "" {
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+server.AdminToken)
 }
 
-func (r cxRunner) serverInstall(ctx context.Context, store cxServerStore, args []string) error {
+func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
 		return fmt.Errorf("usage: %s install <name> [--version latest]", command)
@@ -716,7 +871,9 @@ func (r cxRunner) serverInstall(ctx context.Context, store cxServerStore, args [
 	flags.SetOutput(r.errOut)
 	version := flags.String("version", "latest", "Subrouter release version to install")
 	addr := flags.String("addr", "0.0.0.0:31415", "server listen address")
-	cxSwitchInterval := flags.String("cx-switch-interval", "10m", "cx auto-switch interval; 0 disables")
+	srSwitchInterval := "10m"
+	flags.StringVar(&srSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
+	flags.StringVar(&srSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	extraArgs := flags.String("extra-args", "", "extra arguments appended to subrouter serve")
 	tailscaleHostname := flags.String("tailscale-hostname", "", "hostname for tailscale up when TAILSCALE_AUTH_KEY is set")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -742,7 +899,7 @@ func (r cxRunner) serverInstall(ctx context.Context, store cxServerStore, args [
 		"tailscale_auth_key=''",
 		"read -r tailscale_auth_key || true",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
-		"sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(*cxSwitchInterval) + " --extra-args " + shellQuote(*extraArgs),
+		"sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --extra-args " + shellQuote(*extraArgs),
 		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --ssh --accept-routes=false --accept-dns=false; fi",
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
@@ -762,7 +919,7 @@ func (r cxRunner) serverInstall(ctx context.Context, store cxServerStore, args [
 	return nil
 }
 
-func (r cxRunner) serverLogin(ctx context.Context, store cxServerStore, args []string) error {
+func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
 		return fmt.Errorf("usage: %s login <name> [--device-auth]", command)
@@ -784,7 +941,7 @@ func (r cxRunner) serverLogin(ctx context.Context, store cxServerStore, args []s
 	return r.serverLoginOne(ctx, server, *deviceAuth, "")
 }
 
-func (r cxRunner) serverSync(ctx context.Context, store cxServerStore, args []string) error {
+func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
 		return fmt.Errorf("usage: %s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]", command)
@@ -935,7 +1092,7 @@ func accountEmail(id, email string) string {
 	return strings.TrimSpace(id)
 }
 
-func (r cxRunner) confirmServerSync(count int, serverName string) (bool, error) {
+func (r srRunner) confirmServerSync(count int, serverName string) (bool, error) {
 	if r.in == nil {
 		return false, nil
 	}
@@ -1014,7 +1171,7 @@ func printStatusGroup(w io.Writer, label string, emails []string, statuses map[s
 	}
 }
 
-func (r cxRunner) serverLoginOne(ctx context.Context, server cxServerConfig, deviceAuth bool, expectedEmail string) error {
+func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string) error {
 	previousActive, hadPreviousActive, err := accounts.ReadActiveCodexAuth()
 	if err != nil {
 		return err
@@ -1080,13 +1237,13 @@ func restoreActiveCodexAuth(previous accounts.CodexAuthFile, hadPrevious bool) e
 	return err
 }
 
-func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig, account accounts.StoredCodexAccount) error {
-	tmpDir, err := os.MkdirTemp("", "cx-server-auth-*")
+func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {
+	tmpDir, err := os.MkdirTemp("", "sr-server-auth-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	relPath := filepath.Join("codex", "accounts", cxAccountFilename(account.Email))
+	relPath := filepath.Join("codex", "accounts", codexAccountFilename(account.Email))
 	body, err := json.MarshalIndent(account, "", "  ")
 	if err != nil {
 		return err
@@ -1126,7 +1283,7 @@ func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig
 	if server.GCPInstance == "" || server.GCPZone == "" {
 		return fmt.Errorf("server %s has no GCP target", server.Name)
 	}
-	remotePath := fmt.Sprintf("/tmp/cx-server-auth-%d.tgz", time.Now().UnixNano())
+	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
 	scpArgs := []string{"compute", "scp", archivePath, server.GCPInstance + ":" + remotePath, "--zone", server.GCPZone}
 	if server.GCPProject != "" {
 		scpArgs = append(scpArgs, "--project", server.GCPProject)
@@ -1155,8 +1312,8 @@ func (r cxRunner) uploadServerAccount(ctx context.Context, server cxServerConfig
 	return nil
 }
 
-func (r cxRunner) uploadServerAccountSSH(ctx context.Context, server cxServerConfig, host string, archive []byte) error {
-	remotePath := fmt.Sprintf("/tmp/cx-server-auth-%d.tgz", time.Now().UnixNano())
+func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerConfig, host string, archive []byte) error {
+	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
 	remoteCommand := strings.Join([]string{
 		"set -euo pipefail",
 		"cat > " + shellQuote(remotePath),
@@ -1186,7 +1343,7 @@ func (r cxRunner) uploadServerAccountSSH(ctx context.Context, server cxServerCon
 	return nil
 }
 
-func sshHostForServer(server cxServerConfig) string {
+func sshHostForServer(server srServerConfig) string {
 	parsed, err := url.Parse(server.URL)
 	if err != nil {
 		return ""
@@ -1198,7 +1355,7 @@ func sshHostForServer(server cxServerConfig) string {
 	return host
 }
 
-func cxAccountFilename(email string) string {
+func codexAccountFilename(email string) string {
 	var b strings.Builder
 	for _, r := range email {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '@' || r == '-' {

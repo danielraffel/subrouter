@@ -21,18 +21,20 @@ import (
 const defaultDaemonLabel = "ai.manaflow.subrouter"
 
 type daemonConfig struct {
-	Label            string
-	Addr             string
-	InstallPath      string
-	TranscriptsDir   string
-	LogDir           string
-	WorkingDirectory string
-	CXSwitchInterval string
-	Path             string
-	InstallCXShim    bool
-	CXShimPath       string
-	Start            bool
-	DryRun           bool
+	Label                string
+	Addr                 string
+	InstallPath          string
+	TranscriptsDir       string
+	LogDir               string
+	WorkingDirectory     string
+	SRSwitchInterval     string
+	Path                 string
+	InstallSRAlias       bool
+	SRAliasPath          string
+	InstallLegacyCXAlias bool
+	LegacyCXAliasPath    string
+	Start                bool
+	DryRun               bool
 }
 
 func installDaemon(args []string) error {
@@ -54,10 +56,13 @@ func installDaemon(args []string) error {
 	flags.StringVar(&config.TranscriptsDir, "transcripts", filepath.Join(home, ".subrouter", "transcripts"), "local transcript directory")
 	flags.StringVar(&config.LogDir, "log-dir", filepath.Join(home, "Library", "Logs"), "daemon log directory")
 	flags.StringVar(&config.WorkingDirectory, "working-directory", cwd, "daemon working directory")
-	flags.StringVar(&config.CXSwitchInterval, "cx-switch-interval", "10m", "cx auto-switch interval; 0 disables")
+	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
+	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	flags.StringVar(&config.Path, "path", defaultDaemonPath(defaultInstallPath), "PATH for the daemon")
-	flags.BoolVar(&config.InstallCXShim, "install-cx-shim", true, "install cx as a symlink to the subrouter binary")
-	flags.StringVar(&config.CXShimPath, "cx-shim-path", filepath.Join(home, "bin", "cx"), "cx symlink path")
+	flags.BoolVar(&config.InstallSRAlias, "install-sr-shim", true, "install sr as a symlink to the subrouter binary")
+	flags.StringVar(&config.SRAliasPath, "sr-shim-path", filepath.Join(home, "bin", "sr"), "sr symlink path")
+	flags.BoolVar(&config.InstallLegacyCXAlias, "install-cx-shim", true, "install cx as a compatibility symlink to the subrouter binary")
+	flags.StringVar(&config.LegacyCXAliasPath, "cx-shim-path", filepath.Join(home, "bin", "cx"), "cx compatibility symlink path")
 	flags.BoolVar(&config.Start, "start", true, "load and restart the LaunchAgent after installation")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the LaunchAgent plist without writing files")
 	if err := flags.Parse(args); err != nil {
@@ -97,8 +102,13 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 	if err := installCurrentExecutable(config.InstallPath); err != nil {
 		return err
 	}
-	if config.InstallCXShim {
-		if err := installCXShim(config.InstallPath, config.CXShimPath); err != nil {
+	if config.InstallSRAlias {
+		if err := installBinaryAlias(config.InstallPath, config.SRAliasPath); err != nil {
+			return err
+		}
+	}
+	if config.InstallLegacyCXAlias {
+		if err := installBinaryAlias(config.InstallPath, config.LegacyCXAliasPath); err != nil {
 			return err
 		}
 	}
@@ -114,8 +124,11 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 	}
 
 	fmt.Printf("Installed %s\n", config.InstallPath)
-	if config.InstallCXShim {
-		fmt.Printf("Installed %s -> %s\n", config.CXShimPath, config.InstallPath)
+	if config.InstallSRAlias {
+		fmt.Printf("Installed %s -> %s\n", config.SRAliasPath, config.InstallPath)
+	}
+	if config.InstallLegacyCXAlias {
+		fmt.Printf("Installed %s -> %s\n", config.LegacyCXAliasPath, config.InstallPath)
 	}
 	fmt.Printf("Installed %s\n", plistPath)
 	if config.Start {
@@ -141,7 +154,10 @@ func validateDaemonConfig(config daemonConfig) error {
 	if strings.TrimSpace(config.InstallPath) == "" {
 		return errors.New("install-path is required")
 	}
-	if config.InstallCXShim && strings.TrimSpace(config.CXShimPath) == "" {
+	if config.InstallSRAlias && strings.TrimSpace(config.SRAliasPath) == "" {
+		return errors.New("sr-shim-path is required")
+	}
+	if config.InstallLegacyCXAlias && strings.TrimSpace(config.LegacyCXAliasPath) == "" {
 		return errors.New("cx-shim-path is required")
 	}
 	if strings.TrimSpace(config.TranscriptsDir) == "" {
@@ -153,16 +169,16 @@ func validateDaemonConfig(config daemonConfig) error {
 	if strings.TrimSpace(config.WorkingDirectory) == "" {
 		return errors.New("working-directory is required")
 	}
-	if strings.TrimSpace(config.CXSwitchInterval) == "" {
-		return errors.New("cx-switch-interval is required")
+	if strings.TrimSpace(config.SRSwitchInterval) == "" {
+		return errors.New("sr-switch-interval is required")
 	}
-	if _, err := time.ParseDuration(config.CXSwitchInterval); err != nil {
-		return fmt.Errorf("cx-switch-interval must be a Go duration such as 10m: %w", err)
+	if _, err := time.ParseDuration(config.SRSwitchInterval); err != nil {
+		return fmt.Errorf("sr-switch-interval must be a Go duration such as 10m: %w", err)
 	}
 	return nil
 }
 
-func installCXShim(subrouterPath, shimPath string) error {
+func installBinaryAlias(subrouterPath, shimPath string) error {
 	if err := os.MkdirAll(filepath.Dir(shimPath), 0o755); err != nil {
 		return err
 	}
@@ -281,7 +297,7 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		InstallPath      string
 		Addr             string
 		TranscriptsDir   string
-		CXSwitchInterval string
+		SRSwitchInterval string
 		LogPath          string
 		ErrorLogPath     string
 		WorkingDirectory string
@@ -292,7 +308,7 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		InstallPath:      escapeXMLString(config.InstallPath),
 		Addr:             escapeXMLString(config.Addr),
 		TranscriptsDir:   escapeXMLString(config.TranscriptsDir),
-		CXSwitchInterval: escapeXMLString(config.CXSwitchInterval),
+		SRSwitchInterval: escapeXMLString(config.SRSwitchInterval),
 		LogPath:          escapeXMLString(filepath.Join(config.LogDir, "subrouter.log")),
 		ErrorLogPath:     escapeXMLString(filepath.Join(config.LogDir, "subrouter.err.log")),
 		WorkingDirectory: escapeXMLString(config.WorkingDirectory),
@@ -334,8 +350,8 @@ var launchAgentTemplate = template.Must(template.New("launch-agent").Parse(`<?xm
 		<string>{{.Addr}}</string>
 		<string>--transcripts</string>
 		<string>{{.TranscriptsDir}}</string>
-		<string>--cx-switch-interval</string>
-		<string>{{.CXSwitchInterval}}</string>
+		<string>--sr-switch-interval</string>
+		<string>{{.SRSwitchInterval}}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

@@ -6,14 +6,14 @@ import (
 	"os/exec"
 )
 
-type cxCommandRunner interface {
+type srCommandRunner interface {
 	Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error
 	Output(ctx context.Context, name string, args []string) ([]byte, error)
 }
 
-type execCXCommandRunner struct{}
+type execSRCommandRunner struct{}
 
-func (execCXCommandRunner) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
+func (execSRCommandRunner) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
@@ -21,13 +21,13 @@ func (execCXCommandRunner) Run(ctx context.Context, name string, args []string, 
 	return cmd.Run()
 }
 
-func (execCXCommandRunner) Output(ctx context.Context, name string, args []string) ([]byte, error) {
+func (execSRCommandRunner) Output(ctx context.Context, name string, args []string) ([]byte, error) {
 	return exec.CommandContext(ctx, name, args...).Output()
 }
 
-func (r cxRunner) commandRunner() cxCommandRunner {
+func (r srRunner) commandRunner() srCommandRunner {
 	if r.cmd != nil {
 		return r.cmd
 	}
-	return execCXCommandRunner{}
+	return execSRCommandRunner{}
 }

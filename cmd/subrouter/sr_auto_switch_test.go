@@ -10,7 +10,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
-func TestCXAutoSwitchPicksBestOAuthAccount(t *testing.T) {
+func TestSRAutoSwitchPicksBestOAuthAccount(t *testing.T) {
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -18,7 +18,7 @@ func TestCXAutoSwitchPicksBestOAuthAccount(t *testing.T) {
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
 	var switchedTo string
 
-	picked, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
 		Accounts: []accounts.Account{
 			{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth},
 			{ID: "b@example.com", AuthMode: accounts.AuthModeOAuth},
@@ -65,9 +65,9 @@ func TestCXAutoSwitchPicksBestOAuthAccount(t *testing.T) {
 	}
 }
 
-func TestCXAutoSwitchUsesLiveAccountsFunc(t *testing.T) {
+func TestSRAutoSwitchUsesLiveAccountsFunc(t *testing.T) {
 	var switchedTo string
-	picked, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
 		Accounts: []accounts.Account{
 			{ID: "old@example.com", AuthMode: accounts.AuthModeOAuth},
 		},
@@ -95,9 +95,9 @@ func TestCXAutoSwitchUsesLiveAccountsFunc(t *testing.T) {
 	}
 }
 
-func TestCXAutoSwitchSkipsWhenUsageUnavailable(t *testing.T) {
+func TestSRAutoSwitchSkipsWhenUsageUnavailable(t *testing.T) {
 	ran := false
-	_, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
+	_, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
 		Accounts: []accounts.Account{{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth}},
 		FetchScores: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
 			return []selectacct.Score{{AccountID: "a@example.com", Headroom: 0, ShortHeadroom: 0}}, 0
@@ -111,13 +111,13 @@ func TestCXAutoSwitchSkipsWhenUsageUnavailable(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	if ran {
-		t.Fatal("cx switch ran despite missing fresh usage")
+		t.Fatal("sr switch ran despite missing fresh usage")
 	}
 }
 
-func TestCXAutoSwitchUsesBestNonExhaustedOAuthBelowProtectedHeadroom(t *testing.T) {
+func TestSRAutoSwitchUsesBestNonExhaustedOAuthBelowProtectedHeadroom(t *testing.T) {
 	var switchedTo string
-	picked, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
 		Accounts: []accounts.Account{
 			{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth},
 			{ID: "b@example.com", AuthMode: accounts.AuthModeOAuth},
@@ -141,9 +141,9 @@ func TestCXAutoSwitchUsesBestNonExhaustedOAuthBelowProtectedHeadroom(t *testing.
 	}
 }
 
-func TestCXAutoSwitchSkipsWhenOAuthAccountsExhausted(t *testing.T) {
+func TestSRAutoSwitchSkipsWhenOAuthAccountsExhausted(t *testing.T) {
 	ran := false
-	_, err := cxAutoSwitchOnce(context.Background(), cxAutoSwitchConfig{
+	_, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
 		Accounts: []accounts.Account{
 			{ID: "a@example.com", AuthMode: accounts.AuthModeOAuth},
 			{ID: "b@example.com", AuthMode: accounts.AuthModeOAuth},
@@ -163,6 +163,6 @@ func TestCXAutoSwitchSkipsWhenOAuthAccountsExhausted(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	if ran {
-		t.Fatal("cx switch ran despite exhausted OAuth accounts")
+		t.Fatal("sr switch ran despite exhausted OAuth accounts")
 	}
 }

@@ -16,18 +16,18 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 )
 
-const cxClaudeHelp = `cx claude - Manage multiple Claude Code profiles
+const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
 
 Usage:
-  cx claude                     Show profiles and switch interactively
-  cx claude add [name]          Add account (opens OAuth login, infers email)
-  cx claude list                List all profiles with auth status
-  cx claude switch [name]       Switch active profile
-  cx claude remove <name>       Remove a profile
-  cx claude env                 Print export CLAUDE_CONFIG_DIR=...
-  cx claude run [name] [...]    Launch Claude with a specific profile
-  cx claude <name> [...]        Shorthand for 'cx claude run <name>'
-  cx claude help                Show this help
+  sr claude                     Show profiles and switch interactively
+  sr claude add [name]          Add account (opens OAuth login, infers email)
+  sr claude list                List all profiles with auth status
+  sr claude switch [name]       Switch active profile
+  sr claude remove <name>       Remove a profile
+  sr claude env                 Print export CLAUDE_CONFIG_DIR=...
+  sr claude run [name] [...]    Launch Claude with a specific profile
+  sr claude <name> [...]        Shorthand for 'sr claude run <name>'
+  sr claude help                Show this help
 `
 
 type claudeRunner struct {
@@ -38,7 +38,7 @@ type claudeRunner struct {
 	client *http.Client
 }
 
-func (r cxRunner) claude(ctx context.Context, args []string) error {
+func (r srRunner) claude(ctx context.Context, args []string) error {
 	cr := claudeRunner{
 		store:  claude.DefaultStore(),
 		in:     r.in,
@@ -69,7 +69,7 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		return r.switchProfile(args[1])
 	case "remove", "rm":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: cx claude remove <name>")
+			return fmt.Errorf("usage: sr claude remove <name>")
 		}
 		return r.remove(args[1])
 	case "env":
@@ -87,13 +87,13 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		}
 		return r.runClaude(ctx, name, extra)
 	case "help", "-h", "--help":
-		fmt.Fprint(r.out, cxClaudeHelp)
+		fmt.Fprint(r.out, srClaudeHelp)
 		return nil
 	default:
 		if _, ok := r.store.FindProfile(args[0]); ok {
 			return r.runClaude(ctx, args[0], args[1:])
 		}
-		return fmt.Errorf("unknown command: cx claude %s\n%s", args[0], cxClaudeHelp)
+		return fmt.Errorf("unknown command: sr claude %s\n%s", args[0], srClaudeHelp)
 	}
 }
 
@@ -170,8 +170,8 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		email = " (" + status.Email + ")"
 	}
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q.%s%s\n", profileName, email, plan)
-	fmt.Fprintf(r.out, "\n  cx claude switch %s\n", profileName)
-	fmt.Fprintf(r.out, "  cx claude run %s\n", profileName)
+	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", profileName)
+	fmt.Fprintf(r.out, "  sr claude run %s\n", profileName)
 	return nil
 }
 
@@ -184,7 +184,7 @@ func (r claudeRunner) list(ctx context.Context, numbered bool) error {
 func (r claudeRunner) defaultInteractive(ctx context.Context) error {
 	profiles := r.store.ListProfiles()
 	if len(profiles) == 0 {
-		fmt.Fprintln(r.out, "No Claude profiles. Run 'cx claude add' to create one.")
+		fmt.Fprintln(r.out, "No Claude profiles. Run 'sr claude add' to create one.")
 		return nil
 	}
 	infos := r.fetchInfos(ctx)
@@ -266,7 +266,7 @@ func (r claudeRunner) switchProfile(selector string) error {
 	}
 	fmt.Fprintf(r.out, "Active Claude profile: %s\n", profile.Name)
 	fmt.Fprintf(r.out, "\n  export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(profile.Name))
-	fmt.Fprintln(r.out, "\nOr add to shell rc: eval \"$(cx claude env)\"")
+	fmt.Fprintln(r.out, "\nOr add to shell rc: eval \"$(sr claude env)\"")
 	return nil
 }
 
@@ -335,7 +335,7 @@ type claudeRow struct {
 
 func displayClaudeProfiles(out io.Writer, infos []claude.ProfileInfo, numbered bool) {
 	if len(infos) == 0 {
-		fmt.Fprintln(out, "No Claude profiles. Run 'cx claude add' to create one.")
+		fmt.Fprintln(out, "No Claude profiles. Run 'sr claude add' to create one.")
 		return
 	}
 	colored := colorEnabled(out)

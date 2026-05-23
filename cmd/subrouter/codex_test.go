@@ -15,8 +15,8 @@ func TestCodexArgsInjectsSubrouterBaseURLAsGlobalConfig(t *testing.T) {
 }
 
 func TestDefaultCodexBaseURLDoesNotGuessSingleConfiguredServer(t *testing.T) {
-	store := cxServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
-	if err := store.save(cxServerFile{Servers: []cxServerConfig{{
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(srServerFile{Servers: []srServerConfig{{
 		Name: "community",
 		URL:  "http://100.99.8.37:31415",
 	}}}); err != nil {
@@ -33,10 +33,10 @@ func TestDefaultCodexBaseURLDoesNotGuessSingleConfiguredServer(t *testing.T) {
 }
 
 func TestDefaultCodexBaseURLUsesExplicitDefaultServer(t *testing.T) {
-	store := cxServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
-	if err := store.save(cxServerFile{
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(srServerFile{
 		Default: "community",
-		Servers: []cxServerConfig{
+		Servers: []srServerConfig{
 			{Name: "community", URL: "http://100.99.8.37:31415"},
 			{Name: "other", URL: "http://100.99.8.38:31415"},
 		},
@@ -55,10 +55,10 @@ func TestDefaultCodexBaseURLUsesExplicitDefaultServer(t *testing.T) {
 
 func TestCodexBaseURLUsesServerEnvOverride(t *testing.T) {
 	t.Setenv("SUBROUTER_CODEX_SERVER", "other")
-	store := cxServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
-	if err := store.save(cxServerFile{
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(srServerFile{
 		Default: "community",
-		Servers: []cxServerConfig{
+		Servers: []srServerConfig{
 			{Name: "community", URL: "http://100.99.8.37:31415"},
 			{Name: "other", URL: "http://100.99.8.38:31415"},
 		},
@@ -78,7 +78,7 @@ func TestCodexBaseURLUsesServerEnvOverride(t *testing.T) {
 func TestCodexBaseURLUsesExplicitURLBeforeServerDefault(t *testing.T) {
 	t.Setenv("SUBROUTER_CODEX_BASE_URL", "http://explicit.example/v1")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "other")
-	store := cxServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
 
 	got, err := codexBaseURL(store)
 	if err != nil {

@@ -26,7 +26,7 @@ func defaultCodexConfigPath() (string, error) {
 	return filepath.Join(home, ".codex", "config.toml"), nil
 }
 
-func writeCodexConfigForServer(server cxServerConfig) (string, error) {
+func writeCodexConfigForServer(server srServerConfig) (string, error) {
 	return writeCodexConfigForBaseURL(codexBaseURLForServer(server))
 }
 

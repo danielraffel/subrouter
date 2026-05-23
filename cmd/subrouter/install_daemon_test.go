@@ -16,7 +16,7 @@ func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {
 		TranscriptsDir:   "/Users/alice/.subrouter/transcripts",
 		LogDir:           "/Users/alice/Library/Logs",
 		WorkingDirectory: "/Users/alice/fun/subrouter",
-		CXSwitchInterval: "10m",
+		SRSwitchInterval: "10m",
 		Path:             defaultDaemonPath("/Users/alice/bin/subrouter"),
 	}
 	plist, err := launchAgentPlist(config, home)
@@ -31,7 +31,7 @@ func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {
 		"<string>127.0.0.1:31415</string>",
 		"<string>--transcripts</string>",
 		"<string>/Users/alice/.subrouter/transcripts</string>",
-		"<string>--cx-switch-interval</string>",
+		"<string>--sr-switch-interval</string>",
 		"<string>10m</string>",
 		"<string>/Users/alice/fun/subrouter</string>",
 	} {
@@ -44,17 +44,19 @@ func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {
 func TestInstallDaemonWritesPlistAndInstallsExecutableWithoutStarting(t *testing.T) {
 	home := t.TempDir()
 	config := daemonConfig{
-		Label:            defaultDaemonLabel,
-		Addr:             "127.0.0.1:31415",
-		InstallPath:      filepath.Join(home, "bin", "subrouter"),
-		TranscriptsDir:   filepath.Join(home, ".subrouter", "transcripts"),
-		LogDir:           filepath.Join(home, "Library", "Logs"),
-		WorkingDirectory: home,
-		CXSwitchInterval: "10m",
-		Path:             defaultDaemonPath(filepath.Join(home, "bin", "subrouter")),
-		InstallCXShim:    true,
-		CXShimPath:       filepath.Join(home, "bin", "cx"),
-		Start:            false,
+		Label:                defaultDaemonLabel,
+		Addr:                 "127.0.0.1:31415",
+		InstallPath:          filepath.Join(home, "bin", "subrouter"),
+		TranscriptsDir:       filepath.Join(home, ".subrouter", "transcripts"),
+		LogDir:               filepath.Join(home, "Library", "Logs"),
+		WorkingDirectory:     home,
+		SRSwitchInterval:     "10m",
+		Path:                 defaultDaemonPath(filepath.Join(home, "bin", "subrouter")),
+		InstallSRAlias:       true,
+		SRAliasPath:          filepath.Join(home, "bin", "sr"),
+		InstallLegacyCXAlias: true,
+		LegacyCXAliasPath:    filepath.Join(home, "bin", "cx"),
+		Start:                false,
 	}
 	if err := installDaemonWithConfig(config, home, commandRunner{}); err != nil {
 		t.Fatal(err)
@@ -62,7 +64,8 @@ func TestInstallDaemonWritesPlistAndInstallsExecutableWithoutStarting(t *testing
 
 	for _, path := range []string{
 		config.InstallPath,
-		config.CXShimPath,
+		config.SRAliasPath,
+		config.LegacyCXAliasPath,
 		config.TranscriptsDir,
 		filepath.Join(home, "Library", "LaunchAgents", "ai.manaflow.subrouter.plist"),
 	} {
@@ -78,11 +81,18 @@ func TestInstallDaemonWritesPlistAndInstallsExecutableWithoutStarting(t *testing
 	if !strings.Contains(string(body), "<string>10m</string>") {
 		t.Fatalf("plist did not preserve auto-switch interval:\n%s", body)
 	}
-	target, err := os.Readlink(config.CXShimPath)
+	target, err := os.Readlink(config.SRAliasPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if target != config.InstallPath {
-		t.Fatalf("cx shim target = %q, want %q", target, config.InstallPath)
+		t.Fatalf("sr alias target = %q, want %q", target, config.InstallPath)
+	}
+	target, err = os.Readlink(config.LegacyCXAliasPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != config.InstallPath {
+		t.Fatalf("cx alias target = %q, want %q", target, config.InstallPath)
 	}
 }

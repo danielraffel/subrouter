@@ -17,7 +17,7 @@ func TestSystemdUnitUsesServerDefaults(t *testing.T) {
 		InstallPath:      "/usr/local/bin/subrouter",
 		SessionsPath:     "/var/lib/subrouter/sessions.json",
 		TranscriptsDir:   "/var/lib/subrouter/transcripts",
-		CXSwitchInterval: "10m",
+		SRSwitchInterval: "10m",
 	}
 	unit, err := systemdUnit(config)
 	if err != nil {
@@ -30,6 +30,7 @@ func TestSystemdUnitUsesServerDefaults(t *testing.T) {
 		"Environment=HOME=/var/lib/subrouter",
 		"EnvironmentFile=-/etc/default/subrouter",
 		"ExecStart=/usr/local/bin/subrouter serve --addr ${SUBROUTER_ADDR}",
+		"--sr-switch-interval ${SUBROUTER_SR_SWITCH_INTERVAL}",
 		"TimeoutStopSec=10min",
 		"ReadWritePaths=/var/lib/subrouter /var/log/subrouter",
 	} {
@@ -45,13 +46,16 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 		Home:             "/var/lib/subrouter",
 		SessionsPath:     "/var/lib/subrouter/sessions.json",
 		TranscriptsDir:   "/var/lib/subrouter/transcripts",
-		CXSwitchInterval: "10m",
+		SRSwitchInterval: "10m",
 		AdminToken:       "secret-token",
 		ExtraArgs:        "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
 	}
 	defaults := systemdDefaults(config)
 	if !strings.Contains(defaults, "SUBROUTER_STATE_DIR=/var/lib/subrouter") {
 		t.Fatalf("defaults missing state dir:\n%s", defaults)
+	}
+	if !strings.Contains(defaults, "SUBROUTER_SR_SWITCH_INTERVAL=10m") {
+		t.Fatalf("defaults missing sr switch interval:\n%s", defaults)
 	}
 	if !strings.Contains(defaults, `SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false"`) {
 		t.Fatalf("defaults did not quote extra args:\n%s", defaults)

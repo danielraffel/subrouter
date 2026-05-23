@@ -41,7 +41,7 @@ fi
 curl -fsS "$health_url" >/dev/null
 
 rm -f "$smoke_log"
-"$next" serve --addr 127.0.0.1:31416 --fetch-usage=false --cx-switch-interval 0 >"$smoke_log" 2>&1 &
+"$next" serve --addr 127.0.0.1:31416 --fetch-usage=false --sr-switch-interval 0 >"$smoke_log" 2>&1 &
 smoke_pid="$!"
 smoke_ok=0
 for _ in $(seq 1 40); do
@@ -65,7 +65,7 @@ cp -p "$bin" "$backup"
 "$next" install-daemon \
   --addr 127.0.0.1:31415 \
   --transcripts "$HOME/.subrouter/transcripts" \
-  --cx-switch-interval 10m \
+  --sr-switch-interval 10m \
   --working-directory "$PWD"
 
 ok=0

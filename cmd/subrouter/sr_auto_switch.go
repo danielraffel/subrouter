@@ -11,9 +11,9 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
-const defaultCXSwitchInterval = 10 * time.Minute
+const defaultSRSwitchInterval = 10 * time.Minute
 
-type cxAutoSwitchConfig struct {
+type srAutoSwitchConfig struct {
 	Interval     time.Duration
 	Accounts     []accounts.Account
 	AccountsFunc func() []accounts.Account
@@ -24,7 +24,7 @@ type cxAutoSwitchConfig struct {
 	SwitchActive func(context.Context, string) error
 }
 
-func runCXAutoSwitch(ctx context.Context, cfg cxAutoSwitchConfig) {
+func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
 	if cfg.Interval <= 0 {
 		return
 	}
@@ -35,18 +35,18 @@ func runCXAutoSwitch(ctx context.Context, cfg cxAutoSwitchConfig) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			picked, err := cxAutoSwitchOnce(ctx, cfg)
+			picked, err := srAutoSwitchOnce(ctx, cfg)
 			if err != nil {
-				logCXAutoSwitch(cfg.Logger, slog.LevelWarn, "cx auto-switch failed", "error", err)
+				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch failed", "error", err)
 			} else {
-				logCXAutoSwitch(cfg.Logger, slog.LevelInfo, "cx auto-switch selected account", "account", picked)
+				logSRAutoSwitch(cfg.Logger, slog.LevelInfo, "sr auto-switch selected account", "account", picked)
 			}
 			timer.Reset(cfg.Interval)
 		}
 	}
 }
 
-func cxAutoSwitchOnce(ctx context.Context, cfg cxAutoSwitchConfig) (string, error) {
+func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, error) {
 	fetchScores := cfg.FetchScores
 	if fetchScores == nil {
 		fetchScores = fetchCodexScoresWithSuccess
@@ -62,19 +62,19 @@ func cxAutoSwitchOnce(ctx context.Context, cfg cxAutoSwitchConfig) (string, erro
 			if !ok {
 				return fmt.Errorf("account %q not found", accountID)
 			}
-			refreshCtx := accounts.WithCodexRefreshReason(ctx, "cx-auto-switch")
+			refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr-auto-switch")
 			refreshed, _, err := store.RefreshStoredIfExpired(refreshCtx, nil, stored)
 			if err == nil {
 				stored = refreshed
 			} else {
-				logCXAutoSwitch(cfg.Logger, slog.LevelWarn, "cx auto-switch token refresh failed, using cached tokens", "account", accountID, "error", err)
+				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch token refresh failed, using cached tokens", "account", accountID, "error", err)
 			}
 			if err := accounts.WriteActiveCodexAuth(stored.Auth); err != nil {
 				return err
 			}
 			for _, result := range syncCodexCompatibleAuth(stored) {
 				if result.Err != nil {
-					logCXAutoSwitch(cfg.Logger, slog.LevelWarn, "cx auto-switch compatible auth sync failed", "tool", result.Tool, "error", result.Err)
+					logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch compatible auth sync failed", "tool", result.Tool, "error", result.Err)
 				}
 			}
 			return nil
@@ -87,7 +87,7 @@ func cxAutoSwitchOnce(ctx context.Context, cfg cxAutoSwitchConfig) (string, erro
 	}
 	candidates := oauthAccounts(allAccounts)
 	if len(candidates) == 0 {
-		return "", fmt.Errorf("no OAuth Codex accounts available for cx auto-switch")
+		return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
 	}
 
 	scores, successful := fetchScores(ctx, candidates)
@@ -111,7 +111,7 @@ func cxAutoSwitchOnce(ctx context.Context, cfg cxAutoSwitchConfig) (string, erro
 		if scheduler.Exhausted(picked.ID) {
 			return "", fmt.Errorf("no usable OAuth Codex accounts available")
 		}
-		logCXAutoSwitch(cfg.Logger, slog.LevelWarn, "cx auto-switch selected account below new-session headroom threshold", "account", picked.ID, "threshold", selectacct.MinNewSessionHeadroom)
+		logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch selected account below new-session headroom threshold", "account", picked.ID, "threshold", selectacct.MinNewSessionHeadroom)
 	}
 	if err := switchActive(ctx, picked.ID); err != nil {
 		return "", err
@@ -129,7 +129,7 @@ func oauthAccounts(all []accounts.Account) []accounts.Account {
 	return out
 }
 
-func logCXAutoSwitch(logger *slog.Logger, level slog.Level, message string, args ...any) {
+func logSRAutoSwitch(logger *slog.Logger, level slog.Level, message string, args ...any) {
 	if logger == nil {
 		logger = slog.Default()
 	}

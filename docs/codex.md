@@ -22,7 +22,7 @@ openai_base_url = "http://127.0.0.1:31415/v1"
 Subrouter supports Codex WebSocket requests, so the built-in provider can keep its normal transport behavior.
 This includes Responses WebSockets at `/v1/responses` and realtime WebSockets at `/v1/realtime`.
 
-Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Codex should stay logged in normally, ideally with ChatGPT auth. Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers with the selected `cx` account.
+Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Codex should stay logged in normally, ideally with ChatGPT auth. Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers with the selected `sr` account.
 
 ## Server Switching
 

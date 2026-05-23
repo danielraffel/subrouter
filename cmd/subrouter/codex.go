@@ -15,7 +15,7 @@ import (
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
 
 func codex(args []string) error {
-	baseURL, err := codexBaseURL(defaultCXServerStore(accounts.DefaultCodexStore()))
+	baseURL, err := codexBaseURL(defaultSRServerStore(accounts.DefaultCodexStore()))
 	if err != nil {
 		return err
 	}
@@ -42,7 +42,7 @@ func codex(args []string) error {
 	return cmd.Run()
 }
 
-func codexBaseURL(store cxServerStore) (string, error) {
+func codexBaseURL(store srServerStore) (string, error) {
 	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
 		return baseURL, nil
 	}
@@ -52,7 +52,7 @@ func codexBaseURL(store cxServerStore) (string, error) {
 	return defaultCodexBaseURLFor(store)
 }
 
-func defaultCodexBaseURLFor(store cxServerStore) (string, error) {
+func defaultCodexBaseURLFor(store srServerStore) (string, error) {
 	file, err := store.load()
 	if err != nil {
 		return "", err
@@ -67,7 +67,7 @@ func defaultCodexBaseURLFor(store cxServerStore) (string, error) {
 	return codexBaseURLForServer(server), nil
 }
 
-func codexBaseURLForNamedServer(store cxServerStore, name string) (string, error) {
+func codexBaseURLForNamedServer(store srServerStore, name string) (string, error) {
 	if name == "local" || name == "localhost" {
 		return defaultCodexBaseURL, nil
 	}
@@ -81,7 +81,7 @@ func codexBaseURLForNamedServer(store cxServerStore, name string) (string, error
 	return codexBaseURLForServer(server), nil
 }
 
-func codexBaseURLForServer(server cxServerConfig) string {
+func codexBaseURLForServer(server srServerConfig) string {
 	baseURL := strings.TrimRight(server.URL, "/")
 	if strings.HasSuffix(baseURL, "/v1") {
 		return baseURL

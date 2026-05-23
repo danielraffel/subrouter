@@ -45,7 +45,7 @@ func TestConfigureDefaultLoggerLeavesServeLoggerAlone(t *testing.T) {
 	}
 }
 
-func TestRunAcceptsDirectCXCommands(t *testing.T) {
+func TestRunAcceptsDirectSRCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -83,7 +83,7 @@ func TestSRDefaultRunsAccountPicker(t *testing.T) {
 	}
 }
 
-func TestDirectCXCommandNames(t *testing.T) {
+func TestDirectSRCommandNames(t *testing.T) {
 	expected := []string{
 		"add",
 		"add-admin-key",
@@ -117,21 +117,21 @@ func TestDirectCXCommandNames(t *testing.T) {
 		"why",
 	}
 	sort.Strings(expected)
-	actual := make([]string, 0, len(directCXCommands))
-	for command := range directCXCommands {
+	actual := make([]string, 0, len(directSRCommands))
+	for command := range directSRCommands {
 		actual = append(actual, command)
 	}
 	sort.Strings(actual)
 	if strings.Join(actual, "\n") != strings.Join(expected, "\n") {
-		t.Fatalf("direct cx commands mismatch:\nactual:\n%s\nexpected:\n%s", strings.Join(actual, "\n"), strings.Join(expected, "\n"))
+		t.Fatalf("direct sr commands mismatch:\nactual:\n%s\nexpected:\n%s", strings.Join(actual, "\n"), strings.Join(expected, "\n"))
 	}
 	for _, command := range expected {
-		if !isDirectCXCommand(command) {
-			t.Fatalf("%s should be a direct cx command", command)
+		if !isDirectSRCommand(command) {
+			t.Fatalf("%s should be a direct sr command", command)
 		}
 	}
 	for _, command := range []string{"serve", "codex", "install-daemon", "install-systemd"} {
-		if isDirectCXCommand(command) {
+		if isDirectSRCommand(command) {
 			t.Fatalf("%s should stay a subrouter command", command)
 		}
 	}

@@ -121,13 +121,13 @@ make build
 ./bin/subrouter install-daemon
 ```
 
-This installs the binary to `~/bin/subrouter`, installs `~/bin/cx` as a symlink to the same Go binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, creates `~/.subrouter/transcripts`, starts the service, and runs:
+This installs the binary to `~/bin/subrouter`, installs `~/bin/sr` and `~/bin/cx` as symlinks to the same Go binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, creates `~/.subrouter/transcripts`, starts the service, and runs:
 
 ```bash
-~/bin/subrouter serve --addr 127.0.0.1:31415 --transcripts ~/.subrouter/transcripts --cx-switch-interval 10m
+~/bin/subrouter serve --addr 127.0.0.1:31415 --transcripts ~/.subrouter/transcripts --sr-switch-interval 10m
 ```
 
-The 10 minute `cx` auto-switch interval is the default. Override it with `subrouter install-daemon --cx-switch-interval 5m`, or disable it with `--cx-switch-interval 0`.
+The 10 minute `sr` auto-switch interval is the default. Override it with `subrouter install-daemon --sr-switch-interval 5m`, or disable it with `--sr-switch-interval 0`. The old `--cx-switch-interval` flag remains a compatibility alias.
 
 ### Linux systemd service
 
@@ -141,7 +141,7 @@ sudo sr install-systemd --addr 0.0.0.0:31415
 This creates a `subrouter` system user, stores state under `/var/lib/subrouter`, writes `/etc/systemd/system/subrouter.service`, installs `subrouter`, `sr`, and `cx` in `/usr/local/bin`, and starts:
 
 ```bash
-/usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --transcripts /var/lib/subrouter/transcripts --cx-switch-interval 10m
+/usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --transcripts /var/lib/subrouter/transcripts --sr-switch-interval 10m
 ```
 
 If legacy `switchboard` or `gateway` services exist, `sr install-systemd` stops and disables them, merges their `/var/lib/...` state into `/var/lib/subrouter`, and preserves their extra service args.
@@ -235,7 +235,7 @@ The wrapper injects this config override into the child Codex process:
 openai_base_url = "http://127.0.0.1:31415/v1"
 ```
 
-It does not edit Codex config or set auth environment variables. Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Leave Codex logged in the same way it already is. If Codex is in ChatGPT auth mode, `/model` keeps the subscription model picker. Subrouter replaces outbound credentials with the selected `cx` account before forwarding. Responses and realtime WebSocket requests are proxied through the same route.
+It does not edit Codex config or set auth environment variables. Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Leave Codex logged in the same way it already is. If Codex is in ChatGPT auth mode, `/model` keeps the subscription model picker. Subrouter replaces outbound credentials with the selected `sr` account before forwarding. Responses and realtime WebSocket requests are proxied through the same route.
 
 Override the subrouter URL with `SUBROUTER_CODEX_BASE_URL` if needed. See [docs/codex.md](docs/codex.md) for details and the custom-provider fallback.
 
@@ -257,6 +257,8 @@ Use `--no-codex-config` to change only Subrouter's selected server. Use `sr serv
 
 The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_CODEX_SERVER=team`.
 Rename a local server nickname with `sr server rename <old> <new>`.
+
+Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_CODEX_SERVER=local sr <command>` for a one-off local command.
 
 Set `SUBROUTER_CODEX_USER_EMAIL` to attribute Codex traffic to a teammate:
 
@@ -313,7 +315,7 @@ sr status
 
 The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch`, `g`, `gui`, `gui-switch`, `remove`, `status`, `usage`, `server`, `add-admin-key`, `admin-keys`, `remove-admin-key`, `attach-project`, `claude`, and `gemini`. The older `subrouter cx <command>` form remains as a compatibility alias.
 
-`cx switch` also syncs compatible ChatGPT Codex credentials into:
+`sr switch` also syncs compatible ChatGPT Codex credentials into:
 
 ```text
 ~/.codex/auth.json
@@ -326,20 +328,34 @@ OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `
 Claude profiles are also native Go and use the same Subrouter store:
 
 ```bash
-cx claude list
-cx claude switch <profile>
-cx claude env
-cx claude run <profile>
+sr claude list
+sr claude switch <profile>
+sr claude env
+sr claude run <profile>
 ```
 
-Gemini has its own `cx gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
+Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Generate a long-lived token with `claude setup-token`, then configure the Claude user settings env:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:31415",
+    "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-...",
+    "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-..."
+  }
+}
+```
+
+For a shared server, replace `127.0.0.1` with the server URL. Subrouter recognizes Claude Code traffic, selects a Claude OAuth account from its own store, strips API-key auth, and forwards to Anthropic with the OAuth beta header.
+
+Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
 
 ## Selection policy
 
 On startup, Subrouter fetches current Codex usage for OAuth accounts and scores each account by its most constrained usage window. The scheduler keeps existing sessions sticky. For a new session it protects low-headroom accounts, spends healthy quota that resets soonest, then breaks ties by live assigned-session counts.
 If all else ties, subscription OAuth accounts are preferred before API-key accounts.
 
-The daemon also refreshes usage and updates Codex, OpenCode, and pi auth every 10 minutes by default so local agents follow the same OAuth-only policy. Configure it with `subrouter serve --cx-switch-interval 5m`, or disable it with `--cx-switch-interval 0`. If `--fetch-usage=false`, auto-switch is disabled because fresh usage is required.
+The daemon also refreshes usage and updates Codex, OpenCode, and pi auth every 10 minutes by default so local agents follow the same OAuth-only policy. Configure it with `subrouter serve --sr-switch-interval 5m`, or disable it with `--sr-switch-interval 0`. If `--fetch-usage=false`, auto-switch is disabled because fresh usage is required.
 
 By default, OAuth accounts are forwarded to `https://chatgpt.com/backend-api/codex` and API-key accounts are forwarded to `https://api.openai.com`. Subrouter accepts either `/v1/responses` or `/responses` from clients and normalizes the path for the selected account type.
 

@@ -30,7 +30,7 @@ func main() {
 	program := filepath.Base(os.Args[0])
 	configureDefaultLogger(program, os.Args[1:])
 	if program == "cx" {
-		if err := cx(os.Args[1:]); err != nil {
+		if err := cxAlias(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "cx:", err)
 			os.Exit(1)
 		}
@@ -74,7 +74,7 @@ func run(args []string) error {
 func runForProgram(program string, args []string) error {
 	if len(args) == 0 {
 		if program == "sr" {
-			return cxForProgram(program, nil)
+			return srForProgram(program, nil)
 		}
 		usage(program)
 		return nil
@@ -88,7 +88,7 @@ func runForProgram(program string, args []string) error {
 	case "codex":
 		return codex(args[1:])
 	case "cx":
-		return cx(args[1:])
+		return cxAlias(args[1:])
 	case "install-daemon":
 		return installDaemon(args[1:])
 	case "install-systemd":
@@ -97,14 +97,14 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	default:
-		if isDirectCXCommand(args[0]) || strings.Contains(args[0], "@") {
-			return cxForProgram(program, args)
+		if isDirectSRCommand(args[0]) || strings.Contains(args[0], "@") {
+			return srForProgram(program, args)
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-var directCXCommands = map[string]struct{}{
+var directSRCommands = map[string]struct{}{
 	"add":              {},
 	"add-admin-key":    {},
 	"add-api-key":      {},
@@ -137,8 +137,8 @@ var directCXCommands = map[string]struct{}{
 	"why":              {},
 }
 
-func isDirectCXCommand(command string) bool {
-	_, ok := directCXCommands[command]
+func isDirectSRCommand(command string) bool {
+	_, ok := directSRCommands[command]
 	return ok
 }
 
@@ -153,7 +153,9 @@ func serve(args []string) error {
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
 	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
-	cxSwitchInterval := flags.Duration("cx-switch-interval", defaultCXSwitchInterval, "interval for switching active cx account to the best OAuth account; 0 disables")
+	srSwitchInterval := defaultSRSwitchInterval
+	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for switching the active sr account to the best OAuth account; 0 disables")
+	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
@@ -244,16 +246,16 @@ func serve(args []string) error {
 	if transcriptGCSSyncer.Enabled() {
 		go transcriptGCSSyncer.Run(context.Background())
 	}
-	if *cxSwitchInterval > 0 && *fetchUsage {
-		go runCXAutoSwitch(context.Background(), cxAutoSwitchConfig{
-			Interval:     *cxSwitchInterval,
+	if srSwitchInterval > 0 && *fetchUsage {
+		go runSRAutoSwitch(context.Background(), srAutoSwitchConfig{
+			Interval:     srSwitchInterval,
 			AccountsFunc: accountRef.All,
 			Sessions:     store,
 			SchedulerRef: schedulerRef,
 			Logger:       slog.Default(),
 		})
-	} else if *cxSwitchInterval > 0 {
-		slog.Info("cx auto-switch disabled because usage fetching is disabled", "interval", cxSwitchInterval.String())
+	} else if srSwitchInterval > 0 {
+		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
 
 	httpServer := &http.Server{
@@ -477,7 +479,7 @@ Session stickiness:
   Send X-Subrouter-Agent when the client is not Codex.
   Send X-Subrouter-User-Email for teammate-level observability.
   Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
-  Subrouter switches active cx account every 10m by default; set --cx-switch-interval=0 to disable.
+  Subrouter switches the active sr account every 10m by default; set --sr-switch-interval=0 to disable.
   For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
   The proxy also checks common session headers, query params, and small JSON bodies.
 `, program)

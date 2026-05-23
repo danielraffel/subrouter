@@ -110,7 +110,7 @@ New session selection:
 
 Codex has both shorter rolling and daily/weekly style windows, so using the minimum headroom prevents saturating one window while another still looks available. Later, this can become weighted by expected task size.
 
-Daemon `cx` auto-switching uses the same score refresh on an interval. It only considers usable OAuth Codex accounts, then writes the selected account auth to Codex's active auth file. If no usable OAuth account exists, it leaves the current active account alone. API-key accounts remain a proxy fallback and are not selected for active `cx` switching.
+Daemon `sr` auto-switching uses the same score refresh on an interval. It only considers usable OAuth Codex accounts, then writes the selected account auth to Codex's active auth file. If no usable OAuth account exists, it leaves the current active account alone. API-key accounts remain a proxy fallback and are not selected for active `sr` switching.
 
 ## Account sources
 
@@ -119,13 +119,13 @@ Codex:
 - Read accounts from `~/.subrouter/codex/accounts/*.json`.
 - OAuth accounts provide `tokens.access_token` and optional `tokens.account_id`.
 - API-key accounts provide `OPENAI_API_KEY`.
-- Login, imports, switching, API-key accounts, server install/login, and admin-key usage are native Go commands under `cx`, `subrouter`, and `sr`. The older `subrouter cx` form remains as a compatibility alias.
+- Login, imports, switching, API-key accounts, server install/login, and admin-key usage are native Go commands under `sr` and `subrouter`. The older `cx` and `subrouter cx` forms remain compatibility aliases.
 
 Claude Code:
 
 - Read profile metadata from `~/.subrouter/codex/claude.json`.
 - Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
-- Profile switching, env output, run, remove, and OAuth login are native Go commands under `cx claude`.
+- Profile switching, env output, run, remove, and OAuth login are native Go commands under `sr claude`.
 
 Gemini:
 

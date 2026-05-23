@@ -6,16 +6,16 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/agents/gemini"
 )
 
-const cxGeminiHelp = `cx gemini - Manage Gemini profiles
+const srGeminiHelp = `sr gemini - Manage Gemini profiles
 
 Usage:
-  cx gemini list      List stored Gemini profiles
-  cx gemini help      Show this help
+  sr gemini list      List stored Gemini profiles
+  sr gemini help      Show this help
 
 Gemini routing is namespaced separately in Subrouter. Login/import support will be added when the Gemini CLI credential format is wired in.
 `
 
-func (r cxRunner) gemini(args []string) error {
+func (r srRunner) gemini(args []string) error {
 	if len(args) == 0 {
 		return r.geminiList()
 	}
@@ -23,14 +23,14 @@ func (r cxRunner) gemini(args []string) error {
 	case "list", "ls", "status":
 		return r.geminiList()
 	case "help", "-h", "--help":
-		fmt.Fprint(r.out, cxGeminiHelp)
+		fmt.Fprint(r.out, srGeminiHelp)
 		return nil
 	default:
-		return fmt.Errorf("unknown command: cx gemini %s\n%s", args[0], cxGeminiHelp)
+		return fmt.Errorf("unknown command: sr gemini %s\n%s", args[0], srGeminiHelp)
 	}
 }
 
-func (r cxRunner) geminiList() error {
+func (r srRunner) geminiList() error {
 	store := gemini.DefaultStore()
 	profiles := store.ListProfiles()
 	if len(profiles) == 0 {

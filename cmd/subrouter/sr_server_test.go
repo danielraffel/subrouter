@@ -15,13 +15,13 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
-func TestCXServerAddStoresGCPServer(t *testing.T) {
+func TestSRServerAddStoresGCPServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, out: &out, errOut: &out}
+	runner := srRunner{store: store, out: &out, errOut: &out}
 	err := runner.run(context.Background(), []string{
 		"server", "add", "community",
 		"--url", "http://100.64.0.1:31415",
@@ -33,7 +33,7 @@ func TestCXServerAddStoresGCPServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, ok, err := defaultCXServerStore(store).find("community")
+	server, ok, err := defaultSRServerStore(store).find("community")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,13 +45,13 @@ func TestCXServerAddStoresGCPServer(t *testing.T) {
 	}
 }
 
-func TestCXServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
+func TestSRServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, out: &out, errOut: &out}
+	runner := srRunner{store: store, out: &out, errOut: &out}
 	err := runner.run(context.Background(), []string{
 		"server", "add", "team",
 		"--url", "http://100.64.0.1:31415",
@@ -61,7 +61,7 @@ func TestCXServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, ok, err := defaultCXServerStore(store).find("team")
+	server, ok, err := defaultSRServerStore(store).find("team")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,25 +73,25 @@ func TestCXServerAddStoresAdminTokenForRemoteAdminEndpoints(t *testing.T) {
 	}
 }
 
-func TestCXServerStatusSendsAdminToken(t *testing.T) {
+func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
-	server := cxServerConfig{
+	server := srServerConfig{
 		Name:       "team",
 		URL:        "http://100.64.0.1:31415",
 		AdminToken: "secret-token",
 	}
-	if err := defaultCXServerStore(store).save(cxServerFile{Servers: []cxServerConfig{server}}); err != nil {
+	if err := defaultSRServerStore(store).save(srServerFile{Servers: []srServerConfig{server}}); err != nil {
 		t.Fatal(err)
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		store:  store,
 		out:    &out,
 		errOut: &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path != "/_subrouter/usage-status" {
 				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
 			}
@@ -122,13 +122,13 @@ func TestCXServerStatusSendsAdminToken(t *testing.T) {
 	}
 }
 
-func TestCXServerAddPreservesExistingAdminTokenWhenUpdatingMetadata(t *testing.T) {
+func TestSRServerAddPreservesExistingAdminTokenWhenUpdatingMetadata(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, out: &out, errOut: &out}
+	runner := srRunner{store: store, out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "team",
 		"--url", "http://100.64.0.1:31415",
@@ -145,7 +145,7 @@ func TestCXServerAddPreservesExistingAdminTokenWhenUpdatingMetadata(t *testing.T
 		t.Fatal(err)
 	}
 
-	server, ok, err := defaultCXServerStore(store).find("team")
+	server, ok, err := defaultSRServerStore(store).find("team")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,13 +160,13 @@ func TestCXServerAddPreservesExistingAdminTokenWhenUpdatingMetadata(t *testing.T
 	}
 }
 
-func TestCXServerAddAllowsURLOnlyServer(t *testing.T) {
+func TestSRServerAddAllowsURLOnlyServer(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, out: &out, errOut: &out}
+	runner := srRunner{store: store, out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "team",
 		"--url", "http://100.64.0.1:31415",
@@ -175,7 +175,7 @@ func TestCXServerAddAllowsURLOnlyServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	file, err := defaultCXServerStore(store).load()
+	file, err := defaultSRServerStore(store).load()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,14 +191,14 @@ func TestCXServerAddAllowsURLOnlyServer(t *testing.T) {
 	}
 }
 
-func TestCXServerUseSetsExplicitDefault(t *testing.T) {
+func TestSRServerUseSetsExplicitDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
-	runner := cxRunner{store: store, out: &out, errOut: &out}
+	runner := srRunner{store: store, out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
 		"--url", "http://100.64.0.1:31415",
@@ -211,7 +211,7 @@ func TestCXServerUseSetsExplicitDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	file, err := defaultCXServerStore(store).load()
+	file, err := defaultSRServerStore(store).load()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,15 +240,15 @@ func TestCXServerUseSetsExplicitDefault(t *testing.T) {
 	}
 }
 
-func TestCXServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
+func TestSRServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-home"))
 	store := accounts.DefaultCodexStore()
-	serverStore := defaultCXServerStore(store)
-	if err := serverStore.save(cxServerFile{
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.save(srServerFile{
 		Default: "team",
-		Servers: []cxServerConfig{{
+		Servers: []srServerConfig{{
 			Name: "team",
 			URL:  "http://100.64.0.1:31415",
 		}},
@@ -257,7 +257,7 @@ func TestCXServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{program: "sr", store: store, out: &out, errOut: &out}
+	runner := srRunner{program: "sr", store: store, out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{"server", "use", "local"}); err != nil {
 		t.Fatal(err)
 	}
@@ -277,13 +277,13 @@ func TestCXServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 	}
 }
 
-func TestCXDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
+func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
-	if err := defaultCXServerStore(store).save(cxServerFile{
+	if err := defaultSRServerStore(store).save(srServerFile{
 		Default: "team",
-		Servers: []cxServerConfig{{
+		Servers: []srServerConfig{{
 			Name:       "team",
 			URL:        "http://100.64.0.1:31415",
 			AdminToken: "secret-token",
@@ -293,12 +293,12 @@ func TestCXDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := cxRunner{
+	runner := srRunner{
 		program: "sr",
 		store:   store,
 		out:     &out,
 		errOut:  &out,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path != "/_subrouter/usage-status" {
 				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
 			}
@@ -329,6 +329,213 @@ func TestCXDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 	}
 }
 
+func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name: "team",
+			URL:  "http://100.64.0.1:31415",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("fresh@example.com", "acct_fresh")}
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	if err := runner.run(context.Background(), []string{"add", "--device-auth"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !fake.hasCommand("codex", "login", "--device-auth") {
+		t.Fatalf("missing remote login command: %#v", fake.commands)
+	}
+	if !fake.hasCommandPrefix("ssh", "-o", "BatchMode=yes") {
+		t.Fatalf("missing direct server upload command: %#v", fake.commands)
+	}
+	if strings.Contains(out.String(), "Added account:") {
+		t.Fatalf("top-level add should not add to local account store when a server is selected:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Added server-owned account fresh@example.com to team") {
+		t.Fatalf("missing server add confirmation:\n%s", out.String())
+	}
+}
+
+func TestSRListUsesDefaultRemoteServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "local@example.com",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("local@example.com", "acct_local"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name:       "team",
+			URL:        "http://100.64.0.1:31415",
+			AdminToken: "secret-token",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		out:     &out,
+		errOut:  &out,
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/accounts" {
+				t.Fatalf("path = %s, want /_subrouter/accounts", req.URL.Path)
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
+				t.Fatalf("Authorization = %q", got)
+			}
+			body, _ := json.Marshal([]remoteServerAccount{{
+				ID:       "remote@example.com",
+				Provider: accounts.ProviderCodex,
+				AuthMode: accounts.AuthModeOAuth,
+				Email:    "remote@example.com",
+			}})
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{"list"}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Server: team") || !strings.Contains(got, "remote@example.com") {
+		t.Fatalf("list did not render remote server accounts:\n%s", got)
+	}
+	if strings.Contains(got, "local@example.com") {
+		t.Fatalf("list read local accounts despite selected remote server:\n%s", got)
+	}
+}
+
+func TestSRPickFailsWhenDefaultRemoteServerLacksUsageStatus(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name: "team",
+			URL:  "http://100.64.0.1:31415",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		out:     io.Discard,
+		errOut:  io.Discard,
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "/_subrouter/usage-status" {
+				t.Fatalf("unexpected remote request to %s", req.URL)
+			}
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("not found")),
+			}, nil
+		})},
+	}
+
+	err := runner.run(context.Background(), []string{"pick"})
+	if err == nil || !strings.Contains(err.Error(), "does not support remote pick") {
+		t.Fatalf("err = %v, want unsupported remote pick error", err)
+	}
+}
+
+func TestSRServerEnvLocalKeepsCommandsLocal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_CODEX_SERVER", "local")
+	store := accounts.DefaultCodexStore()
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "local@example.com",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("local@example.com", "acct_local"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name: "team",
+			URL:  "http://100.64.0.1:31415",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   store,
+		out:     &out,
+		errOut:  &out,
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("unexpected remote request to %s", req.URL)
+			return nil, nil
+		})},
+	}
+	if err := runner.run(context.Background(), []string{"list"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "local@example.com") {
+		t.Fatalf("local override did not use local account store:\n%s", out.String())
+	}
+}
+
+func TestSRSwitchDoesNotMutateLocalWhenDefaultRemoteServerSelected(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	localAuth := testCodexAuth("local@example.com", "acct_local")
+	if err := accounts.WriteActiveCodexAuth(localAuth); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name: "team",
+			URL:  "http://100.64.0.1:31415",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &out, errOut: &out}
+	err := runner.run(context.Background(), []string{"switch", "remote@example.com"})
+	if err == nil || !strings.Contains(err.Error(), "will not edit local Codex state") {
+		t.Fatalf("err = %v, want remote guard", err)
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || active.Tokens.RefreshToken != localAuth.Tokens.RefreshToken {
+		t.Fatalf("active local auth was mutated")
+	}
+}
+
 func TestUsageRowsFromServerUsageStatusesKeepsServerErrorWithoutEmail(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
 		Provider:    accounts.ProviderCodex,
@@ -344,13 +551,13 @@ func TestUsageRowsFromServerUsageStatusesKeepsServerErrorWithoutEmail(t *testing
 	}
 }
 
-func TestCXServerRenameUpdatesDefault(t *testing.T) {
+func TestSRServerRenameUpdatesDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
-	runner := cxRunner{program: "sr", store: store, out: &out, errOut: &out}
+	runner := srRunner{program: "sr", store: store, out: &out, errOut: &out}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
 		"--url", "http://100.64.0.1:31415",
@@ -362,7 +569,7 @@ func TestCXServerRenameUpdatesDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	file, err := defaultCXServerStore(store).load()
+	file, err := defaultSRServerStore(store).load()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +584,7 @@ func TestCXServerRenameUpdatesDefault(t *testing.T) {
 	}
 }
 
-func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
+func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -396,8 +603,8 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	fake := &recordingCXCommandRunner{loginAuth: freshServer}
-	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	fake := &recordingSRCommandRunner{loginAuth: freshServer}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
 		"--url", "http://100.64.0.1:31415",
@@ -459,7 +666,7 @@ func TestCXServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	}
 }
 
-func TestCXServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
+func TestSRServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -471,9 +678,9 @@ func TestCXServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	fake := &recordingCXCommandRunner{loginAuth: wrongLogin}
-	runner := cxRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
-	server := cxServerConfig{
+	fake := &recordingSRCommandRunner{loginAuth: wrongLogin}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	server := srServerConfig{
 		Name:        "community",
 		URL:         "http://100.64.0.1:31415",
 		GCPInstance: "subrouter-community",
@@ -496,7 +703,7 @@ func TestCXServerLoginRejectsUnexpectedEmailWithoutUpload(t *testing.T) {
 	}
 }
 
-func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
+func TestSRServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -527,14 +734,14 @@ func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	fake := &recordingCXCommandRunner{loginAuths: []accounts.CodexAuthFile{alice}}
-	runner := cxRunner{
+	fake := &recordingSRCommandRunner{loginAuths: []accounts.CodexAuthFile{alice}}
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader(""),
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path != "/_subrouter/account-status" {
 				t.Fatalf("unexpected path: %s", req.URL.Path)
 			}
@@ -597,7 +804,7 @@ func TestCXServerSyncUploadsMissingLocalOAuthOnly(t *testing.T) {
 	}
 }
 
-func TestCXServerSyncURLOnlyServerUsesDirectSSHUpload(t *testing.T) {
+func TestSRServerSyncURLOnlyServerUsesDirectSSHUpload(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -615,13 +822,13 @@ func TestCXServerSyncURLOnlyServerUsesDirectSSHUpload(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	fake := &recordingCXCommandRunner{loginAuth: fresh}
-	runner := cxRunner{
+	fake := &recordingSRCommandRunner{loginAuth: fresh}
+	runner := srRunner{
 		store:  store,
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			body, _ := json.Marshal([]remoteServerAccountStatus{})
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -655,7 +862,7 @@ func TestCXServerSyncURLOnlyServerUsesDirectSSHUpload(t *testing.T) {
 	}
 }
 
-func TestCXServerSyncDryRunDoesNotLogin(t *testing.T) {
+func TestSRServerSyncDryRunDoesNotLogin(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	store := accounts.DefaultCodexStore()
@@ -668,13 +875,13 @@ func TestCXServerSyncDryRunDoesNotLogin(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	fake := &recordingCXCommandRunner{}
-	runner := cxRunner{
+	fake := &recordingSRCommandRunner{}
+	runner := srRunner{
 		store:  store,
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path != "/_subrouter/account-status" {
 				t.Fatalf("unexpected path: %s", req.URL.Path)
 			}
@@ -705,7 +912,7 @@ func TestCXServerSyncDryRunDoesNotLogin(t *testing.T) {
 	}
 }
 
-func TestCXServerSyncPromptsForInvalidServerAccount(t *testing.T) {
+func TestSRServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("FORCE_COLOR", "1")
@@ -717,14 +924,14 @@ func TestCXServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	fake := &recordingCXCommandRunner{loginAuths: []accounts.CodexAuthFile{invalidFresh}}
-	runner := cxRunner{
+	fake := &recordingSRCommandRunner{loginAuths: []accounts.CodexAuthFile{invalidFresh}}
+	runner := srRunner{
 		store:  store,
 		in:     strings.NewReader("yes\n"),
 		out:    &out,
 		errOut: &out,
 		cmd:    fake,
-		client: &http.Client{Transport: cxRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path != "/_subrouter/account-status" {
 				t.Fatalf("unexpected path: %s", req.URL.Path)
 			}
@@ -766,15 +973,15 @@ func TestCXServerSyncPromptsForInvalidServerAccount(t *testing.T) {
 	}
 }
 
-func TestCXServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
+func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("TAILSCALE_AUTH_KEY", "tailscale-auth-test-secret")
 	store := accounts.DefaultCodexStore()
 
 	var out bytes.Buffer
-	fake := &recordingCXCommandRunner{}
-	runner := cxRunner{store: store, out: &out, errOut: &out, cmd: fake}
+	fake := &recordingSRCommandRunner{}
+	runner := srRunner{store: store, out: &out, errOut: &out, cmd: fake}
 	if err := runner.run(context.Background(), []string{
 		"server", "add", "community",
 		"--url", "http://100.64.0.1:31415",
@@ -814,13 +1021,13 @@ func TestCXServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	}
 }
 
-type recordingCXCommandRunner struct {
+type recordingSRCommandRunner struct {
 	loginAuth  accounts.CodexAuthFile
 	loginAuths []accounts.CodexAuthFile
 	commands   [][]string
 }
 
-func (r *recordingCXCommandRunner) Run(_ context.Context, name string, args []string, _ io.Reader, _ io.Writer, _ io.Writer) error {
+func (r *recordingSRCommandRunner) Run(_ context.Context, name string, args []string, _ io.Reader, _ io.Writer, _ io.Writer) error {
 	command := append([]string{name}, args...)
 	r.commands = append(r.commands, command)
 	if name == "codex" && len(args) > 0 && args[0] == "login" {
@@ -842,11 +1049,11 @@ func (r *recordingCXCommandRunner) Run(_ context.Context, name string, args []st
 	return nil
 }
 
-func (r *recordingCXCommandRunner) Output(context.Context, string, []string) ([]byte, error) {
+func (r *recordingSRCommandRunner) Output(context.Context, string, []string) ([]byte, error) {
 	return nil, nil
 }
 
-func (r *recordingCXCommandRunner) hasCommand(parts ...string) bool {
+func (r *recordingSRCommandRunner) hasCommand(parts ...string) bool {
 	for _, command := range r.commands {
 		if len(command) != len(parts) {
 			continue
@@ -865,7 +1072,7 @@ func (r *recordingCXCommandRunner) hasCommand(parts ...string) bool {
 	return false
 }
 
-func (r *recordingCXCommandRunner) countCommand(parts ...string) int {
+func (r *recordingSRCommandRunner) countCommand(parts ...string) int {
 	count := 0
 	for _, command := range r.commands {
 		if len(command) != len(parts) {
@@ -885,7 +1092,7 @@ func (r *recordingCXCommandRunner) countCommand(parts ...string) int {
 	return count
 }
 
-func (r *recordingCXCommandRunner) hasCommandPrefix(parts ...string) bool {
+func (r *recordingSRCommandRunner) hasCommandPrefix(parts ...string) bool {
 	for _, command := range r.commands {
 		if len(command) < len(parts) {
 			continue
