@@ -1637,22 +1637,33 @@ func compactPickReason(row srUsageRow) string {
 }
 
 func usageGridShortWindowCell(row srUsageRow) usageGridCell {
-	if row.cooked {
+	if longQuotaSaturatedMatching(row.windows, func(window accounts.UsageWindow) bool {
+		return !isSparkWindow(window)
+	}) {
 		return usageGridCell{}
 	}
 	return usageGridWindowCell(row.windows, isShortQuotaWindow)
 }
 
 func usageGridShortNamedWindowCell(row srUsageRow) usageGridCell {
-	if row.cooked {
+	if longQuotaSaturatedMatching(row.windows, isSparkWindow) {
 		return usageGridCell{}
 	}
 	return usageGridNamedWindowCell(row.windows, false)
 }
 
+func longQuotaSaturatedMatching(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) bool {
+	for _, window := range windows {
+		if match(window) && isLongQuotaWindow(window) && clampUsagePercent(window.UsedPercent) >= 100 {
+			return true
+		}
+	}
+	return false
+}
+
 func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) usageGridCell {
 	for _, window := range windows {
-		if match(window) && !strings.Contains(strings.ToLower(window.Name), "codex-spark") {
+		if match(window) && !isSparkWindow(window) {
 			return usageGridWindowStatusCell(window)
 		}
 	}
@@ -1662,7 +1673,7 @@ func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.Usa
 func usageGridNamedWindowCell(windows []accounts.UsageWindow, weekly bool) usageGridCell {
 	for _, window := range windows {
 		name := strings.ToLower(windowLabel(window))
-		if !strings.Contains(name, "codex-spark") {
+		if !isSparkWindow(window) {
 			continue
 		}
 		isWeekly := strings.Contains(name, "weekly")
@@ -1671,6 +1682,10 @@ func usageGridNamedWindowCell(windows []accounts.UsageWindow, weekly bool) usage
 		}
 	}
 	return usageGridCell{}
+}
+
+func isSparkWindow(window accounts.UsageWindow) bool {
+	return strings.Contains(strings.ToLower(windowLabel(window)), "codex-spark")
 }
 
 func usageGridWindowStatusCell(window accounts.UsageWindow) usageGridCell {
