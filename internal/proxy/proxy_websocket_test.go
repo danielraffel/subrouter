@@ -215,6 +215,20 @@ func TestHandlerMapsV1RequestsToCodexBackendPaths(t *testing.T) {
 }
 
 func TestHandlerProxiesClaudeOAuthSubscriptionRequest(t *testing.T) {
+	requestBody := []byte(`{
+		"model": "claude-haiku-4-5",
+		"max_tokens": 8,
+		"system": [
+			{
+				"type": "text",
+				"text": "stable project instructions",
+				"cache_control": {"type": "ephemeral", "ttl": "1h"}
+			}
+		],
+		"messages": [
+			{"role": "user", "content": "ping"}
+		]
+	}`)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Path; got != "/v1/messages" {
 			t.Fatalf("path = %q, want /v1/messages", got)
@@ -232,6 +246,9 @@ func TestHandlerProxiesClaudeOAuthSubscriptionRequest(t *testing.T) {
 		if !strings.Contains(beta, claudeOAuthBetaHeader) {
 			t.Fatalf("Anthropic-Beta = %q, missing OAuth beta", beta)
 		}
+		if !strings.Contains(beta, "extended-cache-ttl-2025-04-11") {
+			t.Fatalf("Anthropic-Beta = %q, missing extended cache TTL beta", beta)
+		}
 		if got := r.Header.Get("ChatGPT-Account-ID"); got != "" {
 			t.Fatalf("ChatGPT-Account-ID = %q, want empty", got)
 		}
@@ -240,6 +257,16 @@ func TestHandlerProxiesClaudeOAuthSubscriptionRequest(t *testing.T) {
 		}
 		if got := r.Header.Get("X-Subrouter-Agent"); got != "" {
 			t.Fatalf("X-Subrouter-Agent leaked upstream: %q", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`"cache_control"`)) {
+			t.Fatalf("body = %s, missing cache_control", body)
+		}
+		if !bytes.Contains(body, []byte(`"ttl": "1h"`)) {
+			t.Fatalf("body = %s, missing 1h cache TTL", body)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -268,12 +295,12 @@ func TestHandlerProxiesClaudeOAuthSubscriptionRequest(t *testing.T) {
 	subrouter := httptest.NewServer(handler)
 	defer subrouter.Close()
 
-	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages?beta=true", strings.NewReader(`{}`))
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages?beta=true", bytes.NewReader(requestBody))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Bearer client-token")
-	req.Header.Set("Anthropic-Beta", "claude-code-20250219")
+	req.Header.Set("Anthropic-Beta", "claude-code-20250219,extended-cache-ttl-2025-04-11")
 	req.Header.Set("X-Api-Key", "client-key")
 	req.Header.Set("X-Claude-Code-Session-Id", "claude-session")
 	response, err := http.DefaultClient.Do(req)
@@ -293,6 +320,77 @@ func TestHandlerProxiesClaudeOAuthSubscriptionRequest(t *testing.T) {
 	}
 	if assignment.AccountID != "work" {
 		t.Fatalf("AccountID = %q, want work", assignment.AccountID)
+	}
+}
+
+func TestHandlerKeepsClaudeConversationOnSameAccount(t *testing.T) {
+	seen := make(chan string, 3)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/v1/messages" {
+			t.Fatalf("path = %q, want /v1/messages", got)
+		}
+		seen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	claudeUpstream, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: claudeUpstream,
+		Accounts: []accounts.Account{
+			{ID: "claude-a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "claude-a-token"},
+			{ID: "claude-b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "claude-b-token"},
+		},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	postClaudeMessage := func(sessionID string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("User-Agent", "claude-cli/2.1.150 (external, sdk-cli)")
+		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", response.StatusCode)
+		}
+	}
+
+	postClaudeMessage("claude-session")
+	postClaudeMessage("claude-session")
+	postClaudeMessage("other-claude-session")
+
+	first := <-seen
+	second := <-seen
+	third := <-seen
+	if first != "Bearer claude-a-token" {
+		t.Fatalf("first Authorization = %q, want claude-a", first)
+	}
+	if second != first {
+		t.Fatalf("same Claude session switched accounts: first %q, second %q", first, second)
+	}
+	if third != "Bearer claude-b-token" {
+		t.Fatalf("new Claude session Authorization = %q, want claude-b", third)
 	}
 }
 
