@@ -81,9 +81,15 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if err != nil {
 		return err
 	}
+	socketUnit, err := systemdSocket(config)
+	if err != nil {
+		return err
+	}
 	defaults := systemdDefaults(config)
 	if config.DryRun {
 		fmt.Print(unit)
+		fmt.Print("\n")
+		fmt.Print(socketUnit)
 		return nil
 	}
 	if os.Geteuid() != 0 {
@@ -133,6 +139,9 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
 		return err
 	}
+	if err := os.WriteFile(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
+		return err
+	}
 	if err := runner.Run("chown", "-R", config.User+":"+config.Group, config.Home, "/var/log/subrouter"); err != nil {
 		return err
 	}
@@ -140,7 +149,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		return err
 	}
 	if config.Start {
-		if err := runner.Run("systemctl", "enable", "--now", config.ServiceName); err != nil {
+		if err := runner.Run("systemctl", "enable", config.ServiceName+".socket", config.ServiceName); err != nil {
 			return err
 		}
 		if err := runner.Run("systemctl", "restart", config.ServiceName); err != nil {
@@ -153,6 +162,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		fmt.Printf("Installed aliases in %s\n", filepath.Dir(config.InstallPath))
 	}
 	fmt.Printf("Installed %s\n", systemdUnitPath(config))
+	fmt.Printf("Installed %s\n", systemdSocketPath(config))
 	if config.Start {
 		fmt.Printf("Started %s\n", config.ServiceName)
 	}
@@ -271,6 +281,10 @@ func systemdUnitPath(config systemdConfig) string {
 	return filepath.Join("/etc/systemd/system", config.ServiceName+".service")
 }
 
+func systemdSocketPath(config systemdConfig) string {
+	return filepath.Join("/etc/systemd/system", config.ServiceName+".socket")
+}
+
 func systemdDefaults(config systemdConfig) string {
 	return fmt.Sprintf(`SUBROUTER_ADDR=%s
 SUBROUTER_STATE_DIR=%s
@@ -285,6 +299,7 @@ SUBROUTER_EXTRA_ARGS=%q
 func systemdUnit(config systemdConfig) (string, error) {
 	data := struct {
 		ServiceName string
+		SocketName  string
 		User        string
 		Group       string
 		Home        string
@@ -292,6 +307,7 @@ func systemdUnit(config systemdConfig) (string, error) {
 		DefaultPath string
 	}{
 		ServiceName: config.ServiceName,
+		SocketName:  config.ServiceName + ".socket",
 		User:        config.User,
 		Group:       config.Group,
 		Home:        config.Home,
@@ -305,13 +321,30 @@ func systemdUnit(config systemdConfig) (string, error) {
 	return out.String(), nil
 }
 
+func systemdSocket(config systemdConfig) (string, error) {
+	data := struct {
+		ServiceName string
+		Addr        string
+	}{
+		ServiceName: config.ServiceName + ".service",
+		Addr:        config.Addr,
+	}
+	var out bytes.Buffer
+	if err := systemdSocketTemplate.Execute(&out, data); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
 var systemdTemplate = template.Must(template.New("systemd").Parse(`[Unit]
 Description=Subrouter AI agent router
 Wants=network-online.target
-After=network-online.target
+Requires={{.SocketName}}
+After=network-online.target {{.SocketName}}
 
 [Service]
 Type=simple
+Sockets={{.SocketName}}
 User={{.User}}
 Group={{.Group}}
 WorkingDirectory={{.Home}}
@@ -329,4 +362,16 @@ ReadWritePaths={{.Home}} /var/log/subrouter
 
 [Install]
 WantedBy=multi-user.target
+`))
+
+var systemdSocketTemplate = template.Must(template.New("systemd-socket").Parse(`[Unit]
+Description=Subrouter AI agent router socket
+
+[Socket]
+ListenStream={{.Addr}}
+NoDelay=true
+Service={{.ServiceName}}
+
+[Install]
+WantedBy=sockets.target
 `))

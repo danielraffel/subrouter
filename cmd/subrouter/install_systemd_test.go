@@ -24,6 +24,9 @@ func TestSystemdUnitUsesServerDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
+		"Requires=subrouter.socket",
+		"After=network-online.target subrouter.socket",
+		"Sockets=subrouter.socket",
 		"User=subrouter",
 		"Group=subrouter",
 		"WorkingDirectory=/var/lib/subrouter",
@@ -36,6 +39,27 @@ func TestSystemdUnitUsesServerDefaults(t *testing.T) {
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing %q:\n%s", want, unit)
+		}
+	}
+}
+
+func TestSystemdSocketUsesConfiguredAddress(t *testing.T) {
+	config := systemdConfig{
+		ServiceName: defaultSystemdServiceName,
+		Addr:        "0.0.0.0:31415",
+	}
+	socketUnit, err := systemdSocket(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"ListenStream=0.0.0.0:31415",
+		"NoDelay=true",
+		"Service=subrouter.service",
+		"WantedBy=sockets.target",
+	} {
+		if !strings.Contains(socketUnit, want) {
+			t.Fatalf("socket unit missing %q:\n%s", want, socketUnit)
 		}
 	}
 }

@@ -45,6 +45,50 @@ func TestConfigureDefaultLoggerLeavesServeLoggerAlone(t *testing.T) {
 	}
 }
 
+func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
+	env := map[string]string{
+		"LISTEN_PID": "123",
+		"LISTEN_FDS": "1",
+	}
+	pid, fdCount, ok, err := systemdListenFDs(123, func(key string) string {
+		return env[key]
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || pid != 123 || fdCount != 1 {
+		t.Fatalf("pid=%d fdCount=%d ok=%v, want pid 123 fdCount 1 ok true", pid, fdCount, ok)
+	}
+}
+
+func TestSystemdListenFDsIgnoresDifferentProcess(t *testing.T) {
+	env := map[string]string{
+		"LISTEN_PID": "456",
+		"LISTEN_FDS": "2",
+	}
+	pid, fdCount, ok, err := systemdListenFDs(123, func(key string) string {
+		return env[key]
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || pid != 456 || fdCount != 2 {
+		t.Fatalf("pid=%d fdCount=%d ok=%v, want pid 456 fdCount 2 ok true", pid, fdCount, ok)
+	}
+}
+
+func TestSystemdListenFDsRejectsInvalidEnv(t *testing.T) {
+	env := map[string]string{
+		"LISTEN_PID": "123",
+		"LISTEN_FDS": "wat",
+	}
+	if _, _, _, err := systemdListenFDs(123, func(key string) string {
+		return env[key]
+	}); err == nil {
+		t.Fatal("expected invalid LISTEN_FDS error")
+	}
+}
+
 func TestRunAcceptsDirectSRCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

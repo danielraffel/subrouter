@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -275,7 +277,7 @@ func serve(args []string) error {
 func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() {
-		err := server.ListenAndServe()
+		err := listenAndServeHTTP(server, logger)
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
@@ -310,6 +312,83 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 		}
 		return <-errCh
 	}
+}
+
+func listenAndServeHTTP(server *http.Server, logger *slog.Logger) error {
+	listeners, err := inheritedSystemdListeners()
+	if err != nil {
+		return err
+	}
+	if len(listeners) == 0 {
+		return server.ListenAndServe()
+	}
+	if logger != nil {
+		logger.Info("using inherited systemd socket", "listeners", len(listeners), "addr", listeners[0].Addr().String())
+	}
+	return server.Serve(listeners[0])
+}
+
+func inheritedSystemdListeners() ([]net.Listener, error) {
+	pid, fdCount, ok, err := systemdListenFDs(os.Getpid(), os.Getenv)
+	if err != nil || !ok {
+		return nil, err
+	}
+	unsetSystemdListenEnv()
+	if pid != os.Getpid() {
+		return nil, nil
+	}
+	listeners := make([]net.Listener, 0, fdCount)
+	var errs []error
+	for i := 0; i < fdCount; i++ {
+		fd := uintptr(3 + i)
+		file := os.NewFile(fd, fmt.Sprintf("systemd-listen-fd-%d", i))
+		if file == nil {
+			errs = append(errs, fmt.Errorf("fd %d is unavailable", fd))
+			continue
+		}
+		listener, listenErr := net.FileListener(file)
+		closeErr := file.Close()
+		if listenErr != nil {
+			errs = append(errs, fmt.Errorf("fd %d: %w", fd, listenErr))
+			continue
+		}
+		if closeErr != nil {
+			_ = listener.Close()
+			errs = append(errs, fmt.Errorf("fd %d: %w", fd, closeErr))
+			continue
+		}
+		listeners = append(listeners, listener)
+	}
+	if len(listeners) == 0 && len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return listeners, nil
+}
+
+func systemdListenFDs(currentPID int, getenv func(string) string) (int, int, bool, error) {
+	rawFDs := strings.TrimSpace(getenv("LISTEN_FDS"))
+	if rawFDs == "" {
+		return 0, 0, false, nil
+	}
+	fdCount, err := strconv.Atoi(rawFDs)
+	if err != nil || fdCount < 0 {
+		return 0, 0, true, fmt.Errorf("invalid LISTEN_FDS %q", rawFDs)
+	}
+	rawPID := strings.TrimSpace(getenv("LISTEN_PID"))
+	pid, err := strconv.Atoi(rawPID)
+	if err != nil {
+		return 0, 0, true, fmt.Errorf("invalid LISTEN_PID %q", rawPID)
+	}
+	if pid != currentPID {
+		return pid, fdCount, true, nil
+	}
+	return pid, fdCount, true, nil
+}
+
+func unsetSystemdListenEnv() {
+	_ = os.Unsetenv("LISTEN_PID")
+	_ = os.Unsetenv("LISTEN_FDS")
+	_ = os.Unsetenv("LISTEN_FDNAMES")
 }
 
 func usageScoreTTLForServe(fetchUsage bool, ttl time.Duration) time.Duration {
