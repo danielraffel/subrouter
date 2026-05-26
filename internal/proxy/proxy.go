@@ -1647,7 +1647,13 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 	attemptReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := t.roundTrip(attemptReq)
-		if err == nil || !retryablePostTransportError(err) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts {
+		retryStatus := err == nil && retryablePostUpstreamStatus(response)
+		retryTransportErr := err != nil && retryablePostTransportError(err)
+		if (!retryStatus && !retryTransportErr) || req.GetBody == nil || req.Context().Err() != nil || attempt == maxAttempts {
+			return response, err
+		}
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
 			return response, err
 		}
 		if response != nil && response.Body != nil {
@@ -1656,16 +1662,16 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
 			closer.CloseIdleConnections()
 		}
-		body, bodyErr := req.GetBody()
-		if bodyErr != nil {
-			return response, err
-		}
 		attemptReq = req.Clone(req.Context())
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
 		attemptReq.ContentLength = req.ContentLength
 		if t.logger != nil {
-			t.logger.Warn("retrying replayable upstream request after transport failure", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
+			if retryStatus {
+				t.logger.Warn("retrying replayable upstream request after upstream timeout status", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "status", response.StatusCode, "cf_ray", response.Header.Get("Cf-Ray"), "request_id", response.Header.Get("X-Request-ID"))
+			} else {
+				t.logger.Warn("retrying replayable upstream request after transport failure", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
+			}
 		}
 	}
 	return t.roundTrip(req)
@@ -1682,6 +1688,10 @@ func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Respon
 		return nil, req.Context().Err()
 	}
 	return t.base.RoundTrip(req)
+}
+
+func retryablePostUpstreamStatus(response *http.Response) bool {
+	return response != nil && response.StatusCode == http.StatusRequestTimeout
 }
 
 func retryablePostTransportError(err error) bool {

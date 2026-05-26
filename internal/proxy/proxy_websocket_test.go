@@ -1630,6 +1630,85 @@ func TestHandlerRetriesReplayableResponsesPostOnTransientTransportError(t *testi
 	}
 }
 
+func TestHandlerRetriesReplayableResponsesPostOnUpstreamRequestTimeout(t *testing.T) {
+	for _, path := range []string{"/v1/responses", "/v1/responses/compact"} {
+		t.Run(path, func(t *testing.T) {
+			upstreamURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempts := 0
+			var bodies []string
+			transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				attempts++
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bodies = append(bodies, string(body))
+				if attempts == 1 {
+					return &http.Response{
+						StatusCode: http.StatusRequestTimeout,
+						Header: http.Header{
+							"Cf-Ray":       []string{"a01b6497ca8ddad6-DFW"},
+							"X-Request-ID": []string{"034a8436-31b9-49b4-9308-fcd5e751cb91"},
+						},
+						Body:    io.NopCloser(strings.NewReader(`{"detail":"Request body read timed out"}`)),
+						Request: req,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusAccepted,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("ok")),
+					Request:    req,
+				}, nil
+			})
+			handler := Server{
+				CodexUpstream: upstreamURL,
+				Accounts: []accounts.Account{{
+					ID:       "codex-account",
+					AuthMode: accounts.AuthModeOAuth,
+					Token:    "oauth-token",
+				}},
+				Sessions:     store,
+				Scheduler:    selectacct.NewScheduler(nil),
+				Transport:    transport,
+				MaxBodyBytes: 1024,
+			}.Handler()
+			subrouter := httptest.NewServer(handler)
+			defer subrouter.Close()
+
+			body := `{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`
+			response, err := http.Post(subrouter.URL+path, "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			responseBody, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202", response.StatusCode)
+			}
+			if string(responseBody) != "ok" {
+				t.Fatalf("body = %q, want ok", string(responseBody))
+			}
+			if attempts != 2 {
+				t.Fatalf("attempts = %d, want 2", attempts)
+			}
+			if strings.Join(bodies, "\x00") != body+"\x00"+body {
+				t.Fatalf("bodies = %#v, want replayed body", bodies)
+			}
+		})
+	}
+}
+
 func TestReplayablePostMaxBodyBytesCoversLargeDesktopCompacts(t *testing.T) {
 	const desktopCompactBytes = 45_994_179
 	if replayablePostMaxBodyBytes < desktopCompactBytes {
