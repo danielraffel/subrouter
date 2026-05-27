@@ -204,7 +204,7 @@ subrouter serve \
   --transcript-max-local-bytes 2GiB
 ```
 
-The daemon shells out to `gsutil -m rsync -r` on a background interval. Local transcript writes stay on the request path; GCS upload failures are logged and retried later. Local cleanup only runs after a successful GCS sync. Files selected for cleanup are copied to an immutable `_archive/` object before local deletion so future resumed sessions cannot overwrite the only cloud copy.
+The daemon uploads with the GCS JSON API on a background interval. Local transcript writes stay on the request path; GCS upload failures are logged and retried later. Local cleanup only runs after a successful GCS sync. Files selected for cleanup are copied to an immutable `_archive/` object before local deletion so future resumed sessions cannot overwrite the only cloud copy.
 
 For best cache behavior, clients should send a stable header per conversation:
 

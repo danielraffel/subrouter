@@ -130,5 +130,5 @@ sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/transcripts
 sudo systemctl restart subrouter
 ```
 
-The mirror runs inside the Subrouter daemon by calling `gsutil -m rsync -r`.
+The mirror runs inside the Subrouter daemon through the GCS JSON API.
 Upload failures are logged and retried; request proxying never waits for GCS. Local cleanup only runs after a successful GCS sync and archives each pruned file under `_archive/` first.
