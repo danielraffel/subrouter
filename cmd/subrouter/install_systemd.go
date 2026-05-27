@@ -146,7 +146,18 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if err := os.WriteFile(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
 		return err
 	}
-	if err := runner.Run("chown", "-R", config.User+":"+config.Group, config.Home, "/var/log/subrouter"); err != nil {
+	chownPaths := []string{
+		config.Home,
+		filepath.Join(config.Home, ".codex"),
+		filepath.Join(config.Home, "codex"),
+		filepath.Join(config.Home, "codex", "accounts"),
+		filepath.Dir(config.SessionsPath),
+		"/var/log/subrouter",
+	}
+	if strings.TrimSpace(config.TranscriptsDir) != "" {
+		chownPaths = append(chownPaths, config.TranscriptsDir)
+	}
+	if err := runner.Run("chown", append([]string{config.User + ":" + config.Group}, chownPaths...)...); err != nil {
 		return err
 	}
 	if err := runner.Run("systemctl", "daemon-reload"); err != nil {
