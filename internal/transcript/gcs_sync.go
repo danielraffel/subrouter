@@ -232,7 +232,7 @@ func (s *GCSSyncer) uploadFile(ctx context.Context, path, objectName string, siz
 		return err
 	}
 	defer file.Close()
-	uploadReq, err := s.newGCSRequest(ctx, http.MethodPut, location, file)
+	uploadReq, err := s.newGCSRequest(ctx, http.MethodPut, location, io.LimitReader(file, size))
 	if err != nil {
 		return err
 	}
