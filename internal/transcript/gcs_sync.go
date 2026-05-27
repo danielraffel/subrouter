@@ -17,7 +17,7 @@ import (
 
 const (
 	defaultGCSSyncCommand = "gsutil"
-	defaultGCSSyncTimeout = 2 * time.Minute
+	defaultGCSSyncTimeout = 30 * time.Minute
 )
 
 type GCSSyncer struct {
@@ -242,7 +242,7 @@ func (s *GCSSyncer) archiveAndRemove(ctx context.Context, file localFile) error 
 
 	copyCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
-	if err := s.runCommand(copyCtx, "cp", "-n", file.path, archiveURI); err != nil {
+	if err := s.runCommand(copyCtx, "cp", "-n", s.destination+file.relPath, archiveURI); err != nil {
 		return err
 	}
 

@@ -199,6 +199,7 @@ To mirror transcripts to GCS without blocking proxy requests, also pass a `gs://
 subrouter serve \
   --transcripts ~/.subrouter/transcripts \
   --transcript-gcs-uri gs://bucket/prefix \
+  --transcript-gcs-sync-timeout 30m \
   --transcript-local-retention 24h \
   --transcript-max-local-bytes 2GiB
 ```

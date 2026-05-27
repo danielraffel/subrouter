@@ -109,7 +109,7 @@ func TestGCSSyncerPrunesOldLocalFilesAfterArchiving(t *testing.T) {
 	if !strings.Contains(logText, "-m rsync -r "+source+" gs://example-bucket/subrouter/") {
 		t.Fatalf("missing rsync command:\n%s", logText)
 	}
-	if !strings.Contains(logText, "cp -n "+oldPath+" gs://example-bucket/subrouter/_archive/by-agent/codex/by-session/old.jsonl/") {
+	if !strings.Contains(logText, "cp -n gs://example-bucket/subrouter/by-agent/codex/by-session/old.jsonl gs://example-bucket/subrouter/_archive/by-agent/codex/by-session/old.jsonl/") {
 		t.Fatalf("missing archive command:\n%s", logText)
 	}
 }
