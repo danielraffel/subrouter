@@ -21,6 +21,7 @@ import (
 
 const (
 	defaultGCSSyncTimeout  = 30 * time.Minute
+	defaultGCSQuietPeriod  = 2 * time.Minute
 	gceMetadataTokenURL    = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 	gcsUploadBaseURL       = "https://storage.googleapis.com/upload/storage/v1"
 	gcsStorageBaseURL      = "https://storage.googleapis.com/storage/v1"
@@ -154,7 +155,20 @@ func (s *GCSSyncer) syncNative(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	now := time.Now()
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].modTime.Equal(files[j].modTime) {
+			if files[i].size == files[j].size {
+				return files[i].path < files[j].path
+			}
+			return files[i].size < files[j].size
+		}
+		return files[i].modTime.Before(files[j].modTime)
+	})
 	for _, file := range files {
+		if now.Sub(file.modTime) < defaultGCSQuietPeriod {
+			continue
+		}
 		if err := s.uploadIfNeeded(ctx, file); err != nil {
 			return err
 		}
