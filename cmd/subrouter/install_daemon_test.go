@@ -13,7 +13,6 @@ func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {
 		Label:            defaultDaemonLabel,
 		Addr:             "127.0.0.1:31415",
 		InstallPath:      "/Users/alice/bin/subrouter",
-		TranscriptsDir:   "/Users/alice/.subrouter/transcripts",
 		LogDir:           "/Users/alice/Library/Logs",
 		WorkingDirectory: "/Users/alice/fun/subrouter",
 		SRSwitchInterval: "10m",
@@ -29,11 +28,38 @@ func TestLaunchAgentPlistUsesMacOSLocalDefaults(t *testing.T) {
 		"<string>serve</string>",
 		"<string>--addr</string>",
 		"<string>127.0.0.1:31415</string>",
-		"<string>--transcripts</string>",
-		"<string>/Users/alice/.subrouter/transcripts</string>",
 		"<string>--sr-switch-interval</string>",
 		"<string>10m</string>",
 		"<string>/Users/alice/fun/subrouter</string>",
+	} {
+		if !strings.Contains(plist, want) {
+			t.Fatalf("plist missing %q:\n%s", want, plist)
+		}
+	}
+	if strings.Contains(plist, "<string>--transcripts</string>") {
+		t.Fatalf("plist enabled transcripts by default:\n%s", plist)
+	}
+}
+
+func TestLaunchAgentPlistIncludesConfiguredTranscripts(t *testing.T) {
+	home := "/Users/alice"
+	config := daemonConfig{
+		Label:            defaultDaemonLabel,
+		Addr:             "127.0.0.1:31415",
+		InstallPath:      "/Users/alice/bin/subrouter",
+		TranscriptsDir:   "/Users/alice/.subrouter/transcripts",
+		LogDir:           "/Users/alice/Library/Logs",
+		WorkingDirectory: "/Users/alice/fun/subrouter",
+		SRSwitchInterval: "10m",
+		Path:             defaultDaemonPath("/Users/alice/bin/subrouter"),
+	}
+	plist, err := launchAgentPlist(config, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"<string>--transcripts</string>",
+		"<string>/Users/alice/.subrouter/transcripts</string>",
 	} {
 		if !strings.Contains(plist, want) {
 			t.Fatalf("plist missing %q:\n%s", want, plist)

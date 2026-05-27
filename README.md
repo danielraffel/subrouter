@@ -121,11 +121,13 @@ make build
 ./bin/subrouter install-daemon
 ```
 
-This installs the binary to `~/bin/subrouter`, installs `~/bin/sr` and `~/bin/cx` as symlinks to the same Go binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, creates `~/.subrouter/transcripts`, starts the service, and runs:
+This installs the binary to `~/bin/subrouter`, installs `~/bin/sr` and `~/bin/cx` as symlinks to the same Go binary, writes `~/Library/LaunchAgents/ai.manaflow.subrouter.plist`, starts the service, and runs:
 
 ```bash
-~/bin/subrouter serve --addr 127.0.0.1:31415 --transcripts ~/.subrouter/transcripts --sr-switch-interval 10m
+~/bin/subrouter serve --addr 127.0.0.1:31415 --sr-switch-interval 10m
 ```
+
+Transcript recording is off by default. Enable it explicitly with `subrouter install-daemon --transcripts ~/.subrouter/transcripts`.
 
 The 10 minute `sr` auto-switch interval is the default. Override it with `subrouter install-daemon --sr-switch-interval 5m`, or disable it with `--sr-switch-interval 0`. The old `--cx-switch-interval` flag remains a compatibility alias.
 
@@ -141,8 +143,10 @@ sudo sr install-systemd --addr 0.0.0.0:31415
 This creates a `subrouter` system user, stores state under `/var/lib/subrouter`, writes `/etc/systemd/system/subrouter.service`, installs `subrouter`, `sr`, and `cx` in `/usr/local/bin`, and starts:
 
 ```bash
-/usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --transcripts /var/lib/subrouter/transcripts --sr-switch-interval 10m
+/usr/local/bin/subrouter serve --addr 0.0.0.0:31415 --sessions /var/lib/subrouter/sessions.json --sr-switch-interval 10m
 ```
+
+Transcript recording is off by default. Enable it explicitly with `sudo sr install-systemd --transcripts /var/lib/subrouter/transcripts`.
 
 If legacy `switchboard` or `gateway` services exist, `sr install-systemd` stops and disables them, merges their `/var/lib/...` state into `/var/lib/subrouter`, and preserves their extra service args.
 
@@ -179,7 +183,7 @@ When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to
 See [deploy/gcp/README.md](deploy/gcp/README.md) for the small GCP + Tailscale Subrouter deployment flow.
 See [docs/production.md](docs/production.md) for the production checklist before running a shared server.
 
-To persist raw Subrouter transcripts, pass a transcript directory:
+Transcript recording is off by default. To persist raw Subrouter transcripts, pass a transcript directory:
 
 ```bash
 subrouter serve --transcripts ~/.subrouter/transcripts
@@ -192,10 +196,14 @@ When transcript recording is enabled, `/_subrouter/dashboard` serves an internal
 To mirror transcripts to GCS without blocking proxy requests, also pass a `gs://` destination:
 
 ```bash
-subrouter serve --transcripts ~/.subrouter/transcripts --transcript-gcs-uri gs://bucket/prefix
+subrouter serve \
+  --transcripts ~/.subrouter/transcripts \
+  --transcript-gcs-uri gs://bucket/prefix \
+  --transcript-local-retention 24h \
+  --transcript-max-local-bytes 2GiB
 ```
 
-The daemon shells out to `gsutil -m rsync -r` on a background interval. Local transcript writes stay on the request path; GCS upload failures are logged and retried later.
+The daemon shells out to `gsutil -m rsync -r` on a background interval. Local transcript writes stay on the request path; GCS upload failures are logged and retried later. Local cleanup only runs after a successful GCS sync. Files selected for cleanup are copied to an immutable `_archive/` object before local deletion so future resumed sessions cannot overwrite the only cloud copy.
 
 For best cache behavior, clients should send a stable header per conversation:
 

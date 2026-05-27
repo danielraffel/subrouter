@@ -46,7 +46,7 @@ func installSystemd(args []string) error {
 	flags.StringVar(&config.Addr, "addr", "0.0.0.0:31415", "service listen address")
 	flags.StringVar(&config.InstallPath, "install-path", "/usr/local/bin/subrouter", "subrouter binary install path")
 	flags.StringVar(&config.SessionsPath, "sessions", "/var/lib/subrouter/sessions.json", "session assignment store")
-	flags.StringVar(&config.TranscriptsDir, "transcripts", "/var/lib/subrouter/transcripts", "transcript directory")
+	flags.StringVar(&config.TranscriptsDir, "transcripts", "", "transcript directory; empty disables transcript recording")
 	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token required for non-loopback _subrouter endpoints; preserves existing SUBROUTER_ADMIN_TOKEN by default")
@@ -106,10 +106,14 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		config.Home,
 		filepath.Join(config.Home, ".codex"),
 		filepath.Dir(config.SessionsPath),
-		config.TranscriptsDir,
 		"/var/log/subrouter",
 	} {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(config.TranscriptsDir) != "" {
+		if err := os.MkdirAll(config.TranscriptsDir, 0o750); err != nil {
 			return err
 		}
 	}
@@ -193,9 +197,6 @@ func validateSystemdConfig(config systemdConfig) error {
 	}
 	if strings.TrimSpace(config.SessionsPath) == "" {
 		return errors.New("sessions is required")
-	}
-	if strings.TrimSpace(config.TranscriptsDir) == "" {
-		return errors.New("transcripts is required")
 	}
 	if strings.TrimSpace(config.SRSwitchInterval) == "" {
 		return errors.New("sr-switch-interval is required")
@@ -286,14 +287,19 @@ func systemdSocketPath(config systemdConfig) string {
 }
 
 func systemdDefaults(config systemdConfig) string {
+	transcriptArgs := ""
+	if strings.TrimSpace(config.TranscriptsDir) != "" {
+		transcriptArgs = "--transcripts=" + strings.TrimSpace(config.TranscriptsDir)
+	}
 	return fmt.Sprintf(`SUBROUTER_ADDR=%s
 SUBROUTER_STATE_DIR=%s
 SUBROUTER_SESSIONS=%s
 SUBROUTER_TRANSCRIPTS=%s
+SUBROUTER_TRANSCRIPT_ARGS=%q
 SUBROUTER_SR_SWITCH_INTERVAL=%s
 SUBROUTER_ADMIN_TOKEN=%q
 SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, config.SRSwitchInterval, config.AdminToken, config.ExtraArgs)
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.ExtraArgs)
 }
 
 func systemdUnit(config systemdConfig) (string, error) {
@@ -350,7 +356,7 @@ Group={{.Group}}
 WorkingDirectory={{.Home}}
 Environment=HOME={{.Home}}
 EnvironmentFile=-{{.DefaultPath}}
-ExecStart={{.InstallPath}} serve --addr ${SUBROUTER_ADDR} --sessions ${SUBROUTER_SESSIONS} --transcripts ${SUBROUTER_TRANSCRIPTS} --sr-switch-interval ${SUBROUTER_SR_SWITCH_INTERVAL} $SUBROUTER_EXTRA_ARGS
+ExecStart={{.InstallPath}} serve --addr ${SUBROUTER_ADDR} --sessions ${SUBROUTER_SESSIONS} $SUBROUTER_TRANSCRIPT_ARGS --sr-switch-interval ${SUBROUTER_SR_SWITCH_INTERVAL} $SUBROUTER_EXTRA_ARGS
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10min

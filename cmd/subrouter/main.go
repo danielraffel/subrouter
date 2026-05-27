@@ -155,6 +155,8 @@ func serve(args []string) error {
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
 	transcriptGCSSyncInterval := flags.Duration("transcript-gcs-sync-interval", 5*time.Minute, "interval for background transcript GCS sync; 0 disables")
+	transcriptLocalRetention := flags.Duration("transcript-local-retention", 0, "delete local transcript files older than this after successful GCS sync; 0 disables")
+	transcriptMaxLocalBytesRaw := flags.String("transcript-max-local-bytes", "0", "max bytes to keep in the local transcript spool after successful GCS sync; supports KiB/MiB/GiB suffixes; 0 disables")
 	srSwitchInterval := defaultSRSwitchInterval
 	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for switching the active sr account to the best OAuth account; 0 disables")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
@@ -165,6 +167,13 @@ func serve(args []string) error {
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if strings.TrimSpace(*transcriptGCSURI) != "" && strings.TrimSpace(*transcriptDir) == "" {
+		return errors.New("--transcripts is required when --transcript-gcs-uri is set")
+	}
+	transcriptMaxLocalBytes, err := parseByteSize(*transcriptMaxLocalBytesRaw)
+	if err != nil {
+		return fmt.Errorf("transcript-max-local-bytes: %w", err)
 	}
 	if *adminToken == "" {
 		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
@@ -240,10 +249,12 @@ func serve(args []string) error {
 		Transcripts:    transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
-		SourceDir:   *transcriptDir,
-		Destination: *transcriptGCSURI,
-		Interval:    *transcriptGCSSyncInterval,
-		Logger:      slog.Default(),
+		SourceDir:      *transcriptDir,
+		Destination:    *transcriptGCSURI,
+		Interval:       *transcriptGCSSyncInterval,
+		LocalRetention: *transcriptLocalRetention,
+		MaxLocalBytes:  transcriptMaxLocalBytes,
+		Logger:         slog.Default(),
 	})
 	if transcriptGCSSyncer.Enabled() {
 		go transcriptGCSSyncer.Run(context.Background())
@@ -398,6 +409,46 @@ func usageScoreTTLForServe(fetchUsage bool, ttl time.Duration) time.Duration {
 	return ttl
 }
 
+func parseByteSize(value string) (int64, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "0" {
+		return 0, nil
+	}
+	lower := strings.ToLower(trimmed)
+	units := []struct {
+		suffix string
+		scale  int64
+	}{
+		{"gib", 1024 * 1024 * 1024},
+		{"gb", 1000 * 1000 * 1000},
+		{"g", 1024 * 1024 * 1024},
+		{"mib", 1024 * 1024},
+		{"mb", 1000 * 1000},
+		{"m", 1024 * 1024},
+		{"kib", 1024},
+		{"kb", 1000},
+		{"k", 1024},
+		{"b", 1},
+	}
+	scale := int64(1)
+	number := trimmed
+	for _, unit := range units {
+		if strings.HasSuffix(lower, unit.suffix) {
+			scale = unit.scale
+			number = strings.TrimSpace(trimmed[:len(trimmed)-len(unit.suffix)])
+			break
+		}
+	}
+	parsed, err := strconv.ParseFloat(number, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size %q", value)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("byte size must be non-negative")
+	}
+	return int64(parsed * float64(scale)), nil
+}
+
 func fetchCodexScores(ctx context.Context, codexAccounts []accounts.Account) []selectacct.Score {
 	scores, _ := fetchCodexScoresWithSuccess(ctx, codexAccounts)
 	return scores
@@ -547,7 +598,7 @@ Usage:
   %[1]s claude             Manage Claude Code profiles
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--transcripts ~/.subrouter/transcripts] [--transcript-gcs-uri gs://bucket/prefix]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

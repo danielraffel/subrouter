@@ -89,6 +89,31 @@ func TestSystemdListenFDsRejectsInvalidEnv(t *testing.T) {
 	}
 }
 
+func TestParseByteSize(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int64
+	}{
+		{"0", 0},
+		{"512", 512},
+		{"1KiB", 1024},
+		{"1.5MiB", 1572864},
+		{"2G", 2147483648},
+		{"3GB", 3000000000},
+	} {
+		got, err := parseByteSize(tc.value)
+		if err != nil {
+			t.Fatalf("parseByteSize(%q): %v", tc.value, err)
+		}
+		if got != tc.want {
+			t.Fatalf("parseByteSize(%q) = %d, want %d", tc.value, got, tc.want)
+		}
+	}
+	if _, err := parseByteSize("-1"); err == nil {
+		t.Fatal("negative byte size should fail")
+	}
+}
+
 func TestRunAcceptsDirectSRCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

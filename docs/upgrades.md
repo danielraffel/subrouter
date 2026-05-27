@@ -25,7 +25,6 @@ rollback() {
   if [ -x "$backup" ]; then
     "$backup" install-daemon \
       --addr 127.0.0.1:31415 \
-      --transcripts "$HOME/.subrouter/transcripts" \
       --cx-switch-interval 10m \
       --working-directory "$PWD"
   fi
@@ -64,7 +63,6 @@ before_sha="$(shasum -a 256 "$bin" | awk '{print $1}')"
 cp -p "$bin" "$backup"
 "$next" install-daemon \
   --addr 127.0.0.1:31415 \
-  --transcripts "$HOME/.subrouter/transcripts" \
   --sr-switch-interval 10m \
   --working-directory "$PWD"
 
@@ -104,7 +102,6 @@ backup="<printed-backup-path>"
 
 "$backup" install-daemon \
   --addr 127.0.0.1:31415 \
-  --transcripts "$HOME/.subrouter/transcripts" \
   --cx-switch-interval 10m \
   --working-directory "$(pwd)"
 curl -fsS http://127.0.0.1:31415/_subrouter/health

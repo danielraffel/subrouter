@@ -120,12 +120,15 @@ on the VM. It shows token usage over time, usage by user email, usage by selecte
 account, sanitized detail JSON, and raw internal trajectory JSON with decoded
 body text under `/raw`.
 
-Background GCS mirror:
+Transcript recording is off by default. To enable it on a shared VM, configure both a local spool and GCS mirror with local cleanup:
 
 ```bash
-sudo sed -i 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://<bucket>/<prefix> --transcript-gcs-sync-interval=5m"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_TRANSCRIPTS=.*|SUBROUTER_TRANSCRIPTS=/var/lib/subrouter/transcripts|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_TRANSCRIPT_ARGS=.*|SUBROUTER_TRANSCRIPT_ARGS="--transcripts=/var/lib/subrouter/transcripts"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_EXTRA_ARGS=.*|SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://<bucket>/<prefix> --transcript-gcs-sync-interval=5m --transcript-local-retention=24h --transcript-max-local-bytes=2GiB"|' /etc/default/subrouter
+sudo install -d -o subrouter -g subrouter -m 0750 /var/lib/subrouter/transcripts
 sudo systemctl restart subrouter
 ```
 
 The mirror runs inside the Subrouter daemon by calling `gsutil -m rsync -r`.
-Upload failures are logged and retried; request proxying never waits for GCS.
+Upload failures are logged and retried; request proxying never waits for GCS. Local cleanup only runs after a successful GCS sync and archives each pruned file under `_archive/` first.

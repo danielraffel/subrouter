@@ -53,7 +53,7 @@ func installDaemon(args []string) error {
 	flags.StringVar(&config.Label, "label", defaultDaemonLabel, "launchd label")
 	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "daemon listen address")
 	flags.StringVar(&config.InstallPath, "install-path", defaultInstallPath, "subrouter binary install path")
-	flags.StringVar(&config.TranscriptsDir, "transcripts", filepath.Join(home, ".subrouter", "transcripts"), "local transcript directory")
+	flags.StringVar(&config.TranscriptsDir, "transcripts", "", "local transcript directory; empty disables transcript recording")
 	flags.StringVar(&config.LogDir, "log-dir", filepath.Join(home, "Library", "Logs"), "daemon log directory")
 	flags.StringVar(&config.WorkingDirectory, "working-directory", cwd, "daemon working directory")
 	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
@@ -90,8 +90,10 @@ func installDaemonWithConfig(config daemonConfig, home string, runner commandRun
 	if err := os.MkdirAll(filepath.Dir(config.InstallPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(config.TranscriptsDir, 0o700); err != nil {
-		return err
+	if strings.TrimSpace(config.TranscriptsDir) != "" {
+		if err := os.MkdirAll(config.TranscriptsDir, 0o700); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(config.LogDir, 0o755); err != nil {
 		return err
@@ -159,9 +161,6 @@ func validateDaemonConfig(config daemonConfig) error {
 	}
 	if config.InstallLegacyCXAlias && strings.TrimSpace(config.LegacyCXAliasPath) == "" {
 		return errors.New("cx-shim-path is required")
-	}
-	if strings.TrimSpace(config.TranscriptsDir) == "" {
-		return errors.New("transcripts is required")
 	}
 	if strings.TrimSpace(config.LogDir) == "" {
 		return errors.New("log-dir is required")
@@ -297,6 +296,7 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		InstallPath      string
 		Addr             string
 		TranscriptsDir   string
+		HasTranscripts   bool
 		SRSwitchInterval string
 		LogPath          string
 		ErrorLogPath     string
@@ -308,6 +308,7 @@ func launchAgentPlist(config daemonConfig, home string) (string, error) {
 		InstallPath:      escapeXMLString(config.InstallPath),
 		Addr:             escapeXMLString(config.Addr),
 		TranscriptsDir:   escapeXMLString(config.TranscriptsDir),
+		HasTranscripts:   strings.TrimSpace(config.TranscriptsDir) != "",
 		SRSwitchInterval: escapeXMLString(config.SRSwitchInterval),
 		LogPath:          escapeXMLString(filepath.Join(config.LogDir, "subrouter.log")),
 		ErrorLogPath:     escapeXMLString(filepath.Join(config.LogDir, "subrouter.err.log")),
@@ -348,9 +349,9 @@ var launchAgentTemplate = template.Must(template.New("launch-agent").Parse(`<?xm
 		<string>serve</string>
 		<string>--addr</string>
 		<string>{{.Addr}}</string>
-		<string>--transcripts</string>
+		{{if .HasTranscripts}}<string>--transcripts</string>
 		<string>{{.TranscriptsDir}}</string>
-		<string>--sr-switch-interval</string>
+		{{end}}<string>--sr-switch-interval</string>
 		<string>{{.SRSwitchInterval}}</string>
 	</array>
 	<key>RunAtLoad</key>

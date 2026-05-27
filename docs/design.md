@@ -74,7 +74,7 @@ X-Subrouter-Account-ID
 
 ## Transcript persistence
 
-`subrouter serve --transcripts <dir>` writes raw proxy transcript JSONL files under:
+Transcript recording is off by default. `subrouter serve --transcripts <dir>` writes raw proxy transcript JSONL files under:
 
 ```text
 <dir>/by-agent/<agent-type>/by-session/<agent-session-id>.jsonl
