@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,6 +28,8 @@ const (
 	gcsStorageBaseURL      = "https://storage.googleapis.com/storage/v1"
 	gcsTokenRefreshPadding = time.Minute
 )
+
+var errGCSObjectNotFound = errors.New("gcs object not found")
 
 type GCSSyncer struct {
 	sourceDir   string
@@ -123,6 +126,9 @@ func (s *GCSSyncer) SyncOnce(ctx context.Context) error {
 	syncCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
+	if err := s.pruneLocal(ctx, time.Now()); err != nil {
+		s.logger.Warn("transcript local prune skipped", "destination", s.destination, "error", err)
+	}
 	if s.command != "" {
 		if err := s.runCommand(syncCtx, "-m", "rsync", "-r", s.sourceDir, s.destination); err != nil {
 			return err
@@ -278,6 +284,10 @@ func (s *GCSSyncer) copyObject(ctx context.Context, sourceObject, destinationObj
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return errGCSObjectNotFound
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return gcsResponseError(resp)
 	}
@@ -453,6 +463,9 @@ func (s *GCSSyncer) archiveAndRemove(ctx context.Context, file localFile) error 
 		}
 	} else {
 		if err := s.copyObject(copyCtx, s.objectName(file.relPath), archiveObject); err != nil {
+			if errors.Is(err, errGCSObjectNotFound) {
+				return nil
+			}
 			return err
 		}
 	}
