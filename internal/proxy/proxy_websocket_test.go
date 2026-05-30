@@ -2219,6 +2219,70 @@ func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowHeadroom(t *tes
 	}
 }
 
+func TestHandlerRoutesSparkModelUsingSparkQuota(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "normal-healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "normal-token"},
+			{ID: "spark-healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "spark-token"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			selectacct.ScoreFromLimitWindows("normal-healthy@example.com", 0, []selectacct.LimitWindow{
+				{Name: "primary", UsedPercent: 1, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "secondary", UsedPercent: 2, LimitWindowSeconds: 7 * 24 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			}),
+			selectacct.ScoreFromLimitWindows("spark-healthy@example.com", 0, []selectacct.LimitWindow{
+				{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			}),
+		}),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "spark-session")
+	req.Header.Set("X-Subrouter-Model", "GPT-5.3-Codex-Spark")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+	if strings.Join(auths, "\x00") != "Bearer spark-token" {
+		t.Fatalf("auths = %#v, want Spark account", auths)
+	}
+}
+
 func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowHeadroom(t *testing.T) {
 	var mu sync.Mutex
 	var auths []string

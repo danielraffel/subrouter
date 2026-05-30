@@ -16,6 +16,7 @@ type Score struct {
 	ShortResetAfterSeconds int64
 	ExpiryPressure         float64
 	Sessions               int
+	ModelScores            map[string]Score
 }
 
 type Scheduler struct {
@@ -52,6 +53,25 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 	}
 	for accountID, count := range counts {
 		next.sessionCounts[accountID] = count
+	}
+	return next
+}
+
+func (s Scheduler) ForModel(model string) Scheduler {
+	key := ModelKey(model)
+	if key == "" {
+		return s
+	}
+	next := Scheduler{
+		scores:        make(map[string]Score, len(s.scores)),
+		sessionCounts: s.sessionCounts,
+	}
+	for accountID, score := range s.scores {
+		modelScore, ok := score.ModelScores[key]
+		if !ok {
+			modelScore = Score{AccountID: accountID, Headroom: 0, ShortHeadroom: 0}
+		}
+		next.scores[accountID] = modelScore
 	}
 	return next
 }

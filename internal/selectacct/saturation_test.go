@@ -46,6 +46,40 @@ func TestScoreFromLimitWindowsComputesExpiryPressure(t *testing.T) {
 	}
 }
 
+func TestSchedulerForSparkModelUsesSparkWindows(t *testing.T) {
+	scheduler := NewScheduler([]Score{
+		ScoreFromLimitWindows("spark-healthy", 0, []LimitWindow{
+			{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
+			{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: 5 * 60 * 60},
+			{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: 7 * 24 * 60 * 60},
+		}),
+		ScoreFromLimitWindows("spark-cooked", 0, []LimitWindow{
+			{Name: "primary", UsedPercent: 0, LimitWindowSeconds: 5 * 60 * 60},
+			{Name: "secondary", UsedPercent: 0, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
+			{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
+		}),
+	}).ForModel("GPT-5.3-Codex-Spark")
+
+	got, err := scheduler.Pick([]accounts.Account{
+		{ID: "spark-cooked", AuthMode: accounts.AuthModeOAuth},
+		{ID: "spark-healthy", AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "spark-healthy" {
+		t.Fatalf("got %q, want spark-healthy", got.ID)
+	}
+	if !scheduler.UsableForNewSession("spark-healthy") {
+		t.Fatal("spark-healthy should be usable for a Spark request")
+	}
+	if !scheduler.Exhausted("spark-cooked") {
+		t.Fatal("spark-cooked should be exhausted for a Spark request")
+	}
+}
+
 func TestExpiryAwareRoutingMatchesSnapshotOrder(t *testing.T) {
 	state := []simulatedAccount{
 		{id: "alpha@example.com", used5h: 73, used7d: 16},

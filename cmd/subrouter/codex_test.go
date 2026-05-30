@@ -181,6 +181,20 @@ func TestCodexArgsInjectsUserEmailAndAccountID(t *testing.T) {
 	}
 }
 
+func TestCodexArgsInjectsModelHeader(t *testing.T) {
+	got := codexArgs([]string{"exec", "-m", "GPT-5.3-Codex-Spark", "prompt"}, "http://127.0.0.1:31415/v1", "", "")
+	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Model"="GPT-5.3-Codex-Spark"}`
+	if !contains(got, headers) {
+		t.Fatalf("args = %#v, want headers %q", got, headers)
+	}
+}
+
+func TestCodexModelArgSupportsEqualsForm(t *testing.T) {
+	if got := codexModelArg([]string{"exec", "--model=GPT-5.3-Codex-Spark"}); got != "GPT-5.3-Codex-Spark" {
+		t.Fatalf("model = %q", got)
+	}
+}
+
 func TestUpsertEnvReplacesExistingValue(t *testing.T) {
 	got := upsertEnv([]string{"A=1", "SUBROUTER_CODEX_DUMMY_API_KEY=old"}, "SUBROUTER_CODEX_DUMMY_API_KEY", "subrouter")
 	want := []string{"A=1", "SUBROUTER_CODEX_DUMMY_API_KEY=subrouter"}

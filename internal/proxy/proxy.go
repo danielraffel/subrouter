@@ -1373,6 +1373,7 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 func (s Server) accountForSession(agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := session.ExtractAccountID(r)
+	model := session.ExtractModel(r, s.MaxBodyBytes)
 	provider := providerForAgent(agentType)
 	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
 	if forcedAccountID != "" {
@@ -1395,7 +1396,7 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 	if provider == accounts.ProviderCodex {
 		s.refreshUsageScoresIfStale(r.Context(), availableAccounts)
 	}
-	scheduler := s.scheduler().WithSessionCounts(s.Sessions.CountByAccount())
+	scheduler := s.scheduler().ForModel(model).WithSessionCounts(s.Sessions.CountByAccount())
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)

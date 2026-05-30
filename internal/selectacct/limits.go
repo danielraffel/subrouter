@@ -1,5 +1,7 @@
 package selectacct
 
+import "strings"
+
 type LimitWindow struct {
 	Name               string
 	UsedPercent        float64
@@ -8,6 +10,45 @@ type LimitWindow struct {
 }
 
 func ScoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow) Score {
+	score := scoreFromLimitWindows(accountID, sessions, windows)
+	if spark, ok := ScoreFromLimitWindowsForModel(accountID, sessions, windows, "spark"); ok {
+		score.ModelScores = map[string]Score{ModelKey("spark"): spark}
+	}
+	return score
+}
+
+func ScoreFromLimitWindowsForModel(accountID string, sessions int, windows []LimitWindow, model string) (Score, bool) {
+	key := ModelKey(model)
+	if key == "" {
+		return scoreFromLimitWindows(accountID, sessions, windows), true
+	}
+	filtered := make([]LimitWindow, 0, len(windows))
+	for _, window := range windows {
+		if limitWindowModelKey(window) == key {
+			filtered = append(filtered, window)
+		}
+	}
+	if len(filtered) == 0 {
+		return Score{AccountID: accountID, Headroom: 0, ShortHeadroom: 0, Sessions: sessions}, false
+	}
+	return scoreFromLimitWindows(accountID, sessions, filtered), true
+}
+
+func ModelKey(model string) string {
+	if strings.Contains(strings.ToLower(model), "spark") {
+		return "spark"
+	}
+	return ""
+}
+
+func limitWindowModelKey(window LimitWindow) string {
+	if strings.Contains(strings.ToLower(window.Name), "spark") {
+		return "spark"
+	}
+	return ""
+}
+
+func scoreFromLimitWindows(accountID string, sessions int, windows []LimitWindow) Score {
 	headroom := 1.0
 	shortHeadroom := 1.0
 	shortResetAfterSeconds := int64(0)

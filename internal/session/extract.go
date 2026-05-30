@@ -41,6 +41,11 @@ var accountIDHeaderCandidates = []string{
 	"X-Subrouter-Account",
 }
 
+var modelHeaderCandidates = []string{
+	"X-Subrouter-Model",
+	"X-Model",
+}
+
 var codexAgentHeaderCandidates = []string{
 	"X-Codex-Window-ID",
 	"X-Codex-Turn-State",
@@ -120,6 +125,26 @@ func ExtractAccountID(r *http.Request) string {
 	return ""
 }
 
+func ExtractModel(r *http.Request, maxBodyBytes int64) string {
+	for _, header := range modelHeaderCandidates {
+		if value := NormalizeModel(r.Header.Get(header)); value != "" {
+			return value
+		}
+	}
+	if value := NormalizeModel(r.URL.Query().Get("model")); value != "" {
+		return value
+	}
+	return extractJSONModel(r, maxBodyBytes)
+}
+
+func NormalizeModel(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || len(trimmed) > 256 {
+		return ""
+	}
+	return trimmed
+}
+
 func NormalizeUserEmail(value string) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" || len(trimmed) > 320 {
@@ -148,6 +173,8 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-User-Email")
 	headers.Del("X-Subrouter-Account-ID")
 	headers.Del("X-Subrouter-Account")
+	headers.Del("X-Subrouter-Model")
+	headers.Del("X-Model")
 }
 
 func ExtractID(r *http.Request, maxBodyBytes int64) string {
@@ -171,30 +198,46 @@ func ExtractID(r *http.Request, maxBodyBytes int64) string {
 }
 
 func extractJSONID(r *http.Request, maxBodyBytes int64) string {
-	if r.Body == nil || maxBodyBytes <= 0 {
+	value := extractJSONValue(r, maxBodyBytes)
+	if value == nil {
 		return ""
+	}
+	return findJSONID(value)
+}
+
+func extractJSONModel(r *http.Request, maxBodyBytes int64) string {
+	value := extractJSONValue(r, maxBodyBytes)
+	if value == nil {
+		return ""
+	}
+	return findJSONModel(value)
+}
+
+func extractJSONValue(r *http.Request, maxBodyBytes int64) any {
+	if r.Body == nil || maxBodyBytes <= 0 {
+		return nil
 	}
 	if r.ContentLength < 0 || r.ContentLength > maxBodyBytes {
-		return ""
+		return nil
 	}
 	if contentType := r.Header.Get("Content-Type"); !strings.Contains(contentType, "json") {
-		return ""
+		return nil
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
-		return ""
+		return nil
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	if int64(len(body)) > maxBodyBytes {
-		return ""
+		return nil
 	}
 
 	var value any
 	if err := json.Unmarshal(body, &value); err != nil {
-		return ""
+		return nil
 	}
-	return findJSONID(value)
+	return value
 }
 
 func findJSONID(value any) string {
@@ -216,6 +259,27 @@ func findJSONID(value any) string {
 		for _, child := range typed {
 			if id := findJSONID(child); id != "" {
 				return id
+			}
+		}
+	}
+	return ""
+}
+
+func findJSONModel(value any) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		if str, ok := typed["model"].(string); ok {
+			return NormalizeModel(str)
+		}
+		for _, child := range typed {
+			if model := findJSONModel(child); model != "" {
+				return model
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if model := findJSONModel(child); model != "" {
+				return model
 			}
 		}
 	}
