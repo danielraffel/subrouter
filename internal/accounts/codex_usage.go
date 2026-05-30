@@ -15,6 +15,11 @@ type UsageWindow struct {
 	UsedPercent        float64
 	LimitWindowSeconds int64
 	ResetAfterSeconds  int64
+	// Feature is the upstream limit_name of the additional (per-model) rate
+	// limit this window belongs to, e.g. "GPT-5.3-Codex-Spark". Empty for the
+	// account-wide primary/secondary windows. Used to route a request to its
+	// model-specific quota pool without matching on display strings.
+	Feature string
 }
 
 type CodexUsageDetails struct {
@@ -152,10 +157,11 @@ func (u codexUsageResponse) windows() []UsageWindow {
 
 func (u codexUsageResponse) displayWindows() []UsageWindow {
 	windows := u.windows()
-	appendDetails := func(prefix string, details codexRateLimitDetails) {
+	appendDetails := func(prefix, feature string, details codexRateLimitDetails) {
 		if details.PrimaryWindow != nil {
 			windows = append(windows, UsageWindow{
 				Name:               prefix + "primary",
+				Feature:            feature,
 				UsedPercent:        details.PrimaryWindow.UsedPercent,
 				LimitWindowSeconds: details.PrimaryWindow.LimitWindowSeconds,
 				ResetAfterSeconds:  details.PrimaryWindow.resetAfterSeconds(),
@@ -164,13 +170,14 @@ func (u codexUsageResponse) displayWindows() []UsageWindow {
 		if details.SecondaryWindow != nil {
 			windows = append(windows, UsageWindow{
 				Name:               prefix + "secondary",
+				Feature:            feature,
 				UsedPercent:        details.SecondaryWindow.UsedPercent,
 				LimitWindowSeconds: details.SecondaryWindow.LimitWindowSeconds,
 				ResetAfterSeconds:  details.SecondaryWindow.resetAfterSeconds(),
 			})
 		}
 		if details.LimitReached {
-			windows = append(windows, UsageWindow{Name: prefix + "reached", UsedPercent: 100})
+			windows = append(windows, UsageWindow{Name: prefix + "reached", Feature: feature, UsedPercent: 100})
 		}
 	}
 	for _, additional := range u.AdditionalRateLimits {
@@ -181,7 +188,7 @@ func (u codexUsageResponse) displayWindows() []UsageWindow {
 		if name == "" {
 			name = "unknown"
 		}
-		appendDetails(name+"/", additional.RateLimit)
+		appendDetails(name+"/", name, additional.RateLimit)
 	}
 	return windows
 }

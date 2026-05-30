@@ -512,6 +512,7 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 					UsedPercent:        window.UsedPercent,
 					LimitWindowSeconds: window.LimitWindowSeconds,
 					ResetAfterSeconds:  window.ResetAfterSeconds,
+					Feature:            window.Feature,
 				})
 			}
 			score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)

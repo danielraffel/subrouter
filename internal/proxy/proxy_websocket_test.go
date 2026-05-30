@@ -2246,14 +2246,14 @@ func TestHandlerRoutesSparkModelUsingSparkQuota(t *testing.T) {
 			selectacct.ScoreFromLimitWindows("normal-healthy@example.com", 0, []selectacct.LimitWindow{
 				{Name: "primary", UsedPercent: 1, LimitWindowSeconds: 5 * 60 * 60},
 				{Name: "secondary", UsedPercent: 2, LimitWindowSeconds: 7 * 24 * 60 * 60},
-				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
-				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
 			}),
 			selectacct.ScoreFromLimitWindows("spark-healthy@example.com", 0, []selectacct.LimitWindow{
 				{Name: "primary", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
 				{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
-				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: 5 * 60 * 60},
-				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: 7 * 24 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 1, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: 7 * 24 * 60 * 60},
 			}),
 		}),
 		MaxBodyBytes: 1024,

@@ -614,6 +614,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				UsedPercent:        window.UsedPercent,
 				LimitWindowSeconds: window.LimitWindowSeconds,
 				ResetAfterSeconds:  window.ResetAfterSeconds,
+				Feature:            window.Feature,
 			})
 		}
 		if idx, ok := scoreByID[account.ID]; ok {
@@ -1396,7 +1397,11 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 	if provider == accounts.ProviderCodex {
 		s.refreshUsageScoresIfStale(r.Context(), availableAccounts)
 	}
-	scheduler := s.scheduler().ForModel(model).WithSessionCounts(s.Sessions.CountByAccount())
+	base := s.scheduler()
+	if model != "" && s.Logger != nil && base.HasModelPool(model) {
+		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(model))
+	}
+	scheduler := base.ForModel(model).WithSessionCounts(s.Sessions.CountByAccount())
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)

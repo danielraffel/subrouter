@@ -57,9 +57,14 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 	return next
 }
 
+// ForModel narrows scoring to a model's dedicated quota pool when one exists.
+// If the model maps to no known pool (the common case: regular models), the
+// base scheduler is returned unchanged so account-wide quota is used. When a
+// pool exists but a given account lacks it, that account scores zero so it is
+// not picked for a model it cannot serve.
 func (s Scheduler) ForModel(model string) Scheduler {
 	key := ModelKey(model)
-	if key == "" {
+	if key == "" || !s.hasModelScore(key) {
 		return s
 	}
 	next := Scheduler{
@@ -74,6 +79,22 @@ func (s Scheduler) ForModel(model string) Scheduler {
 		next.scores[accountID] = modelScore
 	}
 	return next
+}
+
+// HasModelPool reports whether the model maps to a dedicated quota pool present
+// on at least one scored account.
+func (s Scheduler) HasModelPool(model string) bool {
+	key := ModelKey(model)
+	return key != "" && s.hasModelScore(key)
+}
+
+func (s Scheduler) hasModelScore(key string) bool {
+	for _, score := range s.scores {
+		if _, ok := score.ModelScores[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Scheduler) Pick(candidates []accounts.Account) (accounts.Account, error) {
