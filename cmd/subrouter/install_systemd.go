@@ -46,7 +46,7 @@ func installSystemd(args []string) error {
 	flags.StringVar(&config.Addr, "addr", "0.0.0.0:31415", "service listen address")
 	flags.StringVar(&config.InstallPath, "install-path", "/usr/local/bin/subrouter", "subrouter binary install path")
 	flags.StringVar(&config.SessionsPath, "sessions", "/var/lib/subrouter/sessions.json", "session assignment store")
-	flags.StringVar(&config.TranscriptsDir, "transcripts", "", "transcript directory; empty disables transcript recording")
+	flags.StringVar(&config.TranscriptsDir, "transcripts", "", "transcript directory; empty preserves the existing SUBROUTER_TRANSCRIPTS, then disables transcript recording if unset")
 	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token required for non-loopback _subrouter endpoints; preserves existing SUBROUTER_ADMIN_TOKEN by default")
@@ -61,15 +61,7 @@ func installSystemd(args []string) error {
 	if runtime.GOOS != "linux" && !config.DryRun {
 		return errors.New("install-systemd is Linux-only")
 	}
-	if config.ExtraArgs == "" {
-		config.ExtraArgs = readSystemdDefaultExtraArgs(config)
-		if config.ExtraArgs == "" && config.ReplaceLegacy {
-			config.ExtraArgs = readLegacySystemdExtraArgs()
-		}
-	}
-	if config.AdminToken == "" {
-		config.AdminToken = readDefaultValue(systemdDefaultPath(config), "SUBROUTER_ADMIN_TOKEN")
-	}
+	applyExistingSystemdDefaults(&config, systemdDefaultPath(config))
 	return installSystemdWithConfig(config, commandRunner{})
 }
 
@@ -230,8 +222,25 @@ func ensureSystemUser(config systemdConfig, runner commandRunner) error {
 	return runner.Run("useradd", "--system", "--gid", config.Group, "--home-dir", config.Home, "--create-home", "--shell", "/usr/sbin/nologin", config.User)
 }
 
-func readSystemdDefaultExtraArgs(config systemdConfig) string {
-	return readDefaultValue(systemdDefaultPath(config), "SUBROUTER_EXTRA_ARGS")
+// applyExistingSystemdDefaults backfills config values from an existing
+// EnvironmentFile so re-running install-systemd without re-passing every flag
+// preserves the prior configuration. SUBROUTER_TRANSCRIPTS must be preserved
+// alongside SUBROUTER_EXTRA_ARGS: dropping the transcript dir while keeping a
+// --transcript-gcs-uri in extra args yields a config that serve rejects at
+// startup, which crash-loops the service behind socket activation.
+func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
+	if config.ExtraArgs == "" {
+		config.ExtraArgs = readDefaultValue(defaultPath, "SUBROUTER_EXTRA_ARGS")
+		if config.ExtraArgs == "" && config.ReplaceLegacy {
+			config.ExtraArgs = readLegacySystemdExtraArgs()
+		}
+	}
+	if config.TranscriptsDir == "" {
+		config.TranscriptsDir = readDefaultValue(defaultPath, "SUBROUTER_TRANSCRIPTS")
+	}
+	if config.AdminToken == "" {
+		config.AdminToken = readDefaultValue(defaultPath, "SUBROUTER_ADMIN_TOKEN")
+	}
 }
 
 func readLegacySystemdExtraArgs() string {
@@ -358,6 +367,8 @@ Description=Subrouter AI agent router
 Wants=network-online.target
 Requires={{.SocketName}}
 After=network-online.target {{.SocketName}}
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

@@ -35,6 +35,8 @@ func TestSystemdUnitUsesServerDefaults(t *testing.T) {
 		"$SUBROUTER_TRANSCRIPT_ARGS",
 		"--sr-switch-interval ${SUBROUTER_SR_SWITCH_INTERVAL}",
 		"TimeoutStopSec=10min",
+		"StartLimitIntervalSec=60",
+		"StartLimitBurst=5",
 		"ReadWritePaths=/var/lib/subrouter /var/log/subrouter",
 	} {
 		if !strings.Contains(unit, want) {
@@ -105,6 +107,47 @@ func TestSystemdDefaultsDisableTranscriptsByDefault(t *testing.T) {
 	}
 	if !strings.Contains(defaults, `SUBROUTER_TRANSCRIPT_ARGS=""`) {
 		t.Fatalf("defaults should leave transcript args empty:\n%s", defaults)
+	}
+}
+
+func TestApplyExistingSystemdDefaultsPreservesTranscriptsDir(t *testing.T) {
+	// Reproduces the crash-loop: a re-install with no --transcripts flag must
+	// not drop SUBROUTER_TRANSCRIPTS while keeping --transcript-gcs-uri in
+	// SUBROUTER_EXTRA_ARGS, since serve rejects that combination at startup.
+	path := filepath.Join(t.TempDir(), "subrouter")
+	existing := strings.Join([]string{
+		"SUBROUTER_ADDR=0.0.0.0:31415",
+		"SUBROUTER_TRANSCRIPTS=/var/lib/subrouter/transcripts",
+		`SUBROUTER_TRANSCRIPT_ARGS="--transcripts=/var/lib/subrouter/transcripts"`,
+		"SUBROUTER_ADMIN_TOKEN=\"secret-token\"",
+		`SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --transcript-gcs-sync-interval=5m"`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	config := systemdConfig{
+		Addr:             "0.0.0.0:31415",
+		Home:             "/var/lib/subrouter",
+		SessionsPath:     "/var/lib/subrouter/sessions.json",
+		SRSwitchInterval: "10m",
+	}
+	applyExistingSystemdDefaults(&config, path)
+
+	if config.TranscriptsDir != "/var/lib/subrouter/transcripts" {
+		t.Fatalf("transcripts dir = %q, want preserved /var/lib/subrouter/transcripts", config.TranscriptsDir)
+	}
+	if config.AdminToken != "secret-token" {
+		t.Fatalf("admin token = %q, want preserved secret-token", config.AdminToken)
+	}
+	if !strings.Contains(config.ExtraArgs, "--transcript-gcs-uri=gs://bucket/prefix") {
+		t.Fatalf("extra args = %q, want preserved gcs uri", config.ExtraArgs)
+	}
+
+	defaults := systemdDefaults(config)
+	if !strings.Contains(defaults, `SUBROUTER_TRANSCRIPT_ARGS="--transcripts=/var/lib/subrouter/transcripts"`) {
+		t.Fatalf("regenerated defaults dropped transcripts, would crash-loop:\n%s", defaults)
 	}
 }
 
