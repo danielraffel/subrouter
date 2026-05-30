@@ -2368,6 +2368,133 @@ func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowHeadroom(t *test
 	}
 }
 
+func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+
+		block := false
+		if r.URL.Path == "/v1/responses" {
+			firstOnce.Do(func() {
+				block = true
+				close(firstStarted)
+			})
+		}
+		if block {
+			<-releaseFirst
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "empty@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "empty@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
+		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	firstReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReq.Header.Set("X-Subrouter-Session", "session-1")
+	firstErr := make(chan error, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(firstReq)
+		if err != nil {
+			firstErr <- err
+			return
+		}
+		defer response.Body.Close()
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			firstErr <- err
+			return
+		}
+		if response.StatusCode != http.StatusNoContent {
+			firstErr <- fmt.Errorf("first status = %d, want 204", response.StatusCode)
+			return
+		}
+		firstErr <- nil
+	}()
+
+	select {
+	case <-firstStarted:
+	case err := <-firstErr:
+		t.Fatalf("first request finished before becoming active: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first request to become active")
+	}
+
+	schedulerRef.MarkExhausted("empty@example.com")
+
+	secondReq, err := http.NewRequest(http.MethodGet, subrouter.URL+"/backend-api/codex/analytics-events/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReq.Header.Set("X-Subrouter-Session", "session-1")
+	secondResp, err := http.DefaultClient.Do(secondReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, secondResp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondResp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if secondResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("second status = %d, want 204", secondResp.StatusCode)
+	}
+
+	close(releaseFirst)
+	if err := <-firstErr; err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), auths...)
+	mu.Unlock()
+	want := []string{"Bearer empty-token", "Bearer healthy-token"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", got, want)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("missing session-1 assignment")
+	}
+	if assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+}
+
 func TestHandlerRefreshesStaleUsageScoresBeforeReusingStickySession(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2545,7 +2672,7 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	}
 }
 
-func TestHandlerMarksHTTPUsageLimitAccountExhausted(t *testing.T) {
+func TestHandlerRetriesHTTPUsageLimitOnAlternateOAuthAccount(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -2596,37 +2723,14 @@ func TestHandlerMarksHTTPUsageLimitAccountExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstBody, err := io.ReadAll(firstResp.Body)
-	if closeErr := firstResp.Body.Close(); closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	if err != nil {
+	if _, err := io.Copy(io.Discard, firstResp.Body); err != nil {
 		t.Fatal(err)
 	}
-	if firstResp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("first status = %d, want 429", firstResp.StatusCode)
-	}
-	if !strings.Contains(string(firstBody), "usage_limit_reached") {
-		t.Fatalf("first body = %q, want usage limit error", string(firstBody))
-	}
-
-	secondReq, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses/compact", strings.NewReader(`{}`))
-	if err != nil {
+	if err := firstResp.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
-	secondReq.Header.Set("X-Subrouter-Session", "session-1")
-	secondResp, err := http.DefaultClient.Do(secondReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.Copy(io.Discard, secondResp.Body); err != nil {
-		t.Fatal(err)
-	}
-	if err := secondResp.Body.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if secondResp.StatusCode != http.StatusNoContent {
-		t.Fatalf("second status = %d, want 204", secondResp.StatusCode)
+	if firstResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("first status = %d, want 204", firstResp.StatusCode)
 	}
 	want := []string{"Bearer empty-token", "Bearer healthy-token"}
 	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
@@ -2638,6 +2742,79 @@ func TestHandlerMarksHTTPUsageLimitAccountExhausted(t *testing.T) {
 	}
 	if assignment.AccountID != "healthy@example.com" {
 		t.Fatalf("AccountID = %q, want healthy@example.com", assignment.AccountID)
+	}
+}
+
+func TestHandlerRetriesHTTPUsageLimitToBelowThresholdFallback(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer empty-token" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "empty@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "fallback@example.com", Headroom: 0.01, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "fallback@example.com", AuthMode: accounts.AuthModeOAuth, Token: "fallback-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+	want := []string{"Bearer empty-token", "Bearer fallback-token"}
+	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("missing session-1 assignment")
+	}
+	if assignment.AccountID != "fallback@example.com" {
+		t.Fatalf("AccountID = %q, want fallback@example.com", assignment.AccountID)
 	}
 }
 

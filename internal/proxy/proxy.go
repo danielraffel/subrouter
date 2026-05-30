@@ -751,6 +751,21 @@ func (s Server) proxyHandler() http.Handler {
 
 		rp := httputil.NewSingleHostReverseProxy(upstream)
 		transport := s.transport()
+		if retryPost && postReplayable && providerForAgent(agentType) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
+			transport = usageLimitRetryTransport{
+				base:        transport,
+				server:      &s,
+				logger:      s.Logger,
+				agent:       agentType,
+				session:     sessionID,
+				userEmail:   userEmail,
+				account:     account.ID,
+				method:      r.Method,
+				path:        proxyRequest.URL.Path,
+				upstream:    upstream.Host,
+				maxAttempts: replayablePostMaxAttempts,
+			}
+		}
 		if retryPost && postReplayable {
 			transport = replayablePostRetryTransport{
 				base:        transport,
@@ -1248,6 +1263,7 @@ const claudeOAuthBetaHeader = "oauth-2025-04-20"
 
 func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 	headers.Set("Authorization", account.AuthorizationHeader())
+	headers.Del("ChatGPT-Account-ID")
 	switch account.Provider {
 	case accounts.ProviderClaude:
 		headers.Del("X-Api-Key")
@@ -1445,11 +1461,11 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 }
 
 func (s Server) reuseStickyAssignment(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) bool {
-	if s.activeSession(agentType, sessionID) {
-		return true
-	}
 	if scheduler.Exhausted(account.ID) {
 		return false
+	}
+	if s.activeSession(agentType, sessionID) {
+		return true
 	}
 	if providerForAgent(agentType) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
 		return scheduler.UsableForNewSession(account.ID)
@@ -1637,6 +1653,158 @@ type replayablePostRetryTransport struct {
 	upstream    string
 	maxAttempts int
 	limiter     chan struct{}
+}
+
+type usageLimitRetryTransport struct {
+	base        http.RoundTripper
+	server      *Server
+	logger      *slog.Logger
+	agent       string
+	session     string
+	userEmail   string
+	account     string
+	method      string
+	path        string
+	upstream    string
+	maxAttempts int
+}
+
+func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	maxAttempts := t.maxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	attemptReq := req
+	accountID := t.account
+	tried := map[string]struct{}{}
+	if accountID != "" {
+		tried[accountID] = struct{}{}
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		response, err := base.RoundTrip(attemptReq)
+		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
+			return response, err
+		}
+		usageLimited, inspectErr := responseUsageLimit(response)
+		if inspectErr != nil {
+			if t.logger != nil {
+				t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+			}
+			return response, nil
+		}
+		if !usageLimited {
+			return response, nil
+		}
+		if t.server != nil {
+			t.server.markAccountExhausted(accountID)
+		}
+		if attempt == maxAttempts || t.server == nil {
+			return response, nil
+		}
+		nextAccount, pickErr := t.server.codexOAuthRetryAccount(req.Context(), t.agent, t.session, t.userEmail, tried)
+		if pickErr != nil {
+			if t.logger != nil {
+				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
+			}
+			return response, nil
+		}
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			if t.logger != nil {
+				t.logger.Warn("usage-limit retry could not replay request body", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", bodyErr)
+			}
+			return response, nil
+		}
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		previousAccount := accountID
+		accountID = nextAccount.ID
+		tried[accountID] = struct{}{}
+		attemptReq = req.Clone(req.Context())
+		attemptReq.Body = body
+		attemptReq.GetBody = req.GetBody
+		attemptReq.ContentLength = req.ContentLength
+		setAccountAuthHeaders(attemptReq.Header, nextAccount)
+		if t.logger != nil {
+			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
+		}
+	}
+	return base.RoundTrip(req)
+}
+
+func (s Server) codexOAuthRetryAccount(ctx context.Context, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
+	allCandidates := oauthAccounts(filterAccountsForProvider(s.accountList(), accounts.ProviderCodex))
+	if len(allCandidates) == 0 {
+		return accounts.Account{}, fmt.Errorf("no OAuth Codex accounts available")
+	}
+	candidates := make([]accounts.Account, 0, len(allCandidates))
+	for _, account := range allCandidates {
+		if _, ok := tried[account.ID]; ok {
+			continue
+		}
+		candidates = append(candidates, account)
+	}
+	if len(candidates) == 0 {
+		return accounts.Account{}, fmt.Errorf("no untried OAuth Codex accounts available")
+	}
+	s.refreshUsageScoresIfStale(ctx, allCandidates)
+	scheduler := s.scheduler()
+	if s.Sessions != nil {
+		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+	}
+	account, err := scheduler.Pick(candidates)
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	if scheduler.Exhausted(account.ID) {
+		return accounts.Account{}, fmt.Errorf("no non-exhausted OAuth Codex accounts available")
+	}
+	if !scheduler.UsableForNewSession(account.ID) && s.Logger != nil {
+		s.Logger.Warn("usage-limit retry selected OAuth Codex account below new-session headroom threshold", "account", account.ID, "threshold", selectacct.MinNewSessionHeadroom)
+	}
+	refreshed, err := s.refreshAccount(ctx, account)
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	if s.Sessions != nil {
+		if _, err := s.Sessions.Put(agentType, sessionID, refreshed.ID, userEmail); err != nil {
+			return accounts.Account{}, err
+		}
+	}
+	return refreshed, nil
+}
+
+func responseUsageLimit(response *http.Response) (bool, error) {
+	if response == nil || response.Body == nil || !responseStatusCanExhaust(response.StatusCode) {
+		return false, nil
+	}
+	body := response.Body
+	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
+	if err != nil {
+		response.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(prefix), body),
+			Closer: body,
+		}
+		return false, err
+	}
+	if int64(len(prefix)) > usageLimitInspectMaxBytes {
+		response.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(prefix), body),
+			Closer: body,
+		}
+		return false, nil
+	}
+	closeErr := body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(prefix))
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return usageLimitJSON(prefix), nil
 }
 
 func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
