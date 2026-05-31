@@ -1334,7 +1334,9 @@ func shouldDisplayUsageGrid(out io.Writer) bool {
 	case "0", "false", "no", "off":
 		return false
 	}
-	return terminalColumns(out) >= srUsageGridMinWidth
+	// Default to the minimal per-account list regardless of terminal width; the
+	// wide grid is opt-in via SR_USAGE_GRID=on / CX_USAGE_GRID=on.
+	return false
 }
 
 func displayUsageRowsDetailed(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
