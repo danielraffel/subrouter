@@ -1058,6 +1058,7 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 			UsedPercent:        window.UsedPercent,
 			LimitWindowSeconds: window.LimitWindowSeconds,
 			ResetAfterSeconds:  window.ResetAfterSeconds,
+			Feature:            window.Feature,
 		})
 	}
 	return selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)

@@ -35,7 +35,7 @@ func codex(args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	env := os.Environ()
-	if userEmail != "" || accountID != "" {
+	if userEmail != "" || accountID != "" || codexModelArg(args) != "" {
 		env = upsertEnv(env, "SUBROUTER_CODEX_DUMMY_API_KEY", "subrouter")
 	}
 	cmd.Env = env
@@ -90,7 +90,8 @@ func codexBaseURLForServer(server srServerConfig) string {
 }
 
 func codexArgs(args []string, baseURL, userEmail, accountID string) []string {
-	configArgs := codexConfigArgs(baseURL, userEmail, accountID)
+	model := codexModelArg(args)
+	configArgs := codexConfigArgs(baseURL, userEmail, accountID, model)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") || !isKnownCodexCommand(args[0]) {
 		return append(configArgs, args...)
 	}
@@ -103,8 +104,8 @@ func codexArgs(args []string, baseURL, userEmail, accountID string) []string {
 	return out
 }
 
-func codexConfigArgs(baseURL, userEmail, accountID string) []string {
-	if userEmail == "" && accountID == "" {
+func codexConfigArgs(baseURL, userEmail, accountID, model string) []string {
+	if userEmail == "" && accountID == "" && model == "" {
 		return []string{"-c", "openai_base_url=" + strconv.Quote(baseURL)}
 	}
 	return []string{
@@ -114,11 +115,11 @@ func codexConfigArgs(baseURL, userEmail, accountID string) []string {
 		"-c", `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`,
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
-		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID),
+		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID, model),
 	}
 }
 
-func codexSubrouterHeaders(userEmail, accountID string) string {
+func codexSubrouterHeaders(userEmail, accountID, model string) string {
 	headers := []string{`"X-Subrouter-Agent"="codex"`}
 	if userEmail != "" {
 		headers = append(headers, `"X-Subrouter-User-Email"=`+strconv.Quote(userEmail))
@@ -126,7 +127,27 @@ func codexSubrouterHeaders(userEmail, accountID string) string {
 	if accountID != "" {
 		headers = append(headers, `"X-Subrouter-Account-ID"=`+strconv.Quote(accountID))
 	}
+	if model != "" {
+		headers = append(headers, `"X-Subrouter-Model"=`+strconv.Quote(model))
+	}
 	return "{" + strings.Join(headers, ",") + "}"
+}
+
+func codexModelArg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-m" || arg == "--model":
+			if i+1 < len(args) {
+				return session.NormalizeModel(args[i+1])
+			}
+		case strings.HasPrefix(arg, "--model="):
+			return session.NormalizeModel(strings.TrimPrefix(arg, "--model="))
+		case strings.HasPrefix(arg, "-m="):
+			return session.NormalizeModel(strings.TrimPrefix(arg, "-m="))
+		}
+	}
+	return ""
 }
 
 func isSubrouterRoutedCodexCommand(command string) bool {

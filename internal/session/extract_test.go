@@ -69,6 +69,32 @@ func TestExtractAccountIDFromSubrouterHeader(t *testing.T) {
 	}
 }
 
+func TestExtractModelFromHeader(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	req.Header.Set("X-Subrouter-Model", " GPT-5.3-Codex-Spark ")
+
+	if got := ExtractModel(req, 1024); got != "GPT-5.3-Codex-Spark" {
+		t.Fatalf("got %q, want GPT-5.3-Codex-Spark", got)
+	}
+}
+
+func TestExtractModelFromJSONAndRestoresBody(t *testing.T) {
+	body := `{"model":"GPT-5.3-Codex-Spark","input":"hello"}`
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	if got := ExtractModel(req, 1024); got != "GPT-5.3-Codex-Spark" {
+		t.Fatalf("got %q, want GPT-5.3-Codex-Spark", got)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != body {
+		t.Fatalf("body was not restored: %s", restored)
+	}
+}
+
 func TestExtractAgentTypeFromSubrouterHeader(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/responses", nil)
 	req.Header.Set("X-Subrouter-Agent", "Claude")
@@ -120,6 +146,8 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	req.Header.Set("X-User-Email", "alice@example.com")
 	req.Header.Set("X-Subrouter-Account-ID", "apikey:paid")
 	req.Header.Set("X-Subrouter-Account", "paid")
+	req.Header.Set("X-Subrouter-Model", "GPT-5.3-Codex-Spark")
+	req.Header.Set("X-Model", "GPT-5.3-Codex-Spark")
 	req.Header.Set("X-Other", "keep")
 
 	StripSubrouterHeaders(req.Header)
@@ -144,6 +172,12 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Subrouter-Account"); got != "" {
 		t.Fatalf("X-Subrouter-Account = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Subrouter-Model"); got != "" {
+		t.Fatalf("X-Subrouter-Model = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Model"); got != "" {
+		t.Fatalf("X-Model = %q, want empty", got)
 	}
 	if got := req.Header.Get("X-Other"); got != "keep" {
 		t.Fatalf("X-Other = %q, want keep", got)
