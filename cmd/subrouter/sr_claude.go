@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
@@ -120,31 +122,53 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	claudeConfigDir := r.store.PreferredInstancePath(instancePath)
 
 	fmt.Fprintln(r.out, "Starting Claude Code...")
-	fmt.Fprintln(r.out, "Complete the OAuth login in your browser, then exit Claude to finish setup.")
+	fmt.Fprintln(r.out, "Complete the OAuth login in your browser, then exit Claude (Ctrl-C or /exit) to finish setup.")
 	fmt.Fprintln(r.out)
 
-	cmd := exec.CommandContext(ctx, claudePath)
+	cleanup := func() {
+		if name != "" {
+			_, _ = r.store.RemoveProfile(name)
+		} else {
+			_ = r.store.CleanupInstance(tempDir)
+		}
+	}
+
+	// Claude Code is an interactive session the user exits with Ctrl-C. Catch
+	// SIGINT here so the interrupt terminates Claude (whose own handler runs)
+	// without also killing this process before we can finalize and register the
+	// login. A bare exec.Command (not CommandContext) keeps the child alive for
+	// the full interactive login regardless of the parent context.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	go func() {
+		for range sigCh {
+		}
+	}()
+	defer signal.Stop(sigCh)
+
+	cmd := exec.Command(claudePath)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+claudeConfigDir)
-	if err := cmd.Run(); err != nil {
-		if name != "" {
-			_, _ = r.store.RemoveProfile(name)
-		} else {
-			_ = r.store.CleanupInstance(tempDir)
-		}
-		return fmt.Errorf("Claude login did not complete: %w", err)
+	// A non-zero exit (e.g. 130 from Ctrl-C) is the normal way to leave the
+	// interactive session and does NOT mean the login failed. Only a failure to
+	// start Claude at all is fatal; success is decided by auth status below.
+	runErr := cmd.Run()
+	var exitErr *exec.ExitError
+	if runErr != nil && !errors.As(runErr, &exitErr) {
+		cleanup()
+		return fmt.Errorf("could not start Claude login: %w", runErr)
 	}
 
-	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
+	// Detached context so a parent context cancelled by the same interrupt does
+	// not abort the status check.
+	statusCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	status, err := claude.AuthStatusForPath(statusCtx, claudePath, claudeConfigDir)
 	if err != nil || status == nil || !status.LoggedIn {
-		if name != "" {
-			_, _ = r.store.RemoveProfile(name)
-		} else {
-			_ = r.store.CleanupInstance(tempDir)
-		}
-		return fmt.Errorf("login was not completed")
+		cleanup()
+		return fmt.Errorf("login was not completed (no authenticated Claude session detected)")
 	}
 
 	profileName := name
