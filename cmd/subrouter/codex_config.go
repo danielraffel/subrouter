@@ -10,10 +10,15 @@ import (
 )
 
 var codexRoutingConfigKeys = []string{
+	"model_provider",
 	"openai_base_url",
 	"chatgpt_base_url",
 	"experimental_realtime_ws_base_url",
 }
+
+// codexSubrouterProviderID is the model_providers key written into a client's
+// codex config so requests route through a provider with WebSockets disabled.
+const codexSubrouterProviderID = "subrouter"
 
 func defaultCodexConfigPath() (string, error) {
 	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
@@ -40,12 +45,17 @@ func writeCodexConfigForBaseURL(baseURL string) (string, error) {
 		return "", err
 	}
 	root := codexProxyRootURL(baseURL)
+	providerBaseURL := root + "/v1"
 	values := map[string]string{
-		"openai_base_url":                   root + "/v1",
+		"model_provider":                    codexSubrouterProviderID,
+		"openai_base_url":                   providerBaseURL,
 		"chatgpt_base_url":                  root + "/backend-api",
-		"experimental_realtime_ws_base_url": root + "/v1",
+		"experimental_realtime_ws_base_url": providerBaseURL,
 	}
-	if err := writeCodexConfigValues(path, values); err != nil {
+	if err := writeCodexConfig(path, func(existing string) string {
+		next := updateTopLevelTomlStrings(existing, values)
+		return ensureCodexWebsocketDisabledProvider(next, providerBaseURL)
+	}); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -63,11 +73,19 @@ func codexProxyRootURL(baseURL string) string {
 }
 
 func writeCodexConfigValues(path string, values map[string]string) error {
+	return writeCodexConfig(path, func(existing string) string {
+		return updateTopLevelTomlStrings(existing, values)
+	})
+}
+
+// writeCodexConfig reads the codex config, applies transform, and writes the
+// result back atomically (with a `.bak` backup) only when it changed.
+func writeCodexConfig(path string, transform func(existing string) string) error {
 	body, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	next := updateTopLevelTomlStrings(string(body), values)
+	next := transform(string(body))
 	if string(body) == next {
 		return nil
 	}
@@ -84,6 +102,57 @@ func writeCodexConfigValues(path string, values map[string]string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// ensureCodexWebsocketDisabledProvider rewrites the
+// `[model_providers.subrouter]` table so codex routes through a provider with
+// `supports_websockets = false`. codex 0.136+ otherwise derives a `ws://` URL
+// from `openai_base_url` and opens the Responses transport over a WebSocket;
+// the subrouter's upstream rejects that upgrade (403), and codex retries the
+// connect without falling back to HTTP, surfacing the turn as a 429. Pinning a
+// provider with WebSockets disabled keeps codex on the proven HTTP Responses
+// path. `name = "OpenAI"` preserves codex's OpenAI-specific behavior (request
+// compression, remote compaction); the subrouter still selects the upstream
+// account, so client auth is unchanged.
+func ensureCodexWebsocketDisabledProvider(text, baseURL string) string {
+	text = removeTomlTable(text, "model_providers."+codexSubrouterProviderID)
+	block := strings.Join([]string{
+		"[model_providers." + codexSubrouterProviderID + "]",
+		`name = "OpenAI"`,
+		"base_url = " + strconv.Quote(baseURL),
+		`wire_api = "responses"`,
+		"requires_openai_auth = true",
+		"supports_websockets = false",
+		"",
+	}, "\n")
+	if text != "" && !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	if text != "" {
+		text += "\n"
+	}
+	return text + block
+}
+
+// removeTomlTable strips a `[header]` table (its header line through the line
+// before the next table header or EOF) from a TOML document, leaving other
+// top-level keys and tables untouched.
+func removeTomlTable(text, header string) string {
+	lines := splitLinesKeepingEndings(text)
+	out := make([]string, 0, len(lines))
+	target := "[" + header + "]"
+	skipping := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
+		if isTomlTableHeader(trimmed) {
+			skipping = trimmed == target
+		}
+		if skipping {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimRight(strings.Join(out, ""), "\n")
 }
 
 func updateTopLevelTomlStrings(text string, values map[string]string) string {
