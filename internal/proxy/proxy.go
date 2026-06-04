@@ -24,6 +24,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 	"github.com/manaflow-ai/subrouter/internal/session"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -140,10 +141,11 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu       sync.RWMutex
-	accounts []accounts.Account
-	store    accounts.CodexStore
-	client   *http.Client
+	mu          sync.RWMutex
+	accounts    []accounts.Account
+	store       accounts.CodexStore
+	claudeStore agentclaude.Store
+	client      *http.Client
 }
 
 type AccountStatus struct {
@@ -168,9 +170,10 @@ type AccountUsageStatus struct {
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
 	return &AccountRef{
-		accounts: append([]accounts.Account(nil), initial...),
-		store:    store,
-		client:   client,
+		accounts:    append([]accounts.Account(nil), initial...),
+		store:       store,
+		claudeStore: agentclaude.DefaultStore(),
+		client:      client,
 	}
 }
 
@@ -191,6 +194,11 @@ func (r *AccountRef) Reload() ([]accounts.Account, error) {
 	if err != nil {
 		return nil, err
 	}
+	claudeAccounts, err := r.claudeStore.ListAccounts(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	loaded = append(loaded, claudeAccounts...)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
@@ -198,7 +206,18 @@ func (r *AccountRef) Reload() ([]accounts.Account, error) {
 }
 
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
-	if r == nil || account.AuthMode != accounts.AuthModeOAuth || (account.Provider != "" && account.Provider != accounts.ProviderCodex) {
+	if r == nil || account.AuthMode != accounts.AuthModeOAuth {
+		return account, nil
+	}
+	if account.Provider == accounts.ProviderClaude {
+		refreshed, _, err := r.claudeStore.RefreshAccountIfExpired(ctx, r.client, account)
+		if err != nil {
+			return account, err
+		}
+		r.replace(refreshed)
+		return refreshed, nil
+	}
+	if account.Provider != "" && account.Provider != accounts.ProviderCodex {
 		return account, nil
 	}
 	if accounts.CodexRefreshReason(ctx) == "" {
@@ -285,6 +304,36 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 		}
 		out = append(out, status)
 	}
+	for _, profile := range r.claudeStore.ListProfiles() {
+		status := AccountStatus{
+			ID:          profile.Name,
+			Provider:    accounts.ProviderClaude,
+			AuthMode:    accounts.AuthModeOAuth,
+			Email:       claudeProfileEmail(profile.Name),
+			Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
+			AuthChecked: true,
+		}
+		account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+		if err != nil {
+			status.AuthValid = false
+			status.Error = err.Error()
+			out = append(out, status)
+			continue
+		}
+		if forceRefresh {
+			account, didRefresh, err = r.forceRefreshClaude(ctx, profile)
+			if err != nil {
+				status.AuthValid = false
+				status.Error = err.Error()
+				out = append(out, status)
+				continue
+			}
+		}
+		status.AuthValid = true
+		status.Refreshed = didRefresh
+		r.replace(account)
+		out = append(out, status)
+	}
 	return out
 }
 
@@ -360,7 +409,190 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 		}()
 	}
 	wg.Wait()
+	claudeProfiles := r.claudeStore.ListProfiles()
+	claudeOffset := len(out)
+	out = append(out, make([]AccountUsageStatus, len(claudeProfiles))...)
+	activeClaude := r.claudeStore.ActiveProfile()
+	for i, profile := range claudeProfiles {
+		i, profile := claudeOffset+i, profile
+		status := AccountUsageStatus{
+			AccountStatus: AccountStatus{
+				ID:          profile.Name,
+				Provider:    accounts.ProviderClaude,
+				AuthMode:    accounts.AuthModeOAuth,
+				Email:       claudeProfileEmail(profile.Name),
+				Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
+				AuthChecked: true,
+			},
+			Active: profile.Name == activeClaude,
+		}
+		out[i] = status
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+			next := out[i]
+			next.Refreshed = didRefresh
+			if err != nil {
+				next.AuthValid = false
+				next.Error = err.Error()
+				out[i] = next
+				return
+			}
+			next.AuthValid = true
+			r.replace(account)
+			usage, err := agentclaude.FetchUsage(ctx, r.client, account.Token)
+			if err != nil {
+				next.Error = err.Error()
+				out[i] = next
+				return
+			}
+			next.PlanType = "claude"
+			next.Windows = claudeUsageWindows(usage)
+			out[i] = next
+		}()
+	}
+	wg.Wait()
+	promoteUsableClaudeStatus(out[claudeOffset:])
 	return out
+}
+
+func (r *AccountRef) forceRefreshClaude(ctx context.Context, profile agentclaude.Profile) (accounts.Account, bool, error) {
+	configDir := r.claudeStore.ClaudeConfigDir(profile.Name)
+	credential, err := r.claudeStore.ReadCredential(ctx, configDir)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	if credential == nil || credential.RefreshToken == "" {
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
+	}
+	refreshed, err := agentclaude.RefreshCredential(ctx, r.client, *credential)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	if err := r.claudeStore.WriteCredential(ctx, configDir, refreshed); err != nil {
+		return accounts.Account{}, false, err
+	}
+	return claudeAccountFromCredential(profile, configDir, &refreshed), true, nil
+}
+
+func claudeAccountFromCredential(profile agentclaude.Profile, configDir string, credential *agentclaude.CredentialInfo) accounts.Account {
+	addedAt, _ := time.Parse(time.RFC3339, profile.CreatedAt)
+	return accounts.Account{
+		ID:       profile.Name,
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Label:    profile.Name,
+		Email:    claudeProfileEmail(profile.Name),
+		AddedAt:  addedAt,
+		Token:    credential.AccessToken,
+		Source:   configDir,
+	}
+}
+
+func claudeProfileEmail(name string) string {
+	if strings.Contains(name, "@") {
+		return name
+	}
+	return ""
+}
+
+func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow {
+	if usage == nil {
+		return nil
+	}
+	var windows []accounts.UsageWindow
+	add := func(name string, limit *agentclaude.RateLimit) {
+		if limit == nil || limit.Utilization == nil {
+			return
+		}
+		window := accounts.UsageWindow{
+			Name:        name,
+			UsedPercent: *limit.Utilization,
+		}
+		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
+			seconds := int64(time.Until(reset).Seconds())
+			if seconds < 0 {
+				seconds = 0
+			}
+			window.ResetAfterSeconds = seconds
+		}
+		windows = append(windows, window)
+	}
+	add("5h", usage.FiveHour)
+	add("7d", usage.SevenDay)
+	add("opus-weekly", usage.SevenDayOpus)
+	add("sonnet-weekly", usage.SevenDaySonnet)
+	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
+		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
+	}
+	return windows
+}
+
+func promoteUsableClaudeStatus(statuses []AccountUsageStatus) {
+	activeUsable := false
+	bestIdx := -1
+	var best selectacct.Score
+	for i := range statuses {
+		status := &statuses[i]
+		if status.Provider != accounts.ProviderClaude {
+			continue
+		}
+		usable := false
+		if status.AuthValid && status.Error == "" {
+			score := scoreFromUsageWindows(status.ID, status.Windows)
+			usable = scoreUsableForNewSession(score)
+			if usable && (bestIdx == -1 || betterClaudeActiveCandidate(score, best)) {
+				bestIdx = i
+				best = score
+			}
+		}
+		if status.Active && usable {
+			activeUsable = true
+		}
+	}
+	if activeUsable {
+		return
+	}
+	for i := range statuses {
+		if statuses[i].Provider == accounts.ProviderClaude {
+			statuses[i].Active = false
+		}
+	}
+	if bestIdx >= 0 {
+		statuses[bestIdx].Active = true
+	}
+}
+
+func betterClaudeActiveCandidate(left, right selectacct.Score) bool {
+	if left.Headroom != right.Headroom {
+		return left.Headroom > right.Headroom
+	}
+	if left.ShortHeadroom != right.ShortHeadroom {
+		return left.ShortHeadroom > right.ShortHeadroom
+	}
+	if left.ShortResetAfterSeconds != right.ShortResetAfterSeconds {
+		return left.ShortResetAfterSeconds > right.ShortResetAfterSeconds
+	}
+	return left.AccountID < right.AccountID
+}
+
+func scoreUsableForNewSession(score selectacct.Score) bool {
+	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
+}
+
+func scoreFromUsageWindows(accountID string, windows []accounts.UsageWindow) selectacct.Score {
+	limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+	for _, window := range windows {
+		limitWindows = append(limitWindows, selectacct.LimitWindow{
+			Name:               window.Name,
+			UsedPercent:        window.UsedPercent,
+			LimitWindowSeconds: window.LimitWindowSeconds,
+			ResetAfterSeconds:  window.ResetAfterSeconds,
+			Feature:            window.Feature,
+		})
+	}
+	return selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 }
 
 func (r *AccountRef) replace(account accounts.Account) {
@@ -599,7 +831,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			setZeroScore(scores, scoreByID, account.ID)
 			continue
 		}
-		windows, err := accounts.FetchCodexUsage(ctx, client, refreshed)
+		windows, err := s.fetchAccountUsageWindows(ctx, client, refreshed)
 		if err != nil {
 			if s.Logger != nil {
 				s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
@@ -607,22 +839,23 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			setZeroScore(scores, scoreByID, account.ID)
 			continue
 		}
-		limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
-		for _, window := range windows {
-			limitWindows = append(limitWindows, selectacct.LimitWindow{
-				Name:               window.Name,
-				UsedPercent:        window.UsedPercent,
-				LimitWindowSeconds: window.LimitWindowSeconds,
-				ResetAfterSeconds:  window.ResetAfterSeconds,
-				Feature:            window.Feature,
-			})
-		}
 		if idx, ok := scoreByID[account.ID]; ok {
-			scores[idx] = selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
+			scores[idx] = scoreFromUsageWindows(account.ID, windows)
 			scored++
 		}
 	}
 	return scores, scored
+}
+
+func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+	if account.Provider == accounts.ProviderClaude {
+		usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
+		if err != nil {
+			return nil, err
+		}
+		return claudeUsageWindows(usage), nil
+	}
+	return accounts.FetchCodexUsage(ctx, client, account)
 }
 
 const defaultUsageFetchTimeout = 10 * time.Second
@@ -1594,7 +1827,7 @@ func (s Server) accountList() []accounts.Account {
 }
 
 func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (accounts.Account, error) {
-	if s.AccountRef == nil || (account.Provider != "" && account.Provider != accounts.ProviderCodex) {
+	if s.AccountRef == nil {
 		return account, nil
 	}
 	return s.AccountRef.Refresh(ctx, account)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -359,7 +360,7 @@ func TestSRAddUsesDefaultRemoteServer(t *testing.T) {
 	if strings.Contains(out.String(), "Added account:") {
 		t.Fatalf("top-level add should not add to local account store when a server is selected:\n%s", out.String())
 	}
-	if !strings.Contains(out.String(), "Added server-owned account fresh@example.com to team") {
+	if !strings.Contains(out.String(), "Uploaded fresh@example.com to server team.") {
 		t.Fatalf("missing server add confirmation:\n%s", out.String())
 	}
 }
@@ -661,8 +662,11 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if strings.Contains(uploadCommand, "/var/lib/subrouter/.codex-accounts") {
 		t.Fatalf("upload should not use legacy account path:\n%s", uploadCommand)
 	}
-	if !strings.Contains(out.String(), "server owns the new refresh-token chain") {
+	if !strings.Contains(out.String(), "Your local Codex login is back to the account you were using before this command.") {
 		t.Fatalf("missing ownership message:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "The new bob@example.com refresh token is stored on community, not kept as your local active login.") {
+		t.Fatalf("missing server token ownership message:\n%s", out.String())
 	}
 }
 
@@ -1021,15 +1025,64 @@ func TestSRServerInstallUsesPublicInstallerAndSystemdCommand(t *testing.T) {
 	}
 }
 
+func TestSRServerLoginRetriesTransientSSHUploadFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name: "team",
+			URL:  "http://subrouter-team:31415",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &recordingSRCommandRunner{
+		loginAuth: testCodexAuth("fresh@example.com", "fresh-refresh"),
+		failCommandPrefixes: []failCommandPrefix{{
+			prefix: []string{"ssh", "-o", "BatchMode=yes"},
+			times:  1,
+			err:    errors.New("ssh: connect to host subrouter-team port 22: Connection refused"),
+		}},
+	}
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+
+	if err := runner.run(context.Background(), []string{"add"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if count := fake.countCommandPrefix("ssh", "-o", "BatchMode=yes"); count != 2 {
+		t.Fatalf("ssh upload attempts = %d, want 2; commands: %#v", count, fake.commands)
+	}
+	if !strings.Contains(out.String(), "server ssh upload failed, retrying (1/3)") {
+		t.Fatalf("missing retry message:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Uploaded fresh@example.com to server team.") {
+		t.Fatalf("missing success message after retry:\n%s", out.String())
+	}
+}
+
 type recordingSRCommandRunner struct {
-	loginAuth  accounts.CodexAuthFile
-	loginAuths []accounts.CodexAuthFile
-	commands   [][]string
+	loginAuth           accounts.CodexAuthFile
+	loginAuths          []accounts.CodexAuthFile
+	commands            [][]string
+	failCommandPrefixes []failCommandPrefix
 }
 
 func (r *recordingSRCommandRunner) Run(_ context.Context, name string, args []string, _ io.Reader, _ io.Writer, _ io.Writer) error {
 	command := append([]string{name}, args...)
 	r.commands = append(r.commands, command)
+	for i := range r.failCommandPrefixes {
+		failure := &r.failCommandPrefixes[i]
+		if failure.times > 0 && commandHasPrefix(command, failure.prefix) {
+			failure.times--
+			return failure.err
+		}
+	}
 	if name == "codex" && len(args) > 0 && args[0] == "login" {
 		loginAuth := r.loginAuth
 		if len(r.loginAuths) > 0 {
@@ -1047,6 +1100,12 @@ func (r *recordingSRCommandRunner) Run(_ context.Context, name string, args []st
 		return os.WriteFile(path, body, 0o600)
 	}
 	return nil
+}
+
+type failCommandPrefix struct {
+	prefix []string
+	times  int
+	err    error
 }
 
 func (r *recordingSRCommandRunner) Output(context.Context, string, []string) ([]byte, error) {
@@ -1094,21 +1153,33 @@ func (r *recordingSRCommandRunner) countCommand(parts ...string) int {
 
 func (r *recordingSRCommandRunner) hasCommandPrefix(parts ...string) bool {
 	for _, command := range r.commands {
-		if len(command) < len(parts) {
-			continue
-		}
-		matches := true
-		for i := range parts {
-			if command[i] != parts[i] {
-				matches = false
-				break
-			}
-		}
-		if matches {
+		if commandHasPrefix(command, parts) {
 			return true
 		}
 	}
 	return false
+}
+
+func (r *recordingSRCommandRunner) countCommandPrefix(parts ...string) int {
+	count := 0
+	for _, command := range r.commands {
+		if commandHasPrefix(command, parts) {
+			count++
+		}
+	}
+	return count
+}
+
+func commandHasPrefix(command []string, parts []string) bool {
+	if len(command) < len(parts) {
+		return false
+	}
+	for i := range parts {
+		if command[i] != parts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func jsonMarshalIndent(value any) ([]byte, error) {

@@ -227,7 +227,9 @@ func serve(args []string) error {
 	}
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(scores))
 	outboundTransport := proxy.NewOutboundTransport()
-	accountRef := proxy.NewAccountRef(codexStore, codexAccounts, &http.Client{
+	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
+	initialAccounts = append(initialAccounts, claudeAccounts...)
+	accountRef := proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: outboundTransport,
 	})
@@ -237,7 +239,7 @@ func serve(args []string) error {
 		CodexUpstream:  codexUpstream,
 		APIUpstream:    apiUpstream,
 		ClaudeUpstream: claudeUpstream,
-		Accounts:       claudeAccounts,
+		Accounts:       nil,
 		AccountRef:     accountRef,
 		Sessions:       store,
 		SchedulerRef:   schedulerRef,
@@ -570,7 +572,7 @@ func usageText(program string) string {
 	return fmt.Sprintf(`%[1]s routes AI coding-agent traffic across subscription accounts.
 
 Usage:
-  %[1]s                    Show Codex usage for all accounts and switch
+  %[1]s                    Show Codex and Claude usage, grouped by provider
   %[1]s add                Add a new Codex account (opens OAuth login)
   %[1]s add-key            Add a Codex API key account
   %[1]s import             Import current ~/.codex/auth.json account
@@ -580,7 +582,7 @@ Usage:
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s remove <email>     Remove a Codex account
-  %[1]s status             Show Codex usage (non-interactive)
+  %[1]s status             Show Codex and Claude usage (non-interactive)
   %[1]s pick               Switch to the recommended account, failing if none has quota
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account

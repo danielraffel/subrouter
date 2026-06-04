@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
@@ -543,7 +545,7 @@ func TestSRDefaultShowsCookedAccountAndDoesNotPromptWhenAllCooked(t *testing.T) 
 	if !strings.Contains(got, "All of your OAuth accounts are cooked") {
 		t.Fatalf("missing all-cooked warning:\n%s", got)
 	}
-	if !strings.Contains(got, "[cooked]") || !strings.Contains(got, "cooked") {
+	if !strings.Contains(got, "active, cooked") || !strings.Contains(got, "cooked, canno") {
 		t.Fatalf("missing cooked row state:\n%s", got)
 	}
 	if strings.Contains(got, "Switch to (#):") {
@@ -584,16 +586,16 @@ func TestSRDefaultShowsTemporarilyCookedAccountWhenShortWindowConsumed(t *testin
 	}
 
 	got := out.String()
-	if !strings.Contains(got, "[temporarily cooked]") {
+	if !strings.Contains(got, "active, temp") {
 		t.Fatalf("missing temporarily cooked marker:\n%s", got)
 	}
-	if !strings.Contains(got, "temporarily cooked") || !strings.Contains(got, "5h limit fully consumed") {
+	if !strings.Contains(got, "temp cooked") {
 		t.Fatalf("missing temporarily cooked reason:\n%s", got)
 	}
-	if strings.Contains(got, "[cooked]") || strings.Contains(got, "All of your OAuth accounts are cooked") {
+	if strings.Contains(got, "active, cooked") || strings.Contains(got, "All of your OAuth accounts are cooked") {
 		t.Fatalf("short-window saturation should not be treated as permanently cooked:\n%s", got)
 	}
-	if strings.Contains(got, "[recommended]") {
+	if strings.Contains(got, "recommended") {
 		t.Fatalf("temporarily cooked account should not be recommended:\n%s", got)
 	}
 	if strings.Contains(got, "Switch to (#):") {
@@ -870,6 +872,50 @@ func TestSRRankRowsKeepsTemporarilyCookedAboveCooked(t *testing.T) {
 	}
 }
 
+func TestSRRankRowsGroupsProvidersSeparately(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email:    "claude-inactive@example.com",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: "claude-inactive@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+		{
+			email:    "codex-low@example.com",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderCodex,
+			score:    selectacct.Score{AccountID: "codex-low@example.com", Headroom: 0.3, ShortHeadroom: 0.3},
+		},
+		{
+			email:    "claude-active@example.com",
+			active:   true,
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: "claude-active@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		},
+		{
+			email:    "codex-high@example.com",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderCodex,
+			score:    selectacct.Score{AccountID: "codex-high@example.com", Headroom: 0.9, ShortHeadroom: 0.9},
+		},
+	}
+
+	rankUsageRows(rows)
+
+	got := []string{rows[0].email, rows[1].email, rows[2].email, rows[3].email}
+	want := []string{"codex-high@example.com", "codex-low@example.com", "claude-active@example.com", "claude-inactive@example.com"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ranked rows = %#v, want %#v", got, want)
+	}
+	if !rows[0].gtoRecommended {
+		t.Fatal("best Codex row should still be recommended")
+	}
+	if rows[2].gtoRecommended || rows[3].gtoRecommended {
+		t.Fatalf("Claude rows should not be marked as Codex recommendations: %#v", rows)
+	}
+}
+
 func TestScoreFromWindowsUsesAllDisplayedRateLimits(t *testing.T) {
 	score := scoreFromWindows("a@example.com", []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((3 * time.Hour) / time.Second)},
@@ -895,7 +941,6 @@ func TestRenderBarSupportsANSIColors(t *testing.T) {
 }
 
 func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
-	t.Setenv("SR_USAGE_GRID", "1")
 	t.Setenv("COLUMNS", "200")
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
@@ -929,6 +974,91 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	lines := strings.Split(got, "\n")
 	if len(lines) < 3 || !strings.Contains(lines[2], "───") || strings.Contains(lines[2], "===") || strings.Contains(lines[2], "---") {
 		t.Fatalf("grid separator should be a thin Unicode rule:\n%s", got)
+	}
+}
+
+func TestDisplayUsageRowsGridGroupsProviders(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{
+		{
+			email:    "codex@example.com",
+			planType: "pro",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderCodex,
+			score:    selectacct.Score{AccountID: "codex@example.com", Headroom: 0.9, ShortHeadroom: 0.9},
+		},
+		{
+			email:    "claude@example.com",
+			planType: "claude",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: "claude@example.com", Headroom: 0.8, ShortHeadroom: 0.8},
+		},
+	}, true)
+
+	got := out.String()
+	codexGroup := strings.Index(got, "Codex accounts")
+	codexRow := strings.Index(got, "codex@example.com")
+	claudeGroup := strings.Index(got, "Claude profiles")
+	claudeRow := strings.Index(got, "claude@example.com")
+	if codexGroup < 0 || codexRow < 0 || claudeGroup < 0 || claudeRow < 0 {
+		t.Fatalf("grouped rows missing labels or accounts:\n%s", got)
+	}
+	if !(codexGroup < codexRow && codexRow < claudeGroup && claudeGroup < claudeRow) {
+		t.Fatalf("provider grouping order is unclear:\n%s", got)
+	}
+}
+
+func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {
+	t.Setenv("COLUMNS", "80")
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{
+		{
+			email:          "lawrencechen2002@gmail.com",
+			planType:       "pro",
+			gtoRecommended: true,
+			authMode:       accounts.AuthModeOAuth,
+			provider:       accounts.ProviderCodex,
+			score:          selectacct.Score{AccountID: "lawrencechen2002@gmail.com", Headroom: 0.67, ShortHeadroom: 0.96, ShortResetAfterSeconds: int64(time.Minute / time.Second)},
+			windows: []accounts.UsageWindow{
+				{Name: "primary", UsedPercent: 4, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Minute / time.Second)},
+				{Name: "secondary", UsedPercent: 33, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 0, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 0, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+			},
+			credits: &accounts.CreditsInfo{Balance: "0"},
+		},
+		{
+			email:    "austin@manaflow.ai",
+			planType: "claude",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: "austin@manaflow.ai", Headroom: 0.95, ShortHeadroom: 0.95},
+			windows: []accounts.UsageWindow{
+				{Name: "5h", UsedPercent: 5, ResetAfterSeconds: int64((4 * time.Hour) / time.Second)},
+				{Name: "7d", UsedPercent: 1, ResetAfterSeconds: int64((2 * 24 * time.Hour) / time.Second)},
+			},
+		},
+	}, false)
+
+	got := out.String()
+	if strings.Contains(got, "Spark") || strings.Contains(got, "Spark wk") {
+		t.Fatalf("narrow grid should omit Spark columns:\n%s", got)
+	}
+	if strings.HasPrefix(strings.TrimLeft(got, "\n"), "#") {
+		t.Fatalf("non-numbered grid should not render blank # column:\n%s", got)
+	}
+	if !strings.Contains(got, "Use") || !strings.Contains(got, "Claude profiles") {
+		t.Fatalf("narrow grid missing core columns or groups:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if line == "" {
+			continue
+		}
+		if width := utf8.RuneCountInString(line); width > 80 {
+			t.Fatalf("line width = %d, want <= 80:\n%s\nfull output:\n%s", width, line, got)
+		}
 	}
 }
 
@@ -1018,8 +1148,9 @@ func TestUsageGridSuppressesShortWindowsByQuotaFamily(t *testing.T) {
 	}
 }
 
-func TestDisplayUsageRowsDetailedCanBeForced(t *testing.T) {
+func TestDisplayUsageRowsIgnoresDetailedModeEnv(t *testing.T) {
 	t.Setenv("SR_USAGE_GRID", "0")
+	t.Setenv("CX_USAGE_GRID", "0")
 	t.Setenv("COLUMNS", "200")
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
@@ -1031,8 +1162,11 @@ func TestDisplayUsageRowsDetailedCanBeForced(t *testing.T) {
 	}, true)
 
 	got := out.String()
-	if !strings.Contains(got, "1) a@example.com") || !strings.Contains(got, "pick") {
-		t.Fatalf("forced detailed output missing expected labels:\n%s", got)
+	if !strings.Contains(got, "Account") || !strings.Contains(got, "a@example.com") {
+		t.Fatalf("grid output missing expected row:\n%s", got)
+	}
+	if strings.Contains(got, "1) a@example.com") || strings.Contains(got, "pick:") {
+		t.Fatalf("detailed output should never be rendered:\n%s", got)
 	}
 }
 

@@ -2,9 +2,14 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -87,7 +92,7 @@ func TestClaudeConfigDirFallsBackWhenAliasMissing(t *testing.T) {
 
 func TestReadCredentialFile(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"tok","subscriptionType":"pro"}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"tok","refreshToken":"refresh","subscriptionType":"pro"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	credential, ok := readCredentialFile(dir)
@@ -96,6 +101,66 @@ func TestReadCredentialFile(t *testing.T) {
 	}
 	if credential.AccessToken != "tok" {
 		t.Fatalf("access token = %q, want tok", credential.AccessToken)
+	}
+	if credential.RefreshToken != "refresh" {
+		t.Fatalf("refresh token = %q, want refresh", credential.RefreshToken)
+	}
+}
+
+func TestRefreshCredentialPostsClaudeOAuthRefresh(t *testing.T) {
+	originalURL := oauthTokenURL
+	defer func() { oauthTokenURL = originalURL }()
+
+	var sawRequest bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if got := r.Header.Get("anthropic-beta"); got != oauthBetaHeader {
+			t.Fatalf("anthropic-beta = %q, want %q", got, oauthBetaHeader)
+		}
+		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+			t.Fatalf("Content-Type = %q, want JSON", got)
+		}
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if got := payload["client_id"]; got != oauthClientID {
+			t.Fatalf("client_id = %q, want %q", got, oauthClientID)
+		}
+		if got := payload["grant_type"]; got != "refresh_token" {
+			t.Fatalf("grant_type = %q, want refresh_token", got)
+		}
+		if got := payload["refresh_token"]; got != "old-refresh" {
+			t.Fatalf("refresh_token = %q, want old-refresh", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "new-access",
+			"refresh_token": "new-refresh",
+			"expires_in":    3600,
+		})
+	}))
+	defer server.Close()
+	oauthTokenURL = server.URL
+
+	got, err := RefreshCredential(context.Background(), server.Client(), CredentialInfo{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).UnixMilli(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawRequest {
+		t.Fatal("refresh endpoint was not called")
+	}
+	if got.AccessToken != "new-access" || got.RefreshToken != "new-refresh" {
+		t.Fatalf("tokens = %q/%q, want new-access/new-refresh", got.AccessToken, got.RefreshToken)
+	}
+	if got.ExpiresAt <= time.Now().UnixMilli() {
+		t.Fatalf("ExpiresAt = %d, want future", got.ExpiresAt)
 	}
 }
 

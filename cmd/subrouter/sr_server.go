@@ -817,9 +817,6 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	for _, status := range statuses {
-		if status.Provider != "" && status.Provider != accounts.ProviderCodex {
-			continue
-		}
 		email := accountEmail(status.ID, status.Email)
 		if email == "" {
 			if status.Error == "" {
@@ -834,6 +831,10 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			planType: status.PlanType,
 			windows:  status.Windows,
 			credits:  status.Credits,
+			provider: status.Provider,
+		}
+		if status.Provider == accounts.ProviderClaude && row.planType == "" {
+			row.planType = "claude"
 		}
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
@@ -1221,8 +1222,9 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return err
 	}
 	restored = true
-	fmt.Fprintf(r.out, "Added server-owned account %s to %s\n", account.Email, server.Name)
-	fmt.Fprintln(r.out, "Local auth was restored, so only the server owns the new refresh-token chain.")
+	fmt.Fprintf(r.out, "Uploaded %s to server %s.\n", account.Email, server.Name)
+	fmt.Fprintln(r.out, "Your local Codex login is back to the account you were using before this command.")
+	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", account.Email, server.Name)
 	return nil
 }
 
@@ -1337,8 +1339,28 @@ func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerCon
 	}
 	uploadCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	if err := r.commandRunner().Run(uploadCtx, "ssh", args, bytes.NewReader(archive), r.out, r.errOut); err != nil {
-		return fmt.Errorf("install account on server over ssh: %w", err)
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := r.commandRunner().Run(uploadCtx, "ssh", args, bytes.NewReader(archive), r.out, r.errOut); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt < 3 {
+			if r.errOut != nil {
+				fmt.Fprintf(r.errOut, "server ssh upload failed, retrying (%d/3): %v\n", attempt, lastErr)
+			}
+			timer := time.NewTimer(time.Duration(attempt) * time.Second)
+			select {
+			case <-uploadCtx.Done():
+				timer.Stop()
+				return fmt.Errorf("install account on server over ssh: %w", uploadCtx.Err())
+			case <-timer.C:
+			}
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("install account on server over ssh: %w", lastErr)
 	}
 	return nil
 }
