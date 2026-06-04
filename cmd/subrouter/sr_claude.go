@@ -26,6 +26,7 @@ Usage:
   sr claude remove <name>       Remove a profile
   sr claude env                 Print export CLAUDE_CONFIG_DIR=...
   sr claude run [name] [...]    Launch Claude with a specific profile
+  sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
 `
@@ -90,6 +91,9 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		fmt.Fprint(r.out, srClaudeHelp)
 		return nil
 	default:
+		if strings.HasPrefix(args[0], "-") {
+			return r.runClaude(ctx, "", args)
+		}
 		if _, ok := r.store.FindProfile(args[0]); ok {
 			return r.runClaude(ctx, args[0], args[1:])
 		}
