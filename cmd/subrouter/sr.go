@@ -1150,6 +1150,28 @@ func isLongQuotaWindow(window accounts.UsageWindow) bool {
 	return strings.Contains(name, "7d") || strings.Contains(name, "weekly")
 }
 
+func isClaudeSessionWindow(window accounts.UsageWindow) bool {
+	name := strings.ToLower(window.Name)
+	return name == "5h" || strings.Contains(name, "session")
+}
+
+func isClaudeWeeklyWindow(window accounts.UsageWindow) bool {
+	name := strings.ToLower(window.Name)
+	return name == "7d" || name == "weekly"
+}
+
+func isClaudeOpusWeeklyWindow(window accounts.UsageWindow) bool {
+	return strings.Contains(strings.ToLower(window.Name), "opus")
+}
+
+func isClaudeSonnetWeeklyWindow(window accounts.UsageWindow) bool {
+	return strings.Contains(strings.ToLower(window.Name), "sonnet")
+}
+
+func isClaudeExtraWindow(window accounts.UsageWindow) bool {
+	return strings.Contains(strings.ToLower(window.Name), "extra")
+}
+
 func clampUsagePercent(value float64) float64 {
 	switch {
 	case value < 0:
@@ -1467,36 +1489,28 @@ func displayUsageRows(out io.Writer, rows []srUsageRow, numbered bool) {
 }
 
 func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
-	columns := usageGridColumns(out, numbered)
 	fmt.Fprintln(out)
-	printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
-		return usageGridCell{Text: col.Title, Style: ansiDim}
-	}, colored, "")
-	printUsageGridSeparator(out, columns, colored)
 	currentGroup := ""
 	accountRowIndex := 0
 	for i, row := range rows {
 		group := usageProviderLabel(row)
+		columns := usageGridColumns(out, numbered, usageProvider(row))
 		if group != currentGroup {
+			if currentGroup != "" {
+				fmt.Fprintln(out)
+			}
 			printUsageGridGroup(out, columns, group, colored)
+			printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
+				return usageGridCell{Text: col.Title, Style: ansiDim}
+			}, colored, "")
+			printUsageGridSeparator(out, columns, colored)
 			currentGroup = group
 		}
 		rowIndex := ""
 		if numbered {
 			rowIndex = strconv.Itoa(i + 1)
 		}
-		values := map[string]usageGridCell{
-			"#":        {Text: rowIndex, Style: ansiDim},
-			"Account":  {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
-			"Plan":     {Text: row.planType, Style: ansiDim},
-			"State":    {Text: usageGridState(row), Style: usageGridStateColor(row)},
-			"Pick":     {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-			"5h":       usageGridShortWindowCell(row),
-			"7d":       usageGridWindowCell(row.windows, isLongQuotaWindow),
-			"Spark":    usageGridShortNamedWindowCell(row),
-			"Spark wk": usageGridNamedWindowCell(row.windows, true),
-			"Credits":  usageGridCreditsCell(row),
-		}
+		values := usageGridValues(row, rowIndex)
 		printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 			return values[col.Key]
 		}, colored, usageGridRowStyle(accountRowIndex))
@@ -1517,7 +1531,7 @@ func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string,
 	fmt.Fprintln(out, style(colored, ansiBold+ansiDim, fitCell(label, usageGridWidth(columns))))
 }
 
-func usageGridColumns(out io.Writer, numbered bool) []usageGridColumn {
+func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) []usageGridColumn {
 	termWidth := terminalColumns(out)
 	accountWidth := 22
 	planWidth := 6
@@ -1543,12 +1557,24 @@ func usageGridColumns(out io.Writer, numbered bool) []usageGridColumn {
 		usageGridColumn{Key: "Plan", Title: "Plan", Width: planWidth},
 		usageGridColumn{Key: "State", Title: "State", Width: stateWidth},
 		usageGridColumn{Key: "Pick", Title: "Use", Width: pickWidth},
-		usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
-		usageGridColumn{Key: "7d", Title: "7d", Width: windowWidth},
 	)
-	columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
-	columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark", Title: "Spark", Width: sparkWidth}, termWidth)
-	columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark wk", Title: "Spark wk", Width: sparkWidth}, termWidth)
+	if provider == accounts.ProviderClaude {
+		columns = append(columns,
+			usageGridColumn{Key: "Session", Title: "Session", Width: windowWidth},
+			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: windowWidth},
+		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
+	} else {
+		columns = append(columns,
+			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
+			usageGridColumn{Key: "7d", Title: "7d", Width: windowWidth},
+		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark", Title: "Spark", Width: sparkWidth}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark wk", Title: "Spark wk", Width: sparkWidth}, termWidth)
+	}
 
 	extra := termWidth - usageGridWidth(columns)
 	if extra <= 0 {
@@ -1557,9 +1583,31 @@ func usageGridColumns(out io.Writer, numbered bool) []usageGridColumn {
 	extra = widenUsageGridColumn(columns, "Account", extra, 36)
 	extra = widenUsageGridColumn(columns, "Pick", extra, 34)
 	extra = widenUsageGridColumn(columns, "State", extra, 14)
+	extra = widenUsageGridColumn(columns, "Sonnet wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
+	extra = widenUsageGridColumn(columns, "Weekly", extra, 12)
 	_ = widenUsageGridColumn(columns, "7d", extra, 12)
 	return columns
+}
+
+func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
+	return map[string]usageGridCell{
+		"#":         {Text: rowIndex, Style: ansiDim},
+		"Account":   {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
+		"Plan":      {Text: row.planType, Style: ansiDim},
+		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
+		"5h":        usageGridShortWindowCell(row),
+		"7d":        usageGridWindowCell(row.windows, isLongQuotaWindow),
+		"Spark":     usageGridShortNamedWindowCell(row),
+		"Spark wk":  usageGridNamedWindowCell(row.windows, true),
+		"Credits":   usageGridCreditsCell(row),
+		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
+		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
+		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
+		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
+	}
 }
 
 type usageGridColumn struct {
@@ -1724,6 +1772,9 @@ func compactPickReason(row srUsageRow) string {
 		return fmt.Sprintf("%s, protected < %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
+		if usageProvider(row) == accounts.ProviderClaude {
+			return fmt.Sprintf("%s, session reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
+		}
 		return fmt.Sprintf("%s, 5h reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
 	}
 	return left

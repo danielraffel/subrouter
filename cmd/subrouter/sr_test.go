@@ -972,7 +972,14 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 		t.Fatalf("forced grid should not render detailed pick label:\n%s", got)
 	}
 	lines := strings.Split(got, "\n")
-	if len(lines) < 3 || !strings.Contains(lines[2], "───") || strings.Contains(lines[2], "===") || strings.Contains(lines[2], "---") {
+	separator := ""
+	for _, line := range lines {
+		if strings.Contains(line, "───") {
+			separator = line
+			break
+		}
+	}
+	if separator == "" || strings.Contains(separator, "===") || strings.Contains(separator, "---") {
 		t.Fatalf("grid separator should be a thin Unicode rule:\n%s", got)
 	}
 }
@@ -1007,6 +1014,37 @@ func TestDisplayUsageRowsGridGroupsProviders(t *testing.T) {
 	}
 	if !(codexGroup < codexRow && codexRow < claudeGroup && claudeGroup < claudeRow) {
 		t.Fatalf("provider grouping order is unclear:\n%s", got)
+	}
+}
+
+func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
+	t.Setenv("COLUMNS", "160")
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{
+		{
+			email:    "lawrence@manaflow.ai",
+			planType: "claude",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: "lawrence@manaflow.ai", Headroom: 0.46, ShortHeadroom: 0.89, ShortResetAfterSeconds: int64((3 * time.Hour) / time.Second)},
+			windows: []accounts.UsageWindow{
+				{Name: "5h", UsedPercent: 11, ResetAfterSeconds: int64((3 * time.Hour) / time.Second)},
+				{Name: "7d", UsedPercent: 54, ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
+				{Name: "opus-weekly", UsedPercent: 100, ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
+				{Name: "sonnet-weekly", UsedPercent: 0, ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
+			},
+		},
+	}, false)
+
+	got := out.String()
+	if !strings.Contains(got, "Session") || !strings.Contains(got, "Weekly") || !strings.Contains(got, "Opus wk") || !strings.Contains(got, "Sonnet wk") {
+		t.Fatalf("Claude grid missing Claude-specific labels:\n%s", got)
+	}
+	if strings.Contains(got, "  5h  ") || strings.Contains(got, "  7d  ") || strings.Contains(got, "Spark") {
+		t.Fatalf("Claude grid should not use Codex labels:\n%s", got)
+	}
+	if !strings.Contains(got, "session reset") {
+		t.Fatalf("Claude pick reason should use session terminology:\n%s", got)
 	}
 }
 
