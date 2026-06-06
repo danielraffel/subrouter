@@ -23,6 +23,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 	"github.com/manaflow-ai/subrouter/internal/session"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -391,6 +392,103 @@ func TestHandlerKeepsClaudeConversationOnSameAccount(t *testing.T) {
 	}
 	if third != "Bearer claude-b-token" {
 		t.Fatalf("new Claude session Authorization = %q, want claude-b", third)
+	}
+}
+
+func TestHandlerReroutesClaudeWhenStickyAccountRefreshFails(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer good-token" {
+			t.Fatalf("Authorization = %q, want good token", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	claudeUpstream, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claudeStore := agentclaude.Store{Dir: t.TempDir()}
+	badDir, err := claudeStore.CreateProfile("bad-profile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodDir, err := claudeStore.CreateProfile("good-profile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeCredential(t, badDir, agentclaude.CredentialInfo{
+		AccessToken:  "bad-token",
+		RefreshToken: "bad-refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).UnixMilli(),
+	})
+	writeClaudeCredential(t, goodDir, agentclaude.CredentialInfo{
+		AccessToken:  "good-token",
+		RefreshToken: "good-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
+	})
+
+	refreshClient := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Status:     "400 Bad Request",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}`)),
+			Request:    req,
+		}, nil
+	})}
+	accountRef := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, refreshClient)
+	accountRef.claudeStore = claudeStore
+	loaded, err := claudeStore.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountRef.accounts = loaded
+
+	sessionStore, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionStore.Put("claude", "claude-session", "bad-profile", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "bad-profile", Headroom: 0.9, ShortHeadroom: 0.9},
+		{AccountID: "good-profile", Headroom: 0.8, ShortHeadroom: 0.8},
+	}))
+	handler := Server{
+		ClaudeUpstream: claudeUpstream,
+		AccountRef:     accountRef,
+		Sessions:       sessionStore,
+		SchedulerRef:   schedulerRef,
+		MaxBodyBytes:   1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Claude-Code-Session-Id", "claude-session")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+	assignment, ok := sessionStore.Get("claude", "claude-session")
+	if !ok {
+		t.Fatal("missing Claude session assignment")
+	}
+	if assignment.AccountID != "good-profile" {
+		t.Fatalf("sticky AccountID = %q, want good-profile", assignment.AccountID)
 	}
 }
 
@@ -1241,6 +1339,17 @@ type proxyRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f proxyRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func writeClaudeCredential(t *testing.T, dir string, credential agentclaude.CredentialInfo) {
+	t.Helper()
+	body, err := json.Marshal(map[string]agentclaude.CredentialInfo{"claudeAiOauth": credential})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.StoredCodexAccount {

@@ -929,7 +929,7 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		account, err = s.refreshAccount(r.Context(), account)
+		account, err = s.refreshSelectedAccount(r.Context(), agentType, sessionID, userEmail, r, account)
 		if err != nil {
 			http.Error(w, "refresh selected account: "+err.Error(), http.StatusServiceUnavailable)
 			return
@@ -1831,6 +1831,76 @@ func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (a
 		return account, nil
 	}
 	return s.AccountRef.Refresh(ctx, account)
+}
+
+func (s Server) refreshSelectedAccount(ctx context.Context, agentType, sessionID, userEmail string, r *http.Request, account accounts.Account) (accounts.Account, error) {
+	refreshed, err := s.refreshAccount(ctx, account)
+	if err == nil {
+		return refreshed, nil
+	}
+	provider := providerForAgent(agentType)
+	if provider != accounts.ProviderClaude || session.ExtractAccountID(r) != "" {
+		return account, err
+	}
+	if s.Logger != nil {
+		s.Logger.Warn("selected Claude account refresh failed, trying another account", "account", account.ID, "error", err)
+	}
+	tried := map[string]struct{}{account.ID: {}}
+	s.markAccountExhausted(account.ID)
+	lastErr := err
+	for {
+		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried)
+		if pickErr != nil {
+			return account, lastErr
+		}
+		tried[next.ID] = struct{}{}
+		refreshed, err = s.refreshAccount(ctx, next)
+		if err == nil {
+			return refreshed, nil
+		}
+		lastErr = err
+		s.markAccountExhausted(next.ID)
+		if s.Logger != nil {
+			s.Logger.Warn("retry Claude account refresh failed", "account", next.ID, "error", err)
+		}
+	}
+}
+
+func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
+	candidates := filterAccountsForProvider(s.accountList(), provider)
+	if len(candidates) == 0 {
+		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
+	}
+	untried := make([]accounts.Account, 0, len(candidates))
+	for _, account := range candidates {
+		if _, ok := tried[account.ID]; ok {
+			continue
+		}
+		untried = append(untried, account)
+	}
+	if len(untried) == 0 {
+		return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
+	}
+	if provider == accounts.ProviderCodex {
+		s.refreshUsageScoresIfStale(ctx, candidates)
+	}
+	scheduler := s.scheduler()
+	if s.Sessions != nil {
+		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+	}
+	account, err := scheduler.Pick(untried)
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	if scheduler.Exhausted(account.ID) {
+		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
+	}
+	if s.Sessions != nil {
+		if _, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail); err != nil {
+			return accounts.Account{}, err
+		}
+	}
+	return account, nil
 }
 
 const replayablePostMaxBodyBytes = 128 << 20
