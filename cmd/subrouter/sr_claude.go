@@ -323,6 +323,14 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	if err := r.store.SetActiveProfile(profile.Name); err != nil {
 		return err
 	}
+	if sessionID := claude.ResumeSessionID(extra); sessionID != "" {
+		from, migrateErr := r.store.MigrateSession(profile.Name, sessionID)
+		if migrateErr != nil {
+			fmt.Fprintf(r.errOut, "warning: could not migrate session %s: %v\n", sessionID, migrateErr)
+		} else if from != "" {
+			fmt.Fprintf(r.errOut, "Copied session %s from profile %q.\n", sessionID, from)
+		}
+	}
 	cmd := exec.CommandContext(ctx, claudePath, extra...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
