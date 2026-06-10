@@ -27,6 +27,7 @@ Usage:
   sr claude remove <name>       Remove a profile
   sr claude env                 Print export CLAUDE_CONFIG_DIR=...
   sr claude push [name]         Upload a profile to the default Subrouter server pool
+  sr claude pick                Switch to the profile with the most quota left
   sr claude run [name] [...]    Launch Claude with a specific profile
   sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
@@ -45,6 +46,7 @@ type claudeRunner struct {
 	// when no default server is configured.
 	pushToServer func(ctx context.Context, name string) error
 	pushAfterAdd func(ctx context.Context, name string) error
+	pick         func(ctx context.Context) error
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
@@ -56,6 +58,7 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		client:       r.client,
 		pushToServer: r.pushClaudeProfileToServer,
 		pushAfterAdd: r.pushClaudeProfileAfterAdd,
+		pick:         r.pickClaudeProfile,
 	}
 	return cr.run(ctx, args)
 }
@@ -85,6 +88,11 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		return r.remove(args[1])
 	case "env":
 		return r.env()
+	case "pick":
+		if r.pick == nil {
+			return fmt.Errorf("pick is not available")
+		}
+		return r.pick(ctx)
 	case "push", "upload":
 		if r.pushToServer == nil {
 			return fmt.Errorf("server push is not available")
