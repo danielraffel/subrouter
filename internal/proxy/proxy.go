@@ -49,6 +49,7 @@ type Server struct {
 	AdminToken     string
 	MaxBodyBytes   int64
 	Transcripts    *transcript.Recorder
+	ReadCache      *readCache
 }
 
 type ActiveSessions struct {
@@ -686,6 +687,9 @@ func (s Server) Handler() http.Handler {
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
 	}
+	if s.ReadCache == nil {
+		s.ReadCache = newReadCache()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
@@ -989,6 +993,25 @@ func (s Server) proxyHandler() http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+
+		// Serve from cache for heavy read-only polling endpoints (e.g. plugins/installed).
+		// Check before account selection so constrained accounts aren't hammered by polls.
+		if r.Method == http.MethodGet {
+			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
+				if entry, ok := s.ReadCache.get(r.URL.Path); ok {
+					for k, vs := range entry.headers {
+						for _, v := range vs {
+							w.Header().Add(k, v)
+						}
+					}
+					w.Header().Set("X-Subrouter-Cache", "HIT")
+					w.WriteHeader(entry.statusCode)
+					_, _ = w.Write(entry.body)
+					return
+				}
+			}
+		}
+
 		agentType := session.ExtractAgentType(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
@@ -1120,6 +1143,28 @@ func (s Server) proxyHandler() http.Handler {
 		if s.Logger != nil {
 			s.Logger.Info("proxy request", "agent", agentType, "session", sessionID, "user", userEmail, "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host)
 		}
+
+		// For cacheable GET paths, buffer the response so we can store it.
+		if r.Method == http.MethodGet {
+			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
+				rec := &cacheRecorder{}
+				rp.ServeHTTP(rec, proxyRequest)
+				if rec.code >= 200 && rec.code < 300 {
+					s.ReadCache.set(r.URL.Path, rec.code, rec.header, rec.buf.Bytes(), cacheTTL)
+				}
+				for k, vs := range rec.header {
+					for _, v := range vs {
+						w.Header().Add(k, v)
+					}
+				}
+				if rec.code != 0 {
+					w.WriteHeader(rec.code)
+				}
+				_, _ = w.Write(rec.buf.Bytes())
+				return
+			}
+		}
+
 		rp.ServeHTTP(w, proxyRequest)
 	})
 }
