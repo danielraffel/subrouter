@@ -963,7 +963,8 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
-		retryPost := retryableResponsesPostRequest(proxyRequest)
+		requestProvider := providerForAgent(agentType)
+		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
 		postReplayable := false
 		if retryPost {
 			var replayErr error
@@ -985,11 +986,14 @@ func (s Server) proxyHandler() http.Handler {
 
 		rp := httputil.NewSingleHostReverseProxy(upstream)
 		transport := s.transport()
-		if retryPost && postReplayable && providerForAgent(agentType) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
+		if retryPost && postReplayable &&
+			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
+			account.AuthMode == accounts.AuthModeOAuth {
 			transport = usageLimitRetryTransport{
 				base:        transport,
 				server:      &s,
 				logger:      s.Logger,
+				provider:    requestProvider,
 				agent:       agentType,
 				session:     sessionID,
 				userEmail:   userEmail,
@@ -1021,7 +1025,7 @@ func (s Server) proxyHandler() http.Handler {
 			r.Host = upstream.Host
 		}
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, agentType, sessionID, account.ID, proxyRequest.URL.Path)
+			s.captureResponseBody(response, agentType, sessionID, account.ID, account.Provider, proxyRequest.URL.Path)
 			return nil
 		}
 		if s.Logger != nil {
@@ -1318,7 +1322,12 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 	s.Transcripts.RecordPayloadSummary(agentType, sessionID, "http_body", "client_to_upstream", streamID, bytesRead, hex.EncodeToString(hasher.Sum(nil)), chunks, nil)
 }
 
-func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID, path string) {
+func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, path string) {
+	// Anthropic signals subscription exhaustion with a plain 429, with no
+	// codex-style usage-limit body to inspect.
+	if provider == accounts.ProviderClaude && accountID != "" && response.StatusCode == http.StatusTooManyRequests {
+		s.markAccountExhausted(accountID)
+	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
 	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit) {
 		return
@@ -1627,8 +1636,8 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
-	if provider == accounts.ProviderCodex {
-		s.refreshUsageScoresIfStale(r.Context(), availableAccounts)
+	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
+		s.refreshUsageScoresIfStale(r.Context())
 	}
 	base := s.scheduler()
 	if model != "" && s.Logger != nil && base.HasModelPool(model) {
@@ -1750,10 +1759,16 @@ func codexResponsePath(path string) bool {
 	}
 }
 
-func (s Server) refreshUsageScoresIfStale(ctx context.Context, availableAccounts []accounts.Account) {
+// refreshUsageScoresIfStale rebuilds the scheduler from every OAuth account's
+// usage, across all providers. Scoring the full list (not just the requesting
+// provider's accounts) matters because FinishRefresh replaces the scheduler
+// wholesale: a codex-triggered refresh must not wipe claude scores or vice
+// versa.
+func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.SchedulerRef == nil || !s.SchedulerRef.BeginRefreshIfStale(s.UsageScoreTTL) {
 		return
 	}
+	availableAccounts := oauthAccounts(s.accountList())
 	scoreAccounts := s.ScoreAccounts
 	if scoreAccounts == nil {
 		scoreAccounts = s.scoreAccounts
@@ -1881,8 +1896,8 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if len(untried) == 0 {
 		return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
 	}
-	if provider == accounts.ProviderCodex {
-		s.refreshUsageScoresIfStale(ctx, candidates)
+	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
+		s.refreshUsageScoresIfStale(ctx)
 	}
 	scheduler := s.scheduler()
 	if s.Sessions != nil {
@@ -1918,6 +1933,17 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 		path == "/v1/responses" ||
 		path == "/responses/compact" ||
 		path == "/v1/responses/compact"
+}
+
+func retryableUpstreamPostRequest(provider accounts.Provider, r *http.Request) bool {
+	if provider == accounts.ProviderClaude {
+		if r == nil || r.Method != http.MethodPost {
+			return false
+		}
+		path := r.URL.Path
+		return path == "/v1/messages" || path == "/messages"
+	}
+	return retryableResponsesPostRequest(r)
 }
 
 func makeRequestBodyReplayable(r *http.Request, maxBytes int64) (bool, error) {
@@ -1968,6 +1994,7 @@ type usageLimitRetryTransport struct {
 	base        http.RoundTripper
 	server      *Server
 	logger      *slog.Logger
+	provider    accounts.Provider
 	agent       string
 	session     string
 	userEmail   string
@@ -1976,6 +2003,17 @@ type usageLimitRetryTransport struct {
 	path        string
 	upstream    string
 	maxAttempts int
+}
+
+// responseUsageLimited reports whether the upstream response means the current
+// account is out of quota. Anthropic signals subscription exhaustion with a
+// plain 429 (no codex-style "usage_limit_reached" body), so claude is detected
+// by status alone.
+func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) (bool, error) {
+	if t.provider == accounts.ProviderClaude {
+		return response != nil && response.StatusCode == http.StatusTooManyRequests, nil
+	}
+	return responseUsageLimit(response)
 }
 
 func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -1998,7 +2036,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
 			return response, err
 		}
-		usageLimited, inspectErr := responseUsageLimit(response)
+		usageLimited, inspectErr := t.responseUsageLimited(response)
 		if inspectErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
@@ -2014,7 +2052,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if attempt == maxAttempts || t.server == nil {
 			return response, nil
 		}
-		nextAccount, pickErr := t.server.codexOAuthRetryAccount(req.Context(), t.agent, t.session, t.userEmail, tried)
+		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, tried)
 		if pickErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
@@ -2046,10 +2084,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	return base.RoundTrip(req)
 }
 
-func (s Server) codexOAuthRetryAccount(ctx context.Context, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
-	allCandidates := oauthAccounts(filterAccountsForProvider(s.accountList(), accounts.ProviderCodex))
+func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
+	allCandidates := oauthAccounts(filterAccountsForProvider(s.accountList(), provider))
 	if len(allCandidates) == 0 {
-		return accounts.Account{}, fmt.Errorf("no OAuth Codex accounts available")
+		return accounts.Account{}, fmt.Errorf("no OAuth %s accounts available", provider)
 	}
 	candidates := make([]accounts.Account, 0, len(allCandidates))
 	for _, account := range allCandidates {
@@ -2059,9 +2097,9 @@ func (s Server) codexOAuthRetryAccount(ctx context.Context, agentType, sessionID
 		candidates = append(candidates, account)
 	}
 	if len(candidates) == 0 {
-		return accounts.Account{}, fmt.Errorf("no untried OAuth Codex accounts available")
+		return accounts.Account{}, fmt.Errorf("no untried OAuth %s accounts available", provider)
 	}
-	s.refreshUsageScoresIfStale(ctx, allCandidates)
+	s.refreshUsageScoresIfStale(ctx)
 	scheduler := s.scheduler()
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
@@ -2071,10 +2109,10 @@ func (s Server) codexOAuthRetryAccount(ctx context.Context, agentType, sessionID
 		return accounts.Account{}, err
 	}
 	if scheduler.Exhausted(account.ID) {
-		return accounts.Account{}, fmt.Errorf("no non-exhausted OAuth Codex accounts available")
+		return accounts.Account{}, fmt.Errorf("no non-exhausted OAuth %s accounts available", provider)
 	}
 	if !scheduler.UsableForNewSession(account.ID) && s.Logger != nil {
-		s.Logger.Warn("usage-limit retry selected OAuth Codex account below new-session headroom threshold", "account", account.ID, "threshold", selectacct.MinNewSessionHeadroom)
+		s.Logger.Warn("usage-limit retry selected OAuth account below new-session headroom threshold", "provider", provider, "account", account.ID, "threshold", selectacct.MinNewSessionHeadroom)
 	}
 	refreshed, err := s.refreshAccount(ctx, account)
 	if err != nil {
