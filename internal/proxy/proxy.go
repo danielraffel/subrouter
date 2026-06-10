@@ -146,6 +146,16 @@ type AccountRef struct {
 	store       accounts.CodexStore
 	claudeStore agentclaude.Store
 	client      *http.Client
+
+	usageStatusMu    sync.Mutex
+	usageStatusCache []AccountUsageStatus
+	usageStatusAt    time.Time
+	lastGoodUsage    map[string]usageStatusSnapshot
+}
+
+type usageStatusSnapshot struct {
+	status AccountUsageStatus
+	at     time.Time
 }
 
 type AccountStatus struct {
@@ -337,10 +347,72 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 	return out
 }
 
+const usageStatusCacheTTL = 30 * time.Second
+const usageStatusLastGoodTTL = 15 * time.Minute
+
+// UsageStatuses serves a cached sweep when one is fresh, and backfills
+// accounts whose live usage fetch transiently failed (the upstream usage
+// endpoints rate-limit bursts) with their last-known-good windows, so brief
+// 429s do not blank a healthy account's quota display.
 func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	if r == nil {
 		return nil
 	}
+	r.usageStatusMu.Lock()
+	defer r.usageStatusMu.Unlock()
+	if !r.usageStatusAt.IsZero() && time.Since(r.usageStatusAt) < usageStatusCacheTTL && r.usageStatusCache != nil {
+		return append([]AccountUsageStatus(nil), r.usageStatusCache...)
+	}
+	out := r.usageStatusesLive(ctx)
+	now := time.Now()
+	if r.lastGoodUsage == nil {
+		r.lastGoodUsage = map[string]usageStatusSnapshot{}
+	}
+	for i := range out {
+		status := out[i]
+		key := status.ID + "\x00" + string(status.Provider)
+		if len(status.Windows) > 0 {
+			r.lastGoodUsage[key] = usageStatusSnapshot{status: status, at: now}
+			continue
+		}
+		if authLikeUsageError(status.Error) {
+			continue
+		}
+		snapshot, ok := r.lastGoodUsage[key]
+		if !ok || now.Sub(snapshot.at) > usageStatusLastGoodTTL {
+			continue
+		}
+		restored := snapshot.status
+		restored.Active = status.Active
+		restored.Refreshed = status.Refreshed
+		restored.Error = ""
+		out[i] = restored
+	}
+	r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
+	r.usageStatusAt = now
+	return out
+}
+
+func (r *AccountRef) InvalidateUsageStatusCache() {
+	if r == nil {
+		return
+	}
+	r.usageStatusMu.Lock()
+	defer r.usageStatusMu.Unlock()
+	r.usageStatusAt = time.Time{}
+}
+
+func authLikeUsageError(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{"401", "403", "unauthorized", "forbidden", "invalid_grant", "no access token", "no usable credential"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus {
 	storedAccounts, err := r.store.ListStored()
 	if err != nil {
 		return []AccountUsageStatus{{
@@ -761,6 +833,7 @@ func (s Server) handleReloadAccounts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.AccountRef.InvalidateUsageStatusCache()
 	writeJSON(w, map[string]any{
 		"ok":              true,
 		"accounts":        loaded,

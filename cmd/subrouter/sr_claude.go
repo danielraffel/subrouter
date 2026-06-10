@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
@@ -124,7 +125,7 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	claudeConfigDir := r.store.PreferredInstancePath(instancePath)
 
 	fmt.Fprintln(r.out, "Starting Claude Code...")
-	fmt.Fprintln(r.out, "Complete the OAuth login in your browser, then exit Claude to finish setup.")
+	fmt.Fprintln(r.out, "Complete the OAuth login in your browser; Claude closes automatically once the login lands.")
 	fmt.Fprintln(r.out)
 
 	cmd := exec.CommandContext(ctx, claudePath)
@@ -132,13 +133,14 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+claudeConfigDir)
-	if err := cmd.Run(); err != nil {
+	exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
+	if exitErr != nil && !autoClosed {
 		if name != "" {
 			_, _ = r.store.RemoveProfile(name)
 		} else {
 			_ = r.store.CleanupInstance(tempDir)
 		}
-		return fmt.Errorf("Claude login did not complete: %w", err)
+		return fmt.Errorf("Claude login did not complete: %w", exitErr)
 	}
 
 	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
@@ -300,6 +302,76 @@ func (r claudeRunner) env() error {
 	}
 	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(active))
 	return nil
+}
+
+// runClaudeUntilCredential runs the interactive Claude login and polls for the
+// OAuth credential landing in the profile's config dir. As soon as it appears,
+// the Claude process is closed automatically so the user does not have to exit
+// by hand. Returns the process exit error and whether we initiated the close
+// (in which case a non-nil exit error is expected and not a failure).
+func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string) (error, bool) {
+	if err := cmd.Start(); err != nil {
+		return err, false
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err, false
+		case <-ctx.Done():
+			err := closeInteractiveProcess(cmd, done)
+			return err, true
+		case <-ticker.C:
+			credential, _ := r.store.ReadCredential(ctx, claudeConfigDir)
+			if credential == nil || credential.AccessToken == "" {
+				continue
+			}
+			fmt.Fprintln(r.errOut, "\nLogin detected; closing Claude...")
+			err := closeInteractiveProcess(cmd, done)
+			r.restoreTerminal()
+			return err, true
+		}
+	}
+}
+
+// closeInteractiveProcess ends an interactive TUI process: SIGINT twice (Claude
+// requires a double Ctrl-C), then SIGTERM, then SIGKILL, waiting briefly after
+// each signal.
+func closeInteractiveProcess(cmd *exec.Cmd, done <-chan error) error {
+	if cmd.Process == nil {
+		return <-done
+	}
+	for i := 0; i < 2; i++ {
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(750 * time.Millisecond):
+		}
+	}
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(2 * time.Second):
+	}
+	_ = cmd.Process.Kill()
+	return <-done
+}
+
+// restoreTerminal best-effort resets the controlling terminal in case the
+// closed TUI left it in raw mode.
+func (r claudeRunner) restoreTerminal() {
+	stdin, ok := r.in.(*os.File)
+	if !ok {
+		return
+	}
+	cmd := exec.Command("stty", "sane")
+	cmd.Stdin = stdin
+	_ = cmd.Run()
 }
 
 func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string) error {

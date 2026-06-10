@@ -698,7 +698,7 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, nil
+		return nil, fmt.Errorf("usage fetch failed: %s", res.Status)
 	}
 	var usage UsageResponse
 	if err := json.NewDecoder(res.Body).Decode(&usage); err != nil {
