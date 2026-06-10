@@ -26,6 +26,7 @@ Usage:
   sr claude switch [name]       Switch active profile
   sr claude remove <name>       Remove a profile
   sr claude env                 Print export CLAUDE_CONFIG_DIR=...
+  sr claude push [name]         Upload a profile to the default Subrouter server pool
   sr claude run [name] [...]    Launch Claude with a specific profile
   sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
@@ -38,15 +39,23 @@ type claudeRunner struct {
 	out    io.Writer
 	errOut io.Writer
 	client *http.Client
+	// pushToServer uploads a profile to the default Subrouter server, when
+	// one is configured. nil when the claude runner is built without server
+	// support (tests). pushAfterAdd is the same upload but no-ops silently
+	// when no default server is configured.
+	pushToServer func(ctx context.Context, name string) error
+	pushAfterAdd func(ctx context.Context, name string) error
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
 	cr := claudeRunner{
-		store:  claude.DefaultStore(),
-		in:     r.in,
-		out:    r.out,
-		errOut: r.errOut,
-		client: r.client,
+		store:        claude.DefaultStore(),
+		in:           r.in,
+		out:          r.out,
+		errOut:       r.errOut,
+		client:       r.client,
+		pushToServer: r.pushClaudeProfileToServer,
+		pushAfterAdd: r.pushClaudeProfileAfterAdd,
 	}
 	return cr.run(ctx, args)
 }
@@ -76,6 +85,21 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		return r.remove(args[1])
 	case "env":
 		return r.env()
+	case "push", "upload":
+		if r.pushToServer == nil {
+			return fmt.Errorf("server push is not available")
+		}
+		name := ""
+		if len(args) > 1 {
+			name = args[1]
+		}
+		if name == "" {
+			name = r.store.ActiveProfile()
+		}
+		if name == "" {
+			return fmt.Errorf("usage: sr claude push <name>")
+		}
+		return r.pushToServer(ctx, name)
 	case "run":
 		name := ""
 		extra := []string{}
@@ -176,6 +200,12 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		email = " (" + status.Email + ")"
 	}
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q.%s%s\n", profileName, email, plan)
+	if r.pushAfterAdd != nil {
+		if err := r.pushAfterAdd(ctx, profileName); err != nil {
+			fmt.Fprintf(r.errOut, "warning: server upload failed (profile stays local-only): %v\n", err)
+			fmt.Fprintf(r.errOut, "Retry with: sr claude push %s\n", profileName)
+		}
+	}
 	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", profileName)
 	fmt.Fprintf(r.out, "  sr claude run %s\n", profileName)
 	return nil
