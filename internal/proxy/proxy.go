@@ -152,11 +152,57 @@ type AccountRef struct {
 	usageStatusCache []AccountUsageStatus
 	usageStatusAt    time.Time
 	lastGoodUsage    map[string]usageStatusSnapshot
+
+	usageWindowsMu sync.Mutex
+	usageWindows   map[string]usageWindowsEntry
 }
 
 type usageStatusSnapshot struct {
 	status AccountUsageStatus
 	at     time.Time
+}
+
+type usageWindowsEntry struct {
+	windows []accounts.UsageWindow
+	at      time.Time
+}
+
+const usageWindowsTTL = 2 * time.Minute
+const usageWindowsLastGoodTTL = 15 * time.Minute
+
+// FetchUsageWindowsCached is the single path for reading an account's usage
+// windows. Every consumer (scheduler scoring, the usage-status sweep,
+// auto-switch) used to fetch live, and with many pooled accounts the combined
+// rate tripped the upstream usage endpoints' per-IP limits, which then
+// cascaded: failed fetches zeroed scores and made healthy accounts look
+// exhausted. Fresh-within-TTL returns the cache; a transient fetch failure
+// falls back to the last-known-good windows instead of erroring.
+func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+	if r == nil {
+		return fetchAccountUsageWindowsLive(ctx, client, account)
+	}
+	key := account.ID + "\x00" + string(account.Provider)
+	now := time.Now()
+	r.usageWindowsMu.Lock()
+	entry, ok := r.usageWindows[key]
+	r.usageWindowsMu.Unlock()
+	if ok && now.Sub(entry.at) < usageWindowsTTL {
+		return append([]accounts.UsageWindow(nil), entry.windows...), nil
+	}
+	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
+	if err == nil {
+		r.usageWindowsMu.Lock()
+		if r.usageWindows == nil {
+			r.usageWindows = map[string]usageWindowsEntry{}
+		}
+		r.usageWindows[key] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), windows...), at: now}
+		r.usageWindowsMu.Unlock()
+		return windows, nil
+	}
+	if !authLikeUsageError(err.Error()) && ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
+		return append([]accounts.UsageWindow(nil), entry.windows...), nil
+	}
+	return nil, err
 }
 
 type AccountStatus struct {
@@ -514,14 +560,14 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.AuthValid = true
 			r.replace(account)
-			usage, err := agentclaude.FetchUsage(ctx, r.client, account.Token)
+			windows, err := r.FetchUsageWindowsCached(ctx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
 				return
 			}
 			next.PlanType = "claude"
-			next.Windows = claudeUsageWindows(usage)
+			next.Windows = windows
 			out[i] = next
 		}()
 	}
@@ -913,7 +959,15 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			if s.Logger != nil {
 				s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
 			}
-			setZeroScore(scores, scoreByID, account.ID)
+			// Auth failures mean the account is unusable; zero it so the
+			// scheduler avoids it. Transient failures (rate limits, network)
+			// keep the optimistic default score: treating unknown as
+			// exhausted herds every session away from healthy accounts, and
+			// per-request usage-limit failover already handles true
+			// exhaustion.
+			if authLikeUsageError(err.Error()) {
+				setZeroScore(scores, scoreByID, account.ID)
+			}
 			continue
 		}
 		if idx, ok := scoreByID[account.ID]; ok {
@@ -925,6 +979,13 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 }
 
 func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+	if s.AccountRef != nil {
+		return s.AccountRef.FetchUsageWindowsCached(ctx, client, account)
+	}
+	return fetchAccountUsageWindowsLive(ctx, client, account)
+}
+
+func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
 	if account.Provider == accounts.ProviderClaude {
 		usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
 		if err != nil {
