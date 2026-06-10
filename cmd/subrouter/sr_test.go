@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -1311,5 +1312,40 @@ func usageResponseWindows(primaryUsedPercent, secondaryUsedPercent float64) *htt
 		StatusCode: http.StatusOK,
 		Header:     make(http.Header),
 		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+func TestUsageErrorFootnoteShowsProviderAndReaddCommand(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{
+		{
+			email:    "codex-broken@example.com",
+			authMode: accounts.AuthModeOAuth,
+			err:      errors.New("usage fetch failed: 401 Unauthorized"),
+		},
+		{
+			email:    "claude-broken@example.com",
+			provider: accounts.ProviderClaude,
+			err:      errors.New("Claude OAuth refresh failed: 400 Bad Request: invalid_grant"),
+		},
+		{
+			email:    "codex-flaky@example.com",
+			authMode: accounts.AuthModeOAuth,
+			err:      errors.New("usage fetch failed: connection refused"),
+		},
+	}, false)
+	text := out.String()
+	if !strings.Contains(text, "codex-broken@example.com [codex]: usage fetch failed: 401 Unauthorized (re-add with: sr add)") {
+		t.Fatalf("codex 401 footnote missing provider/re-add hint:\n%s", text)
+	}
+	if !strings.Contains(text, "claude-broken@example.com [claude]: Claude OAuth refresh failed: 400 Bad Request: invalid_grant (re-add with: sr claude add)") {
+		t.Fatalf("claude invalid_grant footnote missing provider/re-add hint:\n%s", text)
+	}
+	if strings.Contains(text, "codex-flaky@example.com [codex]: usage fetch failed: connection refused (re-add") {
+		t.Fatalf("transient error should not suggest re-add:\n%s", text)
+	}
+	if !strings.Contains(text, "codex-flaky@example.com [codex]: usage fetch failed: connection refused") {
+		t.Fatalf("transient error footnote should still show provider:\n%s", text)
 	}
 }

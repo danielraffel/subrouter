@@ -1520,11 +1520,43 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, color
 	if usageRowsHaveErrors(rows) {
 		for _, row := range rows {
 			if row.err != nil {
-				fmt.Fprintf(out, "  %s: %s\n", style(colored, ansiBold+ansiWhite, displayAccountName(row.email)), style(colored, ansiRed, row.err.Error()))
+				fmt.Fprintf(out, "  %s %s: %s%s\n",
+					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
+					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
+					style(colored, ansiRed, row.err.Error()),
+					style(colored, ansiDim, usageRowErrorHint(row)))
 			}
 		}
 		fmt.Fprintln(out)
 	}
+}
+
+func usageRowErrorHint(row srUsageRow) string {
+	if row.err == nil || !authErrorNeedsReadd(row.err) {
+		return ""
+	}
+	return " (re-add with: " + providerReaddCommand(usageProvider(row)) + ")"
+}
+
+func providerReaddCommand(provider accounts.Provider) string {
+	switch provider {
+	case accounts.ProviderClaude:
+		return "sr claude add"
+	case "gemini":
+		return "sr gemini add"
+	default:
+		return "sr add"
+	}
+}
+
+func authErrorNeedsReadd(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string, colored bool) {
