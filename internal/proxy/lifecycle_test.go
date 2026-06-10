@@ -148,3 +148,51 @@ func TestAdminTokenRequiredForNonLoopbackAdminEndpoint(t *testing.T) {
 		t.Fatalf("status with token = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestPromoteUsableClaudeStatusSkipsErroredActiveProfile(t *testing.T) {
+	statuses := []AccountUsageStatus{
+		{
+			AccountStatus: AccountStatus{
+				ID:        "austin@manaflow.ai",
+				Provider:  accounts.ProviderClaude,
+				AuthValid: false,
+				Error:     "invalid_grant",
+			},
+			Active: true,
+		},
+		{
+			AccountStatus: AccountStatus{
+				ID:        "lawrence@manaflow.ai",
+				Provider:  accounts.ProviderClaude,
+				AuthValid: true,
+			},
+			Windows: []accounts.UsageWindow{
+				{Name: "5h", UsedPercent: 30},
+				{Name: "7d", UsedPercent: 20},
+			},
+		},
+		{
+			AccountStatus: AccountStatus{
+				ID:        "lc+0@cmux.com",
+				Provider:  accounts.ProviderClaude,
+				AuthValid: true,
+			},
+			Windows: []accounts.UsageWindow{
+				{Name: "5h", UsedPercent: 100},
+				{Name: "7d", UsedPercent: 31},
+			},
+		},
+	}
+
+	promoteUsableClaudeStatus(statuses)
+
+	if statuses[0].Active {
+		t.Fatal("errored Claude profile stayed active")
+	}
+	if !statuses[1].Active {
+		t.Fatal("usable Claude profile was not promoted to active")
+	}
+	if statuses[2].Active {
+		t.Fatal("cooked Claude profile was promoted to active")
+	}
+}

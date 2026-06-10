@@ -73,3 +73,42 @@ func TestClaudeSwitchSupportsPartialProfile(t *testing.T) {
 		t.Fatalf("switch output = %q", out.String())
 	}
 }
+
+func TestClaudeFlagsRunActiveProfile(t *testing.T) {
+	home := t.TempDir()
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(home, "claude-run.txt")
+	claudePath := filepath.Join(binDir, "claude")
+	script := "#!/bin/sh\nprintf 'config=%s\\nargs=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" > " + shellQuote(recordPath) + "\n"
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	err := runner.run(context.Background(), []string{"--dangerously-skip-permissions", "--resume", "1721c0ce-b3bd-4d73-8b33-b3d02b677074"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "config="+store.ClaudeConfigDir("work")) {
+		t.Fatalf("Claude did not receive active config dir:\n%s", got)
+	}
+	if !strings.Contains(got, "args=--dangerously-skip-permissions --resume 1721c0ce-b3bd-4d73-8b33-b3d02b677074") {
+		t.Fatalf("Claude did not receive flags:\n%s", got)
+	}
+}

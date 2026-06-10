@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,6 +26,10 @@ const (
 	usageURL        = "https://api.anthropic.com/api/oauth/usage"
 	oauthBetaHeader = "oauth-2025-04-20"
 )
+
+var oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
+
+const oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 var reservedNames = map[string]bool{
 	"add": true, "login": true, "list": true, "ls": true, "switch": true,
@@ -60,6 +65,7 @@ type AuthStatus struct {
 
 type CredentialInfo struct {
 	AccessToken      string `json:"accessToken,omitempty"`
+	RefreshToken     string `json:"refreshToken,omitempty"`
 	SubscriptionType string `json:"subscriptionType,omitempty"`
 	RateLimitTier    string `json:"rateLimitTier,omitempty"`
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
@@ -161,24 +167,11 @@ func (s Store) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
 		if err != nil {
 			return nil, err
 		}
-		if credential == nil || credential.AccessToken == "" {
+		account, ok := profileAccount(profile, configDir, credential)
+		if !ok {
 			continue
 		}
-		addedAt, _ := time.Parse(time.RFC3339, profile.CreatedAt)
-		email := ""
-		if strings.Contains(profile.Name, "@") {
-			email = profile.Name
-		}
-		out = append(out, accounts.Account{
-			ID:       profile.Name,
-			Provider: accounts.ProviderClaude,
-			AuthMode: accounts.AuthModeOAuth,
-			Label:    profile.Name,
-			Email:    email,
-			AddedAt:  addedAt,
-			Token:    credential.AccessToken,
-			Source:   configDir,
-		})
+		out = append(out, account)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].ID < out[j].ID
@@ -506,6 +499,68 @@ func (s Store) ReadCredential(ctx context.Context, instancePath string) (*Creden
 	return parseCredentialPayload(body)
 }
 
+func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
+	configDir := s.ClaudeConfigDir(profile.Name)
+	credential, err := s.ReadCredential(ctx, configDir)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	if credential == nil || credential.AccessToken == "" {
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
+	}
+	didRefresh := false
+	if credential.RefreshToken != "" && credentialExpired(credential, 60*time.Second) {
+		refreshed, err := RefreshCredential(ctx, client, *credential)
+		if err != nil {
+			return accounts.Account{}, false, err
+		}
+		credential = &refreshed
+		if err := s.WriteCredential(ctx, configDir, *credential); err != nil {
+			return accounts.Account{}, false, err
+		}
+		didRefresh = true
+	}
+	account, ok := profileAccount(profile, configDir, credential)
+	if !ok {
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
+	}
+	return account, didRefresh, nil
+}
+
+func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client, account accounts.Account) (accounts.Account, bool, error) {
+	profile, ok := s.FindProfile(account.ID)
+	if !ok {
+		return account, false, fmt.Errorf("Claude profile %q not found", account.ID)
+	}
+	return s.RefreshCredentialIfExpired(ctx, client, profile)
+}
+
+func (s Store) WriteCredential(ctx context.Context, instancePath string, credential CredentialInfo) error {
+	body, err := credentialPayload(credential)
+	if err != nil {
+		return err
+	}
+	filePath := filepath.Join(instancePath, ".credentials.json")
+	if _, err := os.Stat(filePath); err == nil {
+		return os.WriteFile(filePath, body, 0o600)
+	}
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("Claude credential persistence is only supported for .credentials.json files on %s", runtime.GOOS)
+	}
+	u, err := user.Current()
+	if err != nil {
+		return err
+	}
+	service := "Claude Code-credentials-" + keychainHash(instancePath)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "security", "add-generic-password", "-U", "-s", service, "-a", u.Username, "-w", string(body))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("write Claude credential to keychain: %w", err)
+	}
+	return nil
+}
+
 func readCredentialFile(instancePath string) (*CredentialInfo, bool) {
 	body, err := os.ReadFile(filepath.Join(instancePath, ".credentials.json"))
 	if err != nil {
@@ -523,6 +578,99 @@ func parseCredentialPayload(body []byte) (*CredentialInfo, error) {
 		return nil, err
 	}
 	return raw.ClaudeAIOAuth, nil
+}
+
+func credentialPayload(credential CredentialInfo) ([]byte, error) {
+	body, err := json.MarshalIndent(map[string]CredentialInfo{
+		"claudeAiOauth": credential,
+	}, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	body = append(body, '\n')
+	return body, nil
+}
+
+func credentialExpired(credential *CredentialInfo, skew time.Duration) bool {
+	if credential == nil || credential.ExpiresAt <= 0 {
+		return false
+	}
+	expiresAt := time.UnixMilli(credential.ExpiresAt)
+	return !time.Now().Add(skew).Before(expiresAt)
+}
+
+func RefreshCredential(ctx context.Context, client *http.Client, credential CredentialInfo) (CredentialInfo, error) {
+	if credential.RefreshToken == "" {
+		return credential, nil
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	payload := map[string]string{
+		"client_id":     oauthClientID,
+		"grant_type":    "refresh_token",
+		"refresh_token": credential.RefreshToken,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return credential, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL, bytes.NewReader(body))
+	if err != nil {
+		return credential, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", oauthBetaHeader)
+	res, err := client.Do(req)
+	if err != nil {
+		return credential, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(res.Body)
+		return credential, fmt.Errorf("Claude OAuth refresh failed: %s: %s", res.Status, strings.TrimSpace(buf.String()))
+	}
+	var refreshed struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&refreshed); err != nil {
+		return credential, err
+	}
+	if refreshed.AccessToken == "" {
+		return credential, fmt.Errorf("Claude OAuth refresh response missing access_token")
+	}
+	credential.AccessToken = refreshed.AccessToken
+	if refreshed.RefreshToken != "" {
+		credential.RefreshToken = refreshed.RefreshToken
+	}
+	if refreshed.ExpiresIn > 0 {
+		credential.ExpiresAt = time.Now().Add(time.Duration(refreshed.ExpiresIn) * time.Second).UnixMilli()
+	}
+	return credential, nil
+}
+
+func profileAccount(profile Profile, configDir string, credential *CredentialInfo) (accounts.Account, bool) {
+	if credential == nil || credential.AccessToken == "" {
+		return accounts.Account{}, false
+	}
+	addedAt, _ := time.Parse(time.RFC3339, profile.CreatedAt)
+	email := ""
+	if strings.Contains(profile.Name, "@") {
+		email = profile.Name
+	}
+	return accounts.Account{
+		ID:       profile.Name,
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Label:    profile.Name,
+		Email:    email,
+		AddedAt:  addedAt,
+		Token:    credential.AccessToken,
+		Source:   configDir,
+	}, true
 }
 
 func keychainHash(instancePath string) string {

@@ -18,11 +18,11 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/selectacct"
 )
 
 const srUsageCacheTTL = time.Hour
-const srUsageGridMinWidth = 140
 
 const (
 	ansiReset    = "\x1b[0m"
@@ -41,10 +41,10 @@ const (
 	ansiBGRowAlt = "\x1b[48;5;236m"
 )
 
-const srHelp = `sr - Manage multiple Codex accounts
+const srHelp = `sr - Manage Subrouter accounts
 
 Usage:
-  sr                    Show Codex usage for all accounts and switch
+  sr                    Show Codex and Claude usage, grouped by provider
   sr add                Add a new Codex account (opens OAuth login)
   sr add-key            Add a Codex API key account
   sr import             Import current ~/.codex/auth.json account
@@ -54,7 +54,7 @@ Usage:
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <email>     Remove a Codex account
-  sr status             Show Codex usage (non-interactive)
+  sr status             Show Codex and Claude usage (non-interactive)
   sr pick               Switch to the recommended account, failing if none has quota
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
@@ -110,6 +110,7 @@ type srUsageRow struct {
 	tempCooked       bool
 	tempCookedReason string
 	authMode         accounts.AuthMode
+	provider         accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -701,7 +702,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	var wg sync.WaitGroup
 	for i, account := range all {
 		i, account := i, account
-		rows[i] = srUsageRow{email: account.Email, active: account.Email == active}
+		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: accounts.ProviderCodex}
 		if account.IsAPIKey() {
 			rows[i].authMode = accounts.AuthModeAPIKey
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
@@ -743,6 +744,41 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			rows[i].score = scoreFromWindows(account.Email, details.Windows)
 			rows[i].cooked, rows[i].cookedReason = cookedFromWindows(details.Windows)
 			rows[i].tempCooked, rows[i].tempCookedReason = tempCookedFromWindows(details.Windows)
+		}()
+	}
+	wg.Wait()
+	claudeStore := agentclaude.DefaultStore()
+	claudeProfiles := claudeStore.ListProfiles()
+	claudeOffset := len(rows)
+	rows = append(rows, make([]srUsageRow, len(claudeProfiles))...)
+	activeClaude := claudeStore.ActiveProfile()
+	for i, profile := range claudeProfiles {
+		i, profile := claudeOffset+i, profile
+		rows[i] = srUsageRow{
+			email:    profile.Name,
+			active:   profile.Name == activeClaude,
+			planType: "claude",
+			authMode: accounts.AuthModeOAuth,
+			provider: accounts.ProviderClaude,
+			score:    selectacct.Score{AccountID: profile.Name, Headroom: 1, ShortHeadroom: 1},
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			account, _, err := claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+			if err != nil {
+				rows[i].err = err
+				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
+				return
+			}
+			usage, err := agentclaude.FetchUsage(ctx, r.client, account.Token)
+			if err != nil {
+				rows[i].err = err
+				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
+				return
+			}
+			rows[i].windows = claudeUsageWindows(usage)
+			rows[i].score = scoreFromWindows(profile.Name, rows[i].windows)
 		}()
 	}
 	wg.Wait()
@@ -1114,6 +1150,28 @@ func isLongQuotaWindow(window accounts.UsageWindow) bool {
 	return strings.Contains(name, "7d") || strings.Contains(name, "weekly")
 }
 
+func isClaudeSessionWindow(window accounts.UsageWindow) bool {
+	name := strings.ToLower(window.Name)
+	return name == "5h" || strings.Contains(name, "session")
+}
+
+func isClaudeWeeklyWindow(window accounts.UsageWindow) bool {
+	name := strings.ToLower(window.Name)
+	return name == "7d" || name == "weekly"
+}
+
+func isClaudeOpusWeeklyWindow(window accounts.UsageWindow) bool {
+	return strings.Contains(strings.ToLower(window.Name), "opus")
+}
+
+func isClaudeSonnetWeeklyWindow(window accounts.UsageWindow) bool {
+	return strings.Contains(strings.ToLower(window.Name), "sonnet")
+}
+
+func isClaudeExtraWindow(window accounts.UsageWindow) bool {
+	return strings.Contains(strings.ToLower(window.Name), "extra")
+}
+
 func clampUsagePercent(value float64) float64 {
 	switch {
 	case value < 0:
@@ -1128,6 +1186,9 @@ func clampUsagePercent(value float64) float64 {
 func allOAuthRowsCooked(rows []srUsageRow) bool {
 	seenOAuth := false
 	for _, row := range rows {
+		if row.provider != "" && row.provider != accounts.ProviderCodex {
+			continue
+		}
 		if row.err != nil || row.authMode == accounts.AuthModeAPIKey {
 			return false
 		}
@@ -1145,6 +1206,9 @@ func allOAuthRowsCooked(rows []srUsageRow) bool {
 func allOAuthRowsBlockedForNewSession(rows []srUsageRow) bool {
 	seenOAuth := false
 	for _, row := range rows {
+		if row.provider != "" && row.provider != accounts.ProviderCodex {
+			continue
+		}
 		if row.err != nil || row.authMode == accounts.AuthModeAPIKey {
 			return false
 		}
@@ -1161,6 +1225,9 @@ func allOAuthRowsBlockedForNewSession(rows []srUsageRow) bool {
 
 func hasSwitchableUsageRows(rows []srUsageRow) bool {
 	for _, row := range rows {
+		if row.provider != "" && row.provider != accounts.ProviderCodex {
+			continue
+		}
 		if row.err != nil {
 			continue
 		}
@@ -1175,6 +1242,9 @@ func hasSwitchableUsageRows(rows []srUsageRow) bool {
 }
 
 func ensureUsageRowSwitchable(row srUsageRow) error {
+	if row.provider != "" && row.provider != accounts.ProviderCodex {
+		return fmt.Errorf("cannot switch to %s with sr; use sr claude switch %s", row.email, row.email)
+	}
 	if row.cooked {
 		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", row.email, row.cookedReason)
 	}
@@ -1182,6 +1252,35 @@ func ensureUsageRowSwitchable(row srUsageRow) error {
 		return fmt.Errorf("cannot switch to %s: account is temporarily cooked (%s)", row.email, row.tempCookedReason)
 	}
 	return nil
+}
+
+func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow {
+	if usage == nil {
+		return nil
+	}
+	var windows []accounts.UsageWindow
+	add := func(name string, limit *agentclaude.RateLimit) {
+		if limit == nil || limit.Utilization == nil {
+			return
+		}
+		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization}
+		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
+			seconds := int64(time.Until(reset).Seconds())
+			if seconds < 0 {
+				seconds = 0
+			}
+			window.ResetAfterSeconds = seconds
+		}
+		windows = append(windows, window)
+	}
+	add("5h", usage.FiveHour)
+	add("7d", usage.SevenDay)
+	add("opus-weekly", usage.SevenDayOpus)
+	add("sonnet-weekly", usage.SevenDaySonnet)
+	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
+		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
+	}
+	return windows
 }
 
 func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account accounts.StoredCodexAccount) error {
@@ -1209,33 +1308,14 @@ func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account acc
 func rankUsageRows(rows []srUsageRow) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i], rows[j]
-		if (a.err != nil) != (b.err != nil) {
-			return a.err == nil
+		ao, bo := usageProviderOrder(a), usageProviderOrder(b)
+		if ao != bo {
+			return ao < bo
 		}
-		at, bt := usageRowTier(a), usageRowTier(b)
-		if at != bt {
-			return at < bt
+		if usageProvider(a) == accounts.ProviderClaude {
+			return claudeUsageRowLess(a, b)
 		}
-		au, bu := usableForNewSession(a.score), usableForNewSession(b.score)
-		if au != bu {
-			return au
-		}
-		if au && bu && a.score.ExpiryPressure != b.score.ExpiryPressure {
-			return a.score.ExpiryPressure > b.score.ExpiryPressure
-		}
-		if a.score.Headroom != b.score.Headroom {
-			return a.score.Headroom > b.score.Headroom
-		}
-		if a.score.ShortResetAfterSeconds != b.score.ShortResetAfterSeconds {
-			if a.score.ShortResetAfterSeconds == 0 {
-				return false
-			}
-			if b.score.ShortResetAfterSeconds == 0 {
-				return true
-			}
-			return a.score.ShortResetAfterSeconds < b.score.ShortResetAfterSeconds
-		}
-		return rows[i].email < rows[j].email
+		return codexUsageRowLess(a, b)
 	})
 	recommended := false
 	for i := range rows {
@@ -1248,7 +1328,95 @@ func rankUsageRows(rows []srUsageRow) {
 	}
 }
 
+func codexUsageRowLess(a, b srUsageRow) bool {
+	if (a.err != nil) != (b.err != nil) {
+		return a.err == nil
+	}
+	at, bt := usageRowTier(a), usageRowTier(b)
+	if at != bt {
+		return at < bt
+	}
+	au, bu := usableForNewSession(a.score), usableForNewSession(b.score)
+	if au != bu {
+		return au
+	}
+	if au && bu && a.score.ExpiryPressure != b.score.ExpiryPressure {
+		return a.score.ExpiryPressure > b.score.ExpiryPressure
+	}
+	if a.score.Headroom != b.score.Headroom {
+		return a.score.Headroom > b.score.Headroom
+	}
+	if a.score.ShortResetAfterSeconds != b.score.ShortResetAfterSeconds {
+		if a.score.ShortResetAfterSeconds == 0 {
+			return false
+		}
+		if b.score.ShortResetAfterSeconds == 0 {
+			return true
+		}
+		return a.score.ShortResetAfterSeconds < b.score.ShortResetAfterSeconds
+	}
+	return a.email < b.email
+}
+
+func claudeUsageRowLess(a, b srUsageRow) bool {
+	if (a.err != nil) != (b.err != nil) {
+		return a.err == nil
+	}
+	if a.active != b.active {
+		return a.active
+	}
+	au, bu := usableForNewSession(a.score), usableForNewSession(b.score)
+	if au != bu {
+		return au
+	}
+	if a.score.Headroom != b.score.Headroom {
+		return a.score.Headroom > b.score.Headroom
+	}
+	if a.score.ShortResetAfterSeconds != b.score.ShortResetAfterSeconds {
+		if a.score.ShortResetAfterSeconds == 0 {
+			return false
+		}
+		if b.score.ShortResetAfterSeconds == 0 {
+			return true
+		}
+		return a.score.ShortResetAfterSeconds < b.score.ShortResetAfterSeconds
+	}
+	return a.email < b.email
+}
+
+func usageProvider(row srUsageRow) accounts.Provider {
+	if row.provider == "" {
+		return accounts.ProviderCodex
+	}
+	return row.provider
+}
+
+func usageProviderOrder(row srUsageRow) int {
+	switch usageProvider(row) {
+	case accounts.ProviderCodex:
+		return 0
+	case accounts.ProviderClaude:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func usageProviderLabel(row srUsageRow) string {
+	switch usageProvider(row) {
+	case accounts.ProviderCodex:
+		return "Codex accounts"
+	case accounts.ProviderClaude:
+		return "Claude profiles"
+	default:
+		return strings.Title(string(usageProvider(row))) + " accounts"
+	}
+}
+
 func usageRowTier(row srUsageRow) int {
+	if row.provider != "" && row.provider != accounts.ProviderCodex {
+		return 5
+	}
 	if row.authMode == accounts.AuthModeOAuth && usableForNewSession(row.score) {
 		return 0
 	}
@@ -1268,6 +1436,9 @@ func usageRowTier(row srUsageRow) int {
 }
 
 func recommendedForNewSession(row srUsageRow) bool {
+	if row.provider != "" && row.provider != accounts.ProviderCodex {
+		return false
+	}
 	if row.err != nil || row.cooked || row.tempCooked {
 		return false
 	}
@@ -1314,178 +1485,165 @@ func displayUsageRows(out io.Writer, rows []srUsageRow, numbered bool) {
 		return
 	}
 	colored := colorEnabled(out)
-	if shouldDisplayUsageGrid(out) {
-		displayUsageRowsGrid(out, rows, numbered, colored)
-		return
-	}
-	displayUsageRowsDetailed(out, rows, numbered, colored)
-}
-
-func shouldDisplayUsageGrid(out io.Writer) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("SR_USAGE_GRID"))) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CX_USAGE_GRID"))) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	}
-	return terminalColumns(out) >= srUsageGridMinWidth
-}
-
-func displayUsageRowsDetailed(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
-	width := 0
-	for _, row := range rows {
-		if row.gtoReason != "" {
-			width = max(width, len("pick"))
-		}
-		if row.cookedReason != "" {
-			width = max(width, len("cooked"))
-		}
-		if row.tempCookedReason != "" {
-			width = max(width, len("temporarily cooked"))
-		}
-		for _, window := range row.windows {
-			width = max(width, len(windowLabel(window)))
-		}
-		if row.credits != nil {
-			width = max(width, len("Credits"))
-		}
-		if row.apiKeySpend != nil {
-			width = max(width, len("top model"))
-		}
-	}
-	fmt.Fprintln(out)
-	for i, row := range rows {
-		prefix := ""
-		if numbered {
-			prefix = fmt.Sprintf("%d) ", i+1)
-		}
-		active := ""
-		if row.active {
-			active = " " + style(colored, ansiCyan, "(active)")
-		}
-		recommended := ""
-		if row.gtoRecommended {
-			recommended = " " + style(colored, ansiGreen, "[recommended]")
-		}
-		cooked := ""
-		if row.cooked {
-			cooked = " " + style(colored, ansiRed, "[cooked]")
-		} else if row.tempCooked {
-			cooked = " " + style(colored, ansiYellow, "[temporarily cooked]")
-		}
-		plan := ""
-		if row.planType != "" {
-			plan = " " + style(colored, ansiDim, "["+row.planType+"]")
-		}
-		fmt.Fprintf(out, "%s%s%s%s%s%s\n", style(colored, ansiDim, prefix), style(colored, ansiBold+ansiWhite, displayAccountName(row.email)), plan, active, recommended, cooked)
-		if row.err != nil {
-			fmt.Fprintf(out, "  %s\n\n", style(colored, ansiRed, "Error: "+row.err.Error()))
-			continue
-		}
-		if row.gtoReason != "" {
-			fmt.Fprintf(out, "  %s: %s\n", style(colored, ansiDim, pad("pick", width)), row.gtoReason)
-		}
-		if row.cookedReason != "" {
-			fmt.Fprintf(out, "  %s: %s\n", style(colored, ansiDim, pad("cooked", width)), row.cookedReason)
-		}
-		if row.tempCookedReason != "" {
-			fmt.Fprintf(out, "  %s: %s\n", style(colored, ansiDim, pad("temporarily cooked", width)), row.tempCookedReason)
-		}
-		for _, window := range row.windows {
-			left := formatPercentLeft(window.UsedPercent)
-			fmt.Fprintf(out, "  %s: %s %s", style(colored, ansiDim, pad(windowLabel(window), width)), renderBar(window.UsedPercent, colored), style(colored, usageColor(window.UsedPercent), left+" left"))
-			if window.ResetAfterSeconds > 0 {
-				fmt.Fprintf(out, " %s", style(colored, ansiDim, "resets in "+formatDuration(window.ResetAfterSeconds)))
-			}
-			fmt.Fprintln(out)
-		}
-		if row.credits != nil {
-			if row.credits.Unlimited {
-				fmt.Fprintf(out, "  %s: %s\n", style(colored, ansiDim, pad("Credits", width)), style(colored, ansiGreen, "Unlimited"))
-			} else if row.credits.Balance != "" {
-				fmt.Fprintf(out, "  %s: $%s\n", style(colored, ansiDim, pad("Credits", width)), row.credits.Balance)
-			}
-		}
-		if row.apiKeySpend != nil {
-			displayAPIKeySpend(out, row.apiKeySpend, width, colored)
-		} else if row.apiKeyHint != "" {
-			fmt.Fprintf(out, "  %s\n", style(colored, ansiDim, row.apiKeyHint))
-		}
-		fmt.Fprintln(out)
-	}
+	displayUsageRowsGrid(out, rows, numbered, colored)
 }
 
 func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered bool, colored bool) {
-	columns := usageGridColumns(out)
 	fmt.Fprintln(out)
-	printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
-		return usageGridCell{Text: col.Title, Style: ansiDim}
-	}, colored, "")
-	printUsageGridSeparator(out, columns, colored)
+	currentGroup := ""
+	accountRowIndex := 0
 	for i, row := range rows {
+		group := usageProviderLabel(row)
+		columns := usageGridColumns(out, numbered, usageProvider(row))
+		if group != currentGroup {
+			if currentGroup != "" {
+				fmt.Fprintln(out)
+			}
+			printUsageGridGroup(out, columns, group, colored)
+			printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
+				return usageGridCell{Text: col.Title, Style: ansiDim}
+			}, colored, "")
+			printUsageGridSeparator(out, columns, colored)
+			currentGroup = group
+		}
 		rowIndex := ""
 		if numbered {
 			rowIndex = strconv.Itoa(i + 1)
 		}
-		values := map[string]usageGridCell{
-			"#":        {Text: rowIndex, Style: ansiDim},
-			"Account":  {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
-			"Plan":     {Text: row.planType, Style: ansiDim},
-			"State":    {Text: usageGridState(row), Style: usageGridStateColor(row)},
-			"Pick":     {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-			"5h":       usageGridShortWindowCell(row),
-			"7d":       usageGridWindowCell(row.windows, isLongQuotaWindow),
-			"Spark":    usageGridShortNamedWindowCell(row),
-			"Spark wk": usageGridNamedWindowCell(row.windows, true),
-			"Credits":  usageGridCreditsCell(row),
-		}
+		values := usageGridValues(row, rowIndex)
 		printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
-			return values[col.Title]
-		}, colored, usageGridRowStyle(i))
+			return values[col.Key]
+		}, colored, usageGridRowStyle(accountRowIndex))
+		accountRowIndex++
 	}
 	fmt.Fprintln(out)
 	if usageRowsHaveErrors(rows) {
 		for _, row := range rows {
 			if row.err != nil {
-				fmt.Fprintf(out, "  %s: %s\n", style(colored, ansiBold+ansiWhite, displayAccountName(row.email)), style(colored, ansiRed, row.err.Error()))
+				fmt.Fprintf(out, "  %s %s: %s%s\n",
+					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
+					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
+					style(colored, ansiRed, row.err.Error()),
+					style(colored, ansiDim, usageRowErrorHint(row)))
 			}
 		}
 		fmt.Fprintln(out)
 	}
 }
 
-func usageGridColumns(out io.Writer) []usageGridColumn {
-	columns := []usageGridColumn{
-		{Title: "#", Width: 3},
-		{Title: "Account", Width: 24},
-		{Title: "Plan", Width: 7},
-		{Title: "State", Width: 18},
-		{Title: "Pick", Width: 30},
-		{Title: "5h", Width: 10},
-		{Title: "7d", Width: 10},
-		{Title: "Spark", Width: 10},
-		{Title: "Spark wk", Width: 11},
-		{Title: "Credits", Width: 8},
+func usageRowErrorHint(row srUsageRow) string {
+	if row.err == nil || !authErrorNeedsReadd(row.err) {
+		return ""
 	}
-	extra := terminalColumns(out) - usageGridWidth(columns)
+	return " (re-add with: " + providerReaddCommand(usageProvider(row)) + ")"
+}
+
+func providerReaddCommand(provider accounts.Provider) string {
+	switch provider {
+	case accounts.ProviderClaude:
+		return "sr claude add"
+	case "gemini":
+		return "sr gemini add"
+	default:
+		return "sr add"
+	}
+}
+
+func authErrorNeedsReadd(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string, colored bool) {
+	fmt.Fprintln(out, style(colored, ansiBold+ansiDim, fitCell(label, usageGridWidth(columns))))
+}
+
+func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) []usageGridColumn {
+	termWidth := terminalColumns(out)
+	accountWidth := 22
+	planWidth := 6
+	stateWidth := 10
+	pickWidth := 22
+	windowWidth := 9
+	creditsWidth := 7
+	sparkWidth := 8
+	if termWidth < 100 {
+		accountWidth = 20
+		planWidth = 4
+		stateWidth = 14
+		pickWidth = 16
+		windowWidth = 7
+	}
+
+	columns := []usageGridColumn{}
+	if numbered {
+		columns = append(columns, usageGridColumn{Key: "#", Title: "#", Width: 3})
+	}
+	columns = append(columns,
+		usageGridColumn{Key: "Account", Title: "Account", Width: accountWidth},
+		usageGridColumn{Key: "Plan", Title: "Plan", Width: planWidth},
+		usageGridColumn{Key: "State", Title: "State", Width: stateWidth},
+		usageGridColumn{Key: "Pick", Title: "Use", Width: pickWidth},
+	)
+	if provider == accounts.ProviderClaude {
+		columns = append(columns,
+			usageGridColumn{Key: "Session", Title: "Session", Width: windowWidth},
+			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: windowWidth},
+		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
+	} else {
+		columns = append(columns,
+			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
+			usageGridColumn{Key: "7d", Title: "7d", Width: windowWidth},
+		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark", Title: "Spark", Width: sparkWidth}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark wk", Title: "Spark wk", Width: sparkWidth}, termWidth)
+	}
+
+	extra := termWidth - usageGridWidth(columns)
 	if extra <= 0 {
 		return columns
 	}
 	extra = widenUsageGridColumn(columns, "Account", extra, 36)
-	extra = widenUsageGridColumn(columns, "Pick", extra, 42)
-	extra = widenUsageGridColumn(columns, "State", extra, 22)
-	extra = widenUsageGridColumn(columns, "Spark wk", extra, 13)
+	extra = widenUsageGridColumn(columns, "Pick", extra, 34)
+	extra = widenUsageGridColumn(columns, "State", extra, 14)
+	extra = widenUsageGridColumn(columns, "Sonnet wk", extra, 10)
+	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
+	extra = widenUsageGridColumn(columns, "Weekly", extra, 12)
 	_ = widenUsageGridColumn(columns, "7d", extra, 12)
 	return columns
 }
 
+func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
+	return map[string]usageGridCell{
+		"#":         {Text: rowIndex, Style: ansiDim},
+		"Account":   {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
+		"Plan":      {Text: row.planType, Style: ansiDim},
+		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
+		"5h":        usageGridShortWindowCell(row),
+		"7d":        usageGridWindowCell(row.windows, isLongQuotaWindow),
+		"Spark":     usageGridShortNamedWindowCell(row),
+		"Spark wk":  usageGridNamedWindowCell(row.windows, true),
+		"Credits":   usageGridCreditsCell(row),
+		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
+		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
+		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
+		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
+	}
+}
+
 type usageGridColumn struct {
+	Key   string
 	Title string
 	Width int
 }
@@ -1506,12 +1664,20 @@ func usageGridWidth(columns []usageGridColumn) int {
 	return width
 }
 
+func appendUsageGridColumnIfFits(columns []usageGridColumn, column usageGridColumn, termWidth int) []usageGridColumn {
+	next := append(append([]usageGridColumn{}, columns...), column)
+	if usageGridWidth(next) <= termWidth {
+		return next
+	}
+	return columns
+}
+
 func widenUsageGridColumn(columns []usageGridColumn, title string, extra int, maxWidth int) int {
 	if extra <= 0 {
 		return 0
 	}
 	for i := range columns {
-		if columns[i].Title != title {
+		if columns[i].Key != title {
 			continue
 		}
 		add := min(extra, maxWidth-columns[i].Width)
@@ -1565,13 +1731,13 @@ func usageGridState(row srUsageRow) string {
 			states = append(states, "active")
 		}
 		if row.gtoRecommended {
-			states = append(states, "recommended")
+			states = append(states, "rec")
 		}
 	}
 	if row.cooked {
 		states = append(states, "cooked")
 	} else if row.tempCooked {
-		states = append(states, "temp cooked")
+		states = append(states, "temp")
 	}
 	if row.err != nil {
 		states = append(states, "error")
@@ -1599,6 +1765,9 @@ func usageGridPickColor(row srUsageRow) string {
 	case row.err != nil || row.cooked:
 		return ansiRed
 	case row.tempCooked || !recommendedForNewSession(row):
+		if usageProvider(row) == accounts.ProviderClaude {
+			return ""
+		}
 		return ansiYellow
 	case row.gtoRecommended:
 		return ansiGreen
@@ -1627,11 +1796,17 @@ func compactPickReason(row srUsageRow) string {
 	if row.authMode == accounts.AuthModeAPIKey {
 		return "API key fallback"
 	}
+	if usageProvider(row) == accounts.ProviderClaude && len(row.windows) == 0 {
+		return "Claude profile"
+	}
 	left := fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
 	if !usableForNewSession(row.score) {
 		return fmt.Sprintf("%s, protected < %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
+		if usageProvider(row) == accounts.ProviderClaude {
+			return fmt.Sprintf("%s, session reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
+		}
 		return fmt.Sprintf("%s, 5h reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
 	}
 	return left
