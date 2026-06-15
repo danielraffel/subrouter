@@ -134,6 +134,77 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	}
 }
 
+func TestUsageLimitRetryTransportClaudeFailsOverOn401(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-1", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	// A dead/expired Claude OAuth token yields a plain 401 authentication_error.
+	// subrouter must fail over to a healthy account instead of returning 401.
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		auth := req.Header.Get("Authorization")
+		if strings.Contains(auth, "tok-cooked") {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}`)),
+				Header:     http.Header{},
+			}
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1"}`)),
+			Header:     http.Header{},
+		}
+	}}
+	transport := usageLimitRetryTransport{
+		base:        stub,
+		server:      &server,
+		provider:    accounts.ProviderClaude,
+		agent:       "claude",
+		session:     "session-1",
+		account:     "cooked@example.com",
+		method:      http.MethodPost,
+		path:        "/v1/messages",
+		maxAttempts: 3,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after 401 failover", response.StatusCode)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (401 then retry)", stub.calls)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("401 should drop the dead-token account from selection")
+	}
+	assignment, ok := store.Get("claude", "session-1")
+	if !ok || assignment.AccountID != "fresh@example.com" {
+		t.Fatalf("sticky assignment = %+v, want moved to fresh@example.com", assignment)
+	}
+}
+
+func TestCaptureResponseBodyClaude401MarksExhausted(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	response := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error"}}`)),
+		Header:     http.Header{},
+	}
+	server.captureResponseBody(response, "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "/v1/messages")
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("claude 401 should mark the account exhausted via passive inspection")
+	}
+}
+
 func TestReuseStickyAssignmentClaudeExhausted(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	cooked := accounts.Account{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}

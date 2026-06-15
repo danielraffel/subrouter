@@ -1505,9 +1505,11 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 }
 
 func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, path string) {
-	// Anthropic signals subscription exhaustion with a plain 429, with no
-	// codex-style usage-limit body to inspect.
-	if provider == accounts.ProviderClaude && accountID != "" && response.StatusCode == http.StatusTooManyRequests {
+	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
+	// expired OAuth token with a plain 401, neither with a codex-style
+	// usage-limit body to inspect. Both mean this account can't serve the
+	// request, so drop it from selection and let failover pick another.
+	if provider == accounts.ProviderClaude && accountID != "" && claudeAccountUnusableStatus(response.StatusCode) {
 		s.markAccountExhausted(provider, accountID)
 	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
@@ -2193,9 +2195,19 @@ type usageLimitRetryTransport struct {
 // by status alone.
 func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) (bool, error) {
 	if t.provider == accounts.ProviderClaude {
-		return response != nil && response.StatusCode == http.StatusTooManyRequests, nil
+		return response != nil && claudeAccountUnusableStatus(response.StatusCode), nil
 	}
 	return responseUsageLimit(response)
+}
+
+// claudeAccountUnusableStatus reports whether an upstream status means the
+// selected Claude account cannot serve this request and subrouter should fail
+// over to another account. 429 is quota exhaustion; 401 is a dead or expired
+// OAuth token (Anthropic returns authentication_error). Both are
+// account-specific, so replaying the same request on a different account is the
+// correct response instead of surfacing the failure to the client.
+func claudeAccountUnusableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code == http.StatusUnauthorized
 }
 
 func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
