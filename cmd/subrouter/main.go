@@ -489,8 +489,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 			} else if refreshed, _, err := store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored); err != nil {
 				slog.Warn("account refresh failed", "account", account.ID, "error", err)
 				mu.Lock()
-				if idx, ok := scoreByID[account.ID]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Headroom: 0, ShortHeadroom: 0}
+				if idx, ok := scoreByID[account.SchedulerKey()]; ok {
+					scores[idx] = selectacct.Score{AccountID: account.SchedulerKey(), Headroom: 0, ShortHeadroom: 0}
 				}
 				mu.Unlock()
 				return
@@ -501,8 +501,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 			if err != nil {
 				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
 				mu.Lock()
-				if idx, ok := scoreByID[account.ID]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Headroom: 0}
+				if idx, ok := scoreByID[account.SchedulerKey()]; ok {
+					scores[idx] = selectacct.Score{AccountID: account.SchedulerKey(), Headroom: 0}
 				}
 				mu.Unlock()
 				return
@@ -517,9 +517,9 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 					Feature:            window.Feature,
 				})
 			}
-			score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
+			score := selectacct.ScoreFromLimitWindows(account.SchedulerKey(), 0, limitWindows)
 			mu.Lock()
-			if idx, ok := scoreByID[account.ID]; ok {
+			if idx, ok := scoreByID[account.SchedulerKey()]; ok {
 				scores[idx] = score
 				successful++
 			}
@@ -541,7 +541,7 @@ func fallbackScores(codexAccounts []accounts.Account) []selectacct.Score {
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			headroom = 0.01
 		}
-		scores = append(scores, selectacct.Score{AccountID: account.ID, Headroom: headroom, ShortHeadroom: headroom})
+		scores = append(scores, selectacct.Score{AccountID: account.SchedulerKey(), Headroom: headroom, ShortHeadroom: headroom})
 	}
 	return scores
 }

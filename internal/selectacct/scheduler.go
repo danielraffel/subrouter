@@ -104,8 +104,8 @@ func (s Scheduler) Pick(candidates []accounts.Account) (accounts.Account, error)
 
 	sorted := append([]accounts.Account(nil), candidates...)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		left := s.score(sorted[i].ID)
-		right := s.score(sorted[j].ID)
+		left := s.scoreFor(sorted[i])
+		right := s.scoreFor(sorted[j])
 		leftTier := selectionTier(sorted[i], left)
 		rightTier := selectionTier(sorted[j], right)
 		if leftTier != rightTier {
@@ -161,6 +161,23 @@ func (s Scheduler) score(accountID string) Score {
 	}
 	if s.sessionCounts != nil {
 		score.Sessions = s.sessionCounts[accountID]
+	}
+	return score
+}
+
+// scoreFor resolves an account's score for selection. Headroom/exhaustion are
+// keyed by the provider-scoped SchedulerKey so a codex account and a claude
+// profile sharing an email never clobber each other. The session-count
+// tiebreaker is keyed by the bare account ID, since session counts are
+// provider-agnostic load and the session store records bare account IDs.
+func (s Scheduler) scoreFor(account accounts.Account) Score {
+	key := account.SchedulerKey()
+	score, ok := s.scores[key]
+	if !ok {
+		score = Score{AccountID: key, Headroom: 1, ShortHeadroom: 1}
+	}
+	if s.sessionCounts != nil {
+		score.Sessions = s.sessionCounts[account.ID]
 	}
 	return score
 }

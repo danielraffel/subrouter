@@ -107,8 +107,8 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	if err != nil {
 		return "", err
 	}
-	if !scheduler.UsableForNewSession(picked.ID) {
-		if scheduler.Exhausted(picked.ID) {
+	if !scheduler.UsableForNewSession(picked.SchedulerKey()) {
+		if scheduler.Exhausted(picked.SchedulerKey()) {
 			return "", fmt.Errorf("no usable OAuth Codex accounts available")
 		}
 		logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch selected account below new-session headroom threshold", "account", picked.ID, "threshold", selectacct.MinNewSessionHeadroom)

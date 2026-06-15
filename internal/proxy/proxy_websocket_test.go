@@ -2783,14 +2783,14 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
-		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: accounts.SchedulerKey(accounts.ProviderCodex, "empty@example.com"), Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: accounts.SchedulerKey(accounts.ProviderCodex, "healthy@example.com"), Headroom: 0.80, ShortHeadroom: 0.80},
 	}))
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
-			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
-			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+			{ID: "empty@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
 		},
 		Sessions:     store,
 		SchedulerRef: schedulerRef,
@@ -2871,14 +2871,14 @@ func TestHandlerRetriesHTTPUsageLimitOnAlternateOAuthAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "empty@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
-		{AccountID: "healthy@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: accounts.SchedulerKey(accounts.ProviderCodex, "empty@example.com"), Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: accounts.SchedulerKey(accounts.ProviderCodex, "healthy@example.com"), Headroom: 0.80, ShortHeadroom: 0.80},
 	}))
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
-			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
-			{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+			{ID: "empty@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
 		},
 		Sessions:     store,
 		SchedulerRef: schedulerRef,
