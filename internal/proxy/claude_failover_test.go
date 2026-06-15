@@ -125,7 +125,7 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (429 then retry)", stub.calls)
 	}
-	if !server.SchedulerRef.Get().Exhausted("cooked@example.com") {
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("429 should mark the cooked account exhausted")
 	}
 	assignment, ok := store.Get("claude", "session-1")
@@ -138,8 +138,8 @@ func TestReuseStickyAssignmentClaudeExhausted(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	cooked := accounts.Account{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}
 	scheduler := selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "cooked@example.com", Headroom: 0, ShortHeadroom: 0},
-		{AccountID: "fresh@example.com", Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
 	})
 	if server.reuseStickyAssignment("claude", "session-1", cooked, scheduler) {
 		t.Fatal("exhausted claude account should not keep its sticky session")
@@ -158,7 +158,7 @@ func TestCaptureResponseBodyClaude429MarksExhausted(t *testing.T) {
 		Header:     http.Header{},
 	}
 	server.captureResponseBody(response, "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "/v1/messages")
-	if !server.SchedulerRef.Get().Exhausted("cooked@example.com") {
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("claude 429 should mark the account exhausted via passive inspection")
 	}
 }
@@ -180,7 +180,7 @@ func TestRefreshUsageScoresCoversAllProviders(t *testing.T) {
 		UsageScoreTTL: time.Minute,
 		ScoreAccounts: func(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
 			captured = available
-			return []selectacct.Score{{AccountID: "claude@example.com", Headroom: 0, ShortHeadroom: 0}}, 1
+			return []selectacct.Score{{AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0}}, 1
 		},
 	}
 	server.SchedulerRef.SetUpdatedAt(time.Now().Add(-time.Hour))
@@ -195,7 +195,7 @@ func TestRefreshUsageScoresCoversAllProviders(t *testing.T) {
 	if ids["apikey"] {
 		t.Fatal("API-key accounts should not be usage-scored")
 	}
-	if !server.SchedulerRef.Get().Exhausted("claude@example.com") {
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "claude@example.com") {
 		t.Fatal("claude usage scores should make Exhausted() real")
 	}
 }

@@ -11,6 +11,7 @@ var ErrNoAccounts = errors.New("no accounts available")
 
 type Score struct {
 	AccountID              string
+	Provider               accounts.Provider
 	Headroom               float64
 	ShortHeadroom          float64
 	ShortResetAfterSeconds int64
@@ -26,10 +27,24 @@ type Scheduler struct {
 
 const MinNewSessionHeadroom = 0.40
 
+// ScoreKey is the scheduler's identity for an account. A Codex account's ID is
+// its bare email and a Claude account's ID is its profile name, which can also
+// be an email, so the same string routinely identifies one account per
+// provider (e.g. lawrence@cmux.com exists as both a Codex account and a Claude
+// profile). Keying scores by the bare ID alone lets one provider's score
+// silently overwrite the other's; scoping the key by provider keeps them
+// distinct.
+func ScoreKey(provider accounts.Provider, accountID string) string {
+	if provider == "" {
+		provider = accounts.ProviderCodex
+	}
+	return string(provider) + "\x00" + accountID
+}
+
 func NewScheduler(scores []Score) Scheduler {
 	byID := make(map[string]Score, len(scores))
 	for _, score := range scores {
-		byID[score.AccountID] = score
+		byID[ScoreKey(score.Provider, score.AccountID)] = score
 	}
 	return Scheduler{scores: byID}
 }
@@ -39,10 +54,10 @@ func (s Scheduler) WithScore(score Score) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)+1),
 		sessionCounts: s.sessionCounts,
 	}
-	for accountID, existing := range s.scores {
-		next.scores[accountID] = existing
+	for key, existing := range s.scores {
+		next.scores[key] = existing
 	}
-	next.scores[score.AccountID] = score
+	next.scores[ScoreKey(score.Provider, score.AccountID)] = score
 	return next
 }
 
@@ -71,12 +86,12 @@ func (s Scheduler) ForModel(model string) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)),
 		sessionCounts: s.sessionCounts,
 	}
-	for accountID, score := range s.scores {
+	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			modelScore = Score{AccountID: accountID, Headroom: 0, ShortHeadroom: 0}
+			modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
 		}
-		next.scores[accountID] = modelScore
+		next.scores[scoreKey] = modelScore
 	}
 	return next
 }
@@ -104,8 +119,8 @@ func (s Scheduler) Pick(candidates []accounts.Account) (accounts.Account, error)
 
 	sorted := append([]accounts.Account(nil), candidates...)
 	sort.SliceStable(sorted, func(i, j int) bool {
-		left := s.score(sorted[i].ID)
-		right := s.score(sorted[j].ID)
+		left := s.score(sorted[i].Provider, sorted[i].ID)
+		right := s.score(sorted[j].Provider, sorted[j].ID)
 		leftTier := selectionTier(sorted[i], left)
 		rightTier := selectionTier(sorted[j], right)
 		if leftTier != rightTier {
@@ -130,12 +145,12 @@ func (s Scheduler) Pick(candidates []accounts.Account) (accounts.Account, error)
 	return sorted[0], nil
 }
 
-func (s Scheduler) UsableForNewSession(accountID string) bool {
-	return s.score(accountID).usableForNewSession()
+func (s Scheduler) UsableForNewSession(provider accounts.Provider, accountID string) bool {
+	return s.score(provider, accountID).usableForNewSession()
 }
 
-func (s Scheduler) Exhausted(accountID string) bool {
-	return s.score(accountID).exhausted()
+func (s Scheduler) Exhausted(provider accounts.Provider, accountID string) bool {
+	return s.score(provider, accountID).exhausted()
 }
 
 func selectionTier(account accounts.Account, score Score) int {
@@ -154,10 +169,10 @@ func selectionTier(account accounts.Account, score Score) int {
 	return 4
 }
 
-func (s Scheduler) score(accountID string) Score {
-	score, ok := s.scores[accountID]
+func (s Scheduler) score(provider accounts.Provider, accountID string) Score {
+	score, ok := s.scores[ScoreKey(provider, accountID)]
 	if !ok {
-		score = Score{AccountID: accountID, Headroom: 1, ShortHeadroom: 1}
+		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 	}
 	if s.sessionCounts != nil {
 		score.Sessions = s.sessionCounts[accountID]

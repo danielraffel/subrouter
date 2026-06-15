@@ -2626,7 +2626,7 @@ func TestHandlerReroutesActiveStickySessionWhenAssignedAccountExhausted(t *testi
 		t.Fatal("timed out waiting for first request to become active")
 	}
 
-	schedulerRef.MarkExhausted("empty@example.com")
+	schedulerRef.MarkExhausted(accounts.ProviderCodex, "empty@example.com")
 
 	secondReq, err := http.NewRequest(http.MethodGet, subrouter.URL+"/backend-api/codex/analytics-events/events", nil)
 	if err != nil {

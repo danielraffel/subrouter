@@ -659,7 +659,7 @@ func promoteUsableClaudeStatus(statuses []AccountUsageStatus) {
 		}
 		usable := false
 		if status.AuthValid && status.Error == "" {
-			score := scoreFromUsageWindows(status.ID, status.Windows)
+			score := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
 			usable = scoreUsableForNewSession(score)
 			if usable && (bestIdx == -1 || betterClaudeActiveCandidate(score, best)) {
 				bestIdx = i
@@ -700,7 +700,7 @@ func scoreUsableForNewSession(score selectacct.Score) bool {
 	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
 }
 
-func scoreFromUsageWindows(accountID string, windows []accounts.UsageWindow) selectacct.Score {
+func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
 	limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
 	for _, window := range windows {
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
@@ -711,7 +711,9 @@ func scoreFromUsageWindows(accountID string, windows []accounts.UsageWindow) sel
 			Feature:            window.Feature,
 		})
 	}
-	return selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
+	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
+	score.Provider = provider
+	return score
 }
 
 func (r *AccountRef) replace(account accounts.Account) {
@@ -925,9 +927,10 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			headroom = 0.01
 		}
-		scoreByID[account.ID] = len(scores)
+		scoreByID[selectacct.ScoreKey(account.Provider, account.ID)] = len(scores)
 		scores = append(scores, selectacct.Score{
 			AccountID:     account.ID,
+			Provider:      account.Provider,
 			Headroom:      headroom,
 			ShortHeadroom: headroom,
 		})
@@ -951,7 +954,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			if s.Logger != nil {
 				s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)
 			}
-			setZeroScore(scores, scoreByID, account.ID)
+			setZeroScore(scores, scoreByID, account.Provider, account.ID)
 			continue
 		}
 		windows, err := s.fetchAccountUsageWindows(ctx, client, refreshed)
@@ -966,12 +969,12 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			// per-request usage-limit failover already handles true
 			// exhaustion.
 			if authLikeUsageError(err.Error()) {
-				setZeroScore(scores, scoreByID, account.ID)
+				setZeroScore(scores, scoreByID, account.Provider, account.ID)
 			}
 			continue
 		}
-		if idx, ok := scoreByID[account.ID]; ok {
-			scores[idx] = scoreFromUsageWindows(account.ID, windows)
+		if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+			scores[idx] = scoreFromUsageWindows(account.Provider, account.ID, windows)
 			scored++
 		}
 	}
@@ -998,9 +1001,9 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 
 const defaultUsageFetchTimeout = 10 * time.Second
 
-func setZeroScore(scores []selectacct.Score, scoreByID map[string]int, accountID string) {
-	if idx, ok := scoreByID[accountID]; ok {
-		scores[idx] = selectacct.Score{AccountID: accountID, Headroom: 0, ShortHeadroom: 0}
+func setZeroScore(scores []selectacct.Score, scoreByID map[string]int, provider accounts.Provider, accountID string) {
+	if idx, ok := scoreByID[selectacct.ScoreKey(provider, accountID)]; ok {
+		scores[idx] = selectacct.Score{AccountID: accountID, Provider: provider, Headroom: 0, ShortHeadroom: 0}
 	}
 }
 
@@ -1331,7 +1334,7 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction
 			})
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage && usageLimitJSON(body) {
-			s.markAccountExhausted(accountID)
+			s.markAccountExhausted(providerForAgent(agentType), accountID)
 		}
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
@@ -1339,9 +1342,9 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction
 	}
 }
 
-func (s Server) markAccountExhausted(accountID string) {
+func (s Server) markAccountExhausted(provider accounts.Provider, accountID string) {
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.MarkExhausted(accountID)
+		s.SchedulerRef.MarkExhausted(provider, accountID)
 	}
 }
 
@@ -1505,7 +1508,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 	// Anthropic signals subscription exhaustion with a plain 429, with no
 	// codex-style usage-limit body to inspect.
 	if provider == accounts.ProviderClaude && accountID != "" && response.StatusCode == http.StatusTooManyRequests {
-		s.markAccountExhausted(accountID)
+		s.markAccountExhausted(provider, accountID)
 	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
 	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit) {
@@ -1516,7 +1519,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 	if inspectUsageLimit {
 		inspect = func(body []byte) {
 			if usageLimitJSON(body) {
-				s.markAccountExhausted(accountID)
+				s.markAccountExhausted(provider, accountID)
 			}
 		}
 	}
@@ -1845,8 +1848,8 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 					"session", sessionID,
 					"account", account.ID,
 					"active", s.activeSession(agentType, sessionID),
-					"usable_for_new_session", scheduler.UsableForNewSession(account.ID),
-					"exhausted", scheduler.Exhausted(account.ID),
+					"usable_for_new_session", scheduler.UsableForNewSession(account.Provider, account.ID),
+					"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 				)
 			}
 		}
@@ -1856,8 +1859,8 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
 	}
-	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.ID) {
-		if scheduler.Exhausted(account.ID) {
+	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.Provider, account.ID) {
+		if scheduler.Exhausted(account.Provider, account.ID) {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no usable OAuth %s accounts available", provider)
 		}
 		if provider == accounts.ProviderCodex && s.Logger != nil {
@@ -1875,7 +1878,7 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 	if s.Logger == nil || providerForAgent(agentType) != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
 		return
 	}
-	if scheduler.UsableForNewSession(account.ID) || scheduler.Exhausted(account.ID) || !s.activeSession(agentType, sessionID) {
+	if scheduler.UsableForNewSession(account.Provider, account.ID) || scheduler.Exhausted(account.Provider, account.ID) || !s.activeSession(agentType, sessionID) {
 		return
 	}
 	s.Logger.Info("keeping active sticky session on constrained account",
@@ -1888,14 +1891,14 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 }
 
 func (s Server) reuseStickyAssignment(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) bool {
-	if scheduler.Exhausted(account.ID) {
+	if scheduler.Exhausted(account.Provider, account.ID) {
 		return false
 	}
 	if s.activeSession(agentType, sessionID) {
 		return true
 	}
 	if providerForAgent(agentType) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
-		return scheduler.UsableForNewSession(account.ID)
+		return scheduler.UsableForNewSession(account.Provider, account.ID)
 	}
 	return true
 }
@@ -2040,7 +2043,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, agentType, sessionID
 		s.Logger.Warn("selected Claude account refresh failed, trying another account", "account", account.ID, "error", err)
 	}
 	tried := map[string]struct{}{account.ID: {}}
-	s.markAccountExhausted(account.ID)
+	s.markAccountExhausted(provider, account.ID)
 	lastErr := err
 	for {
 		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried)
@@ -2053,7 +2056,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, agentType, sessionID
 			return refreshed, nil
 		}
 		lastErr = err
-		s.markAccountExhausted(next.ID)
+		s.markAccountExhausted(provider, next.ID)
 		if s.Logger != nil {
 			s.Logger.Warn("retry Claude account refresh failed", "account", next.ID, "error", err)
 		}
@@ -2086,7 +2089,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if err != nil {
 		return accounts.Account{}, err
 	}
-	if scheduler.Exhausted(account.ID) {
+	if scheduler.Exhausted(account.Provider, account.ID) {
 		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
 	}
 	if s.Sessions != nil {
@@ -2226,7 +2229,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			return response, nil
 		}
 		if t.server != nil {
-			t.server.markAccountExhausted(accountID)
+			t.server.markAccountExhausted(t.provider, accountID)
 		}
 		if attempt == maxAttempts || t.server == nil {
 			return response, nil
@@ -2287,10 +2290,10 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 	if err != nil {
 		return accounts.Account{}, err
 	}
-	if scheduler.Exhausted(account.ID) {
+	if scheduler.Exhausted(account.Provider, account.ID) {
 		return accounts.Account{}, fmt.Errorf("no non-exhausted OAuth %s accounts available", provider)
 	}
-	if !scheduler.UsableForNewSession(account.ID) && s.Logger != nil {
+	if !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
 		s.Logger.Warn("usage-limit retry selected OAuth account below new-session headroom threshold", "provider", provider, "account", account.ID, "threshold", selectacct.MinNewSessionHeadroom)
 	}
 	refreshed, err := s.refreshAccount(ctx, account)
