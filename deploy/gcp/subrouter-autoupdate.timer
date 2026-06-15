@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll for new Subrouter releases and auto-update
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

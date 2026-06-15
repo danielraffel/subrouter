@@ -216,16 +216,23 @@ func serve(args []string) error {
 		slog.Warn("Claude accounts skipped", "error", err)
 		claudeAccounts = nil
 	}
-	scores := fallbackScores(codexAccounts)
+	// Start with optimistic fallback scores so the proxy begins accepting
+	// connections immediately. Blocking startup on a synchronous usage fetch
+	// (an OAuth refresh per account) stalls socket-activated connections during
+	// a deploy restart, so the real scores are fetched in the background and
+	// swapped in once ready. Per-request 401/429 failover covers the brief
+	// window before fresh scores land.
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
 	if *fetchUsage {
-		fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
-		if successful > 0 {
-			scores = fetchedScores
-		} else {
-			slog.Warn("initial usage score fetch skipped", "reason", "no fresh OAuth usage scores")
-		}
+		go func() {
+			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
+			if successful > 0 {
+				schedulerRef.Set(selectacct.NewScheduler(fetchedScores))
+			} else {
+				slog.Warn("initial usage score fetch skipped", "reason", "no fresh OAuth usage scores")
+			}
+		}()
 	}
-	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(scores))
 	outboundTransport := proxy.NewOutboundTransport()
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
 	initialAccounts = append(initialAccounts, claudeAccounts...)
