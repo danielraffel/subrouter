@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -165,7 +166,11 @@ func (s Store) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
 		configDir := s.ClaudeConfigDir(profile.Name)
 		credential, err := s.ReadCredential(ctx, configDir)
 		if err != nil {
-			return nil, err
+			// One profile with a corrupt credential (e.g. a malformed
+			// keychain blob) must not drop every other Claude account.
+			// Skip it and keep loading the rest.
+			slog.Warn("Claude profile credential unreadable, skipping", "profile", profile.Name, "error", err)
+			continue
 		}
 		account, ok := profileAccount(profile, configDir, credential)
 		if !ok {

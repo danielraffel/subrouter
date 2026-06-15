@@ -186,3 +186,54 @@ func TestPickFallsBackToAPIKeyWhenNoOAuth(t *testing.T) {
 		t.Fatalf("got %q, want apikey:only", got.ID)
 	}
 }
+
+// A Codex account's ID is its bare email and a Claude account's ID is its
+// profile name, which is often the same email, so both providers routinely
+// share one ID. The scheduler must score them independently; keying by the
+// bare ID alone let one provider's score clobber the other's, which made a
+// healthy Codex account look exhausted (and vice versa) whenever a same-named
+// Claude profile existed.
+func TestScoresAreIsolatedPerProvider(t *testing.T) {
+	const shared = "lawrence@cmux.com"
+	scheduler := NewScheduler([]Score{
+		{AccountID: shared, Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: shared, Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	})
+
+	if scheduler.Exhausted(accounts.ProviderCodex, shared) {
+		t.Fatal("healthy Codex account must not be exhausted by a same-named Claude profile")
+	}
+	if !scheduler.UsableForNewSession(accounts.ProviderCodex, shared) {
+		t.Fatal("healthy Codex account must stay usable for a new session")
+	}
+	if !scheduler.Exhausted(accounts.ProviderClaude, shared) {
+		t.Fatal("exhausted Claude profile must stay exhausted")
+	}
+
+	got, err := scheduler.Pick([]accounts.Account{
+		{ID: shared, Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != shared || got.Provider != accounts.ProviderCodex {
+		t.Fatalf("got %q/%s, want the Codex account", got.ID, got.Provider)
+	}
+}
+
+// Independent of ordering: a healthy Claude profile must survive an exhausted
+// same-named Codex account (the reverse clobber direction).
+func TestScoresAreIsolatedPerProviderReversed(t *testing.T) {
+	const shared = "austin@manaflow.ai"
+	scheduler := NewScheduler([]Score{
+		{AccountID: shared, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: shared, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+	})
+
+	if scheduler.Exhausted(accounts.ProviderClaude, shared) {
+		t.Fatal("healthy Claude profile must not be exhausted by a same-named Codex account")
+	}
+	if !scheduler.Exhausted(accounts.ProviderCodex, shared) {
+		t.Fatal("exhausted Codex account must stay exhausted")
+	}
+}

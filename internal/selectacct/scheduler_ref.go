@@ -3,6 +3,8 @@ package selectacct
 import (
 	"sync"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 type SchedulerRef struct {
@@ -32,7 +34,7 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.updatedAt = time.Now()
 }
 
-func (r *SchedulerRef) MarkExhausted(accountID string) {
+func (r *SchedulerRef) MarkExhausted(provider accounts.Provider, accountID string) {
 	if accountID == "" {
 		return
 	}
@@ -40,6 +42,7 @@ func (r *SchedulerRef) MarkExhausted(accountID string) {
 	defer r.mu.Unlock()
 	r.scheduler = r.scheduler.WithScore(Score{
 		AccountID:     accountID,
+		Provider:      provider,
 		Headroom:      0,
 		ShortHeadroom: 0,
 	})

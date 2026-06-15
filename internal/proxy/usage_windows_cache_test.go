@@ -90,7 +90,7 @@ func TestScoreAccountsKeepsOptimisticScoreOnTransientFailure(t *testing.T) {
 		Logger:        nil,
 	}
 	scores := []selectacct.Score{{AccountID: "a@example.com", Headroom: 1, ShortHeadroom: 1}}
-	scoreByID := map[string]int{"a@example.com": 0}
+	scoreByID := map[string]int{selectacct.ScoreKey(accounts.ProviderCodex, "a@example.com"): 0}
 	// Simulate the error-handling branch directly: transient errors must not
 	// zero, auth errors must.
 	transientErr := errors.New("usage fetch failed: 429 Too Many Requests")
@@ -101,7 +101,7 @@ func TestScoreAccountsKeepsOptimisticScoreOnTransientFailure(t *testing.T) {
 	if !authLikeUsageError(authErr.Error()) {
 		t.Fatal("401 must classify as auth error")
 	}
-	setZeroScore(scores, scoreByID, "a@example.com")
+	setZeroScore(scores, scoreByID, accounts.ProviderCodex, "a@example.com")
 	if scores[0].Headroom != 0 {
 		t.Fatal("setZeroScore should zero")
 	}

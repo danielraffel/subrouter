@@ -470,7 +470,7 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 	scores := fallbackScores(codexAccounts)
 	scoreByID := make(map[string]int, len(scores))
 	for i, score := range scores {
-		scoreByID[score.AccountID] = i
+		scoreByID[selectacct.ScoreKey(score.Provider, score.AccountID)] = i
 	}
 
 	var mu sync.Mutex
@@ -489,8 +489,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 			} else if refreshed, _, err := store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored); err != nil {
 				slog.Warn("account refresh failed", "account", account.ID, "error", err)
 				mu.Lock()
-				if idx, ok := scoreByID[account.ID]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Headroom: 0, ShortHeadroom: 0}
+				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+					scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0}
 				}
 				mu.Unlock()
 				return
@@ -501,8 +501,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 			if err != nil {
 				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
 				mu.Lock()
-				if idx, ok := scoreByID[account.ID]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Headroom: 0}
+				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+					scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0}
 				}
 				mu.Unlock()
 				return
@@ -518,8 +518,9 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 				})
 			}
 			score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
+			score.Provider = account.Provider
 			mu.Lock()
-			if idx, ok := scoreByID[account.ID]; ok {
+			if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
 				scores[idx] = score
 				successful++
 			}
@@ -541,7 +542,7 @@ func fallbackScores(codexAccounts []accounts.Account) []selectacct.Score {
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			headroom = 0.01
 		}
-		scores = append(scores, selectacct.Score{AccountID: account.ID, Headroom: headroom, ShortHeadroom: headroom})
+		scores = append(scores, selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: headroom, ShortHeadroom: headroom})
 	}
 	return scores
 }

@@ -74,10 +74,10 @@ func TestSchedulerForSparkModelUsesSparkWindows(t *testing.T) {
 	if got.ID != "spark-healthy" {
 		t.Fatalf("got %q, want spark-healthy", got.ID)
 	}
-	if !scheduler.UsableForNewSession("spark-healthy") {
+	if !scheduler.UsableForNewSession("", "spark-healthy") {
 		t.Fatal("spark-healthy should be usable for a Spark request")
 	}
-	if !scheduler.Exhausted("spark-cooked") {
+	if !scheduler.Exhausted("", "spark-cooked") {
 		t.Fatal("spark-cooked should be exhausted for a Spark request")
 	}
 }
@@ -95,11 +95,11 @@ func TestRegularModelDoesNotMatchSparkPool(t *testing.T) {
 		}),
 	}).ForModel("gpt-5.3-codex")
 
-	if scheduler.Exhausted("acct") {
+	if scheduler.Exhausted("", "acct") {
 		t.Fatal("regular model must use base quota, not the cooked Spark pool")
 	}
-	if math.Abs(scheduler.score("acct").Headroom-0.80) > 0.0001 {
-		t.Fatalf("regular headroom = %.2f, want 0.80 (base)", scheduler.score("acct").Headroom)
+	if math.Abs(scheduler.score("", "acct").Headroom-0.80) > 0.0001 {
+		t.Fatalf("regular headroom = %.2f, want 0.80 (base)", scheduler.score("", "acct").Headroom)
 	}
 }
 
@@ -163,10 +163,10 @@ func TestForModelZeroesAccountsLackingTheFeature(t *testing.T) {
 		}),
 	}).ForModel("gpt-5.3-codex-spark")
 
-	if !scheduler.Exhausted("no-spark") {
+	if !scheduler.Exhausted("", "no-spark") {
 		t.Fatal("account without the Spark pool must score zero for a Spark request")
 	}
-	if scheduler.Exhausted("has-spark") {
+	if scheduler.Exhausted("", "has-spark") {
 		t.Fatal("account with an open Spark pool must be usable")
 	}
 }
@@ -179,8 +179,8 @@ func TestForModelWithoutAnyPoolsFallsBackToBase(t *testing.T) {
 		ScoreFromLimitWindows("a", 0, []LimitWindow{{Name: "5h", UsedPercent: 30}}),
 	}).ForModel("gpt-5.3-codex-spark")
 
-	if math.Abs(scheduler.score("a").Headroom-0.70) > 0.0001 {
-		t.Fatalf("headroom = %.2f, want 0.70 (base, no matching pool)", scheduler.score("a").Headroom)
+	if math.Abs(scheduler.score("", "a").Headroom-0.70) > 0.0001 {
+		t.Fatalf("headroom = %.2f, want 0.70 (base, no matching pool)", scheduler.score("", "a").Headroom)
 	}
 }
 
