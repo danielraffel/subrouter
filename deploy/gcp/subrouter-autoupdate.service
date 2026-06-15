@@ -1,0 +1,8 @@
+[Unit]
+Description=Subrouter auto-update from latest GitHub release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/subrouter-autoupdate.sh
