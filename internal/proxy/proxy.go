@@ -302,7 +302,7 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	defer r.mu.Unlock()
 	replaced := false
 	for i := range r.accounts {
-		if accountMatches(r.accounts[i], account.ID) {
+		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
 			r.accounts[i] = next
 			replaced = true
 			break
@@ -726,7 +726,7 @@ func (r *AccountRef) replace(account accounts.Account) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i := range r.accounts {
-		if accountMatches(r.accounts[i], account.ID) {
+		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
 			r.accounts[i] = account
 			return
 		}
@@ -2492,6 +2492,22 @@ func findAccount(haystack []accounts.Account, id string) (accounts.Account, bool
 		}
 	}
 	return accounts.Account{}, false
+}
+
+// sameProvider reports whether two providers refer to the same upstream,
+// treating the empty provider as Codex (its historical default). Account-list
+// mutations must compare provider too: a Codex account and a Claude account
+// routinely share the same ID (a Codex email equals a Claude profile name), so
+// matching by ID alone let one provider's refresh overwrite the other's entry,
+// dropping the Codex account from selection entirely.
+func sameProvider(a, b accounts.Provider) bool {
+	if a == "" {
+		a = accounts.ProviderCodex
+	}
+	if b == "" {
+		b = accounts.ProviderCodex
+	}
+	return a == b
 }
 
 func accountMatches(account accounts.Account, id string) bool {
