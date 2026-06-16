@@ -169,6 +169,17 @@ func selectionTier(account accounts.Account, score Score) int {
 	return 4
 }
 
+// ScoreFor returns the stored score for an account, or an optimistic default
+// (treated as fully healthy) when none is known. Callers use it to seed a
+// refresh so accounts whose fresh usage could not be fetched preserve their
+// last known score instead of being clobbered with low-confidence data.
+func (s Scheduler) ScoreFor(provider accounts.Provider, accountID string) Score {
+	if score, ok := s.scores[ScoreKey(provider, accountID)]; ok {
+		return score
+	}
+	return Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+}
+
 func (s Scheduler) score(provider accounts.Provider, accountID string) Score {
 	score, ok := s.scores[ScoreKey(provider, accountID)]
 	if !ok {

@@ -37,9 +37,12 @@ func TestFetchUsageWindowsCachedServesFromCacheWithinTTL(t *testing.T) {
 	client := &http.Client{Transport: transport}
 	account := accounts.Account{ID: "a@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
 	for i := 0; i < 3; i++ {
-		windows, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+		windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
 		if err != nil || len(windows) == 0 {
 			t.Fatalf("call %d: windows=%v err=%v", i, windows, err)
+		}
+		if !fresh {
+			t.Fatalf("call %d: within-TTL cache should report fresh", i)
 		}
 	}
 	if transport.calls != 1 {
@@ -52,7 +55,7 @@ func TestFetchUsageWindowsCachedFallsBackToLastGoodOn429(t *testing.T) {
 	ref := &AccountRef{}
 	client := &http.Client{Transport: transport}
 	account := accounts.Account{ID: "a@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
-	if _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err != nil {
 		t.Fatal(err)
 	}
 	// Expire the freshness window but keep the entry as last-good.
@@ -63,12 +66,15 @@ func TestFetchUsageWindowsCachedFallsBackToLastGoodOn429(t *testing.T) {
 	ref.usageWindows[key] = entry
 	ref.usageWindowsMu.Unlock()
 	transport.responses = claudeUsage429
-	windows, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
+	windows, fresh, err := ref.FetchUsageWindowsCached(context.Background(), client, account)
 	if err != nil {
 		t.Fatalf("transient 429 should serve last-good, got error %v", err)
 	}
 	if len(windows) == 0 {
 		t.Fatal("last-good windows missing")
+	}
+	if fresh {
+		t.Fatal("stale last-good fallback must report fresh=false so scoring does not trust it")
 	}
 }
 
@@ -79,7 +85,7 @@ func TestFetchUsageWindowsCachedPropagatesAuthErrors(t *testing.T) {
 	ref := &AccountRef{}
 	client := &http.Client{Transport: transport}
 	account := accounts.Account{ID: "a@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
-	if _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err == nil {
+	if _, _, err := ref.FetchUsageWindowsCached(context.Background(), client, account); err == nil {
 		t.Fatal("auth error should propagate, not be masked")
 	}
 }
