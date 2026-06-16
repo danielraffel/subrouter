@@ -1861,13 +1861,21 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
 	}
-	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.Provider, account.ID) {
-		if scheduler.Exhausted(account.Provider, account.ID) {
-			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no usable OAuth %s accounts available", provider)
-		}
-		if provider == accounts.ProviderCodex && s.Logger != nil {
-			s.Logger.Warn("selected OAuth Codex account below new-session headroom threshold", "account", account.ID, "threshold", selectacct.MinNewSessionHeadroom)
-		}
+	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
+		// Never refuse here based on the scheduler's view. Usage scores can be
+		// stale: the per-request re-score reads usage through a cache that falls
+		// back to stale "last good" data when the upstream usage endpoint
+		// rate-limits, which made healthy accounts look exhausted and produced
+		// bogus "no usable accounts" 503s while real quota existed. The
+		// scheduler is a load-balancing hint, not a hard gate. Route the best
+		// account and let the real upstream response drive per-request
+		// usage-limit failover; a genuinely exhausted account surfaces the
+		// upstream's own 429 instead of a premature rejection.
+		s.Logger.Warn("selected OAuth account below new-session headroom; routing optimistically",
+			"provider", provider,
+			"account", account.ID,
+			"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+			"threshold", selectacct.MinNewSessionHeadroom)
 	}
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
@@ -2302,11 +2310,16 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 	if err != nil {
 		return accounts.Account{}, err
 	}
-	if scheduler.Exhausted(account.Provider, account.ID) {
-		return accounts.Account{}, fmt.Errorf("no non-exhausted OAuth %s accounts available", provider)
-	}
+	// Do not stop failover when the best untried account looks exhausted: scores
+	// can be stale, so trying it (the retry loop is bounded by maxAttempts and
+	// the tried set) is strictly better than refusing an account that may have
+	// quota. A truly exhausted account just returns the upstream's own limit.
 	if !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
-		s.Logger.Warn("usage-limit retry selected OAuth account below new-session headroom threshold", "provider", provider, "account", account.ID, "threshold", selectacct.MinNewSessionHeadroom)
+		s.Logger.Warn("usage-limit retry selecting OAuth account below new-session headroom; trying anyway",
+			"provider", provider,
+			"account", account.ID,
+			"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+			"threshold", selectacct.MinNewSessionHeadroom)
 	}
 	refreshed, err := s.refreshAccount(ctx, account)
 	if err != nil {
