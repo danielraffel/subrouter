@@ -177,9 +177,15 @@ const usageWindowsLastGoodTTL = 15 * time.Minute
 // cascaded: failed fetches zeroed scores and made healthy accounts look
 // exhausted. Fresh-within-TTL returns the cache; a transient fetch failure
 // falls back to the last-known-good windows instead of erroring.
-func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+//
+// The returned bool reports whether the windows are FRESH (a recent successful
+// fetch) versus a STALE last-known-good fallback. Callers must not treat stale
+// windows as a confident exhaustion signal: stale cooked data was overwriting
+// healthy accounts' scores and routing traffic to dead accounts.
+func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
 	if r == nil {
-		return fetchAccountUsageWindowsLive(ctx, client, account)
+		windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
+		return windows, err == nil, err
 	}
 	key := account.ID + "\x00" + string(account.Provider)
 	now := time.Now()
@@ -187,7 +193,7 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 	entry, ok := r.usageWindows[key]
 	r.usageWindowsMu.Unlock()
 	if ok && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), true, nil
 	}
 	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
 	if err == nil {
@@ -197,12 +203,12 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 		}
 		r.usageWindows[key] = usageWindowsEntry{windows: append([]accounts.UsageWindow(nil), windows...), at: now}
 		r.usageWindowsMu.Unlock()
-		return windows, nil
+		return windows, true, nil
 	}
 	if !authLikeUsageError(err.Error()) && ok && now.Sub(entry.at) < usageWindowsLastGoodTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), nil
+		return append([]accounts.UsageWindow(nil), entry.windows...), false, nil
 	}
-	return nil, err
+	return nil, false, err
 }
 
 type AccountStatus struct {
@@ -560,7 +566,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.AuthValid = true
 			r.replace(account)
-			windows, err := r.FetchUsageWindowsCached(ctx, r.client, account)
+			windows, _, err := r.FetchUsageWindowsCached(ctx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -920,20 +926,26 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 }
 
 func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
+	// Seed each account from the scheduler's current score so a refresh that
+	// can't get FRESH usage data for an account preserves its last known score
+	// instead of overwriting it. Previously a refresh built every score from
+	// scratch and, when the usage cache served stale "last good" cooked data
+	// (the upstream usage endpoint rate-limits under load), it clobbered
+	// healthy accounts to exhausted and the router then routed traffic to dead
+	// accounts. A score is only overwritten on confident, fresh evidence.
+	current := s.scheduler()
 	scores := make([]selectacct.Score, 0, len(available))
 	scoreByID := make(map[string]int, len(available))
 	for _, account := range available {
-		headroom := 1.0
+		seed := current.ScoreFor(account.Provider, account.ID)
+		seed.AccountID = account.ID
+		seed.Provider = account.Provider
 		if account.AuthMode == accounts.AuthModeAPIKey {
-			headroom = 0.01
+			seed.Headroom = 0.01
+			seed.ShortHeadroom = 0.01
 		}
 		scoreByID[selectacct.ScoreKey(account.Provider, account.ID)] = len(scores)
-		scores = append(scores, selectacct.Score{
-			AccountID:     account.ID,
-			Provider:      account.Provider,
-			Headroom:      headroom,
-			ShortHeadroom: headroom,
-		})
+		scores = append(scores, seed)
 	}
 
 	client := (*http.Client)(nil)
@@ -954,23 +966,28 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			if s.Logger != nil {
 				s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)
 			}
-			setZeroScore(scores, scoreByID, account.Provider, account.ID)
+			// Only zero on a confident auth failure (dead/invalid token).
+			// Transient refresh errors preserve the seed.
+			if authLikeUsageError(err.Error()) {
+				setZeroScore(scores, scoreByID, account.Provider, account.ID)
+			}
 			continue
 		}
-		windows, err := s.fetchAccountUsageWindows(ctx, client, refreshed)
+		windows, fresh, err := s.fetchAccountUsageWindows(ctx, client, refreshed)
 		if err != nil {
 			if s.Logger != nil {
 				s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
 			}
 			// Auth failures mean the account is unusable; zero it so the
-			// scheduler avoids it. Transient failures (rate limits, network)
-			// keep the optimistic default score: treating unknown as
-			// exhausted herds every session away from healthy accounts, and
-			// per-request usage-limit failover already handles true
-			// exhaustion.
+			// scheduler avoids it. Transient failures preserve the seed.
 			if authLikeUsageError(err.Error()) {
 				setZeroScore(scores, scoreByID, account.Provider, account.ID)
 			}
+			continue
+		}
+		if !fresh {
+			// Stale last-known-good windows are not a confident signal. Keep
+			// the seeded score rather than risk demoting a healthy account.
 			continue
 		}
 		if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
@@ -981,11 +998,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	return scores, scored
 }
 
-func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
+// fetchAccountUsageWindows returns an account's usage windows and whether they
+// are fresh (a recent successful fetch) versus a stale last-known-good fallback.
+func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
 	if s.AccountRef != nil {
 		return s.AccountRef.FetchUsageWindowsCached(ctx, client, account)
 	}
-	return fetchAccountUsageWindowsLive(ctx, client, account)
+	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
+	return windows, err == nil, err
 }
 
 func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
