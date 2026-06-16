@@ -2991,7 +2991,11 @@ func TestHandlerRetriesHTTPUsageLimitToBelowThresholdFallback(t *testing.T) {
 	}
 }
 
-func TestHandlerDoesNotAssignNewSessionToExhaustedOAuthAccount(t *testing.T) {
+// When every OAuth account is scored exhausted, the router must still route
+// optimistically and let the upstream decide, rather than refusing with a 503.
+// Scores can be stale (cached usage behind a rate-limited upstream), and a hard
+// refusal here caused real outages where healthy accounts looked exhausted.
+func TestHandlerRoutesOptimisticallyWhenAllOAuthScoredExhausted(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))
@@ -3036,14 +3040,17 @@ func TestHandlerDoesNotAssignNewSessionToExhaustedOAuthAccount(t *testing.T) {
 	if _, err := io.Copy(io.Discard, response.Body); err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", response.StatusCode)
+	if response.StatusCode == http.StatusServiceUnavailable {
+		t.Fatal("router refused with 503 instead of routing optimistically on stale-exhausted scores")
 	}
-	if len(auths) != 0 {
-		t.Fatalf("upstream auths = %#v, want no upstream request", auths)
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (forwarded upstream)", response.StatusCode)
 	}
-	if _, ok := store.Get("codex", "session-1"); ok {
-		t.Fatal("exhausted account should not be assigned to new session")
+	if len(auths) != 1 {
+		t.Fatalf("upstream auths = %#v, want exactly one forwarded request", auths)
+	}
+	if _, ok := store.Get("codex", "session-1"); !ok {
+		t.Fatal("session should be assigned after optimistic routing")
 	}
 }
 
