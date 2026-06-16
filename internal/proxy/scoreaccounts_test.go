@@ -52,3 +52,41 @@ func TestScoreAccountsPreservesHealthyScoreWhenUsageIsStale(t *testing.T) {
 		t.Fatalf("healthy account clobbered to exhausted by stale usage: %+v", scores[0])
 	}
 }
+
+// Regression: a Codex account and a Claude account routinely share the same ID
+// (a Codex email equals a Claude profile name). Mutating the account list
+// (refresh/replace) must match provider too, or one provider's update silently
+// overwrites the other's entry, dropping it from selection. This is exactly
+// what hid the best Codex accounts (e.g. aziz@cmux.com) behind their Claude
+// namesakes so Codex never routed to them.
+func TestAccountRefReplaceDoesNotClobberAcrossProviders(t *testing.T) {
+	ref := &AccountRef{
+		accounts: []accounts.Account{
+			{ID: "shared@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "codex-tok"},
+			{ID: "shared@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "claude-tok"},
+		},
+	}
+
+	// A Claude-side refresh must update only the Claude entry.
+	ref.replace(accounts.Account{ID: "shared@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "claude-tok-2"})
+
+	all := ref.All()
+	var codex, claude *accounts.Account
+	for i := range all {
+		switch all[i].Provider {
+		case accounts.ProviderCodex:
+			codex = &all[i]
+		case accounts.ProviderClaude:
+			claude = &all[i]
+		}
+	}
+	if codex == nil {
+		t.Fatal("Codex account was clobbered by a same-ID Claude replace")
+	}
+	if codex.Token != "codex-tok" {
+		t.Fatalf("Codex token = %q, want untouched codex-tok", codex.Token)
+	}
+	if claude == nil || claude.Token != "claude-tok-2" {
+		t.Fatalf("Claude entry not updated: %+v", claude)
+	}
+}
