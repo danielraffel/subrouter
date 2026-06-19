@@ -19,6 +19,7 @@ type CodexStore struct {
 
 type StoredCodexAccount struct {
 	Email         string                `json:"email"`
+	Provider      Provider              `json:"provider,omitempty"`
 	AddedAt       string                `json:"addedAt"`
 	Auth          CodexAuthFile         `json:"auth"`
 	ProjectID     string                `json:"projectId,omitempty"`
@@ -161,6 +162,13 @@ func (a StoredCodexAccount) APIKeyLabel() string {
 	return strings.TrimPrefix(a.Email, "apikey:")
 }
 
+func (a StoredCodexAccount) ProviderOrDefault() Provider {
+	if a.Provider != "" {
+		return a.Provider
+	}
+	return ProviderCodex
+}
+
 func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	id := strings.TrimSpace(a.Email)
 	if id == "" {
@@ -170,7 +178,7 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	addedAt, _ := time.Parse(time.RFC3339, a.AddedAt)
 	out := Account{
 		ID:       id,
-		Provider: ProviderCodex,
+		Provider: a.ProviderOrDefault(),
 		Label:    id,
 		Email:    id,
 		AddedAt:  addedAt,
