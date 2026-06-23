@@ -152,6 +152,8 @@ func serve(args []string) error {
 	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
 	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
 	claudeUpstreamRaw := flags.String("claude-upstream", "https://api.anthropic.com", "Claude subscription upstream base URL")
+	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
+	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -201,6 +203,14 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	kimiUpstream, err := url.Parse(*kimiUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	zaiUpstream, err := url.Parse(*zaiUpstreamRaw)
+	if err != nil {
+		return err
+	}
 
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
@@ -247,6 +257,8 @@ func serve(args []string) error {
 		CodexUpstream:  codexUpstream,
 		APIUpstream:    apiUpstream,
 		ClaudeUpstream: claudeUpstream,
+		KimiUpstream:   kimiUpstream,
+		ZAIUpstream:    zaiUpstream,
 		Accounts:       nil,
 		AccountRef:     accountRef,
 		Sessions:       store,
@@ -613,7 +625,7 @@ Usage:
   %[1]s claude             Manage Claude Code profiles
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

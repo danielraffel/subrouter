@@ -565,13 +565,31 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig)
 	return nil
 }
 
-func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig) error {
+func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, args []string) error {
+	command := r.programOrSubrouter() + " add-key"
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(r.errOut)
+	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: codex, kimi, or zai")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	provider, err := parseAPIKeyProvider(*providerRaw)
+	if err != nil {
+		return err
+	}
 	reader := bufio.NewReader(r.in)
 	label, err := promptLine(r.out, reader, "Label (e.g. work, personal): ")
 	if err != nil {
 		return err
 	}
-	key, err := promptLine(r.out, reader, "API key (sk-...): ")
+	keyPrompt := "API key"
+	if provider == accounts.ProviderCodex {
+		keyPrompt = "API key (sk-...)"
+	}
+	key, err := promptLine(r.out, reader, keyPrompt+": ")
 	if err != nil {
 		return err
 	}
@@ -580,12 +598,20 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig) err
 	if label == "" {
 		return fmt.Errorf("label is required")
 	}
-	if !strings.HasPrefix(key, "sk-") {
+	if key == "" {
+		return fmt.Errorf("API key is required")
+	}
+	if provider == accounts.ProviderCodex && !strings.HasPrefix(key, "sk-") {
 		return fmt.Errorf("invalid API key format, expected sk-...")
 	}
+	emailPrefix := "apikey:"
+	if provider != accounts.ProviderCodex {
+		emailPrefix = string(provider) + ":"
+	}
 	account := accounts.StoredCodexAccount{
-		Email:   "apikey:" + label,
-		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Email:    emailPrefix + label,
+		Provider: provider,
+		AddedAt:  time.Now().UTC().Format(time.RFC3339),
 		Auth: accounts.CodexAuthFile{
 			AuthMode:     "apikey",
 			OpenAIAPIKey: key,
@@ -596,6 +622,19 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig) err
 	}
 	fmt.Fprintf(r.out, "Added server API-key account %s to %s\n", account.APIKeyLabel(), server.Name)
 	return nil
+}
+
+func parseAPIKeyProvider(value string) (accounts.Provider, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", string(accounts.ProviderCodex), "openai":
+		return accounts.ProviderCodex, nil
+	case string(accounts.ProviderKimi), "kimi-for-coding":
+		return accounts.ProviderKimi, nil
+	case string(accounts.ProviderZAI), "glm", "glm-5.2":
+		return accounts.ProviderZAI, nil
+	default:
+		return "", fmt.Errorf("unsupported API-key provider %q, expected codex, kimi, or zai", value)
+	}
 }
 
 func (r srRunner) pickRemoteAccount(ctx context.Context, server srServerConfig) error {

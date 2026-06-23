@@ -249,7 +249,7 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		}
 		return r.serverLoginOne(ctx, server, deviceAuth, "")
 	case "add-key", "add-api-key":
-		return r.addKeyToServer(ctx, server)
+		return r.addKeyToServer(ctx, server, args[1:])
 	case "list", "ls":
 		return r.listServerAccounts(ctx, server)
 	case "status":

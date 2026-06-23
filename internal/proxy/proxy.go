@@ -35,6 +35,8 @@ type Server struct {
 	CodexUpstream  *url.URL
 	APIUpstream    *url.URL
 	ClaudeUpstream *url.URL
+	KimiUpstream   *url.URL
+	ZAIUpstream    *url.URL
 	Accounts       []accounts.Account
 	AccountRef     *AccountRef
 	Sessions       *session.Store
@@ -369,9 +371,10 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 	}
 	out := make([]AccountStatus, 0, len(storedAccounts))
 	for _, stored := range storedAccounts {
+		provider := stored.ProviderOrDefault()
 		status := AccountStatus{
 			ID:       stored.Email,
-			Provider: accounts.ProviderCodex,
+			Provider: provider,
 			Email:    stored.Email,
 			Source:   stored.SourcePath(r.store),
 		}
@@ -505,6 +508,17 @@ func authLikeUsageError(message string) bool {
 	return false
 }
 
+func apiKeyPlanType(provider accounts.Provider) string {
+	switch provider {
+	case accounts.ProviderKimi:
+		return "kimi api key"
+	case accounts.ProviderZAI:
+		return "zai api key"
+	default:
+		return "api key"
+	}
+}
+
 func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus {
 	storedAccounts, err := r.store.ListStored()
 	if err != nil {
@@ -522,10 +536,11 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	var wg sync.WaitGroup
 	for i, stored := range storedAccounts {
 		i, stored := i, stored
+		provider := stored.ProviderOrDefault()
 		status := AccountUsageStatus{
 			AccountStatus: AccountStatus{
 				ID:       stored.Email,
-				Provider: accounts.ProviderCodex,
+				Provider: provider,
 				Email:    stored.Email,
 				Source:   stored.SourcePath(r.store),
 			},
@@ -533,7 +548,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}
 		if stored.IsAPIKey() {
 			status.AuthMode = accounts.AuthModeAPIKey
-			status.PlanType = "api key"
+			status.PlanType = apiKeyPlanType(provider)
 			out[i] = status
 			continue
 		}
@@ -1362,12 +1377,14 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
-		account, sessionID, userEmail, err := s.accountForSession(agentType, sessionID, r)
+		requestProvider := providerForRequest(agentType, r.URL.Path)
+		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
+		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		account, err = s.refreshSelectedAccount(r.Context(), agentType, sessionID, userEmail, r, account)
+		account, err = s.refreshSelectedAccount(r.Context(), requestProvider, sessionAgentType, sessionID, userEmail, r, account)
 		if err != nil {
 			http.Error(w, "refresh selected account: "+err.Error(), http.StatusServiceUnavailable)
 			return
@@ -1380,8 +1397,8 @@ func (s Server) proxyHandler() http.Handler {
 		}
 
 		endActive := func() {}
-		if activeSessionRequest(agentType, r) {
-			endActive = s.ActiveSessions.Begin(agentType, sessionID)
+		if activeSessionRequest(sessionAgentType, r) {
+			endActive = s.ActiveSessions.Begin(sessionAgentType, sessionID)
 			defer endActive()
 		}
 
@@ -1393,7 +1410,7 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if websocket.IsWebSocketUpgrade(r) {
-			s.proxyWebSocket(w, r, account, agentType, sessionID, userEmail, upstream)
+			s.proxyWebSocket(w, r, account, sessionAgentType, sessionID, userEmail, upstream)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -1401,7 +1418,6 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
-		requestProvider := providerForAgent(agentType)
 		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
 		postReplayable := false
 		if retryPost {
@@ -1412,14 +1428,14 @@ func (s Server) proxyHandler() http.Handler {
 				return
 			}
 			if !postReplayable && s.Logger != nil {
-				s.Logger.Warn("retryable request body exceeds retry buffer", "agent", agentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "content_length", r.ContentLength, "max_bytes", replayablePostMaxBodyBytes)
+				s.Logger.Warn("retryable request body exceeds retry buffer", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "content_length", r.ContentLength, "max_bytes", replayablePostMaxBodyBytes)
 			}
 		}
-		s.recordHTTPMeta(proxyRequest, agentType, sessionID, userEmail, account, upstream)
+		s.recordHTTPMeta(proxyRequest, sessionAgentType, sessionID, userEmail, account, upstream)
 		if retryPost && postReplayable {
-			s.recordReplayableRequestBody(proxyRequest, agentType, sessionID)
+			s.recordReplayableRequestBody(proxyRequest, sessionAgentType, sessionID)
 		} else {
-			s.captureRequestBody(proxyRequest, agentType, sessionID)
+			s.captureRequestBody(proxyRequest, sessionAgentType, sessionID)
 		}
 
 		rp := httputil.NewSingleHostReverseProxy(upstream)
@@ -1432,7 +1448,7 @@ func (s Server) proxyHandler() http.Handler {
 				server:      &s,
 				logger:      s.Logger,
 				provider:    requestProvider,
-				agent:       agentType,
+				agent:       sessionAgentType,
 				session:     sessionID,
 				userEmail:   userEmail,
 				account:     account.ID,
@@ -1446,7 +1462,7 @@ func (s Server) proxyHandler() http.Handler {
 			transport = replayablePostRetryTransport{
 				base:        transport,
 				logger:      s.Logger,
-				agent:       agentType,
+				agent:       sessionAgentType,
 				session:     sessionID,
 				account:     account.ID,
 				method:      r.Method,
@@ -1463,13 +1479,13 @@ func (s Server) proxyHandler() http.Handler {
 			r.Host = upstream.Host
 		}
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, agentType, sessionID, account.ID, account.Provider, proxyRequest.URL.Path)
+			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, proxyRequest.URL.Path)
 			return nil
 		}
 		if s.Logger != nil {
 			rp.ErrorLog = log.New(proxyErrorWriter{
 				logger:   s.Logger,
-				agent:    agentType,
+				agent:    sessionAgentType,
 				session:  sessionID,
 				account:  account.ID,
 				method:   r.Method,
@@ -1477,13 +1493,13 @@ func (s Server) proxyHandler() http.Handler {
 				upstream: upstream.Host,
 			}, "", 0)
 			rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-				s.Logger.Error("proxy request failed", "agent", agentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
+				s.Logger.Error("proxy request failed", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
 				http.Error(w, "upstream request failed", http.StatusBadGateway)
 			}
 		}
 
 		if s.Logger != nil {
-			s.Logger.Info("proxy request", "agent", agentType, "session", sessionID, "user", userEmail, "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host)
+			s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user", userEmail, "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host)
 		}
 
 		// For cacheable GET paths, buffer the response so we can store it.
@@ -1612,7 +1628,7 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, direction
 			})
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage && usageLimitJSON(body) {
-			s.markAccountExhausted(providerForAgent(agentType), accountID)
+			s.markAccountExhausted(providerForRequest(agentType, ""), accountID)
 		}
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
@@ -1973,6 +1989,14 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 	case accounts.ProviderClaude:
 		headers.Del("X-Api-Key")
 		ensureCommaHeaderValue(headers, "Anthropic-Beta", claudeOAuthBetaHeader)
+	case accounts.ProviderKimi:
+		headers.Set("Authorization", account.AuthorizationHeader())
+		headers.Set("X-Api-Key", account.Token)
+		if headers.Get("Anthropic-Version") == "" {
+			headers.Set("Anthropic-Version", "2023-06-01")
+		}
+	case accounts.ProviderZAI:
+		headers.Del("X-Api-Key")
 	case accounts.ProviderCodex, "":
 		if account.AccountID != "" {
 			headers.Set("ChatGPT-Account-ID", account.AccountID)
@@ -2001,6 +2025,12 @@ func (s Server) upstreamForRequest(path string, account accounts.Account) *url.U
 	if account.Provider == accounts.ProviderClaude {
 		return s.ClaudeUpstream
 	}
+	if account.Provider == accounts.ProviderKimi {
+		return s.KimiUpstream
+	}
+	if account.Provider == accounts.ProviderZAI {
+		return s.ZAIUpstream
+	}
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return s.APIUpstream
 	}
@@ -2019,6 +2049,12 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 	}
 	if account.Provider == accounts.ProviderClaude {
 		return path
+	}
+	if account.Provider == accounts.ProviderKimi {
+		return stripProviderPathPrefix(path, "kimi")
+	}
+	if account.Provider == accounts.ProviderZAI {
+		return stripProviderPathPrefix(path, "zai")
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
 		if stripped, ok := stripChatGPTBackendPath(path); ok {
@@ -2076,10 +2112,13 @@ func (s Server) accountFor(agentType string, r *http.Request) (accounts.Account,
 }
 
 func (s Server) accountForSession(agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
+	return s.accountForSessionProvider(providerForRequest(agentType, r.URL.Path), agentType, sessionID, r)
+}
+
+func (s Server) accountForSessionProvider(provider accounts.Provider, agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := session.ExtractAccountID(r)
 	model := session.ExtractModel(r, s.MaxBodyBytes)
-	provider := providerForAgent(agentType)
 	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
 	if forcedAccountID != "" {
 		account, ok := findAccount(availableAccounts, forcedAccountID)
@@ -2163,7 +2202,7 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 }
 
 func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) {
-	if s.Logger == nil || providerForAgent(agentType) != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
+	if s.Logger == nil || accountProviderOrCodex(account) != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
 		return
 	}
 	if scheduler.UsableForNewSession(account.Provider, account.ID) || scheduler.Exhausted(account.Provider, account.ID) || !s.activeSession(agentType, sessionID) {
@@ -2185,7 +2224,7 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 	if s.activeSession(agentType, sessionID) {
 		return true
 	}
-	if providerForAgent(agentType) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
+	if accountProviderOrCodex(account) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
 		return scheduler.UsableForNewSession(account.Provider, account.ID)
 	}
 	return true
@@ -2285,6 +2324,56 @@ func providerForAgent(agentType string) accounts.Provider {
 	}
 }
 
+func providerForRequest(agentType, path string) accounts.Provider {
+	if provider, ok := providerForPath(path); ok {
+		return provider
+	}
+	return providerForAgent(agentType)
+}
+
+func agentTypeForProviderSession(agentType string, provider accounts.Provider) string {
+	switch provider {
+	case accounts.ProviderKimi, accounts.ProviderZAI:
+		return string(provider)
+	default:
+		return agentType
+	}
+}
+
+func providerForPath(path string) (accounts.Provider, bool) {
+	switch firstPathSegment(path) {
+	case "kimi":
+		return accounts.ProviderKimi, true
+	case "zai":
+		return accounts.ProviderZAI, true
+	default:
+		return "", false
+	}
+}
+
+func firstPathSegment(path string) string {
+	path = strings.TrimPrefix(path, "/")
+	if path == "" {
+		return ""
+	}
+	segment, _, _ := strings.Cut(path, "/")
+	return segment
+}
+
+func stripProviderPathPrefix(path, provider string) string {
+	if path == "" || path == "/" {
+		return "/"
+	}
+	prefix := "/" + provider
+	if path == prefix {
+		return "/"
+	}
+	if strings.HasPrefix(path, prefix+"/") {
+		return strings.TrimPrefix(path, prefix)
+	}
+	return path
+}
+
 func filterAccountsForProvider(all []accounts.Account, provider accounts.Provider) []accounts.Account {
 	filtered := make([]accounts.Account, 0, len(all))
 	legacy := make([]accounts.Account, 0)
@@ -2300,7 +2389,17 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	if len(filtered) > 0 {
 		return filtered
 	}
+	if provider == accounts.ProviderKimi || provider == accounts.ProviderZAI {
+		return nil
+	}
 	return legacy
+}
+
+func accountProviderOrCodex(account accounts.Account) accounts.Provider {
+	if account.Provider == "" {
+		return accounts.ProviderCodex
+	}
+	return account.Provider
 }
 
 func (s Server) accountList() []accounts.Account {
@@ -2318,12 +2417,11 @@ func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (a
 	return s.AccountRef.Refresh(ctx, account)
 }
 
-func (s Server) refreshSelectedAccount(ctx context.Context, agentType, sessionID, userEmail string, r *http.Request, account accounts.Account) (accounts.Account, error) {
+func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, r *http.Request, account accounts.Account) (accounts.Account, error) {
 	refreshed, err := s.refreshAccount(ctx, account)
 	if err == nil {
 		return refreshed, nil
 	}
-	provider := providerForAgent(agentType)
 	if provider != accounts.ProviderClaude || session.ExtractAccountID(r) != "" {
 		return account, err
 	}

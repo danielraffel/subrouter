@@ -7,6 +7,8 @@ type Provider string
 const (
 	ProviderCodex  Provider = "codex"
 	ProviderClaude Provider = "claude"
+	ProviderKimi   Provider = "kimi"
+	ProviderZAI    Provider = "zai"
 )
 
 type AuthMode string
