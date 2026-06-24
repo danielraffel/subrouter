@@ -1,0 +1,241 @@
+package proxy
+
+import (
+	"bytes"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/internal/session"
+)
+
+// realisticAnthropic429Body mirrors the body Anthropic returns when a Claude
+// subscription account hits its rolling rate limit. The exact wording is what we
+// want to surface in logs so operators can see "what the message is like".
+const realisticAnthropic429Body = `{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}`
+
+// TestClaude429FailoverEndToEndAndCaptured drives a real request through
+// Server.Handler() with a mock Anthropic upstream that rate-limits the first
+// account. It proves two things the user asked for: (1) the genuine 429 message
+// and rate-limit headers are captured in logs, and (2) traffic fails over to a
+// second Claude account and succeeds.
+func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
+	var cookedHits, freshHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		auth := r.Header.Get("Authorization")
+		switch {
+		case strings.Contains(auth, "tok-cooked"):
+			cookedHits++
+			w.Header().Set("Retry-After", "3600")
+			w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			w.Header().Set("Anthropic-Ratelimit-Unified-Reset", "1750000000")
+			w.Header().Set("Anthropic-Ratelimit-Unified-Remaining", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(realisticAnthropic429Body))
+		case strings.Contains(auth, "tok-fresh"):
+			freshHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"msg_ok","type":"message"}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unexpected account"}`))
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pin the session to the cooked account so it is selected first; the 429
+	// then forces failover. Both accounts start healthy so the sticky
+	// assignment is honored until the upstream rejects it.
+	if _, err := store.Put("claude", "session-rl", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+	}))
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
+		},
+		Sessions:      store,
+		SchedulerRef:  schedulerRef,
+		UsageScoreTTL: 0,
+		MaxBodyBytes:  1 << 20,
+		Logger:        logger,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-rl")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after failover; body=%s", response.StatusCode, string(body))
+	}
+	if cookedHits != 1 {
+		t.Fatalf("cooked upstream hits = %d, want 1 (one 429 then failover)", cookedHits)
+	}
+	if freshHits != 1 {
+		t.Fatalf("fresh upstream hits = %d, want 1 (served after failover)", freshHits)
+	}
+	if !schedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("cooked account should be marked exhausted by the 429")
+	}
+	assignment, ok := store.Get("claude", "session-rl")
+	if !ok || assignment.AccountID != "fresh@example.com" {
+		t.Fatalf("sticky assignment = %+v, want moved to fresh@example.com", assignment)
+	}
+
+	logs := logBuf.String()
+	// The genuine upstream message must be captured so operators can see it.
+	if !strings.Contains(logs, "This request would exceed your account") {
+		t.Fatalf("expected the 429 body to be logged; logs=\n%s", logs)
+	}
+	// The rate-limit headers must be captured too.
+	for _, want := range []string{"retry-after", "anthropic-ratelimit-unified-reset"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("expected rate-limit header %q in logs; logs=\n%s", want, logs)
+		}
+	}
+}
+
+func floatPtr(v float64) *float64 { return &v }
+
+// TestClaudeUsageWindowsClassifyFiveHourAsShort guards the GTO routing fix:
+// the 5h window must be tagged with its window length so the scheduler treats it
+// as the short window. Without LimitWindowSeconds the scheduler could not tell
+// the 5h rate limit apart from the 7d one, so ShortHeadroom, the 5h reset, and
+// ExpiryPressure were all dead and the routing calculation ignored the 5h limit.
+func TestClaudeUsageWindowsClassifyFiveHourAsShort(t *testing.T) {
+	usage := &agentclaude.UsageResponse{
+		// 5h window is nearly drained and resets soon; 7d window is healthy.
+		FiveHour: &agentclaude.RateLimit{Utilization: floatPtr(95), ResetsAt: time.Now().Add(30 * time.Minute).Format(time.RFC3339)},
+		SevenDay: &agentclaude.RateLimit{Utilization: floatPtr(10), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+	}
+	windows := claudeUsageWindows(usage)
+
+	var fiveHour, sevenDay *accounts.UsageWindow
+	for i := range windows {
+		switch windows[i].Name {
+		case "5h":
+			fiveHour = &windows[i]
+		case "7d":
+			sevenDay = &windows[i]
+		}
+	}
+	if fiveHour == nil || sevenDay == nil {
+		t.Fatalf("missing windows: %+v", windows)
+	}
+	if fiveHour.LimitWindowSeconds != 5*60*60 {
+		t.Fatalf("5h LimitWindowSeconds = %d, want %d", fiveHour.LimitWindowSeconds, 5*60*60)
+	}
+	if sevenDay.LimitWindowSeconds != 7*24*60*60 {
+		t.Fatalf("7d LimitWindowSeconds = %d, want %d", sevenDay.LimitWindowSeconds, 7*24*60*60)
+	}
+
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
+	// Overall headroom is the min remaining (driven by the cooked 5h window).
+	if score.Headroom > 0.06 {
+		t.Fatalf("Headroom = %.3f, want ~0.05 (driven by 5h window)", score.Headroom)
+	}
+	// Short headroom must come from the 5h window specifically.
+	if score.ShortHeadroom > 0.06 {
+		t.Fatalf("ShortHeadroom = %.3f, want ~0.05 from the 5h window", score.ShortHeadroom)
+	}
+	// The 5h reset must be carried so the scheduler can compute expiry pressure.
+	if score.ShortResetAfterSeconds <= 0 {
+		t.Fatalf("ShortResetAfterSeconds = %d, want > 0 (5h reset)", score.ShortResetAfterSeconds)
+	}
+	if score.ExpiryPressure <= 0 {
+		t.Fatal("ExpiryPressure should be > 0 once the 5h window is classified as short")
+	}
+}
+
+// TestClaudeShortWindowDrivesRouting proves the routing calculation now prefers
+// the account with more 5h headroom even when both accounts have identical
+// account-wide (7d) headroom. Before the fix both scored equal short headroom.
+func TestClaudeShortWindowDrivesRouting(t *testing.T) {
+	drained := scoreFromUsageWindows(accounts.ProviderClaude, "drained", claudeUsageWindows(&agentclaude.UsageResponse{
+		FiveHour: &agentclaude.RateLimit{Utilization: floatPtr(90), ResetsAt: time.Now().Add(time.Hour).Format(time.RFC3339)},
+		SevenDay: &agentclaude.RateLimit{Utilization: floatPtr(10), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+	}))
+	fresh := scoreFromUsageWindows(accounts.ProviderClaude, "fresh", claudeUsageWindows(&agentclaude.UsageResponse{
+		FiveHour: &agentclaude.RateLimit{Utilization: floatPtr(10), ResetsAt: time.Now().Add(time.Hour).Format(time.RFC3339)},
+		SevenDay: &agentclaude.RateLimit{Utilization: floatPtr(10), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+	}))
+
+	scheduler := selectacct.NewScheduler([]selectacct.Score{drained, fresh})
+	picked, err := scheduler.Pick([]accounts.Account{
+		{ID: "drained", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "fresh", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "fresh" {
+		t.Fatalf("scheduler picked %q, want fresh (more 5h headroom)", picked.ID)
+	}
+}
+
+func TestClaudeRateLimitHeaderFields(t *testing.T) {
+	header := http.Header{}
+	header.Set("Retry-After", "3600")
+	header.Set("Anthropic-Ratelimit-Unified-Reset", "1750000000")
+	header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+	header.Set("Content-Type", "application/json")
+	header.Set("X-Should-Not-Appear", "secret")
+
+	fields := claudeRateLimitHeaderFields(header)
+	got := map[string]string{}
+	for i := 0; i+1 < len(fields); i += 2 {
+		got[fields[i].(string)] = fields[i+1].(string)
+	}
+	if got["retry-after"] != "3600" {
+		t.Fatalf("retry-after = %q, want 3600", got["retry-after"])
+	}
+	if got["anthropic-ratelimit-unified-reset"] != "1750000000" {
+		t.Fatalf("reset = %q, want 1750000000", got["anthropic-ratelimit-unified-reset"])
+	}
+	if _, ok := got["content-type"]; ok {
+		t.Fatal("content-type should not be captured as a rate-limit field")
+	}
+	if _, ok := got["x-should-not-appear"]; ok {
+		t.Fatal("unrelated headers must not be captured")
+	}
+}

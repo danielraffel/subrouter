@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -683,13 +684,21 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		return nil
 	}
 	var windows []accounts.UsageWindow
-	add := func(name string, limit *agentclaude.RateLimit) {
+	// LimitWindowSeconds lets the scheduler classify a window as "short"
+	// (<= 6h) versus account-wide. Anthropic's usage endpoint reports
+	// utilization and a reset time but not the window length, so we encode the
+	// known fixed lengths here. Without this the 5h window is never recognized
+	// as short, so ShortHeadroom/ShortResetAfterSeconds/ExpiryPressure stay
+	// dead for every Claude account and the GTO routing calculation ignores the
+	// 5h rate limit (the one that actually bites mid-session).
+	add := func(name string, windowSeconds int64, limit *agentclaude.RateLimit) {
 		if limit == nil || limit.Utilization == nil {
 			return
 		}
 		window := accounts.UsageWindow{
-			Name:        name,
-			UsedPercent: *limit.Utilization,
+			Name:               name,
+			UsedPercent:        *limit.Utilization,
+			LimitWindowSeconds: windowSeconds,
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())
@@ -700,10 +709,14 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		}
 		windows = append(windows, window)
 	}
-	add("5h", usage.FiveHour)
-	add("7d", usage.SevenDay)
-	add("opus-weekly", usage.SevenDayOpus)
-	add("sonnet-weekly", usage.SevenDaySonnet)
+	const (
+		fiveHourSeconds = int64(5 * 60 * 60)
+		sevenDaySeconds = int64(7 * 24 * 60 * 60)
+	)
+	add("5h", fiveHourSeconds, usage.FiveHour)
+	add("7d", sevenDaySeconds, usage.SevenDay)
+	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
+	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
 		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
 	}
@@ -1803,19 +1816,45 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
 	// request, so drop it from selection and let failover pick another.
-	if provider == accounts.ProviderClaude && accountID != "" && claudeAccountUnusableStatus(response.StatusCode) {
+	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" && claudeAccountUnusableStatus(response.StatusCode)
+	if claudeUnusable {
 		s.markAccountExhausted(provider, accountID)
+		// Surface the genuine upstream rate-limit signal (headers now, body
+		// prefix below). Anthropic conveys subscription exhaustion only via the
+		// status plus these headers and an opaque JSON body, none of which were
+		// logged before, so the actual 429 message was invisible in the wild.
+		if s.Logger != nil {
+			s.Logger.Warn("claude account unusable upstream response",
+				append([]any{
+					"agent", agentType,
+					"session", sessionID,
+					"account", accountID,
+					"path", path,
+					"status", response.StatusCode,
+				}, claudeRateLimitHeaderFields(response.Header)...)...)
+		}
 	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit) {
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !claudeUnusable) {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
 	var inspect func([]byte)
-	if inspectUsageLimit {
+	if inspectUsageLimit || claudeUnusable {
+		loggedBody := false
 		inspect = func(body []byte) {
-			if usageLimitJSON(body) {
+			if inspectUsageLimit && usageLimitJSON(body) {
 				s.markAccountExhausted(provider, accountID)
+			}
+			if claudeUnusable && !loggedBody && s.Logger != nil {
+				loggedBody = true
+				s.Logger.Warn("claude account unusable upstream body",
+					"agent", agentType,
+					"session", sessionID,
+					"account", accountID,
+					"path", path,
+					"status", response.StatusCode,
+					"body", string(body))
 			}
 		}
 	}
@@ -2594,6 +2633,30 @@ func claudeAccountUnusableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code == http.StatusUnauthorized
 }
 
+// claudeRateLimitHeaderFields extracts the upstream rate-limit headers Anthropic
+// returns on a 429/401 (retry-after plus the anthropic-ratelimit-unified-*
+// family) as flat key/value slog fields, so the genuine reset/remaining signal
+// is captured in logs instead of being silently dropped.
+func claudeRateLimitHeaderFields(header http.Header) []any {
+	if header == nil {
+		return nil
+	}
+	type kv struct{ key, value string }
+	pairs := make([]kv, 0, len(header))
+	for key, values := range header {
+		lower := strings.ToLower(key)
+		if lower == "retry-after" || strings.HasPrefix(lower, "anthropic-ratelimit") {
+			pairs = append(pairs, kv{key: lower, value: strings.Join(values, ",")})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+	fields := make([]any, 0, len(pairs)*2)
+	for _, pair := range pairs {
+		fields = append(fields, pair.key, pair.value)
+	}
+	return fields
+}
+
 func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	maxAttempts := t.maxAttempts
 	if maxAttempts < 1 {
@@ -2623,6 +2686,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		if !usageLimited {
 			return response, nil
+		}
+		if t.provider == accounts.ProviderClaude {
+			// Surface the genuine upstream rate-limit signal. The active retry
+			// path consumes this 429 before the passive ModifyResponse capture
+			// runs, so without logging here the real message would be invisible
+			// whenever failover succeeds.
+			t.logClaudeUnusableResponse(response, accountID)
 		}
 		if t.server != nil {
 			t.server.markAccountExhausted(t.provider, accountID)
@@ -2660,6 +2730,44 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 	}
 	return base.RoundTrip(req)
+}
+
+// logClaudeUnusableResponse logs the upstream rate-limit headers and a bounded
+// body prefix for a Claude 429/401, then restores the body so a final-attempt
+// response can still be returned to the client intact.
+func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Response, accountID string) {
+	if t.logger == nil || response == nil {
+		return
+	}
+	t.logger.Warn("claude account unusable upstream response",
+		append([]any{
+			"agent", t.agent,
+			"session", t.session,
+			"account", accountID,
+			"method", t.method,
+			"path", t.path,
+			"upstream", t.upstream,
+			"status", response.StatusCode,
+		}, claudeRateLimitHeaderFields(response.Header)...)...)
+	if response.Body == nil {
+		return
+	}
+	prefix, err := io.ReadAll(io.LimitReader(response.Body, usageLimitInspectMaxBytes+1))
+	response.Body = prefixReadCloser{
+		Reader: io.MultiReader(bytes.NewReader(prefix), response.Body),
+		Closer: response.Body,
+	}
+	if err != nil {
+		return
+	}
+	t.logger.Warn("claude account unusable upstream body",
+		"agent", t.agent,
+		"session", t.session,
+		"account", accountID,
+		"method", t.method,
+		"path", t.path,
+		"status", response.StatusCode,
+		"body", string(prefix))
 }
 
 func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
