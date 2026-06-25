@@ -350,6 +350,7 @@ func TestClaudeRejectedHeaderOn200FailsOver(t *testing.T) {
 		t.Fatal(err)
 	}
 	var cookedHits, freshHits int
+	const secretCompletion = "SECRET_USER_COMPLETION_CONTENT"
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
 			cookedHits++
@@ -357,15 +358,18 @@ func TestClaudeRejectedHeaderOn200FailsOver(t *testing.T) {
 			// 200 OK, but Anthropic flags the account out of quota (served via overage).
 			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 			h.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
-			return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_overage"}`))}
+			// A rejected 200 carries a real completion; it must never be logged.
+			return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_overage","text":"` + secretCompletion + `"}`))}
 		}
 		freshHits++
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
 		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
 	}}
+	var logBuf bytes.Buffer
+	server.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	transport := usageLimitRetryTransport{
-		base: stub, server: &server, provider: accounts.ProviderClaude,
+		base: stub, server: &server, logger: server.Logger, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-rej", account: "cooked@example.com",
 		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
 	}
@@ -399,6 +403,18 @@ func TestClaudeRejectedHeaderOn200FailsOver(t *testing.T) {
 	assignment, ok := store.Get("claude", "session-rej")
 	if !ok || assignment.AccountID != "fresh@example.com" {
 		t.Fatalf("sticky assignment = %+v, want moved to fresh@example.com", assignment)
+	}
+	// Privacy: the rejected 200's completion body must never be logged.
+	logs := logBuf.String()
+	if strings.Contains(logs, secretCompletion) {
+		t.Fatalf("leaked Claude completion content into logs; logs=\n%s", logs)
+	}
+	if strings.Contains(logs, "claude account unusable upstream body") {
+		t.Fatalf("must not log a body for a 2xx rejected response; logs=\n%s", logs)
+	}
+	// But the rejected signal itself (headers) should still be captured.
+	if !strings.Contains(logs, "claude account unusable upstream response") {
+		t.Fatalf("expected the rejected-header signal to be logged; logs=\n%s", logs)
 	}
 }
 

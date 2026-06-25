@@ -1857,7 +1857,10 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 			if inspectUsageLimit && usageLimitJSON(body) {
 				s.markAccountExhausted(provider, accountID)
 			}
-			if claudeUnusable && !loggedBody && s.Logger != nil {
+			// Only log the body for error responses. A rejected-header 200
+			// (overage) is a real Claude completion, so logging its body would
+			// leak user/model content; the headers already carry the signal.
+			if claudeUnusable && response.StatusCode >= 400 && !loggedBody && s.Logger != nil {
 				loggedBody = true
 				s.Logger.Warn("claude account unusable upstream body",
 					"agent", agentType,
@@ -2855,7 +2858,11 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 			"upstream", t.upstream,
 			"status", response.StatusCode,
 		}, claudeRateLimitHeaderFields(response.Header)...)...)
-	if response.Body == nil {
+	// Never read or log a 2xx body: a rejected-header 200 (served via overage)
+	// contains a real Claude completion, so logging it would leak user/model
+	// content. Only error responses carry a rate-limit error envelope worth
+	// capturing; the headers above already convey the rejected signal.
+	if response.Body == nil || response.StatusCode < 400 {
 		return
 	}
 	prefix, err := io.ReadAll(io.LimitReader(response.Body, usageLimitInspectMaxBytes+1))
