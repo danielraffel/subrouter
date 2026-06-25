@@ -339,6 +339,103 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
+// TestClaudeRejectedHeaderOn200FailsOver is the Aziz regression: a depleted
+// account answers 200 via overage but sets anthropic-ratelimit-unified-status:
+// rejected, which Claude Code hard-blocks on. subrouter must treat that 200 as
+// unusable, fail over to a healthy account, return the healthy (allowed)
+// response to the client, and mark the depleted account exhausted.
+func TestClaudeRejectedHeaderOn200FailsOver(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-rej", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var cookedHits, freshHits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			cookedHits++
+			h := http.Header{}
+			// 200 OK, but Anthropic flags the account out of quota (served via overage).
+			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			h.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
+			return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_overage"}`))}
+		}
+		freshHits++
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-rej", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	// The client must receive the healthy account's response, not the rejected one.
+	if !strings.Contains(string(body), "msg_fresh") {
+		t.Fatalf("client got %q, want the healthy account's response", string(body))
+	}
+	if response.Header.Get("Anthropic-Ratelimit-Unified-Status") != "allowed" {
+		t.Fatalf("client header status = %q, want allowed", response.Header.Get("Anthropic-Ratelimit-Unified-Status"))
+	}
+	if cookedHits != 1 || freshHits != 1 {
+		t.Fatalf("hits cooked=%d fresh=%d, want 1/1 (rejected 200 then failover)", cookedHits, freshHits)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("a rejected-header 200 must mark the depleted account exhausted")
+	}
+	assignment, ok := store.Get("claude", "session-rej")
+	if !ok || assignment.AccountID != "fresh@example.com" {
+		t.Fatalf("sticky assignment = %+v, want moved to fresh@example.com", assignment)
+	}
+}
+
+// TestClaudeAllowedHeaderOn200DoesNotFailOver guards against over-rerouting: a
+// normal 200 with allowed/allowed_warning must pass straight through.
+func TestClaudeAllowedHeaderOn200DoesNotFailOver(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-ok", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var hits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		hits++
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "allowed_warning")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-ok", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1 (no failover on allowed_warning)", hits)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("allowed_warning must not mark the account exhausted")
+	}
+}
+
 func TestClaudeRateLimitHeaderFields(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "3600")

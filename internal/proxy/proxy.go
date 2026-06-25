@@ -1816,12 +1816,17 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
 	// request, so drop it from selection and let failover pick another.
-	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" && claudeAccountUnusableStatus(response.StatusCode)
+	// A 429/401 is unusable by status; a 200 carrying
+	// anthropic-ratelimit-unified-status=rejected is also unusable, because the
+	// account is depleted (served via overage) and Claude Code hard-blocks the
+	// user on that header even though the request "succeeded".
+	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" &&
+		(claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejected(response.Header))
 	if claudeUnusable {
 		// Only poison the routing score when the account is genuinely out of
-		// quota (401, or a 429 the upstream marks "rejected"). A transient
-		// "allowed"/"allowed_warning" 429 still fails over for this request but
-		// must not mark a healthy account exhausted.
+		// quota (401, a 429 the upstream marks "rejected", or any response with
+		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
+		// fails over for this request but must not mark a healthy account exhausted.
 		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
 			s.markAccountExhausted(provider, accountID)
 		}
@@ -2624,7 +2629,16 @@ type usageLimitRetryTransport struct {
 // by status alone.
 func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) (bool, error) {
 	if t.provider == accounts.ProviderClaude {
-		return response != nil && claudeAccountUnusableStatus(response.StatusCode), nil
+		if response == nil {
+			return false, nil
+		}
+		// Fail over on a hard status (429/401) OR on the authoritative
+		// out-of-quota header even when the upstream answered 200 via overage.
+		// Anthropic serves a "rejected" account through paid overage and returns
+		// 200, but Claude Code reads anthropic-ratelimit-unified-status=rejected
+		// and hard-blocks the user, so a 200 from a rejected account is unusable
+		// from the client's view and must be rerouted to a healthy account.
+		return claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejected(response.Header), nil
 	}
 	return responseUsageLimit(response)
 }
@@ -2647,20 +2661,35 @@ func claudeAccountUnusableStatus(code int) bool {
 // of quota, while "allowed"/"allowed_warning" mean a transient or
 // non-subscription throttle that must NOT poison a healthy account's score. When
 // the header is absent we fall back to the conservative legacy behavior and
-// treat the 429 as exhaustion.
+// treat the 429 as exhaustion. A "rejected" header marks the account exhausted
+// regardless of HTTP status, because Anthropic answers a depleted account with
+// 200 via overage while still reporting rejected.
 func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
 	if status == http.StatusUnauthorized {
 		return true
 	}
-	if status != http.StatusTooManyRequests {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-status"))) {
-	case "allowed", "allowed_warning":
-		return false
-	default:
+	switch claudeUnifiedStatus(header) {
+	case "rejected":
 		return true
+	case "allowed", "allowed_warning":
+		// Healthy or merely warned; a 429 here is a transient/non-subscription
+		// throttle that must not poison the account's routing score.
+		return false
 	}
+	// Header absent: conservative legacy behavior, treat a 429 as exhaustion.
+	return status == http.StatusTooManyRequests
+}
+
+// claudeUnifiedStatus returns the lowercased anthropic-ratelimit-unified-status
+// header ("allowed" | "allowed_warning" | "rejected"), or "" when absent.
+func claudeUnifiedStatus(header http.Header) string {
+	return strings.ToLower(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-status")))
+}
+
+// claudeResponseRejected reports whether Anthropic flagged the account as out of
+// quota for this response, even if it answered 200 via overage.
+func claudeResponseRejected(header http.Header) bool {
+	return claudeUnifiedStatus(header) == "rejected"
 }
 
 func claudeHeaderGet(header http.Header, key string) string {
