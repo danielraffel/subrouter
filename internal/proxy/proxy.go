@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -2891,6 +2892,33 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 		"body", string(prefix))
 }
 
+// isTerminalCredentialError reports whether an account refresh failed because
+// its credential is dead and re-auth is required (so the account should be
+// dropped from selection), as opposed to a transient or context failure.
+func isTerminalCredentialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, terminal := range []string{
+		"invalid_grant",
+		"refresh token not found",
+		"no refresh token",
+		"has no refresh token",
+		"no usable credential",
+		"invalid_client",
+		"unauthorized_client",
+	} {
+		if strings.Contains(msg, terminal) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
 	allCandidates := oauthAccounts(filterAccountsForProvider(s.accountList(), provider))
 	if len(allCandidates) == 0 {
@@ -2938,16 +2966,27 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 		}
 		refreshed, err := s.refreshAccount(ctx, account)
 		if err != nil {
-			// Dead/expired OAuth token (e.g. invalid_grant). Drop the account
-			// from selection and continue to the next untried candidate instead
-			// of failing the whole failover.
+			if ctx.Err() != nil {
+				// The request itself was cancelled or timed out; abort failover
+				// without poisoning the account's routing score.
+				return accounts.Account{}, err
+			}
+			// Skip this account for the rest of THIS failover and try the next
+			// untried candidate. Only poison the routing score for a terminal
+			// credential failure (a dead/expired refresh token, invalid_grant); a
+			// transient refresh failure (network blip, token-service hiccup,
+			// keychain error) must not mark an otherwise-healthy account exhausted.
 			tried[account.ID] = struct{}{}
-			s.markAccountExhausted(provider, account.ID)
 			lastErr = err
+			terminal := isTerminalCredentialError(err)
+			if terminal {
+				s.markAccountExhausted(provider, account.ID)
+			}
 			if s.Logger != nil {
 				s.Logger.Warn("usage-limit retry skipping OAuth account with failed refresh",
 					"provider", provider,
 					"account", account.ID,
+					"terminal", terminal,
 					"error", err)
 			}
 			continue

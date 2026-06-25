@@ -567,6 +567,90 @@ func TestClaudeFailoverSkipsDeadTokenAccount(t *testing.T) {
 	}
 }
 
+// TestClaudeFailoverTransientRefreshErrorNotPoisoned guards the refinement: a
+// transient refresh failure (not a dead token) must skip the account for this
+// request but must NOT mark it exhausted, so it stays eligible for future
+// routing once the transient condition clears.
+func TestClaudeFailoverTransientRefreshErrorNotPoisoned(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "session-tr", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+			{ID: "blip@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-blip"},
+			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
+		},
+		Sessions:     store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		ScoreAccounts: func(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
+			h := map[string]float64{"cooked@example.com": 0, "blip@example.com": 1.0, "fresh@example.com": 0.9}
+			scores := make([]selectacct.Score, 0, len(available))
+			for _, a := range available {
+				scores = append(scores, selectacct.Score{AccountID: a.ID, Provider: a.Provider, Headroom: h[a.ID], ShortHeadroom: h[a.ID]})
+			}
+			return scores, len(scores)
+		},
+		// blip@ fails with a transient (non-credential) error, not a dead token.
+		RefreshAccountFn: func(ctx context.Context, a accounts.Account) (accounts.Account, error) {
+			if a.ID == "blip@example.com" {
+				return accounts.Account{}, fmt.Errorf("dial tcp: connection refused")
+			}
+			return a, nil
+		},
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
+		}
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-tr", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_fresh") {
+		t.Fatalf("status=%d body=%s, want 200 from fresh (transient blip skipped)", response.StatusCode, string(body))
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "blip@example.com") {
+		t.Fatal("a transient refresh error must NOT mark the account exhausted")
+	}
+}
+
+func TestIsTerminalCredentialError(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{fmt.Errorf(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`), true},
+		{fmt.Errorf("profile has no refresh token"), true},
+		{fmt.Errorf("dial tcp: connection refused"), false},
+		{context.Canceled, false},
+		{context.DeadlineExceeded, false},
+		{nil, false},
+	}
+	for _, tc := range cases {
+		if got := isTerminalCredentialError(tc.err); got != tc.want {
+			t.Fatalf("isTerminalCredentialError(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
 func TestClaudeRateLimitHeaderFields(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "3600")
