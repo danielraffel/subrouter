@@ -213,6 +213,80 @@ func TestClaudeShortWindowDrivesRouting(t *testing.T) {
 	}
 }
 
+// TestClaudeAccountExhaustedByResponse pins the authoritative-signal logic:
+// 401 and a "rejected" 429 mean the account is out of quota, while an
+// "allowed"/"allowed_warning" 429 is a transient throttle that must not poison
+// the routing score. A 429 with no unified-status header keeps the conservative
+// legacy behavior (treated as exhausted).
+func TestClaudeAccountExhaustedByResponse(t *testing.T) {
+	withStatus := func(v string) http.Header {
+		h := http.Header{}
+		if v != "" {
+			h.Set("Anthropic-Ratelimit-Unified-Status", v)
+		}
+		return h
+	}
+	cases := []struct {
+		name   string
+		status int
+		header http.Header
+		want   bool
+	}{
+		{"401 dead token", http.StatusUnauthorized, http.Header{}, true},
+		{"429 rejected", http.StatusTooManyRequests, withStatus("rejected"), true},
+		{"429 allowed_warning", http.StatusTooManyRequests, withStatus("allowed_warning"), false},
+		{"429 allowed", http.StatusTooManyRequests, withStatus("allowed"), false},
+		{"429 no header (legacy)", http.StatusTooManyRequests, http.Header{}, true},
+		{"200 healthy", http.StatusOK, withStatus("allowed"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := claudeAccountExhaustedByResponse(tc.status, tc.header); got != tc.want {
+				t.Fatalf("claudeAccountExhaustedByResponse(%d, %v) = %v, want %v", tc.status, tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClaudeTransient429FailsOverWithoutPoisoningScore proves a transient
+// (allowed_warning) 429 still fails the request over to another account but does
+// NOT mark the first account exhausted, so the GTO scheduler keeps routing to it.
+func TestClaudeTransient429FailsOverWithoutPoisoningScore(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-t", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-Status", "allowed_warning")
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-t", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after transient failover", response.StatusCode)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("a transient allowed_warning 429 must NOT mark the account exhausted")
+	}
+}
+
 func TestClaudeRateLimitHeaderFields(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "3600")

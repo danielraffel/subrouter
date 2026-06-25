@@ -1818,7 +1818,13 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 	// request, so drop it from selection and let failover pick another.
 	claudeUnusable := provider == accounts.ProviderClaude && accountID != "" && claudeAccountUnusableStatus(response.StatusCode)
 	if claudeUnusable {
-		s.markAccountExhausted(provider, accountID)
+		// Only poison the routing score when the account is genuinely out of
+		// quota (401, or a 429 the upstream marks "rejected"). A transient
+		// "allowed"/"allowed_warning" 429 still fails over for this request but
+		// must not mark a healthy account exhausted.
+		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
+			s.markAccountExhausted(provider, accountID)
+		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
 		// status plus these headers and an opaque JSON body, none of which were
@@ -2633,6 +2639,37 @@ func claudeAccountUnusableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code == http.StatusUnauthorized
 }
 
+// claudeAccountExhaustedByResponse reports whether an upstream response means the
+// account is genuinely out of subscription quota and should be dropped from the
+// routing scheduler (not merely failed over for this one request). A 401 is a
+// dead/expired token. For a 429, Anthropic's authoritative signal is the
+// anthropic-ratelimit-unified-status header: "rejected" means the account is out
+// of quota, while "allowed"/"allowed_warning" mean a transient or
+// non-subscription throttle that must NOT poison a healthy account's score. When
+// the header is absent we fall back to the conservative legacy behavior and
+// treat the 429 as exhaustion.
+func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
+	if status == http.StatusUnauthorized {
+		return true
+	}
+	if status != http.StatusTooManyRequests {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-status"))) {
+	case "allowed", "allowed_warning":
+		return false
+	default:
+		return true
+	}
+}
+
+func claudeHeaderGet(header http.Header, key string) string {
+	if header == nil {
+		return ""
+	}
+	return header.Get(key)
+}
+
 // claudeRateLimitHeaderFields extracts the upstream rate-limit headers Anthropic
 // returns on a 429/401 (retry-after plus the anthropic-ratelimit-unified-*
 // family) as flat key/value slog fields, so the genuine reset/remaining signal
@@ -2687,14 +2724,18 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if !usageLimited {
 			return response, nil
 		}
+		exhausted := true
 		if t.provider == accounts.ProviderClaude {
 			// Surface the genuine upstream rate-limit signal. The active retry
 			// path consumes this 429 before the passive ModifyResponse capture
 			// runs, so without logging here the real message would be invisible
 			// whenever failover succeeds.
 			t.logClaudeUnusableResponse(response, accountID)
+			// Only poison the score on genuine quota exhaustion; a transient
+			// "allowed"/"allowed_warning" 429 still fails over for this request.
+			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
 		}
-		if t.server != nil {
+		if t.server != nil && exhausted {
 			t.server.markAccountExhausted(t.provider, accountID)
 		}
 		if attempt == maxAttempts || t.server == nil {
