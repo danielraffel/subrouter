@@ -132,3 +132,26 @@ sudo systemctl restart subrouter
 
 The mirror runs inside the Subrouter daemon through the GCS JSON API.
 Upload failures are logged and retried; request proxying never waits for GCS. Local cleanup only runs after a successful GCS sync and archives each pruned file under `_archive/` first.
+
+## Claude rate-limit reroute self-verifier
+
+`subrouter-verify.{sh,service,timer}` is a durable self-check for the Claude
+rate-limit reroute (a depleted account answers 200 via overage with
+`anthropic-ratelimit-unified-status: rejected`; subrouter must reroute to a
+healthy account). The systemd timer runs every 5 minutes and, all from the VM:
+
+- asserts the passive invariant (a rate-limit reaching the client after failover
+  gave up while healthy accounts existed is an ALERT),
+- watches for contract drift (Claude HTTP 429s reappearing, or any unknown
+  `anthropic-ratelimit-unified-status` value),
+- checks service health/version, and
+- runs an hourly canary that pins one tiny request to a cooked account and
+  asserts the client is not `rejected`.
+
+`startup.sh` installs and enables it on provision, so VM rebuilds keep it.
+Verdicts go to `journalctl -u subrouter-verify` and
+`/var/lib/subrouter-verify/{status.json,alerts.log}`. Watch alerts with:
+
+```bash
+journalctl -u subrouter-verify -f | grep '\[ALERT\]'
+```
