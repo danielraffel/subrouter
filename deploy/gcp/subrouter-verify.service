@@ -1,0 +1,10 @@
+[Unit]
+Description=Subrouter Claude rate-limit reroute self-verification
+After=subrouter.service
+Wants=subrouter.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/subrouter-verify.sh
+User=root
+Nice=10
