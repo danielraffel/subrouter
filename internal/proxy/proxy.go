@@ -2739,6 +2739,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.server.markAccountExhausted(t.provider, accountID)
 		}
 		if attempt == maxAttempts || t.server == nil {
+			reason := "max_attempts"
+			if t.server == nil {
+				reason = "no_server"
+			}
+			t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
 			return response, nil
 		}
 		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, tried)
@@ -2746,6 +2751,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
 			}
+			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
 		body, bodyErr := req.GetBody()
@@ -2753,6 +2759,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry could not replay request body", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", bodyErr)
 			}
+			t.logClaudeFailoverExhausted(response, accountID, "replay_failed", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
 		if response.Body != nil {
@@ -2771,6 +2778,35 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 	}
 	return base.RoundTrip(req)
+}
+
+// logClaudeFailoverExhausted emits the single authoritative signal that a Claude
+// rate-limit (or 401) is being returned to the client because failover gave up.
+// "no alternate account" and a silent maxAttempts exhaustion are both failures
+// from the client's view, but only the former was logged before, so a request
+// that burned through maxAttempts while untried accounts still had quota failed
+// invisibly. Monitoring keys on this one string; tried_accounts vs the account
+// pool tells whether quota may have remained elsewhere.
+func (t usageLimitRetryTransport) logClaudeFailoverExhausted(response *http.Response, accountID, reason string, attempt, maxAttempts, triedCount int) {
+	if t.logger == nil || t.provider != accounts.ProviderClaude {
+		return
+	}
+	status := 0
+	if response != nil {
+		status = response.StatusCode
+	}
+	t.logger.Warn("claude rate-limit returned to client after failover exhausted",
+		"agent", t.agent,
+		"session", t.session,
+		"final_account", accountID,
+		"reason", reason,
+		"status", status,
+		"attempts", attempt,
+		"max_attempts", maxAttempts,
+		"tried_accounts", triedCount,
+		"method", t.method,
+		"path", t.path,
+		"upstream", t.upstream)
 }
 
 // logClaudeUnusableResponse logs the upstream rate-limit headers and a bounded

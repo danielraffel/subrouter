@@ -287,6 +287,58 @@ func TestClaudeTransient429FailsOverWithoutPoisoningScore(t *testing.T) {
 	}
 }
 
+// TestClaudeFailoverExhaustionIsLogged guards the monitoring contract: when
+// every failover attempt is rate-limited and the client ends up with a 429, the
+// single authoritative failure signal must be logged even though no
+// "no alternate account" error occurred (the maxAttempts cap was hit first).
+func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-x", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Every account the server can pick returns a rejected 429, so failover
+	// never finds a healthy account and the client gets a 429.
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))}
+	}}
+	var logBuf bytes.Buffer
+	server.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// maxAttempts=2 with the 2-account server forces the max_attempts give-up
+	// path specifically: attempt 1 (cooked) fails over to fresh, attempt 2
+	// (fresh) hits attempt==maxAttempts and returns via the max_attempts branch
+	// BEFORE oauthRetryAccount could report no_alternate_account. This is the
+	// path that previously failed silently.
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, logger: server.Logger, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-x", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 2,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (all accounts rate-limited)", response.StatusCode)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "claude rate-limit returned to client after failover exhausted") {
+		t.Fatalf("expected the client-facing failover-exhaustion signal; logs=\n%s", logs)
+	}
+	// Assert the path is specifically max_attempts (not no_alternate_account), so
+	// removing the new max_attempts logging call would fail this test.
+	if !strings.Contains(logs, "reason=max_attempts") {
+		t.Fatalf("expected reason=max_attempts in the failover-exhaustion log; logs=\n%s", logs)
+	}
+}
+
 func TestClaudeRateLimitHeaderFields(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "3600")
