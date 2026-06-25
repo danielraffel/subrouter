@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -486,6 +488,82 @@ func TestClaudeRejectedNon429StatusDoesNotLogBody(t *testing.T) {
 	defer response.Body.Close()
 	if strings.Contains(logBuf.String(), secret) {
 		t.Fatalf("leaked a non-rate-limit 5xx body into logs; logs=\n%s", logBuf.String())
+	}
+}
+
+// TestClaudeFailoverSkipsDeadTokenAccount is the live regression caught by
+// monitoring: failover picked an account whose OAuth refresh returned
+// invalid_grant and aborted the whole retry ("no alternate account" -> 429 to
+// the client) even though healthy accounts remained untried. Failover must skip
+// the dead-token account and continue to a healthy one.
+func TestClaudeFailoverSkipsDeadTokenAccount(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "session-dead", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+			{ID: "dead@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-dead"},
+			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
+		},
+		Sessions:     store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		// Pick order among untried candidates: dead (highest) before fresh, so
+		// failover tries the dead-token account first and must skip it.
+		ScoreAccounts: func(ctx context.Context, available []accounts.Account) ([]selectacct.Score, int) {
+			h := map[string]float64{"cooked@example.com": 0, "dead@example.com": 1.0, "fresh@example.com": 0.9}
+			scores := make([]selectacct.Score, 0, len(available))
+			for _, a := range available {
+				scores = append(scores, selectacct.Score{AccountID: a.ID, Provider: a.Provider, Headroom: h[a.ID], ShortHeadroom: h[a.ID]})
+			}
+			return scores, len(scores)
+		},
+		// dead@example.com has a dead refresh token; everything else refreshes fine.
+		RefreshAccountFn: func(ctx context.Context, a accounts.Account) (accounts.Account, error) {
+			if a.ID == "dead@example.com" {
+				return accounts.Account{}, fmt.Errorf("Claude OAuth refresh failed: 400 Bad Request: invalid_grant")
+			}
+			return a, nil
+		},
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
+		}
+		// cooked (and any other) -> 429 rejected
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-dead", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (failover should skip dead token and reach fresh); body=%s", response.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "msg_fresh") {
+		t.Fatalf("client got %q, want the healthy account's response", string(body))
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "dead@example.com") {
+		t.Fatal("the dead-token account should be marked exhausted (dropped from selection)")
+	}
+	assignment, ok := store.Get("claude", "session-dead")
+	if !ok || assignment.AccountID != "fresh@example.com" {
+		t.Fatalf("sticky assignment = %+v, want fresh@example.com", assignment)
 	}
 }
 

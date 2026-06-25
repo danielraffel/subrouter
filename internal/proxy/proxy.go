@@ -45,8 +45,11 @@ type Server struct {
 	SchedulerRef   *selectacct.SchedulerRef
 	UsageScoreTTL  time.Duration
 	ScoreAccounts  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
-	Transport      http.RoundTripper
-	Logger         *slog.Logger
+	// RefreshAccountFn, when set, replaces the default OAuth refresh path. Test
+	// seam for simulating dead/expired refresh tokens; nil in production.
+	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
+	Transport        http.RoundTripper
+	Logger           *slog.Logger
 	ActiveSessions *ActiveSessions
 	Lifecycle      *Lifecycle
 	AdminToken     string
@@ -2465,6 +2468,9 @@ func (s Server) accountList() []accounts.Account {
 }
 
 func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (accounts.Account, error) {
+	if s.RefreshAccountFn != nil {
+		return s.RefreshAccountFn(ctx, account)
+	}
 	if s.AccountRef == nil {
 		return account, nil
 	}
@@ -2890,46 +2896,69 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no OAuth %s accounts available", provider)
 	}
-	candidates := make([]accounts.Account, 0, len(allCandidates))
-	for _, account := range allCandidates {
-		if _, ok := tried[account.ID]; ok {
-			continue
-		}
-		candidates = append(candidates, account)
-	}
-	if len(candidates) == 0 {
-		return accounts.Account{}, fmt.Errorf("no untried OAuth %s accounts available", provider)
-	}
 	s.refreshUsageScoresIfStale(ctx)
-	scheduler := s.scheduler()
-	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
-	}
-	account, err := scheduler.Pick(candidates)
-	if err != nil {
-		return accounts.Account{}, err
-	}
-	// Do not stop failover when the best untried account looks exhausted: scores
-	// can be stale, so trying it (the retry loop is bounded by maxAttempts and
-	// the tried set) is strictly better than refusing an account that may have
-	// quota. A truly exhausted account just returns the upstream's own limit.
-	if !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
-		s.Logger.Warn("usage-limit retry selecting OAuth account below new-session headroom; trying anyway",
-			"provider", provider,
-			"account", account.ID,
-			"exhausted", scheduler.Exhausted(account.Provider, account.ID),
-			"threshold", selectacct.MinNewSessionHeadroom)
-	}
-	refreshed, err := s.refreshAccount(ctx, account)
-	if err != nil {
-		return accounts.Account{}, err
-	}
-	if s.Sessions != nil {
-		if _, err := s.Sessions.Put(agentType, sessionID, refreshed.ID, userEmail); err != nil {
+	// Loop so a single account with a dead OAuth token (refresh returns
+	// invalid_grant) does NOT abort failover: skip it and try the next untried
+	// candidate. Before this, one expired refresh token in the pool made the
+	// caller log "no alternate account" and return the 429 to the client even
+	// though healthy accounts remained untried.
+	var lastErr error
+	for {
+		candidates := make([]accounts.Account, 0, len(allCandidates))
+		for _, account := range allCandidates {
+			if _, ok := tried[account.ID]; ok {
+				continue
+			}
+			candidates = append(candidates, account)
+		}
+		if len(candidates) == 0 {
+			if lastErr != nil {
+				return accounts.Account{}, lastErr
+			}
+			return accounts.Account{}, fmt.Errorf("no untried OAuth %s accounts available", provider)
+		}
+		scheduler := s.scheduler()
+		if s.Sessions != nil {
+			scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+		}
+		account, err := scheduler.Pick(candidates)
+		if err != nil {
 			return accounts.Account{}, err
 		}
+		// Do not stop failover when the best untried account looks exhausted: scores
+		// can be stale, so trying it (the retry loop is bounded by maxAttempts and
+		// the tried set) is strictly better than refusing an account that may have
+		// quota. A truly exhausted account just returns the upstream's own limit.
+		if !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
+			s.Logger.Warn("usage-limit retry selecting OAuth account below new-session headroom; trying anyway",
+				"provider", provider,
+				"account", account.ID,
+				"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+				"threshold", selectacct.MinNewSessionHeadroom)
+		}
+		refreshed, err := s.refreshAccount(ctx, account)
+		if err != nil {
+			// Dead/expired OAuth token (e.g. invalid_grant). Drop the account
+			// from selection and continue to the next untried candidate instead
+			// of failing the whole failover.
+			tried[account.ID] = struct{}{}
+			s.markAccountExhausted(provider, account.ID)
+			lastErr = err
+			if s.Logger != nil {
+				s.Logger.Warn("usage-limit retry skipping OAuth account with failed refresh",
+					"provider", provider,
+					"account", account.ID,
+					"error", err)
+			}
+			continue
+		}
+		if s.Sessions != nil {
+			if _, err := s.Sessions.Put(agentType, sessionID, refreshed.ID, userEmail); err != nil {
+				return accounts.Account{}, err
+			}
+		}
+		return refreshed, nil
 	}
-	return refreshed, nil
 }
 
 func responseUsageLimit(response *http.Response) (bool, error) {
