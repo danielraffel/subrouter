@@ -305,10 +305,15 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}}
 	var logBuf bytes.Buffer
 	server.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// maxAttempts=2 with the 2-account server forces the max_attempts give-up
+	// path specifically: attempt 1 (cooked) fails over to fresh, attempt 2
+	// (fresh) hits attempt==maxAttempts and returns via the max_attempts branch
+	// BEFORE oauthRetryAccount could report no_alternate_account. This is the
+	// path that previously failed silently.
 	transport := usageLimitRetryTransport{
 		base: stub, server: &server, logger: server.Logger, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-x", account: "cooked@example.com",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 2,
 	}
 	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
 	if err != nil {
@@ -326,6 +331,11 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	logs := logBuf.String()
 	if !strings.Contains(logs, "claude rate-limit returned to client after failover exhausted") {
 		t.Fatalf("expected the client-facing failover-exhaustion signal; logs=\n%s", logs)
+	}
+	// Assert the path is specifically max_attempts (not no_alternate_account), so
+	// removing the new max_attempts logging call would fail this test.
+	if !strings.Contains(logs, "reason=max_attempts") {
+		t.Fatalf("expected reason=max_attempts in the failover-exhaustion log; logs=\n%s", logs)
 	}
 }
 
