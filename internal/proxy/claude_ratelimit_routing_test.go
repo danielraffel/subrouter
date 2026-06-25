@@ -339,6 +339,156 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
+// TestClaudeRejectedHeaderOn200FailsOver is the Aziz regression: a depleted
+// account answers 200 via overage but sets anthropic-ratelimit-unified-status:
+// rejected, which Claude Code hard-blocks on. subrouter must treat that 200 as
+// unusable, fail over to a healthy account, return the healthy (allowed)
+// response to the client, and mark the depleted account exhausted.
+func TestClaudeRejectedHeaderOn200FailsOver(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-rej", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var cookedHits, freshHits int
+	const secretCompletion = "SECRET_USER_COMPLETION_CONTENT"
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			cookedHits++
+			h := http.Header{}
+			// 200 OK, but Anthropic flags the account out of quota (served via overage).
+			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			h.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
+			// A rejected 200 carries a real completion; it must never be logged.
+			return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_overage","text":"` + secretCompletion + `"}`))}
+		}
+		freshHits++
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
+	}}
+	var logBuf bytes.Buffer
+	server.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, logger: server.Logger, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-rej", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	// The client must receive the healthy account's response, not the rejected one.
+	if !strings.Contains(string(body), "msg_fresh") {
+		t.Fatalf("client got %q, want the healthy account's response", string(body))
+	}
+	if response.Header.Get("Anthropic-Ratelimit-Unified-Status") != "allowed" {
+		t.Fatalf("client header status = %q, want allowed", response.Header.Get("Anthropic-Ratelimit-Unified-Status"))
+	}
+	if cookedHits != 1 || freshHits != 1 {
+		t.Fatalf("hits cooked=%d fresh=%d, want 1/1 (rejected 200 then failover)", cookedHits, freshHits)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("a rejected-header 200 must mark the depleted account exhausted")
+	}
+	assignment, ok := store.Get("claude", "session-rej")
+	if !ok || assignment.AccountID != "fresh@example.com" {
+		t.Fatalf("sticky assignment = %+v, want moved to fresh@example.com", assignment)
+	}
+	// Privacy: the rejected 200's completion body must never be logged.
+	logs := logBuf.String()
+	if strings.Contains(logs, secretCompletion) {
+		t.Fatalf("leaked Claude completion content into logs; logs=\n%s", logs)
+	}
+	if strings.Contains(logs, "claude account unusable upstream body") {
+		t.Fatalf("must not log a body for a 2xx rejected response; logs=\n%s", logs)
+	}
+	// But the rejected signal itself (headers) should still be captured.
+	if !strings.Contains(logs, "claude account unusable upstream response") {
+		t.Fatalf("expected the rejected-header signal to be logged; logs=\n%s", logs)
+	}
+}
+
+// TestClaudeAllowedHeaderOn200DoesNotFailOver guards against over-rerouting: a
+// normal 200 with allowed/allowed_warning must pass straight through.
+func TestClaudeAllowedHeaderOn200DoesNotFailOver(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-ok", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var hits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		hits++
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "allowed_warning")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-ok", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1 (no failover on allowed_warning)", hits)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("allowed_warning must not mark the account exhausted")
+	}
+}
+
+// TestClaudeRejectedNon429StatusDoesNotLogBody locks the logging scope: a
+// rejected-header response on a status other than 429/401 (here a 500) must fail
+// over but never have its body logged, since that body is not a known rate-limit
+// envelope and may contain request/error detail.
+func TestClaudeRejectedNon429StatusDoesNotLogBody(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-5xx", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	const secret = "SENSITIVE_5XX_BODY"
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			return &http.Response{StatusCode: http.StatusInternalServerError, Header: h, Body: io.NopCloser(strings.NewReader(secret))}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"ok"}`))}
+	}}
+	var logBuf bytes.Buffer
+	server.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, logger: server.Logger, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-5xx", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if strings.Contains(logBuf.String(), secret) {
+		t.Fatalf("leaked a non-rate-limit 5xx body into logs; logs=\n%s", logBuf.String())
+	}
+}
+
 func TestClaudeRateLimitHeaderFields(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "3600")
