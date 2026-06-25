@@ -1857,10 +1857,11 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 			if inspectUsageLimit && usageLimitJSON(body) {
 				s.markAccountExhausted(provider, accountID)
 			}
-			// Only log the body for error responses. A rejected-header 200
-			// (overage) is a real Claude completion, so logging its body would
-			// leak user/model content; the headers already carry the signal.
-			if claudeUnusable && response.StatusCode >= 400 && !loggedBody && s.Logger != nil {
+			// Only log the body for the original hard rate-limit statuses
+			// (429/401), whose body is a known rate-limit/auth error envelope. A
+			// rejected-header response on any other status (a 200 overage
+			// completion, or an unrelated 4xx/5xx) must not have its body logged.
+			if claudeUnusable && claudeAccountUnusableStatus(response.StatusCode) && !loggedBody && s.Logger != nil {
 				loggedBody = true
 				s.Logger.Warn("claude account unusable upstream body",
 					"agent", agentType,
@@ -2858,11 +2859,12 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 			"upstream", t.upstream,
 			"status", response.StatusCode,
 		}, claudeRateLimitHeaderFields(response.Header)...)...)
-	// Never read or log a 2xx body: a rejected-header 200 (served via overage)
-	// contains a real Claude completion, so logging it would leak user/model
-	// content. Only error responses carry a rate-limit error envelope worth
-	// capturing; the headers above already convey the rejected signal.
-	if response.Body == nil || response.StatusCode < 400 {
+	// Only the original hard rate-limit statuses (429/401) carry a known
+	// rate-limit/auth error envelope worth logging. A rejected-header response on
+	// any other status (a 200 served via overage, or an unrelated 4xx/5xx that
+	// merely carries the header) may contain a real completion or request details,
+	// so log headers only; the headers above already convey the rejected signal.
+	if response.Body == nil || !claudeAccountUnusableStatus(response.StatusCode) {
 		return
 	}
 	prefix, err := io.ReadAll(io.LimitReader(response.Body, usageLimitInspectMaxBytes+1))

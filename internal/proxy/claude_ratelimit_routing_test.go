@@ -452,6 +452,43 @@ func TestClaudeAllowedHeaderOn200DoesNotFailOver(t *testing.T) {
 	}
 }
 
+// TestClaudeRejectedNon429StatusDoesNotLogBody locks the logging scope: a
+// rejected-header response on a status other than 429/401 (here a 500) must fail
+// over but never have its body logged, since that body is not a known rate-limit
+// envelope and may contain request/error detail.
+func TestClaudeRejectedNon429StatusDoesNotLogBody(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-5xx", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	const secret = "SENSITIVE_5XX_BODY"
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			return &http.Response{StatusCode: http.StatusInternalServerError, Header: h, Body: io.NopCloser(strings.NewReader(secret))}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"ok"}`))}
+	}}
+	var logBuf bytes.Buffer
+	server.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, logger: server.Logger, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-5xx", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if strings.Contains(logBuf.String(), secret) {
+		t.Fatalf("leaked a non-rate-limit 5xx body into logs; logs=\n%s", logBuf.String())
+	}
+}
+
 func TestClaudeRateLimitHeaderFields(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "3600")
