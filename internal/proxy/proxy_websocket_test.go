@@ -3269,8 +3269,18 @@ func readTranscriptEvents(t *testing.T, path string) []map[string]any {
 
 func readTranscriptEventsEventually(t *testing.T, path string, wantAtLeast int) []map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	// Transcript events are written server-side as the request/response bodies
+	// stream and close, which races the client-side body close the caller does
+	// before polling. The events also arrive incrementally, so returning the
+	// instant len >= wantAtLeast could return before a still-pending event (e.g.
+	// upstream_to_client) is written, producing the flaky "missing http_body
+	// upstream_to_client transcript event". Wait until the count both reaches
+	// wantAtLeast AND stops growing for a short grace window, so all pending
+	// events are captured. 10s deadline absorbs CI load.
+	deadline := time.Now().Add(10 * time.Second)
+	const stableFor = 200 * time.Millisecond
 	var lastEvents []map[string]any
+	var stableSince time.Time
 	for {
 		body, err := os.ReadFile(path)
 		if err == nil {
@@ -3289,14 +3299,20 @@ func readTranscriptEventsEventually(t *testing.T, path string, wantAtLeast int) 
 				events = append(events, event)
 			}
 			if parseOK {
-				lastEvents = events
-				if len(events) >= wantAtLeast {
-					return events
+				if len(events) != len(lastEvents) {
+					stableSince = time.Time{} // count changed; reset the grace window
+				} else if len(events) >= wantAtLeast {
+					if stableSince.IsZero() {
+						stableSince = time.Now()
+					} else if time.Since(stableSince) >= stableFor {
+						return events
+					}
 				}
+				lastEvents = events
 			}
 		}
 		if time.Now().After(deadline) {
-			if len(lastEvents) > 0 {
+			if len(lastEvents) >= wantAtLeast {
 				return lastEvents
 			}
 			t.Fatalf("transcript %s did not reach %d events", path, wantAtLeast)
