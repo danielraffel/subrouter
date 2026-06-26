@@ -79,6 +79,7 @@ while IFS= read -r l; do
       reason=$(sed -n 's/.*reason=\([^ ]*\).*/\1/p' <<<"$l")
       tried=$(sed -n 's/.*tried_accounts=\([0-9]*\).*/\1/p' <<<"$l"); : "${tried:=0}"
       sess=$(sed -n 's/.*session=\([^ ]*\).*/\1/p' <<<"$l")
+      fstatus=$(sed -n 's/.* status=\([0-9]*\).*/\1/p' <<<"$l")
       # Classify: was this a transient short-window/per-IP burst (every attempt a
       # bare 429 with no quota header), or a genuine reroute failure where a
       # quota-rejected account was involved? A bare-only burst is not a routing
@@ -96,7 +97,11 @@ while IFS= read -r l; do
           | grep "session=$sess" | grep "claude account unusable upstream response" \
           | grep -c "anthropic-ratelimit-unified-status=rejected")
       fi
-      if [ "$rejected_seen" -eq 0 ]; then
+      # Only downgrade a 429 burst (transient short-window/per-IP). A final 401
+      # is a dead/expired token and never carries the rejected header, but it IS
+      # account-specific and should have rerouted to a healthy account, so keep
+      # the ALERT path for 401/non-429 final responses.
+      if [ "$fstatus" = "429" ] && [ "$rejected_seen" -eq 0 ]; then
         emit INFO "transient rate-limit burst, not a routing bug (all bare 429s, client retries): reason=$reason tried=$tried session=$sess"
       elif [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
         emit ALERT "failed reroute while healthy accounts existed: reason=$reason tried=$tried total_claude=$total_claude healthy=$healthy_claude :: $l"
