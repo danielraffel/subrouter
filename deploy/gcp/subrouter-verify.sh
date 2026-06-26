@@ -69,6 +69,7 @@ fi
 lines=$(journalctl -u "$UNIT" --cursor-file="$CURSOR" -o cat 2>/dev/null || true)
 
 drift_429=0
+overload_5xx=0
 while IFS= read -r l; do
   [ -z "$l" ] && continue
   # 2. Failed-reroute invariant: a rate-limit reached the client after failover
@@ -89,6 +90,12 @@ while IFS= read -r l; do
     *"claude account unusable upstream response"*"status=429"*)
       drift_429=$((drift_429 + 1)) ;;
   esac
+  # 3b. Anthropic overload (529/5xx): not a subrouter bug, but track it so we
+  #     can see capacity outages that make the client (Claude Code) force-fail.
+  case "$l" in
+    *"claude upstream server error"*)
+      overload_5xx=$((overload_5xx + 1)) ;;
+  esac
   # 4. Contract drift: an anthropic-ratelimit-unified-status value we do not know.
   case "$l" in
     *"claude account unusable upstream response"*" anthropic-ratelimit-unified-status="*)
@@ -101,6 +108,15 @@ while IFS= read -r l; do
   esac
 done <<<"$lines"
 [ "$drift_429" -gt 0 ] && emit INFO "claude HTTP 429s observed this window (handled): $drift_429"
+# Anthropic overload: INFO normally, ALERT on a sustained burst so a real
+# capacity outage (clients force-failing) pings the on-call.
+if [ "$overload_5xx" -gt 0 ]; then
+  if [ "$overload_5xx" -ge 20 ]; then
+    emit ALERT "anthropic overload: $overload_5xx upstream 5xx/529 this window (clients likely force-failing)"
+  else
+    emit INFO "anthropic overload: $overload_5xx upstream 5xx/529 this window"
+  fi
+fi
 
 # --- 5. Canary (hourly, only when a cooked Claude account exists) ---
 last_canary=$(cat "$CANARY_STAMP" 2>/dev/null || echo 0)
@@ -140,7 +156,7 @@ for x in rows:
   fi
 fi
 
-printf '{"ts":"%s","version":"%s","healthy_claude":%s,"total_claude":%s,"alerts_this_run":%s}\n' \
-  "$now_iso" "$ver" "$healthy_claude" "$total_claude" "$alerts" >"$STATUS"
+printf '{"ts":"%s","version":"%s","healthy_claude":%s,"total_claude":%s,"overload_5xx":%s,"claude_429s":%s,"alerts_this_run":%s}\n' \
+  "$now_iso" "$ver" "$healthy_claude" "$total_claude" "$overload_5xx" "$drift_429" "$alerts" >"$STATUS"
 [ "$alerts" -eq 0 ] && emit OK "checks passed (version=$ver healthy_claude=$healthy_claude/$total_claude)"
 exit 0

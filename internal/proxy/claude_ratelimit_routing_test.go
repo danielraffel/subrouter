@@ -651,6 +651,28 @@ func TestIsTerminalCredentialError(t *testing.T) {
 	}
 }
 
+// TestClaudeUpstreamServerErrorLoggedNotExhausted verifies a 529 overload is
+// logged for observability but does NOT mark the account exhausted (overload is
+// Anthropic-side capacity, not account-specific; rerouting can't help).
+func TestClaudeUpstreamServerErrorLoggedNotExhausted(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	var logBuf bytes.Buffer
+	server.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	response := &http.Response{
+		StatusCode: 529,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`)),
+	}
+	server.captureResponseBody(response, "claude", "session-1", "acct@example.com", accounts.ProviderClaude, "/v1/messages")
+	logs := logBuf.String()
+	if !strings.Contains(logs, "claude upstream server error") || !strings.Contains(logs, "status=529") {
+		t.Fatalf("expected a 529 upstream-server-error log; logs=\n%s", logs)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "acct@example.com") {
+		t.Fatal("a 529 overload must NOT mark the account exhausted")
+	}
+}
+
 func TestClaudeRateLimitHeaderFields(t *testing.T) {
 	header := http.Header{}
 	header.Set("Retry-After", "3600")
