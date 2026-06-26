@@ -2666,29 +2666,24 @@ func claudeAccountUnusableStatus(code int) bool {
 
 // claudeAccountExhaustedByResponse reports whether an upstream response means the
 // account is genuinely out of subscription quota and should be dropped from the
-// routing scheduler (not merely failed over for this one request). A 401 is a
-// dead/expired token. For a 429, Anthropic's authoritative signal is the
-// anthropic-ratelimit-unified-status header: "rejected" means the account is out
-// of quota, while "allowed"/"allowed_warning" mean a transient or
-// non-subscription throttle that must NOT poison a healthy account's score. When
-// the header is absent we fall back to the conservative legacy behavior and
-// treat the 429 as exhaustion. A "rejected" header marks the account exhausted
-// regardless of HTTP status, because Anthropic answers a depleted account with
-// 200 via overage while still reporting rejected.
+// routing scheduler (not merely failed over for this one request). The
+// authoritative quota signal is the anthropic-ratelimit-unified-status header:
+// "rejected" marks the account exhausted regardless of HTTP status, because
+// Anthropic answers a depleted account with 200 via paid overage while still
+// reporting rejected.
+//
+// A bare 429 with no unified-status header is NOT treated as exhaustion.
+// Observed in production: healthy accounts (80-100% quota) return a headerless
+// rate_limit_error 429 under short-window request bursts, and poisoning their
+// routing score on that is wrong. Such a 429 still fails over
+// (claudeAccountUnusableStatus is status-based), but genuine quota exhaustion is
+// detected by the rejected header and the periodic usage-score refresh, not by a
+// bare 429. A 401 is always a dead/expired token.
 func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
 	if status == http.StatusUnauthorized {
 		return true
 	}
-	switch claudeUnifiedStatus(header) {
-	case "rejected":
-		return true
-	case "allowed", "allowed_warning":
-		// Healthy or merely warned; a 429 here is a transient/non-subscription
-		// throttle that must not poison the account's routing score.
-		return false
-	}
-	// Header absent: conservative legacy behavior, treat a 429 as exhaustion.
-	return status == http.StatusTooManyRequests
+	return claudeUnifiedStatus(header) == "rejected"
 }
 
 // claudeUnifiedStatus returns the lowercased anthropic-ratelimit-unified-status
