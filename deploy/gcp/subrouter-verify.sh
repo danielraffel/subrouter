@@ -86,9 +86,13 @@ while IFS= read -r l; do
       # rerouting cannot help (the client retries with backoff). Only a failure
       # involving a "rejected" quota account while healthy accounts remained
       # untried is actionable.
+      # Correlate against the same cursor-bounded batch we are processing (a
+      # request's captures and its failover-exhausted line are logged together),
+      # not a fixed wall-clock window, so a backlog of >N minutes cannot strand
+      # the rejected captures outside the lookup and mis-downgrade a real alert.
       rejected_seen=0
       if [ -n "$sess" ]; then
-        rejected_seen=$(journalctl -u "$UNIT" --since "10 min ago" -o cat 2>/dev/null \
+        rejected_seen=$(printf '%s\n' "$lines" \
           | grep "session=$sess" | grep "claude account unusable upstream response" \
           | grep -c "anthropic-ratelimit-unified-status=rejected")
       fi
