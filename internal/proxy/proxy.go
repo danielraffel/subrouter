@@ -1849,6 +1849,22 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 				}, claudeRateLimitHeaderFields(response.Header)...)...)
 		}
 	}
+	// Upstream server errors (529 overloaded_error, 5xx) are an Anthropic-side
+	// capacity problem, not account-specific, so subrouter passes them through
+	// (the client retries with backoff and eventually surfaces them). They were
+	// invisible before; log them so overload periods are observable. Do NOT mark
+	// the account exhausted or fail over: rerouting cannot fix an API-wide
+	// capacity issue and just amplifies load on the overloaded endpoint.
+	if provider == accounts.ProviderClaude && response.StatusCode >= 500 && s.Logger != nil {
+		s.Logger.Warn("claude upstream server error",
+			append([]any{
+				"agent", agentType,
+				"session", sessionID,
+				"account", accountID,
+				"path", path,
+				"status", response.StatusCode,
+			}, claudeRateLimitHeaderFields(response.Header)...)...)
+	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
 	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !claudeUnusable) {
 		return
