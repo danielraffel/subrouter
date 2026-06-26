@@ -238,7 +238,7 @@ func TestClaudeAccountExhaustedByResponse(t *testing.T) {
 		{"429 rejected", http.StatusTooManyRequests, withStatus("rejected"), true},
 		{"429 allowed_warning", http.StatusTooManyRequests, withStatus("allowed_warning"), false},
 		{"429 allowed", http.StatusTooManyRequests, withStatus("allowed"), false},
-		{"429 no header (legacy)", http.StatusTooManyRequests, http.Header{}, true},
+		{"429 no header (transient burst, not quota)", http.StatusTooManyRequests, http.Header{}, false},
 		{"200 healthy", http.StatusOK, withStatus("allowed"), false},
 	}
 	for _, tc := range cases {

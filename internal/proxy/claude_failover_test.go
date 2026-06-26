@@ -86,10 +86,14 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		auth := req.Header.Get("Authorization")
 		if strings.Contains(auth, "tok-cooked") {
+			// Genuine quota exhaustion: Anthropic stamps the unified-status
+			// rejected header, which is what marks the account exhausted.
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 			return &http.Response{
 				StatusCode: http.StatusTooManyRequests,
 				Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"You've hit your session limit"}}`)),
-				Header:     http.Header{},
+				Header:     h,
 			}
 		}
 		return &http.Response{
@@ -223,14 +227,35 @@ func TestReuseStickyAssignmentClaudeExhausted(t *testing.T) {
 
 func TestCaptureResponseBodyClaude429MarksExhausted(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
+	// A quota 429 carries the authoritative rejected header; that is what marks
+	// the account exhausted (a bare 429 does not, see
+	// TestCaptureResponseBodyClaudeBare429DoesNotPoison).
+	h := http.Header{}
+	h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 	response := &http.Response{
 		StatusCode: http.StatusTooManyRequests,
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error"}}`)),
-		Header:     http.Header{},
+		Header:     h,
 	}
 	server.captureResponseBody(response, "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "/v1/messages")
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
-		t.Fatal("claude 429 should mark the account exhausted via passive inspection")
+		t.Fatal("claude rejected-header 429 should mark the account exhausted via passive inspection")
+	}
+}
+
+// TestCaptureResponseBodyClaudeBare429DoesNotPoison is the production
+// regression: healthy accounts return a headerless rate_limit_error 429 under a
+// short-window burst; that must NOT mark them exhausted (poisoning the scheduler).
+func TestCaptureResponseBodyClaudeBare429DoesNotPoison(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`)),
+		Header:     http.Header{},
+	}
+	server.captureResponseBody(response, "claude", "session-1", "healthy@example.com", accounts.ProviderClaude, "/v1/messages")
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "healthy@example.com") {
+		t.Fatal("a bare (headerless) 429 must NOT mark a healthy account exhausted")
 	}
 }
 
