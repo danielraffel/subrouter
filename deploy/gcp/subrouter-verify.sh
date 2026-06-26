@@ -78,7 +78,23 @@ while IFS= read -r l; do
     *"claude rate-limit returned to client after failover exhausted"*)
       reason=$(sed -n 's/.*reason=\([^ ]*\).*/\1/p' <<<"$l")
       tried=$(sed -n 's/.*tried_accounts=\([0-9]*\).*/\1/p' <<<"$l"); : "${tried:=0}"
-      if [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
+      sess=$(sed -n 's/.*session=\([^ ]*\).*/\1/p' <<<"$l")
+      # Classify: was this a transient short-window/per-IP burst (every attempt a
+      # bare 429 with no quota header), or a genuine reroute failure where a
+      # quota-rejected account was involved? A bare-only burst is not a routing
+      # bug: the accounts have quota but a transient limit hit them all, and
+      # rerouting cannot help (the client retries with backoff). Only a failure
+      # involving a "rejected" quota account while healthy accounts remained
+      # untried is actionable.
+      rejected_seen=0
+      if [ -n "$sess" ]; then
+        rejected_seen=$(journalctl -u "$UNIT" --since "10 min ago" -o cat 2>/dev/null \
+          | grep "session=$sess" | grep "claude account unusable upstream response" \
+          | grep -c "anthropic-ratelimit-unified-status=rejected")
+      fi
+      if [ "$rejected_seen" -eq 0 ]; then
+        emit INFO "transient rate-limit burst, not a routing bug (all bare 429s, client retries): reason=$reason tried=$tried session=$sess"
+      elif [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
         emit ALERT "failed reroute while healthy accounts existed: reason=$reason tried=$tried total_claude=$total_claude healthy=$healthy_claude :: $l"
       else
         emit INFO "failover exhausted, pool genuinely constrained: reason=$reason tried=$tried healthy=$healthy_claude"
