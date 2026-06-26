@@ -79,16 +79,15 @@ while IFS= read -r l; do
       reason=$(sed -n 's/.*reason=\([^ ]*\).*/\1/p' <<<"$l")
       tried=$(sed -n 's/.*tried_accounts=\([0-9]*\).*/\1/p' <<<"$l"); : "${tried:=0}"
       sess=$(sed -n 's/.*session=\([^ ]*\).*/\1/p' <<<"$l")
-      # Synthetic connectivity probes (sr-probe-*, etc.) burst many requests
-      # through subrouter's single IP and trip a transient/per-IP limit; that is
-      # not real user traffic and not a routing bug, so it must not count against
-      # the watch. Real Claude Code sessions are UUIDs or fallback:<hash> and
-      # never contain "probe", so this cannot mask a real failure. Everything
-      # else keeps the conservative invariant: failover gave up while healthy
-      # accounts remained untried.
+      # Synthetic sr connectivity probes (session id "sr-probe-...") burst many
+      # requests through subrouter's single IP and trip a transient/per-IP limit;
+      # that is not real user traffic and not a routing bug. Match only this exact
+      # synthetic namespace (not any session merely containing "probe", since
+      # session ids are client-provided) so a real failover failure is never
+      # downgraded. Everything else keeps the conservative invariant.
       case "$sess" in
-        *probe*)
-          emit INFO "synthetic probe session (not real traffic, not a routing bug): reason=$reason tried=$tried session=$sess" ;;
+        sr-probe-*)
+          emit INFO "synthetic sr probe session (not real traffic, not a routing bug): reason=$reason tried=$tried session=$sess" ;;
         *)
           if [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
             emit ALERT "failed reroute while healthy accounts existed: reason=$reason tried=$tried total_claude=$total_claude healthy=$healthy_claude :: $l"
