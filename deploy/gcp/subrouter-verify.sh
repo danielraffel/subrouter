@@ -79,35 +79,24 @@ while IFS= read -r l; do
       reason=$(sed -n 's/.*reason=\([^ ]*\).*/\1/p' <<<"$l")
       tried=$(sed -n 's/.*tried_accounts=\([0-9]*\).*/\1/p' <<<"$l"); : "${tried:=0}"
       sess=$(sed -n 's/.*session=\([^ ]*\).*/\1/p' <<<"$l")
-      fstatus=$(sed -n 's/.* status=\([0-9]*\).*/\1/p' <<<"$l")
-      # Classify: was this a transient short-window/per-IP burst (every attempt a
-      # bare 429 with no quota header), or a genuine reroute failure where a
-      # quota-rejected account was involved? A bare-only burst is not a routing
-      # bug: the accounts have quota but a transient limit hit them all, and
-      # rerouting cannot help (the client retries with backoff). Only a failure
-      # involving a "rejected" quota account while healthy accounts remained
-      # untried is actionable.
-      # Correlate against the same cursor-bounded batch we are processing (a
-      # request's captures and its failover-exhausted line are logged together),
-      # not a fixed wall-clock window, so a backlog of >N minutes cannot strand
-      # the rejected captures outside the lookup and mis-downgrade a real alert.
-      rejected_seen=0
-      if [ -n "$sess" ]; then
-        rejected_seen=$(printf '%s\n' "$lines" \
-          | grep "session=$sess" | grep "claude account unusable upstream response" \
-          | grep -c "anthropic-ratelimit-unified-status=rejected")
-      fi
-      # Only downgrade a 429 burst (transient short-window/per-IP). A final 401
-      # is a dead/expired token and never carries the rejected header, but it IS
-      # account-specific and should have rerouted to a healthy account, so keep
-      # the ALERT path for 401/non-429 final responses.
-      if [ "$fstatus" = "429" ] && [ "$rejected_seen" -eq 0 ]; then
-        emit INFO "transient rate-limit burst, not a routing bug (all bare 429s, client retries): reason=$reason tried=$tried session=$sess"
-      elif [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
-        emit ALERT "failed reroute while healthy accounts existed: reason=$reason tried=$tried total_claude=$total_claude healthy=$healthy_claude :: $l"
-      else
-        emit INFO "failover exhausted, pool genuinely constrained: reason=$reason tried=$tried healthy=$healthy_claude"
-      fi
+      # Synthetic connectivity probes (sr-probe-*, etc.) burst many requests
+      # through subrouter's single IP and trip a transient/per-IP limit; that is
+      # not real user traffic and not a routing bug, so it must not count against
+      # the watch. Real Claude Code sessions are UUIDs or fallback:<hash> and
+      # never contain "probe", so this cannot mask a real failure. Everything
+      # else keeps the conservative invariant: failover gave up while healthy
+      # accounts remained untried.
+      case "$sess" in
+        *probe*)
+          emit INFO "synthetic probe session (not real traffic, not a routing bug): reason=$reason tried=$tried session=$sess" ;;
+        *)
+          if [ "$healthy_claude" -gt 0 ] && [ "$tried" -lt "$total_claude" ]; then
+            emit ALERT "failed reroute while healthy accounts existed: reason=$reason tried=$tried total_claude=$total_claude healthy=$healthy_claude :: $l"
+          else
+            emit INFO "failover exhausted, pool genuinely constrained: reason=$reason tried=$tried healthy=$healthy_claude"
+          fi
+          ;;
+      esac
       ;;
   esac
   # 3. Contract drift: Claude HTTP 429 reappearing (we handle it, but note it).
