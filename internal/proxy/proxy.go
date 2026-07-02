@@ -1678,6 +1678,46 @@ func (s Server) markAccountExhausted(provider accounts.Provider, accountID strin
 	}
 }
 
+// markAccountExhaustedFromResponse marks the account exhausted until the reset
+// time the upstream itself reported, so the mark self-expires exactly when the
+// account's window recovers. Observed live: an account whose weekly window had
+// reset (real quota available) stayed zero-scored for hours because marks only
+// cleared on a successful usage refresh, which the loaded usage endpoint kept
+// failing; failover then burned its attempts on genuinely-cooked accounts and
+// never reached the recovered one.
+func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, accountID string, header http.Header) {
+	if s.SchedulerRef == nil {
+		return
+	}
+	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, claudeExhaustionExpiry(header, time.Now()))
+}
+
+// claudeExhaustionExpiry picks when an exhaustion mark should lapse:
+// anthropic-ratelimit-unified-reset (epoch seconds, the authoritative window
+// reset) when present, else Retry-After seconds, else the scheduler default.
+// Clamped to [now+1m, now+8d]: the floor guards clock skew / already-passed
+// resets, the ceiling guards a nonsense far-future header pinning an account
+// out forever.
+func claudeExhaustionExpiry(header http.Header, now time.Time) time.Time {
+	until := now.Add(selectacct.DefaultExhaustedTTL)
+	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset")); raw != "" {
+		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
+			until = time.Unix(epoch, 0)
+		}
+	} else if ra := strings.TrimSpace(claudeHeaderGet(header, "Retry-After")); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+			until = now.Add(time.Duration(secs) * time.Second)
+		}
+	}
+	if min := now.Add(time.Minute); until.Before(min) {
+		return min
+	}
+	if max := now.Add(8 * 24 * time.Hour); until.After(max) {
+		return max
+	}
+	return until
+}
+
 func usageLimitJSON(body []byte) bool {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -1851,7 +1891,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
 		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
-			s.markAccountExhausted(provider, accountID)
+			s.markAccountExhaustedFromResponse(provider, accountID, response.Header)
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
@@ -2904,7 +2944,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
 		}
 		if t.server != nil && exhausted {
-			t.server.markAccountExhausted(t.provider, accountID)
+			// Use the response's own reset time so the mark self-expires when the
+			// window recovers (codex responses lack these headers and fall back
+			// to the default TTL inside claudeExhaustionExpiry).
+			t.server.markAccountExhaustedFromResponse(t.provider, accountID, response.Header)
 		}
 		if attempt == maxAttempts || t.server == nil {
 			reason := "max_attempts"

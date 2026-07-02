@@ -922,3 +922,84 @@ func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
 		t.Fatal("a rejected 5xx must mark the depleted account exhausted")
 	}
 }
+
+func TestClaudeExhaustionExpiry(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	h := http.Header{}
+	// No headers: scheduler default TTL.
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(selectacct.DefaultExhaustedTTL)) {
+		t.Fatalf("default = %v, want now+%v", got, selectacct.DefaultExhaustedTTL)
+	}
+	// Authoritative unified-reset epoch wins.
+	h.Set("Anthropic-Ratelimit-Unified-Reset", "1750003600")
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(time.Unix(1_750_003_600, 0)) {
+		t.Fatalf("unified-reset = %v, want epoch 1750003600", got)
+	}
+	// A reset already in the past floors to now+1m (clock skew guard).
+	h.Set("Anthropic-Ratelimit-Unified-Reset", "1749990000")
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(time.Minute)) {
+		t.Fatalf("past reset = %v, want floor now+1m", got)
+	}
+	// Far-future reset is capped at 8d.
+	h.Set("Anthropic-Ratelimit-Unified-Reset", "1999999999")
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(8*24*time.Hour)) {
+		t.Fatalf("far reset = %v, want cap now+8d", got)
+	}
+	// Retry-After honored when unified-reset absent.
+	h = http.Header{}
+	h.Set("Retry-After", "300")
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("retry-after = %v, want now+5m", got)
+	}
+}
+
+// TestClaudeFailoverTriesRecoveredAccount is the live regression: an account
+// whose exhaustion mark has lapsed (window reset) must be reachable by failover
+// again. Before the fix its zero score persisted until a successful usage
+// refresh, so failover burned its attempts on genuinely-cooked accounts and
+// never reached the recovered one.
+func TestClaudeFailoverTriesRecoveredAccount(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "session-rec", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	// recovered@ was marked exhausted while cooked, but its window has reset.
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "recovered@example.com", time.Now().Add(-time.Second))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+			{ID: "recovered@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-recovered"},
+		},
+		Sessions:     store,
+		SchedulerRef: ref,
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-recovered") {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_recovered"}`))}
+		}
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		h.Set("Anthropic-Ratelimit-Unified-Reset", "1999999999")
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-rec", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_recovered") {
+		t.Fatalf("status=%d body=%s, want the recovered account to serve after its mark lapsed", response.StatusCode, string(body))
+	}
+}
