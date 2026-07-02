@@ -69,10 +69,26 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.scheduler = scheduler
-	// Fresh usage data supersedes request-time marks; keeping expiries around
-	// would later delete scores that now come from a real refresh.
-	r.exhaustedUntil = nil
+	r.retainExhaustedExpiriesLocked()
 	r.updatedAt = time.Now()
+}
+
+// retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
+// refresh. An expiry is dropped only when the new score actually supersedes the
+// mark (shows headroom). It is KEPT while the incoming score is still zero,
+// because refreshes seed from the current scheduler and carry the old zero
+// score forward when that account's own usage fetch failed — clearing the
+// expiry there would make the request-time mark permanent again, recreating the
+// stranded-recovered-account failure. Keeping an expiry for a genuinely-cooked
+// account is safe: when it lapses, routing tries the account once and the
+// upstream's reject re-marks it.
+func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
+	for key := range r.exhaustedUntil {
+		score, ok := r.scheduler.scores[key]
+		if !ok || !score.exhausted() {
+			delete(r.exhaustedUntil, key)
+		}
+	}
 }
 
 // DefaultExhaustedTTL bounds an exhaustion mark when the upstream response gave
@@ -135,7 +151,7 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 	defer r.mu.Unlock()
 	if update {
 		r.scheduler = scheduler
-		r.exhaustedUntil = nil
+		r.retainExhaustedExpiriesLocked()
 	}
 	r.updatedAt = time.Now()
 	r.refreshing = false

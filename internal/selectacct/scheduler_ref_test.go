@@ -69,3 +69,29 @@ func TestSetClearsExhaustedUntil(t *testing.T) {
 		t.Fatalf("refreshed score clobbered by stale expiry prune: headroom=%v want 0.02", got)
 	}
 }
+
+// TestPartialRefreshKeepsMarkExpiry is the mixed-refresh regression: a refresh
+// that carries the exhausted account's zero score forward (its own usage fetch
+// failed) must NOT strip the mark's expiry, or the mark becomes permanent again
+// and the recovered account stays unroutable.
+func TestPartialRefreshKeepsMarkExpiry(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "recovered@example.com", time.Now().Add(-time.Second))
+	// Partial refresh: another account got fresh data, but recovered@'s zero
+	// score is seeded/carried forward unchanged.
+	ref.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "other@example.com", Provider: accounts.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "recovered@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	}), true)
+	if ref.Get().Exhausted(accounts.ProviderClaude, "recovered@example.com") {
+		t.Fatal("carried-forward zero score must keep its expiry; recovered account still exhausted after lapse")
+	}
+	// But a refresh that genuinely supersedes the mark (headroom) drops the expiry.
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "busy@example.com", time.Now().Add(-time.Second))
+	ref.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "busy@example.com", Provider: accounts.ProviderClaude, Headroom: 0.05, ShortHeadroom: 0.05},
+	}), true)
+	if got := ref.Get().ScoreFor(accounts.ProviderClaude, "busy@example.com").Headroom; got != 0.05 {
+		t.Fatalf("superseded mark must not prune the refreshed score: headroom=%v want 0.05", got)
+	}
+}
