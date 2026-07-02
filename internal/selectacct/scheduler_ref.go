@@ -36,6 +36,17 @@ func (r *SchedulerRef) Get() Scheduler {
 
 // pruneExpired drops exhaustion marks whose window has reset, restoring the
 // account to the optimistic default score so routing can try it again.
+//
+// Deliberate tradeoff: a lapsed mark cannot distinguish "recovered" from "fresh
+// usage re-confirmed exhausted" (refreshes seed zero scores forward, so the two
+// are indistinguishable here). We choose optimistic retry-once: if the account
+// is still cooked, the one probe request is rejected upstream and the account
+// is immediately re-marked with the NEW authoritative reset time, so the cost
+// is bounded at one attempt per account per expiry window. The opposite choice
+// (trusting a zero score without an expiry) is the failure this fixes: a
+// recovered account's real quota stayed unroutable for hours. This matches the
+// scheduler-wide philosophy that scores are load-balancing hints and the
+// upstream response is the source of truth.
 func (r *SchedulerRef) pruneExpired(now time.Time) {
 	r.mu.RLock()
 	anyExpired := false

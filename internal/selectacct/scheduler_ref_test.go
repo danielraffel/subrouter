@@ -95,3 +95,20 @@ func TestPartialRefreshKeepsMarkExpiry(t *testing.T) {
 		t.Fatalf("superseded mark must not prune the refreshed score: headroom=%v want 0.05", got)
 	}
 }
+
+// TestLapsedMarkRemarksOnNextReject documents the retry-once-on-lapse loop: a
+// lapsed mark makes a still-cooked account optimistic for exactly one probe;
+// the upstream's next reject re-marks it with the new authoritative reset, so
+// the cost of guessing wrong is bounded at one attempt per expiry window.
+func TestLapsedMarkRemarksOnNextReject(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "cooked@example.com", time.Now().Add(-time.Second))
+	if ref.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("lapsed mark should allow one optimistic probe")
+	}
+	// The probe's rejected response re-marks with the new upstream reset.
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "cooked@example.com", time.Now().Add(2*time.Hour))
+	if !ref.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("re-mark after the probe's reject must hold until the new reset")
+	}
+}
