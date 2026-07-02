@@ -135,6 +135,15 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider accounts.Provider, accountID 
 	r.updatedAt = time.Now()
 }
 
+// ExhaustedUntilFor reports the expiry recorded for an account's exhaustion
+// mark, if any. Used by tests and diagnostics to verify TTL selection.
+func (r *SchedulerRef) ExhaustedUntilFor(provider accounts.Provider, accountID string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	until, ok := r.exhaustedUntil[ScoreKey(provider, accountID)]
+	return until, ok
+}
+
 func (r *SchedulerRef) Stale(ttl time.Duration) bool {
 	if ttl <= 0 {
 		return false

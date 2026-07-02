@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1001,5 +1002,50 @@ func TestClaudeFailoverTriesRecoveredAccount(t *testing.T) {
 	body, _ := io.ReadAll(response.Body)
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_recovered") {
 		t.Fatalf("status=%d body=%s, want the recovered account to serve after its mark lapsed", response.StatusCode, string(body))
+	}
+}
+
+// TestMarkTTLSelection pins the TTL class per failure kind: rate-limit marks
+// expire at the upstream reset, 401 dead-credential marks get the long
+// credential TTL, and re-marking through the passive body-inspect path must not
+// shorten a header-derived expiry.
+func TestMarkTTLSelection(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	resetEpoch := time.Now().Add(48 * time.Hour).Unix()
+	h := http.Header{}
+	h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+	h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(resetEpoch, 10))
+
+	// Rate-limit mark: expiry = upstream reset.
+	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "rl@example.com", http.StatusTooManyRequests, h)
+	until, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "rl@example.com")
+	if !ok || !until.Equal(time.Unix(resetEpoch, 0)) {
+		t.Fatalf("rate-limit mark until=%v ok=%v, want upstream reset %v", until, ok, time.Unix(resetEpoch, 0))
+	}
+	// Re-marking with the same headers (the passive body-inspect path) must not
+	// shorten the expiry to the default TTL.
+	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "rl@example.com", http.StatusTooManyRequests, h)
+	until2, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "rl@example.com")
+	if !until2.Equal(time.Unix(resetEpoch, 0)) {
+		t.Fatalf("re-mark shortened expiry to %v, want %v", until2, time.Unix(resetEpoch, 0))
+	}
+
+	// 401 dead credential: long credential TTL, not the 10m default.
+	server.markAccountExhaustedFromResponse(accounts.ProviderClaude, "dead@example.com", http.StatusUnauthorized, http.Header{})
+	deadUntil, ok := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "dead@example.com")
+	if !ok || time.Until(deadUntil) < 50*time.Minute {
+		t.Fatalf("401 mark until=%v (in %v), want ~1h credential TTL", deadUntil, time.Until(deadUntil))
+	}
+
+	// Terminal refresh failure: credential TTL; transient: short default.
+	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "invalid@example.com", fmt.Errorf("400 Bad Request: invalid_grant"))
+	invUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "invalid@example.com")
+	if time.Until(invUntil) < 50*time.Minute {
+		t.Fatalf("terminal refresh mark in %v, want ~1h", time.Until(invUntil))
+	}
+	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "blip@example.com", fmt.Errorf("dial tcp: connection refused"))
+	blipUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "blip@example.com")
+	if time.Until(blipUntil) > 15*time.Minute {
+		t.Fatalf("transient refresh mark in %v, want ~10m default", time.Until(blipUntil))
 	}
 }
