@@ -1326,6 +1326,24 @@ func isLoopbackRemote(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// clientRemoteIP returns the best-effort source IP for request attribution: the
+// leftmost X-Forwarded-For entry when present, otherwise the RemoteAddr host with
+// the port stripped. On the tailnet this is the caller's device IP, which maps to
+// a device via `tailscale status`.
+func clientRemoteIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.authorizeAdmin(r) {
@@ -1516,7 +1534,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 
 		if s.Logger != nil {
-			s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user", userEmail, "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host)
+			// remote_addr + user_agent attribute each request to a source (tailnet
+			// device / client type). Without them a concurrency spike is an
+			// anonymous wall of user="" sessions that cannot be traced to whatever
+			// fired it (a load-test loader, an agent fleet, etc.).
+			s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user", userEmail, "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent())
 		}
 
 		// For cacheable GET paths, buffer the response so we can store it.
