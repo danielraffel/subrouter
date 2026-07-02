@@ -3,6 +3,8 @@ package selectacct
 import (
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestSchedulerRefAllowsOnlyOneStaleRefresh(t *testing.T) {
@@ -37,5 +39,109 @@ func TestSchedulerRefRetryAfterSkippedRefreshWaitsForTTL(t *testing.T) {
 	ref.SetUpdatedAt(time.Now().Add(-time.Hour))
 	if !ref.BeginRefreshIfStale(time.Minute) {
 		t.Fatal("refresh should be allowed after TTL passes")
+	}
+}
+
+// TestMarkExhaustedUntilExpires: a mark with a reset time in the past must lapse
+// on the next read, restoring the optimistic default so routing retries the
+// account. A future mark holds.
+func TestMarkExhaustedUntilExpires(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "recovered@example.com", time.Now().Add(-time.Second))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "cooked@example.com", time.Now().Add(time.Hour))
+	s := ref.Get()
+	if s.Exhausted(accounts.ProviderClaude, "recovered@example.com") {
+		t.Fatal("expired mark must lapse: recovered account still exhausted")
+	}
+	if !s.Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("unexpired mark must hold: cooked account not exhausted")
+	}
+}
+
+// TestSetClearsExhaustedUntil: a full refresh supersedes request-time marks; a
+// later prune must not delete refreshed scores.
+func TestSetClearsExhaustedUntil(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "a@example.com", time.Now().Add(-time.Second))
+	ref.Set(NewScheduler([]Score{{AccountID: "a@example.com", Provider: accounts.ProviderClaude, Headroom: 0.02, ShortHeadroom: 0.02}}))
+	s := ref.Get()
+	if got := s.ScoreFor(accounts.ProviderClaude, "a@example.com").Headroom; got != 0.02 {
+		t.Fatalf("refreshed score clobbered by stale expiry prune: headroom=%v want 0.02", got)
+	}
+}
+
+// TestPartialRefreshKeepsMarkExpiry is the mixed-refresh regression: a refresh
+// that carries the exhausted account's zero score forward (its own usage fetch
+// failed) must NOT strip the mark's expiry, or the mark becomes permanent again
+// and the recovered account stays unroutable.
+func TestPartialRefreshKeepsMarkExpiry(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "recovered@example.com", time.Now().Add(-time.Second))
+	// Partial refresh: another account got fresh data, but recovered@'s zero
+	// score is seeded/carried forward unchanged.
+	ref.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "other@example.com", Provider: accounts.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "recovered@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	}), true)
+	if ref.Get().Exhausted(accounts.ProviderClaude, "recovered@example.com") {
+		t.Fatal("carried-forward zero score must keep its expiry; recovered account still exhausted after lapse")
+	}
+	// But a refresh that genuinely supersedes the mark (headroom) drops the expiry.
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "busy@example.com", time.Now().Add(-time.Second))
+	ref.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "busy@example.com", Provider: accounts.ProviderClaude, Headroom: 0.05, ShortHeadroom: 0.05},
+	}), true)
+	if got := ref.Get().ScoreFor(accounts.ProviderClaude, "busy@example.com").Headroom; got != 0.05 {
+		t.Fatalf("superseded mark must not prune the refreshed score: headroom=%v want 0.05", got)
+	}
+}
+
+// TestLapsedMarkRemarksOnNextReject documents the retry-once-on-lapse loop: a
+// lapsed mark makes a still-cooked account optimistic for exactly one probe;
+// the upstream's next reject re-marks it with the new authoritative reset, so
+// the cost of guessing wrong is bounded at one attempt per expiry window.
+func TestLapsedMarkRemarksOnNextReject(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "cooked@example.com", time.Now().Add(-time.Second))
+	if ref.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("lapsed mark should allow one optimistic probe")
+	}
+	// The probe's rejected response re-marks with the new upstream reset.
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "cooked@example.com", time.Now().Add(2*time.Hour))
+	if !ref.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("re-mark after the probe's reject must hold until the new reset")
+	}
+}
+
+// TestFreshZeroReanchorsExpiry: a successful usage fetch that re-confirms
+// exhaustion must re-anchor the mark's expiry to that newest evidence, so an
+// older request-time expiry cannot lapse a freshly-observed zero back to
+// optimistic. Expiries only extend, never shorten.
+func TestFreshZeroReanchorsExpiry(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	// Old request-time mark about to lapse.
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "confirmed@example.com", time.Now().Add(time.Millisecond))
+	// Fresh refresh re-confirms exhaustion with a 2h window reset.
+	ref.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "confirmed@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 7200, Fresh: true},
+	}), true)
+	until, ok := ref.ExhaustedUntilFor(accounts.ProviderClaude, "confirmed@example.com")
+	if !ok || time.Until(until) < 90*time.Minute {
+		t.Fatalf("fresh zero should re-anchor expiry to its reset (~2h), got %v (in %v)", until, time.Until(until))
+	}
+	if ref.Get().Exhausted(accounts.ProviderClaude, "confirmed@example.com") != true {
+		t.Fatal("freshly-confirmed exhausted account must stay exhausted")
+	}
+
+	// A fresh zero must never SHORTEN a longer authoritative expiry.
+	ref2 := NewSchedulerRef(NewScheduler(nil))
+	long := time.Now().Add(72 * time.Hour)
+	ref2.MarkExhaustedUntil(accounts.ProviderClaude, "weekly@example.com", long)
+	ref2.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "weekly@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3600, Fresh: true},
+	}), true)
+	got, _ := ref2.ExhaustedUntilFor(accounts.ProviderClaude, "weekly@example.com")
+	if !got.Equal(long) {
+		t.Fatalf("fresh zero shortened authoritative expiry: got %v want %v", got, long)
 	}
 }

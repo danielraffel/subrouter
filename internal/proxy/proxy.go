@@ -1231,6 +1231,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		seed := current.ScoreFor(account.Provider, account.ID)
 		seed.AccountID = account.ID
 		seed.Provider = account.Provider
+		seed.Fresh = false // carried forward until a fresh fetch overwrites it
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			seed.Headroom = 0.01
 			seed.ShortHeadroom = 0.01
@@ -1282,7 +1283,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			continue
 		}
 		if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-			scores[idx] = scoreFromUsageWindows(account.Provider, account.ID, windows)
+			next := scoreFromUsageWindows(account.Provider, account.ID, windows)
+			next.Fresh = true
+			scores[idx] = next
 			scored++
 		}
 	}
@@ -1678,6 +1681,79 @@ func (s Server) markAccountExhausted(provider accounts.Provider, accountID strin
 	}
 }
 
+// markAccountExhaustedFromResponse marks the account exhausted until the reset
+// time the upstream itself reported, so the mark self-expires exactly when the
+// account's window recovers. Observed live: an account whose weekly window had
+// reset (real quota available) stayed zero-scored for hours because marks only
+// cleared on a successful usage refresh, which the loaded usage endpoint kept
+// failing; failover then burned its attempts on genuinely-cooked accounts and
+// never reached the recovered one.
+func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, accountID string, status int, header http.Header) {
+	if s.SchedulerRef == nil {
+		return
+	}
+	if status == http.StatusUnauthorized {
+		// Dead/expired credential, not a rate-limit window: no reset header
+		// exists and it will not self-heal on a schedule. A longer TTL avoids
+		// probing a dead account every few minutes while still picking it back
+		// up within the hour after a re-auth.
+		s.markAccountExhaustedCredential(provider, accountID)
+		return
+	}
+	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, claudeExhaustionExpiry(header, time.Now()))
+}
+
+// credentialExhaustionTTL is how long an account with a dead credential
+// (401 / invalid_grant) stays out of routing before one re-probe. Credentials
+// only recover via human re-auth, so probes are pure overhead; but the mark
+// must still lapse so a re-authed account rejoins without waiting for a
+// successful usage refresh.
+const credentialExhaustionTTL = time.Hour
+
+func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accountID string) {
+	if s.SchedulerRef == nil {
+		return
+	}
+	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, time.Now().Add(credentialExhaustionTTL))
+}
+
+// markAccountExhaustedRefreshFailure picks the mark TTL by failure class: a
+// terminal credential error gets the long credential TTL, anything transient
+// gets the short default so the account rejoins quickly.
+func (s Server) markAccountExhaustedRefreshFailure(provider accounts.Provider, accountID string, err error) {
+	if isTerminalCredentialError(err) {
+		s.markAccountExhaustedCredential(provider, accountID)
+		return
+	}
+	s.markAccountExhausted(provider, accountID)
+}
+
+// claudeExhaustionExpiry picks when an exhaustion mark should lapse:
+// anthropic-ratelimit-unified-reset (epoch seconds, the authoritative window
+// reset) when present, else Retry-After seconds, else the scheduler default.
+// Clamped to [now+1m, now+8d]: the floor guards clock skew / already-passed
+// resets, the ceiling guards a nonsense far-future header pinning an account
+// out forever.
+func claudeExhaustionExpiry(header http.Header, now time.Time) time.Time {
+	until := now.Add(selectacct.DefaultExhaustedTTL)
+	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-reset")); raw != "" {
+		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
+			until = time.Unix(epoch, 0)
+		}
+	} else if ra := strings.TrimSpace(claudeHeaderGet(header, "Retry-After")); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+			until = now.Add(time.Duration(secs) * time.Second)
+		}
+	}
+	if min := now.Add(time.Minute); until.Before(min) {
+		return min
+	}
+	if max := now.Add(8 * 24 * time.Hour); until.After(max) {
+		return max
+	}
+	return until
+}
+
 func usageLimitJSON(body []byte) bool {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
@@ -1851,7 +1927,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
 		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
-			s.markAccountExhausted(provider, accountID)
+			s.markAccountExhaustedFromResponse(provider, accountID, response.StatusCode, response.Header)
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
@@ -1894,7 +1970,10 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		loggedBody := false
 		inspect = func(body []byte) {
 			if inspectUsageLimit && usageLimitJSON(body) {
-				s.markAccountExhausted(provider, accountID)
+				// Use the response's headers so a header-derived reset expiry set
+				// above is recomputed identically, not overwritten with the short
+				// default TTL.
+				s.markAccountExhaustedFromResponse(provider, accountID, response.StatusCode, response.Header)
 			}
 			// Only log the body for the original hard rate-limit statuses
 			// (429/401), whose body is a known rate-limit/auth error envelope. A
@@ -2525,7 +2604,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		s.Logger.Warn("selected Claude account refresh failed, trying another account", "account", account.ID, "error", err)
 	}
 	tried := map[string]struct{}{account.ID: {}}
-	s.markAccountExhausted(provider, account.ID)
+	s.markAccountExhaustedRefreshFailure(provider, account.ID, err)
 	lastErr := err
 	for {
 		next, pickErr := s.retryAccount(ctx, provider, agentType, sessionID, userEmail, tried)
@@ -2538,7 +2617,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 			return refreshed, nil
 		}
 		lastErr = err
-		s.markAccountExhausted(provider, next.ID)
+		s.markAccountExhaustedRefreshFailure(provider, next.ID, err)
 		if s.Logger != nil {
 			s.Logger.Warn("retry Claude account refresh failed", "account", next.ID, "error", err)
 		}
@@ -2904,7 +2983,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
 		}
 		if t.server != nil && exhausted {
-			t.server.markAccountExhausted(t.provider, accountID)
+			// Use the response's own reset time so the mark self-expires when the
+			// window recovers (codex responses lack these headers and fall back
+			// to the default TTL inside claudeExhaustionExpiry).
+			t.server.markAccountExhaustedFromResponse(t.provider, accountID, response.StatusCode, response.Header)
 		}
 		if attempt == maxAttempts || t.server == nil {
 			reason := "max_attempts"
@@ -3108,7 +3190,9 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			lastErr = err
 			terminal := isTerminalCredentialError(err)
 			if terminal {
-				s.markAccountExhausted(provider, account.ID)
+				// Credential TTL, not the short default: a dead token only heals
+				// via human re-auth, so frequent probes are pure overhead.
+				s.markAccountExhaustedCredential(provider, account.ID)
 			}
 			if s.Logger != nil {
 				s.Logger.Warn("usage-limit retry skipping OAuth account with failed refresh",
