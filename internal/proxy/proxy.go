@@ -2847,8 +2847,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// backoff. Overload is API-wide, not account-specific, so no failover, no
 		// exhaustion-marking, and no failover-budget consumption. Once the small
 		// overload budget is spent the 5xx passes through and the client's own
-		// backoff takes over.
-		if t.provider == accounts.ProviderClaude && claudeOverloadStatus(response.StatusCode) {
+		// backoff takes over. A 5xx that carries the rejected unified-status
+		// header is NOT overload-retried: rejected means this account is out of
+		// quota regardless of HTTP status, so it falls through to the usage-limit
+		// path below and fails over to a healthy account instead.
+		if t.provider == accounts.ProviderClaude && claudeOverloadStatus(response.StatusCode) && !claudeResponseRejected(response.Header) {
 			if overloadRetries >= claudeOverloadMaxRetries {
 				return response, nil
 			}

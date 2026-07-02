@@ -875,3 +875,50 @@ func TestClaudeOverloadBackoff(t *testing.T) {
 		t.Fatal("claudeOverloadStatus classification wrong")
 	}
 }
+
+// TestClaudeRejected5xxFailsOverNotOverloadRetried: a 5xx that carries the
+// rejected unified-status header is a depleted account, not API overload, so it
+// must fail over to a healthy account instead of burning same-account retries.
+func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-r5", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var cookedCalls, freshCalls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			cookedCalls++
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			return &http.Response{StatusCode: http.StatusInternalServerError, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error"}`))}
+		}
+		freshCalls++
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-r5", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 via failover", response.StatusCode)
+	}
+	if cookedCalls != 1 || freshCalls != 1 {
+		t.Fatalf("calls cooked=%d fresh=%d, want 1/1 (failover, not same-account overload retry)", cookedCalls, freshCalls)
+	}
+	if len(waits) != 0 {
+		t.Fatalf("overload backoff waits = %v, want none for a rejected 5xx", waits)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("a rejected 5xx must mark the depleted account exhausted")
+	}
+}
