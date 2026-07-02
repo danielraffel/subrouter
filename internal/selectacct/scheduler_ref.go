@@ -85,19 +85,38 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 }
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
-// refresh. An expiry is dropped only when the new score actually supersedes the
-// mark (shows headroom). It is KEPT while the incoming score is still zero,
-// because refreshes seed from the current scheduler and carry the old zero
-// score forward when that account's own usage fetch failed — clearing the
-// expiry there would make the request-time mark permanent again, recreating the
-// stranded-recovered-account failure. Keeping an expiry for a genuinely-cooked
-// account is safe: when it lapses, routing tries the account once and the
-// upstream's reject re-marks it.
+// refresh, by evidence class:
+//   - Score shows headroom (or is gone): the mark is superseded; drop the expiry.
+//   - Carried-forward zero (the account's own usage fetch failed, seed dragged
+//     along, Fresh=false): keep the existing expiry. Clearing it would make the
+//     request-time mark permanent again, recreating the stranded-recovered-
+//     account failure this exists to fix.
+//   - Fresh zero (a successful fetch re-confirmed exhaustion, Fresh=true):
+//     re-anchor the expiry to this newest evidence — extend it to at least the
+//     fresh window's own reset (floored at the default TTL) — so an OLDER
+//     request-time expiry can never lapse a freshly-observed zero back to the
+//     optimistic default. Expiries only extend here, never shorten, so an
+//     authoritative long reset from a rejected response still holds.
 func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
+	now := time.Now()
 	for key := range r.exhaustedUntil {
 		score, ok := r.scheduler.scores[key]
-		if !ok || !score.exhausted() {
+		switch {
+		case !ok || !score.exhausted():
 			delete(r.exhaustedUntil, key)
+		case score.Fresh:
+			until := now.Add(DefaultExhaustedTTL)
+			if score.ShortResetAfterSeconds > 0 {
+				if fromReset := now.Add(time.Duration(score.ShortResetAfterSeconds) * time.Second); fromReset.After(until) {
+					until = fromReset
+				}
+			}
+			if cap := now.Add(8 * 24 * time.Hour); until.After(cap) {
+				until = cap
+			}
+			if until.After(r.exhaustedUntil[key]) {
+				r.exhaustedUntil[key] = until
+			}
 		}
 	}
 }

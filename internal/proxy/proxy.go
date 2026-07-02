@@ -1231,6 +1231,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		seed := current.ScoreFor(account.Provider, account.ID)
 		seed.AccountID = account.ID
 		seed.Provider = account.Provider
+		seed.Fresh = false // carried forward until a fresh fetch overwrites it
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			seed.Headroom = 0.01
 			seed.ShortHeadroom = 0.01
@@ -1282,7 +1283,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			continue
 		}
 		if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-			scores[idx] = scoreFromUsageWindows(account.Provider, account.ID, windows)
+			next := scoreFromUsageWindows(account.Provider, account.ID, windows)
+			next.Fresh = true
+			scores[idx] = next
 			scored++
 		}
 	}

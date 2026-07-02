@@ -112,3 +112,36 @@ func TestLapsedMarkRemarksOnNextReject(t *testing.T) {
 		t.Fatal("re-mark after the probe's reject must hold until the new reset")
 	}
 }
+
+// TestFreshZeroReanchorsExpiry: a successful usage fetch that re-confirms
+// exhaustion must re-anchor the mark's expiry to that newest evidence, so an
+// older request-time expiry cannot lapse a freshly-observed zero back to
+// optimistic. Expiries only extend, never shorten.
+func TestFreshZeroReanchorsExpiry(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	// Old request-time mark about to lapse.
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "confirmed@example.com", time.Now().Add(time.Millisecond))
+	// Fresh refresh re-confirms exhaustion with a 2h window reset.
+	ref.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "confirmed@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 7200, Fresh: true},
+	}), true)
+	until, ok := ref.ExhaustedUntilFor(accounts.ProviderClaude, "confirmed@example.com")
+	if !ok || time.Until(until) < 90*time.Minute {
+		t.Fatalf("fresh zero should re-anchor expiry to its reset (~2h), got %v (in %v)", until, time.Until(until))
+	}
+	if ref.Get().Exhausted(accounts.ProviderClaude, "confirmed@example.com") != true {
+		t.Fatal("freshly-confirmed exhausted account must stay exhausted")
+	}
+
+	// A fresh zero must never SHORTEN a longer authoritative expiry.
+	ref2 := NewSchedulerRef(NewScheduler(nil))
+	long := time.Now().Add(72 * time.Hour)
+	ref2.MarkExhaustedUntil(accounts.ProviderClaude, "weekly@example.com", long)
+	ref2.FinishRefresh(NewScheduler([]Score{
+		{AccountID: "weekly@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, ShortResetAfterSeconds: 3600, Fresh: true},
+	}), true)
+	got, _ := ref2.ExhaustedUntilFor(accounts.ProviderClaude, "weekly@example.com")
+	if !got.Equal(long) {
+		t.Fatalf("fresh zero shortened authoritative expiry: got %v want %v", got, long)
+	}
+}

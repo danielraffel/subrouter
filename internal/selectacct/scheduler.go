@@ -18,6 +18,12 @@ type Score struct {
 	ExpiryPressure         float64
 	Sessions               int
 	ModelScores            map[string]Score
+	// Fresh marks a score computed from a successful, current usage fetch, as
+	// opposed to a seed carried forward from the previous scheduler (fetch
+	// failed/stale) or a request-time exhaustion mark. Expiry reconciliation
+	// uses it to tell "fresh evidence re-confirmed exhausted" apart from "old
+	// zero score dragged along".
+	Fresh bool
 }
 
 type Scheduler struct {
