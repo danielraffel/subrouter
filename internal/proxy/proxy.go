@@ -1326,17 +1326,13 @@ func isLoopbackRemote(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// clientRemoteIP returns the best-effort source IP for request attribution: the
-// leftmost X-Forwarded-For entry when present, otherwise the RemoteAddr host with
-// the port stripped. On the tailnet this is the caller's device IP, which maps to
-// a device via `tailscale status`.
+// clientRemoteIP returns the authoritative source IP for request attribution:
+// the socket peer (RemoteAddr) host with the port stripped. subrouter is reached
+// directly on the tailnet with no trusted proxy in front, so X-Forwarded-For is
+// deliberately ignored (a caller could spoof it to frame another device); the
+// socket peer cannot be forged. On the tailnet this maps to a device via
+// `tailscale status`.
 func clientRemoteIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

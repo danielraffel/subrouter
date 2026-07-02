@@ -712,9 +712,9 @@ func TestClientRemoteIP(t *testing.T) {
 	cases := []struct{ remote, xff, want string }{
 		{"100.94.126.75:41562", "", "100.94.126.75"},
 		{"[fd7a:115c:a1e0::1]:443", "", "fd7a:115c:a1e0::1"},
-		{"10.0.0.1:80", "100.1.2.3, 10.0.0.1", "100.1.2.3"},
-		{"10.0.0.1:80", "100.1.2.3", "100.1.2.3"},
 		{"noport", "", "noport"},
+		// X-Forwarded-For is spoofable and must be ignored; the socket peer wins.
+		{"100.94.126.75:41562", "100.1.2.3", "100.94.126.75"},
 	}
 	for _, tc := range cases {
 		if got := clientRemoteIP(mk(tc.remote, tc.xff)); got != tc.want {
