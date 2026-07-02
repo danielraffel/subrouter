@@ -52,12 +52,12 @@ type Server struct {
 	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
 	Transport        http.RoundTripper
 	Logger           *slog.Logger
-	ActiveSessions *ActiveSessions
-	Lifecycle      *Lifecycle
-	AdminToken     string
-	MaxBodyBytes   int64
-	Transcripts    *transcript.Recorder
-	ReadCache      *readCache
+	ActiveSessions   *ActiveSessions
+	Lifecycle        *Lifecycle
+	AdminToken       string
+	MaxBodyBytes     int64
+	Transcripts      *transcript.Recorder
+	ReadCache        *readCache
 }
 
 type ActiveSessions struct {
@@ -1490,7 +1490,7 @@ func (s Server) proxyHandler() http.Handler {
 				method:      r.Method,
 				path:        proxyRequest.URL.Path,
 				upstream:    upstream.Host,
-				maxAttempts: replayablePostMaxAttempts,
+				maxAttempts: s.usageLimitRetryMaxAttempts(requestProvider),
 			}
 		}
 		if retryPost && postReplayable {
@@ -2663,6 +2663,15 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 
 const replayablePostMaxBodyBytes = 128 << 20
 const replayablePostMaxAttempts = 6
+
+func (s Server) usageLimitRetryMaxAttempts(provider accounts.Provider) int {
+	count := len(oauthAccounts(filterAccountsForProvider(s.accountList(), provider)))
+	if count > replayablePostMaxAttempts {
+		return count
+	}
+	return replayablePostMaxAttempts
+}
+
 const replayablePostMaxConcurrentUploads = 4
 
 var replayablePostUploadLimiter = make(chan struct{}, replayablePostMaxConcurrentUploads)

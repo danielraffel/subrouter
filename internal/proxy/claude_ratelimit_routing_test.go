@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strconv"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +135,82 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("expected rate-limit header %q in logs; logs=\n%s", want, logs)
 		}
+	}
+}
+
+func TestClaude429FailoverTriesPastDefaultAttemptBudget(t *testing.T) {
+	var hits []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		account := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer tok-")
+		hits = append(hits, account)
+		if account == "fresh-7@example.com" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"msg_fresh","type":"message"}`))
+			return
+		}
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.Header().Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(24*time.Hour).Unix(), 10))
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(realisticAnthropic429Body))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("claude", "session-many", "cooked-0@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	accountsList := make([]accounts.Account, 0, 8)
+	scores := make([]selectacct.Score, 0, 8)
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("cooked-%d@example.com", i)
+		if i == 7 {
+			id = "fresh-7@example.com"
+		}
+		accountsList = append(accountsList, accounts.Account{ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-" + id})
+		headroom := 0.90 - float64(i)*0.01
+		scores = append(scores, selectacct.Score{AccountID: id, Provider: accounts.ProviderClaude, Headroom: headroom, ShortHeadroom: headroom})
+	}
+
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts:       accountsList,
+		Sessions:       store,
+		SchedulerRef:   selectacct.NewSchedulerRef(selectacct.NewScheduler(scores)),
+		UsageScoreTTL:  0,
+		MaxBodyBytes:   1 << 20,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{"model":"claude-fable-5","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-many")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_fresh") {
+		t.Fatalf("status=%d body=%s hits=%v, want failover to reach the eighth account", response.StatusCode, string(body), hits)
+	}
+	if len(hits) != 8 {
+		t.Fatalf("hits=%v, want all 8 accounts tried before success", hits)
+	}
+	if hits[len(hits)-1] != "fresh-7@example.com" {
+		t.Fatalf("last hit=%q, want fresh-7@example.com; hits=%v", hits[len(hits)-1], hits)
 	}
 }
 
@@ -943,13 +1019,13 @@ func TestClaudeExhaustionExpiry(t *testing.T) {
 	}
 	// Far-future reset is capped at 8d.
 	h.Set("Anthropic-Ratelimit-Unified-Reset", "1999999999")
-	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(8*24*time.Hour)) {
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(8 * 24 * time.Hour)) {
 		t.Fatalf("far reset = %v, want cap now+8d", got)
 	}
 	// Retry-After honored when unified-reset absent.
 	h = http.Header{}
 	h.Set("Retry-After", "300")
-	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(5*time.Minute)) {
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(5 * time.Minute)) {
 		t.Fatalf("retry-after = %v, want now+5m", got)
 	}
 }
