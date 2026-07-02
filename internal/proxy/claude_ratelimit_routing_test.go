@@ -722,3 +722,156 @@ func TestClientRemoteIP(t *testing.T) {
 		}
 	}
 }
+
+// recordSleep returns a sleep fn that records waits without actually sleeping.
+func recordSleep(waits *[]time.Duration) func(context.Context, time.Duration) error {
+	return func(ctx context.Context, d time.Duration) error {
+		*waits = append(*waits, d)
+		return ctx.Err()
+	}
+}
+
+// TestClaudeOverloadRetrySucceeds: a brief 529 blip is absorbed on the SAME
+// account with backoff; the client sees the eventual 200 and the account is
+// never marked exhausted.
+func TestClaudeOverloadRetrySucceeds(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-529", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		if calls <= 2 {
+			return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_ok"}`))}
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-529", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after overload retries", response.StatusCode)
+	}
+	if calls != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (529, 529, 200)", calls)
+	}
+	if len(waits) != 2 || waits[0] != time.Second || waits[1] != 2*time.Second {
+		t.Fatalf("backoff waits = %v, want [1s 2s]", waits)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("an overload must NOT mark the account exhausted")
+	}
+}
+
+// TestClaudeOverloadRetryGivesUpAfterBudget: a sustained outage passes the 5xx
+// through after the small retry budget so the client's own backoff takes over.
+func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "s", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 529 {
+		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
+	}
+	if calls != 1+claudeOverloadMaxRetries {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeOverloadMaxRetries)
+	}
+}
+
+// TestClaudeOverloadRetryPreservesFailoverAccount is the header-revert
+// regression: after failover moved the request to a second account, an overload
+// retry must keep that account's auth, not silently revert to the first.
+func TestClaudeOverloadRetryPreservesFailoverAccount(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-mix", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var freshCalls int
+	var authsSeen []string
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		auth := req.Header.Get("Authorization")
+		authsSeen = append(authsSeen, auth)
+		if strings.Contains(auth, "tok-cooked") {
+			h := http.Header{}
+			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error"}}`))}
+		}
+		freshCalls++
+		if freshCalls == 1 {
+			return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_fresh"}`))}
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-mix", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_fresh") {
+		t.Fatalf("status=%d body=%s, want fresh 200 (429 -> failover -> 529 -> retry same fresh account)", response.StatusCode, string(body))
+	}
+	// Sequence must be cooked, fresh (529), fresh (200): the overload retry
+	// stays on the failover account.
+	if len(authsSeen) != 3 || !strings.Contains(authsSeen[1], "tok-fresh") || !strings.Contains(authsSeen[2], "tok-fresh") {
+		t.Fatalf("auth sequence = %v, want cooked then fresh twice", authsSeen)
+	}
+}
+
+func TestClaudeOverloadBackoff(t *testing.T) {
+	h := http.Header{}
+	if d := claudeOverloadBackoff(h, 0); d != time.Second {
+		t.Fatalf("retry0 = %v, want 1s", d)
+	}
+	if d := claudeOverloadBackoff(h, 1); d != 2*time.Second {
+		t.Fatalf("retry1 = %v, want 2s", d)
+	}
+	h.Set("Retry-After", "3")
+	if d := claudeOverloadBackoff(h, 0); d != 3*time.Second {
+		t.Fatalf("retry-after 3 = %v, want 3s", d)
+	}
+	h.Set("Retry-After", "9999")
+	if d := claudeOverloadBackoff(h, 0); d != claudeOverloadMaxWait {
+		t.Fatalf("retry-after 9999 = %v, want cap %v", d, claudeOverloadMaxWait)
+	}
+	if !claudeOverloadStatus(529) || !claudeOverloadStatus(500) || claudeOverloadStatus(429) || claudeOverloadStatus(200) {
+		t.Fatal("claudeOverloadStatus classification wrong")
+	}
+}

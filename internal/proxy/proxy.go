@@ -19,6 +19,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2666,6 +2667,64 @@ type usageLimitRetryTransport struct {
 	path        string
 	upstream    string
 	maxAttempts int
+	// sleep waits for the backoff duration or until the context is cancelled.
+	// Injectable for tests; nil means a real timer wait.
+	sleep func(context.Context, time.Duration) error
+}
+
+// claudeOverloadMaxRetries bounds the same-account retries subrouter itself
+// performs on an Anthropic 5xx/529 overload before passing the error through to
+// the client (which retries further with its own backoff). Small on purpose:
+// subrouter absorbs brief blips without stacking long waits on top of the
+// client's retry budget or amplifying load during a sustained outage.
+const claudeOverloadMaxRetries = 2
+
+// claudeOverloadMaxWait caps a single overload backoff wait, including one
+// requested via Retry-After, so a pathological header cannot hold a proxied
+// request hostage.
+const claudeOverloadMaxWait = 10 * time.Second
+
+// claudeOverloadStatus reports whether the upstream response is an
+// Anthropic-side server failure (529 overloaded_error or another 5xx) worth
+// retrying on the SAME account: it is not account-specific, so rotating
+// accounts cannot help and would only burn the failover budget.
+func claudeOverloadStatus(code int) bool {
+	return code >= 500 && code <= 599
+}
+
+// claudeOverloadBackoff picks the wait before an overload retry: Retry-After
+// when the upstream sent one (capped), else 1s << retry (1s, 2s, ...).
+func claudeOverloadBackoff(header http.Header, retry int) time.Duration {
+	if ra := strings.TrimSpace(claudeHeaderGet(header, "Retry-After")); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+			wait := time.Duration(secs) * time.Second
+			if wait > claudeOverloadMaxWait {
+				return claudeOverloadMaxWait
+			}
+			return wait
+		}
+	}
+	wait := time.Second << retry
+	if wait > claudeOverloadMaxWait {
+		return claudeOverloadMaxWait
+	}
+	return wait
+}
+
+// sleepCtx waits for d or until ctx is cancelled, using the injected sleep when
+// present (tests) and a real timer otherwise.
+func (t usageLimitRetryTransport) sleepCtx(ctx context.Context, d time.Duration) error {
+	if t.sleep != nil {
+		return t.sleep(ctx, d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // responseUsageLimited reports whether the upstream response means the current
@@ -2778,10 +2837,47 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if accountID != "" {
 		tried[accountID] = struct{}{}
 	}
+	overloadRetries := 0
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
 			return response, err
+		}
+		// Anthropic overload (529/5xx): retry the SAME account after a bounded
+		// backoff. Overload is API-wide, not account-specific, so no failover, no
+		// exhaustion-marking, and no failover-budget consumption. Once the small
+		// overload budget is spent the 5xx passes through and the client's own
+		// backoff takes over.
+		if t.provider == accounts.ProviderClaude && claudeOverloadStatus(response.StatusCode) {
+			if overloadRetries >= claudeOverloadMaxRetries {
+				return response, nil
+			}
+			wait := claudeOverloadBackoff(response.Header, overloadRetries)
+			overloadRetries++
+			if t.logger != nil {
+				t.logger.Warn("retrying after anthropic overload", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "wait", wait.String(), "overload_retry", overloadRetries, "max_overload_retries", claudeOverloadMaxRetries)
+			}
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
+				return nil, sleepErr
+			}
+			body, bodyErr := req.GetBody()
+			if bodyErr != nil {
+				return nil, bodyErr
+			}
+			// Preserve the CURRENT attempt's headers: after an earlier account
+			// failover attemptReq carries that account's auth, and cloning from the
+			// original req would silently revert to the first account.
+			currentHeader := attemptReq.Header.Clone()
+			attemptReq = req.Clone(req.Context())
+			attemptReq.Body = body
+			attemptReq.GetBody = req.GetBody
+			attemptReq.ContentLength = req.ContentLength
+			attemptReq.Header = currentHeader
+			attempt-- // overload retries do not consume the account-failover budget
+			continue
 		}
 		usageLimited, inspectErr := t.responseUsageLimited(response)
 		if inspectErr != nil {
