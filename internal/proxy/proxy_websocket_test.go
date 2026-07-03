@@ -1069,6 +1069,43 @@ func TestUsageStatusEndpointFetchesUsageWithoutForcingFreshRefresh(t *testing.T)
 	}
 }
 
+func TestUsageStatusEndpointIncludesClaudeRequestTimeExhaustion(t *testing.T) {
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	ref.MarkExhaustedUntil(accounts.ProviderClaude, "claude@example.com", time.Now().Add(2*time.Hour))
+	handler := Server{
+		Accounts: []accounts.Account{{
+			ID:       "claude@example.com",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth,
+			Email:    "claude@example.com",
+		}},
+		SchedulerRef: ref,
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var statuses []AccountUsageStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &statuses); err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one", statuses)
+	}
+	for _, window := range statuses[0].Windows {
+		if window.Name == "oauth-apps-weekly" {
+			if window.UsedPercent != 100 || window.ResetAfterSeconds <= 0 {
+				t.Fatalf("oauth-apps-weekly = %+v, want saturated with reset", window)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing oauth-apps-weekly window: %+v", statuses[0].Windows)
+}
+
 func TestReloadAccountsHotLoadsNewAccountWithoutRestart(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	accountStore := accounts.CodexStore{Dir: t.TempDir()}
