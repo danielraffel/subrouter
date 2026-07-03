@@ -1167,6 +1167,11 @@ func isClaudeWeeklyWindow(window accounts.UsageWindow) bool {
 	return name == "7d" || name == "weekly"
 }
 
+func isClaudeOAuthAppsWeeklyWindow(window accounts.UsageWindow) bool {
+	name := strings.ToLower(window.Name)
+	return strings.Contains(name, "oauth-apps") || strings.Contains(name, "7d_oi")
+}
+
 func isClaudeOpusWeeklyWindow(window accounts.UsageWindow) bool {
 	return strings.Contains(strings.ToLower(window.Name), "opus")
 }
@@ -1266,11 +1271,11 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		return nil
 	}
 	var windows []accounts.UsageWindow
-	add := func(name string, limit *agentclaude.RateLimit) {
+	add := func(name string, windowSeconds int64, limit *agentclaude.RateLimit) {
 		if limit == nil || limit.Utilization == nil {
 			return
 		}
-		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization}
+		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization, LimitWindowSeconds: windowSeconds}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
@@ -1280,10 +1285,15 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		}
 		windows = append(windows, window)
 	}
-	add("5h", usage.FiveHour)
-	add("7d", usage.SevenDay)
-	add("opus-weekly", usage.SevenDayOpus)
-	add("sonnet-weekly", usage.SevenDaySonnet)
+	const (
+		fiveHourSeconds = int64(5 * 60 * 60)
+		sevenDaySeconds = int64(7 * 24 * 60 * 60)
+	)
+	add("5h", fiveHourSeconds, usage.FiveHour)
+	add("7d", sevenDaySeconds, usage.SevenDay)
+	add("oauth-apps-weekly", sevenDaySeconds, usage.SevenDayOAuthApps)
+	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
+	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
 		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
 	}
@@ -1602,6 +1612,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 			usageGridColumn{Key: "Session", Title: "Session", Width: windowWidth},
 			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: windowWidth},
 		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "OAuth wk", Title: "OAuth wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
@@ -1623,6 +1634,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 	extra = widenUsageGridColumn(columns, "Account", extra, 36)
 	extra = widenUsageGridColumn(columns, "Pick", extra, 34)
 	extra = widenUsageGridColumn(columns, "State", extra, 14)
+	extra = widenUsageGridColumn(columns, "OAuth wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Sonnet wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Weekly", extra, 12)
@@ -1645,6 +1657,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Credits":   usageGridCreditsCell(row),
 		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"OAuth wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
 		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
@@ -2077,6 +2090,9 @@ func windowLabel(window accounts.UsageWindow) string {
 	}
 	if strings.HasSuffix(name, "/secondary") {
 		return strings.TrimSuffix(name, "/secondary") + " (weekly)"
+	}
+	if name == "oauth-apps-weekly" {
+		return "OAuth apps (weekly)"
 	}
 	return name
 }
