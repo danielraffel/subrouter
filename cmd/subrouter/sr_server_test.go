@@ -1205,6 +1205,16 @@ func commandHasPrefix(command []string, parts []string) bool {
 	return true
 }
 
+func TestParseAPIKeyProviderClaude(t *testing.T) {
+	provider, err := parseAPIKeyProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider != accounts.ProviderClaude {
+		t.Fatalf("provider = %q, want claude", provider)
+	}
+}
+
 func jsonMarshalIndent(value any) ([]byte, error) {
 	return json.MarshalIndent(value, "", "  ")
 }
