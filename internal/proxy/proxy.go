@@ -3163,9 +3163,16 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 	// though healthy accounts remained untried.
 	var lastErr error
 	for {
+		scheduler := s.scheduler()
+		if s.Sessions != nil {
+			scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+		}
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
+				continue
+			}
+			if scheduler.Exhausted(account.Provider, account.ID) {
 				continue
 			}
 			candidates = append(candidates, account)
@@ -3174,11 +3181,7 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if lastErr != nil {
 				return accounts.Account{}, lastErr
 			}
-			return accounts.Account{}, fmt.Errorf("no untried OAuth %s accounts available", provider)
-		}
-		scheduler := s.scheduler()
-		if s.Sessions != nil {
-			scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+			return accounts.Account{}, fmt.Errorf("no untried non-exhausted OAuth %s accounts available", provider)
 		}
 		account, err := scheduler.Pick(candidates)
 		if err != nil {
