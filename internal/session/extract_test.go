@@ -95,6 +95,23 @@ func TestExtractModelFromJSONAndRestoresBody(t *testing.T) {
 	}
 }
 
+func TestExtractModelFromLargeJSONPrefixAndRestoresBody(t *testing.T) {
+	body := `{"model":"claude-fable-5","messages":[{"role":"user","content":"` + strings.Repeat("x", 2048) + `"}]}`
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	if got := ExtractModel(req, 128); got != "claude-fable-5" {
+		t.Fatalf("got %q, want claude-fable-5", got)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != body {
+		t.Fatalf("body was not restored")
+	}
+}
+
 func TestExtractAgentTypeFromSubrouterHeader(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/responses", nil)
 	req.Header.Set("X-Subrouter-Agent", "Claude")
