@@ -277,6 +277,7 @@ type AccountUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	UsageFresh         bool                             `json:"-"`
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
@@ -488,6 +489,7 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 		restored.Active = status.Active
 		restored.Refreshed = status.Refreshed
 		restored.Error = ""
+		restored.UsageFresh = false
 		out[i] = restored
 	}
 	r.usageStatusCache = append([]AccountUsageStatus(nil), out...)
@@ -592,6 +594,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			next.Windows = details.Windows
 			next.Credits = details.Credits
 			next.ComplimentaryReset = details.ComplimentaryReset
+			next.UsageFresh = true
 			out[i] = next
 		}()
 	}
@@ -628,7 +631,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.AuthValid = true
 			r.replace(account)
-			windows, _, err := r.FetchUsageWindowsCached(ctx, r.client, account)
+			windows, fresh, err := r.FetchUsageWindowsCached(ctx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -636,6 +639,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.PlanType = "claude"
 			next.Windows = windows
+			next.UsageFresh = fresh
 			out[i] = next
 		}()
 	}
@@ -953,7 +957,9 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
-		writeJSON(w, s.withRequestTimeExhaustionWindows(s.AccountRef.UsageStatuses(r.Context())))
+		statuses := s.AccountRef.UsageStatuses(r.Context())
+		s.updateSchedulerFromUsageStatuses(statuses)
+		writeJSON(w, s.withRequestTimeExhaustionWindows(statuses))
 		return
 	}
 	accounts := s.accountList()
@@ -970,6 +976,47 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, s.withRequestTimeExhaustionWindows(out))
+}
+
+func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) {
+	if s.SchedulerRef == nil {
+		return
+	}
+	available := oauthAccounts(s.accountList())
+	if len(available) == 0 {
+		return
+	}
+	current := s.scheduler()
+	scores := make([]selectacct.Score, 0, len(available))
+	scoreByID := make(map[string]int, len(available))
+	for _, account := range available {
+		seed := current.ScoreFor(account.Provider, account.ID)
+		seed.AccountID = account.ID
+		seed.Provider = account.Provider
+		seed.Fresh = false
+		scoreByID[selectacct.ScoreKey(account.Provider, account.ID)] = len(scores)
+		scores = append(scores, seed)
+	}
+	scored := 0
+	for _, status := range statuses {
+		if !status.UsageFresh || status.AuthMode != accounts.AuthModeOAuth || len(status.Windows) == 0 {
+			continue
+		}
+		if idx, ok := scoreByID[selectacct.ScoreKey(status.Provider, status.ID)]; ok {
+			next := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
+			next.Fresh = true
+			scores[idx] = next
+			scored++
+		}
+	}
+	if scored == 0 {
+		return
+	}
+	scheduler := selectacct.NewScheduler(scores)
+	if s.Sessions != nil {
+		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
+	}
+	s.SchedulerRef.Set(scheduler)
 }
 
 func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
