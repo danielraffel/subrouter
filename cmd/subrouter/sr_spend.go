@@ -26,6 +26,8 @@ type bedrockCostSummaryView struct {
 	OutputTokens     int64                          `json:"output_tokens"`
 	CacheReadTokens  int64                          `json:"cache_read_tokens"`
 	CacheWriteTokens int64                          `json:"cache_write_tokens"`
+	Throttled        int                            `json:"throttled"`
+	LastThrottle     string                         `json:"last_throttle,omitempty"`
 	ByModel          map[string]bedrockModelAggView `json:"by_model"`
 }
 
@@ -84,6 +86,10 @@ func (r srRunner) spend(ctx context.Context) error {
 			agg := summary.ByModel[m]
 			fmt.Fprintf(r.out, "    %-26s $%s  (%d req)\n", m, fmtUSD4(agg.TotalUSD), agg.Requests)
 		}
+	}
+	if summary.Throttled > 0 {
+		when := summary.LastThrottle
+		fmt.Fprintf(r.out, "  throttled %d request(s) (429); last %s — auto-bump requests a quota increase\n", summary.Throttled, when)
 	}
 	if summary.Requests == 0 {
 		fmt.Fprintln(r.out, "  no Bedrock requests recorded yet")

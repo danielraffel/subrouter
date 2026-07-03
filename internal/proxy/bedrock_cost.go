@@ -196,6 +196,8 @@ type bedrockCostSummary struct {
 	OutputTokens     int64                      `json:"output_tokens"`
 	CacheReadTokens  int64                      `json:"cache_read_tokens"`
 	CacheWriteTokens int64                      `json:"cache_write_tokens"`
+	Throttled        int                        `json:"throttled"`
+	LastThrottle     string                     `json:"last_throttle,omitempty"`
 	ByModel          map[string]bedrockModelAgg `json:"by_model"`
 }
 
@@ -231,6 +233,12 @@ func summarizeBedrockCost(path string) bedrockCostSummary {
 		summary.OutputTokens += int64(record.Usage.OutputTokens)
 		summary.CacheReadTokens += int64(record.Usage.CacheReadTokens)
 		summary.CacheWriteTokens += int64(record.Usage.CacheWriteTokens)
+		if record.Status == 429 {
+			summary.Throttled++
+			if record.Timestamp > summary.LastThrottle {
+				summary.LastThrottle = record.Timestamp
+			}
+		}
 		if ts, err := time.Parse(time.RFC3339, record.Timestamp); err == nil {
 			if ts.After(startToday) {
 				summary.TodayUSD += record.CostUSD

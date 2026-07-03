@@ -177,6 +177,7 @@ func serve(args []string) error {
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "AWS region for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
+	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -274,7 +275,10 @@ func serve(args []string) error {
 			Transport:    outboundTransport,
 			CostLogPath:  filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"),
 		}
-		slog.Info("bedrock gateway enabled", "region", *bedrockRegion, "auth", token != "")
+		if *bedrockAutoBump {
+			bedrockConfig.Bumper = proxy.NewBedrockQuotaBumper(awsCfg, slog.Default())
+		}
+		slog.Info("bedrock gateway enabled", "region", *bedrockRegion, "auth", token != "", "autobump", *bedrockAutoBump)
 	}
 
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)

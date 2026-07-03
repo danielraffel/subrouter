@@ -29,6 +29,9 @@ type BedrockConfig struct {
 	// CostLogPath is the JSONL file where per-request token usage and estimated
 	// cost are appended. Empty disables cost tracking.
 	CostLogPath string
+	// Bumper, when set, requests a Service Quotas increase when Bedrock throttles
+	// (HTTP 429), deduped per quota with a cooldown.
+	Bumper *bedrockQuotaBumper
 }
 
 const bedrockService = "bedrock"
@@ -118,6 +121,14 @@ func (s Server) bedrockHandler() http.Handler {
 		w.WriteHeader(resp.StatusCode)
 
 		model := bedrockModelFromPath(upstreamPath)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if s.Logger != nil {
+				s.Logger.Warn("bedrock throttled", "model", model, "path", upstreamPath)
+			}
+			if cfg.Bumper != nil {
+				go cfg.Bumper.onThrottle(model)
+			}
+		}
 		usage, haveUsage := s.streamBedrockResponse(w, resp)
 		if cfg.CostLogPath != "" && model != "" {
 			record := bedrockCostRecord{
