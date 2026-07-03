@@ -95,8 +95,8 @@ func TestExtractModelFromJSONAndRestoresBody(t *testing.T) {
 	}
 }
 
-func TestExtractModelFromLargeJSONPrefixAndRestoresBody(t *testing.T) {
-	body := `{"model":"claude-fable-5","messages":[{"role":"user","content":"` + strings.Repeat("x", 2048) + `"}]}`
+func TestExtractModelFromLargeJSONScanAndRestoresBody(t *testing.T) {
+	body := `{"tools":[{"input_schema":"` + strings.Repeat("x", 2048) + `"}],"model":"claude-fable-5","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 

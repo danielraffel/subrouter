@@ -211,7 +211,7 @@ func extractJSONModel(r *http.Request, maxBodyBytes int64) string {
 	if value != nil {
 		return findJSONModel(value)
 	}
-	return extractJSONModelPrefix(r, maxBodyBytes)
+	return extractJSONModelScan(r, maxBodyBytes)
 }
 
 func extractJSONValue(r *http.Request, maxBodyBytes int64) any {
@@ -289,14 +289,20 @@ func findJSONModel(value any) string {
 
 var jsonModelFieldPattern = regexp.MustCompile(`"model"\s*:\s*"((?:\\.|[^"\\])*)"`)
 
-func extractJSONModelPrefix(r *http.Request, maxBodyBytes int64) string {
+const modelScanMaxBodyBytes = int64(8 << 20)
+
+func extractJSONModelScan(r *http.Request, maxBodyBytes int64) string {
 	if r.Body == nil || maxBodyBytes <= 0 {
 		return ""
 	}
 	if contentType := r.Header.Get("Content-Type"); !strings.Contains(contentType, "json") {
 		return ""
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	limit := maxBodyBytes
+	if limit < modelScanMaxBodyBytes {
+		limit = modelScanMaxBodyBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit))
 	if err != nil {
 		return ""
 	}
