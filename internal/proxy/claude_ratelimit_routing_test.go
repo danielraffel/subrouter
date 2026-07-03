@@ -510,6 +510,47 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
+func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-exhausted-alt", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "fresh@example.com", time.Now().Add(time.Hour))
+
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			t.Fatal("fresh account is marked exhausted and must not be retried")
+		}
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-exhausted-alt", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want original 429", response.StatusCode)
+	}
+	if calls != 1 {
+		t.Fatalf("upstream calls=%d, want 1 because marked-exhausted alternates are skipped", calls)
+	}
+}
+
 // TestClaudeRejectedHeaderOn200FailsOver is the Aziz regression: a depleted
 // account answers 200 via overage but sets anthropic-ratelimit-unified-status:
 // rejected, which Claude Code hard-blocks on. subrouter must treat that 200 as
