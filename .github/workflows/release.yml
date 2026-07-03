@@ -125,6 +125,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :latest is skipped for prerelease versions (anything with a hyphen,
+      # e.g. v1.2.3-rc1) so pulling latest never lands on an unstable build.
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
@@ -133,7 +135,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/manaflow-ai/subrouter:v${{ needs.build.outputs.version }}
-            ghcr.io/manaflow-ai/subrouter:latest
+            ${{ !contains(needs.build.outputs.version, '-') && 'ghcr.io/manaflow-ai/subrouter:latest' || '' }}
 
   # Manual opt-in only. These never run on a tag push; trigger this workflow via
   # the Actions "Run workflow" button with the toggle enabled to publish.

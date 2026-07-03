@@ -49,7 +49,7 @@ docker compose up -d
 curl -fsS http://127.0.0.1:31415/_subrouter/health
 ```
 
-Release tags publish `ghcr.io/manaflow-ai/subrouter:<version>` and `:latest` for amd64 and arm64. State (accounts, sessions) lives in the `subrouter-state` volume at `/var/lib/subrouter`; account files written there survive image upgrades. To add accounts, use `sr server add` + `sr server sync` from your workstation rather than exec-ing into the container.
+Release tags publish `ghcr.io/manaflow-ai/subrouter:<version>` for amd64 and arm64; `:latest` moves only on stable versions, never on prerelease tags (anything with a hyphen, like `v1.2.3-rc1`). State (accounts, sessions) lives in the `subrouter-state` volume at `/var/lib/subrouter`; account files written there survive image upgrades. To add accounts, use `sr server add` + `sr server sync` from your workstation rather than exec-ing into the container.
 
 The compose file publishes 31415 on all interfaces. On a shared host, change the mapping to `127.0.0.1:31415:31415` or a tailnet address.
 
