@@ -458,6 +458,41 @@ func TestClaudeFableProbeTreatsHeaderless429AsFableExhausted(t *testing.T) {
 	}
 }
 
+func TestUsageStatusFreshFableWindowUpdatesSchedulerModelPool(t *testing.T) {
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "acct", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+	}))
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID:       "acct",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth,
+		}},
+		SchedulerRef: schedulerRef,
+	}
+	server.updateSchedulerFromUsageStatuses([]AccountUsageStatus{{
+		AccountStatus: AccountStatus{
+			ID:       "acct",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth,
+		},
+		UsageFresh: true,
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60},
+			{Name: "7d", UsedPercent: 40, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			{Name: agentclaude.FableWindowName, Feature: agentclaude.FableModel, UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
+		},
+	}})
+	base := schedulerRef.Get()
+	if base.Exhausted(accounts.ProviderClaude, "acct") {
+		t.Fatalf("base Claude score should remain usable when only Fable is exhausted")
+	}
+	fable := base.ForModel(agentclaude.FableModel)
+	if !fable.Exhausted(accounts.ProviderClaude, "acct") {
+		t.Fatalf("Fable model score should be exhausted after fresh status update")
+	}
+}
+
 // TestClaudeShortWindowDrivesRouting proves the routing calculation now prefers
 // the account with more 5h headroom even when both accounts have identical
 // account-wide (7d) headroom. Before the fix both scored equal short headroom.
