@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
@@ -115,6 +117,7 @@ var directSRCommands = map[string]struct{}{
 	"attach-project":   {},
 	"breadcrumbs":      {},
 	"claude":           {},
+	"claude-aws":       {},
 	"g":                {},
 	"gemini":           {},
 	"gui":              {},
@@ -169,6 +172,9 @@ func serve(args []string) error {
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
+	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
+	bedrockRegion := flags.String("bedrock-region", "us-east-1", "AWS region for the Bedrock signing gateway")
+	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -245,6 +251,29 @@ func serve(args []string) error {
 		}()
 	}
 	outboundTransport := proxy.NewOutboundTransport()
+
+	var bedrockConfig *proxy.BedrockConfig
+	if *bedrockEnable {
+		token := strings.TrimSpace(*bedrockGatewayToken)
+		if token == "" {
+			token = strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
+		}
+		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(*bedrockRegion))
+		if err != nil {
+			return fmt.Errorf("bedrock: load AWS config: %w", err)
+		}
+		if awsCfg.Credentials == nil {
+			return errors.New("bedrock: no AWS credentials available")
+		}
+		bedrockConfig = &proxy.BedrockConfig{
+			Region:       *bedrockRegion,
+			Credentials:  aws.NewCredentialsCache(awsCfg.Credentials),
+			GatewayToken: token,
+			Transport:    outboundTransport,
+		}
+		slog.Info("bedrock gateway enabled", "region", *bedrockRegion, "auth", token != "")
+	}
+
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
 	initialAccounts = append(initialAccounts, claudeAccounts...)
 	accountRef := proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
@@ -269,6 +298,7 @@ func serve(args []string) error {
 		Lifecycle:      proxy.NewLifecycle(),
 		AdminToken:     *adminToken,
 		MaxBodyBytes:   *maxBodyBytes,
+		Bedrock:        bedrockConfig,
 		Transcripts:    transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
@@ -623,6 +653,8 @@ Usage:
   %[1]s attach-project <api-key-label> [--project-id <id-or-name>]
 
   %[1]s claude             Manage Claude Code profiles
+  %[1]s claude-aws [--model fable] [claude args...]
+                           Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s gemini             Manage Gemini profiles
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]

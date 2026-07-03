@@ -162,6 +162,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"attach-project",
 		"breadcrumbs",
 		"claude",
+		"claude-aws",
 		"g",
 		"gemini",
 		"gui",

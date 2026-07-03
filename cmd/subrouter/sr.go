@@ -74,6 +74,8 @@ Usage:
   sr attach-project <api-key-label> [--project-id <id-or-name>]
 
   sr claude             Manage Claude Code profiles
+  sr claude-aws [--model fable] [claude args...]
+                        Launch Claude Code on AWS Bedrock via the server (Fable 5)
   sr gemini             Manage Gemini profiles
 
 These account commands also work at top level as subrouter <command> and sr <command>.
@@ -220,6 +222,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return nil
 	case "claude":
 		return r.claude(ctx, args[1:])
+	case "claude-aws":
+		return r.claudeAWS(ctx, args[1:])
 	case "gemini":
 		return r.gemini(args[1:])
 	default:
@@ -232,7 +236,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "claude", "gemini", "help", "-h", "--help":
+	case "server", "servers", "claude", "claude-aws", "gemini", "help", "-h", "--help":
 		return false
 	default:
 		return true

@@ -58,6 +58,8 @@ type Server struct {
 	MaxBodyBytes     int64
 	Transcripts      *transcript.Recorder
 	ReadCache        *readCache
+	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
+	Bedrock *BedrockConfig
 }
 
 type ActiveSessions struct {
@@ -857,6 +859,9 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
+	if s.Bedrock != nil {
+		mux.Handle("/bedrock/", s.bedrockHandler())
+	}
 	mux.Handle("/", s.proxyHandler())
 	return mux
 }

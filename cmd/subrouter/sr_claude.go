@@ -449,6 +449,93 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	return cmd.Run()
 }
 
+// claudeAWS launches Claude Code in Amazon Bedrock gateway mode, routed through
+// the default Subrouter server's /bedrock endpoint. The server holds the AWS
+// credentials and SigV4-signs each request, so teammates need no AWS access.
+// All flags after an optional --model are passed through to Claude Code
+// unchanged. --model accepts a friendly alias (fable, opus, sonnet, haiku) or a
+// full Bedrock model id / inference profile; it defaults to Fable 5.
+func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
+	server, ok, err := r.defaultRemoteServer()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("sr claude-aws needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
+	}
+	baseURL := strings.TrimRight(server.URL, "/") + "/bedrock"
+
+	model := "fable"
+	region := "us-east-1"
+	passthrough := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--model", "-m":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--model requires a value")
+			}
+			model = args[i+1]
+			i++
+		case "--aws-region":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--aws-region requires a value")
+			}
+			region = args[i+1]
+			i++
+		default:
+			passthrough = append(passthrough, args[i])
+		}
+	}
+
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, passthrough...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	env := append(os.Environ(),
+		"CLAUDE_CODE_USE_BEDROCK=1",
+		"CLAUDE_CODE_SKIP_BEDROCK_AUTH=1",
+		"ANTHROPIC_BEDROCK_BASE_URL="+baseURL,
+		"AWS_REGION="+region,
+		"AWS_DEFAULT_REGION="+region,
+		"ANTHROPIC_MODEL="+bedrockModelID(model),
+		"ANTHROPIC_SMALL_FAST_MODEL="+bedrockSmallFastModelID,
+	)
+	if token := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN")); token != "" {
+		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
+	}
+	cmd.Env = env
+	return cmd.Run()
+}
+
+const bedrockSmallFastModelID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+// bedrockModelID maps a friendly model alias to a Bedrock inference profile id.
+// A value that already looks like a Bedrock id (contains "anthropic.") is passed
+// through unchanged, as is any unrecognized value.
+func bedrockModelID(name string) string {
+	trimmed := strings.TrimSpace(name)
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "anthropic.") {
+		return trimmed
+	}
+	switch lower {
+	case "", "fable", "fable-5", "fable5", "claude-fable-5":
+		return "us.anthropic.claude-fable-5"
+	case "opus", "claude-opus-4-8", "opus-4-8":
+		return "us.anthropic.claude-opus-4-8"
+	case "sonnet", "claude-sonnet-5", "sonnet-5":
+		return "us.anthropic.claude-sonnet-5"
+	case "haiku", "claude-haiku-4-5":
+		return bedrockSmallFastModelID
+	default:
+		return trimmed
+	}
+}
+
 type claudeRow struct {
 	label    string
 	used     float64
