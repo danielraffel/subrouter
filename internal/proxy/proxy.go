@@ -934,7 +934,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
-		writeJSON(w, s.AccountRef.UsageStatuses(r.Context()))
+		writeJSON(w, s.withRequestTimeExhaustionWindows(s.AccountRef.UsageStatuses(r.Context())))
 		return
 	}
 	accounts := s.accountList()
@@ -950,7 +950,53 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
-	writeJSON(w, out)
+	writeJSON(w, s.withRequestTimeExhaustionWindows(out))
+}
+
+func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
+	if s.SchedulerRef == nil {
+		return statuses
+	}
+	now := time.Now()
+	out := append([]AccountUsageStatus(nil), statuses...)
+	for i := range out {
+		status := &out[i]
+		if status.AuthMode != accounts.AuthModeOAuth {
+			continue
+		}
+		until, ok := s.SchedulerRef.ExhaustedUntilFor(status.Provider, status.ID)
+		if !ok || !until.After(now) {
+			continue
+		}
+		resetAfter := int64(until.Sub(now).Seconds())
+		if resetAfter < 0 {
+			resetAfter = 0
+		}
+		name := "request-limit"
+		windowSeconds := int64(7 * 24 * 60 * 60)
+		if status.Provider == accounts.ProviderClaude {
+			name = "oauth-apps-weekly"
+		}
+		if usageWindowNamed(status.Windows, name) {
+			continue
+		}
+		status.Windows = append(append([]accounts.UsageWindow(nil), status.Windows...), accounts.UsageWindow{
+			Name:               name,
+			UsedPercent:        100,
+			LimitWindowSeconds: windowSeconds,
+			ResetAfterSeconds:  resetAfter,
+		})
+	}
+	return out
+}
+
+func usageWindowNamed(windows []accounts.UsageWindow, name string) bool {
+	for _, window := range windows {
+		if window.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Server) handleReloadAccounts(w http.ResponseWriter, r *http.Request) {
