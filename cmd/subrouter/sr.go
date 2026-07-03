@@ -1325,7 +1325,9 @@ func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessTok
 	if !usageWindowNamed(windows, agentclaude.FableWindowName) {
 		fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, accessToken)
 		if probeErr == nil && len(fableWindows) > 0 {
-			windows = mergeUsageWindows(windows, fableWindows)
+			if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
+				windows = mergeUsageWindows(windows, fableWindows)
+			}
 		} else if err != nil {
 			if probeErr != nil {
 				return nil, probeErr
@@ -1337,6 +1339,15 @@ func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessTok
 		return nil, err
 	}
 	return windows, nil
+}
+
+func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
+	for _, window := range windows {
+		if window.Name == "5h" || window.Name == "7d" {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeUsageWindows(base, extra []accounts.UsageWindow) []accounts.UsageWindow {

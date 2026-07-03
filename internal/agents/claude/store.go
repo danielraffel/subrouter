@@ -749,6 +749,14 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 	if len(windows) > 0 {
 		return windows, nil
 	}
+	if res.StatusCode == http.StatusTooManyRequests {
+		return []accounts.UsageWindow{{
+			Name:               FableWindowName,
+			UsedPercent:        100,
+			LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second),
+			Feature:            FableModel,
+		}}, nil
+	}
 	if res.StatusCode == http.StatusUnauthorized {
 		return nil, fmt.Errorf("fable probe failed: %s", res.Status)
 	}

@@ -1096,14 +1096,17 @@ func TestUsageStatusEndpointIncludesClaudeRequestTimeExhaustion(t *testing.T) {
 		t.Fatalf("statuses = %+v, want one", statuses)
 	}
 	for _, window := range statuses[0].Windows {
-		if window.Name == "oauth-apps-weekly" {
+		if window.Name == agentclaude.FableWindowName {
 			if window.UsedPercent != 100 || window.ResetAfterSeconds <= 0 {
-				t.Fatalf("oauth-apps-weekly = %+v, want saturated with reset", window)
+				t.Fatalf("Fable window = %+v, want saturated with reset", window)
+			}
+			if window.Feature != agentclaude.FableModel {
+				t.Fatalf("Fable Feature = %q, want %q", window.Feature, agentclaude.FableModel)
 			}
 			return
 		}
 	}
-	t.Fatalf("missing oauth-apps-weekly window: %+v", statuses[0].Windows)
+	t.Fatalf("missing Fable window: %+v", statuses[0].Windows)
 }
 
 func TestReloadAccountsHotLoadsNewAccountWithoutRestart(t *testing.T) {

@@ -993,8 +993,10 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 		}
 		name := "request-limit"
 		windowSeconds := int64(7 * 24 * 60 * 60)
+		feature := ""
 		if status.Provider == accounts.ProviderClaude {
-			name = "oauth-apps-weekly"
+			name = agentclaude.FableWindowName
+			feature = agentclaude.FableModel
 		}
 		if usageWindowNamed(status.Windows, name) {
 			continue
@@ -1004,6 +1006,7 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 			UsedPercent:        100,
 			LimitWindowSeconds: windowSeconds,
 			ResetAfterSeconds:  resetAfter,
+			Feature:            feature,
 		})
 	}
 	return out
@@ -1374,7 +1377,9 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 		windows := claudeUsageWindows(usage)
 		if !usageWindowNamed(windows, agentclaude.FableWindowName) {
 			if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
-				windows = mergeUsageWindows(windows, fableWindows)
+				if err == nil || fableProbeHasPrimaryWindows(fableWindows) {
+					windows = mergeUsageWindows(windows, fableWindows)
+				}
 			} else if err != nil {
 				if probeErr != nil {
 					return nil, probeErr
@@ -1388,6 +1393,15 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 		return windows, nil
 	}
 	return accounts.FetchCodexUsage(ctx, client, account)
+}
+
+func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
+	for _, window := range windows {
+		if window.Name == "5h" || window.Name == "7d" {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeUsageWindows(base, extra []accounts.UsageWindow) []accounts.UsageWindow {

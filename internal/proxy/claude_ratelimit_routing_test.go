@@ -423,6 +423,41 @@ func TestClaudeFableProbeAddsHiddenOAuthAppsWindow(t *testing.T) {
 	}
 }
 
+func TestClaudeFableProbeTreatsHeaderless429AsFableExhausted(t *testing.T) {
+	usageBody := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":60.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/api/oauth/usage":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(usageBody)), Header: http.Header{}}, nil
+		case "/v1/messages":
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`)), Header: http.Header{}}, nil
+		default:
+			t.Fatalf("unexpected path %s", req.URL.Path)
+			return nil, nil
+		}
+	})}
+	windows, err := fetchAccountUsageWindowsLive(context.Background(), client, accounts.Account{
+		ID:       "acct",
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Token:    "tok",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
+	if score.Headroom == 0 {
+		t.Fatalf("base Headroom = %.3f, hidden Fable bucket should not exhaust non-Fable Claude models", score.Headroom)
+	}
+	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableModel)]
+	if !ok {
+		t.Fatalf("missing Fable model score: %+v", score.ModelScores)
+	}
+	if fableScore.Headroom != 0 {
+		t.Fatalf("Fable Headroom = %.3f, want 0 from headerless Fable probe 429", fableScore.Headroom)
+	}
+}
+
 // TestClaudeShortWindowDrivesRouting proves the routing calculation now prefers
 // the account with more 5h headroom even when both accounts have identical
 // account-wide (7d) headroom. Before the fix both scored equal short headroom.
