@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/mail"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -207,10 +208,10 @@ func extractJSONID(r *http.Request, maxBodyBytes int64) string {
 
 func extractJSONModel(r *http.Request, maxBodyBytes int64) string {
 	value := extractJSONValue(r, maxBodyBytes)
-	if value == nil {
-		return ""
+	if value != nil {
+		return findJSONModel(value)
 	}
-	return findJSONModel(value)
+	return extractJSONModelPrefix(r, maxBodyBytes)
 }
 
 func extractJSONValue(r *http.Request, maxBodyBytes int64) any {
@@ -284,6 +285,31 @@ func findJSONModel(value any) string {
 		}
 	}
 	return ""
+}
+
+var jsonModelFieldPattern = regexp.MustCompile(`"model"\s*:\s*"((?:\\.|[^"\\])*)"`)
+
+func extractJSONModelPrefix(r *http.Request, maxBodyBytes int64) string {
+	if r.Body == nil || maxBodyBytes <= 0 {
+		return ""
+	}
+	if contentType := r.Header.Get("Content-Type"); !strings.Contains(contentType, "json") {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	if err != nil {
+		return ""
+	}
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+	match := jsonModelFieldPattern.FindSubmatch(body)
+	if len(match) != 2 {
+		return ""
+	}
+	unquoted, err := strconv.Unquote(`"` + string(match[1]) + `"`)
+	if err != nil {
+		return ""
+	}
+	return NormalizeModel(unquoted)
 }
 
 func fallbackID(r *http.Request) string {
