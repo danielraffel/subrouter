@@ -138,6 +138,68 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 	}
 }
 
+func TestHTTPProxyDoesNotForwardClientIPHeaders(t *testing.T) {
+	var upstreamHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		upstreamHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"msg_ok","type":"message"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "claude@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+	}))
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-claude"},
+		},
+		Sessions:      store,
+		SchedulerRef:  schedulerRef,
+		UsageScoreTTL: 0,
+		MaxBodyBytes:  1 << 20,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-forwarded")
+	req.Header.Set("Forwarded", "for=203.0.113.7")
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	req.Header.Set("X-Forwarded-Host", "attacker.example")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Header.Set("X-Real-IP", "203.0.113.8")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status=%d body=%s, want 200", response.StatusCode, string(body))
+	}
+	for _, header := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Ssl", "X-Real-IP"} {
+		if got := upstreamHeaders.Get(header); got != "" {
+			t.Fatalf("upstream %s = %q, want stripped; headers=%v", header, got, upstreamHeaders)
+		}
+	}
+}
+
 func TestClaude429FailoverTriesPastDefaultAttemptBudget(t *testing.T) {
 	var hits []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -263,6 +325,36 @@ func TestClaudeUsageWindowsClassifyFiveHourAsShort(t *testing.T) {
 	}
 	if score.ExpiryPressure <= 0 {
 		t.Fatal("ExpiryPressure should be > 0 once the 5h window is classified as short")
+	}
+}
+
+func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
+	usage := &agentclaude.UsageResponse{
+		FiveHour:          &agentclaude.RateLimit{Utilization: floatPtr(0), ResetsAt: time.Now().Add(time.Hour).Format(time.RFC3339)},
+		SevenDay:          &agentclaude.RateLimit{Utilization: floatPtr(60), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+		SevenDayOAuthApps: &agentclaude.RateLimit{Utilization: floatPtr(100), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+	}
+	windows := claudeUsageWindows(usage)
+
+	var oauthApps *accounts.UsageWindow
+	for i := range windows {
+		if windows[i].Name == "oauth-apps-weekly" {
+			oauthApps = &windows[i]
+			break
+		}
+	}
+	if oauthApps == nil {
+		t.Fatalf("missing oauth-apps-weekly window: %+v", windows)
+	}
+	if oauthApps.LimitWindowSeconds != 7*24*60*60 {
+		t.Fatalf("oauth apps LimitWindowSeconds = %d, want %d", oauthApps.LimitWindowSeconds, 7*24*60*60)
+	}
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
+	if score.Headroom != 0 {
+		t.Fatalf("Headroom = %.3f, want 0 from saturated oauth app weekly bucket", score.Headroom)
+	}
+	if score.ShortHeadroom != 1 {
+		t.Fatalf("ShortHeadroom = %.3f, want 1 from healthy 5h bucket", score.ShortHeadroom)
 	}
 }
 
