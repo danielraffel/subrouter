@@ -13,6 +13,8 @@ package sentryreport
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -205,16 +207,25 @@ const logContextKey = "log_attributes"
 // attrExtras are the additional attribute keys copied into the event's
 // log_attributes context. Every other attribute is dropped: attributes are
 // sensitive by default because log call sites include things like response
-// bodies.
+// bodies. The "account" attribute is handled separately in eventFromRecord:
+// account IDs are usually OAuth account emails, so only a short hash goes
+// out.
 var attrExtras = map[string]struct{}{
 	"path":    {},
-	"account": {},
 	"session": {},
 	"error":   {},
 	"message": {},
 	"reason":  {},
 	"bytes":   {},
 	"signal":  {},
+}
+
+// accountHash reduces an account ID (often an email) to a stable non-PII
+// fingerprint so events still correlate per account. Match against local logs
+// with: printf %s '<account-id>' | shasum -a 256 | cut -c1-12
+func accountHash(accountID string) string {
+	sum := sha256.Sum256([]byte(accountID))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // LogHandler is a slog.Handler that forwards Error-level records (plus the
@@ -282,6 +293,10 @@ func eventFromRecord(record slog.Record, handlerAttrs []slog.Attr) *sentry.Event
 		value := attr.Value.Resolve()
 		if tag, ok := attrTags[attr.Key]; ok {
 			event.Tags[tag] = redactTokens(fmt.Sprint(value.Any()))
+			return
+		}
+		if attr.Key == "account" {
+			logContext["account_hash"] = accountHash(fmt.Sprint(value.Any()))
 			return
 		}
 		if _, ok := attrExtras[attr.Key]; ok {

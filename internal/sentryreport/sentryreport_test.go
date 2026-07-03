@@ -100,6 +100,7 @@ func TestEventFromRecordUsesAllowlistedAttrsOnly(t *testing.T) {
 		slog.String("agent", "codex"),
 		slog.String("upstream", "chatgpt.com"),
 		slog.Int("status", 502),
+		slog.String("account", "alice@example.com"),
 		slog.String("error", "dial tcp: refused; auth Bearer sk-proj-abc12345"),
 		slog.String("body", `{"secret":"payload"}`),
 		slog.String("refresh_token", "srt_supersecret1234"),
@@ -116,6 +117,15 @@ func TestEventFromRecordUsesAllowlistedAttrsOnly(t *testing.T) {
 	}
 	if _, ok := logContext["refresh_token"]; ok {
 		t.Fatal("non-allowlisted attributes must be dropped")
+	}
+	if _, ok := logContext["account"]; ok {
+		t.Fatal("raw account id must never be forwarded")
+	}
+	if logContext["account_hash"] != accountHash("alice@example.com") {
+		t.Fatalf("account must be forwarded as a hash, got %v", logContext["account_hash"])
+	}
+	if hash, _ := logContext["account_hash"].(string); strings.Contains(hash, "alice") || strings.Contains(hash, "@") {
+		t.Fatalf("account hash must not embed the email, got %q", hash)
 	}
 	errExtra, _ := logContext["error"].(string)
 	if strings.Contains(errExtra, "sk-") || strings.Contains(errExtra, "Bearer ") {
