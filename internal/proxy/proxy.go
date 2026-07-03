@@ -720,6 +720,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	)
 	add("5h", fiveHourSeconds, usage.FiveHour)
 	add("7d", sevenDaySeconds, usage.SevenDay)
+	add("oauth-apps-weekly", sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
@@ -1344,6 +1345,15 @@ func clientRemoteIP(r *http.Request) string {
 	return host
 }
 
+func stripOutboundForwardingHeaders(headers http.Header) {
+	headers.Del("Forwarded")
+	headers.Del("X-Forwarded-For")
+	headers.Del("X-Forwarded-Host")
+	headers.Del("X-Forwarded-Proto")
+	headers.Del("X-Forwarded-Ssl")
+	headers.Del("X-Real-IP")
+}
+
 func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.authorizeAdmin(r) {
@@ -1453,6 +1463,7 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
+		stripOutboundForwardingHeaders(proxyRequest.Header)
 		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
 		postReplayable := false
 		if retryPost {
@@ -1473,7 +1484,12 @@ func (s Server) proxyHandler() http.Handler {
 			s.captureRequestBody(proxyRequest, sessionAgentType, sessionID)
 		}
 
-		rp := httputil.NewSingleHostReverseProxy(upstream)
+		rp := &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(upstream)
+				stripOutboundForwardingHeaders(pr.Out.Header)
+			},
+		}
 		transport := s.transport()
 		if retryPost && postReplayable &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
@@ -1508,11 +1524,6 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 		rp.Transport = transport
-		originalDirector := rp.Director
-		rp.Director = func(r *http.Request) {
-			originalDirector(r)
-			r.Host = upstream.Host
-		}
 		rp.ModifyResponse = func(response *http.Response) error {
 			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, proxyRequest.URL.Path)
 			return nil
@@ -1580,6 +1591,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	headers := r.Header.Clone()
 	stripWebSocketDialHeaders(headers)
 	session.StripSubrouterHeaders(headers)
+	stripOutboundForwardingHeaders(headers)
 	setAccountAuthHeaders(headers, account)
 	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
