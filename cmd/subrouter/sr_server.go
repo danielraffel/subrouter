@@ -569,7 +569,7 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, arg
 	command := r.programOrSubrouter() + " add-key"
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
-	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: codex, kimi, or zai")
+	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: codex, claude, kimi, or zai")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -628,12 +628,14 @@ func parseAPIKeyProvider(value string) (accounts.Provider, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", string(accounts.ProviderCodex), "openai":
 		return accounts.ProviderCodex, nil
+	case string(accounts.ProviderClaude), "anthropic":
+		return accounts.ProviderClaude, nil
 	case string(accounts.ProviderKimi), "kimi-for-coding":
 		return accounts.ProviderKimi, nil
 	case string(accounts.ProviderZAI), "glm", "glm-5.2":
 		return accounts.ProviderZAI, nil
 	default:
-		return "", fmt.Errorf("unsupported API-key provider %q, expected codex, kimi, or zai", value)
+		return "", fmt.Errorf("unsupported API-key provider %q, expected codex, claude, kimi, or zai", value)
 	}
 }
 

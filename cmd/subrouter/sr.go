@@ -46,7 +46,7 @@ const srHelp = `sr - Manage Subrouter accounts
 Usage:
   sr                    Show Codex and Claude usage, grouped by provider
   sr add                Add a new Codex account (opens OAuth login)
-  sr add-key            Add a Codex API key account
+  sr add-key            Add an API key account
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
   sr switch [email]     Switch active Codex account and sync OpenCode/pi

@@ -595,7 +595,7 @@ func usageText(program string) string {
 Usage:
   %[1]s                    Show Codex and Claude usage, grouped by provider
   %[1]s add                Add a new Codex account (opens OAuth login)
-  %[1]s add-key            Add a Codex API key account
+  %[1]s add-key            Add an API key account
   %[1]s import             Import current ~/.codex/auth.json account
   %[1]s list               List all Codex accounts
   %[1]s switch [email]     Switch active Codex account and sync OpenCode/pi

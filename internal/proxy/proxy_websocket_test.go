@@ -1533,6 +1533,66 @@ func TestHandlerUsesExplicitSubrouterAccountID(t *testing.T) {
 	}
 }
 
+func TestHandlerUsesClaudeAPIKeyHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Path; got != "/v1/messages" {
+			t.Fatalf("path = %q, want /v1/messages", got)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "anthropic-key" {
+			t.Fatalf("X-Api-Key = %q, want API key", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("Authorization leaked upstream: %q", got)
+		}
+		if strings.Contains(r.Header.Get("Anthropic-Beta"), "oauth-2025-04-20") {
+			t.Fatalf("OAuth beta sent for API-key Claude account: %q", r.Header.Get("Anthropic-Beta"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	claudeUpstream, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: claudeUpstream,
+		Accounts: []accounts.Account{{
+			ID:       "claude:team-key",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeAPIKey,
+			Token:    "anthropic-key",
+		}},
+		Sessions:     store,
+		Scheduler:    selectacct.NewScheduler(nil),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer subrouter-client-token")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+}
+
 func TestHandlerPreservesRequestBodyBytesAfterJSONSessionExtraction(t *testing.T) {
 	body := []byte("{\n  \"input\": \"keep bytes: \\u2603\",\n  \"metadata\": {\"session_id\": \"json-session\"},\n  \"array\": [1, true, null]\n}")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
