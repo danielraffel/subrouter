@@ -206,7 +206,7 @@ func TestUsageLimitRetryTransportClaudeFallsBackToAPIKey(t *testing.T) {
 			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
 			{ID: "claude:team-key", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "api-key"},
 		},
-		Sessions:     store,
+		Sessions: store,
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
 			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
 		})),

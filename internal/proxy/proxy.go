@@ -2217,6 +2217,12 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 	headers.Del("ChatGPT-Account-ID")
 	switch account.Provider {
 	case accounts.ProviderClaude:
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			headers.Del("Authorization")
+			headers.Set("X-Api-Key", account.Token)
+			removeCommaHeaderValue(headers, "Anthropic-Beta", claudeOAuthBetaHeader)
+			return
+		}
 		headers.Del("X-Api-Key")
 		ensureCommaHeaderValue(headers, "Anthropic-Beta", claudeOAuthBetaHeader)
 	case accounts.ProviderKimi:
@@ -2232,6 +2238,27 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 			headers.Set("ChatGPT-Account-ID", account.AccountID)
 		}
 	}
+}
+
+func removeCommaHeaderValue(headers http.Header, key, value string) {
+	existing := headers.Get(key)
+	if existing == "" {
+		return
+	}
+	parts := strings.Split(existing, ",")
+	kept := parts[:0]
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" || trimmed == value {
+			continue
+		}
+		kept = append(kept, trimmed)
+	}
+	if len(kept) == 0 {
+		headers.Del(key)
+		return
+	}
+	headers.Set(key, strings.Join(kept, ","))
 }
 
 func ensureCommaHeaderValue(headers http.Header, key, value string) {
@@ -2407,6 +2434,9 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	account, err := scheduler.Pick(availableAccounts)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
+	}
+	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(account.Provider, account.ID) {
+		return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
@@ -2723,7 +2753,7 @@ const replayablePostMaxBodyBytes = 128 << 20
 const replayablePostMaxAttempts = 6
 
 func (s Server) usageLimitRetryMaxAttempts(provider accounts.Provider) int {
-	count := len(oauthAccounts(filterAccountsForProvider(s.accountList(), provider)))
+	count := len(filterAccountsForProvider(s.accountList(), provider))
 	if count > replayablePostMaxAttempts {
 		return count
 	}
@@ -3197,9 +3227,9 @@ func isTerminalCredentialError(err error) bool {
 }
 
 func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
-	allCandidates := oauthAccounts(filterAccountsForProvider(s.accountList(), provider))
+	allCandidates := filterAccountsForProvider(s.accountList(), provider)
 	if len(allCandidates) == 0 {
-		return accounts.Account{}, fmt.Errorf("no OAuth %s accounts available", provider)
+		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
 	s.refreshUsageScoresIfStale(ctx)
 	// Loop so a single account with a dead OAuth token (refresh returns
@@ -3218,7 +3248,7 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if _, ok := tried[account.ID]; ok {
 				continue
 			}
-			if scheduler.Exhausted(account.Provider, account.ID) {
+			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(account.Provider, account.ID) {
 				continue
 			}
 			candidates = append(candidates, account)
@@ -3227,11 +3257,19 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if lastErr != nil {
 				return accounts.Account{}, lastErr
 			}
-			return accounts.Account{}, fmt.Errorf("no untried non-exhausted OAuth %s accounts available", provider)
+			return accounts.Account{}, fmt.Errorf("no untried non-exhausted %s accounts available", provider)
 		}
 		account, err := scheduler.Pick(candidates)
 		if err != nil {
 			return accounts.Account{}, err
+		}
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			if s.Sessions != nil {
+				if _, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail); err != nil {
+					return accounts.Account{}, err
+				}
+			}
+			return account, nil
 		}
 		// Do not stop failover when the best untried account looks exhausted: scores
 		// can be stale, so trying it (the retry loop is bounded by maxAttempts and
