@@ -80,13 +80,62 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: bunx wrangler deploy --env staging --keep-vars
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error title=Missing CLOUDFLARE_API_TOKEN::Set a long-lived Cloudflare API token in the subrouter repository or subrouter-staging environment secrets."
+            exit 1
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error title=Missing CLOUDFLARE_ACCOUNT_ID::Set the Cloudflare account ID in the subrouter repository or subrouter-staging environment secrets."
+            exit 1
+          fi
+          bunx wrangler deploy --env staging --keep-vars
 
       - name: Smoke health
         run: curl -fsS https://subrouter-staging.cmux.dev/healthz
 
   deploy-production:
     name: Deploy production
+    needs:
+      - verify
+      - deploy-staging
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: subrouter-production
+      url: https://subrouter.cmux.dev/healthz
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install
+        working-directory: cloudflare
+        run: bun install --frozen-lockfile
+
+      - name: Deploy
+        working-directory: cloudflare/packages/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error title=Missing CLOUDFLARE_API_TOKEN::Set a long-lived Cloudflare API token in the subrouter repository or subrouter-production environment secrets."
+            exit 1
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error title=Missing CLOUDFLARE_ACCOUNT_ID::Set the Cloudflare account ID in the subrouter repository or subrouter-production environment secrets."
+            exit 1
+          fi
+          bunx wrangler deploy --env production --keep-vars
+
+      - name: Smoke health
+        run: curl -fsS https://subrouter.cmux.dev/healthz
+
+  deploy-production-manual:
+    name: Deploy production manual
     needs: verify
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_environment == 'production'
@@ -109,7 +158,16 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: bunx wrangler deploy --env production --keep-vars
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error title=Missing CLOUDFLARE_API_TOKEN::Set a long-lived Cloudflare API token in the subrouter repository or subrouter-production environment secrets."
+            exit 1
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error title=Missing CLOUDFLARE_ACCOUNT_ID::Set the Cloudflare account ID in the subrouter repository or subrouter-production environment secrets."
+            exit 1
+          fi
+          bunx wrangler deploy --env production --keep-vars
 
       - name: Smoke health
         run: curl -fsS https://subrouter.cmux.dev/healthz

@@ -23,6 +23,19 @@ bun run deploy:staging
 bun run deploy:production
 ```
 
+GitHub Actions runs `Cloudflare Durable Object` for changes under
+`cloudflare/**`. Pull requests run install, typecheck, tests, and a Wrangler
+dry-run bundle validation. Pushes to `main` deploy staging first, smoke
+`https://subrouter-staging.cmux.dev/healthz`, then deploy production and smoke
+`https://subrouter.cmux.dev/healthz`.
+
+Required Actions secrets:
+
+- `CLOUDFLARE_ACCOUNT_ID` - Cloudflare account ID for Wrangler.
+- `CLOUDFLARE_API_TOKEN` - long-lived Cloudflare API token with Workers deploy
+  permissions for both `regatta-subrouter-do-staging` and
+  `regatta-subrouter-do-production`.
+
 ## Secrets
 
 `ADMIN_TOKEN` gates the `/admin/*`, `/_subrouter/*`, and `/websocket-status`
