@@ -26,6 +26,9 @@ type BedrockConfig struct {
 	// means the endpoint relies on network-level trust like the rest of the proxy.
 	GatewayToken string
 	Transport    http.RoundTripper
+	// CostLogPath is the JSONL file where per-request token usage and estimated
+	// cost are appended. Empty disables cost tracking.
+	CostLogPath string
 }
 
 const bedrockService = "bedrock"
@@ -93,6 +96,7 @@ func (s Server) bedrockHandler() http.Handler {
 		if transport == nil {
 			transport = http.DefaultTransport
 		}
+		started := time.Now()
 		resp, err := transport.RoundTrip(outReq)
 		if err != nil {
 			if s.Logger != nil {
@@ -112,8 +116,31 @@ func (s Server) bedrockHandler() http.Handler {
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		flushingCopy(w, resp.Body)
+
+		model := bedrockModelFromPath(upstreamPath)
+		usage, haveUsage := s.streamBedrockResponse(w, resp)
+		if cfg.CostLogPath != "" && model != "" {
+			record := bedrockCostRecord{
+				Timestamp:  started.UTC().Format(time.RFC3339),
+				Model:      model,
+				Status:     resp.StatusCode,
+				DurationMs: time.Since(started).Milliseconds(),
+			}
+			if haveUsage {
+				record.Usage = usage
+				record.CostUSD = usage.costUSD(model)
+			}
+			appendBedrockCostRecord(cfg.CostLogPath, record)
+		}
 	})
+}
+
+func (s Server) handleBedrockCost(w http.ResponseWriter, r *http.Request) {
+	path := ""
+	if s.Bedrock != nil {
+		path = s.Bedrock.CostLogPath
+	}
+	writeJSON(w, summarizeBedrockCost(path))
 }
 
 func bedrockGatewayTokenOK(r *http.Request, token string) bool {
@@ -150,12 +177,49 @@ func sha256Hex(body []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func flushingCopy(w http.ResponseWriter, r io.Reader) {
+// bedrockModelFromPath extracts the model id from /model/<id>/invoke[...] paths.
+func bedrockModelFromPath(path string) string {
+	trimmed := strings.TrimPrefix(path, "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) >= 2 && parts[0] == "model" {
+		return parts[1]
+	}
+	return ""
+}
+
+// streamBedrockResponse forwards the upstream response to the client while
+// extracting token usage. Event-stream responses are parsed frame-by-frame as
+// they flow; non-streaming JSON responses are buffered (they are small) and
+// parsed directly. Usage extraction never blocks or corrupts the forwarded
+// bytes.
+func (s Server) streamBedrockResponse(w http.ResponseWriter, resp *http.Response) (bedrockUsage, bool) {
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "eventstream") {
+		parser := newBedrockStreamUsageWriter()
+		flushingCopy(w, resp.Body, parser)
+		return parser.Usage()
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, replayablePostMaxBodyBytes))
+	if err == nil && len(body) > 0 {
+		_, _ = w.Write(body)
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return parseBedrockInvokeUsage(body)
+}
+
+// flushingCopy streams src to the client, flushing after each chunk, and
+// mirrors the bytes to sink (used for usage parsing) when sink is non-nil.
+func flushingCopy(w http.ResponseWriter, src io.Reader, sink io.Writer) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
-		n, readErr := r.Read(buf)
+		n, readErr := src.Read(buf)
 		if n > 0 {
+			if sink != nil {
+				_, _ = sink.Write(buf[:n])
+			}
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				return
 			}

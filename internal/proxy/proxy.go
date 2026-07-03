@@ -858,6 +858,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
+	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
 	if s.Bedrock != nil {
 		mux.Handle("/bedrock/", s.bedrockHandler())

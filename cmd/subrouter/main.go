@@ -118,6 +118,7 @@ var directSRCommands = map[string]struct{}{
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
+	"cost":             {},
 	"g":                {},
 	"gemini":           {},
 	"gui":              {},
@@ -135,6 +136,7 @@ var directSRCommands = map[string]struct{}{
 	"rm":               {},
 	"server":           {},
 	"servers":          {},
+	"spend":            {},
 	"status":           {},
 	"switch":           {},
 	"trace":            {},
@@ -270,6 +272,7 @@ func serve(args []string) error {
 			Credentials:  aws.NewCredentialsCache(awsCfg.Credentials),
 			GatewayToken: token,
 			Transport:    outboundTransport,
+			CostLogPath:  filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"),
 		}
 		slog.Info("bedrock gateway enabled", "region", *bedrockRegion, "auth", token != "")
 	}
@@ -655,6 +658,7 @@ Usage:
   %[1]s claude             Manage Claude Code profiles
   %[1]s claude-aws [--model fable] [claude args...]
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
+  %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
