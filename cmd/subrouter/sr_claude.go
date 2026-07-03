@@ -511,6 +511,65 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	return cmd.Run()
 }
 
+// claudeDirect launches Claude Code straight against Anthropic on the user's own
+// claude.ai login, guaranteeing subrouter (and any Bedrock/Vertex/Mantle
+// gateway) is not used. It strips every routing/gateway env var plus
+// ANTHROPIC_API_KEY (which would otherwise override the claude.ai login and bill
+// pay-per-token), so the run cannot be silently pointed at a proxy or API key,
+// then passes all flags through unchanged.
+func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, args...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	cmd.Env = envWithout(os.Environ(), claudeRoutingEnvKeys)
+	return cmd.Run()
+}
+
+// claudeRoutingEnvKeys are the env vars that could route Claude Code through a
+// proxy or cloud gateway instead of Anthropic directly.
+var claudeRoutingEnvKeys = []string{
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+	"CLAUDE_CODE_USE_MANTLE",
+	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"ANTHROPIC_AWS_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+}
+
+// envWithout returns environ with the named keys removed (case-insensitive).
+func envWithout(environ []string, keys []string) []string {
+	drop := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		drop[strings.ToLower(k)] = true
+	}
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name = kv[:i]
+		}
+		if drop[strings.ToLower(name)] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 const bedrockSmallFastModelID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 // bedrockModelID maps a friendly model alias to a Bedrock inference profile id.

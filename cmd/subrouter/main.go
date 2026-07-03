@@ -118,6 +118,7 @@ var directSRCommands = map[string]struct{}{
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
+	"claude-direct":    {},
 	"cost":             {},
 	"g":                {},
 	"gemini":           {},
@@ -662,6 +663,8 @@ Usage:
   %[1]s claude             Manage Claude Code profiles
   %[1]s claude-aws [--model fable] [claude args...]
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
+  %[1]s claude-direct [claude args...]
+                           Launch Claude Code directly on Anthropic (bypass subrouter)
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 

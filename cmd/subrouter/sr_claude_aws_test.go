@@ -1,6 +1,33 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestEnvWithoutStripsRoutingVars(t *testing.T) {
+	environ := []string{
+		"PATH=/usr/bin",
+		"ANTHROPIC_BASE_URL=http://subrouter-team:31415",
+		"ANTHROPIC_AUTH_TOKEN=secret",
+		"ANTHROPIC_API_KEY=sk-ant-xyz",
+		"CLAUDE_CODE_USE_BEDROCK=1",
+		"ANTHROPIC_MODEL=claude-fable-5",
+		"HOME=/home/x",
+	}
+	got := envWithout(environ, claudeRoutingEnvKeys)
+	joined := strings.Join(got, "\n")
+	for _, banned := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK"} {
+		if strings.Contains(joined, banned) {
+			t.Fatalf("%s should have been stripped: %v", banned, got)
+		}
+	}
+	for _, kept := range []string{"PATH=/usr/bin", "HOME=/home/x", "ANTHROPIC_MODEL=claude-fable-5"} {
+		if !strings.Contains(joined, kept) {
+			t.Fatalf("%s should have been kept: %v", kept, got)
+		}
+	}
+}
 
 func TestBedrockModelID(t *testing.T) {
 	cases := map[string]string{
