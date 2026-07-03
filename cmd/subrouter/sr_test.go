@@ -1099,7 +1099,7 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 	}, false)
 
 	got := out.String()
-	if !strings.Contains(got, "Session") || !strings.Contains(got, "Weekly") || !strings.Contains(got, "OAuth wk") || !strings.Contains(got, "Opus wk") || !strings.Contains(got, "Sonnet wk") {
+	if !strings.Contains(got, "Session") || !strings.Contains(got, "Weekly") || !strings.Contains(got, "Fable wk") || !strings.Contains(got, "Opus wk") || !strings.Contains(got, "Sonnet wk") {
 		t.Fatalf("Claude grid missing Claude-specific labels:\n%s", got)
 	}
 	if strings.Contains(got, "  5h  ") || strings.Contains(got, "  7d  ") || strings.Contains(got, "Spark") {
@@ -1131,13 +1131,23 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	if oauthApps.LimitWindowSeconds != int64((7*24*time.Hour)/time.Second) {
 		t.Fatalf("oauth apps LimitWindowSeconds = %d, want 7d", oauthApps.LimitWindowSeconds)
 	}
+	if oauthApps.Feature != agentclaude.FableModel {
+		t.Fatalf("oauth apps Feature = %q, want %q", oauthApps.Feature, agentclaude.FableModel)
+	}
 	score := scoreFromWindows("claude@example.com", windows)
-	if score.Headroom != 0 {
-		t.Fatalf("headroom = %.2f, want 0 from saturated oauth app weekly bucket", score.Headroom)
+	if score.Headroom == 0 {
+		t.Fatalf("base headroom = %.2f, hidden Fable bucket should not exhaust non-Fable Claude models", score.Headroom)
+	}
+	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableModel)]
+	if !ok {
+		t.Fatalf("missing Fable model score: %+v", score.ModelScores)
+	}
+	if fableScore.Headroom != 0 {
+		t.Fatalf("Fable headroom = %.2f, want 0 from saturated oauth app weekly bucket", fableScore.Headroom)
 	}
 	cooked, reason := cookedFromWindows(windows)
-	if !cooked || !strings.Contains(reason, "OAuth apps") {
-		t.Fatalf("cooked=%v reason=%q, want OAuth apps weekly cooked", cooked, reason)
+	if !cooked || !strings.Contains(reason, "Fable") {
+		t.Fatalf("cooked=%v reason=%q, want Fable weekly cooked", cooked, reason)
 	}
 }
 

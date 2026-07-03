@@ -778,13 +778,13 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
-			usage, err := agentclaude.FetchUsage(ctx, r.client, account.Token)
+			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
-			rows[i].windows = claudeUsageWindows(usage)
+			rows[i].windows = windows
 			rows[i].score = scoreFromWindows(profile.Name, rows[i].windows)
 		}()
 	}
@@ -1094,7 +1094,14 @@ func accountFromStored(account accounts.StoredCodexAccount) accounts.Account {
 }
 
 func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectacct.Score {
-	limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+	limitWindows := make([]selectacct.LimitWindow, 0, len(windows)*2)
+	hasFableWindow := false
+	for _, window := range windows {
+		if window.Feature == agentclaude.FableModel || window.Name == agentclaude.FableWindowName {
+			hasFableWindow = true
+			break
+		}
+	}
 	for _, window := range windows {
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
@@ -1103,6 +1110,15 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 			ResetAfterSeconds:  window.ResetAfterSeconds,
 			Feature:            window.Feature,
 		})
+		if hasFableWindow && window.Feature == "" {
+			limitWindows = append(limitWindows, selectacct.LimitWindow{
+				Name:               window.Name,
+				UsedPercent:        window.UsedPercent,
+				LimitWindowSeconds: window.LimitWindowSeconds,
+				ResetAfterSeconds:  window.ResetAfterSeconds,
+				Feature:            agentclaude.FableModel,
+			})
+		}
 	}
 	return selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 }
@@ -1276,6 +1292,9 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			return
 		}
 		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization, LimitWindowSeconds: windowSeconds}
+		if name == agentclaude.FableWindowName {
+			window.Feature = agentclaude.FableModel
+		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
@@ -1291,13 +1310,64 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	)
 	add("5h", fiveHourSeconds, usage.FiveHour)
 	add("7d", sevenDaySeconds, usage.SevenDay)
-	add("oauth-apps-weekly", sevenDaySeconds, usage.SevenDayOAuthApps)
+	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
 		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
 	}
 	return windows
+}
+
+func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessToken string) ([]accounts.UsageWindow, error) {
+	usage, err := agentclaude.FetchUsage(ctx, client, accessToken)
+	windows := claudeUsageWindows(usage)
+	if !usageWindowNamed(windows, agentclaude.FableWindowName) {
+		fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, accessToken)
+		if probeErr == nil && len(fableWindows) > 0 {
+			windows = mergeUsageWindows(windows, fableWindows)
+		} else if err != nil {
+			if probeErr != nil {
+				return nil, probeErr
+			}
+			return nil, err
+		}
+	}
+	if err != nil && len(windows) == 0 {
+		return nil, err
+	}
+	return windows, nil
+}
+
+func mergeUsageWindows(base, extra []accounts.UsageWindow) []accounts.UsageWindow {
+	out := append([]accounts.UsageWindow(nil), base...)
+	index := make(map[string]int, len(out))
+	for i, window := range out {
+		index[usageWindowMergeKey(window)] = i
+	}
+	for _, window := range extra {
+		key := usageWindowMergeKey(window)
+		if i, ok := index[key]; ok {
+			out[i] = window
+			continue
+		}
+		index[key] = len(out)
+		out = append(out, window)
+	}
+	return out
+}
+
+func usageWindowNamed(windows []accounts.UsageWindow, name string) bool {
+	for _, window := range windows {
+		if window.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func usageWindowMergeKey(window accounts.UsageWindow) string {
+	return strings.ToLower(window.Name) + "\x00" + strings.ToLower(window.Feature)
 }
 
 func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account accounts.StoredCodexAccount) error {
@@ -1612,7 +1682,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 			usageGridColumn{Key: "Session", Title: "Session", Width: windowWidth},
 			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: windowWidth},
 		)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "OAuth wk", Title: "OAuth wk", Width: sparkWidth}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Fable wk", Title: "Fable wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
@@ -1634,7 +1704,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 	extra = widenUsageGridColumn(columns, "Account", extra, 36)
 	extra = widenUsageGridColumn(columns, "Pick", extra, 34)
 	extra = widenUsageGridColumn(columns, "State", extra, 14)
-	extra = widenUsageGridColumn(columns, "OAuth wk", extra, 10)
+	extra = widenUsageGridColumn(columns, "Fable wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Sonnet wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
 	extra = widenUsageGridColumn(columns, "Weekly", extra, 12)
@@ -1657,7 +1727,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Credits":   usageGridCreditsCell(row),
 		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
-		"OAuth wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
+		"Fable wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
 		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
@@ -2091,8 +2161,8 @@ func windowLabel(window accounts.UsageWindow) string {
 	if strings.HasSuffix(name, "/secondary") {
 		return strings.TrimSuffix(name, "/secondary") + " (weekly)"
 	}
-	if name == "oauth-apps-weekly" {
-		return "OAuth apps (weekly)"
+	if name == agentclaude.FableWindowName {
+		return "Fable (weekly)"
 	}
 	return name
 }

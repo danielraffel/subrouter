@@ -705,6 +705,9 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			UsedPercent:        *limit.Utilization,
 			LimitWindowSeconds: windowSeconds,
 		}
+		if name == agentclaude.FableWindowName {
+			window.Feature = agentclaude.FableModel
+		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
@@ -720,7 +723,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	)
 	add("5h", fiveHourSeconds, usage.FiveHour)
 	add("7d", sevenDaySeconds, usage.SevenDay)
-	add("oauth-apps-weekly", sevenDaySeconds, usage.SevenDayOAuthApps)
+	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
@@ -782,7 +785,14 @@ func scoreUsableForNewSession(score selectacct.Score) bool {
 }
 
 func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
-	limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+	limitWindows := make([]selectacct.LimitWindow, 0, len(windows)*2)
+	hasFableWindow := false
+	for _, window := range windows {
+		if window.Feature == agentclaude.FableModel || window.Name == agentclaude.FableWindowName {
+			hasFableWindow = true
+			break
+		}
+	}
 	for _, window := range windows {
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
@@ -791,6 +801,15 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			ResetAfterSeconds:  window.ResetAfterSeconds,
 			Feature:            window.Feature,
 		})
+		if provider == accounts.ProviderClaude && hasFableWindow && window.Feature == "" {
+			limitWindows = append(limitWindows, selectacct.LimitWindow{
+				Name:               window.Name,
+				UsedPercent:        window.UsedPercent,
+				LimitWindowSeconds: window.LimitWindowSeconds,
+				ResetAfterSeconds:  window.ResetAfterSeconds,
+				Feature:            agentclaude.FableModel,
+			})
+		}
 	}
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 	score.Provider = provider
@@ -1352,12 +1371,45 @@ func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Clien
 func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
 	if account.Provider == accounts.ProviderClaude {
 		usage, err := agentclaude.FetchUsage(ctx, client, account.Token)
-		if err != nil {
+		windows := claudeUsageWindows(usage)
+		if !usageWindowNamed(windows, agentclaude.FableWindowName) {
+			if fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token); probeErr == nil && len(fableWindows) > 0 {
+				windows = mergeUsageWindows(windows, fableWindows)
+			} else if err != nil {
+				if probeErr != nil {
+					return nil, probeErr
+				}
+				return nil, err
+			}
+		}
+		if err != nil && len(windows) == 0 {
 			return nil, err
 		}
-		return claudeUsageWindows(usage), nil
+		return windows, nil
 	}
 	return accounts.FetchCodexUsage(ctx, client, account)
+}
+
+func mergeUsageWindows(base, extra []accounts.UsageWindow) []accounts.UsageWindow {
+	out := append([]accounts.UsageWindow(nil), base...)
+	index := make(map[string]int, len(out))
+	for i, window := range out {
+		index[usageWindowMergeKey(window)] = i
+	}
+	for _, window := range extra {
+		key := usageWindowMergeKey(window)
+		if i, ok := index[key]; ok {
+			out[i] = window
+			continue
+		}
+		index[key] = len(out)
+		out = append(out, window)
+	}
+	return out
+}
+
+func usageWindowMergeKey(window accounts.UsageWindow) string {
+	return strings.ToLower(window.Name) + "\x00" + strings.ToLower(window.Feature)
 }
 
 const defaultUsageFetchTimeout = 10 * time.Second

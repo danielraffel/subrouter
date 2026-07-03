@@ -349,12 +349,77 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	if oauthApps.LimitWindowSeconds != 7*24*60*60 {
 		t.Fatalf("oauth apps LimitWindowSeconds = %d, want %d", oauthApps.LimitWindowSeconds, 7*24*60*60)
 	}
-	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
-	if score.Headroom != 0 {
-		t.Fatalf("Headroom = %.3f, want 0 from saturated oauth app weekly bucket", score.Headroom)
+	if oauthApps.Feature != agentclaude.FableModel {
+		t.Fatalf("oauth apps Feature = %q, want %q", oauthApps.Feature, agentclaude.FableModel)
 	}
-	if score.ShortHeadroom != 1 {
-		t.Fatalf("ShortHeadroom = %.3f, want 1 from healthy 5h bucket", score.ShortHeadroom)
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
+	if score.Headroom == 0 {
+		t.Fatalf("base Headroom = %.3f, hidden Fable bucket should not exhaust non-Fable Claude models", score.Headroom)
+	}
+	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableModel)]
+	if !ok {
+		t.Fatalf("missing Fable model score: %+v", score.ModelScores)
+	}
+	if fableScore.Headroom != 0 {
+		t.Fatalf("Fable Headroom = %.3f, want 0 from saturated oauth app weekly bucket", fableScore.Headroom)
+	}
+	if fableScore.ShortHeadroom != 1 {
+		t.Fatalf("Fable ShortHeadroom = %.3f, want 1 from healthy 5h bucket", fableScore.ShortHeadroom)
+	}
+}
+
+func TestClaudeFableProbeAddsHiddenOAuthAppsWindow(t *testing.T) {
+	usageBody := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":60.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`
+	probeHeader := http.Header{}
+	probeHeader.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+	probeHeader.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.1")
+	probeHeader.Set("Anthropic-Ratelimit-Unified-5h-Reset", fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()))
+	probeHeader.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+	probeHeader.Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.6")
+	probeHeader.Set("Anthropic-Ratelimit-Unified-7d-Reset", fmt.Sprintf("%d", time.Now().Add(5*24*time.Hour).Unix()))
+	probeHeader.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "rejected")
+	probeHeader.Set("Anthropic-Ratelimit-Unified-7d_Oi-Utilization", "1.0")
+	probeHeader.Set("Anthropic-Ratelimit-Unified-7d_Oi-Reset", fmt.Sprintf("%d", time.Now().Add(5*24*time.Hour).Unix()))
+	calls := 0
+	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		switch req.URL.Path {
+		case "/api/oauth/usage":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(usageBody)), Header: http.Header{}}, nil
+		case "/v1/messages":
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"type":"error"}`)), Header: probeHeader}, nil
+		default:
+			t.Fatalf("unexpected path %s", req.URL.Path)
+			return nil, nil
+		}
+	})}
+	windows, err := fetchAccountUsageWindowsLive(context.Background(), client, accounts.Account{
+		ID:       "acct",
+		Provider: accounts.ProviderClaude,
+		AuthMode: accounts.AuthModeOAuth,
+		Token:    "tok",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want usage fetch plus Fable probe", calls)
+	}
+	var fable *accounts.UsageWindow
+	for i := range windows {
+		if windows[i].Name == "oauth-apps-weekly" {
+			fable = &windows[i]
+			break
+		}
+	}
+	if fable == nil {
+		t.Fatalf("missing Fable window: %+v", windows)
+	}
+	if fable.UsedPercent != 100 {
+		t.Fatalf("Fable UsedPercent = %.1f, want 100", fable.UsedPercent)
+	}
+	if fable.Feature != agentclaude.FableModel {
+		t.Fatalf("Fable Feature = %q, want %q", fable.Feature, agentclaude.FableModel)
 	}
 }
 
