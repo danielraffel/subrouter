@@ -1130,9 +1130,17 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 	return selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
 }
 
+// isModelScopedWindow reports whether a window is a per-model quota pool (e.g.
+// Fable), identified by a non-empty Feature. Such a pool being exhausted must
+// not cook the whole account: the scheduler already scores it as its own pool,
+// and the account stays usable for other models (Opus/Sonnet).
+func isModelScopedWindow(window accounts.UsageWindow) bool {
+	return strings.TrimSpace(window.Feature) != ""
+}
+
 func cookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
 	for _, window := range windows {
-		if !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
+		if isModelScopedWindow(window) || !isLongQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
 			continue
 		}
 		if window.ResetAfterSeconds > 0 {
@@ -1948,16 +1956,56 @@ func compactPickReason(row srUsageRow) string {
 		return "Claude profile"
 	}
 	left := fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
+	suffix := exhaustedModelSuffix(row.windows)
 	if !usableForNewSession(row.score) {
-		return fmt.Sprintf("%s, protected < %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
+		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom*100), suffix)
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {
-			return fmt.Sprintf("%s, session reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
+			return fmt.Sprintf("%s, session reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 		}
-		return fmt.Sprintf("%s, 5h reset %s", left, formatDuration(row.score.ShortResetAfterSeconds))
+		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
-	return left
+	return left + suffix
+}
+
+// exhaustedModelSuffix names any per-model quota pools that are fully consumed
+// (e.g. Fable) so the Use column makes clear the account still works for other
+// models even when one model's weekly pool is out.
+func exhaustedModelSuffix(windows []accounts.UsageWindow) string {
+	var out []string
+	seen := map[string]bool{}
+	for _, window := range windows {
+		if !isModelScopedWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
+			continue
+		}
+		label := modelScopedWindowLabel(window)
+		if label == "" || seen[label] {
+			continue
+		}
+		seen[label] = true
+		out = append(out, label)
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(out, "/") + " out)"
+}
+
+func modelScopedWindowLabel(window accounts.UsageWindow) string {
+	f := strings.ToLower(window.Feature)
+	switch {
+	case strings.Contains(f, "fable"):
+		return "Fable"
+	case strings.Contains(f, "opus"):
+		return "Opus"
+	case strings.Contains(f, "sonnet"):
+		return "Sonnet"
+	case strings.Contains(f, "haiku"):
+		return "Haiku"
+	default:
+		return window.Feature
+	}
 }
 
 func usageGridShortWindowCell(row srUsageRow) usageGridCell {
@@ -1978,6 +2026,9 @@ func usageGridShortNamedWindowCell(row srUsageRow) usageGridCell {
 
 func longQuotaSaturatedMatching(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) bool {
 	for _, window := range windows {
+		if isModelScopedWindow(window) {
+			continue
+		}
 		if match(window) && isLongQuotaWindow(window) && clampUsagePercent(window.UsedPercent) >= 100 {
 			return true
 		}

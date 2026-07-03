@@ -1145,9 +1145,15 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	if fableScore.Headroom != 0 {
 		t.Fatalf("Fable headroom = %.2f, want 0 from saturated oauth app weekly bucket", fableScore.Headroom)
 	}
+	// A saturated Fable (per-model) pool must NOT cook the account: Opus/Sonnet
+	// and the base weekly quota remain usable. The Use column instead notes that
+	// Fable specifically is out.
 	cooked, reason := cookedFromWindows(windows)
-	if !cooked || !strings.Contains(reason, "Fable") {
-		t.Fatalf("cooked=%v reason=%q, want Fable weekly cooked", cooked, reason)
+	if cooked {
+		t.Fatalf("account should not be cooked when only the Fable pool is exhausted (reason=%q)", reason)
+	}
+	if suffix := exhaustedModelSuffix(windows); !strings.Contains(suffix, "Fable") {
+		t.Fatalf("Use suffix = %q, want it to note Fable is out", suffix)
 	}
 }
 
