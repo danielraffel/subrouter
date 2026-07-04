@@ -15,7 +15,7 @@ func (s Server) claudeFableEnabled() bool {
 	if s.ClaudeFableAPIKey != "" {
 		return true
 	}
-	return s.Bedrock != nil && s.Bedrock.Credentials != nil
+	return s.Bedrock != nil && s.Bedrock.configured()
 }
 
 // maybeServeClaudeFable intercepts Claude Messages requests for a Fable model
@@ -47,7 +47,7 @@ func (s Server) maybeServeClaudeFable(w http.ResponseWriter, r *http.Request) bo
 		s.serveClaudeFableViaAPIKey(w, r, body)
 		return true
 	}
-	if s.Bedrock != nil && s.Bedrock.Credentials != nil {
+	if s.Bedrock != nil && s.Bedrock.configured() {
 		s.serveClaudeFableViaBedrock(w, r, body)
 		return true
 	}

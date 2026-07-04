@@ -80,3 +80,27 @@ func TestMaybeServeClaudeFableIgnoresNonFable(t *testing.T) {
 		t.Fatalf("request body not restored for non-fable: %q", b)
 	}
 }
+
+func TestMaybeServeClaudeFableUsesBedrockSources(t *testing.T) {
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"output_tokens":3}}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Region:    "us-east-1",
+		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport: rt,
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
+	rec := httptest.NewRecorder()
+
+	if !s.maybeServeClaudeFable(rec, req) {
+		t.Fatal("expected fable request to be handled by Bedrock source config")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+}

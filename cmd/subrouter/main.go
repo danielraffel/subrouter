@@ -350,7 +350,7 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
-	}
+}
 
 func loadBedrockAWSSources(ctx context.Context, region string, profiles []string, autobump bool) (aws.Config, []proxy.BedrockCredentialSource, error) {
 	if len(profiles) == 0 {

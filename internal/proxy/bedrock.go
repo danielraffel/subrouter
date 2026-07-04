@@ -37,7 +37,7 @@ type BedrockConfig struct {
 	CostLogPath string
 	// Bumper, when set, requests a Service Quotas increase when Bedrock throttles
 	// (HTTP 429), deduped per quota with a cooldown.
-	Bumper *bedrockQuotaBumper
+	Bumper     *bedrockQuotaBumper
 	nextSource atomic.Uint64
 }
 

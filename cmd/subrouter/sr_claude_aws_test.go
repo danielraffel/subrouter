@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -45,5 +47,27 @@ func TestBedrockModelID(t *testing.T) {
 		if got := bedrockModelID(in); got != want {
 			t.Errorf("bedrockModelID(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestBedrockAWSProfileNames(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "config")
+	credentials := filepath.Join(dir, "credentials")
+	if err := os.WriteFile(config, []byte("[profile aw10]\nregion=us-east-1\n[profile aw1]\nregion=us-east-1\n[profile root-login]\nregion=us-east-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentials, []byte("[aw0]\naws_access_key_id=x\naws_secret_access_key=y\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", config)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credentials)
+	t.Setenv("SUBROUTER_BEDROCK_PROFILES", "")
+
+	if got := strings.Join(bedrockAWSProfileNames(""), ","); got != "aw0,aw1,aw10" {
+		t.Fatalf("profiles = %q, want aw0,aw1,aw10", got)
+	}
+	if got := strings.Join(bedrockAWSProfileNames("aw2, aw1 aw2"), ","); got != "aw2,aw1" {
+		t.Fatalf("explicit profiles = %q, want aw2,aw1", got)
 	}
 }
