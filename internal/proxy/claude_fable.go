@@ -53,6 +53,12 @@ func (s Server) serveClaudeFableFallback(w http.ResponseWriter, r *http.Request)
 		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 		return false
 	}
+	if s.Logger != nil {
+		// Same signal the transport-level give-up logs emit; without it a
+		// handler-level fallback (no usable OAuth account at selection) is
+		// invisible and Bedrock activity cannot be attributed to the chain.
+		s.Logger.Warn("serving claude fable via fallback chain", "reason", "no_usable_account", "fallback_status", resp.StatusCode)
+	}
 	defer resp.Body.Close()
 	for key, values := range resp.Header {
 		if isHopByHopHeader(key) {

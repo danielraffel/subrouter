@@ -399,3 +399,66 @@ func TestRefreshUsageScoresCoversAllProviders(t *testing.T) {
 		t.Fatal("claude usage scores should make Exhausted() real")
 	}
 }
+
+// Anthropic can disable OAuth for one account's org mid-flight (403
+// permission_error "OAuth authentication is currently not allowed for this
+// organization", observed live 2026-07-04): the account must fail over and be
+// marked exhausted with the credential TTL, not black-hole its sticky sessions.
+func TestUsageLimitRetryTransportClaudeFailsOverOn403OrgDisabled(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-403", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		auth := req.Header.Get("Authorization")
+		if strings.Contains(auth, "tok-cooked") {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."}}`)),
+				Header:     http.Header{},
+			}
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1"}`)),
+			Header:     http.Header{},
+		}
+	}}
+	transport := usageLimitRetryTransport{
+		base:        stub,
+		server:      &server,
+		provider:    accounts.ProviderClaude,
+		agent:       "claude",
+		session:     "session-403",
+		account:     "cooked@example.com",
+		method:      http.MethodPost,
+		path:        "/v1/messages",
+		maxAttempts: 3,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte(`{"model":"claude-opus-4-8"}`))), nil
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after failing over the org-disabled account", response.StatusCode)
+	}
+	if stub.calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (403 then retry on healthy account)", stub.calls)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
+		t.Fatal("an org-disabled 403 should mark the account exhausted (credential TTL)")
+	}
+	assignment, ok := store.Get("claude", "session-403")
+	if !ok || assignment.AccountID != "fresh@example.com" {
+		t.Fatalf("sticky assignment = %+v, want moved off the org-disabled account", assignment)
+	}
+}

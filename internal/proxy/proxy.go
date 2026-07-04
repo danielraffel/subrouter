@@ -1962,11 +1962,12 @@ func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, acc
 	if s.SchedulerRef == nil {
 		return
 	}
-	if status == http.StatusUnauthorized {
-		// Dead/expired credential, not a rate-limit window: no reset header
-		// exists and it will not self-heal on a schedule. A longer TTL avoids
-		// probing a dead account every few minutes while still picking it back
-		// up within the hour after a re-auth.
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// Dead/expired credential (401) or org-level OAuth disablement (403):
+		// not a rate-limit window, no reset header exists, and neither
+		// self-heals on a schedule. A longer TTL avoids probing every few
+		// minutes while still picking the account back up within the hour
+		// after a re-auth or an org re-enable.
 		s.markAccountExhaustedCredential(provider, accountID)
 		return
 	}
@@ -3191,11 +3192,16 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 // claudeAccountUnusableStatus reports whether an upstream status means the
 // selected Claude account cannot serve this request and subrouter should fail
 // over to another account. 429 is quota exhaustion; 401 is a dead or expired
-// OAuth token (Anthropic returns authentication_error). Both are
-// account-specific, so replaying the same request on a different account is the
-// correct response instead of surfacing the failure to the client.
+// OAuth token (Anthropic returns authentication_error); 403 is an org-level
+// permission_error ("OAuth authentication is currently not allowed for this
+// organization" — Anthropic disabling Claude Code subscription access for one
+// account's org, observed live 2026-07-04). All are account-specific, so
+// replaying the same request on a different account is the correct response
+// instead of surfacing the failure to the client; before 403 was included, a
+// sticky session pinned to an org-disabled account black-holed every request
+// while the rest of the pool was healthy.
 func claudeAccountUnusableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code == http.StatusUnauthorized
+	return code == http.StatusTooManyRequests || code == http.StatusUnauthorized || code == http.StatusForbidden
 }
 
 // claudeAccountExhaustedByResponse reports whether an upstream response means the
@@ -3214,7 +3220,7 @@ func claudeAccountUnusableStatus(code int) bool {
 // detected by the rejected header and the periodic usage-score refresh, not by a
 // bare 429. A 401 is always a dead/expired token.
 func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
-	if status == http.StatusUnauthorized {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return true
 	}
 	if claudeUnifiedStatus(header) != "rejected" {
