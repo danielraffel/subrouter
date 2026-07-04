@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"math"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -95,4 +98,24 @@ func TestSummarizeBedrockCost(t *testing.T) {
 
 func nowRFC3339() string {
 	return "2026-07-03T10:00:00Z"
+}
+
+func TestTranscodeBedrockToSSE(t *testing.T) {
+	start := buildEventStreamFrame(t, `{"type":"message_start","message":{"usage":{"input_tokens":10}}}`)
+	delta := buildEventStreamFrame(t, `{"type":"message_delta","usage":{"output_tokens":7}}`)
+	stop := buildEventStreamFrame(t, `{"type":"message_stop"}`)
+	stream := append(append(append([]byte{}, start...), delta...), stop...)
+
+	rec := httptest.NewRecorder()
+	usage, ok := transcodeBedrockToSSE(rec, bytes.NewReader(stream))
+	out := rec.Body.String()
+	if !strings.Contains(out, "event: message_start\ndata: {") {
+		t.Fatalf("missing message_start SSE frame:\n%s", out)
+	}
+	if !strings.Contains(out, "event: message_stop\ndata: {") {
+		t.Fatalf("missing message_stop SSE frame:\n%s", out)
+	}
+	if !ok || usage.InputTokens != 10 || usage.OutputTokens != 7 {
+		t.Fatalf("usage = %+v ok=%v, want in=10 out=7", usage, ok)
+	}
 }

@@ -2,8 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -144,6 +148,237 @@ func (s Server) bedrockHandler() http.Handler {
 			appendBedrockCostRecord(cfg.CostLogPath, record)
 		}
 	})
+}
+
+const bedrockFableModelID = "us.anthropic.claude-fable-5"
+
+// maybeServeClaudeFableViaBedrock intercepts Claude Messages requests for a
+// Fable model and serves them from Bedrock instead of the OAuth subscription
+// pool. Fable is entitlement-gated on the claude.ai subscription (Anthropic
+// returns 429 even at 0% usage), so the only working path is Bedrock. Returns
+// true if it handled the response. For any non-Fable request it restores the
+// request body and returns false so the normal proxy path runs unchanged.
+func (s Server) maybeServeClaudeFableViaBedrock(w http.ResponseWriter, r *http.Request) bool {
+	cfg := s.Bedrock
+	if cfg == nil || cfg.Credentials == nil || strings.TrimSpace(cfg.Region) == "" {
+		return false
+	}
+	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/v1/messages") {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
+	if err != nil {
+		return false
+	}
+	restore := func() {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+	}
+	var probe struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &probe) != nil || !strings.Contains(strings.ToLower(probe.Model), "fable") {
+		restore()
+		return false
+	}
+	s.serveClaudeFableViaBedrock(w, r, body)
+	return true
+}
+
+func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Request, body []byte) {
+	cfg := s.Bedrock
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	stream := false
+	if raw, ok := payload["stream"]; ok {
+		_ = json.Unmarshal(raw, &stream)
+	}
+	// Bedrock takes the model in the URL and streaming via the endpoint; the body
+	// must carry anthropic_version and must not carry model/stream.
+	delete(payload, "model")
+	delete(payload, "stream")
+	payload["anthropic_version"] = json.RawMessage(`"bedrock-2023-05-31"`)
+	newBody, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, "failed to build bedrock request", http.StatusInternalServerError)
+		return
+	}
+
+	endpoint := "invoke"
+	if stream {
+		endpoint = "invoke-with-response-stream"
+	}
+	path := "/model/" + bedrockFableModelID + "/" + endpoint
+	started := time.Now()
+	resp, err := s.signAndForwardBedrock(r.Context(), http.MethodPost, path, newBody)
+	if err != nil {
+		if s.Logger != nil {
+			s.Logger.Error("claude-fable bedrock request failed", "error", err)
+		}
+		http.Error(w, "bedrock upstream request failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if s.Logger != nil {
+			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path)
+		}
+		if cfg.Bumper != nil {
+			go cfg.Bumper.onThrottle(bedrockFableModelID)
+		}
+	}
+
+	var usage bedrockUsage
+	var haveUsage bool
+	if stream && resp.StatusCode == http.StatusOK {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		usage, haveUsage = transcodeBedrockToSSE(w, resp.Body)
+	} else {
+		// Non-stream success or any error: Bedrock returns Anthropic-format JSON.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, replayablePostMaxBodyBytes))
+		_, _ = w.Write(respBody)
+		usage, haveUsage = parseBedrockInvokeUsage(respBody)
+	}
+	if cfg.CostLogPath != "" {
+		record := bedrockCostRecord{
+			Timestamp:  started.UTC().Format(time.RFC3339),
+			Model:      bedrockFableModelID,
+			Status:     resp.StatusCode,
+			DurationMs: time.Since(started).Milliseconds(),
+		}
+		if haveUsage {
+			record.Usage = usage
+			record.CostUSD = usage.costUSD(bedrockFableModelID)
+		}
+		appendBedrockCostRecord(cfg.CostLogPath, record)
+	}
+}
+
+// signAndForwardBedrock SigV4-signs a JSON body to bedrock-runtime and returns
+// the raw response.
+func (s Server) signAndForwardBedrock(ctx context.Context, method, upstreamPath string, body []byte) (*http.Response, error) {
+	cfg := s.Bedrock
+	host := "bedrock-runtime." + cfg.Region + ".amazonaws.com"
+	target := &url.URL{Scheme: "https", Host: host, Path: upstreamPath}
+	outReq, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	outReq.Header.Set("Content-Type", "application/json")
+	outReq.Host = host
+	outReq.ContentLength = int64(len(body))
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := v4.NewSigner().SignHTTP(ctx, creds, outReq, sha256Hex(body), bedrockService, cfg.Region, time.Now()); err != nil {
+		return nil, err
+	}
+	transport := cfg.Transport
+	if transport == nil {
+		transport = s.Transport
+	}
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	return transport.RoundTrip(outReq)
+}
+
+// transcodeBedrockToSSE converts a Bedrock invoke-with-response-stream body (AWS
+// event-stream framing wrapping Anthropic event JSON) into Anthropic Messages
+// SSE, which is what a Claude client on the OAuth path expects. It also extracts
+// token usage for cost tracking.
+func transcodeBedrockToSSE(w http.ResponseWriter, src io.Reader) (bedrockUsage, bool) {
+	flusher, _ := w.(http.Flusher)
+	var scanner bedrockFrameScanner
+	var usage bedrockUsage
+	var got bool
+	emit := func(inner []byte) {
+		var ev struct {
+			Type    string `json:"type"`
+			Message struct {
+				Usage bedrockUsage `json:"usage"`
+			} `json:"message"`
+			Usage bedrockUsage `json:"usage"`
+		}
+		_ = json.Unmarshal(inner, &ev)
+		switch ev.Type {
+		case "message_start":
+			usage.InputTokens = ev.Message.Usage.InputTokens
+			usage.CacheReadTokens = ev.Message.Usage.CacheReadTokens
+			usage.CacheWriteTokens = ev.Message.Usage.CacheWriteTokens
+			got = true
+		case "message_delta":
+			if ev.Usage.OutputTokens > 0 {
+				usage.OutputTokens = ev.Usage.OutputTokens
+				got = true
+			}
+		}
+		eventType := ev.Type
+		if eventType == "" {
+			eventType = "message"
+		}
+		_, _ = w.Write([]byte("event: " + eventType + "\ndata: "))
+		_, _ = w.Write(inner)
+		_, _ = w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			scanner.feed(buf[:n], emit)
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	return usage, got && !usage.empty()
+}
+
+// bedrockFrameScanner parses AWS event-stream frames incrementally and yields
+// each frame's decoded inner payload (the Anthropic event JSON).
+type bedrockFrameScanner struct{ buf []byte }
+
+func (s *bedrockFrameScanner) feed(data []byte, emit func([]byte)) {
+	s.buf = append(s.buf, data...)
+	for {
+		if len(s.buf) < 12 {
+			return
+		}
+		total := int(binary.BigEndian.Uint32(s.buf[0:4]))
+		headersLen := int(binary.BigEndian.Uint32(s.buf[4:8]))
+		if total < 16 || total > 64<<20 {
+			s.buf = nil
+			return
+		}
+		if len(s.buf) < total {
+			return
+		}
+		payloadStart := 12 + headersLen
+		payloadEnd := total - 4
+		if payloadStart <= payloadEnd && payloadEnd <= len(s.buf) {
+			var wrap struct {
+				Bytes string `json:"bytes"`
+			}
+			if json.Unmarshal(s.buf[payloadStart:payloadEnd], &wrap) == nil && wrap.Bytes != "" {
+				if decoded, err := base64.StdEncoding.DecodeString(wrap.Bytes); err == nil {
+					emit(decoded)
+				}
+			}
+		}
+		s.buf = s.buf[total:]
+	}
 }
 
 func (s Server) handleBedrockCost(w http.ResponseWriter, r *http.Request) {

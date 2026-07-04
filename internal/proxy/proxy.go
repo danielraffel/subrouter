@@ -1588,6 +1588,14 @@ func (s Server) proxyHandler() http.Handler {
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
 		requestProvider := providerForRequest(agentType, r.URL.Path)
+		// Claude Fable is entitlement-gated on the subscription (Anthropic 429s it
+		// even at 0% usage), so serve Fable from Bedrock when the gateway is
+		// configured. Non-Fable requests fall through unchanged.
+		if requestProvider == accounts.ProviderClaude && s.Bedrock != nil {
+			if s.maybeServeClaudeFableViaBedrock(w, r) {
+				return
+			}
+		}
 		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
 		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)
 		if err != nil {
