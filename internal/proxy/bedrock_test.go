@@ -21,6 +21,12 @@ func staticBedrockCreds() aws.CredentialsProvider {
 	})
 }
 
+func namedBedrockCreds(accessKey string) aws.CredentialsProvider {
+	return aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		return aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: "secret", Source: accessKey}, nil
+	})
+}
+
 func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 	var captured *http.Request
 	var capturedBody string
@@ -100,6 +106,54 @@ func TestBedrockHandlerRequiresGatewayToken(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 || !forwarded {
 		t.Fatalf("valid token status = %d forwarded = %v, want 200 + forwarded", rec.Code, forwarded)
+	}
+}
+
+func TestBedrockHandlerRetriesNextSourceOnThrottle(t *testing.T) {
+	var accessKeys []string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		auth := req.Header.Get("Authorization")
+		switch {
+		case strings.Contains(auth, "Credential=AKIAONE/"):
+			accessKeys = append(accessKeys, "AKIAONE")
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Body:       io.NopCloser(strings.NewReader(`{"error":"throttled"}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		case strings.Contains(auth, "Credential=AKIATWO/"):
+			accessKeys = append(accessKeys, "AKIATWO")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		default:
+			t.Fatalf("unexpected Authorization header: %q", auth)
+			return nil, nil
+		}
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Region: "us-east-1",
+		Sources: []BedrockCredentialSource{
+			{Name: "aw0", Credentials: namedBedrockCreds("AKIAONE")},
+			{Name: "aw1", Credentials: namedBedrockCreds("AKIATWO")},
+		},
+		Transport: rt,
+	}}
+
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != `{"ok":true}` {
+		t.Fatalf("body = %q, want successful second source response", rec.Body.String())
+	}
+	if got := strings.Join(accessKeys, ","); got != "AKIAONE,AKIATWO" {
+		t.Fatalf("access key order = %s, want AKIAONE,AKIATWO", got)
 	}
 }
 

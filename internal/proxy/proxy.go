@@ -60,6 +60,11 @@ type Server struct {
 	ReadCache        *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
+	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
+	// API key (x-api-key) instead of the subscription pool or Bedrock. It applies
+	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
+	// touch this key.
+	ClaudeFableAPIKey string
 }
 
 type ActiveSessions struct {
@@ -1588,11 +1593,12 @@ func (s Server) proxyHandler() http.Handler {
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
 		requestProvider := providerForRequest(agentType, r.URL.Path)
-		// Claude Fable is entitlement-gated on the subscription (Anthropic 429s it
-		// even at 0% usage), so serve Fable from Bedrock when the gateway is
-		// configured. Non-Fable requests fall through unchanged.
-		if requestProvider == accounts.ProviderClaude && s.Bedrock != nil {
-			if s.maybeServeClaudeFableViaBedrock(w, r) {
+		// Claude Fable is entitlement-gated on the subscription pool (Anthropic 429s
+		// it even at 0% usage). Serve Fable via the dedicated Anthropic API key if
+		// configured, else Bedrock. This applies ONLY to Fable; other Claude models
+		// fall through to the normal pool unchanged.
+		if requestProvider == accounts.ProviderClaude && s.claudeFableEnabled() {
+			if s.maybeServeClaudeFable(w, r) {
 				return
 			}
 		}

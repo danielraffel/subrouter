@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,6 +26,7 @@ import (
 type BedrockConfig struct {
 	Region      string
 	Credentials aws.CredentialsProvider
+	Sources     []BedrockCredentialSource
 	// GatewayToken, when non-empty, must be presented by clients via the
 	// Authorization: Bearer header (Claude Code's ANTHROPIC_AUTH_TOKEN). Empty
 	// means the endpoint relies on network-level trust like the rest of the proxy.
@@ -36,6 +38,13 @@ type BedrockConfig struct {
 	// Bumper, when set, requests a Service Quotas increase when Bedrock throttles
 	// (HTTP 429), deduped per quota with a cooldown.
 	Bumper *bedrockQuotaBumper
+	nextSource atomic.Uint64
+}
+
+type BedrockCredentialSource struct {
+	Name        string
+	Credentials aws.CredentialsProvider
+	Bumper      *bedrockQuotaBumper
 }
 
 const bedrockService = "bedrock"
@@ -43,7 +52,7 @@ const bedrockService = "bedrock"
 func (s Server) bedrockHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.Bedrock
-		if cfg == nil || cfg.Credentials == nil || strings.TrimSpace(cfg.Region) == "" {
+		if cfg == nil || !cfg.configured() {
 			http.Error(w, "bedrock gateway not configured", http.StatusServiceUnavailable)
 			return
 		}
@@ -67,44 +76,10 @@ func (s Server) bedrockHandler() http.Handler {
 			return
 		}
 
-		host := "bedrock-runtime." + cfg.Region + ".amazonaws.com"
-		target := &url.URL{Scheme: "https", Host: host, Path: upstreamPath, RawQuery: r.URL.RawQuery}
-		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(body))
-		if err != nil {
-			http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
-			return
-		}
-		copyBedrockRequestHeaders(outReq.Header, r.Header)
-		outReq.Host = host
-		outReq.ContentLength = int64(len(body))
-
-		creds, err := cfg.Credentials.Retrieve(r.Context())
-		if err != nil {
-			if s.Logger != nil {
-				s.Logger.Error("bedrock credentials unavailable", "error", err)
-			}
-			http.Error(w, "bedrock credentials unavailable", http.StatusBadGateway)
-			return
-		}
-		payloadHash := sha256Hex(body)
-		signer := v4.NewSigner()
-		if err := signer.SignHTTP(r.Context(), creds, outReq, payloadHash, bedrockService, cfg.Region, time.Now()); err != nil {
-			if s.Logger != nil {
-				s.Logger.Error("bedrock sigv4 signing failed", "error", err)
-			}
-			http.Error(w, "bedrock signing failed", http.StatusBadGateway)
-			return
-		}
-
-		transport := cfg.Transport
-		if transport == nil {
-			transport = s.Transport
-		}
-		if transport == nil {
-			transport = http.DefaultTransport
-		}
+		headers := http.Header{}
+		copyBedrockRequestHeaders(headers, r.Header)
 		started := time.Now()
-		resp, err := transport.RoundTrip(outReq)
+		resp, sourceName, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, r.URL.RawQuery, headers, body)
 		if err != nil {
 			if s.Logger != nil {
 				s.Logger.Error("bedrock upstream request failed", "path", upstreamPath, "error", err)
@@ -127,11 +102,9 @@ func (s Server) bedrockHandler() http.Handler {
 		model := bedrockModelFromPath(upstreamPath)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock throttled", "model", model, "path", upstreamPath)
+				s.Logger.Warn("bedrock throttled", "model", model, "path", upstreamPath, "bedrock_source", sourceName)
 			}
-			if cfg.Bumper != nil {
-				go cfg.Bumper.onThrottle(model)
-			}
+			cfg.onThrottle(sourceName, model)
 		}
 		usage, haveUsage := s.streamBedrockResponse(w, resp)
 		if cfg.CostLogPath != "" && model != "" {
@@ -151,40 +124,6 @@ func (s Server) bedrockHandler() http.Handler {
 }
 
 const bedrockFableModelID = "us.anthropic.claude-fable-5"
-
-// maybeServeClaudeFableViaBedrock intercepts Claude Messages requests for a
-// Fable model and serves them from Bedrock instead of the OAuth subscription
-// pool. Fable is entitlement-gated on the claude.ai subscription (Anthropic
-// returns 429 even at 0% usage), so the only working path is Bedrock. Returns
-// true if it handled the response. For any non-Fable request it restores the
-// request body and returns false so the normal proxy path runs unchanged.
-func (s Server) maybeServeClaudeFableViaBedrock(w http.ResponseWriter, r *http.Request) bool {
-	cfg := s.Bedrock
-	if cfg == nil || cfg.Credentials == nil || strings.TrimSpace(cfg.Region) == "" {
-		return false
-	}
-	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/v1/messages") {
-		return false
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
-	if err != nil {
-		return false
-	}
-	restore := func() {
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
-		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	}
-	var probe struct {
-		Model string `json:"model"`
-	}
-	if json.Unmarshal(body, &probe) != nil || !strings.Contains(strings.ToLower(probe.Model), "fable") {
-		restore()
-		return false
-	}
-	s.serveClaudeFableViaBedrock(w, r, body)
-	return true
-}
 
 func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Request, body []byte) {
 	cfg := s.Bedrock
@@ -214,7 +153,7 @@ func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Reques
 	}
 	path := "/model/" + bedrockFableModelID + "/" + endpoint
 	started := time.Now()
-	resp, err := s.signAndForwardBedrock(r.Context(), http.MethodPost, path, newBody)
+	resp, sourceName, err := s.signAndForwardBedrock(r.Context(), http.MethodPost, path, newBody)
 	if err != nil {
 		if s.Logger != nil {
 			s.Logger.Error("claude-fable bedrock request failed", "error", err)
@@ -225,11 +164,9 @@ func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Reques
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if s.Logger != nil {
-			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path)
+			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName)
 		}
-		if cfg.Bumper != nil {
-			go cfg.Bumper.onThrottle(bedrockFableModelID)
-		}
+		cfg.onThrottle(sourceName, bedrockFableModelID)
 	}
 
 	var usage bedrockUsage
@@ -263,19 +200,62 @@ func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Reques
 }
 
 // signAndForwardBedrock SigV4-signs a JSON body to bedrock-runtime and returns
-// the raw response.
-func (s Server) signAndForwardBedrock(ctx context.Context, method, upstreamPath string, body []byte) (*http.Response, error) {
+// the raw response plus the Bedrock source name that handled it.
+func (s Server) signAndForwardBedrock(ctx context.Context, method, upstreamPath string, body []byte) (*http.Response, string, error) {
+	headers := http.Header{"Content-Type": []string{"application/json"}}
+	return s.signAndForwardBedrockWithHeaders(ctx, method, upstreamPath, "", headers, body)
+}
+
+func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, string, error) {
+	cfg := s.Bedrock
+	sources := cfg.orderedSources()
+	var firstErr error
+	for i, source := range sources {
+		resp, err := s.signAndForwardBedrockWithSource(ctx, source, method, upstreamPath, rawQuery, headers, body)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if s.Logger != nil {
+				s.Logger.Warn("bedrock source failed", "bedrock_source", source.Name, "path", upstreamPath, "error", err)
+			}
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && i+1 < len(sources) {
+			if s.Logger != nil {
+				s.Logger.Warn("bedrock source throttled, retrying next source", "bedrock_source", source.Name, "path", upstreamPath)
+			}
+			cfg.onThrottle(source.Name, bedrockModelFromPath(upstreamPath))
+			resp.Body.Close()
+			continue
+		}
+		return resp, source.Name, nil
+	}
+	if firstErr != nil {
+		return nil, "", firstErr
+	}
+	return nil, "", io.ErrUnexpectedEOF
+}
+
+func (s Server) signAndForwardBedrockWithSource(ctx context.Context, source BedrockCredentialSource, method, upstreamPath, rawQuery string, headers http.Header, body []byte) (*http.Response, error) {
 	cfg := s.Bedrock
 	host := "bedrock-runtime." + cfg.Region + ".amazonaws.com"
-	target := &url.URL{Scheme: "https", Host: host, Path: upstreamPath}
+	target := &url.URL{Scheme: "https", Host: host, Path: upstreamPath, RawQuery: rawQuery}
 	outReq, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	outReq.Header.Set("Content-Type", "application/json")
+	for key, values := range headers {
+		for _, value := range values {
+			outReq.Header.Add(key, value)
+		}
+	}
+	if outReq.Header.Get("Content-Type") == "" {
+		outReq.Header.Set("Content-Type", "application/json")
+	}
 	outReq.Host = host
 	outReq.ContentLength = int64(len(body))
-	creds, err := cfg.Credentials.Retrieve(ctx)
+	creds, err := source.Credentials.Retrieve(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +270,55 @@ func (s Server) signAndForwardBedrock(ctx context.Context, method, upstreamPath 
 		transport = http.DefaultTransport
 	}
 	return transport.RoundTrip(outReq)
+}
+
+func (cfg *BedrockConfig) configured() bool {
+	return strings.TrimSpace(cfg.Region) != "" && len(cfg.sources()) > 0
+}
+
+func (cfg *BedrockConfig) sources() []BedrockCredentialSource {
+	var out []BedrockCredentialSource
+	for _, source := range cfg.Sources {
+		if source.Credentials == nil {
+			continue
+		}
+		name := strings.TrimSpace(source.Name)
+		if name == "" {
+			name = "default"
+		}
+		out = append(out, BedrockCredentialSource{Name: name, Credentials: source.Credentials, Bumper: source.Bumper})
+	}
+	if len(out) == 0 && cfg.Credentials != nil {
+		out = append(out, BedrockCredentialSource{Name: "default", Credentials: cfg.Credentials, Bumper: cfg.Bumper})
+	}
+	return out
+}
+
+func (cfg *BedrockConfig) orderedSources() []BedrockCredentialSource {
+	sources := cfg.sources()
+	if len(sources) <= 1 {
+		return sources
+	}
+	start := int(cfg.nextSource.Add(1)-1) % len(sources)
+	ordered := make([]BedrockCredentialSource, 0, len(sources))
+	ordered = append(ordered, sources[start:]...)
+	ordered = append(ordered, sources[:start]...)
+	return ordered
+}
+
+func (cfg *BedrockConfig) onThrottle(sourceName, model string) {
+	if model == "" {
+		return
+	}
+	for _, source := range cfg.Sources {
+		if source.Name == sourceName && source.Bumper != nil {
+			go source.Bumper.onThrottle(model)
+			return
+		}
+	}
+	if cfg.Bumper != nil {
+		go cfg.Bumper.onThrottle(model)
+	}
 }
 
 // transcodeBedrockToSSE converts a Bedrock invoke-with-response-stream body (AWS
