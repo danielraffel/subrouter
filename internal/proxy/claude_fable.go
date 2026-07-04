@@ -7,10 +7,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
-// claudeFableEnabled reports whether a Fable-specific route is configured (a
-// dedicated Anthropic API key, or the Bedrock gateway).
+// claudeFableModel reports whether a Claude request targets a Fable model.
+func claudeFableModel(model string) bool {
+	return strings.Contains(strings.ToLower(model), "fable")
+}
+
+// claudeFableEnabled reports whether a Fable fallback route is configured (the
+// Bedrock gateway or a dedicated Anthropic API key). Fable routing order is
+// subscription pool first, then Bedrock, then the API key; this only gates the
+// fallback stages, never the pool.
 func (s Server) claudeFableEnabled() bool {
 	if s.ClaudeFableAPIKey != "" {
 		return true
@@ -18,49 +27,102 @@ func (s Server) claudeFableEnabled() bool {
 	return s.Bedrock != nil && s.Bedrock.configured()
 }
 
-// maybeServeClaudeFable intercepts Claude Messages requests for a Fable model
-// and serves them off the subscription pool (which Anthropic rate-limits). Fable
-// goes to the dedicated Anthropic API key when set, otherwise Bedrock. Any
-// non-Fable request restores the body and returns false so the normal pool path
-// runs unchanged, so Opus/Sonnet never use the Fable API key.
-func (s Server) maybeServeClaudeFable(w http.ResponseWriter, r *http.Request) bool {
+// claudeFableRequest reports whether this is a Claude Messages call for a Fable
+// model. ExtractModel restores the request body after probing it.
+func (s Server) claudeFableRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/v1/messages") {
 		return false
 	}
+	return claudeFableModel(session.ExtractModel(r, s.MaxBodyBytes))
+}
+
+// serveClaudeFableFallback serves a Fable request straight off the fallback
+// chain (Bedrock, then the dedicated API key). Used when the subscription pool
+// cannot even start: no usable Claude OAuth account or selection failed. It
+// restores the request body and returns false when no fallback produced a
+// response, so the caller can surface its own error.
+func (s Server) serveClaudeFableFallback(w http.ResponseWriter, r *http.Request) bool {
 	body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
 	if err != nil {
 		return false
 	}
-	restore := func() {
+	resp, ok := s.claudeFableFallbackResponse(r, body)
+	if !ok {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	}
-	var probe struct {
-		Model string `json:"model"`
-	}
-	if json.Unmarshal(body, &probe) != nil || !strings.Contains(strings.ToLower(probe.Model), "fable") {
-		restore()
 		return false
 	}
-	if s.ClaudeFableAPIKey != "" {
-		s.serveClaudeFableViaAPIKey(w, r, body)
-		return true
+	defer resp.Body.Close()
+	for key, values := range resp.Header {
+		if isHopByHopHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
 	}
-	if s.Bedrock != nil && s.Bedrock.configured() {
-		s.serveClaudeFableViaBedrock(w, r, body)
-		return true
-	}
-	restore()
-	return false
+	w.WriteHeader(resp.StatusCode)
+	flushingCopy(w, resp.Body, nil)
+	return true
 }
 
-// serveClaudeFableViaAPIKey forwards a Fable request to Anthropic using the
+// claudeFableFallbackResponse runs the Fable fallback chain for a request the
+// subscription pool could not serve: AWS Bedrock first, then the dedicated
+// Anthropic API key when Bedrock is throttled, overloaded, or unreachable. The
+// returned response is native Anthropic shape (JSON or SSE). ok is false when
+// no fallback is configured or every configured stage failed without producing
+// an HTTP response, so the caller keeps whatever it was about to return.
+func (s Server) claudeFableFallbackResponse(r *http.Request, body []byte) (*http.Response, bool) {
+	if s.Bedrock != nil && s.Bedrock.configured() {
+		resp, err := s.claudeFableBedrockResponse(r.Context(), body)
+		if err == nil {
+			if !claudeFableBedrockUnusable(resp.StatusCode) || s.ClaudeFableAPIKey == "" {
+				return resp, true
+			}
+			if s.Logger != nil {
+				s.Logger.Warn("claude-fable bedrock unusable, falling back to api key", "status", resp.StatusCode)
+			}
+			_ = resp.Body.Close()
+		} else {
+			if r.Context().Err() != nil {
+				return nil, false
+			}
+			if s.Logger != nil {
+				s.Logger.Error("claude-fable bedrock request failed", "error", err)
+			}
+		}
+	}
+	if s.ClaudeFableAPIKey != "" {
+		resp, err := s.claudeFableAPIKeyResponse(r, body)
+		if err != nil {
+			if s.Logger != nil && r.Context().Err() == nil {
+				s.Logger.Error("claude-fable api-key request failed", "error", err)
+			}
+			return nil, false
+		}
+		return resp, true
+	}
+	return nil, false
+}
+
+// claudeFableBedrockUnusable reports whether a Bedrock response should push the
+// request to the next fallback stage. Any non-2xx counts: 429 is consumed TPM
+// quota, 5xx (e.g. 503 "Bedrock is unable to process your request") is a
+// Bedrock-side failure, and 4xx covers auth/validation/model-access errors the
+// Anthropic API may still accept. Credential-source rotation already happened
+// before this status surfaced, and the API key is the chain's last stage, so a
+// request that fails everywhere surfaces the API key's own error.
+func claudeFableBedrockUnusable(status int) bool {
+	return status < 200 || status >= 300
+}
+
+// claudeFableAPIKeyResponse forwards a Fable request to Anthropic using the
 // dedicated Fable API key (x-api-key). It strips the context_management field
 // that the Messages API rejects with "Extra inputs are not permitted", and drops
 // the OAuth-only auth so the api key is authoritative. The response is native
-// Anthropic (SSE or JSON), so it streams straight back with no transcoding.
-func (s Server) serveClaudeFableViaAPIKey(w http.ResponseWriter, r *http.Request, body []byte) {
+// Anthropic (SSE or JSON), so it forwards with no transcoding.
+func (s Server) claudeFableAPIKeyResponse(r *http.Request, body []byte) (*http.Response, error) {
 	body = stripClaudeUnsupportedFields(body)
 
 	upstream := s.ClaudeUpstream
@@ -73,8 +135,7 @@ func (s Server) serveClaudeFableViaAPIKey(w http.ResponseWriter, r *http.Request
 
 	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target.String(), bytes.NewReader(body))
 	if err != nil {
-		http.Error(w, "failed to build fable request", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	for key, values := range r.Header {
 		lower := strings.ToLower(key)
@@ -97,26 +158,7 @@ func (s Server) serveClaudeFableViaAPIKey(w http.ResponseWriter, r *http.Request
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	resp, err := transport.RoundTrip(outReq)
-	if err != nil {
-		if s.Logger != nil {
-			s.Logger.Error("claude-fable api-key request failed", "error", err)
-		}
-		http.Error(w, "fable upstream request failed", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	for key, values := range resp.Header {
-		if isHopByHopHeader(key) {
-			continue
-		}
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	flushingCopy(w, resp.Body, nil)
+	return transport.RoundTrip(outReq)
 }
 
 // stripClaudeUnsupportedFields removes request fields the Anthropic Messages API

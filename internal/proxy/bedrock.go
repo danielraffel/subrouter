@@ -125,12 +125,15 @@ func (s Server) bedrockHandler() http.Handler {
 
 const bedrockFableModelID = "us.anthropic.claude-fable-5"
 
-func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Request, body []byte) {
+// claudeFableBedrockResponse forwards a Fable Messages request to Bedrock and
+// returns a native Anthropic-shaped response: SSE (transcoded from AWS
+// event-stream framing) for streaming requests, JSON otherwise. Cost is
+// recorded like the /bedrock/* gateway path.
+func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*http.Response, error) {
 	cfg := s.Bedrock
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
+		return nil, err
 	}
 	stream := false
 	if raw, ok := payload["stream"]; ok {
@@ -143,8 +146,7 @@ func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Reques
 	payload["anthropic_version"] = json.RawMessage(`"bedrock-2023-05-31"`)
 	newBody, err := json.Marshal(payload)
 	if err != nil {
-		http.Error(w, "failed to build bedrock request", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
 	endpoint := "invoke"
@@ -153,15 +155,10 @@ func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Reques
 	}
 	path := "/model/" + bedrockFableModelID + "/" + endpoint
 	started := time.Now()
-	resp, sourceName, err := s.signAndForwardBedrock(r.Context(), http.MethodPost, path, newBody)
+	resp, sourceName, err := s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
 	if err != nil {
-		if s.Logger != nil {
-			s.Logger.Error("claude-fable bedrock request failed", "error", err)
-		}
-		http.Error(w, "bedrock upstream request failed", http.StatusBadGateway)
-		return
+		return nil, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if s.Logger != nil {
 			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName)
@@ -169,34 +166,58 @@ func (s Server) serveClaudeFableViaBedrock(w http.ResponseWriter, r *http.Reques
 		cfg.onThrottle(sourceName, bedrockFableModelID)
 	}
 
-	var usage bedrockUsage
-	var haveUsage bool
 	if stream && resp.StatusCode == http.StatusOK {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
-		usage, haveUsage = transcodeBedrockToSSE(w, resp.Body)
-	} else {
-		// Non-stream success or any error: Bedrock returns Anthropic-format JSON.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, replayablePostMaxBodyBytes))
-		_, _ = w.Write(respBody)
-		usage, haveUsage = parseBedrockInvokeUsage(respBody)
+		pr, pw := io.Pipe()
+		go func() {
+			usage, haveUsage := transcodeBedrockToSSE(pw, resp.Body)
+			_ = resp.Body.Close()
+			_ = pw.Close()
+			s.recordClaudeFableBedrockCost(started, http.StatusOK, usage, haveUsage)
+		}()
+		return &http.Response{
+			Status:        "200 OK",
+			StatusCode:    http.StatusOK,
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			Header:        http.Header{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}},
+			Body:          pr,
+			ContentLength: -1,
+		}, nil
 	}
-	if cfg.CostLogPath != "" {
-		record := bedrockCostRecord{
-			Timestamp:  started.UTC().Format(time.RFC3339),
-			Model:      bedrockFableModelID,
-			Status:     resp.StatusCode,
-			DurationMs: time.Since(started).Milliseconds(),
-		}
-		if haveUsage {
-			record.Usage = usage
-			record.CostUSD = usage.costUSD(bedrockFableModelID)
-		}
-		appendBedrockCostRecord(cfg.CostLogPath, record)
+	// Non-stream success or any error status: Bedrock answers Anthropic-format JSON.
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, replayablePostMaxBodyBytes))
+	_ = resp.Body.Close()
+	usage, haveUsage := parseBedrockInvokeUsage(respBody)
+	s.recordClaudeFableBedrockCost(started, resp.StatusCode, usage, haveUsage)
+	return &http.Response{
+		Status:        resp.Status,
+		StatusCode:    resp.StatusCode,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(respBody)),
+		ContentLength: int64(len(respBody)),
+	}, nil
+}
+
+func (s Server) recordClaudeFableBedrockCost(started time.Time, status int, usage bedrockUsage, haveUsage bool) {
+	cfg := s.Bedrock
+	if cfg == nil || cfg.CostLogPath == "" {
+		return
 	}
+	record := bedrockCostRecord{
+		Timestamp:  started.UTC().Format(time.RFC3339),
+		Model:      bedrockFableModelID,
+		Status:     status,
+		DurationMs: time.Since(started).Milliseconds(),
+	}
+	if haveUsage {
+		record.Usage = usage
+		record.CostUSD = usage.costUSD(bedrockFableModelID)
+	}
+	appendBedrockCostRecord(cfg.CostLogPath, record)
 }
 
 // signAndForwardBedrock SigV4-signs a JSON body to bedrock-runtime and returns
@@ -221,11 +242,17 @@ func (s Server) signAndForwardBedrockWithHeaders(ctx context.Context, method, up
 			}
 			continue
 		}
-		if resp.StatusCode == http.StatusTooManyRequests && i+1 < len(sources) {
+		// Rotate to the next credential source on a throttle (429, per-account
+		// TPM) or a Bedrock-side 5xx (e.g. 503 "Bedrock is unable to process
+		// your request"): both are specific to this source's account/endpoint
+		// and another source may serve the request fine.
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && i+1 < len(sources) {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock source throttled, retrying next source", "bedrock_source", source.Name, "path", upstreamPath)
+				s.Logger.Warn("bedrock source unusable, retrying next source", "bedrock_source", source.Name, "path", upstreamPath, "status", resp.StatusCode)
 			}
-			cfg.onThrottle(source.Name, bedrockModelFromPath(upstreamPath))
+			if resp.StatusCode == http.StatusTooManyRequests {
+				cfg.onThrottle(source.Name, bedrockModelFromPath(upstreamPath))
+			}
 			resp.Body.Close()
 			continue
 		}
@@ -324,8 +351,10 @@ func (cfg *BedrockConfig) onThrottle(sourceName, model string) {
 // transcodeBedrockToSSE converts a Bedrock invoke-with-response-stream body (AWS
 // event-stream framing wrapping Anthropic event JSON) into Anthropic Messages
 // SSE, which is what a Claude client on the OAuth path expects. It also extracts
-// token usage for cost tracking.
-func transcodeBedrockToSSE(w http.ResponseWriter, src io.Reader) (bedrockUsage, bool) {
+// token usage for cost tracking. w may be an http.ResponseWriter (flushed per
+// event) or a plain writer like an io.Pipe (each Write hands the event to the
+// reader directly).
+func transcodeBedrockToSSE(w io.Writer, src io.Reader) (bedrockUsage, bool) {
 	flusher, _ := w.(http.Flusher)
 	var scanner bedrockFrameScanner
 	var usage bedrockUsage

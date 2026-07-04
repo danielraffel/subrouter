@@ -165,3 +165,48 @@ func TestBedrockHandlerDisabledWithoutConfig(t *testing.T) {
 		t.Fatalf("status = %d, want 503 when bedrock not configured", rec.Code)
 	}
 }
+
+func TestBedrockHandlerRetriesNextSourceOn5xx(t *testing.T) {
+	var accessKeys []string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		auth := req.Header.Get("Authorization")
+		switch {
+		case strings.Contains(auth, "Credential=AKIAONE/"):
+			accessKeys = append(accessKeys, "AKIAONE")
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader(`{"message":"Bedrock is unable to process your request."}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		case strings.Contains(auth, "Credential=AKIATWO/"):
+			accessKeys = append(accessKeys, "AKIATWO")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		default:
+			t.Fatalf("unexpected Authorization header: %q", auth)
+			return nil, nil
+		}
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Region: "us-east-1",
+		Sources: []BedrockCredentialSource{
+			{Name: "aw0", Credentials: namedBedrockCreds("AKIAONE")},
+			{Name: "aw1", Credentials: namedBedrockCreds("AKIATWO")},
+		},
+		Transport: rt,
+	}}
+
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if got := strings.Join(accessKeys, ","); got != "AKIAONE,AKIATWO" {
+		t.Fatalf("access key order = %s, want AKIAONE,AKIATWO", got)
+	}
+}
