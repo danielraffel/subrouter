@@ -82,7 +82,7 @@ func (s Server) bedrockHandler() http.Handler {
 		resp, sourceName, err := s.signAndForwardBedrockWithHeaders(r.Context(), r.Method, upstreamPath, r.URL.RawQuery, headers, body)
 		if err != nil {
 			if s.Logger != nil {
-				s.Logger.Error("bedrock upstream request failed", "path", upstreamPath, "error", err)
+				s.Logger.Error("bedrock upstream request failed", "path", upstreamPath, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "error", err)
 			}
 			http.Error(w, "bedrock upstream request failed", http.StatusBadGateway)
 			return
@@ -102,7 +102,7 @@ func (s Server) bedrockHandler() http.Handler {
 		model := bedrockModelFromPath(upstreamPath)
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				s.Logger.Warn("bedrock throttled", "model", model, "path", upstreamPath, "bedrock_source", sourceName)
+				s.Logger.Warn("bedrock throttled", "model", model, "path", upstreamPath, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent(), "bedrock_source", sourceName)
 			}
 			cfg.onThrottle(sourceName, model)
 		}

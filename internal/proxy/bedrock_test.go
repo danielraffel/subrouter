@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,6 +156,38 @@ func TestBedrockHandlerRetriesNextSourceOnThrottle(t *testing.T) {
 	}
 	if got := strings.Join(accessKeys, ","); got != "AKIAONE,AKIATWO" {
 		t.Fatalf("access key order = %s, want AKIAONE,AKIATWO", got)
+	}
+}
+
+func TestBedrockHandlerLogsClientAttributionOnThrottle(t *testing.T) {
+	var logBuf bytes.Buffer
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"throttled"}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := Server{
+		Logger: slog.New(slog.NewTextHandler(&logBuf, nil)),
+		Bedrock: &BedrockConfig{
+			Region:    "us-east-1",
+			Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: namedBedrockCreds("AKIAONE")}},
+			Transport: rt,
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/us.anthropic.claude-fable-5/invoke", strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`))
+	req.Header.Set("User-Agent", "sr claude-aws")
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (body %q)", rec.Code, rec.Body.String())
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "bedrock throttled") || !strings.Contains(logs, "remote_addr=") || !strings.Contains(logs, "user_agent=\"sr claude-aws\"") {
+		t.Fatalf("expected throttle log with remote_addr and user_agent; logs=\n%s", logs)
 	}
 }
 
