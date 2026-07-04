@@ -1131,14 +1131,14 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	if oauthApps.LimitWindowSeconds != int64((7*24*time.Hour)/time.Second) {
 		t.Fatalf("oauth apps LimitWindowSeconds = %d, want 7d", oauthApps.LimitWindowSeconds)
 	}
-	if oauthApps.Feature != agentclaude.FableModel {
-		t.Fatalf("oauth apps Feature = %q, want %q", oauthApps.Feature, agentclaude.FableModel)
+	if oauthApps.Feature != agentclaude.FableFeature {
+		t.Fatalf("oauth apps Feature = %q, want %q", oauthApps.Feature, agentclaude.FableFeature)
 	}
 	score := scoreFromWindows("claude@example.com", windows)
 	if score.Headroom == 0 {
 		t.Fatalf("base headroom = %.2f, hidden Fable bucket should not exhaust non-Fable Claude models", score.Headroom)
 	}
-	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableModel)]
+	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableFeature)]
 	if !ok {
 		t.Fatalf("missing Fable model score: %+v", score.ModelScores)
 	}

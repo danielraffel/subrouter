@@ -695,6 +695,23 @@ func claudeProfileEmail(name string) string {
 	return ""
 }
 
+// claudePoolModel canonicalizes a Claude request model to the quota-pool
+// family stamped on usage windows, so "claude-opus-4-8" and
+// "claude-opus-4-8[1m]" both resolve to the opus weekly pool. Non-Claude and
+// unrecognized models pass through unchanged (strict generic matching).
+func claudePoolModel(model string) string {
+	lower := strings.ToLower(model)
+	switch {
+	case strings.Contains(lower, "fable"):
+		return agentclaude.FableFeature
+	case strings.Contains(lower, "opus"):
+		return agentclaude.OpusFeature
+	case strings.Contains(lower, "sonnet"):
+		return agentclaude.SonnetFeature
+	}
+	return model
+}
+
 func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow {
 	if usage == nil {
 		return nil
@@ -716,8 +733,13 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			UsedPercent:        *limit.Utilization,
 			LimitWindowSeconds: windowSeconds,
 		}
-		if name == agentclaude.FableWindowName {
-			window.Feature = agentclaude.FableModel
+		switch name {
+		case agentclaude.FableWindowName:
+			window.Feature = agentclaude.FableFeature
+		case "opus-weekly":
+			window.Feature = agentclaude.OpusFeature
+		case "sonnet-weekly":
+			window.Feature = agentclaude.SonnetFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())
@@ -737,6 +759,17 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
+	// The usage endpoint reports opus/sonnet weekly buckets as null until the
+	// account has used that model family. Null means "unused", not "cannot
+	// serve": emit a 0%-used window so ForModel never zero-fills a fresh
+	// account out of opus/sonnet routing once other accounts grow real
+	// windows.
+	if !usageWindowNamed(windows, "opus-weekly") {
+		windows = append(windows, accounts.UsageWindow{Name: "opus-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.OpusFeature})
+	}
+	if !usageWindowNamed(windows, "sonnet-weekly") {
+		windows = append(windows, accounts.UsageWindow{Name: "sonnet-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.SonnetFeature})
+	}
 	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
 		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
 	}
@@ -797,11 +830,19 @@ func scoreUsableForNewSession(score selectacct.Score) bool {
 
 func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
 	limitWindows := make([]selectacct.LimitWindow, 0, len(windows)*2)
-	hasFableWindow := false
-	for _, window := range windows {
-		if window.Feature == agentclaude.FableModel || window.Name == agentclaude.FableWindowName {
-			hasFableWindow = true
-			break
+	// A model-pool request (fable/opus/sonnet) consumes the account-wide 5h/7d
+	// windows too, so every feature pool's score must also reflect the base
+	// windows: duplicate each base window into every distinct feature present.
+	// Without this a pool with quota left on an account whose 5h window is
+	// cooked would still score high and route traffic into guaranteed 429s.
+	var features []string
+	if provider == accounts.ProviderClaude {
+		seen := map[string]bool{}
+		for _, window := range windows {
+			if window.Feature != "" && !seen[window.Feature] {
+				seen[window.Feature] = true
+				features = append(features, window.Feature)
+			}
 		}
 	}
 	for _, window := range windows {
@@ -812,14 +853,16 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 			ResetAfterSeconds:  window.ResetAfterSeconds,
 			Feature:            window.Feature,
 		})
-		if provider == accounts.ProviderClaude && hasFableWindow && window.Feature == "" {
-			limitWindows = append(limitWindows, selectacct.LimitWindow{
-				Name:               window.Name,
-				UsedPercent:        window.UsedPercent,
-				LimitWindowSeconds: window.LimitWindowSeconds,
-				ResetAfterSeconds:  window.ResetAfterSeconds,
-				Feature:            agentclaude.FableModel,
-			})
+		if window.Feature == "" {
+			for _, feature := range features {
+				limitWindows = append(limitWindows, selectacct.LimitWindow{
+					Name:               window.Name,
+					UsedPercent:        window.UsedPercent,
+					LimitWindowSeconds: window.LimitWindowSeconds,
+					ResetAfterSeconds:  window.ResetAfterSeconds,
+					Feature:            feature,
+				})
+			}
 		}
 	}
 	score := selectacct.ScoreFromLimitWindows(accountID, 0, limitWindows)
@@ -1598,8 +1641,14 @@ func (s Server) proxyHandler() http.Handler {
 		// run when the pool gives up (usageLimitRetryTransport exhausts failover)
 		// or cannot start (no usable OAuth account). Other Claude models use the
 		// normal pool unchanged.
-		fableFallbackConfigured := requestProvider == accounts.ProviderClaude &&
-			s.claudeFableEnabled() && s.claudeFableRequest(r)
+		requestPoolModel := ""
+		fableFallbackConfigured := false
+		if requestProvider == accounts.ProviderClaude {
+			requestModel := session.ExtractModel(r, s.MaxBodyBytes)
+			requestPoolModel = claudePoolModel(requestModel)
+			fableFallbackConfigured = s.claudeFableEnabled() && claudeFableModel(requestModel) &&
+				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
+		}
 		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
 		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)
 		if err != nil {
@@ -1708,6 +1757,7 @@ func (s Server) proxyHandler() http.Handler {
 				path:          proxyRequest.URL.Path,
 				upstream:      upstream.Host,
 				maxAttempts:   s.usageLimitRetryMaxAttempts(requestProvider),
+				poolModel:     requestPoolModel,
 				fableFallback: fableFallback,
 			}
 		}
@@ -2561,10 +2611,14 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 		s.refreshUsageScoresIfStale(r.Context())
 	}
 	base := s.scheduler()
-	if model != "" && s.Logger != nil && base.HasModelPool(model) {
-		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(model))
+	poolModel := model
+	if provider == accounts.ProviderClaude {
+		poolModel = claudePoolModel(model)
 	}
-	scheduler := base.ForModel(model).WithSessionCounts(s.Sessions.CountByAccount())
+	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
+		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
+	}
+	scheduler := base.ForModel(poolModel).WithSessionCounts(s.Sessions.CountByAccount())
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)
@@ -3009,6 +3063,11 @@ type usageLimitRetryTransport struct {
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
+	// poolModel is the canonicalized quota-pool model for this request (e.g.
+	// "claude-fable"); failover scores candidates against that pool so an
+	// account whose pool is cooked but whose base windows are healthy is not
+	// retried for a model it cannot serve.
+	poolModel string
 	// fableFallback, when set, serves the request via the Fable fallback chain
 	// (Bedrock, then the dedicated Anthropic API key) once the subscription
 	// pool gives up. Set only for Claude Fable requests with a chain configured;
@@ -3152,7 +3211,47 @@ func claudeAccountExhaustedByResponse(status int, header http.Header) bool {
 	if status == http.StatusUnauthorized {
 		return true
 	}
-	return claudeUnifiedStatus(header) == "rejected"
+	if claudeUnifiedStatus(header) != "rejected" {
+		return false
+	}
+	// A rejection caused solely by a model-scoped window (e.g. the Fable
+	// 7d_oi bucket) while the account-wide 5h/7d windows are still allowed
+	// must not cook the whole account: opus/sonnet traffic can still use it,
+	// and the usage refresh zeroes the affected pool on its own evidence.
+	// Before this, a wave of Fable traffic marked every account exhausted and
+	// starved opus/sonnet routing.
+	return !claudeRejectionIsModelPoolScoped(header)
+}
+
+// claudeModelPoolWindowPrefixes are the unified-header window prefixes that
+// meter a single model family rather than the whole account. 7d_oi is the
+// hidden Fable/OAuth-apps weekly bucket.
+var claudeModelPoolWindowPrefixes = []string{"7d_oi"}
+
+// claudeRejectionIsModelPoolScoped reports whether a rejected response is
+// attributable only to a model-scoped window: some pool window says rejected
+// and no account-wide window does. Responses without per-window statuses are
+// treated as account-wide (conservative).
+func claudeRejectionIsModelPoolScoped(header http.Header) bool {
+	windowStatus := func(prefix string) string {
+		return strings.ToLower(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-"+prefix+"-status")))
+	}
+	poolRejected := false
+	for _, prefix := range claudeModelPoolWindowPrefixes {
+		if windowStatus(prefix) == "rejected" {
+			poolRejected = true
+			break
+		}
+	}
+	if !poolRejected {
+		return false
+	}
+	for _, prefix := range []string{"5h", "7d"} {
+		if windowStatus(prefix) == "rejected" {
+			return false
+		}
+	}
+	return true
 }
 
 // claudeUnifiedStatus returns the lowercased anthropic-ratelimit-unified-status
@@ -3299,7 +3398,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			return response, nil
 		}
-		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, tried, t.fableFallback != nil)
+		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil)
 		if pickErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
@@ -3439,7 +3538,7 @@ func isTerminalCredentialError(err error) bool {
 // pool to OAuth accounts; Fable requests with a fallback chain set it so a
 // metered API-key pool account never preempts the Bedrock stage (the dedicated
 // Fable API key is the chain's own last stage).
-func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
+func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
 	allCandidates := filterAccountsForProvider(s.accountList(), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
@@ -3452,7 +3551,7 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 	// though healthy accounts remained untried.
 	var lastErr error
 	for {
-		scheduler := s.scheduler()
+		scheduler := s.scheduler().ForModel(poolModel)
 		if s.Sessions != nil {
 			scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 		}

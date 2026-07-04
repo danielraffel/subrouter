@@ -373,14 +373,47 @@ func TestOauthRetryAccountSkipsAPIKeyAccountsWhenOAuthOnly(t *testing.T) {
 		"cooked@example.com": {},
 		"fresh@example.com":  {},
 	}
-	if _, err := server.oauthRetryAccount(t.Context(), accounts.ProviderClaude, "claude", "s", "", tried, true); err == nil {
+	if _, err := server.oauthRetryAccount(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, true); err == nil {
 		t.Fatal("oauthOnly must not hand out the API-key pool account")
 	}
-	account, err := server.oauthRetryAccount(t.Context(), accounts.ProviderClaude, "claude", "s", "", tried, false)
+	account, err := server.oauthRetryAccount(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, false)
 	if err != nil {
 		t.Fatalf("non-oauthOnly retry should use the API-key account: %v", err)
 	}
 	if account.AuthMode != accounts.AuthModeAPIKey {
 		t.Fatalf("account = %+v, want the API-key fallback", account)
+	}
+}
+
+// Bedrock's Anthropic schema 400s on OAuth-only fields ("context_management:
+// Extra inputs are not permitted", observed live), which used to push every
+// context-editing Claude Code request straight past Bedrock to the API key.
+func TestClaudeFableBedrockStripsUnsupportedFields(t *testing.T) {
+	var forwarded string
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(req.Body)
+		forwarded = string(b)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message"}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{
+		Region:    "us-east-1",
+		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport: rt,
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	resp, err := s.claudeFableBedrockResponse(req.Context(), []byte(`{"model":"claude-fable-5","context_management":{"edits":[]},"max_tokens":8,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if strings.Contains(forwarded, "context_management") {
+		t.Fatalf("context_management not stripped for bedrock: %s", forwarded)
+	}
+	if !strings.Contains(forwarded, "anthropic_version") {
+		t.Fatalf("bedrock body missing anthropic_version: %s", forwarded)
 	}
 }

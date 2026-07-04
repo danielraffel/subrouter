@@ -27,13 +27,21 @@ import (
 
 const (
 	usageURL        = "https://api.anthropic.com/api/oauth/usage"
-	messagesURL     = "https://api.anthropic.com/v1/messages"
 	oauthBetaHeader = "oauth-2025-04-20"
 )
+
+// messagesURL is a var so probe tests can point it at a local server.
+var messagesURL = "https://api.anthropic.com/v1/messages"
 
 const (
 	FableModel      = "claude-fable-5"
 	FableWindowName = "oauth-apps-weekly"
+	// Quota-pool family keys stamped on Claude usage windows and matched
+	// against canonicalized request models ("claude-opus-4-8[1m]" and
+	// "claude-opus-4-8" both belong to the opus pool).
+	FableFeature  = "claude-fable"
+	OpusFeature   = "claude-opus"
+	SonnetFeature = "claude-sonnet"
 )
 
 var oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
@@ -730,15 +738,23 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"messages":[{"role":"user","content":"."}]}`)
+	// The probe must look like Claude Code: Anthropic rejects subscription
+	// OAuth Messages calls that lack the Claude Code system prompt, beta tag,
+	// and client identity with a headerless 429 rate_limit_error regardless of
+	// quota (observed live 2026-07-04: a fresh Max 20x account with 0.0
+	// utilization 429'd the bare probe but answered 200 with unified headers,
+	// including 7d_oi, once the request carried the Claude Code shape).
+	body := bytes.NewBufferString(`{"model":"` + FableModel + `","max_tokens":1,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"."}]}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, messagesURL, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("anthropic-beta", oauthBetaHeader)
+	req.Header.Set("anthropic-beta", "claude-code-20250219,"+oauthBetaHeader)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "claude-cli/2.1.199 (external, cli)")
+	req.Header.Set("x-app", "cli")
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -749,14 +765,11 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 	if len(windows) > 0 {
 		return windows, nil
 	}
-	if res.StatusCode == http.StatusTooManyRequests {
-		return []accounts.UsageWindow{{
-			Name:               FableWindowName,
-			UsedPercent:        100,
-			LimitWindowSeconds: int64(7 * 24 * time.Hour / time.Second),
-			Feature:            FableModel,
-		}}, nil
-	}
+	// A headerless 429 is a transient burst or bot-shape rejection, never an
+	// authoritative quota signal (the taxonomy that governs the proxy's own
+	// exhaustion marking). Synthesizing 100% here falsely cooked every
+	// account's fable pool and pushed all Fable traffic to Bedrock/API key.
+	// Return no windows so the caller keeps the last known state.
 	if res.StatusCode == http.StatusUnauthorized {
 		return nil, fmt.Errorf("fable probe failed: %s", res.Status)
 	}
@@ -804,6 +817,6 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 	}
 	add("5h", "5h", fiveHourSeconds, "")
 	add("7d", "7d", sevenDaySeconds, "")
-	add("7d_oi", FableWindowName, sevenDaySeconds, FableModel)
+	add("7d_oi", FableWindowName, sevenDaySeconds, FableFeature)
 	return windows
 }

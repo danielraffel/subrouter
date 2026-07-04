@@ -349,14 +349,14 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	if oauthApps.LimitWindowSeconds != 7*24*60*60 {
 		t.Fatalf("oauth apps LimitWindowSeconds = %d, want %d", oauthApps.LimitWindowSeconds, 7*24*60*60)
 	}
-	if oauthApps.Feature != agentclaude.FableModel {
-		t.Fatalf("oauth apps Feature = %q, want %q", oauthApps.Feature, agentclaude.FableModel)
+	if oauthApps.Feature != agentclaude.FableFeature {
+		t.Fatalf("oauth apps Feature = %q, want %q", oauthApps.Feature, agentclaude.FableFeature)
 	}
 	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
 	if score.Headroom == 0 {
 		t.Fatalf("base Headroom = %.3f, hidden Fable bucket should not exhaust non-Fable Claude models", score.Headroom)
 	}
-	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableModel)]
+	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableFeature)]
 	if !ok {
 		t.Fatalf("missing Fable model score: %+v", score.ModelScores)
 	}
@@ -418,12 +418,17 @@ func TestClaudeFableProbeAddsHiddenOAuthAppsWindow(t *testing.T) {
 	if fable.UsedPercent != 100 {
 		t.Fatalf("Fable UsedPercent = %.1f, want 100", fable.UsedPercent)
 	}
-	if fable.Feature != agentclaude.FableModel {
-		t.Fatalf("Fable Feature = %q, want %q", fable.Feature, agentclaude.FableModel)
+	if fable.Feature != agentclaude.FableFeature {
+		t.Fatalf("Fable Feature = %q, want %q", fable.Feature, agentclaude.FableFeature)
 	}
 }
 
-func TestClaudeFableProbeTreatsHeaderless429AsFableExhausted(t *testing.T) {
+// A headerless 429 from the probe is a transient burst or bot-shape
+// rejection, never authoritative quota evidence: a fresh Max 20x account with
+// 0.0 utilization 429'd the bare probe live while answering 200 (with 7d_oi
+// headers) once the request looked like Claude Code. It must NOT synthesize a
+// cooked fable pool.
+func TestClaudeFableProbeIgnoresHeaderless429(t *testing.T) {
 	usageBody := `{"five_hour":{"utilization":10.0,"resets_at":"2030-01-01T00:00:00+00:00"},"seven_day":{"utilization":60.0,"resets_at":"2030-01-02T00:00:00+00:00"}}`
 	client := &http.Client{Transport: proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Path {
@@ -447,14 +452,10 @@ func TestClaudeFableProbeTreatsHeaderless429AsFableExhausted(t *testing.T) {
 	}
 	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
 	if score.Headroom == 0 {
-		t.Fatalf("base Headroom = %.3f, hidden Fable bucket should not exhaust non-Fable Claude models", score.Headroom)
+		t.Fatalf("base Headroom = %.3f, a headerless probe 429 must not exhaust the account", score.Headroom)
 	}
-	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableModel)]
-	if !ok {
-		t.Fatalf("missing Fable model score: %+v", score.ModelScores)
-	}
-	if fableScore.Headroom != 0 {
-		t.Fatalf("Fable Headroom = %.3f, want 0 from headerless Fable probe 429", fableScore.Headroom)
+	if _, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableFeature)]; ok {
+		t.Fatalf("headerless probe 429 must not synthesize a fable pool: %+v", score.ModelScores)
 	}
 }
 
@@ -480,14 +481,15 @@ func TestUsageStatusFreshFableWindowUpdatesSchedulerModelPool(t *testing.T) {
 		Windows: []accounts.UsageWindow{
 			{Name: "5h", UsedPercent: 10, LimitWindowSeconds: 5 * 60 * 60},
 			{Name: "7d", UsedPercent: 40, LimitWindowSeconds: 7 * 24 * 60 * 60},
-			{Name: agentclaude.FableWindowName, Feature: agentclaude.FableModel, UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			{Name: agentclaude.FableWindowName, Feature: agentclaude.FableFeature, UsedPercent: 100, LimitWindowSeconds: 7 * 24 * 60 * 60},
 		},
 	}})
 	base := schedulerRef.Get()
 	if base.Exhausted(accounts.ProviderClaude, "acct") {
 		t.Fatalf("base Claude score should remain usable when only Fable is exhausted")
 	}
-	fable := base.ForModel(agentclaude.FableModel)
+	// The request path canonicalizes the model to its pool family first.
+	fable := base.ForModel(claudePoolModel(agentclaude.FableModel))
 	if !fable.Exhausted(accounts.ProviderClaude, "acct") {
 		t.Fatalf("Fable model score should be exhausted after fresh status update")
 	}
@@ -1391,5 +1393,93 @@ func TestMarkTTLSelection(t *testing.T) {
 	blipUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "blip@example.com")
 	if time.Until(blipUntil) > 15*time.Minute {
 		t.Fatalf("transient refresh mark in %v, want ~10m default", time.Until(blipUntil))
+	}
+}
+
+func TestClaudePoolModelAliasesVersionedModels(t *testing.T) {
+	cases := map[string]string{
+		"claude-fable-5":      agentclaude.FableFeature,
+		"claude-fable-5[1m]":  agentclaude.FableFeature,
+		"claude-opus-4-8":     agentclaude.OpusFeature,
+		"claude-opus-4-8[1m]": agentclaude.OpusFeature,
+		"claude-sonnet-5":     agentclaude.SonnetFeature,
+		"claude-haiku-4-5":    "claude-haiku-4-5",
+		"gpt-5.3-codex-spark": "gpt-5.3-codex-spark",
+	}
+	for model, want := range cases {
+		if got := claudePoolModel(model); got != want {
+			t.Fatalf("claudePoolModel(%q) = %q, want %q", model, got, want)
+		}
+	}
+}
+
+// A Fable-only rejection (7d_oi rejected, account windows allowed) must not
+// cook the whole account: opus/sonnet can still use it. Before this a wave of
+// Fable traffic marked every account exhausted and starved opus routing.
+func TestClaudeExhaustedByResponseIgnoresPoolScopedRejection(t *testing.T) {
+	poolOnly := http.Header{}
+	poolOnly.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+	poolOnly.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+	poolOnly.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
+	poolOnly.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "rejected")
+	if claudeAccountExhaustedByResponse(http.StatusOK, poolOnly) {
+		t.Fatal("fable-pool-only rejection must not exhaust the account")
+	}
+
+	accountWide := http.Header{}
+	accountWide.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+	accountWide.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+	accountWide.Set("Anthropic-Ratelimit-Unified-7d_Oi-Status", "rejected")
+	if !claudeAccountExhaustedByResponse(http.StatusOK, accountWide) {
+		t.Fatal("7d rejection must exhaust the account")
+	}
+
+	bare := http.Header{}
+	bare.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+	if !claudeAccountExhaustedByResponse(http.StatusTooManyRequests, bare) {
+		t.Fatal("rejected with no per-window detail stays account-wide (conservative)")
+	}
+}
+
+// Fresh accounts report opus/sonnet weekly buckets as null (unused). They must
+// still carry 0%-used pool windows so ForModel never zero-fills them out of
+// opus routing once another account grows a real opus window.
+func TestClaudeUsageWindowsSynthesizeUnusedOpusSonnetPools(t *testing.T) {
+	usage := &agentclaude.UsageResponse{
+		FiveHour:          &agentclaude.RateLimit{Utilization: floatPtr(10), ResetsAt: time.Now().Add(time.Hour).Format(time.RFC3339)},
+		SevenDay:          &agentclaude.RateLimit{Utilization: floatPtr(20), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+		SevenDayOAuthApps: &agentclaude.RateLimit{Utilization: floatPtr(100), ResetsAt: time.Now().Add(5 * 24 * time.Hour).Format(time.RFC3339)},
+	}
+	windows := claudeUsageWindows(usage)
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "fresh", windows)
+
+	opusScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.OpusFeature)]
+	if !ok {
+		t.Fatalf("missing synthesized opus pool: %+v", score.ModelScores)
+	}
+	// Pool score includes the base windows, so 7d at 20%% caps it at 0.8.
+	if opusScore.Headroom < 0.79 || opusScore.Headroom > 0.81 {
+		t.Fatalf("opus pool Headroom = %.3f, want ~0.8 (base 7d), fable exhaustion must not leak in", opusScore.Headroom)
+	}
+	if _, ok := score.ModelScores[selectacct.ModelKey(agentclaude.SonnetFeature)]; !ok {
+		t.Fatalf("missing synthesized sonnet pool: %+v", score.ModelScores)
+	}
+}
+
+// A model pool with quota left is still unusable when the account-wide windows
+// are cooked: the pool score must include base windows.
+func TestClaudeModelPoolScoresIncludeBaseWindows(t *testing.T) {
+	windows := []accounts.UsageWindow{
+		{Name: "5h", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60},
+		{Name: "7d", UsedPercent: 10, LimitWindowSeconds: 7 * 24 * 60 * 60},
+		{Name: agentclaude.FableWindowName, Feature: agentclaude.FableFeature, UsedPercent: 0, LimitWindowSeconds: 7 * 24 * 60 * 60},
+	}
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "acct", windows)
+	fableScore, ok := score.ModelScores[selectacct.ModelKey(agentclaude.FableFeature)]
+	if !ok {
+		t.Fatalf("missing fable pool: %+v", score.ModelScores)
+	}
+	if fableScore.Headroom != 0 {
+		t.Fatalf("fable pool Headroom = %.3f, want 0: the cooked 5h window binds every pool", fableScore.Headroom)
 	}
 }
