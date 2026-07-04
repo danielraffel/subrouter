@@ -1,19 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import {
+  adminJSON,
+  adminToken,
+  cleanupWorkers,
+  createTenant,
+  proxyToken,
+  startWorker,
+  waitForCondition,
+} from "./helpers/worker.ts"
 
-const adminToken = "admin-test-token"
-const proxyToken = "proxy-test-token"
-
-const processes: Bun.Subprocess[] = []
 const servers: Array<{ stop: () => void }> = []
 
 afterEach(async () => {
-  for (const proc of processes.splice(0)) {
-    proc.kill()
-    await proc.exited.catch(() => {})
-  }
+  await cleanupWorkers()
   for (const server of servers.splice(0)) server.stop()
 })
 
@@ -49,10 +48,12 @@ describe("subrouter Durable Object Worker transcripts", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker(`${upstream.url.origin}/backend-api/codex`)
+    const worker = await startWorker({ codexUpstream: `${upstream.url.origin}/backend-api/codex` })
+    const baseURL = worker.baseURL
+    const tenant = await createTenant(baseURL, "Refresh Org")
     await upsertAccount(baseURL, {
       id: "acct-refresh",
-      orgId: "org-refresh",
+      orgId: tenant.id,
       kind: "codex_oauth",
       label: "refresh@example.com",
       credentials: {
@@ -70,9 +71,8 @@ describe("subrouter Durable Object Worker transcripts", () => {
     const proxied = await fetch(`${baseURL}/v1/responses`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${proxyToken}`,
+        Authorization: `Bearer ${tenant.key}`,
         "Content-Type": "application/json",
-        "X-Subrouter-Org-ID": "org-refresh",
         "X-Subrouter-Session": "refresh-session",
       },
       body: "{}",
@@ -83,17 +83,20 @@ describe("subrouter Durable Object Worker transcripts", () => {
   }, 60_000)
 
   test("keeps admin state, routing, sessions, and lifecycle scoped per org", async () => {
-    const baseURL = await startWorker("https://codex.invalid/backend-api/codex")
+    const worker = await startWorker({ codexUpstream: "https://codex.invalid/backend-api/codex" })
+    const baseURL = worker.baseURL
+    const tenantA = await createTenant(baseURL, "Org A")
+    const tenantB = await createTenant(baseURL, "Org B")
     await upsertAccount(baseURL, {
       id: "acct-a",
-      orgId: "org-a",
+      orgId: tenantA.id,
       kind: "openai_apikey",
       label: "org-a@example.com",
       credentials: { apiKey: "sk-org-a" },
     })
     await upsertAccount(baseURL, {
       id: "acct-b",
-      orgId: "org-b",
+      orgId: tenantB.id,
       kind: "openai_apikey",
       label: "org-b@example.com",
       credentials: { apiKey: "sk-org-b" },
@@ -107,11 +110,11 @@ describe("subrouter Durable Object Worker transcripts", () => {
 
     const orgAAccounts = await adminJSON<Array<Record<string, any>>>(
       baseURL,
-      "/_subrouter/accounts?orgId=org-a"
+      `/_subrouter/accounts?tenant=${tenantA.id}`
     )
     const orgBAccounts = await adminJSON<Array<Record<string, any>>>(
       baseURL,
-      "/_subrouter/accounts?orgId=org-b"
+      `/_subrouter/accounts?tenant=${tenantB.id}`
     )
     expect(orgAAccounts.map((account) => account.id)).toEqual(["acct-a"])
     expect(orgBAccounts.map((account) => account.id)).toEqual(["acct-b"])
@@ -119,21 +122,24 @@ describe("subrouter Durable Object Worker transcripts", () => {
 
     const orgAStatus = await adminJSON<Array<Record<string, any>>>(
       baseURL,
-      "/_subrouter/account-status?orgId=org-a"
+      `/_subrouter/account-status?tenant=${tenantA.id}`
     )
     expect(orgAStatus.map((account) => account.id)).toEqual(["acct-a"])
 
     const orgAUsage = await adminJSON<Array<Record<string, any>>>(
       baseURL,
-      "/_subrouter/usage-status?orgId=org-a"
+      `/_subrouter/usage-status?tenant=${tenantA.id}`
     )
     expect(orgAUsage.map((account) => account.id)).toEqual(["acct-a"])
     expect(orgAUsage[0]?.plan_type).toBe("api key")
 
     const routeA = await fetch(`${baseURL}/route`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ orgId: "org-a", sessionId: "shared-session", model: "gpt-5" }),
+      headers: {
+        Authorization: `Bearer ${tenantA.key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: "shared-session", model: "gpt-5" }),
     })
     expect(routeA.status).toBe(200)
     const routeABody = (await routeA.json()) as Record<string, any>
@@ -141,8 +147,11 @@ describe("subrouter Durable Object Worker transcripts", () => {
 
     const routeB = await fetch(`${baseURL}/route`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ orgId: "org-b", sessionId: "shared-session", model: "gpt-5" }),
+      headers: {
+        Authorization: `Bearer ${tenantB.key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: "shared-session", model: "gpt-5" }),
     })
     expect(routeB.status).toBe(200)
     const routeBBody = (await routeB.json()) as Record<string, any>
@@ -150,32 +159,77 @@ describe("subrouter Durable Object Worker transcripts", () => {
 
     const crossOrgUsage = await fetch(`${baseURL}/usage`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ orgId: "org-a", sessionId: "shared-session", accountId: "acct-b" }),
+      headers: {
+        Authorization: `Bearer ${tenantA.key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sessionId: "shared-session", accountId: "acct-b" }),
     })
     expect(crossOrgUsage.status).toBe(400)
 
     const sessionsA = await adminJSON<Array<Record<string, any>>>(
       baseURL,
-      "/_subrouter/sessions?orgId=org-a"
+      `/_subrouter/sessions?tenant=${tenantA.id}`
     )
     const sessionsB = await adminJSON<Array<Record<string, any>>>(
       baseURL,
-      "/_subrouter/sessions?orgId=org-b"
+      `/_subrouter/sessions?tenant=${tenantB.id}`
     )
     expect(sessionsA).toHaveLength(1)
     expect(sessionsA[0]?.account_id).toBe("acct-a")
     expect(sessionsB).toHaveLength(1)
     expect(sessionsB[0]?.account_id).toBe("acct-b")
 
-    expect((await fetch(`${baseURL}/_subrouter/ready?orgId=org-a`)).status).toBe(200)
-    const drainA = await fetch(`${baseURL}/_subrouter/drain?orgId=org-a`, {
+    const bareReadyBeforeDrain = await fetch(`${baseURL}/_subrouter/ready`)
+    expect(bareReadyBeforeDrain.status).toBe(200)
+    const bareReadyBeforeDrainBody = await bareReadyBeforeDrain.json() as Record<string, unknown>
+    expect(bareReadyBeforeDrainBody).toEqual({ ok: true })
+    const tenantAReadyBeforeDrain = await fetch(
+      `${baseURL}/_subrouter/ready?tenant=${tenantA.id}`
+    )
+    const tenantBReadyBeforeDrain = await fetch(
+      `${baseURL}/_subrouter/ready?tenant=${tenantB.id}`
+    )
+    expect(tenantAReadyBeforeDrain.status).toBe(200)
+    const tenantAReadyBeforeDrainBody = await tenantAReadyBeforeDrain.json() as Record<string, unknown>
+    expect(tenantAReadyBeforeDrainBody).toEqual({ ok: true, draining: false })
+    expect(tenantBReadyBeforeDrain.status).toBe(200)
+    const tenantBReadyBeforeDrainBody = await tenantBReadyBeforeDrain.json() as Record<string, unknown>
+    expect(tenantBReadyBeforeDrainBody).toEqual({ ok: true, draining: false })
+    expect((await fetch(`${baseURL}/_subrouter/ready?tenant=Bad Tenant`)).status).toBe(400)
+
+    const drainA = await fetch(`${baseURL}/_subrouter/drain?tenant=${tenantA.id}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${adminToken}` },
     })
     expect(drainA.status).toBe(200)
-    expect((await fetch(`${baseURL}/_subrouter/ready?orgId=org-a`)).status).toBe(503)
-    expect((await fetch(`${baseURL}/_subrouter/ready?orgId=org-b`)).status).toBe(200)
+    const bareReadyAfterDrain = await fetch(`${baseURL}/_subrouter/ready`)
+    expect(bareReadyAfterDrain.status).toBe(200)
+    const bareReadyAfterDrainBody = await bareReadyAfterDrain.json() as Record<string, unknown>
+    expect(bareReadyAfterDrainBody).toEqual({ ok: true })
+    const tenantAReadyAfterDrain = await fetch(
+      `${baseURL}/_subrouter/ready?tenant=${tenantA.id}`
+    )
+    const tenantBReadyAfterDrain = await fetch(
+      `${baseURL}/_subrouter/ready?tenant=${tenantB.id}`
+    )
+    expect(tenantAReadyAfterDrain.status).toBe(503)
+    const tenantAReadyAfterDrainBody = await tenantAReadyAfterDrain.json() as Record<string, unknown>
+    expect(tenantAReadyAfterDrainBody).toEqual({ ok: false, draining: true })
+    expect(tenantBReadyAfterDrain.status).toBe(200)
+    const tenantBReadyAfterDrainBody = await tenantBReadyAfterDrain.json() as Record<string, unknown>
+    expect(tenantBReadyAfterDrainBody).toEqual({ ok: true, draining: false })
+
+    const drainStatusA = await adminJSON<Record<string, any>>(
+      baseURL,
+      `/_subrouter/drain-status?tenant=${tenantA.id}`
+    )
+    const drainStatusB = await adminJSON<Record<string, any>>(
+      baseURL,
+      `/_subrouter/drain-status?tenant=${tenantB.id}`
+    )
+    expect(drainStatusA.draining).toBe(true)
+    expect(drainStatusB.draining).toBe(false)
   }, 60_000)
 
   test("records scoped HTTP transcripts with sanitized and raw endpoints", async () => {
@@ -203,16 +257,16 @@ describe("subrouter Durable Object Worker transcripts", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker(`${upstream.url.origin}/backend-api/codex`)
-
-    await upsertCodexAccount(baseURL, "org-a", "acct-a")
+    const worker = await startWorker({ codexUpstream: `${upstream.url.origin}/backend-api/codex` })
+    const baseURL = worker.baseURL
+    const tenant = await createTenant(baseURL, "Transcript Org")
+    await upsertCodexAccount(baseURL, tenant.id, "acct-a")
 
     const proxied = await fetch(`${baseURL}/v1/responses`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${proxyToken}`,
+        Authorization: `Bearer ${tenant.key}`,
         "Content-Type": "application/json",
-        "X-Subrouter-Org-ID": "org-a",
         "X-Subrouter-Session": "session-1:turn-0",
         "X-Subrouter-User-Email": "symphony@manaflow.ai",
       },
@@ -223,7 +277,7 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(upstreamRequests[0]?.path).toBe("/backend-api/codex/responses")
     expect(upstreamRequests[0]?.auth).toBe("Bearer codex-access-token")
 
-    const list = await fetch(`${baseURL}/_subrouter/transcripts?orgId=org-a`, {
+    const list = await fetch(`${baseURL}/_subrouter/transcripts?tenant=${tenant.id}`, {
       headers: { Authorization: `Bearer ${adminToken}` },
     })
     expect(list.status).toBe(200)
@@ -237,13 +291,13 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(summaries[0]?.user).toBe("symphony@manaflow.ai")
     expect(summaries[0]?.account).toBe("acct-a")
 
-    const otherOrgList = await fetch(`${baseURL}/_subrouter/transcripts?orgId=org-b`, {
+    const otherOrgList = await fetch(`${baseURL}/_subrouter/transcripts?tenant=org-b`, {
       headers: { Authorization: `Bearer ${adminToken}` },
     })
     expect((await otherOrgList.json()) as unknown[]).toEqual([])
 
     const detail = await fetch(
-      `${baseURL}/_subrouter/transcripts/codex/session-1?orgId=org-a`,
+      `${baseURL}/_subrouter/transcripts/codex/session-1?tenant=${tenant.id}`,
       { headers: { Authorization: `Bearer ${adminToken}` } }
     )
     const detailText = await detail.text()
@@ -255,7 +309,7 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(detailText).toContain("<redacted>")
 
     const raw = await fetch(
-      `${baseURL}/_subrouter/transcripts/codex/session-1/raw?orgId=org-a`,
+      `${baseURL}/_subrouter/transcripts/codex/session-1/raw?tenant=${tenant.id}`,
       { headers: { Authorization: `Bearer ${adminToken}` } }
     )
     const rawText = await raw.text()
@@ -263,7 +317,7 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(rawText).toContain("secret body")
     expect(rawText).toContain("gpt-5.5")
 
-    const dashboard = await fetch(`${baseURL}/_subrouter/dashboard?orgId=org-a`, {
+    const dashboard = await fetch(`${baseURL}/_subrouter/dashboard?tenant=${tenant.id}`, {
       headers: { Authorization: `Bearer ${adminToken}` },
     })
     const dashboardText = await dashboard.text()
@@ -310,14 +364,15 @@ describe("subrouter Durable Object Worker transcripts", () => {
     })
     servers.push(upstream)
 
-    const baseURL = await startWorker(`${upstream.url.origin}/backend-api/codex`)
-    await upsertCodexAccount(baseURL, "org-ws", "acct-ws")
+    const worker = await startWorker({ codexUpstream: `${upstream.url.origin}/backend-api/codex` })
+    const baseURL = worker.baseURL
+    const tenant = await createTenant(baseURL, "WebSocket Org")
+    await upsertCodexAccount(baseURL, tenant.id, "acct-ws")
 
     const wsURL = baseURL.replace("http://", "ws://") + "/v1/responses"
     const socket = new WebSocket(wsURL, {
       headers: {
-        Authorization: `Bearer ${proxyToken}`,
-        "X-Subrouter-Org-ID": "org-ws",
+        Authorization: `Bearer ${tenant.key}`,
         "X-Subrouter-Session": "ws-session:turn-0",
         "X-Subrouter-User-Email": "symphony@manaflow.ai",
       },
@@ -330,14 +385,14 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(String(reply.data)).toContain("ws-secret")
     expect(upstreamAuth as string | null).toBe("Bearer codex-access-token")
 
-    const summaries = await waitForTranscriptEvents(baseURL, "org-ws", 3)
+    const summaries = await waitForTranscriptEvents(baseURL, tenant.id, 3)
     expect(summaries).toHaveLength(1)
     expect(summaries[0]?.session_id).toBe("ws-session")
     expect(summaries[0]?.event_count).toBe(3)
     expect(summaries[0]?.usage.total_tokens).toBe(11)
 
     const detail = await fetch(
-      `${baseURL}/_subrouter/transcripts/codex/ws-session?orgId=org-ws`,
+      `${baseURL}/_subrouter/transcripts/codex/ws-session?tenant=${tenant.id}`,
       { headers: { Authorization: `Bearer ${adminToken}` } }
     )
     const detailText = await detail.text()
@@ -347,7 +402,7 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(detailText).toContain("body_base64_redacted")
 
     const raw = await fetch(
-      `${baseURL}/_subrouter/transcripts/codex/ws-session/raw?orgId=org-ws`,
+      `${baseURL}/_subrouter/transcripts/codex/ws-session/raw?tenant=${tenant.id}`,
       { headers: { Authorization: `Bearer ${adminToken}` } }
     )
     const rawText = await raw.text()
@@ -356,42 +411,6 @@ describe("subrouter Durable Object Worker transcripts", () => {
     expect(rawText).toContain("gpt-5.5")
   }, 60_000)
 })
-
-const startWorker = async (codexUpstream: string): Promise<string> => {
-  const workerPort = 18_000 + Math.floor(Math.random() * 1_000)
-  const persistDir = await mkdtemp(join(tmpdir(), "subrouter-do-worker-test-"))
-  const worker = Bun.spawn(
-    [
-      "bunx",
-      "wrangler",
-      "dev",
-      "--local",
-      "--ip",
-      "127.0.0.1",
-      "--port",
-      String(workerPort),
-      "--persist-to",
-      persistDir,
-      "--var",
-      `ADMIN_TOKEN:${adminToken}`,
-      "--var",
-      `PROXY_TOKEN:${proxyToken}`,
-      "--var",
-      `CODEX_UPSTREAM:${codexUpstream}`,
-      "--log-level",
-      "error",
-    ],
-    {
-      cwd: import.meta.dir.replace(/\/test$/, ""),
-      stdout: "pipe",
-      stderr: "pipe",
-    }
-  )
-  processes.push(worker)
-  const baseURL = `http://127.0.0.1:${workerPort}`
-  await waitForWorker(baseURL)
-  return baseURL
-}
 
 const upsertCodexAccount = async (
   baseURL: string,
@@ -430,23 +449,15 @@ const upsertAccount = async (
   expect(upsert.status).toBe(200)
 }
 
-const adminJSON = async <T>(baseURL: string, path: string): Promise<T> => {
-  const response = await fetch(`${baseURL}${path}`, {
-    headers: { Authorization: `Bearer ${adminToken}` },
-  })
-  expect(response.status).toBe(200)
-  return (await response.json()) as T
-}
-
 const waitForTranscriptEvents = async (
   baseURL: string,
-  orgId: string,
+  tenantId: string,
   eventCount: number
 ): Promise<Array<Record<string, any>>> => {
   const deadline = Date.now() + 10_000
   let summaries: Array<Record<string, any>> = []
   while (Date.now() < deadline) {
-    const list = await fetch(`${baseURL}/_subrouter/transcripts?orgId=${orgId}`, {
+    const list = await fetch(`${baseURL}/_subrouter/transcripts?tenant=${tenantId}`, {
       headers: { Authorization: `Bearer ${adminToken}` },
     })
     summaries = (await list.json()) as Array<Record<string, any>>
@@ -475,31 +486,3 @@ const waitForWebSocket = <Type extends "open" | "message">(
       reject(new Error(`websocket ${type} failed`))
     }, { once: true })
   })
-
-const waitForCondition = async (
-  condition: () => boolean,
-  label: string
-): Promise<void> => {
-  const deadline = Date.now() + 10_000
-  while (Date.now() < deadline) {
-    if (condition()) return
-    await Bun.sleep(100)
-  }
-  throw new Error(`${label} timed out`)
-}
-
-const waitForWorker = async (baseURL: string): Promise<void> => {
-  const deadline = Date.now() + 20_000
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseURL}/healthz`)
-      if (response.ok) return
-      lastError = new Error(`healthz returned ${response.status}`)
-    } catch (error) {
-      lastError = error
-    }
-    await Bun.sleep(250)
-  }
-  throw lastError ?? new Error("worker did not start")
-}

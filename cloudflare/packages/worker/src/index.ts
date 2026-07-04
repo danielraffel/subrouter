@@ -18,6 +18,7 @@ import {
   refreshOAuthCredentials,
   safeGoAccount,
   setUpstreamAuthHeaders,
+  stripSubrouterHeaders,
   stickySessionId,
   terminalRefreshFailure,
   upstreamURLForRequest,
@@ -27,33 +28,18 @@ import {
   type AgentType,
   type StoredAccountContract,
 } from "./contract.ts"
+import {
+  isReservedTenantId,
+  isTenantKey,
+  normalizeTenantId,
+  tenantKeySha256Hex,
+  TenantRegistryDurableObject,
+  type TenantResolution,
+} from "./tenants.ts"
+
+export { TenantRegistryDurableObject }
 
 type TotpAlgorithm = "SHA-1" | "SHA-256" | "SHA-512"
-
-const demoAccounts: ReadonlyArray<Account> = [
-  {
-    id: "demo-codex-primary",
-    orgId: "demo-org",
-    kind: "codex_oauth",
-    label: "demo primary",
-    enabled: true,
-    modelQuotas: {
-      default: { remainingPercent: 100 },
-      spark: { remainingPercent: 100 },
-    },
-  },
-  {
-    id: "demo-codex-spare",
-    orgId: "demo-org",
-    kind: "codex_oauth",
-    label: "demo spare",
-    enabled: true,
-    modelQuotas: {
-      default: { remainingPercent: 100 },
-      spark: { remainingPercent: 100 },
-    },
-  },
-]
 
 const accountKinds = new Set<AccountKind>([
   "codex_oauth",
@@ -65,6 +51,7 @@ const accountKinds = new Set<AccountKind>([
 interface RouteInput {
   readonly orgId?: string
   readonly agentType?: AgentType
+  readonly upstreamProvider?: UpstreamProvider
   readonly sessionId: string
   readonly userEmail?: string
   readonly preferAccountId?: string
@@ -97,6 +84,32 @@ interface UpsertAccountInput {
   readonly modelQuotas?: AccountModelQuotas
 }
 
+interface TenantAccountUploadInput {
+  readonly validate: boolean
+  readonly account: UpsertAccountInput
+}
+
+interface TenantAccountOutput {
+  readonly id: string
+  readonly provider: "codex" | "claude"
+  readonly label: string
+  readonly auth_mode: "oauth" | "apikey"
+  readonly created_at: string
+  readonly email?: string
+  readonly validation?: "ok" | "failed"
+}
+
+type UpstreamProvider = "claude" | "codex"
+
+const anthropicBootstrapModelQuotas: AccountModelQuotas = {
+  opus: { remainingPercent: 100 },
+  sonnet: { remainingPercent: 100 },
+}
+
+const codexBootstrapModelQuotas: AccountModelQuotas = {
+  spark: { remainingPercent: 100 },
+}
+
 interface ModelProbeInput {
   readonly orgId?: string
   readonly accountId: string
@@ -110,6 +123,8 @@ interface StoredAccount extends Account {
   readonly totpDigits: number | null
   readonly totpPeriod: number | null
   readonly totpAlgorithm: TotpAlgorithm | null
+  readonly createdAt: number
+  readonly updatedAt: number
   readonly source?: string
 }
 
@@ -158,6 +173,8 @@ interface AccountRow {
   readonly totp_digits: number | null
   readonly totp_period: number | null
   readonly totp_algorithm: string | null
+  readonly created_at: number
+  readonly updated_at: number
 }
 
 interface OAuthRefreshStatus {
@@ -258,6 +275,7 @@ interface WebSocketClientMessage {
   readonly type?: unknown
   readonly requestId?: unknown
   readonly orgId?: unknown
+  readonly agentType?: unknown
   readonly sessionId?: unknown
   readonly preferAccountId?: unknown
   readonly model?: unknown
@@ -278,11 +296,14 @@ interface WebSocketServerMessage {
 
 export interface Env {
   readonly SUBROUTER_DO: DurableObjectNamespace<SubrouterDurableObject>
+  readonly TENANT_REGISTRY_DO: DurableObjectNamespace<TenantRegistryDurableObject>
   readonly ADMIN_TOKEN?: string
   readonly PROXY_TOKEN?: string
+  readonly ALLOW_LEGACY_PROXY_TOKEN?: string
   readonly CODEX_UPSTREAM?: string
   readonly API_UPSTREAM?: string
   readonly CLAUDE_UPSTREAM?: string
+  readonly VALIDATION_TIMEOUT_MS?: string
 }
 
 const json = (body: unknown, init?: ResponseInit): Response =>
@@ -403,6 +424,172 @@ const parseUpsertAccountInput = async (
   }
 }
 
+const parseTenantAccountUploadInput = async (
+  request: Request,
+  tenantId: string
+): Promise<Response | TenantAccountUploadInput> => {
+  const record = await parseJsonRecord(request)
+  if (record instanceof Response) return record
+
+  const provider = nonEmptyString(record["provider"])
+  if (!provider) return json({ error: "Missing provider" }, { status: 400 })
+  const label = nonEmptyString(record["label"]) ?? defaultTenantAccountLabel(provider)
+  if (!label) return json({ error: "Invalid provider" }, { status: 400 })
+
+  try {
+    const input = accountInputForTenantUpload(provider, label, tenantId, record)
+    const validate = new URL(request.url).searchParams.get("validate") === "1"
+    return { validate, account: input }
+  } catch (error) {
+    return json({ error: String((error as Error).message ?? error) }, { status: 400 })
+  }
+}
+
+const accountInputForTenantUpload = (
+  provider: string,
+  label: string,
+  tenantId: string,
+  record: Record<string, unknown>
+): UpsertAccountInput => {
+  if (provider === "claude") {
+    const claudeAiOauth = requireRecord(record["claudeAiOauth"], "claudeAiOauth")
+    const accessToken = requireSecretString(claudeAiOauth["accessToken"], "claudeAiOauth.accessToken")
+    const refreshToken = requireSecretString(claudeAiOauth["refreshToken"], "claudeAiOauth.refreshToken")
+    const expiresAt = claudeAiOauth["expiresAt"]
+    if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= 0) {
+      throw new Error("Invalid claudeAiOauth.expiresAt")
+    }
+    return {
+      id: randomAccountId("claude"),
+      orgId: tenantId,
+      kind: "anthropic_oauth",
+      label,
+      modelQuotas: anthropicBootstrapModelQuotas,
+      credentials: {
+        accessToken,
+        refreshToken,
+        expiresAt,
+        ...optionalCredentialString(claudeAiOauth, "subscriptionType"),
+        ...optionalCredentialString(claudeAiOauth, "rateLimitTier"),
+        ...optionalCredentialString(claudeAiOauth, "tokenEndpoint"),
+        ...optionalCredentialString(claudeAiOauth, "clientId"),
+        ...optionalCredentialString(claudeAiOauth, "usageUrl"),
+      },
+    }
+  }
+
+  if (provider === "anthropic-apikey") {
+    const apiKey = requireSecretString(record["apiKey"], "apiKey")
+    if (!apiKey.startsWith("sk-ant-")) throw new Error("Invalid Anthropic API key")
+    return {
+      id: randomAccountId("anthropic"),
+      orgId: tenantId,
+      kind: "anthropic_apikey",
+      label,
+      modelQuotas: anthropicBootstrapModelQuotas,
+      credentials: { apiKey },
+    }
+  }
+
+  if (provider === "codex") {
+    const tokens = requireRecord(record["tokens"], "tokens")
+    const accessToken = requireSecretString(tokens["accessToken"], "tokens.accessToken")
+    const refreshToken = requireSecretString(tokens["refreshToken"], "tokens.refreshToken")
+    const idToken = requireSecretString(tokens["idToken"], "tokens.idToken")
+    const accountId = requireSecretString(tokens["accountID"], "tokens.accountID")
+    return {
+      id: randomAccountId("codex"),
+      orgId: tenantId,
+      kind: "codex_oauth",
+      label,
+      modelQuotas: codexBootstrapModelQuotas,
+      credentials: {
+        accessToken,
+        refreshToken,
+        idToken,
+        accountId,
+        ...optionalCredentialString(tokens, "tokenEndpoint"),
+        ...optionalCredentialString(tokens, "clientId"),
+        ...optionalCredentialString(tokens, "usageUrl"),
+      },
+    }
+  }
+
+  if (provider === "openai-apikey") {
+    const apiKey = requireSecretString(record["apiKey"], "apiKey")
+    if (!apiKey.startsWith("sk-")) throw new Error("Invalid OpenAI API key")
+    return {
+      id: randomAccountId("openai"),
+      orgId: tenantId,
+      kind: "openai_apikey",
+      label,
+      credentials: { apiKey },
+    }
+  }
+
+  throw new Error("Invalid provider")
+}
+
+const defaultTenantAccountLabel = (provider: string): string | null => {
+  if (provider === "claude") return "Claude OAuth"
+  if (provider === "anthropic-apikey") return "Anthropic API key"
+  if (provider === "codex") return "Codex OAuth"
+  if (provider === "openai-apikey") return "OpenAI API key"
+  return null
+}
+
+const requireRecord = (value: unknown, name: string): Record<string, unknown> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Missing ${name}`)
+  }
+  return value as Record<string, unknown>
+}
+
+const requireSecretString = (value: unknown, name: string): string => {
+  const parsed = nonEmptyString(value)
+  if (!parsed) throw new Error(`Missing ${name}`)
+  return parsed
+}
+
+const optionalCredentialString = (
+  record: Record<string, unknown>,
+  name: string
+): Record<string, string> => {
+  const value = nonEmptyString(record[name])
+  return value ? { [name]: value } : {}
+}
+
+const randomAccountId = (prefix: string): string => {
+  const bytes = new Uint8Array(8)
+  crypto.getRandomValues(bytes)
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+  return `${prefix}-${hex}`
+}
+
+const safeTenantAccount = (
+  account: StoredAccount,
+  validation?: "ok" | "failed"
+): TenantAccountOutput => {
+  const safe = safeGoAccount(account)
+  return {
+    id: account.id,
+    provider: safe.provider,
+    label: account.label,
+    auth_mode: safe.auth_mode,
+    created_at: new Date(account.createdAt).toISOString(),
+    ...(safe.email ? { email: safe.email } : {}),
+    ...(validation ? { validation } : {}),
+  }
+}
+
+const accountMatchesUpstreamProvider = (
+  account: StoredAccountContract,
+  upstreamProvider: UpstreamProvider | undefined
+): boolean => {
+  if (!upstreamProvider) return true
+  return providerForAccount(account.kind) === upstreamProvider
+}
+
 const parseModelProbeInput = async (
   request: Request
 ): Promise<Response | ModelProbeInput> => {
@@ -507,16 +694,61 @@ const authorizeAdmin = (request: Request, env: Env): Response | null => {
   return null
 }
 
-const authorizeProxy = (request: Request, env: Env): Response | null => {
-  const token = env.PROXY_TOKEN || env.ADMIN_TOKEN
-  if (!token) return null
+interface TenantAuth {
+  readonly tenantId: string
+  readonly legacy: boolean
+}
+
+const registryActor = (env: Env): DurableObjectStub<TenantRegistryDurableObject> =>
+  env.TENANT_REGISTRY_DO.getByName("registry")
+
+const registryTenantDOName = (tenantId: string): string => `tenant:${tenantId}`
+
+const adminTenantDOName = (tenantId: string): string =>
+  isReservedTenantId(tenantId) ? tenantId : registryTenantDOName(tenantId)
+
+const tenantActor = (
+  env: Env,
+  tenant: TenantAuth
+): DurableObjectStub<SubrouterDurableObject> =>
+  env.SUBROUTER_DO.getByName(
+    tenant.legacy ? tenant.tenantId : registryTenantDOName(tenant.tenantId)
+  )
+
+const authorizeTenant = async (
+  request: Request,
+  env: Env
+): Promise<Response | TenantAuth> => {
   const header = request.headers.get("authorization") ?? ""
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : ""
-  const got = bearer || request.headers.get("x-subrouter-proxy-token") || ""
-  if (!constantTimeStringEqual(got, token)) {
-    return json({ error: "Proxy token required" }, { status: 401 })
+  const tenantKey = request.headers.get("x-subrouter-tenant-key") || bearer
+  if (tenantKey.startsWith("srt_") || request.headers.has("x-subrouter-tenant-key")) {
+    if (!isTenantKey(tenantKey)) {
+      return json({ error: "Invalid tenant key" }, { status: 401 })
+    }
+    const resolved = await registryActor(env).resolveTenantKeySha256(
+      await tenantKeySha256Hex(tenantKey)
+    )
+    if (!resolved) {
+      return json({ error: "Invalid tenant key" }, { status: 401 })
+    }
+    if (resolved.revoked_at !== null) {
+      return json({ error: "Tenant key revoked" }, { status: 403 })
+    }
+    return { tenantId: resolved.id, legacy: false }
   }
-  return null
+
+  const legacyToken =
+    bearer || request.headers.get("x-subrouter-proxy-token") || ""
+  if (
+    env.ALLOW_LEGACY_PROXY_TOKEN === "1" &&
+    env.PROXY_TOKEN &&
+    constantTimeStringEqual(legacyToken, env.PROXY_TOKEN)
+  ) {
+    return { tenantId: "legacy", legacy: true }
+  }
+
+  return json({ error: "Tenant key required" }, { status: 401 })
 }
 
 const constantTimeStringEqual = (a: string, b: string): boolean => {
@@ -545,6 +777,8 @@ const rowToAccount = (row: AccountRow): StoredAccount => ({
   totpDigits: row.totp_digits,
   totpPeriod: row.totp_period,
   totpAlgorithm: row.totp_algorithm as TotpAlgorithm | null,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
   source: "durable-object",
 })
 
@@ -1183,22 +1417,6 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       INSERT OR IGNORE INTO lifecycle(id, started_at) VALUES (1, ${Date.now()});
     `)
 
-    const now = Date.now()
-    for (const account of demoAccounts) {
-      this.ctx.storage.sql.exec(
-        `INSERT OR IGNORE INTO accounts(
-          id, org_id, kind, label, enabled, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        account.id,
-        account.orgId,
-        account.kind,
-        account.label,
-        account.enabled ? 1 : 0,
-        now,
-        now
-      )
-      this.upsertModelQuotas(account.id, account.modelQuotas)
-    }
     this.ctx.blockConcurrencyWhile(async () => {
       await this.scheduleNextRefreshAlarm()
     })
@@ -1315,6 +1533,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       this.requireNonEmpty(input.sessionId, "sessionId")
     )
     const quotaKey = this.resolveQuotaKey(input)
+    const upstreamProvider = this.resolveUpstreamProvider(input)
     const routedAt = Date.now()
     const sql = this.ctx.storage.sql
 
@@ -1329,7 +1548,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       )
       .toArray()[0]
     const stickyAccount = sticky
-      ? this.getEligibleAccount(sql, orgId, sticky.account_id, quotaKey, true)
+      ? this.getEligibleAccount(sql, orgId, sticky.account_id, quotaKey, true, upstreamProvider)
       : null
     if (stickyAccount) {
       this.recordRouteMetadata(sql, routedAt, stickyAccount.id, sessionId)
@@ -1341,7 +1560,7 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     }
 
     const preferredAccount = input.preferAccountId
-      ? this.getEligibleAccount(sql, orgId, input.preferAccountId, quotaKey, true)
+      ? this.getEligibleAccount(sql, orgId, input.preferAccountId, quotaKey, true, upstreamProvider)
       : null
     if (preferredAccount) {
       this.rememberSticky(sql, orgId, agentType, quotaKey, sessionId, preferredAccount.id, input.userEmail)
@@ -1354,9 +1573,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       }
     }
 
-    const eligible = this.listEligibleAccounts(sql, orgId, quotaKey)
+    const eligible = this.listEligibleAccounts(sql, orgId, quotaKey, upstreamProvider)
     if (eligible.length === 0) {
-      throw new Error(`no eligible ${quotaKey} subrouter account for org ${orgId}`)
+      const providerLabel = upstreamProvider ? `${upstreamProvider} ` : ""
+      throw new Error(`no eligible ${providerLabel}${quotaKey} subrouter account for org ${orgId}`)
     }
 
     const status = this.statusRow(sql)
@@ -1523,6 +1743,34 @@ export class SubrouterDurableObject extends DurableObject<Env> {
         .toArray()
         .map((row) => this.accountFromRow(row)),
     }
+  }
+
+  async deleteAccount(input: { readonly orgId?: string; readonly accountId: string }): Promise<{ ok: true }> {
+    const orgId = this.resolveOrgId(input.orgId)
+    const accountId = this.requireNonEmpty(input.accountId, "accountId")
+    const row = this.getAccountRow(this.ctx.storage.sql, orgId, accountId, false)
+    if (!row) throw new Error("account not found")
+    const sql = this.ctx.storage.sql
+    sql.exec("DELETE FROM accounts WHERE id = ? AND org_id = ?", accountId, orgId)
+    sql.exec("DELETE FROM account_model_quotas WHERE account_id = ?", accountId)
+    sql.exec("DELETE FROM account_usage WHERE account_id = ?", accountId)
+    sql.exec(
+      "DELETE FROM session_assignments WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    sql.exec(
+      "DELETE FROM sticky_sessions WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    sql.exec(
+      "DELETE FROM sticky_session_routes WHERE org_id = ? AND account_id = ?",
+      orgId,
+      accountId
+    )
+    await this.scheduleNextRefreshAlarm()
+    return { ok: true }
   }
 
   async accountStatuses(orgId: string, forceRefresh: boolean): Promise<ReadonlyArray<OAuthRefreshStatus>> {
@@ -1761,6 +2009,16 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     return quotaKeyForModel(input.model)
   }
 
+  private resolveUpstreamProvider(input: { upstreamProvider?: UpstreamProvider; agentType?: AgentType }): UpstreamProvider | undefined {
+    if (input.upstreamProvider === "claude" || input.upstreamProvider === "codex") {
+      return input.upstreamProvider
+    }
+    const agentType = normalizeAgentType(input.agentType)
+    if (agentType === "claude") return "claude"
+    if (agentType === "codex") return "codex"
+    return undefined
+  }
+
   private requireNonEmpty(value: string, name: string): string {
     if (value.trim().length === 0) {
       throw new Error(`missing ${name}`)
@@ -1775,7 +2033,8 @@ export class SubrouterDurableObject extends DurableObject<Env> {
   private listEligibleAccounts(
     sql: SqlStorage,
     orgId: string,
-    quotaKey: string
+    quotaKey: string,
+    upstreamProvider: UpstreamProvider | undefined
   ): StoredAccount[] {
     return sql
       .exec<AccountRow>(
@@ -1786,7 +2045,10 @@ export class SubrouterDurableObject extends DurableObject<Env> {
       )
       .toArray()
       .map((row) => this.accountFromRow(row))
-      .filter((account) => accountHasQuotaForModel(account, quotaKey))
+      .filter((account) =>
+        accountMatchesUpstreamProvider(account, upstreamProvider) &&
+        accountHasQuotaForModel(account, quotaKey)
+      )
   }
 
   private getEligibleAccount(
@@ -1794,11 +2056,15 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     orgId: string,
     accountId: string,
     quotaKey: string,
-    enabledOnly: boolean
+    enabledOnly: boolean,
+    upstreamProvider: UpstreamProvider | undefined
   ): StoredAccount | null {
     const account = this.getAccount(sql, orgId, accountId, enabledOnly)
     if (!account) return null
-    return accountHasQuotaForModel(account, quotaKey) ? account : null
+    return accountMatchesUpstreamProvider(account, upstreamProvider) &&
+      accountHasQuotaForModel(account, quotaKey)
+      ? account
+      : null
   }
 
   private getAccount(
@@ -2173,12 +2439,14 @@ export class SubrouterDurableObject extends DurableObject<Env> {
     if (type === "route") {
       const sessionId = nonEmptyString(message.sessionId)
       if (!sessionId) throw new Error("route message is missing sessionId")
+      const agentType = normalizeAgentType(nonEmptyString(message.agentType)) || "codex"
       return {
         type: "route",
         ok: true,
         ...(requestId ? { requestId } : {}),
         message: await this.route({
           orgId: websocketOrgId(attachment, message),
+          agentType,
           sessionId,
           ...(nonEmptyString(message.preferAccountId)
             ? { preferAccountId: nonEmptyString(message.preferAccountId)! }
@@ -2289,8 +2557,96 @@ const websocketOrgId = (
   return orgId
 }
 
-const adminActor = (env: Env, orgId: string) =>
-  env.SUBROUTER_DO.getByName(orgId)
+const adminActor = (env: Env, tenantId: string) =>
+  env.SUBROUTER_DO.getByName(adminTenantDOName(tenantId))
+
+const tenantScopedAdminActor = (
+  env: Env,
+  url: URL
+): Response | { readonly tenantId: string; readonly actor: DurableObjectStub<SubrouterDurableObject> } => {
+  const tenantId = nonEmptyString(url.searchParams.get("tenant"))
+  if (!tenantId) {
+    return json({ error: "Missing tenant" }, { status: 400 })
+  }
+  return { tenantId, actor: adminActor(env, tenantId) }
+}
+
+const routeInputForTenant = <T extends { readonly orgId?: string }>(
+  input: T,
+  tenantId: string
+): T & { readonly orgId: string } => ({
+  ...input,
+  orgId: tenantId,
+})
+
+const proxyRouteInputForTenant = (
+  request: Request,
+  input: RouteInput,
+  tenantId: string
+): RouteInput => {
+  const upstreamProvider = upstreamProviderForProxyRequest(request, input)
+  return {
+    ...input,
+    orgId: tenantId,
+    upstreamProvider,
+    ...(upstreamProvider === "claude" ? { agentType: "claude" } : {}),
+  }
+}
+
+const upstreamProviderForProxyRequest = (
+  request: Request,
+  input: RouteInput
+): UpstreamProvider => {
+  const agentType = normalizeAgentType(input.agentType)
+  if (agentType === "claude") return "claude"
+  const path = new URL(request.url).pathname
+  if (path === "/v1/messages" || path.startsWith("/v1/messages/")) {
+    return "claude"
+  }
+  return "codex"
+}
+
+const requestWithTenantOrg = (request: Request, tenantId: string): Request => {
+  const url = new URL(request.url)
+  url.searchParams.set("orgId", tenantId)
+  return new Request(url, request)
+}
+
+const validateTenantAccountUpload = async (
+  input: UpsertAccountInput,
+  options: {
+    readonly timeoutMs?: number
+    readonly fetcher?: typeof fetch
+  } = {}
+): Promise<"ok" | "failed"> => {
+  if (!input.credentials) return "ok"
+  if (!isOAuthKind(input.kind)) return "ok"
+  const timeoutMs = options.timeoutMs ?? 10_000
+  const signal = AbortSignal.timeout(timeoutMs)
+  const baseFetcher = options.fetcher ?? fetch
+  const fetcher = Object.assign(
+    ((requestInfo: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      baseFetcher(requestInfo, {
+        ...init,
+        signal: init?.signal ?? signal,
+      })) as typeof fetch,
+    { preconnect: baseFetcher.preconnect?.bind(baseFetcher) ?? (() => {}) }
+  )
+  try {
+    await fetchProviderUsage(input.kind, input.credentials, fetcher)
+    return "ok"
+  } catch {
+    return "failed"
+  }
+}
+
+const validationTimeoutMs = (env: Env): number => {
+  const parsed = Number(env.VALIDATION_TIMEOUT_MS)
+  if (Number.isFinite(parsed) && parsed > 0 && parsed <= 10_000) {
+    return parsed
+  }
+  return 10_000
+}
 
 const defaultUpstreamForAccount = (
   env: Env,
@@ -2308,9 +2664,12 @@ const defaultUpstreamForAccount = (
 const proxyUpstream = async (
   request: Request,
   env: Env,
+  actor: DurableObjectStub<SubrouterDurableObject>,
   routeInput: RouteInput
 ): Promise<Response> => {
-  const actor = env.SUBROUTER_DO.getByName(routeInput.orgId ?? "demo-org")
+  if (!routeInput.orgId) {
+    return json({ error: "tenant id required" }, { status: 401 })
+  }
   const routed = await actor.routeForProxy(routeInput)
   const account = routed.account
   if (!account.credentials?.apiKey && !account.credentials?.accessToken) {
@@ -2337,7 +2696,7 @@ const proxyUpstream = async (
       method: request.method,
       path: new URL(request.url).pathname,
       upstream: upstreamURL.toString(),
-      headers: redactedHeaders(request.headers),
+      headers: redactedHeaders(stripSubrouterHeaders(request.headers)),
     },
   })
   const init: RequestInit = {
@@ -2377,9 +2736,12 @@ const proxyUpstream = async (
 const proxyUpstreamWebSocket = async (
   request: Request,
   env: Env,
+  actor: DurableObjectStub<SubrouterDurableObject>,
   routeInput: RouteInput
 ): Promise<Response> => {
-  const actor = env.SUBROUTER_DO.getByName(routeInput.orgId ?? "demo-org")
+  if (!routeInput.orgId) {
+    return json({ error: "tenant id required" }, { status: 401 })
+  }
   const routed = await actor.routeForProxy(routeInput)
   const account = routed.account
   if (!account.credentials?.apiKey && !account.credentials?.accessToken) {
@@ -2478,6 +2840,8 @@ const sensitiveHeaders = new Set([
   "proxy-authorization",
   "x-api-key",
   "openai-api-key",
+  "x-subrouter-proxy-token",
+  "x-subrouter-tenant-key",
 ])
 
 const redactedHeaders = (headers: Headers): Record<string, ReadonlyArray<string>> => {
@@ -2671,7 +3035,7 @@ const renderDashboard = (
       const agentType = String(summary["agent_type"] ?? "")
       const sessionId = String(summary["session_id"] ?? "")
       const usage = recordPayload(summary["usage"]) ?? {}
-      const href = `/_subrouter/transcripts/${encodeURIComponent(agentType)}/${encodeURIComponent(sessionId)}?orgId=${encodeURIComponent(orgId)}`
+      const href = `/_subrouter/transcripts/${encodeURIComponent(agentType)}/${encodeURIComponent(sessionId)}?tenant=${encodeURIComponent(orgId)}`
       const raw = `${href.replace("?", "/raw?")}`
       return `<tr>
         <td>${escapeHTML(agentType)}</td>
@@ -2807,8 +3171,13 @@ export default {
     }
 
     if (url.pathname === "/_subrouter/ready") {
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      const ready = await env.SUBROUTER_DO.getByName(orgId).ready()
+      const tenantId = url.searchParams.get("tenant")
+      if (!tenantId) return json({ ok: true })
+      const normalizedTenantId = normalizeTenantId(tenantId)
+      if (!normalizedTenantId) {
+        return json({ error: "Invalid tenant" }, { status: 400 })
+      }
+      const ready = await adminActor(env, normalizedTenantId).ready()
       return json(ready, ready.ok ? undefined : { status: 503 })
     }
 
@@ -2822,22 +3191,26 @@ export default {
           { status: 426 }
         )
       }
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      return env.SUBROUTER_DO.getByName(orgId).fetch(request)
+      const tenant = await authorizeTenant(request, env)
+      if (tenant instanceof Response) return tenant
+      return tenantActor(env, tenant).fetch(requestWithTenantOrg(request, tenant.tenantId))
     }
 
     if (url.pathname === "/websocket-status") {
       const unauthorized = authorizeAdmin(request, env)
       if (unauthorized) return unauthorized
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      return json(await env.SUBROUTER_DO.getByName(orgId).webSocketStats())
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      return json(await scoped.actor.webSocketStats())
     }
 
     if (url.pathname === "/route" && request.method === "POST") {
+      const tenant = await authorizeTenant(request, env)
+      if (tenant instanceof Response) return tenant
       try {
         const input = await parseRouteInput(request)
-        const actor = env.SUBROUTER_DO.getByName(input.orgId ?? "demo-org")
-        return json(await actor.route(input))
+        const actor = tenantActor(env, tenant)
+        return json(await actor.route(routeInputForTenant(input, tenant.tenantId)))
       } catch (error) {
         return errorJson(error, 409)
       }
@@ -2849,8 +3222,9 @@ export default {
       if (request.method !== "POST") {
         return json({ error: "method not allowed" }, { status: 405 })
       }
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      return json(await env.SUBROUTER_DO.getByName(orgId).drain())
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      return json(await scoped.actor.drain())
     }
 
     if (url.pathname === "/_subrouter/drain-status") {
@@ -2859,26 +3233,30 @@ export default {
       if (request.method !== "GET") {
         return json({ error: "method not allowed" }, { status: 405 })
       }
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      return json(await env.SUBROUTER_DO.getByName(orgId).ready())
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      return json(await scoped.actor.ready())
     }
 
     if (url.pathname === "/usage" && request.method === "POST") {
+      const tenant = await authorizeTenant(request, env)
+      if (tenant instanceof Response) return tenant
       const input = await parseUsageInput(request)
       if (input instanceof Response) {
         return input
       }
-      const actor = env.SUBROUTER_DO.getByName(input.orgId ?? "demo-org")
+      const actor = tenantActor(env, tenant)
       try {
-        return json(await actor.recordUsage(input))
+        return json(await actor.recordUsage(routeInputForTenant(input, tenant.tenantId)))
       } catch (error) {
         return errorJson(error, 400)
       }
     }
 
     if (url.pathname === "/status") {
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      const actor = env.SUBROUTER_DO.getByName(orgId)
+      const tenant = await authorizeTenant(request, env)
+      if (tenant instanceof Response) return tenant
+      const actor = tenantActor(env, tenant)
       try {
         return json(await actor.status())
       } catch (error) {
@@ -2889,15 +3267,17 @@ export default {
     if (url.pathname === "/_subrouter/sessions") {
       const unauthorized = authorizeAdmin(request, env)
       if (unauthorized) return unauthorized
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      return json(await env.SUBROUTER_DO.getByName(orgId).listSessions())
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      return json(await scoped.actor.listSessions())
     }
 
     if (url.pathname === "/_subrouter/accounts") {
       const unauthorized = authorizeAdmin(request, env)
       if (unauthorized) return unauthorized
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      const { accounts } = await env.SUBROUTER_DO.getByName(orgId).listAccounts(orgId)
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      const { accounts } = await scoped.actor.listAccounts(scoped.tenantId)
       return json(accounts.map((account) => safeGoAccount(account)))
     }
 
@@ -2907,8 +3287,9 @@ export default {
       if (request.method !== "GET" && request.method !== "POST") {
         return json({ error: "method not allowed" }, { status: 405 })
       }
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      return json(await env.SUBROUTER_DO.getByName(orgId).accountStatuses(orgId, request.method === "POST"))
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      return json(await scoped.actor.accountStatuses(scoped.tenantId, request.method === "POST"))
     }
 
     if (url.pathname === "/_subrouter/usage-status") {
@@ -2917,8 +3298,9 @@ export default {
       if (request.method !== "GET") {
         return json({ error: "method not allowed" }, { status: 405 })
       }
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      return json(await env.SUBROUTER_DO.getByName(orgId).usageStatuses(orgId))
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      return json(await scoped.actor.usageStatuses(scoped.tenantId))
     }
 
     if (url.pathname === "/_subrouter/reload-accounts") {
@@ -2927,17 +3309,18 @@ export default {
       if (request.method !== "POST") {
         return json({ error: "method not allowed" }, { status: 405 })
       }
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      const { accounts } = await env.SUBROUTER_DO.getByName(orgId).listAccounts(orgId)
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      const { accounts } = await scoped.actor.listAccounts(scoped.tenantId)
       return json({ ok: true, accounts: accounts.length, usage_refreshed: 0 })
     }
 
     if (url.pathname === "/_subrouter/dashboard") {
       const unauthorized = authorizeAdmin(request, env)
       if (unauthorized) return unauthorized
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      const actor = env.SUBROUTER_DO.getByName(orgId)
-      return new Response(renderDashboard(await actor.transcriptDashboardData(orgId), orgId), {
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
+      return new Response(renderDashboard(await scoped.actor.transcriptDashboardData(scoped.tenantId), scoped.tenantId), {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       })
     }
@@ -2948,15 +3331,70 @@ export default {
     ) {
       const unauthorized = authorizeAdmin(request, env)
       if (unauthorized) return unauthorized
-      const orgId = url.searchParams.get("orgId") ?? "demo-org"
-      const actor = env.SUBROUTER_DO.getByName(orgId)
+      const scoped = tenantScopedAdminActor(env, url)
+      if (scoped instanceof Response) return scoped
       if (url.pathname === "/_subrouter/transcripts") {
-        return json(await actor.listTranscriptSummaries(orgId))
+        return json(await scoped.actor.listTranscriptSummaries(scoped.tenantId))
       }
       const parsed = parseTranscriptPath(url.pathname)
       if (!parsed) return new Response("Not Found", { status: 404 })
       try {
-        return json(await actor.readTranscriptSession({ orgId, ...parsed }))
+        return json(await scoped.actor.readTranscriptSession({ orgId: scoped.tenantId, ...parsed }))
+      } catch (error) {
+        return errorJson(error, 404)
+      }
+    }
+
+    if (url.pathname === "/tenant/accounts" && request.method === "POST") {
+      const tenant = await authorizeTenant(request, env)
+      if (tenant instanceof Response) return tenant
+      if (tenant.legacy) {
+        return json({ error: "Tenant key required" }, { status: 401 })
+      }
+      const input = await parseTenantAccountUploadInput(request, tenant.tenantId)
+      if (input instanceof Response) return input
+      const validation = input.validate
+        ? await validateTenantAccountUpload(input.account, {
+            timeoutMs: validationTimeoutMs(env),
+          })
+        : undefined
+      if (validation === "failed") {
+        return json({ error: "Account validation failed", validation }, { status: 400 })
+      }
+      const actor = tenantActor(env, tenant)
+      try {
+        const { account } = await actor.upsertAccount(input.account)
+        return json(safeTenantAccount(account, validation))
+      } catch (error) {
+        return errorJson(error, 400)
+      }
+    }
+
+    if (url.pathname === "/tenant/accounts" && request.method === "GET") {
+      const tenant = await authorizeTenant(request, env)
+      if (tenant instanceof Response) return tenant
+      if (tenant.legacy) {
+        return json({ error: "Tenant key required" }, { status: 401 })
+      }
+      const { accounts } = await tenantActor(env, tenant).listAccounts(tenant.tenantId)
+      return json({ accounts: accounts.map((account) => safeTenantAccount(account)) })
+    }
+
+    const tenantAccountDeleteMatch = url.pathname.match(/^\/tenant\/accounts\/([^/]+)$/)
+    if (tenantAccountDeleteMatch && request.method === "DELETE") {
+      const tenant = await authorizeTenant(request, env)
+      if (tenant instanceof Response) return tenant
+      if (tenant.legacy) {
+        return json({ error: "Tenant key required" }, { status: 401 })
+      }
+      const accountId = decodeURIComponent(tenantAccountDeleteMatch[1]!)
+      try {
+        return json(
+          await tenantActor(env, tenant).deleteAccount({
+            orgId: tenant.tenantId,
+            accountId,
+          })
+        )
       } catch (error) {
         return errorJson(error, 404)
       }
@@ -2966,9 +3404,44 @@ export default {
       const unauthorized = authorizeAdmin(request, env)
       if (unauthorized) return unauthorized
 
+      if (url.pathname === "/admin/tenants" && request.method === "POST") {
+        const record = await parseJsonRecord(request)
+        if (record instanceof Response) return record
+        try {
+          return json(await registryActor(env).createTenant({ name: record["name"] }))
+        } catch (error) {
+          return errorJson(error, 400)
+        }
+      }
+
+      if (url.pathname === "/admin/tenants" && request.method === "GET") {
+        return json(await registryActor(env).listTenants())
+      }
+
+      const tenantRevokeMatch = url.pathname.match(/^\/admin\/tenants\/([^/]+)\/revoke$/)
+      if (tenantRevokeMatch && request.method === "POST") {
+        const tenantId = decodeURIComponent(tenantRevokeMatch[1]!)
+        try {
+          return json(await registryActor(env).revokeTenant(tenantId))
+        } catch (error) {
+          return errorJson(error, 404)
+        }
+      }
+
+      const tenantRotateMatch = url.pathname.match(/^\/admin\/tenants\/([^/]+)\/rotate$/)
+      if (tenantRotateMatch && request.method === "POST") {
+        const tenantId = decodeURIComponent(tenantRotateMatch[1]!)
+        try {
+          return json(await registryActor(env).rotateTenant(tenantId))
+        } catch (error) {
+          return errorJson(error, 400)
+        }
+      }
+
       if (url.pathname === "/admin/accounts" && request.method === "GET") {
-        const orgId = url.searchParams.get("orgId") ?? "demo-org"
-        return json(await adminActor(env, orgId).listAccounts(orgId))
+        const scoped = tenantScopedAdminActor(env, url)
+        if (scoped instanceof Response) return scoped
+        return json(await scoped.actor.listAccounts(scoped.tenantId))
       }
 
       if (url.pathname === "/admin/accounts" && request.method === "POST") {
@@ -2984,9 +3457,10 @@ export default {
       const totpMatch = url.pathname.match(/^\/admin\/accounts\/([^/]+)\/totp$/)
       if (totpMatch && request.method === "POST") {
         const accountId = decodeURIComponent(totpMatch[1]!)
-        const orgId = url.searchParams.get("orgId") ?? "demo-org"
+        const scoped = tenantScopedAdminActor(env, url)
+        if (scoped instanceof Response) return scoped
         try {
-          return json(await adminActor(env, orgId).totpCode({ orgId, accountId }))
+          return json(await scoped.actor.totpCode({ orgId: scoped.tenantId, accountId }))
         } catch (error) {
           return errorJson(error, 400)
         }
@@ -2996,25 +3470,33 @@ export default {
         try {
           const input = await parseModelProbeInput(request)
           if (input instanceof Response) return input
-          return json(await adminActor(env, input.orgId ?? "demo-org").modelProbe(input))
+          const tenantId = input.orgId ?? nonEmptyString(url.searchParams.get("tenant"))
+          if (!tenantId) return json({ error: "Missing tenant" }, { status: 400 })
+          return json(await adminActor(env, tenantId).modelProbe(routeInputForTenant(input, tenantId)))
         } catch (error) {
           return errorJson(error, 400)
         }
       }
     }
 
+    if (url.pathname.startsWith("/tenant/")) {
+      return new Response("Not Found", { status: 404 })
+    }
+
     if (url.pathname.startsWith("/_subrouter/")) {
       return new Response("Not Found", { status: 404 })
     }
 
-    const unauthorized = authorizeProxy(request, env)
-    if (unauthorized) return unauthorized
+    const tenant = await authorizeTenant(request, env)
+    if (tenant instanceof Response) return tenant
     try {
       const routeInput = await parseProxyRouteInput(request)
+      const tenantRouteInput = proxyRouteInputForTenant(request, routeInput, tenant.tenantId)
+      const actor = tenantActor(env, tenant)
       if (isWebSocketUpgrade(request)) {
-        return await proxyUpstreamWebSocket(request, env, routeInput)
+        return await proxyUpstreamWebSocket(request, env, actor, tenantRouteInput)
       }
-      return await proxyUpstream(request, env, routeInput)
+      return await proxyUpstream(request, env, actor, tenantRouteInput)
     } catch (error) {
       return errorJson(error, 503)
     }
