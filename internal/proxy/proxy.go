@@ -58,6 +58,13 @@ type Server struct {
 	MaxBodyBytes     int64
 	Transcripts      *transcript.Recorder
 	ReadCache        *readCache
+	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
+	Bedrock *BedrockConfig
+	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
+	// API key (x-api-key) instead of the subscription pool or Bedrock. It applies
+	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
+	// touch this key.
+	ClaudeFableAPIKey string
 }
 
 type ActiveSessions struct {
@@ -856,7 +863,11 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
+	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
+	if s.Bedrock != nil {
+		mux.Handle("/bedrock/", s.bedrockHandler())
+	}
 	mux.Handle("/", s.proxyHandler())
 	return mux
 }
@@ -1582,20 +1593,36 @@ func (s Server) proxyHandler() http.Handler {
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
 		requestProvider := providerForRequest(agentType, r.URL.Path)
+		// Claude Fable routing order: subscription pool (Max accounts) first, then
+		// AWS Bedrock, then the dedicated Anthropic API key. The fallback stages
+		// run when the pool gives up (usageLimitRetryTransport exhausts failover)
+		// or cannot start (no usable OAuth account). Other Claude models use the
+		// normal pool unchanged.
+		fableFallbackConfigured := requestProvider == accounts.ProviderClaude &&
+			s.claudeFableEnabled() && s.claudeFableRequest(r)
 		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
 		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)
 		if err != nil {
+			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+				return
+			}
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		account, err = s.refreshSelectedAccount(r.Context(), requestProvider, sessionAgentType, sessionID, userEmail, r, account)
 		if err != nil {
+			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+				return
+			}
 			http.Error(w, "refresh selected account: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
 		auth := account.AuthorizationHeader()
 		if auth == "" {
+			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
+				return
+			}
 			http.Error(w, "selected account has no usable credential", http.StatusServiceUnavailable)
 			return
 		}
@@ -1653,19 +1680,35 @@ func (s Server) proxyHandler() http.Handler {
 		if retryPost && postReplayable &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
 			account.AuthMode == accounts.AuthModeOAuth {
+			var fableFallback func() (*http.Response, bool)
+			if fableFallbackConfigured {
+				fableFallback = func() (*http.Response, bool) {
+					rc, err := proxyRequest.GetBody()
+					if err != nil {
+						return nil, false
+					}
+					fallbackBody, err := io.ReadAll(rc)
+					_ = rc.Close()
+					if err != nil {
+						return nil, false
+					}
+					return s.claudeFableFallbackResponse(proxyRequest, fallbackBody)
+				}
+			}
 			transport = usageLimitRetryTransport{
-				base:        transport,
-				server:      &s,
-				logger:      s.Logger,
-				provider:    requestProvider,
-				agent:       sessionAgentType,
-				session:     sessionID,
-				userEmail:   userEmail,
-				account:     account.ID,
-				method:      r.Method,
-				path:        proxyRequest.URL.Path,
-				upstream:    upstream.Host,
-				maxAttempts: s.usageLimitRetryMaxAttempts(requestProvider),
+				base:          transport,
+				server:        &s,
+				logger:        s.Logger,
+				provider:      requestProvider,
+				agent:         sessionAgentType,
+				session:       sessionID,
+				userEmail:     userEmail,
+				account:       account.ID,
+				method:        r.Method,
+				path:          proxyRequest.URL.Path,
+				upstream:      upstream.Host,
+				maxAttempts:   s.usageLimitRetryMaxAttempts(requestProvider),
+				fableFallback: fableFallback,
 			}
 		}
 		if retryPost && postReplayable {
@@ -2507,6 +2550,13 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
+	if provider == accounts.ProviderClaude && s.claudeFableEnabled() && claudeFableModel(model) {
+		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
+		// metered API-key pool accounts never preempt the Bedrock stage. With no
+		// OAuth account usable, selection fails and the handler serves the
+		// fallback chain directly.
+		availableAccounts = oauthAccounts(availableAccounts)
+	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
 		s.refreshUsageScoresIfStale(r.Context())
 	}
@@ -2959,6 +3009,43 @@ type usageLimitRetryTransport struct {
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
+	// fableFallback, when set, serves the request via the Fable fallback chain
+	// (Bedrock, then the dedicated Anthropic API key) once the subscription
+	// pool gives up. Set only for Claude Fable requests with a chain configured;
+	// it also restricts account failover to OAuth accounts so metered API-key
+	// pool accounts never preempt the Bedrock stage.
+	fableFallback func() (*http.Response, bool)
+}
+
+// fableFallbackResponse swaps the pool's give-up response for one served by the
+// Fable fallback chain (Bedrock, then the dedicated API key). Returns false
+// when no chain is configured for this request or every stage failed, in which
+// case the caller returns its original response.
+func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, accountID, reason string) (*http.Response, bool) {
+	if t.fableFallback == nil {
+		return nil, false
+	}
+	fallback, ok := t.fableFallback()
+	if !ok {
+		return nil, false
+	}
+	if t.logger != nil {
+		giveUpStatus := 0
+		if giveUp != nil {
+			giveUpStatus = giveUp.StatusCode
+		}
+		t.logger.Warn("serving claude fable via fallback chain",
+			"agent", t.agent,
+			"session", t.session,
+			"account", accountID,
+			"reason", reason,
+			"pool_status", giveUpStatus,
+			"fallback_status", fallback.StatusCode)
+	}
+	if giveUp != nil && giveUp.Body != nil {
+		_ = giveUp.Body.Close()
+	}
+	return fallback, true
 }
 
 // claudeOverloadMaxRetries bounds the same-account retries subrouter itself
@@ -3142,6 +3229,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// path below and fails over to a healthy account instead.
 		if t.provider == accounts.ProviderClaude && claudeOverloadStatus(response.StatusCode) && !claudeResponseRejected(response.Header) {
 			if overloadRetries >= claudeOverloadMaxRetries {
+				if fallback, ok := t.fableFallbackResponse(response, accountID, "overload"); ok {
+					return fallback, nil
+				}
 				return response, nil
 			}
 			wait := claudeOverloadBackoff(response.Header, overloadRetries)
@@ -3204,14 +3294,20 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				reason = "no_server"
 			}
 			t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
+			if fallback, ok := t.fableFallbackResponse(response, accountID, reason); ok {
+				return fallback, nil
+			}
 			return response, nil
 		}
-		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, tried)
+		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, tried, t.fableFallback != nil)
 		if pickErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
 			}
 			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
+			if fallback, ok := t.fableFallbackResponse(response, accountID, "no_alternate_account"); ok {
+				return fallback, nil
+			}
 			return response, nil
 		}
 		body, bodyErr := req.GetBody()
@@ -3339,7 +3435,11 @@ func isTerminalCredentialError(err error) bool {
 	return false
 }
 
-func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
+// oauthRetryAccount picks the next failover candidate. oauthOnly restricts the
+// pool to OAuth accounts; Fable requests with a fallback chain set it so a
+// metered API-key pool account never preempts the Bedrock stage (the dedicated
+// Fable API key is the chain's own last stage).
+func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
 	allCandidates := filterAccountsForProvider(s.accountList(), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
@@ -3359,6 +3459,9 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
+				continue
+			}
+			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
 				continue
 			}
 			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(account.Provider, account.ID) {
