@@ -1796,6 +1796,12 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 
+		if s.SchedulerRef != nil {
+			// Live debit: the scheduler sees its own routed traffic draining
+			// the usage snapshot between refreshes (sticky and fresh picks
+			// both consume quota).
+			s.SchedulerRef.NoteRouted(requestProvider, account.ID)
+		}
 		if s.Logger != nil {
 			// remote_addr + user_agent attribute each request to a source (tailnet
 			// device / client type). Without them a concurrency spike is an
@@ -3423,6 +3429,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		previousAccount := accountID
 		accountID = nextAccount.ID
 		tried[accountID] = struct{}{}
+		if t.server != nil && t.server.SchedulerRef != nil {
+			t.server.SchedulerRef.NoteRouted(t.provider, accountID)
+		}
 		attemptReq = req.Clone(req.Context())
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
@@ -3761,7 +3770,7 @@ func NewOutboundTransport() *http.Transport {
 
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
-		return s.SchedulerRef.Get()
+		return s.SchedulerRef.Get().WithLiveDebits(s.SchedulerRef.LiveDebits())
 	}
 	return s.Scheduler
 }
