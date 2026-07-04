@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -361,6 +362,125 @@ func TestUsageLimitRetryTransportClaudeFableFallsBackAfterPoolExhausted(t *testi
 	body, _ := io.ReadAll(response.Body)
 	if !strings.Contains(string(body), `"type":"message"`) {
 		t.Fatalf("fallback body = %q, want bedrock message", body)
+	}
+}
+
+func TestUsageLimitRetryTransportClaudeFableFallbackSuppressesExhaustedLog(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-fable", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`)),
+			Header:     h,
+		}
+	}}
+	bedrockRT := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"output_tokens":3}}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	server.Bedrock = &BedrockConfig{
+		Region:    "us-east-1",
+		Sources:   []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport: bedrockRT,
+	}
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	fableBody := []byte(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`)
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(fableBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(fableBody)), nil }
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	transport := usageLimitRetryTransport{
+		base:        stub,
+		server:      &server,
+		logger:      logger,
+		provider:    accounts.ProviderClaude,
+		agent:       "claude",
+		session:     "session-fable",
+		account:     "cooked@example.com",
+		method:      http.MethodPost,
+		path:        "/v1/messages",
+		maxAttempts: 4,
+		fableFallback: func() (*http.Response, bool) {
+			return server.claudeFableFallbackResponse(req, fableBody)
+		},
+	}
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 from bedrock after pool exhausted", response.StatusCode)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "serving claude fable via fallback chain") {
+		t.Fatalf("expected fable fallback save log; logs=\n%s", logs)
+	}
+	if strings.Contains(logs, "returned to client after failover exhausted") {
+		t.Fatalf("did not expect client-facing failover-exhaustion signal on fallback save; logs=\n%s", logs)
+	}
+}
+
+func TestUsageLimitRetryTransportClaudeFableFallbackFailureLogsExhausted(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-fable", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		h := http.Header{}
+		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`)),
+			Header:     h,
+		}
+	}}
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	fableBody := []byte(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`)
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(fableBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(fableBody)), nil }
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	transport := usageLimitRetryTransport{
+		base:        stub,
+		server:      &server,
+		logger:      logger,
+		provider:    accounts.ProviderClaude,
+		agent:       "claude",
+		session:     "session-fable",
+		account:     "cooked@example.com",
+		method:      http.MethodPost,
+		path:        "/v1/messages",
+		maxAttempts: 4,
+		fableFallback: func() (*http.Response, bool) {
+			return nil, false
+		},
+	}
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want pool 429", response.StatusCode)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "claude rate-limit returned to client after failover exhausted") {
+		t.Fatalf("expected client-facing failover-exhaustion signal; logs=\n%s", logs)
 	}
 }
 
