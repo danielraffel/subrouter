@@ -237,3 +237,73 @@ func TestScoresAreIsolatedPerProviderReversed(t *testing.T) {
 		t.Fatal("exhausted Codex account must stay exhausted")
 	}
 }
+
+func TestLiveDebitsReorderPickWithoutExhausting(t *testing.T) {
+	accountA := accounts.Account{ID: "a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
+	accountB := accounts.Account{ID: "b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
+	scheduler := NewScheduler([]Score{
+		{AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "b", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+	})
+
+	// Equal scores: deterministic tie falls to "a".
+	picked, err := scheduler.Pick([]accounts.Account{accountA, accountB})
+	if err != nil || picked.ID != "a" {
+		t.Fatalf("baseline pick = %v %v, want a", picked.ID, err)
+	}
+
+	// Five requests routed to "a" since the snapshot: the debit flips the pick.
+	debited := scheduler.WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 5})
+	picked, err = debited.Pick([]accounts.Account{accountA, accountB})
+	if err != nil || picked.ID != "b" {
+		t.Fatalf("debited pick = %v %v, want b", picked.ID, err)
+	}
+
+	// Even a huge debit never exhausts the account or resurrects an exhausted one.
+	heavy := scheduler.WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 1000})
+	if heavy.Exhausted(accounts.ProviderClaude, "a") {
+		t.Fatal("a live debit must never mark an account exhausted")
+	}
+	cooked := NewScheduler([]Score{{AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0}}).
+		WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 3})
+	if !cooked.Exhausted(accounts.ProviderClaude, "a") {
+		t.Fatal("a live debit must not resurrect an exhausted account")
+	}
+}
+
+func TestLiveDebitsSurviveForModelAndSessionCounts(t *testing.T) {
+	scheduler := NewScheduler([]Score{
+		{AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+			ModelScores: map[string]Score{"claudefable": {AccountID: "a", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
+		{AccountID: "b", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+			ModelScores: map[string]Score{"claudefable": {AccountID: "b", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1}}},
+	}).WithLiveDebits(map[string]int{ScoreKey(accounts.ProviderClaude, "a"): 5}).
+		WithSessionCounts(map[string]int{})
+	accountA := accounts.Account{ID: "a", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
+	accountB := accounts.Account{ID: "b", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "x"}
+	picked, err := scheduler.ForModel("claude-fable").Pick([]accounts.Account{accountA, accountB})
+	if err != nil || picked.ID != "b" {
+		t.Fatalf("pool pick = %v %v, want b (debits must survive ForModel and WithSessionCounts)", picked.ID, err)
+	}
+}
+
+func TestSchedulerRefLiveDebitLifecycle(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.NoteRouted(accounts.ProviderClaude, "a")
+	ref.NoteRouted(accounts.ProviderClaude, "a")
+	ref.NoteRouted(accounts.ProviderCodex, "a")
+	debits := ref.LiveDebits()
+	if debits[ScoreKey(accounts.ProviderClaude, "a")] != 2 || debits[ScoreKey(accounts.ProviderCodex, "a")] != 1 {
+		t.Fatalf("debits = %v", debits)
+	}
+	// A failed refresh keeps the debits (the stale snapshot still applies)...
+	ref.FinishRefresh(Scheduler{}, false)
+	if ref.LiveDebits() == nil {
+		t.Fatal("failed refresh must keep live debits")
+	}
+	// ...a successful one supersedes them.
+	ref.FinishRefresh(NewScheduler(nil), true)
+	if ref.LiveDebits() != nil {
+		t.Fatal("fresh refresh must clear live debits")
+	}
+}

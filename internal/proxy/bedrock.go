@@ -131,6 +131,10 @@ const bedrockFableModelID = "us.anthropic.claude-fable-5"
 // recorded like the /bedrock/* gateway path.
 func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*http.Response, error) {
 	cfg := s.Bedrock
+	// Bedrock's Anthropic schema rejects OAuth-only request fields with a 400
+	// ("context_management: Extra inputs are not permitted"), which used to
+	// push every context-editing Claude Code request straight to the API key.
+	body = stripClaudeUnsupportedFields(body)
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
@@ -188,6 +192,16 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	// Non-stream success or any error status: Bedrock answers Anthropic-format JSON.
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, replayablePostMaxBodyBytes))
 	_ = resp.Body.Close()
+	if (resp.StatusCode < 200 || resp.StatusCode >= 300) && s.Logger != nil {
+		// Error bodies only (no user content): without this the concrete
+		// Bedrock failure ("Too many tokens...", validation errors) is
+		// invisible once the chain falls through to the API key.
+		preview := respBody
+		if len(preview) > 512 {
+			preview = preview[:512]
+		}
+		s.Logger.Warn("claude-fable bedrock error response", "status", resp.StatusCode, "bedrock_source", sourceName, "body", string(preview))
+	}
 	usage, haveUsage := parseBedrockInvokeUsage(respBody)
 	s.recordClaudeFableBedrockCost(started, resp.StatusCode, usage, haveUsage)
 	return &http.Response{

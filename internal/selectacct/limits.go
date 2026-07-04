@@ -141,3 +141,20 @@ func clampPercent(value float64) float64 {
 		return value
 	}
 }
+
+// VelocityProjectionMinutes is how far ahead a refresh-delta velocity signal
+// projects headroom (kept for the experiment's comparison policies), and
+// LiveDebitPerRequest is the assumed cost of one routed request as a fraction
+// of an account's short window: Pick debits the snapshot headroom by it for
+// every request the proxy itself routed to the account since the last usage
+// refresh, so concurrent fleets spread across accounts instead of herding
+// onto the snapshot's single best account until it cooks. Deliberately an
+// over-estimate (real mean is ~0.3%): the experiment shows 2% minimizes
+// user-visible failovers (-31% vs no debit), with degradation on both sides
+// (0.6%: -23%, 5%: -27%, 10%: -22%). Chosen by TestVelocityPolicyExperiment
+// (a deterministic 24h 3-user/19-thread fleet-burst workload over 24 seeds);
+// rerun with -v when tuning.
+const (
+	VelocityProjectionMinutes = 20.0
+	LiveDebitPerRequest       = 0.020
+)

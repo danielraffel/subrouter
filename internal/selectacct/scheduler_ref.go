@@ -18,6 +18,11 @@ type SchedulerRef struct {
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
+	// routedSinceRefresh counts requests the proxy routed per account (by
+	// ScoreKey) since the last successful usage refresh. Pick debits headroom
+	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
+	// instead of herding onto the snapshot's best account until it cooks.
+	routedSinceRefresh map[string]int
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
@@ -191,9 +196,45 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 	if update {
 		r.scheduler = scheduler
 		r.retainExhaustedExpiriesLocked()
+		// Fresh scores supersede the live debits accumulated against the old
+		// snapshot. A failed refresh (update=false) keeps them: the snapshot
+		// is still the old one, so its debits still apply.
+		r.routedSinceRefresh = nil
 	}
 	r.updatedAt = time.Now()
 	r.refreshing = false
+}
+
+// NoteRouted records that one request was routed to the account, debiting its
+// live score until the next successful usage refresh.
+func (r *SchedulerRef) NoteRouted(provider accounts.Provider, accountID string) {
+	if r == nil || accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.routedSinceRefresh == nil {
+		r.routedSinceRefresh = make(map[string]int)
+	}
+	r.routedSinceRefresh[ScoreKey(provider, accountID)]++
+}
+
+// LiveDebits returns the per-account routed-request counts since the last
+// successful refresh, for Scheduler.WithLiveDebits.
+func (r *SchedulerRef) LiveDebits() map[string]int {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.routedSinceRefresh) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(r.routedSinceRefresh))
+	for key, count := range r.routedSinceRefresh {
+		out[key] = count
+	}
+	return out
 }
 
 func (r *SchedulerRef) Touch() {

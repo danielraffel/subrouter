@@ -1108,7 +1108,7 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 	limitWindows := make([]selectacct.LimitWindow, 0, len(windows)*2)
 	hasFableWindow := false
 	for _, window := range windows {
-		if window.Feature == agentclaude.FableModel || window.Name == agentclaude.FableWindowName {
+		if window.Feature == agentclaude.FableFeature || window.Feature == agentclaude.FableModel || window.Name == agentclaude.FableWindowName {
 			hasFableWindow = true
 			break
 		}
@@ -1127,7 +1127,7 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 				UsedPercent:        window.UsedPercent,
 				LimitWindowSeconds: window.LimitWindowSeconds,
 				ResetAfterSeconds:  window.ResetAfterSeconds,
-				Feature:            agentclaude.FableModel,
+				Feature:            agentclaude.FableFeature,
 			})
 		}
 	}
@@ -1312,7 +1312,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		}
 		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization, LimitWindowSeconds: windowSeconds}
 		if name == agentclaude.FableWindowName {
-			window.Feature = agentclaude.FableModel
+			window.Feature = agentclaude.FableFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			seconds := int64(time.Until(reset).Seconds())

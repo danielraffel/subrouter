@@ -2,6 +2,7 @@ package selectacct
 
 import (
 	"errors"
+	"math"
 	"sort"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -29,6 +30,7 @@ type Score struct {
 type Scheduler struct {
 	scores        map[string]Score
 	sessionCounts map[string]int
+	liveDebits    map[string]int
 }
 
 const MinNewSessionHeadroom = 0.40
@@ -59,6 +61,7 @@ func (s Scheduler) WithScore(score Score) Scheduler {
 	next := Scheduler{
 		scores:        make(map[string]Score, len(s.scores)+1),
 		sessionCounts: s.sessionCounts,
+		liveDebits:    s.liveDebits,
 	}
 	for key, existing := range s.scores {
 		next.scores[key] = existing
@@ -71,6 +74,7 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 	next := Scheduler{
 		scores:        s.scores,
 		sessionCounts: map[string]int{},
+		liveDebits:    s.liveDebits,
 	}
 	for accountID, count := range counts {
 		next.sessionCounts[accountID] = count
@@ -91,6 +95,7 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	next := Scheduler{
 		scores:        make(map[string]Score, len(s.scores)),
 		sessionCounts: s.sessionCounts,
+		liveDebits:    s.liveDebits,
 	}
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
@@ -186,6 +191,15 @@ func (s Scheduler) ScoreFor(provider accounts.Provider, accountID string) Score 
 	return Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 }
 
+// WithLiveDebits attaches per-account routed-request counts accumulated since
+// the last usage refresh. score() debits LiveDebitPerRequest of headroom per
+// routed request, so between refreshes the scheduler sees its OWN traffic
+// draining the snapshot instead of herding every pick onto the same account.
+// Keys are ScoreKey(provider, accountID).
+func (s Scheduler) WithLiveDebits(debits map[string]int) Scheduler {
+	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits}
+}
+
 func (s Scheduler) score(provider accounts.Provider, accountID string) Score {
 	score, ok := s.scores[ScoreKey(provider, accountID)]
 	if !ok {
@@ -193,6 +207,20 @@ func (s Scheduler) score(provider accounts.Provider, accountID string) Score {
 	}
 	if s.sessionCounts != nil {
 		score.Sessions = s.sessionCounts[accountID]
+	}
+	if count := s.liveDebits[ScoreKey(provider, accountID)]; count > 0 {
+		// A soft, self-correcting signal: it reorders picks and can push an
+		// account below the new-session threshold, but never onto (or off of)
+		// the exhaustion floor: routing our own optimism into an account is
+		// recoverable; falsely marking it exhausted, or resurrecting a
+		// genuinely exhausted one, is not.
+		debit := LiveDebitPerRequest * float64(count)
+		if score.Headroom > 0.01 {
+			score.Headroom = math.Max(0.01, score.Headroom-debit)
+		}
+		if score.ShortHeadroom > 0.01 {
+			score.ShortHeadroom = math.Max(0.01, score.ShortHeadroom-debit)
+		}
 	}
 	return score
 }
