@@ -73,6 +73,17 @@ func newCLIFileLogHandler(path string) slog.Handler {
 	return slog.NewTextHandler(file, opts)
 }
 
+// envTrue reports whether an environment variable is set to a truthy value
+// ("1", "true", "yes", "on", case-insensitive).
+func envTrue(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func run(args []string) error {
 	return runForProgram("subrouter", args)
 }
@@ -182,6 +193,7 @@ func serve(args []string) error {
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
 	bedrockProfiles := flags.String("bedrock-profiles", "", "comma-separated AWS profiles for the Bedrock gateway; defaults to SUBROUTER_BEDROCK_PROFILES or discovered awN profiles")
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
+	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -298,25 +310,26 @@ func serve(args []string) error {
 	})
 
 	server := proxy.Server{
-		Upstream:          upstream,
-		CodexUpstream:     codexUpstream,
-		APIUpstream:       apiUpstream,
-		ClaudeUpstream:    claudeUpstream,
-		KimiUpstream:      kimiUpstream,
-		ZAIUpstream:       zaiUpstream,
-		Accounts:          nil,
-		AccountRef:        accountRef,
-		Sessions:          store,
-		SchedulerRef:      schedulerRef,
-		UsageScoreTTL:     usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
-		Transport:         outboundTransport,
-		Logger:            slog.Default(),
-		Lifecycle:         proxy.NewLifecycle(),
-		AdminToken:        *adminToken,
-		MaxBodyBytes:      *maxBodyBytes,
-		Bedrock:           bedrockConfig,
-		ClaudeFableAPIKey: strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
-		Transcripts:       transcript.NewRecorder(*transcriptDir),
+		Upstream:            upstream,
+		CodexUpstream:       codexUpstream,
+		APIUpstream:         apiUpstream,
+		ClaudeUpstream:      claudeUpstream,
+		KimiUpstream:        kimiUpstream,
+		ZAIUpstream:         zaiUpstream,
+		Accounts:            nil,
+		AccountRef:          accountRef,
+		Sessions:            store,
+		SchedulerRef:        schedulerRef,
+		UsageScoreTTL:       usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		Transport:           outboundTransport,
+		Logger:              slog.Default(),
+		Lifecycle:           proxy.NewLifecycle(),
+		AdminToken:          *adminToken,
+		MaxBodyBytes:        *maxBodyBytes,
+		Bedrock:             bedrockConfig,
+		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
+		FableBedrockPrimary: *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
+		Transcripts:         transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,

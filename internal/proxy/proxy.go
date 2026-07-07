@@ -65,6 +65,13 @@ type Server struct {
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
 	// touch this key.
 	ClaudeFableAPIKey string
+	// FableBedrockPrimary, when true, routes Claude Fable requests to AWS Bedrock
+	// FIRST, before the subscription pool, instead of using Bedrock only as a
+	// fallback. It only takes effect when the Bedrock gateway is configured; a
+	// non-2xx Bedrock response (or an unreachable Bedrock) falls through to the
+	// normal pool path, which keeps its own Bedrock/API-key fallback. Applies
+	// ONLY to Fable; other Claude models are unaffected.
+	FableBedrockPrimary bool
 }
 
 type ActiveSessions struct {
@@ -1648,6 +1655,15 @@ func (s Server) proxyHandler() http.Handler {
 			requestPoolModel = claudePoolModel(requestModel)
 			fableFallbackConfigured = s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
+		}
+		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
+		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
+		// the body and falls through to the normal pool path (which still carries
+		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
+		if s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
+			if s.serveClaudeFableBedrockPrimary(w, r) {
+				return
+			}
 		}
 		sessionAgentType := agentTypeForProviderSession(agentType, requestProvider)
 		account, sessionID, userEmail, err := s.accountForSessionProvider(requestProvider, sessionAgentType, sessionID, r)
