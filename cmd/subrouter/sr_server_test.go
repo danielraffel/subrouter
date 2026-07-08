@@ -94,11 +94,18 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 		out:    &out,
 		errOut: &out,
 		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Path != "/_subrouter/usage-status" {
-				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
-			}
 			if got := req.Header.Get("Authorization"); got != "Bearer secret-token" {
 				t.Fatalf("Authorization = %q", got)
+			}
+			if req.URL.Path == "/_subrouter/bedrock-cost" {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader([]byte(`{"requests":0,"throttled":0}`))),
+				}, nil
+			}
+			if req.URL.Path != "/_subrouter/usage-status" {
+				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
 			}
 			body, _ := json.Marshal([]remoteServerUsageStatus{{
 				ID:                 "acct@example.com",
@@ -305,6 +312,15 @@ func TestSRDefaultOutputUsesDefaultRemoteServerStatus(t *testing.T) {
 		out:     &out,
 		errOut:  &out,
 		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			// status also queries bedrock-cost for the spend/rate-limit block;
+			// return an empty summary so it stays silent here.
+			if req.URL.Path == "/_subrouter/bedrock-cost" {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(bytes.NewReader([]byte(`{"requests":0,"throttled":0}`))),
+				}, nil
+			}
 			if req.URL.Path != "/_subrouter/usage-status" {
 				t.Fatalf("path = %s, want /_subrouter/usage-status", req.URL.Path)
 			}

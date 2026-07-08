@@ -31,6 +31,54 @@ type bedrockCostSummaryView struct {
 	ByModel          map[string]bedrockModelAggView `json:"by_model"`
 }
 
+// fetchBedrockSummary pulls the server's AWS Bedrock cost/throttle summary.
+func (r srRunner) fetchBedrockSummary(ctx context.Context, server srServerConfig) (bedrockCostSummaryView, error) {
+	var summary bedrockCostSummaryView
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/bedrock-cost", nil)
+	if err != nil {
+		return summary, err
+	}
+	addServerAdminAuth(req, server)
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return summary, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return summary, fmt.Errorf("bedrock cost fetch failed: %s", res.Status)
+	}
+	if err := json.NewDecoder(res.Body).Decode(&summary); err != nil {
+		return summary, err
+	}
+	return summary, nil
+}
+
+// printBedrockStatus appends a compact AWS Bedrock spend + rate-limit block to
+// `sr` status. It stays silent on servers with no Bedrock activity (or old
+// servers missing the endpoint) so it never clutters non-Bedrock status output.
+func (r srRunner) printBedrockStatus(ctx context.Context, server srServerConfig) {
+	summary, err := r.fetchBedrockSummary(ctx, server)
+	if err != nil {
+		return
+	}
+	if summary.Requests == 0 && summary.Throttled == 0 {
+		return
+	}
+	fmt.Fprintln(r.out)
+	fmt.Fprintf(r.out, "AWS Bedrock spend     today $%s · 7d $%s · 30d $%s · all-time $%s (%d req)\n",
+		fmtUSD4(summary.TodayUSD), fmtUSD4(summary.Week7dUSD), fmtUSD4(summary.Month30dUSD),
+		fmtUSD4(summary.TotalUSD), summary.Requests)
+	limits := fmt.Sprintf("throttled(429) %d", summary.Throttled)
+	if summary.Throttled > 0 && summary.LastThrottle != "" {
+		limits += " · last " + summary.LastThrottle
+	}
+	fmt.Fprintf(r.out, "AWS Bedrock limits    %s\n", limits)
+}
+
 // spend reports AWS Bedrock spend tracked by the default Subrouter server.
 func (r srRunner) spend(ctx context.Context) error {
 	server, ok, err := r.defaultRemoteServer()
@@ -40,25 +88,8 @@ func (r srRunner) spend(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("sr spend needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/bedrock-cost", nil)
+	summary, err := r.fetchBedrockSummary(ctx, server)
 	if err != nil {
-		return err
-	}
-	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("bedrock cost fetch failed: %s", res.Status)
-	}
-	var summary bedrockCostSummaryView
-	if err := json.NewDecoder(res.Body).Decode(&summary); err != nil {
 		return err
 	}
 
