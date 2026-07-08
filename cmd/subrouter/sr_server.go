@@ -523,6 +523,7 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 		rows := usageRowsFromServerUsageStatuses(usage)
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
 		displayUsageRows(r.out, rows, false)
+		r.printBedrockStatus(ctx, server)
 		return nil
 	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)
