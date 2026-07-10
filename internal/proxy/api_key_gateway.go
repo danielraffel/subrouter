@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"crypto/subtle"
+	"errors"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
@@ -150,12 +152,13 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		query := proxyRequest.URL.Query()
 		query.Del("key")
 		query.Del("api_key")
+		query.Del("access_token")
+		query.Del("oauth_token")
 		proxyRequest.URL.RawQuery = query.Encode()
 		proxyRequest.Header.Del("Authorization")
 		proxyRequest.Header.Del("X-Api-Key")
-		if spec.auth == apiKeyGatewayBearer {
-			stripOpenAIWebSocketCredential(proxyRequest.Header)
-		}
+		proxyRequest.Header.Del("X-Goog-Api-Key")
+		stripOpenAIWebSocketCredential(proxyRequest.Header)
 		for _, header := range spec.stripHeaders {
 			proxyRequest.Header.Del(header)
 		}
@@ -195,6 +198,46 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		}
 		rp.ServeHTTP(w, proxyRequest)
 	})
+}
+
+func (s Server) validateReloadedGatewayCredentials(loaded []accounts.Account) error {
+	providerKeys := []string{s.ClaudeFableAPIKey}
+	gatewayTokens := make([]string, 0, 4)
+	if s.Gemini != nil {
+		providerKeys = append(providerKeys, s.Gemini.APIKey)
+		gatewayTokens = append(gatewayTokens, s.Gemini.GatewayToken)
+	}
+	if s.AnthropicGateway != nil {
+		providerKeys = append(providerKeys, s.AnthropicGateway.APIKey)
+		gatewayTokens = append(gatewayTokens, s.AnthropicGateway.GatewayToken)
+	}
+	if s.OpenAIGateway != nil {
+		providerKeys = append(providerKeys, s.OpenAIGateway.APIKey)
+		gatewayTokens = append(gatewayTokens, s.OpenAIGateway.GatewayToken)
+	}
+	if s.Bedrock != nil {
+		gatewayTokens = append(gatewayTokens, s.Bedrock.GatewayToken)
+	}
+	for _, account := range loaded {
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			providerKeys = append(providerKeys, account.Token)
+		}
+	}
+	for _, providerKey := range providerKeys {
+		providerKey = strings.TrimSpace(providerKey)
+		if providerKey == "" {
+			continue
+		}
+		if adminToken := strings.TrimSpace(s.AdminToken); adminToken != "" && providerKey == adminToken {
+			return errors.New("reloaded provider key conflicts with the admin token")
+		}
+		for _, gatewayToken := range gatewayTokens {
+			if providerKey == strings.TrimSpace(gatewayToken) {
+				return errors.New("reloaded provider key conflicts with a gateway token")
+			}
+		}
+	}
+	return nil
 }
 
 func gatewayMethodCanReflectCredentials(method string) bool {

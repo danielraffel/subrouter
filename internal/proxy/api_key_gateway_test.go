@@ -35,7 +35,7 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 	}{
 		{
 			name:         "anthropic",
-			path:         "/anthropic/v1/messages?beta=true&trace=a%2Fb&api_key=remove-me",
+			path:         "/anthropic/v1/messages?beta=true&trace=a%2Fb&api_key=remove-me&access_token=remove-oauth&oauth_token=remove-legacy",
 			wantPath:     "/v1/messages",
 			wantQuery:    "beta=true&trace=a%2Fb",
 			gatewayToken: "anthropic-team-token",
@@ -51,7 +51,7 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 		},
 		{
 			name:         "openai",
-			path:         "/api/v1/responses?include=usage&trace=a%2Fb&key=remove-me",
+			path:         "/api/v1/responses?include=usage&trace=a%2Fb&key=remove-me&access_token=remove-oauth&oauth_token=remove-legacy",
 			wantPath:     "/v1/responses",
 			wantQuery:    "include=usage&trace=a%2Fb",
 			gatewayToken: "openai-team-token",
@@ -101,6 +101,8 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 				idempotencyKey   string
 				requestID        string
 				adminToken       string
+				googAPIKey       string
+				wsProtocols      string
 			}
 			captured := make(chan capturedRequest, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +123,8 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 					idempotencyKey:   r.Header.Get("Idempotency-Key"),
 					requestID:        r.Header.Get("X-Request-ID"),
 					adminToken:       r.Header.Get("X-Subrouter-Admin-Token"),
+					googAPIKey:       r.Header.Get("X-Goog-Api-Key"),
+					wsProtocols:      r.Header.Get("Sec-WebSocket-Protocol"),
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("X-Request-ID", "request-123")
@@ -149,6 +153,8 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 			req.Header.Set("Idempotency-Key", "idem-123")
 			req.Header.Set("X-Request-ID", "client-request-123")
 			req.Header.Set("X-Subrouter-Admin-Token", "admin-secret")
+			req.Header.Set("X-Goog-Api-Key", "gemini-team-token")
+			req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key.openai-team-token")
 			rec := httptest.NewRecorder()
 			server.Handler().ServeHTTP(rec, req)
 
@@ -173,6 +179,9 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 			}
 			if got.adminToken != "" {
 				t.Fatalf("Subrouter admin token leaked upstream")
+			}
+			if got.googAPIKey != "" || strings.Contains(got.wsProtocols, openAIWebSocketCredentialPrefix) {
+				t.Fatalf("cross-gateway credential leaked upstream: X-Goog-Api-Key=%q protocols=%q", got.googAPIKey, got.wsProtocols)
 			}
 			if test.name == "openai" && (got.organization != "" || got.project != "") {
 				t.Fatalf("OpenAI tenant headers leaked upstream: organization=%q project=%q", got.organization, got.project)
@@ -361,6 +370,26 @@ func TestAPIKeyGatewaysFailClosed(t *testing.T) {
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("upstream requests = %d", got)
+	}
+}
+
+func TestReloadedAccountsCannotCollideWithGatewayCredentials(t *testing.T) {
+	t.Parallel()
+
+	server := Server{
+		AdminToken:       "admin-token",
+		OpenAIGateway:    &APIKeyGatewayConfig{APIKey: "openai-provider", GatewayToken: "openai-team"},
+		AnthropicGateway: &APIKeyGatewayConfig{APIKey: "anthropic-provider", GatewayToken: "anthropic-team"},
+	}
+	for _, token := range []string{"admin-token", "openai-team", "anthropic-team"} {
+		loaded := []accounts.Account{{AuthMode: accounts.AuthModeAPIKey, Token: token}}
+		if err := server.validateReloadedGatewayCredentials(loaded); err == nil {
+			t.Fatalf("reloaded provider key %q did not collide", token)
+		}
+	}
+	loaded := []accounts.Account{{AuthMode: accounts.AuthModeAPIKey, Token: "separate-provider"}}
+	if err := server.validateReloadedGatewayCredentials(loaded); err != nil {
+		t.Fatalf("separate reloaded provider key rejected: %v", err)
 	}
 }
 

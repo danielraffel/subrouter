@@ -333,9 +333,14 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	adminKeys, err := codexStore.ListAdminKeys()
-	if err != nil {
-		return err
+	var adminKeys []accounts.AdminKeyEntry
+	gatewayTokensConfigured := geminiGatewayToken != "" || anthropicGatewayToken != "" || openAIGatewayToken != "" ||
+		(*bedrockEnable && resolvedBedrockGatewayToken != "")
+	if gatewayTokensConfigured {
+		adminKeys, err = codexStore.ListAdminKeys()
+		if err != nil {
+			return err
+		}
 	}
 	claudeAccounts, err := agentclaude.DefaultStore().ListAccounts(context.Background())
 	if err != nil {
@@ -347,11 +352,15 @@ func serve(args []string) error {
 		return err
 	}
 	inheritedListener := listenEnvSet && listenPID == os.Getpid() && listenFDCount > 0
+	bedrockGatewayTokenForValidation := ""
+	if *bedrockEnable {
+		bedrockGatewayTokenForValidation = resolvedBedrockGatewayToken
+	}
 	gatewayCredentials := []teamGatewayCredential{
 		{providerKey: geminiAPIKey, gatewayToken: geminiGatewayToken},
 		{providerKey: anthropicAPIKey, gatewayToken: anthropicGatewayToken},
 		{providerKey: openAIAPIKey, gatewayToken: openAIGatewayToken},
-		{gatewayToken: resolvedBedrockGatewayToken, enabled: *bedrockEnable},
+		{gatewayToken: bedrockGatewayTokenForValidation, enabled: *bedrockEnable},
 		{providerKey: claudeFableAPIKey},
 	}
 	for _, account := range append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...) {

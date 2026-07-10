@@ -319,6 +319,10 @@ func (r *AccountRef) All() []accounts.Account {
 }
 
 func (r *AccountRef) Reload() ([]accounts.Account, error) {
+	return r.ReloadValidated(nil)
+}
+
+func (r *AccountRef) ReloadValidated(validate func([]accounts.Account) error) ([]accounts.Account, error) {
 	if r == nil {
 		return nil, nil
 	}
@@ -331,6 +335,11 @@ func (r *AccountRef) Reload() ([]accounts.Account, error) {
 		return nil, err
 	}
 	loaded = append(loaded, claudeAccounts...)
+	if validate != nil {
+		if err := validate(loaded); err != nil {
+			return nil, err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
@@ -1188,7 +1197,7 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	if s.AccountRef == nil {
 		return 0, 0, fmt.Errorf("account reload is not configured")
 	}
-	loaded, err := s.AccountRef.Reload()
+	loaded, err := s.AccountRef.ReloadValidated(s.validateReloadedGatewayCredentials)
 	if err != nil {
 		return 0, 0, err
 	}
