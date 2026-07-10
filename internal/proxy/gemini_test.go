@@ -31,7 +31,7 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		if got := r.Header.Get("X-Subrouter-Session"); got != "" {
 			t.Fatalf("X-Subrouter-Session leaked upstream: %q", got)
 		}
-		w.Header().Set("X-Goog-Upload-Url", "https://upload.example/session")
+		w.Header().Set("X-Goog-Upload-Url", "http://"+r.Host+"/upload/v1beta/files?upload_id=abc")
 		_, _ = io.WriteString(w, r.URL.Path)
 	}))
 	defer upstream.Close()
@@ -66,7 +66,7 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		if got := strings.TrimSpace(rec.Body.String()); got != strings.TrimPrefix(path, "/gemini") {
 			t.Fatalf("%s upstream path = %q", path, got)
 		}
-		if got := rec.Header().Get("X-Goog-Upload-Url"); got != "https://upload.example/session" {
+		if got := rec.Header().Get("X-Goog-Upload-Url"); got != "http://example.com/upload/v1beta/files?upload_id=abc" {
 			t.Fatalf("upload URL = %q", got)
 		}
 	}

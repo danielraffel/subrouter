@@ -72,6 +72,10 @@ func (s Server) geminiHandler() http.Handler {
 			},
 			Transport: s.Gemini.Transport,
 		}
+		rp.ModifyResponse = func(response *http.Response) error {
+			rewriteGeminiUploadURL(response.Header, upstream, r)
+			return nil
+		}
 		if rp.Transport == nil {
 			rp.Transport = s.transport()
 		}
@@ -90,6 +94,24 @@ func (s Server) geminiHandler() http.Handler {
 		}
 		rp.ServeHTTP(w, proxyRequest)
 	})
+}
+
+func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *http.Request) {
+	raw := strings.TrimSpace(headers.Get("X-Goog-Upload-Url"))
+	if raw == "" || upstream == nil || request == nil || request.Host == "" {
+		return
+	}
+	uploadURL, err := url.Parse(raw)
+	if err != nil || !uploadURL.IsAbs() || !strings.EqualFold(uploadURL.Host, upstream.Host) {
+		return
+	}
+	scheme := "http"
+	if request.TLS != nil {
+		scheme = "https"
+	}
+	uploadURL.Scheme = scheme
+	uploadURL.Host = request.Host
+	headers.Set("X-Goog-Upload-Url", uploadURL.String())
 }
 
 func authorizeGeminiGateway(r *http.Request, configuredToken string) bool {
