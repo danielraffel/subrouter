@@ -39,7 +39,7 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 		return &http.Response{
 			StatusCode: 200,
 			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "Set-Cookie": []string{"provider-session=secret"}},
 		}, nil
 	})
 	s := Server{Bedrock: &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt}}
@@ -51,6 +51,7 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 	req.Header.Set("X-Api-Key", "anthropic-team")
 	req.Header.Set("X-Goog-Api-Key", "gemini-team")
 	req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key.openai-team")
+	req.Header.Set("Cookie", "gateway-session=secret")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -81,6 +82,9 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 	}
 	if captured.Header.Get("X-Api-Key") != "" || captured.Header.Get("X-Goog-Api-Key") != "" || captured.Header.Get("Sec-WebSocket-Protocol") != "" {
 		t.Fatal("cross-gateway credential leaked to Bedrock")
+	}
+	if captured.Header.Get("Cookie") != "" || rec.Header().Get("Set-Cookie") != "" {
+		t.Fatal("cookie crossed Bedrock gateway boundary")
 	}
 	if capturedBody != `{"anthropic_version":"bedrock-2023-05-31"}` {
 		t.Fatalf("forwarded body = %q", capturedBody)

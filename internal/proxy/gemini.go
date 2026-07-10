@@ -78,6 +78,7 @@ func (s Server) geminiHandler() http.Handler {
 		proxyRequest := r.Clone(r.Context())
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = stripProviderPathPrefix(proxyRequest.URL.Path, "gemini")
+		proxyRequest.URL.Path = stripDuplicateGatewayVersionPrefix(upstream.Path, proxyRequest.URL.Path)
 		proxyRequest.URL.RawPath = ""
 		joinedUpstreamPath := joinGatewayUpstreamPath(upstream.Path, proxyRequest.URL.Path)
 		if gatewayPathIsUnsafe(&url.URL{Path: joinedUpstreamPath}) {
@@ -99,6 +100,7 @@ func (s Server) geminiHandler() http.Handler {
 		proxyRequest.URL.RawQuery = query.Encode()
 		proxyRequest.Header.Del("Authorization")
 		proxyRequest.Header.Del("X-Api-Key")
+		proxyRequest.Header.Del("Cookie")
 		proxyRequest.Header.Del("X-Goog-User-Project")
 		stripOpenAIWebSocketCredential(proxyRequest.Header)
 		proxyRequest.Header.Set("X-Goog-Api-Key", strings.TrimSpace(s.Gemini.APIKey))
@@ -116,6 +118,7 @@ func (s Server) geminiHandler() http.Handler {
 			Transport: s.Gemini.Transport,
 		}
 		rp.ModifyResponse = func(response *http.Response) error {
+			response.Header.Del("Set-Cookie")
 			return rewriteGeminiUploadURLs(response.Header, upstream, s.Gemini.PublicURL, r, s.Gemini.GatewayToken)
 		}
 		if rp.Transport == nil {

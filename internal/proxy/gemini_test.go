@@ -37,6 +37,9 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		if got := r.Header.Get("Sec-WebSocket-Protocol"); strings.Contains(got, openAIWebSocketCredentialPrefix) {
 			t.Fatalf("OpenAI WebSocket credential leaked upstream: %q", got)
 		}
+		if got := r.Header.Get("Cookie"); got != "" {
+			t.Fatalf("gateway cookie leaked upstream: %q", got)
+		}
 		if r.URL.Query().Get("$userProject") != "" {
 			t.Fatalf("Google billing project leaked upstream")
 		}
@@ -54,6 +57,7 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		}
 		w.Header().Set("X-Goog-Upload-Url", "http://"+r.Host+"/upload/v1beta/files?upload_id=abc")
 		w.Header().Set("X-Goog-Upload-Control-Url", "http://"+r.Host+"/upload/v1beta/files?key=provider-secret&upload_id=abc")
+		w.Header().Set("Set-Cookie", "provider-session=secret")
 		_, _ = io.WriteString(w, r.URL.Path)
 	}))
 	defer upstream.Close()
@@ -84,6 +88,7 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		req.Header.Set("X-Goog-User-Project", "client-project")
 		req.Header.Set("X-Api-Key", "anthropic-team")
 		req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key.openai-team")
+		req.Header.Set("Cookie", "gateway-session=secret")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -94,6 +99,9 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		}
 		requireGeminiUploadCapabilityURL(t, rec.Header().Get("X-Goog-Upload-Url"), "http", "example.com", "/gemini/upload/v1beta/files", "team-token")
 		requireGeminiUploadCapabilityURL(t, rec.Header().Get("X-Goog-Upload-Control-Url"), "http", "example.com", "/gemini/upload/v1beta/files", "team-token")
+		if got := rec.Header().Get("Set-Cookie"); got != "" {
+			t.Fatalf("provider cookie leaked to client: %q", got)
+		}
 	}
 	if got := requests.Load(); got != 5 {
 		t.Fatalf("upstream requests = %d", got)

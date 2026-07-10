@@ -103,6 +103,7 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 				adminToken       string
 				googAPIKey       string
 				wsProtocols      string
+				cookie           string
 			}
 			captured := make(chan capturedRequest, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -125,9 +126,11 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 					adminToken:       r.Header.Get("X-Subrouter-Admin-Token"),
 					googAPIKey:       r.Header.Get("X-Goog-Api-Key"),
 					wsProtocols:      r.Header.Get("Sec-WebSocket-Protocol"),
+					cookie:           r.Header.Get("Cookie"),
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("X-Request-ID", "request-123")
+				w.Header().Set("Set-Cookie", "provider-session=secret")
 				_, _ = io.WriteString(w, "data: first\n\ndata: second\n\n")
 			}))
 			defer upstream.Close()
@@ -159,6 +162,7 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 			req.Header.Set("X-Subrouter-Admin-Token", "admin-secret")
 			req.Header.Set("X-Goog-Api-Key", "gemini-team-token")
 			req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key.openai-team-token")
+			req.Header.Set("Cookie", "gateway-session=secret")
 			rec := httptest.NewRecorder()
 			server.Handler().ServeHTTP(rec, req)
 
@@ -187,6 +191,9 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 			if got.googAPIKey != "" || strings.Contains(got.wsProtocols, openAIWebSocketCredentialPrefix) {
 				t.Fatalf("cross-gateway credential leaked upstream: X-Goog-Api-Key=%q protocols=%q", got.googAPIKey, got.wsProtocols)
 			}
+			if got.cookie != "" || rec.Header().Get("Set-Cookie") != "" {
+				t.Fatalf("cookie crossed gateway boundary: request=%q response=%q", got.cookie, rec.Header().Get("Set-Cookie"))
+			}
 			if test.name == "openai" && (got.organization != "" || got.project != "") {
 				t.Fatalf("OpenAI tenant headers leaked upstream: organization=%q project=%q", got.organization, got.project)
 			}
@@ -209,6 +216,26 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStripDuplicateGatewayVersionPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		basePath    string
+		requestPath string
+		want        string
+	}{
+		{"/provider/v1", "/v1/models", "/models"},
+		{"/provider/v1beta", "/v1beta/models", "/models"},
+		{"/provider", "/v1/models", "/v1/models"},
+		{"/provider/v1", "/organization", "/organization"},
+	}
+	for _, test := range tests {
+		if got := stripDuplicateGatewayVersionPrefix(test.basePath, test.requestPath); got != test.want {
+			t.Fatalf("base=%q request=%q got=%q want=%q", test.basePath, test.requestPath, got, test.want)
+		}
 	}
 }
 
@@ -533,11 +560,13 @@ func TestGatewaysRejectAmbiguousPaths(t *testing.T) {
 		{"/api/v1/%252forganization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/api/v1/x/%252e%252e/organization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/api/v1/organization%252Fprojects/example", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/api/v1/%256frganization/projects/example", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/anthropic/%2e%2e/debug", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/anthropic/v1/%5corganizations/example", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/anthropic/v1%252Forganizations/example", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/gemini/%2e%2e/debug", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 		{"/gemini/x/%252e%252e/%252e%252e/admin", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
+		{"/gemini/%255fsubrouter/drain", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 	}
 	for _, test := range tests {
 		req := httptest.NewRequest(http.MethodGet, test.path, nil)

@@ -105,7 +105,7 @@ func (s Server) bedrockHandler() http.Handler {
 		defer resp.Body.Close()
 
 		for key, values := range resp.Header {
-			if isHopByHopHeader(key) {
+			if isHopByHopHeader(key) || strings.EqualFold(key, "Set-Cookie") {
 				continue
 			}
 			for _, value := range values {
@@ -746,7 +746,7 @@ func bedrockGatewayTokenOK(r *http.Request, token string) bool {
 func copyBedrockRequestHeaders(dst, src http.Header) {
 	for key, values := range src {
 		lower := strings.ToLower(key)
-		if isHopByHopHeader(key) || lower == "authorization" || lower == "host" || lower == "content-length" ||
+		if isHopByHopHeader(key) || lower == "authorization" || lower == "host" || lower == "content-length" || lower == "cookie" ||
 			lower == "x-api-key" || lower == "x-goog-api-key" || lower == "sec-websocket-protocol" {
 			continue
 		}

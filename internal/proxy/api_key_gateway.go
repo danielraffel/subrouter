@@ -148,6 +148,7 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		proxyRequest := r.Clone(r.Context())
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = stripGatewayPathPrefix(proxyRequest.URL.Path, spec.prefixes)
+		proxyRequest.URL.Path = stripDuplicateGatewayVersionPrefix(upstream.Path, proxyRequest.URL.Path)
 		proxyRequest.URL.RawPath = ""
 		joinedUpstreamPath := joinGatewayUpstreamPath(upstream.Path, proxyRequest.URL.Path)
 		if gatewayPathIsUnsafe(&url.URL{Path: joinedUpstreamPath}) {
@@ -173,6 +174,7 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		proxyRequest.Header.Del("Authorization")
 		proxyRequest.Header.Del("X-Api-Key")
 		proxyRequest.Header.Del("X-Goog-Api-Key")
+		proxyRequest.Header.Del("Cookie")
 		stripOpenAIWebSocketCredential(proxyRequest.Header)
 		if spec.auth == apiKeyGatewayXAPIKeyOrBearer {
 			removeCommaHeaderValue(proxyRequest.Header, "Anthropic-Beta", claudeOAuthBetaHeader)
@@ -197,6 +199,10 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 				stripOutboundForwardingHeaders(pr.Out.Header)
 			},
 			Transport: config.Transport,
+		}
+		rp.ModifyResponse = func(response *http.Response) error {
+			response.Header.Del("Set-Cookie")
+			return nil
 		}
 		if rp.Transport == nil {
 			rp.Transport = s.transport()
@@ -271,6 +277,39 @@ func joinGatewayUpstreamPath(basePath, requestPath string) string {
 	}
 }
 
+func stripDuplicateGatewayVersionPrefix(basePath, requestPath string) string {
+	baseVersion := pathLastSegment(basePath)
+	requestVersion := pathFirstSegment(requestPath)
+	if baseVersion == "" || baseVersion != requestVersion || !gatewayAPIVersionSegment(baseVersion) {
+		return requestPath
+	}
+	stripped := strings.TrimPrefix(requestPath, "/"+requestVersion)
+	if stripped == "" {
+		return "/"
+	}
+	return stripped
+}
+
+func pathLastSegment(value string) string {
+	value = strings.Trim(value, "/")
+	if index := strings.LastIndexByte(value, '/'); index >= 0 {
+		return value[index+1:]
+	}
+	return value
+}
+
+func pathFirstSegment(value string) string {
+	value = strings.TrimPrefix(value, "/")
+	if index := strings.IndexByte(value, '/'); index >= 0 {
+		return value[:index]
+	}
+	return value
+}
+
+func gatewayAPIVersionSegment(segment string) bool {
+	return segment == "v1" || segment == "v1beta" || segment == "v1alpha"
+}
+
 func gatewayPathUsesBlockedPrefix(requestPath, blockedPrefix string) bool {
 	if requestPath == blockedPrefix || strings.HasPrefix(requestPath, blockedPrefix+"/") {
 		return true
@@ -284,6 +323,10 @@ func gatewayMethodCanReflectCredentials(method string) bool {
 
 func gatewayPathIsUnsafe(requestURL *url.URL) bool {
 	if requestURL == nil {
+		return true
+	}
+	fullyDecodedPath, err := url.PathUnescape(requestURL.Path)
+	if err != nil || fullyDecodedPath != requestURL.Path {
 		return true
 	}
 	for _, candidate := range []string{requestURL.Path, requestURL.RawPath} {
