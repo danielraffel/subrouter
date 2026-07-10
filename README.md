@@ -357,15 +357,46 @@ Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Gene
 
 For a shared server, replace `127.0.0.1` with the server URL. Subrouter recognizes Claude Code traffic, selects a Claude OAuth account from its own store, strips API-key auth, and forwards to Anthropic with the OAuth beta header. Claude Code prompt caching does not require Subrouter-specific cache settings: Subrouter keeps the same Claude conversation pinned to the same Claude account when that account is still available, and forwards the client `Anthropic-Beta` values and request body `cache_control` blocks unchanged.
 
-Gemini has its own `sr gemini` namespace and a transparent Developer API gateway. Configure the server with `SUBROUTER_GEMINI_API_KEY`; official Gemini SDK clients use `http://<subrouter>:31415` as their base URL. The gateway replaces client credentials before forwarding Files and Interactions API requests, so teammates never receive the provider key. `/gemini/*` remains available as an explicit alias for raw HTTP clients.
+Subrouter exposes separate team API gateways without changing root subscription routing. Each gateway requires a server-owned provider key and a distinct client-facing token. The gateway stays disabled unless both are set.
 
-Set `SUBROUTER_GEMINI_GATEWAY_TOKEN` whenever the Gemini gateway is enabled. Clients present that token as `x-goog-api-key`; the gateway stays disabled when either credential is missing.
+| Provider | Client base URL | Client credential | Server configuration |
+|---|---|---|---|
+| Anthropic | `http://<subrouter>:31415/anthropic` | `x-api-key` or Bearer | `SUBROUTER_ANTHROPIC_API_KEY`, `SUBROUTER_ANTHROPIC_GATEWAY_TOKEN` |
+| OpenAI | `http://<subrouter>:31415/api/v1` | Bearer | `SUBROUTER_OPENAI_API_KEY`, `SUBROUTER_OPENAI_GATEWAY_TOKEN` |
+| Gemini | `http://<subrouter>:31415` | `x-goog-api-key` | `SUBROUTER_GEMINI_API_KEY`, `SUBROUTER_GEMINI_GATEWAY_TOKEN` |
+
+`/openai/v1/*` is an alias for `/api/v1/*`. `/gemini/*` is an alias for raw Gemini HTTP clients. Root `/v1/*` and `/responses` requests continue through subscription/account routing.
+Use `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, or `--gemini-upstream` to point a gateway at another API-compatible backend without changing root routing.
 
 ```bash
+SUBROUTER_ANTHROPIC_API_KEY=<anthropic-provider-key> \
+SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=<anthropic-team-token> \
+SUBROUTER_OPENAI_API_KEY=<openai-provider-key> \
+SUBROUTER_OPENAI_GATEWAY_TOKEN=<openai-team-token> \
 SUBROUTER_GEMINI_API_KEY=<provider-key> \
 SUBROUTER_GEMINI_GATEWAY_TOKEN=<team-token> \
 subrouter serve --addr 0.0.0.0:31415
+```
 
+Python SDK setup:
+
+```python
+from anthropic import Anthropic
+from openai import OpenAI
+
+anthropic = Anthropic(
+    api_key="<anthropic-team-token>",
+    base_url="http://subrouter-team:31415/anthropic",
+)
+openai = OpenAI(
+    api_key="<openai-team-token>",
+    base_url="http://subrouter-team:31415/api/v1",
+)
+```
+
+Gemini keeps its native root paths for SDK uploads. Raw HTTP clients can use:
+
+```bash
 curl -fsS http://subrouter-team:31415/gemini/v1beta/interactions \
   -H 'Content-Type: application/json' \
   -H 'x-goog-api-key: <team-token>' \

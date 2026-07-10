@@ -8,7 +8,7 @@ Use this checklist before putting a shared Subrouter on a tailnet or a public-fa
 - Keep `/_subrouter/health` unauthenticated for liveness checks.
 - Use `/_subrouter/ready` for readiness checks. It returns 503 while the process is draining.
 - Set `SUBROUTER_ADMIN_TOKEN` for any non-loopback listener. Sensitive admin endpoints then require `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`.
-- Set `SUBROUTER_GEMINI_GATEWAY_TOKEN` whenever the Gemini gateway is enabled. It protects the Gemini routes without exposing the provider key, and the gateway stays disabled when the token is missing.
+- Set a provider-specific `SUBROUTER_*_GATEWAY_TOKEN` whenever its API gateway is enabled. Gateways stay disabled when either the provider key or client-facing token is missing.
 
 ## Linux install
 
@@ -28,20 +28,24 @@ sr server add team \
   --default
 ```
 
-`install-systemd` preserves existing `SUBROUTER_ADMIN_TOKEN`, `SUBROUTER_GEMINI_API_KEY`, and `SUBROUTER_GEMINI_GATEWAY_TOKEN` values. When any secret is configured, `/etc/default/subrouter` is written with mode `0600`.
+`install-systemd` preserves existing admin, Gemini, Anthropic, and OpenAI provider/gateway credentials. When any secret is configured, `/etc/default/subrouter` is atomically replaced with mode `0600`.
 
-## Gemini gateway
+## Team API gateways
 
-Add the provider key and a separate client-facing gateway token to the service environment, then rerun the installer or restart the service:
+Add provider keys and separate client-facing tokens, then restart the service:
 
 ```bash
 sudo chmod 600 /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_ANTHROPIC_API_KEY=.*|SUBROUTER_ANTHROPIC_API_KEY="<anthropic-provider-key>"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=.*|SUBROUTER_ANTHROPIC_GATEWAY_TOKEN="<anthropic-team-token>"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_OPENAI_API_KEY=.*|SUBROUTER_OPENAI_API_KEY="<openai-provider-key>"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_OPENAI_GATEWAY_TOKEN=.*|SUBROUTER_OPENAI_GATEWAY_TOKEN="<openai-team-token>"|' /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_GEMINI_API_KEY=.*|SUBROUTER_GEMINI_API_KEY="<provider-key>"|' /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_GEMINI_GATEWAY_TOKEN=.*|SUBROUTER_GEMINI_GATEWAY_TOKEN="<team-token>"|' /etc/default/subrouter
 sudo systemctl restart subrouter
 ```
 
-The provider key is injected only upstream. Official Gemini SDK clients use `http://<server>:31415` as their base URL and send the gateway token as `x-goog-api-key`. The SDK requires native `/upload/v1beta/*` and `/v1beta/*` paths for resumable uploads; raw HTTP clients may also use the `/gemini/*` alias.
+Anthropic SDKs use `http://<server>:31415/anthropic`; OpenAI SDKs use `http://<server>:31415/api/v1` (`/openai/v1` is an alias). Gemini SDKs use `http://<server>:31415` because resumable uploads require native `/upload/v1beta/*` and `/v1beta/*` paths. Existing root `/v1/*` and `/responses` routes retain subscription/account routing. Override gateway destinations with `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, and `--gemini-upstream` without changing root provider routing.
 
 ## Transcripts
 

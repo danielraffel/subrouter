@@ -69,15 +69,19 @@ func TestSystemdSocketUsesConfiguredAddress(t *testing.T) {
 
 func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	config := systemdConfig{
-		Addr:             "0.0.0.0:31415",
-		Home:             "/var/lib/subrouter",
-		SessionsPath:     "/var/lib/subrouter/sessions.json",
-		TranscriptsDir:   "/var/lib/subrouter/transcripts",
-		SRSwitchInterval: "10m",
-		AdminToken:       "secret-token",
-		GeminiAPIKey:     "provider-key",
-		GeminiGatewayKey: "team-key",
-		ExtraArgs:        "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
+		Addr:                "0.0.0.0:31415",
+		Home:                "/var/lib/subrouter",
+		SessionsPath:        "/var/lib/subrouter/sessions.json",
+		TranscriptsDir:      "/var/lib/subrouter/transcripts",
+		SRSwitchInterval:    "10m",
+		AdminToken:          "secret-token",
+		GeminiAPIKey:        "provider-key",
+		GeminiGatewayKey:    "team-key",
+		AnthropicAPIKey:     "anthropic-provider-key",
+		AnthropicGatewayKey: "anthropic-team-key",
+		OpenAIAPIKey:        "openai-provider-key",
+		OpenAIGatewayKey:    "openai-team-key",
+		ExtraArgs:           "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
 	}
 	defaults := systemdDefaults(config)
 	if !strings.Contains(defaults, "SUBROUTER_STATE_DIR=/var/lib/subrouter") {
@@ -100,6 +104,16 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	}
 	if !strings.Contains(defaults, `SUBROUTER_GEMINI_GATEWAY_TOKEN="team-key"`) {
 		t.Fatalf("defaults did not quote Gemini gateway token:\n%s", defaults)
+	}
+	for _, want := range []string{
+		`SUBROUTER_ANTHROPIC_API_KEY="anthropic-provider-key"`,
+		`SUBROUTER_ANTHROPIC_GATEWAY_TOKEN="anthropic-team-key"`,
+		`SUBROUTER_OPENAI_API_KEY="openai-provider-key"`,
+		`SUBROUTER_OPENAI_GATEWAY_TOKEN="openai-team-key"`,
+	} {
+		if !strings.Contains(defaults, want) {
+			t.Fatalf("defaults missing %q:\n%s", want, defaults)
+		}
 	}
 }
 
@@ -172,6 +186,10 @@ func TestApplyExistingSystemdDefaultsPreservesTranscriptsDir(t *testing.T) {
 		"SUBROUTER_ADMIN_TOKEN=\"secret-token\"",
 		"SUBROUTER_GEMINI_API_KEY=\"provider-key\"",
 		"SUBROUTER_GEMINI_GATEWAY_TOKEN=\"team-key\"",
+		"SUBROUTER_ANTHROPIC_API_KEY=\"anthropic-provider-key\"",
+		"SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=\"anthropic-team-key\"",
+		"SUBROUTER_OPENAI_API_KEY=\"openai-provider-key\"",
+		"SUBROUTER_OPENAI_GATEWAY_TOKEN=\"openai-team-key\"",
 		`SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --transcript-gcs-sync-interval=5m"`,
 		"",
 	}, "\n")
@@ -198,6 +216,12 @@ func TestApplyExistingSystemdDefaultsPreservesTranscriptsDir(t *testing.T) {
 	}
 	if config.GeminiGatewayKey != "team-key" {
 		t.Fatalf("Gemini gateway token = %q, want preserved team-key", config.GeminiGatewayKey)
+	}
+	if config.AnthropicAPIKey != "anthropic-provider-key" || config.AnthropicGatewayKey != "anthropic-team-key" {
+		t.Fatalf("Anthropic credentials = %q / %q", config.AnthropicAPIKey, config.AnthropicGatewayKey)
+	}
+	if config.OpenAIAPIKey != "openai-provider-key" || config.OpenAIGatewayKey != "openai-team-key" {
+		t.Fatalf("OpenAI credentials = %q / %q", config.OpenAIAPIKey, config.OpenAIGatewayKey)
 	}
 	if !strings.Contains(config.ExtraArgs, "--transcript-gcs-uri=gs://bucket/prefix") {
 		t.Fatalf("extra args = %q, want preserved gcs uri", config.ExtraArgs)

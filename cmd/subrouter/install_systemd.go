@@ -19,23 +19,27 @@ import (
 const defaultSystemdServiceName = "subrouter"
 
 type systemdConfig struct {
-	ServiceName      string
-	User             string
-	Group            string
-	Home             string
-	Addr             string
-	InstallPath      string
-	SessionsPath     string
-	TranscriptsDir   string
-	SRSwitchInterval string
-	AdminToken       string
-	GeminiAPIKey     string
-	GeminiGatewayKey string
-	ExtraArgs        string
-	Start            bool
-	DryRun           bool
-	InstallAliases   bool
-	ReplaceLegacy    bool
+	ServiceName         string
+	User                string
+	Group               string
+	Home                string
+	Addr                string
+	InstallPath         string
+	SessionsPath        string
+	TranscriptsDir      string
+	SRSwitchInterval    string
+	AdminToken          string
+	GeminiAPIKey        string
+	GeminiGatewayKey    string
+	AnthropicAPIKey     string
+	AnthropicGatewayKey string
+	OpenAIAPIKey        string
+	OpenAIGatewayKey    string
+	ExtraArgs           string
+	Start               bool
+	DryRun              bool
+	InstallAliases      bool
+	ReplaceLegacy       bool
 }
 
 func installSystemd(args []string) error {
@@ -62,6 +66,10 @@ func installSystemd(args []string) error {
 	}
 	config.GeminiAPIKey = strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY"))
 	config.GeminiGatewayKey = strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN"))
+	config.AnthropicAPIKey = strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_API_KEY"))
+	config.AnthropicGatewayKey = strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN"))
+	config.OpenAIAPIKey = strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY"))
+	config.OpenAIGatewayKey = strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN"))
 	if runtime.GOOS != "linux" && !config.DryRun {
 		return errors.New("install-systemd is Linux-only")
 	}
@@ -130,7 +138,9 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		}
 	}
 	defaultMode := os.FileMode(0o644)
-	if config.AdminToken != "" || config.GeminiAPIKey != "" || config.GeminiGatewayKey != "" {
+	if config.AdminToken != "" || config.GeminiAPIKey != "" || config.GeminiGatewayKey != "" ||
+		config.AnthropicAPIKey != "" || config.AnthropicGatewayKey != "" ||
+		config.OpenAIAPIKey != "" || config.OpenAIGatewayKey != "" {
 		defaultMode = 0o600
 	}
 	if err := writeSystemdDefaults(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
@@ -275,6 +285,18 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	if config.GeminiGatewayKey == "" {
 		config.GeminiGatewayKey = readDefaultValue(defaultPath, "SUBROUTER_GEMINI_GATEWAY_TOKEN")
 	}
+	if config.AnthropicAPIKey == "" {
+		config.AnthropicAPIKey = readDefaultValue(defaultPath, "SUBROUTER_ANTHROPIC_API_KEY")
+	}
+	if config.AnthropicGatewayKey == "" {
+		config.AnthropicGatewayKey = readDefaultValue(defaultPath, "SUBROUTER_ANTHROPIC_GATEWAY_TOKEN")
+	}
+	if config.OpenAIAPIKey == "" {
+		config.OpenAIAPIKey = readDefaultValue(defaultPath, "SUBROUTER_OPENAI_API_KEY")
+	}
+	if config.OpenAIGatewayKey == "" {
+		config.OpenAIGatewayKey = readDefaultValue(defaultPath, "SUBROUTER_OPENAI_GATEWAY_TOKEN")
+	}
 }
 
 func readLegacySystemdExtraArgs() string {
@@ -354,8 +376,12 @@ SUBROUTER_SR_SWITCH_INTERVAL=%s
 SUBROUTER_ADMIN_TOKEN=%q
 SUBROUTER_GEMINI_API_KEY=%q
 SUBROUTER_GEMINI_GATEWAY_TOKEN=%q
+SUBROUTER_ANTHROPIC_API_KEY=%q
+SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=%q
+SUBROUTER_OPENAI_API_KEY=%q
+SUBROUTER_OPENAI_GATEWAY_TOKEN=%q
 SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.GeminiAPIKey, config.GeminiGatewayKey, config.ExtraArgs)
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.GeminiAPIKey, config.GeminiGatewayKey, config.AnthropicAPIKey, config.AnthropicGatewayKey, config.OpenAIAPIKey, config.OpenAIGatewayKey, config.ExtraArgs)
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

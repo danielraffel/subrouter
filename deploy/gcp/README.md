@@ -102,16 +102,20 @@ Health check:
 curl http://<tailscale-ip>:31415/_subrouter/health
 ```
 
-For Gemini clients, configure the VM once with the provider key and a separate team token:
+For team API clients, configure provider keys and separate team tokens:
 
 ```bash
 sudo chmod 600 /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_ANTHROPIC_API_KEY=.*|SUBROUTER_ANTHROPIC_API_KEY="<anthropic-provider-key>"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=.*|SUBROUTER_ANTHROPIC_GATEWAY_TOKEN="<anthropic-team-token>"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_OPENAI_API_KEY=.*|SUBROUTER_OPENAI_API_KEY="<openai-provider-key>"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_OPENAI_GATEWAY_TOKEN=.*|SUBROUTER_OPENAI_GATEWAY_TOKEN="<openai-team-token>"|' /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_GEMINI_API_KEY=.*|SUBROUTER_GEMINI_API_KEY="<provider-key>"|' /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_GEMINI_GATEWAY_TOKEN=.*|SUBROUTER_GEMINI_GATEWAY_TOKEN="<team-token>"|' /etc/default/subrouter
 sudo systemctl restart subrouter
 ```
 
-Official Gemini SDK clients use `http://subrouter-team:31415` as the Gemini API base URL and the team token as `x-goog-api-key`. Raw HTTP clients may use the `/gemini/*` alias. The provider key remains on the VM.
+Anthropic SDK clients use `http://subrouter-team:31415/anthropic`, OpenAI SDK clients use `http://subrouter-team:31415/api/v1`, and Gemini SDK clients use `http://subrouter-team:31415`. Provider keys remain on the VM.
 
 Sessions:
 

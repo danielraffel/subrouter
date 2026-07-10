@@ -174,6 +174,8 @@ func serve(args []string) error {
 	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
 	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
 	geminiUpstreamRaw := flags.String("gemini-upstream", "https://generativelanguage.googleapis.com", "Gemini Developer API upstream base URL")
+	anthropicGatewayUpstreamRaw := flags.String("anthropic-gateway-upstream", "https://api.anthropic.com", "Anthropic team gateway upstream base URL")
+	openAIGatewayUpstreamRaw := flags.String("openai-gateway-upstream", "https://api.openai.com", "OpenAI team gateway upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -238,6 +240,14 @@ func serve(args []string) error {
 		return err
 	}
 	geminiUpstream, err := url.Parse(*geminiUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	anthropicGatewayUpstream, err := url.Parse(*anthropicGatewayUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	openAIGatewayUpstream, err := url.Parse(*openAIGatewayUpstreamRaw)
 	if err != nil {
 		return err
 	}
@@ -336,6 +346,18 @@ func serve(args []string) error {
 			Upstream:     geminiUpstream,
 			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY")),
 			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN")),
+			Transport:    outboundTransport,
+		},
+		AnthropicGateway: &proxy.APIKeyGatewayConfig{
+			Upstream:     anthropicGatewayUpstream,
+			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_API_KEY")),
+			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN")),
+			Transport:    outboundTransport,
+		},
+		OpenAIGateway: &proxy.APIKeyGatewayConfig{
+			Upstream:     openAIGatewayUpstream,
+			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY")),
+			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN")),
 			Transport:    outboundTransport,
 		},
 		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
@@ -872,7 +894,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--gemini-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--api-upstream URL] [--claude-upstream URL] [--anthropic-gateway-upstream URL] [--openai-gateway-upstream URL] [--gemini-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

@@ -62,6 +62,10 @@ type Server struct {
 	Bedrock *BedrockConfig
 	// Gemini, when set, enables the /gemini/* Gemini Developer API gateway.
 	Gemini *GeminiConfig
+	// AnthropicGateway enables the /anthropic/* team API-key gateway.
+	AnthropicGateway *APIKeyGatewayConfig
+	// OpenAIGateway enables the /api/* and /openai/* team API-key gateway.
+	OpenAIGateway *APIKeyGatewayConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
 	// API key (x-api-key) instead of the subscription pool or Bedrock. It applies
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
@@ -928,6 +932,19 @@ func (s Server) Handler() http.Handler {
 	// available at the listener root.
 	mux.Handle("/upload/v1beta/", s.geminiHandler())
 	mux.Handle("/v1beta/", s.geminiHandler())
+	anthropicHandler := s.apiKeyGatewayHandler(s.AnthropicGateway, apiKeyGatewaySpec{
+		name: "anthropic", prefixes: []string{"anthropic"}, auth: apiKeyGatewayXAPIKeyOrBearer,
+	})
+	mux.Handle("/anthropic", anthropicHandler)
+	mux.Handle("/anthropic/", anthropicHandler)
+	openAIHandler := s.apiKeyGatewayHandler(s.OpenAIGateway, apiKeyGatewaySpec{
+		name: "openai", prefixes: []string{"api", "openai"}, auth: apiKeyGatewayBearer,
+		stripHeaders: []string{"OpenAI-Organization", "OpenAI-Project"},
+	})
+	mux.Handle("/api", openAIHandler)
+	mux.Handle("/api/", openAIHandler)
+	mux.Handle("/openai", openAIHandler)
+	mux.Handle("/openai/", openAIHandler)
 	mux.Handle("/", s.proxyHandler())
 	return mux
 }
