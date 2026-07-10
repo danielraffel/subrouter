@@ -133,7 +133,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	if config.AdminToken != "" || config.GeminiAPIKey != "" || config.GeminiGatewayKey != "" {
 		defaultMode = 0o600
 	}
-	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
+	if err := writeSystemdDefaults(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
 		return err
 	}
 	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
@@ -176,6 +176,16 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	fmt.Printf("Installed %s\n", systemdSocketPath(config))
 	if config.Start {
 		fmt.Printf("Started %s\n", config.ServiceName)
+	}
+	return nil
+}
+
+func writeSystemdDefaults(path string, contents []byte, mode os.FileMode) error {
+	if err := os.WriteFile(path, contents, mode); err != nil {
+		return err
+	}
+	if mode.Perm() == 0o600 {
+		return os.Chmod(path, 0o600)
 	}
 	return nil
 }

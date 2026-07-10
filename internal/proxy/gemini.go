@@ -40,6 +40,12 @@ func (s Server) geminiHandler() http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if s.Lifecycle != nil && s.Lifecycle.Draining() {
+			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
+			return
+		}
+		endProxyRequest := s.Lifecycle.BeginProxyRequest()
+		defer endProxyRequest()
 
 		upstream := cloneURL(s.Gemini.Upstream)
 		proxyRequest := r.Clone(r.Context())

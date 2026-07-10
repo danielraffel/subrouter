@@ -135,3 +135,89 @@ func TestGeminiGatewayReportsMissingGatewayToken(t *testing.T) {
 		t.Fatalf("upstream requests = %d", got)
 	}
 }
+
+func TestGeminiGatewayRejectsRequestsWhileDraining(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := NewLifecycle()
+	lifecycle.Drain()
+	handler := Server{
+		Lifecycle: lifecycle,
+		Gemini: &GeminiConfig{
+			Upstream:     upstreamURL,
+			APIKey:       "provider-secret",
+			GatewayToken: "team-token",
+		},
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/gemini/v1beta/interactions", strings.NewReader("{}"))
+	req.Header.Set("X-Goog-Api-Key", "team-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("upstream requests = %d", got)
+	}
+	if got := lifecycle.ActiveProxyRequests(); got != 0 {
+		t.Fatalf("active proxy requests = %d", got)
+	}
+}
+
+func TestGeminiGatewayTracksActiveProxyRequests(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := NewLifecycle()
+	handler := Server{
+		Lifecycle: lifecycle,
+		Gemini: &GeminiConfig{
+			Upstream:     upstreamURL,
+			APIKey:       "provider-secret",
+			GatewayToken: "team-token",
+		},
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/gemini/v1beta/interactions", strings.NewReader("{}"))
+	req.Header.Set("X-Goog-Api-Key", "team-token")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(rec, req)
+	}()
+
+	<-started
+	if got := lifecycle.ActiveProxyRequests(); got != 1 {
+		t.Fatalf("active proxy requests = %d, want 1", got)
+	}
+	close(release)
+	<-done
+	if got := lifecycle.ActiveProxyRequests(); got != 0 {
+		t.Fatalf("active proxy requests after response = %d", got)
+	}
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
