@@ -16,7 +16,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
-const geminiUploadCapabilityTTL = time.Hour
+const geminiUploadCapabilityTTL = 7 * 24 * time.Hour
 
 const (
 	geminiUploadCapabilityParam = "subrouter_upload_cap"

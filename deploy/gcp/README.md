@@ -102,17 +102,12 @@ Health check:
 curl http://<tailscale-ip>:31415/_subrouter/health
 ```
 
-For team API clients, configure provider keys and separate team tokens:
+For team API clients, regenerate the current defaults, then use a protected editor to set the six `SUBROUTER_{ANTHROPIC,OPENAI,GEMINI}_{API_KEY,GATEWAY_TOKEN}` values. Do not put secrets in command arguments or shell history.
 
 ```bash
 sudo sr install-systemd --start=false
 sudo chmod 600 /etc/default/subrouter
-sudo sed -i 's|^SUBROUTER_ANTHROPIC_API_KEY=.*|SUBROUTER_ANTHROPIC_API_KEY="<anthropic-provider-key>"|' /etc/default/subrouter
-sudo sed -i 's|^SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=.*|SUBROUTER_ANTHROPIC_GATEWAY_TOKEN="<anthropic-team-token>"|' /etc/default/subrouter
-sudo sed -i 's|^SUBROUTER_OPENAI_API_KEY=.*|SUBROUTER_OPENAI_API_KEY="<openai-provider-key>"|' /etc/default/subrouter
-sudo sed -i 's|^SUBROUTER_OPENAI_GATEWAY_TOKEN=.*|SUBROUTER_OPENAI_GATEWAY_TOKEN="<openai-team-token>"|' /etc/default/subrouter
-sudo sed -i 's|^SUBROUTER_GEMINI_API_KEY=.*|SUBROUTER_GEMINI_API_KEY="<provider-key>"|' /etc/default/subrouter
-sudo sed -i 's|^SUBROUTER_GEMINI_GATEWAY_TOKEN=.*|SUBROUTER_GEMINI_GATEWAY_TOKEN="<team-token>"|' /etc/default/subrouter
+sudoedit /etc/default/subrouter
 sudo systemctl restart subrouter
 ```
 
