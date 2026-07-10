@@ -1,14 +1,26 @@
 package proxy
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/session"
+)
+
+const geminiUploadCapabilityTTL = time.Hour
+
+const (
+	geminiUploadCapabilityParam = "subrouter_upload_cap"
+	geminiUploadExpiryParam     = "subrouter_upload_expires"
 )
 
 // GeminiConfig enables a transparent Gemini Developer API gateway. Clients
@@ -36,7 +48,8 @@ func (s Server) geminiHandler() http.Handler {
 			http.Error(w, "gemini gateway not configured", http.StatusServiceUnavailable)
 			return
 		}
-		if !authorizeGeminiGateway(r, s.Gemini.GatewayToken) {
+		if !authorizeGeminiGateway(r, s.Gemini.GatewayToken) &&
+			!authorizeGeminiUploadCapability(r, s.Gemini.GatewayToken, time.Now()) {
 			http.Error(w, "gemini gateway token required", http.StatusUnauthorized)
 			return
 		}
@@ -62,6 +75,8 @@ func (s Server) geminiHandler() http.Handler {
 		proxyRequest.URL.RawPath = ""
 		query := proxyRequest.URL.Query()
 		query.Del("key")
+		query.Del(geminiUploadCapabilityParam)
+		query.Del(geminiUploadExpiryParam)
 		proxyRequest.URL.RawQuery = query.Encode()
 		proxyRequest.Header.Del("Authorization")
 		proxyRequest.Header.Set("X-Goog-Api-Key", strings.TrimSpace(s.Gemini.APIKey))
@@ -132,10 +147,49 @@ func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *htt
 	}
 	uploadURL.Path = "/gemini" + uploadPath
 	uploadURL.RawPath = ""
-	query := uploadURL.Query()
-	query.Set("key", strings.TrimSpace(gatewayToken))
-	uploadURL.RawQuery = query.Encode()
+	addGeminiUploadCapability(uploadURL, gatewayToken, time.Now().Add(geminiUploadCapabilityTTL))
 	headers.Set("X-Goog-Upload-Url", uploadURL.String())
+}
+
+func addGeminiUploadCapability(uploadURL *url.URL, gatewayToken string, expires time.Time) {
+	query := uploadURL.Query()
+	query.Del("key")
+	query.Del(geminiUploadCapabilityParam)
+	query.Set(geminiUploadExpiryParam, strconv.FormatInt(expires.Unix(), 10))
+	uploadURL.RawQuery = query.Encode()
+	query.Set(geminiUploadCapabilityParam, geminiUploadCapability(uploadURL.Path, query, gatewayToken))
+	uploadURL.RawQuery = query.Encode()
+}
+
+func authorizeGeminiUploadCapability(r *http.Request, gatewayToken string, now time.Time) bool {
+	if r == nil || !strings.HasPrefix(r.URL.Path, "/gemini/upload/") {
+		return false
+	}
+	query := r.URL.Query()
+	got := query.Get(geminiUploadCapabilityParam)
+	expiresRaw := query.Get(geminiUploadExpiryParam)
+	if got == "" || expiresRaw == "" {
+		return false
+	}
+	expires, err := strconv.ParseInt(expiresRaw, 10, 64)
+	if err != nil || now.Unix() > expires {
+		return false
+	}
+	want := geminiUploadCapability(r.URL.Path, query, gatewayToken)
+	return len(got) == len(want) && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func geminiUploadCapability(path string, query url.Values, gatewayToken string) string {
+	unsigned := make(url.Values, len(query))
+	for key, values := range query {
+		unsigned[key] = append([]string(nil), values...)
+	}
+	unsigned.Del(geminiUploadCapabilityParam)
+	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(gatewayToken)))
+	_, _ = mac.Write([]byte(path))
+	_, _ = mac.Write([]byte{'\n'})
+	_, _ = mac.Write([]byte(unsigned.Encode()))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func authorizeGeminiGateway(r *http.Request, configuredToken string) bool {

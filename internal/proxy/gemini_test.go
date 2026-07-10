@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -72,9 +73,7 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		if got := strings.TrimSpace(rec.Body.String()); got != strings.TrimPrefix(path, "/gemini") {
 			t.Fatalf("%s upstream path = %q", path, got)
 		}
-		if got := rec.Header().Get("X-Goog-Upload-Url"); got != "http://example.com/gemini/upload/v1beta/files?key=team-token&upload_id=abc" {
-			t.Fatalf("upload URL = %q", got)
-		}
+		requireGeminiUploadCapabilityURL(t, rec.Header().Get("X-Goog-Upload-Url"), "http", "example.com", "/gemini/upload/v1beta/files", "team-token")
 	}
 	if got := requests.Load(); got != 5 {
 		t.Fatalf("upstream requests = %d", got)
@@ -269,9 +268,7 @@ func TestRewriteGeminiUploadURLUsesForwardedHTTPS(t *testing.T) {
 		"X-Goog-Upload-Url": []string{"https://generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc"},
 	}
 	rewriteGeminiUploadURL(headers, upstream, request, "team-token")
-	if got := headers.Get("X-Goog-Upload-Url"); got != "https://gateway.example.com/gemini/upload/v1beta/files?key=team-token&upload_id=abc" {
-		t.Fatalf("upload URL = %q", got)
-	}
+	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "https", "gateway.example.com", "/gemini/upload/v1beta/files", "team-token")
 }
 
 func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
@@ -287,10 +284,7 @@ func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
 		"X-Goog-Upload-Url": []string{"https://proxy.example.com/google/upload/v1beta/files?upload_id=abc"},
 	}
 	rewriteGeminiUploadURL(headers, upstream, request, "team-token")
-	want := "http://gateway.example.com/gemini/upload/v1beta/files?key=team-token&upload_id=abc"
-	if got := headers.Get("X-Goog-Upload-Url"); got != want {
-		t.Fatalf("upload URL = %q, want %q", got, want)
-	}
+	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "http", "gateway.example.com", "/gemini/upload/v1beta/files", "team-token")
 }
 
 func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
@@ -307,6 +301,9 @@ func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
 		}
 		if r.URL.Query().Get("key") != "" {
 			t.Errorf("gateway token leaked upstream")
+		}
+		if r.URL.Query().Get(geminiUploadCapabilityParam) != "" || r.URL.Query().Get(geminiUploadExpiryParam) != "" {
+			t.Errorf("upload capability leaked upstream")
 		}
 		if r.URL.Query().Get("upload_id") == "" {
 			w.Header().Set("X-Goog-Upload-Url", "http://"+r.Host+r.URL.Path+"?upload_id=abc")
@@ -332,9 +329,10 @@ func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
 		t.Fatalf("start status = %d body = %s", startRec.Code, startRec.Body.String())
 	}
 	continuationURL := startRec.Header().Get("X-Goog-Upload-Url")
-	if !strings.Contains(continuationURL, "key=team-token") {
-		t.Fatalf("continuation URL lacks gateway capability: %q", continuationURL)
+	if strings.Contains(continuationURL, "team-token") {
+		t.Fatalf("continuation URL exposes reusable gateway token: %q", continuationURL)
 	}
+	parsedContinuation := requireGeminiUploadCapabilityURL(t, continuationURL, "http", "example.com", "/gemini/upload/v1beta/files", "team-token")
 
 	continuation := httptest.NewRequest(http.MethodPost, continuationURL, strings.NewReader("file bytes"))
 	continuationRec := httptest.NewRecorder()
@@ -344,6 +342,54 @@ func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
 	}
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("upstream requests = %d, want 2", got)
+	}
+	tamperedQuery := parsedContinuation.Query()
+	tamperedQuery.Set("upload_id", "other")
+	parsedContinuation.RawQuery = tamperedQuery.Encode()
+	tampered := httptest.NewRequest(http.MethodPost, parsedContinuation.String(), strings.NewReader("tampered"))
+	tamperedRec := httptest.NewRecorder()
+	handler.ServeHTTP(tamperedRec, tampered)
+	if tamperedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("tampered continuation status = %d body = %s", tamperedRec.Code, tamperedRec.Body.String())
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("tampered continuation reached upstream: requests = %d", got)
+	}
+}
+
+func requireGeminiUploadCapabilityURL(t *testing.T, raw, scheme, host, path, gatewayToken string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Scheme != scheme || parsed.Host != host || parsed.Path != path {
+		t.Fatalf("upload URL = %q", raw)
+	}
+	query := parsed.Query()
+	if query.Get("upload_id") != "abc" || query.Get("key") != "" ||
+		query.Get(geminiUploadCapabilityParam) == "" || query.Get(geminiUploadExpiryParam) == "" {
+		t.Fatalf("upload URL query = %q", parsed.RawQuery)
+	}
+	request := httptest.NewRequest(http.MethodPost, parsed.String(), nil)
+	if !authorizeGeminiUploadCapability(request, gatewayToken, time.Now()) {
+		t.Fatalf("upload capability did not verify")
+	}
+	return parsed
+}
+
+func TestGeminiUploadCapabilityExpires(t *testing.T) {
+	t.Parallel()
+
+	uploadURL, err := url.Parse("https://gateway.example.com/gemini/upload/v1beta/files?upload_id=abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	addGeminiUploadCapability(uploadURL, "team-token", now.Add(-time.Second))
+	request := httptest.NewRequest(http.MethodPost, uploadURL.String(), nil)
+	if authorizeGeminiUploadCapability(request, "team-token", now) {
+		t.Fatal("expired upload capability authorized")
 	}
 }
 
