@@ -357,7 +357,20 @@ Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Gene
 
 For a shared server, replace `127.0.0.1` with the server URL. Subrouter recognizes Claude Code traffic, selects a Claude OAuth account from its own store, strips API-key auth, and forwards to Anthropic with the OAuth beta header. Claude Code prompt caching does not require Subrouter-specific cache settings: Subrouter keeps the same Claude conversation pinned to the same Claude account when that account is still available, and forwards the client `Anthropic-Beta` values and request body `cache_control` blocks unchanged.
 
-Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
+Gemini has its own `sr gemini` namespace and a transparent Developer API gateway. Configure the server with `SUBROUTER_GEMINI_API_KEY`; official Gemini SDK clients use `http://<subrouter>:31415` as their base URL. The gateway replaces client credentials before forwarding Files and Interactions API requests, so teammates never receive the provider key. `/gemini/*` remains available as an explicit alias for raw HTTP clients.
+
+For a shared listener, also set `SUBROUTER_GEMINI_GATEWAY_TOKEN`. Clients present that token as `x-goog-api-key`. A tailnet-only server may omit the gateway token, but public listeners must not expose an unauthenticated Gemini route.
+
+```bash
+SUBROUTER_GEMINI_API_KEY=<provider-key> \
+SUBROUTER_GEMINI_GATEWAY_TOKEN=<team-token> \
+subrouter serve --addr 0.0.0.0:31415
+
+curl -fsS http://subrouter-team:31415/gemini/v1beta/interactions \
+  -H 'Content-Type: application/json' \
+  -H 'x-goog-api-key: <team-token>' \
+  -d '{"model":"gemini-3.5-flash","input":"Reply with OK"}'
+```
 
 ## Selection policy
 

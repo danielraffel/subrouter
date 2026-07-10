@@ -60,6 +60,8 @@ type Server struct {
 	ReadCache        *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
+	// Gemini, when set, enables the /gemini/* Gemini Developer API gateway.
+	Gemini *GeminiConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
 	// API key (x-api-key) instead of the subscription pool or Bedrock. It applies
 	// ONLY to Fable; Opus/Sonnet/etc. continue to use the OAuth pool and never
@@ -919,6 +921,13 @@ func (s Server) Handler() http.Handler {
 	if s.Bedrock != nil {
 		mux.Handle("/bedrock/", s.bedrockHandler())
 	}
+	mux.Handle("/gemini", s.geminiHandler())
+	mux.Handle("/gemini/", s.geminiHandler())
+	// The Google GenAI SDK rewrites resumable upload URLs to the configured
+	// base host without retaining a path prefix, so native paths must also be
+	// available at the listener root.
+	mux.Handle("/upload/v1beta/", s.geminiHandler())
+	mux.Handle("/v1beta/", s.geminiHandler())
 	mux.Handle("/", s.proxyHandler())
 	return mux
 }

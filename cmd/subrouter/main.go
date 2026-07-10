@@ -173,6 +173,7 @@ func serve(args []string) error {
 	claudeUpstreamRaw := flags.String("claude-upstream", "https://api.anthropic.com", "Claude subscription upstream base URL")
 	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
 	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
+	geminiUpstreamRaw := flags.String("gemini-upstream", "https://generativelanguage.googleapis.com", "Gemini Developer API upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -233,6 +234,10 @@ func serve(args []string) error {
 		return err
 	}
 	zaiUpstream, err := url.Parse(*zaiUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	geminiUpstream, err := url.Parse(*geminiUpstreamRaw)
 	if err != nil {
 		return err
 	}
@@ -310,23 +315,29 @@ func serve(args []string) error {
 	})
 
 	server := proxy.Server{
-		Upstream:            upstream,
-		CodexUpstream:       codexUpstream,
-		APIUpstream:         apiUpstream,
-		ClaudeUpstream:      claudeUpstream,
-		KimiUpstream:        kimiUpstream,
-		ZAIUpstream:         zaiUpstream,
-		Accounts:            nil,
-		AccountRef:          accountRef,
-		Sessions:            store,
-		SchedulerRef:        schedulerRef,
-		UsageScoreTTL:       usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
-		Transport:           outboundTransport,
-		Logger:              slog.Default(),
-		Lifecycle:           proxy.NewLifecycle(),
-		AdminToken:          *adminToken,
-		MaxBodyBytes:        *maxBodyBytes,
-		Bedrock:             bedrockConfig,
+		Upstream:       upstream,
+		CodexUpstream:  codexUpstream,
+		APIUpstream:    apiUpstream,
+		ClaudeUpstream: claudeUpstream,
+		KimiUpstream:   kimiUpstream,
+		ZAIUpstream:    zaiUpstream,
+		Accounts:       nil,
+		AccountRef:     accountRef,
+		Sessions:       store,
+		SchedulerRef:   schedulerRef,
+		UsageScoreTTL:  usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		Transport:      outboundTransport,
+		Logger:         slog.Default(),
+		Lifecycle:      proxy.NewLifecycle(),
+		AdminToken:     *adminToken,
+		MaxBodyBytes:   *maxBodyBytes,
+		Bedrock:        bedrockConfig,
+		Gemini: &proxy.GeminiConfig{
+			Upstream:     geminiUpstream,
+			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY")),
+			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN")),
+			Transport:    outboundTransport,
+		},
 		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
 		FableBedrockPrimary: *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
 		Transcripts:         transcript.NewRecorder(*transcriptDir),
@@ -861,7 +872,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--gemini-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

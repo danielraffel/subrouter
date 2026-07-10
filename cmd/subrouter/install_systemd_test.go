@@ -74,6 +74,8 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 		TranscriptsDir:   "/var/lib/subrouter/transcripts",
 		SRSwitchInterval: "10m",
 		AdminToken:       "secret-token",
+		GeminiAPIKey:     "provider-key",
+		GeminiGatewayKey: "team-key",
 		ExtraArgs:        "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false",
 	}
 	defaults := systemdDefaults(config)
@@ -91,6 +93,12 @@ func TestSystemdDefaultsEscapesExtraArgs(t *testing.T) {
 	}
 	if !strings.Contains(defaults, `SUBROUTER_ADMIN_TOKEN="secret-token"`) {
 		t.Fatalf("defaults did not quote admin token:\n%s", defaults)
+	}
+	if !strings.Contains(defaults, `SUBROUTER_GEMINI_API_KEY="provider-key"`) {
+		t.Fatalf("defaults did not quote Gemini API key:\n%s", defaults)
+	}
+	if !strings.Contains(defaults, `SUBROUTER_GEMINI_GATEWAY_TOKEN="team-key"`) {
+		t.Fatalf("defaults did not quote Gemini gateway token:\n%s", defaults)
 	}
 }
 
@@ -120,6 +128,8 @@ func TestApplyExistingSystemdDefaultsPreservesTranscriptsDir(t *testing.T) {
 		"SUBROUTER_TRANSCRIPTS=/var/lib/subrouter/transcripts",
 		`SUBROUTER_TRANSCRIPT_ARGS="--transcripts=/var/lib/subrouter/transcripts"`,
 		"SUBROUTER_ADMIN_TOKEN=\"secret-token\"",
+		"SUBROUTER_GEMINI_API_KEY=\"provider-key\"",
+		"SUBROUTER_GEMINI_GATEWAY_TOKEN=\"team-key\"",
 		`SUBROUTER_EXTRA_ARGS="--transcript-gcs-uri=gs://bucket/prefix --transcript-gcs-sync-interval=5m"`,
 		"",
 	}, "\n")
@@ -140,6 +150,12 @@ func TestApplyExistingSystemdDefaultsPreservesTranscriptsDir(t *testing.T) {
 	}
 	if config.AdminToken != "secret-token" {
 		t.Fatalf("admin token = %q, want preserved secret-token", config.AdminToken)
+	}
+	if config.GeminiAPIKey != "provider-key" {
+		t.Fatalf("Gemini API key = %q, want preserved provider-key", config.GeminiAPIKey)
+	}
+	if config.GeminiGatewayKey != "team-key" {
+		t.Fatalf("Gemini gateway token = %q, want preserved team-key", config.GeminiGatewayKey)
 	}
 	if !strings.Contains(config.ExtraArgs, "--transcript-gcs-uri=gs://bucket/prefix") {
 		t.Fatalf("extra args = %q, want preserved gcs uri", config.ExtraArgs)

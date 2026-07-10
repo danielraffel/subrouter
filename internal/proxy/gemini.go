@@ -1,0 +1,99 @@
+package proxy
+
+import (
+	"crypto/subtle"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+)
+
+// GeminiConfig enables a transparent Gemini Developer API gateway. Clients
+// present the optional gateway token as x-goog-api-key; the gateway replaces it
+// with the provider key before forwarding the request.
+type GeminiConfig struct {
+	Upstream     *url.URL
+	APIKey       string
+	GatewayToken string
+	Transport    http.RoundTripper
+}
+
+func (c *GeminiConfig) configured() bool {
+	return c != nil && c.Upstream != nil && strings.TrimSpace(c.APIKey) != ""
+}
+
+func (s Server) geminiHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.Gemini == nil || !s.Gemini.configured() {
+			http.Error(w, "gemini gateway not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if !authorizeGeminiGateway(r, s.Gemini.GatewayToken) {
+			http.Error(w, "gemini gateway token required", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodHead && (r.URL.Path == "/gemini" || r.URL.Path == "/gemini/") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		upstream := cloneURL(s.Gemini.Upstream)
+		proxyRequest := r.Clone(r.Context())
+		proxyRequest.URL = cloneURL(r.URL)
+		proxyRequest.URL.Path = stripProviderPathPrefix(proxyRequest.URL.Path, "gemini")
+		proxyRequest.URL.RawPath = ""
+		query := proxyRequest.URL.Query()
+		query.Del("key")
+		proxyRequest.URL.RawQuery = query.Encode()
+		proxyRequest.Header.Del("Authorization")
+		proxyRequest.Header.Set("X-Goog-Api-Key", strings.TrimSpace(s.Gemini.APIKey))
+		stripOutboundForwardingHeaders(proxyRequest.Header)
+		if s.Logger != nil {
+			s.Logger.Info("gemini proxy request", "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r))
+		}
+
+		rp := &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(upstream)
+				stripOutboundForwardingHeaders(pr.Out.Header)
+			},
+			Transport: s.Gemini.Transport,
+		}
+		if rp.Transport == nil {
+			rp.Transport = s.transport()
+		}
+		if s.Logger != nil {
+			rp.ErrorLog = log.New(proxyErrorWriter{
+				logger:   s.Logger,
+				agent:    "gemini",
+				method:   r.Method,
+				path:     proxyRequest.URL.Path,
+				upstream: upstream.Host,
+			}, "", 0)
+			rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+				s.Logger.Error("gemini proxy request failed", "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "error", err)
+				http.Error(w, "gemini upstream request failed", http.StatusBadGateway)
+			}
+		}
+		rp.ServeHTTP(w, proxyRequest)
+	})
+}
+
+func authorizeGeminiGateway(r *http.Request, configuredToken string) bool {
+	token := strings.TrimSpace(configuredToken)
+	if token == "" {
+		return true
+	}
+	got := strings.TrimSpace(r.Header.Get("X-Goog-Api-Key"))
+	if got == "" {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if scheme, value, ok := strings.Cut(auth, " "); ok && strings.EqualFold(scheme, "Bearer") {
+			got = strings.TrimSpace(value)
+		}
+	}
+	if len(got) != len(token) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}

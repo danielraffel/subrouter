@@ -29,6 +29,8 @@ type systemdConfig struct {
 	TranscriptsDir   string
 	SRSwitchInterval string
 	AdminToken       string
+	GeminiAPIKey     string
+	GeminiGatewayKey string
 	ExtraArgs        string
 	Start            bool
 	DryRun           bool
@@ -58,6 +60,8 @@ func installSystemd(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	config.GeminiAPIKey = strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY"))
+	config.GeminiGatewayKey = strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN"))
 	if runtime.GOOS != "linux" && !config.DryRun {
 		return errors.New("install-systemd is Linux-only")
 	}
@@ -126,7 +130,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 		}
 	}
 	defaultMode := os.FileMode(0o644)
-	if config.AdminToken != "" {
+	if config.AdminToken != "" || config.GeminiAPIKey != "" || config.GeminiGatewayKey != "" {
 		defaultMode = 0o600
 	}
 	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
@@ -241,6 +245,12 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	if config.AdminToken == "" {
 		config.AdminToken = readDefaultValue(defaultPath, "SUBROUTER_ADMIN_TOKEN")
 	}
+	if config.GeminiAPIKey == "" {
+		config.GeminiAPIKey = readDefaultValue(defaultPath, "SUBROUTER_GEMINI_API_KEY")
+	}
+	if config.GeminiGatewayKey == "" {
+		config.GeminiGatewayKey = readDefaultValue(defaultPath, "SUBROUTER_GEMINI_GATEWAY_TOKEN")
+	}
 }
 
 func readLegacySystemdExtraArgs() string {
@@ -318,8 +328,10 @@ SUBROUTER_TRANSCRIPTS=%s
 SUBROUTER_TRANSCRIPT_ARGS=%q
 SUBROUTER_SR_SWITCH_INTERVAL=%s
 SUBROUTER_ADMIN_TOKEN=%q
+SUBROUTER_GEMINI_API_KEY=%q
+SUBROUTER_GEMINI_GATEWAY_TOKEN=%q
 SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.ExtraArgs)
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.GeminiAPIKey, config.GeminiGatewayKey, config.ExtraArgs)
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

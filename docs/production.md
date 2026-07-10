@@ -8,6 +8,7 @@ Use this checklist before putting a shared Subrouter on a tailnet or a public-fa
 - Keep `/_subrouter/health` unauthenticated for liveness checks.
 - Use `/_subrouter/ready` for readiness checks. It returns 503 while the process is draining.
 - Set `SUBROUTER_ADMIN_TOKEN` for any non-loopback listener. Sensitive admin endpoints then require `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`.
+- Set `SUBROUTER_GEMINI_GATEWAY_TOKEN` whenever the Gemini gateway is enabled on a shared listener. It protects `/gemini/*` without exposing the provider key.
 
 ## Linux install
 
@@ -27,7 +28,19 @@ sr server add team \
   --default
 ```
 
-`install-systemd` preserves an existing `SUBROUTER_ADMIN_TOKEN` if `--admin-token` is omitted. When a token is configured, `/etc/default/subrouter` is written with mode `0600`.
+`install-systemd` preserves existing `SUBROUTER_ADMIN_TOKEN`, `SUBROUTER_GEMINI_API_KEY`, and `SUBROUTER_GEMINI_GATEWAY_TOKEN` values. When any secret is configured, `/etc/default/subrouter` is written with mode `0600`.
+
+## Gemini gateway
+
+Add the provider key and a separate client-facing gateway token to the service environment, then rerun the installer or restart the service:
+
+```bash
+sudo sed -i 's|^SUBROUTER_GEMINI_API_KEY=.*|SUBROUTER_GEMINI_API_KEY="<provider-key>"|' /etc/default/subrouter
+sudo sed -i 's|^SUBROUTER_GEMINI_GATEWAY_TOKEN=.*|SUBROUTER_GEMINI_GATEWAY_TOKEN="<team-token>"|' /etc/default/subrouter
+sudo systemctl restart subrouter
+```
+
+The provider key is injected only upstream. Official Gemini SDK clients use `http://<server>:31415` as their base URL and send the gateway token as `x-goog-api-key`. The SDK requires native `/upload/v1beta/*` and `/v1beta/*` paths for resumable uploads; raw HTTP clients may also use the `/gemini/*` alias.
 
 ## Transcripts
 
