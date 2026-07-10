@@ -45,6 +45,66 @@ type apiKeyGatewaySpec struct {
 	blockedAPIKeyPrefixes []string
 }
 
+func (s Server) rejectMisroutedGatewayCredentials(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.requestUsesConfiguredGatewayCredential(r) {
+			http.Error(w, "gateway credential used outside its gateway route", http.StatusBadRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s Server) requestUsesConfiguredGatewayCredential(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	var configured []string
+	if s.Gemini != nil {
+		configured = append(configured, strings.TrimSpace(s.Gemini.GatewayToken))
+	}
+	if s.AnthropicGateway != nil {
+		configured = append(configured, strings.TrimSpace(s.AnthropicGateway.GatewayToken))
+	}
+	if s.OpenAIGateway != nil {
+		configured = append(configured, strings.TrimSpace(s.OpenAIGateway.GatewayToken))
+	}
+	if s.Bedrock != nil {
+		configured = append(configured, strings.TrimSpace(s.Bedrock.GatewayToken))
+	}
+	var presented []string
+	presented = append(presented, r.Header.Values("X-Goog-Api-Key")...)
+	presented = append(presented, r.Header.Values("X-Api-Key")...)
+	for _, header := range r.Header.Values("Authorization") {
+		if scheme, value, ok := strings.Cut(strings.TrimSpace(header), " "); ok && strings.EqualFold(scheme, "Bearer") {
+			presented = append(presented, strings.TrimSpace(value))
+		}
+	}
+	for _, value := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, protocol := range strings.Split(value, ",") {
+			protocol = strings.TrimSpace(protocol)
+			if strings.HasPrefix(protocol, openAIWebSocketCredentialPrefix) {
+				presented = append(presented, strings.TrimPrefix(protocol, openAIWebSocketCredentialPrefix))
+			}
+		}
+	}
+	query := r.URL.Query()
+	presented = append(presented, query["key"]...)
+	presented = append(presented, query["api_key"]...)
+	for _, candidate := range presented {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		for _, token := range configured {
+			if len(candidate) == len(token) && token != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) == 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGatewaySpec) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if config == nil || !config.configured() {

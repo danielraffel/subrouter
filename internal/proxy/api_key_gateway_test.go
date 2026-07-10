@@ -666,3 +666,50 @@ func TestAPIKeyGatewayRoutesDoNotCaptureRootProxyPaths(t *testing.T) {
 		t.Fatalf("gateway upstream requests = %d", got)
 	}
 }
+
+func TestRootProxyRejectsMisroutedGatewayCredentials(t *testing.T) {
+	t.Parallel()
+
+	var rootRequests atomic.Int32
+	root := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		rootRequests.Add(1)
+	}))
+	defer root.Close()
+	rootURL, err := url.Parse(root.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream:         rootURL,
+		Gemini:           &GeminiConfig{GatewayToken: "gemini-team"},
+		AnthropicGateway: &APIKeyGatewayConfig{GatewayToken: "anthropic-team"},
+		OpenAIGateway:    &APIKeyGatewayConfig{GatewayToken: "openai-team"},
+	}.Handler()
+	tests := []struct {
+		name string
+		path string
+		set  func(http.Header)
+	}{
+		{"gemini header", "/v1/models", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
+		{"gemini query", "/v1alpha/models?key=gemini-team", func(http.Header) {}},
+		{"anthropic header", "/v1/messages", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
+		{"openai bearer", "/v1/responses", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"openai websocket", "/v1/realtime", func(h http.Header) {
+			h.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key.openai-team")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, test.path, nil)
+			test.set(req.Header)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if got := rootRequests.Load(); got != 0 {
+		t.Fatalf("misrouted credentials reached root upstream: requests = %d", got)
+	}
+}

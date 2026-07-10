@@ -951,7 +951,7 @@ func (s Server) Handler() http.Handler {
 	mux.Handle("/api/v1/", openAIHandler)
 	mux.Handle("/openai", openAIHandler)
 	mux.Handle("/openai/", openAIHandler)
-	mux.Handle("/", s.proxyHandler())
+	mux.Handle("/", s.rejectMisroutedGatewayCredentials(s.proxyHandler()))
 	return mux
 }
 
