@@ -275,7 +275,13 @@ func TestOpenAIGatewayProxiesRealtimeWebSocketWithSubprotocolAuth(t *testing.T) 
 		"OpenAI-Beta":         []string{"realtime=v1"},
 	}
 	dialer := *websocket.DefaultDialer
-	dialer.Subprotocols = []string{"realtime", "openai-insecure-api-key.team-token", "openai-beta.realtime-v1"}
+	dialer.Subprotocols = []string{
+		"realtime",
+		"openai-insecure-api-key.team-token",
+		"openai-organization.client-org",
+		"openai-project.client-project",
+		"openai-beta.realtime-v1",
+	}
 	conn, response, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		if response != nil && response.Body != nil {

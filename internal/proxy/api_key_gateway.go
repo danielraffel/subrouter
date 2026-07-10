@@ -201,6 +201,8 @@ func authorizeAPIKeyGateway(r *http.Request, configuredToken string, auth apiKey
 
 const openAIWebSocketCredentialPrefix = "openai-insecure-api-key."
 
+var openAIWebSocketTenantPrefixes = []string{"openai-organization.", "openai-project."}
+
 func openAIWebSocketCredential(headers http.Header) string {
 	for _, value := range headers.Values("Sec-WebSocket-Protocol") {
 		for _, protocol := range strings.Split(value, ",") {
@@ -218,7 +220,15 @@ func stripOpenAIWebSocketCredential(headers http.Header) {
 	for _, value := range headers.Values("Sec-WebSocket-Protocol") {
 		for _, protocol := range strings.Split(value, ",") {
 			protocol = strings.TrimSpace(protocol)
-			if protocol != "" && !strings.HasPrefix(protocol, openAIWebSocketCredentialPrefix) {
+			lowerProtocol := strings.ToLower(protocol)
+			isTenantSelector := false
+			for _, prefix := range openAIWebSocketTenantPrefixes {
+				if strings.HasPrefix(lowerProtocol, prefix) {
+					isTenantSelector = true
+					break
+				}
+			}
+			if protocol != "" && !strings.HasPrefix(lowerProtocol, openAIWebSocketCredentialPrefix) && !isTenantSelector {
 				kept = append(kept, protocol)
 			}
 		}

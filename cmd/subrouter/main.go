@@ -333,6 +333,10 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	adminKeys, err := codexStore.ListAdminKeys()
+	if err != nil {
+		return err
+	}
 	claudeAccounts, err := agentclaude.DefaultStore().ListAccounts(context.Background())
 	if err != nil {
 		slog.Warn("Claude accounts skipped", "error", err)
@@ -354,6 +358,9 @@ func serve(args []string) error {
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			gatewayCredentials = append(gatewayCredentials, teamGatewayCredential{providerKey: account.Token})
 		}
+	}
+	for _, adminKey := range adminKeys {
+		gatewayCredentials = append(gatewayCredentials, teamGatewayCredential{providerKey: adminKey.Key})
 	}
 	if err := validateTeamGatewayCredentials(*addr, inheritedListener, *adminToken, gatewayCredentials...); err != nil {
 		return err
