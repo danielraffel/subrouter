@@ -229,3 +229,22 @@ func TestGeminiGatewayTracksActiveProxyRequests(t *testing.T) {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestRewriteGeminiUploadURLUsesForwardedHTTPS(t *testing.T) {
+	t.Parallel()
+
+	upstream, err := url.Parse("https://generativelanguage.googleapis.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/gemini/upload/v1beta/files", nil)
+	request.Host = "gateway.example.com"
+	request.Header.Set("X-Forwarded-Proto", "https, http")
+	headers := http.Header{
+		"X-Goog-Upload-Url": []string{"https://generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc"},
+	}
+	rewriteGeminiUploadURL(headers, upstream, request)
+	if got := headers.Get("X-Goog-Upload-Url"); got != "https://gateway.example.com/upload/v1beta/files?upload_id=abc" {
+		t.Fatalf("upload URL = %q", got)
+	}
+}

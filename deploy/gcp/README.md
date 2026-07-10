@@ -105,6 +105,7 @@ curl http://<tailscale-ip>:31415/_subrouter/health
 For team API clients, configure provider keys and separate team tokens:
 
 ```bash
+sudo sr install-systemd --start=false
 sudo chmod 600 /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_ANTHROPIC_API_KEY=.*|SUBROUTER_ANTHROPIC_API_KEY="<anthropic-provider-key>"|' /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=.*|SUBROUTER_ANTHROPIC_GATEWAY_TOKEN="<anthropic-team-token>"|' /etc/default/subrouter

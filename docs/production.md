@@ -35,6 +35,7 @@ sr server add team \
 Add provider keys and separate client-facing tokens, then restart the service:
 
 ```bash
+sudo sr install-systemd --start=false
 sudo chmod 600 /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_ANTHROPIC_API_KEY=.*|SUBROUTER_ANTHROPIC_API_KEY="<anthropic-provider-key>"|' /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=.*|SUBROUTER_ANTHROPIC_GATEWAY_TOKEN="<anthropic-team-token>"|' /etc/default/subrouter

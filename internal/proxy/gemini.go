@@ -108,6 +108,11 @@ func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *htt
 	scheme := "http"
 	if request.TLS != nil {
 		scheme = "https"
+	} else {
+		forwardedProto, _, _ := strings.Cut(request.Header.Get("X-Forwarded-Proto"), ",")
+		if strings.EqualFold(strings.TrimSpace(forwardedProto), "https") {
+			scheme = "https"
+		}
 	}
 	uploadURL.Scheme = scheme
 	uploadURL.Host = request.Host
