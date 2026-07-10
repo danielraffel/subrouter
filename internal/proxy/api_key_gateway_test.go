@@ -148,7 +148,11 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 			req.Header.Set("OpenAI-Organization", "client-org")
 			req.Header.Set("OpenAI-Project", "client-project")
 			req.Header.Set("Anthropic-Version", "2023-06-01")
-			req.Header.Set("Anthropic-Beta", "prompt-caching-2024-07-31")
+			anthropicBeta := "prompt-caching-2024-07-31"
+			if strings.HasPrefix(test.name, "anthropic") {
+				anthropicBeta += "," + claudeOAuthBetaHeader
+			}
+			req.Header.Set("Anthropic-Beta", anthropicBeta)
 			req.Header.Set("OpenAI-Beta", "realtime=v1")
 			req.Header.Set("Idempotency-Key", "idem-123")
 			req.Header.Set("X-Request-ID", "client-request-123")

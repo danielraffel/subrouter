@@ -166,6 +166,9 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		proxyRequest.Header.Del("X-Api-Key")
 		proxyRequest.Header.Del("X-Goog-Api-Key")
 		stripOpenAIWebSocketCredential(proxyRequest.Header)
+		if spec.auth == apiKeyGatewayXAPIKeyOrBearer {
+			removeCommaHeaderValue(proxyRequest.Header, "Anthropic-Beta", claudeOAuthBetaHeader)
+		}
 		for _, header := range spec.stripHeaders {
 			proxyRequest.Header.Del(header)
 		}

@@ -351,6 +351,23 @@ func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
 	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "http", "gateway.example.com", "/gemini/upload/v1beta/files", "team-token")
 }
 
+func TestRewriteGeminiRelativeUploadURLUsesCustomUpstreamBasePath(t *testing.T) {
+	t.Parallel()
+
+	upstream, err := url.Parse("https://proxy.example.com/google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/gemini/upload/v1beta/files", nil)
+	headers := http.Header{
+		"X-Goog-Upload-Url": []string{"upload/v1beta/files?upload_id=abc"},
+	}
+	if err := rewriteGeminiUploadURLs(headers, upstream, nil, request, "team-token"); err != nil {
+		t.Fatal(err)
+	}
+	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "http", "example.com", "/gemini/upload/v1beta/files", "team-token")
+}
+
 func TestRewriteGeminiUploadURLRejectsPathOutsideCustomUpstreamBase(t *testing.T) {
 	t.Parallel()
 
@@ -439,6 +456,18 @@ func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("upstream requests = %d, want 2", got)
 	}
+	rootAlias := *parsedContinuation
+	rootAlias.Path = strings.TrimPrefix(rootAlias.Path, "/gemini")
+	rootAlias.RawPath = ""
+	rootContinuation := httptest.NewRequest(http.MethodPost, rootAlias.String(), strings.NewReader("root alias bytes"))
+	rootContinuationRec := httptest.NewRecorder()
+	handler.ServeHTTP(rootContinuationRec, rootContinuation)
+	if rootContinuationRec.Code != http.StatusNoContent {
+		t.Fatalf("root alias continuation status = %d body = %s", rootContinuationRec.Code, rootContinuationRec.Body.String())
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("upstream requests after root alias = %d, want 3", got)
+	}
 	tamperedQuery := parsedContinuation.Query()
 	tamperedQuery.Set("upload_id", "other")
 	parsedContinuation.RawQuery = tamperedQuery.Encode()
@@ -448,7 +477,7 @@ func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
 	if tamperedRec.Code != http.StatusUnauthorized {
 		t.Fatalf("tampered continuation status = %d body = %s", tamperedRec.Code, tamperedRec.Body.String())
 	}
-	if got := requests.Load(); got != 2 {
+	if got := requests.Load(); got != 3 {
 		t.Fatalf("tampered continuation reached upstream: requests = %d", got)
 	}
 }

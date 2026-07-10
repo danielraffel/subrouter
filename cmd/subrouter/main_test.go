@@ -96,6 +96,23 @@ func TestCredentialIsolationNeedsAdminKeys(t *testing.T) {
 	}
 }
 
+func TestParseGatewayUpstream(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{"/proxy", "localhost:8080", "ftp://example.com", "https://user@example.com", "https://example.com?token=secret"} {
+		if _, err := parseGatewayUpstream(raw, "test-upstream"); err == nil {
+			t.Fatalf("invalid upstream %q accepted", raw)
+		}
+	}
+	parsed, err := parseGatewayUpstream("https://example.com/provider/v1", "test-upstream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Host != "example.com" || parsed.Path != "/provider/v1" {
+		t.Fatalf("parsed upstream = %s", parsed)
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",

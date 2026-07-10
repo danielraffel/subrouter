@@ -226,6 +226,15 @@ func credentialIsolationNeedsAdminKeys(adminToken string, gatewayTokens ...strin
 	return false
 }
 
+func parseGatewayUpstream(raw, flagName string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("--%s must be an absolute HTTP(S) URL without credentials, query, or fragment", flagName)
+	}
+	return parsed, nil
+}
+
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
@@ -313,7 +322,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	geminiUpstream, err := url.Parse(*geminiUpstreamRaw)
+	geminiUpstream, err := parseGatewayUpstream(*geminiUpstreamRaw, "gemini-upstream")
 	if err != nil {
 		return err
 	}
@@ -326,11 +335,11 @@ func serve(args []string) error {
 			return errors.New("--gemini-public-url must be an HTTP(S) origin without credentials, path, query, or fragment")
 		}
 	}
-	anthropicGatewayUpstream, err := url.Parse(*anthropicGatewayUpstreamRaw)
+	anthropicGatewayUpstream, err := parseGatewayUpstream(*anthropicGatewayUpstreamRaw, "anthropic-gateway-upstream")
 	if err != nil {
 		return err
 	}
-	openAIGatewayUpstream, err := url.Parse(*openAIGatewayUpstreamRaw)
+	openAIGatewayUpstream, err := parseGatewayUpstream(*openAIGatewayUpstreamRaw, "openai-gateway-upstream")
 	if err != nil {
 		return err
 	}
@@ -1008,7 +1017,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--api-upstream URL] [--claude-upstream URL] [--anthropic-gateway-upstream URL] [--openai-gateway-upstream URL] [--gemini-upstream URL] [--gemini-public-url ORIGIN] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--api-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--anthropic-gateway-upstream URL] [--openai-gateway-upstream URL] [--gemini-upstream URL] [--gemini-public-url ORIGIN] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

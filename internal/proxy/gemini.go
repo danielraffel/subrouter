@@ -151,7 +151,12 @@ func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream, 
 		return errors.New("cannot sanitize Gemini upload URL")
 	}
 	if !uploadURL.IsAbs() {
-		uploadURL = upstream.ResolveReference(uploadURL)
+		resolutionBase := cloneURL(upstream)
+		if !strings.HasSuffix(resolutionBase.Path, "/") {
+			resolutionBase.Path += "/"
+		}
+		resolutionBase.RawPath = ""
+		uploadURL = resolutionBase.ResolveReference(uploadURL)
 	}
 	if !sameURLOrigin(uploadURL, upstream) {
 		return errors.New("cannot sanitize Gemini upload URL")
@@ -235,7 +240,13 @@ func addGeminiUploadCapability(uploadURL *url.URL, gatewayToken string, expires 
 }
 
 func authorizeGeminiUploadCapability(r *http.Request, gatewayToken string, now time.Time) bool {
-	if r == nil || !strings.HasPrefix(r.URL.Path, "/gemini/upload/") {
+	if r == nil {
+		return false
+	}
+	capabilityPath := r.URL.Path
+	if strings.HasPrefix(capabilityPath, "/upload/") {
+		capabilityPath = "/gemini" + capabilityPath
+	} else if !strings.HasPrefix(capabilityPath, "/gemini/upload/") {
 		return false
 	}
 	query := r.URL.Query()
@@ -248,7 +259,7 @@ func authorizeGeminiUploadCapability(r *http.Request, gatewayToken string, now t
 	if err != nil || now.Unix() > expires {
 		return false
 	}
-	want := geminiUploadCapability(r.URL.Path, query, gatewayToken)
+	want := geminiUploadCapability(capabilityPath, query, gatewayToken)
 	return len(got) == len(want) && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 

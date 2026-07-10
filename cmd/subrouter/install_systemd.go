@@ -137,13 +137,7 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 			}
 		}
 	}
-	defaultMode := os.FileMode(0o644)
-	if config.AdminToken != "" || config.GeminiAPIKey != "" || config.GeminiGatewayKey != "" ||
-		config.AnthropicAPIKey != "" || config.AnthropicGatewayKey != "" ||
-		config.OpenAIAPIKey != "" || config.OpenAIGatewayKey != "" {
-		defaultMode = 0o600
-	}
-	if err := writeSystemdDefaults(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
+	if err := writeSystemdDefaults(systemdDefaultPath(config), []byte(defaults), 0o600); err != nil {
 		return err
 	}
 	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
