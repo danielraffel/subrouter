@@ -43,7 +43,7 @@ sudo systemctl restart subrouter
 
 Anthropic SDKs use `http://<server>:31415/anthropic`; OpenAI SDKs use `http://<server>:31415/api/v1` (`/openai/v1` is an alias). Gemini SDKs using default `v1beta` use `http://<server>:31415`; clients selecting `v1` or `v1alpha` use `http://<server>:31415/gemini`. Existing root `/v1/*` and `/responses` routes retain subscription/account routing. Override gateway destinations with `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, and `--gemini-upstream` without changing root provider routing.
 
-Gemini Live requires HTTPS termination because official Python clients dial `wss`. The terminating proxy must forward `/ws/*` and set `X-Forwarded-Proto: https`; use its `https://` URL as the Gemini SDK base. If the proxy replaces `Host`, start Subrouter with `--gemini-public-url https://<public-host>` so resumable upload continuations use the external origin without trusting client-supplied forwarding headers.
+Gemini Live requires HTTPS termination because official Python clients dial `wss`. The terminating proxy must forward the provider gateway paths, including `/ws/*`, and set `X-Forwarded-Proto: https`; use its `https://` URL as the Gemini SDK base. It must reject `/_subrouter/*` instead of forwarding management routes through its trusted loopback connection. If the proxy replaces `Host`, start Subrouter with `--gemini-public-url https://<public-host>` so resumable upload continuations use the external origin without trusting client-supplied forwarding headers.
 
 ## Transcripts
 

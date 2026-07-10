@@ -159,7 +159,10 @@ func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream, 
 	uploadURL.Host = host
 	uploadPath := uploadURL.Path
 	basePath := strings.TrimSuffix(upstream.Path, "/")
-	if basePath != "" && (uploadPath == basePath || strings.HasPrefix(uploadPath, basePath+"/")) {
+	if basePath != "" {
+		if uploadPath != basePath && !strings.HasPrefix(uploadPath, basePath+"/") {
+			return errors.New("cannot sanitize Gemini upload URL")
+		}
 		uploadPath = strings.TrimPrefix(uploadPath, basePath)
 	}
 	if !strings.HasPrefix(uploadPath, "/") {

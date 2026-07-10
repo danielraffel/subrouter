@@ -323,6 +323,22 @@ func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
 	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "http", "gateway.example.com", "/gemini/upload/v1beta/files", "team-token")
 }
 
+func TestRewriteGeminiUploadURLRejectsPathOutsideCustomUpstreamBase(t *testing.T) {
+	t.Parallel()
+
+	upstream, err := url.Parse("https://proxy.example.com/google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/gemini/upload/v1beta/files", nil)
+	headers := http.Header{
+		"X-Goog-Upload-Url": []string{"https://proxy.example.com/upload/v1beta/files?upload_id=abc"},
+	}
+	if err := rewriteGeminiUploadURLs(headers, upstream, nil, request, "team-token"); err == nil {
+		t.Fatal("upload URL outside custom upstream base path was accepted")
+	}
+}
+
 func TestRewriteGeminiUploadURLsRejectsForeignControlURL(t *testing.T) {
 	t.Parallel()
 

@@ -164,6 +164,43 @@ func isDirectSRCommand(command string) bool {
 	return ok
 }
 
+type teamGatewayCredential struct {
+	providerKey  string
+	gatewayToken string
+	enabled      bool
+}
+
+func validateTeamGatewayCredentials(addr, adminToken string, gateways ...teamGatewayCredential) error {
+	adminToken = strings.TrimSpace(adminToken)
+	anyEnabled := false
+	for _, gateway := range gateways {
+		providerKey := strings.TrimSpace(gateway.providerKey)
+		gatewayToken := strings.TrimSpace(gateway.gatewayToken)
+		if gateway.enabled || (providerKey != "" && gatewayToken != "") {
+			anyEnabled = true
+		}
+		if adminToken != "" && (adminToken == providerKey || adminToken == gatewayToken) {
+			return errors.New("SUBROUTER_ADMIN_TOKEN must differ from every provider key and gateway token")
+		}
+	}
+	if anyEnabled && adminToken == "" && !listenAddressIsLoopback(addr) {
+		return errors.New("SUBROUTER_ADMIN_TOKEN is required when a team gateway listens on a non-loopback address")
+	}
+	return nil
+}
+
+func listenAddressIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
@@ -210,6 +247,24 @@ func serve(args []string) error {
 	}
 	if *adminToken == "" {
 		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
+	}
+	resolvedBedrockGatewayToken := strings.TrimSpace(*bedrockGatewayToken)
+	if resolvedBedrockGatewayToken == "" {
+		resolvedBedrockGatewayToken = strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
+	}
+	geminiAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY"))
+	geminiGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN"))
+	anthropicAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_API_KEY"))
+	anthropicGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN"))
+	openAIAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY"))
+	openAIGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN"))
+	if err := validateTeamGatewayCredentials(*addr, *adminToken,
+		teamGatewayCredential{providerKey: geminiAPIKey, gatewayToken: geminiGatewayToken},
+		teamGatewayCredential{providerKey: anthropicAPIKey, gatewayToken: anthropicGatewayToken},
+		teamGatewayCredential{providerKey: openAIAPIKey, gatewayToken: openAIGatewayToken},
+		teamGatewayCredential{gatewayToken: resolvedBedrockGatewayToken, enabled: *bedrockEnable},
+	); err != nil {
+		return err
 	}
 
 	var upstream *url.URL
@@ -298,10 +353,6 @@ func serve(args []string) error {
 
 	var bedrockConfig *proxy.BedrockConfig
 	if *bedrockEnable {
-		token := strings.TrimSpace(*bedrockGatewayToken)
-		if token == "" {
-			token = strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
-		}
 		regions := parseBedrockRegions(*bedrockRegion)
 		if len(regions) == 0 {
 			return errors.New("bedrock: no AWS regions configured")
@@ -317,14 +368,14 @@ func serve(args []string) error {
 		bedrockConfig = &proxy.BedrockConfig{
 			Regions:      regions,
 			Sources:      sources,
-			GatewayToken: token,
+			GatewayToken: resolvedBedrockGatewayToken,
 			Transport:    outboundTransport,
 			CostLogPath:  filepath.Join(filepath.Dir(*sessionPath), "bedrock-cost.jsonl"),
 		}
 		if *bedrockAutoBump {
 			bedrockConfig.Bumper = proxy.NewBedrockQuotaBumper(awsCfg, slog.Default())
 		}
-		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
+		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", resolvedBedrockGatewayToken != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
 	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
@@ -355,20 +406,20 @@ func serve(args []string) error {
 		Gemini: &proxy.GeminiConfig{
 			Upstream:     geminiUpstream,
 			PublicURL:    geminiPublicURL,
-			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY")),
-			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN")),
+			APIKey:       geminiAPIKey,
+			GatewayToken: geminiGatewayToken,
 			Transport:    outboundTransport,
 		},
 		AnthropicGateway: &proxy.APIKeyGatewayConfig{
 			Upstream:     anthropicGatewayUpstream,
-			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_API_KEY")),
-			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN")),
+			APIKey:       anthropicAPIKey,
+			GatewayToken: anthropicGatewayToken,
 			Transport:    outboundTransport,
 		},
 		OpenAIGateway: &proxy.APIKeyGatewayConfig{
 			Upstream:     openAIGatewayUpstream,
-			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY")),
-			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN")),
+			APIKey:       openAIAPIKey,
+			GatewayToken: openAIGatewayToken,
 			Transport:    outboundTransport,
 		},
 		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),

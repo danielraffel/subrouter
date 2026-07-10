@@ -45,6 +45,26 @@ func TestConfigureDefaultLoggerLeavesServeLoggerAlone(t *testing.T) {
 	}
 }
 
+func TestValidateTeamGatewayCredentials(t *testing.T) {
+	t.Parallel()
+
+	gateway := teamGatewayCredential{providerKey: "provider-key", gatewayToken: "team-token"}
+	if err := validateTeamGatewayCredentials("0.0.0.0:31415", "", gateway); err == nil {
+		t.Fatal("non-loopback gateway started without an admin token")
+	}
+	if err := validateTeamGatewayCredentials("127.0.0.1:31415", "", gateway); err != nil {
+		t.Fatalf("loopback gateway without admin token: %v", err)
+	}
+	for _, reused := range []string{"provider-key", "team-token"} {
+		if err := validateTeamGatewayCredentials("0.0.0.0:31415", reused, gateway); err == nil {
+			t.Fatalf("admin token reused credential %q", reused)
+		}
+	}
+	if err := validateTeamGatewayCredentials("0.0.0.0:31415", "admin-token", gateway); err != nil {
+		t.Fatalf("separate credentials rejected: %v", err)
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",
