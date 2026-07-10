@@ -471,8 +471,10 @@ func TestGatewaysRejectAmbiguousPaths(t *testing.T) {
 		{"/api/v1/%2forganization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/api/v1/%252forganization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/api/v1/x/%252e%252e/organization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/api/v1/organization%252Fprojects/example", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/anthropic/%2e%2e/debug", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/anthropic/v1/%5corganizations/example", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
+		{"/anthropic/v1%252Forganizations/example", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/gemini/%2e%2e/debug", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 		{"/gemini/x/%252e%252e/%252e%252e/admin", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 	}

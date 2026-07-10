@@ -153,6 +153,10 @@ func gatewayPathIsUnsafe(requestURL *url.URL) bool {
 			if !strings.HasPrefix(candidate, "/") || strings.Contains(candidate, "//") || strings.Contains(candidate, `\`) {
 				return true
 			}
+			lowerCandidate := strings.ToLower(candidate)
+			if strings.Contains(lowerCandidate, "%2f") || strings.Contains(lowerCandidate, "%5c") {
+				return true
+			}
 			for _, segment := range strings.Split(candidate, "/") {
 				if segment == "." || segment == ".." {
 					return true

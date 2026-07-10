@@ -148,7 +148,7 @@ func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream, 
 	if !uploadURL.IsAbs() {
 		uploadURL = upstream.ResolveReference(uploadURL)
 	}
-	if !strings.EqualFold(uploadURL.Host, upstream.Host) {
+	if !sameURLOrigin(uploadURL, upstream) {
 		return errors.New("cannot sanitize Gemini upload URL")
 	}
 	scheme, host := geminiPublicOrigin(request, publicURL)
@@ -173,6 +173,28 @@ func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream, 
 	addGeminiUploadCapability(uploadURL, gatewayToken, time.Now().Add(geminiUploadCapabilityTTL))
 	headers.Set(header, uploadURL.String())
 	return nil
+}
+
+func sameURLOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil || !strings.EqualFold(left.Scheme, right.Scheme) ||
+		!strings.EqualFold(left.Hostname(), right.Hostname()) {
+		return false
+	}
+	return effectiveURLPort(left) == effectiveURLPort(right)
+}
+
+func effectiveURLPort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(value.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func geminiPublicOrigin(request *http.Request, publicURL *url.URL) (string, string) {

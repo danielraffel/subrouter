@@ -305,6 +305,23 @@ func TestRewriteGeminiUploadURLUsesConfiguredPublicOrigin(t *testing.T) {
 	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "https", "gemini.team.example", "/gemini/upload/v1beta/files", "team-token")
 }
 
+func TestRewriteGeminiUploadURLNormalizesDefaultUpstreamPort(t *testing.T) {
+	t.Parallel()
+
+	upstream, err := url.Parse("https://generativelanguage.googleapis.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/gemini/upload/v1beta/files", nil)
+	headers := http.Header{
+		"X-Goog-Upload-Url": []string{"https://generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc"},
+	}
+	if err := rewriteGeminiUploadURLs(headers, upstream, nil, request, "team-token"); err != nil {
+		t.Fatal(err)
+	}
+	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "http", "example.com", "/gemini/upload/v1beta/files", "team-token")
+}
+
 func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
 	t.Parallel()
 
