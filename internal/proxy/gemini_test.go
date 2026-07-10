@@ -68,7 +68,7 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		if got := strings.TrimSpace(rec.Body.String()); got != strings.TrimPrefix(path, "/gemini") {
 			t.Fatalf("%s upstream path = %q", path, got)
 		}
-		if got := rec.Header().Get("X-Goog-Upload-Url"); got != "http://example.com/upload/v1beta/files?key=team-token&upload_id=abc" {
+		if got := rec.Header().Get("X-Goog-Upload-Url"); got != "http://example.com/gemini/upload/v1beta/files?key=team-token&upload_id=abc" {
 			t.Fatalf("upload URL = %q", got)
 		}
 	}
@@ -246,8 +246,27 @@ func TestRewriteGeminiUploadURLUsesForwardedHTTPS(t *testing.T) {
 		"X-Goog-Upload-Url": []string{"https://generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc"},
 	}
 	rewriteGeminiUploadURL(headers, upstream, request, "team-token")
-	if got := headers.Get("X-Goog-Upload-Url"); got != "https://gateway.example.com/upload/v1beta/files?key=team-token&upload_id=abc" {
+	if got := headers.Get("X-Goog-Upload-Url"); got != "https://gateway.example.com/gemini/upload/v1beta/files?key=team-token&upload_id=abc" {
 		t.Fatalf("upload URL = %q", got)
+	}
+}
+
+func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
+	t.Parallel()
+
+	upstream, err := url.Parse("https://proxy.example.com/google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/gemini/upload/v1beta/files", nil)
+	request.Host = "gateway.example.com"
+	headers := http.Header{
+		"X-Goog-Upload-Url": []string{"https://proxy.example.com/google/upload/v1beta/files?upload_id=abc"},
+	}
+	rewriteGeminiUploadURL(headers, upstream, request, "team-token")
+	want := "http://gateway.example.com/gemini/upload/v1beta/files?key=team-token&upload_id=abc"
+	if got := headers.Get("X-Goog-Upload-Url"); got != want {
+		t.Fatalf("upload URL = %q, want %q", got, want)
 	}
 }
 
@@ -257,6 +276,9 @@ func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
 	var requests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		if !strings.HasPrefix(r.URL.Path, "/google/upload/v1beta/files") {
+			t.Errorf("upstream path = %q", r.URL.Path)
+		}
 		if got := r.Header.Get("X-Goog-Api-Key"); got != "provider-secret" {
 			t.Errorf("X-Goog-Api-Key = %q", got)
 		}
@@ -264,14 +286,14 @@ func TestGeminiGatewayAuthenticatesResumableUploadContinuation(t *testing.T) {
 			t.Errorf("gateway token leaked upstream")
 		}
 		if r.URL.Query().Get("upload_id") == "" {
-			w.Header().Set("X-Goog-Upload-Url", "http://"+r.Host+"/upload/v1beta/files?upload_id=abc")
+			w.Header().Set("X-Goog-Upload-Url", "http://"+r.Host+r.URL.Path+"?upload_id=abc")
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
-	upstreamURL, err := url.Parse(upstream.URL)
+	upstreamURL, err := url.Parse(upstream.URL + "/google")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -38,6 +38,10 @@ func (s Server) geminiHandler() http.Handler {
 			http.Error(w, "gemini gateway token required", http.StatusUnauthorized)
 			return
 		}
+		if gatewayPathHasDotSegment(r.URL.Path) {
+			http.Error(w, "invalid gateway path", http.StatusBadRequest)
+			return
+		}
 		if r.Method == http.MethodHead && (r.URL.Path == "/gemini" || r.URL.Path == "/gemini/") {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -116,6 +120,16 @@ func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *htt
 	}
 	uploadURL.Scheme = scheme
 	uploadURL.Host = request.Host
+	uploadPath := uploadURL.Path
+	basePath := strings.TrimSuffix(upstream.Path, "/")
+	if basePath != "" && (uploadPath == basePath || strings.HasPrefix(uploadPath, basePath+"/")) {
+		uploadPath = strings.TrimPrefix(uploadPath, basePath)
+	}
+	if !strings.HasPrefix(uploadPath, "/") {
+		uploadPath = "/" + uploadPath
+	}
+	uploadURL.Path = "/gemini" + uploadPath
+	uploadURL.RawPath = ""
 	query := uploadURL.Query()
 	query.Set("key", strings.TrimSpace(gatewayToken))
 	uploadURL.RawQuery = query.Encode()

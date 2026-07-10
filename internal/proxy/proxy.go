@@ -941,7 +941,9 @@ func (s Server) Handler() http.Handler {
 	mux.Handle("/anthropic/", anthropicHandler)
 	openAIHandler := s.apiKeyGatewayHandler(s.OpenAIGateway, apiKeyGatewaySpec{
 		name: "openai", prefixes: []string{"api", "openai"}, auth: apiKeyGatewayBearer,
-		stripHeaders: []string{"OpenAI-Organization", "OpenAI-Project"},
+		stripHeaders:          []string{"OpenAI-Organization", "OpenAI-Project"},
+		blockedPathPrefixes:   []string{"/v1/organization"},
+		blockedAPIKeyPrefixes: []string{"sk-admin-"},
 	})
 	mux.Handle("/api", openAIHandler)
 	mux.Handle("/api/", openAIHandler)

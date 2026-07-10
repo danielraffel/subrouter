@@ -339,6 +339,84 @@ func TestAPIKeyGatewaysFailClosed(t *testing.T) {
 	}
 }
 
+func TestOpenAIGatewayRejectsAdministrativeAccess(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adminKeyHandler := Server{OpenAIGateway: &APIKeyGatewayConfig{
+		Upstream: upstreamURL, APIKey: "sk-admin-secret", GatewayToken: "team-token",
+	}}.Handler()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer team-token")
+	rec := httptest.NewRecorder()
+	adminKeyHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("admin key status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	organizationHandler := Server{OpenAIGateway: &APIKeyGatewayConfig{
+		Upstream: upstreamURL, APIKey: "sk-project-secret", GatewayToken: "team-token",
+	}}.Handler()
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/organization/projects/example/service_accounts", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer team-token")
+	rec = httptest.NewRecorder()
+	organizationHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("organization route status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("upstream requests = %d", got)
+	}
+}
+
+func TestGatewaysRejectEncodedDotSegments(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL + "/provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		AnthropicGateway: &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "anthropic-provider", GatewayToken: "anthropic-team"},
+		OpenAIGateway:    &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "openai-provider", GatewayToken: "openai-team"},
+		Gemini:           &GeminiConfig{Upstream: upstreamURL, APIKey: "gemini-provider", GatewayToken: "gemini-team"},
+	}.Handler()
+	tests := []struct {
+		path string
+		auth func(http.Header)
+	}{
+		{"/api/%2e%2e/debug", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/anthropic/%2e%2e/debug", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
+		{"/gemini/%2e%2e/debug", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
+	}
+	for _, test := range tests {
+		req := httptest.NewRequest(http.MethodGet, test.path, nil)
+		test.auth(req.Header)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d body = %s", test.path, rec.Code, rec.Body.String())
+		}
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("upstream requests = %d", got)
+	}
+}
+
 func TestAPIKeyGatewaysRejectRequestsWhileDraining(t *testing.T) {
 	t.Parallel()
 

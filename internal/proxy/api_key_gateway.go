@@ -35,10 +35,12 @@ const (
 )
 
 type apiKeyGatewaySpec struct {
-	name         string
-	prefixes     []string
-	auth         apiKeyGatewayAuth
-	stripHeaders []string
+	name                  string
+	prefixes              []string
+	auth                  apiKeyGatewayAuth
+	stripHeaders          []string
+	blockedPathPrefixes   []string
+	blockedAPIKeyPrefixes []string
 }
 
 func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGatewaySpec) http.Handler {
@@ -47,8 +49,18 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 			http.Error(w, spec.name+" gateway not configured", http.StatusServiceUnavailable)
 			return
 		}
+		for _, prefix := range spec.blockedAPIKeyPrefixes {
+			if strings.HasPrefix(strings.TrimSpace(config.APIKey), prefix) {
+				http.Error(w, spec.name+" gateway requires a non-admin provider key", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		if !authorizeAPIKeyGateway(r, config.GatewayToken, spec.auth) {
 			http.Error(w, spec.name+" gateway token required", http.StatusUnauthorized)
+			return
+		}
+		if gatewayPathHasDotSegment(r.URL.Path) {
+			http.Error(w, "invalid gateway path", http.StatusBadRequest)
 			return
 		}
 		if s.Lifecycle != nil && s.Lifecycle.Draining() {
@@ -63,6 +75,12 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = stripGatewayPathPrefix(proxyRequest.URL.Path, spec.prefixes)
 		proxyRequest.URL.RawPath = ""
+		for _, prefix := range spec.blockedPathPrefixes {
+			if proxyRequest.URL.Path == prefix || strings.HasPrefix(proxyRequest.URL.Path, prefix+"/") {
+				http.Error(w, spec.name+" administrative route not allowed", http.StatusForbidden)
+				return
+			}
+		}
 		query := proxyRequest.URL.Query()
 		query.Del("key")
 		query.Del("api_key")
@@ -108,6 +126,15 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		}
 		rp.ServeHTTP(w, proxyRequest)
 	})
+}
+
+func gatewayPathHasDotSegment(path string) bool {
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "." || segment == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func authorizeAPIKeyGateway(r *http.Request, configuredToken string, auth apiKeyGatewayAuth) bool {
