@@ -319,14 +319,15 @@ func readDefaultValue(path, keyName string) string {
 	if err != nil {
 		return ""
 	}
+	value := ""
 	for _, line := range strings.Split(string(body), "\n") {
-		key, value, ok := strings.Cut(line, "=")
+		key, rawValue, ok := strings.Cut(line, "=")
 		if !ok || strings.TrimSpace(key) != keyName {
 			continue
 		}
-		return decodeSystemdDefaultValue(value)
+		value = decodeSystemdDefaultValue(rawValue)
 	}
-	return ""
+	return value
 }
 
 func decodeSystemdDefaultValue(value string) string {

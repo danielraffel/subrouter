@@ -936,6 +936,8 @@ func (s Server) Handler() http.Handler {
 	mux.Handle("/ws/", s.geminiHandler())
 	anthropicHandler := s.apiKeyGatewayHandler(s.AnthropicGateway, apiKeyGatewaySpec{
 		name: "anthropic", prefixes: []string{"anthropic"}, auth: apiKeyGatewayXAPIKeyOrBearer,
+		blockedPathPrefixes:   []string{"/v1/organizations", "/v1/compliance"},
+		blockedAPIKeyPrefixes: []string{"sk-ant-admin", "sk-ant-api01-"},
 	})
 	mux.Handle("/anthropic", anthropicHandler)
 	mux.Handle("/anthropic/", anthropicHandler)

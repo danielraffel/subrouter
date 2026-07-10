@@ -33,6 +33,9 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		if got := r.Header.Get("X-Subrouter-Session"); got != "" {
 			t.Fatalf("X-Subrouter-Session leaked upstream: %q", got)
 		}
+		if got := r.Header.Get("X-Subrouter-Admin-Token"); got != "" {
+			t.Fatalf("X-Subrouter-Admin-Token leaked upstream: %q", got)
+		}
 		w.Header().Set("X-Goog-Upload-Url", "http://"+r.Host+"/upload/v1beta/files?upload_id=abc")
 		_, _ = io.WriteString(w, r.URL.Path)
 	}))
@@ -60,6 +63,7 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		req.Header.Set("Authorization", "Bearer client-secret")
 		req.Header.Set("X-Subrouter-User-Email", "alice@example.com")
 		req.Header.Set("X-Subrouter-Session", "session-secret")
+		req.Header.Set("X-Subrouter-Admin-Token", "admin-secret")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {

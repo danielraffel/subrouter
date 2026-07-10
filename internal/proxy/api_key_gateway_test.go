@@ -100,6 +100,7 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 				openAIBeta       string
 				idempotencyKey   string
 				requestID        string
+				adminToken       string
 			}
 			captured := make(chan capturedRequest, 1)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +120,7 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 					openAIBeta:       r.Header.Get("OpenAI-Beta"),
 					idempotencyKey:   r.Header.Get("Idempotency-Key"),
 					requestID:        r.Header.Get("X-Request-ID"),
+					adminToken:       r.Header.Get("X-Subrouter-Admin-Token"),
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.Header().Set("X-Request-ID", "request-123")
@@ -146,6 +148,7 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 			req.Header.Set("OpenAI-Beta", "realtime=v1")
 			req.Header.Set("Idempotency-Key", "idem-123")
 			req.Header.Set("X-Request-ID", "client-request-123")
+			req.Header.Set("X-Subrouter-Admin-Token", "admin-secret")
 			rec := httptest.NewRecorder()
 			server.Handler().ServeHTTP(rec, req)
 
@@ -167,6 +170,9 @@ func TestAPIKeyGatewaysPassThroughRequestsAndStreams(t *testing.T) {
 			}
 			if got.userEmail != "" || got.sessionID != "" {
 				t.Fatalf("internal headers leaked upstream: email=%q session=%q", got.userEmail, got.sessionID)
+			}
+			if got.adminToken != "" {
+				t.Fatalf("Subrouter admin token leaked upstream")
 			}
 			if test.name == "openai" && (got.organization != "" || got.project != "") {
 				t.Fatalf("OpenAI tenant headers leaked upstream: organization=%q project=%q", got.organization, got.project)
@@ -372,6 +378,49 @@ func TestOpenAIGatewayRejectsAdministrativeAccess(t *testing.T) {
 	organizationHandler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("organization route status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("upstream requests = %d", got)
+	}
+}
+
+func TestAnthropicGatewayRejectsPrivilegedAccess(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, providerKey := range []string{"sk-ant-admin01-secret", "sk-ant-api01-secret"} {
+		handler := Server{AnthropicGateway: &APIKeyGatewayConfig{
+			Upstream: upstreamURL, APIKey: providerKey, GatewayToken: "team-token",
+		}}.Handler()
+		req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/messages", nil)
+		req.Header.Set("X-Api-Key", "team-token")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("key %q status = %d body = %s", providerKey, rec.Code, rec.Body.String())
+		}
+	}
+
+	handler := Server{AnthropicGateway: &APIKeyGatewayConfig{
+		Upstream: upstreamURL, APIKey: "sk-ant-api03-inference", GatewayToken: "team-token",
+	}}.Handler()
+	for _, path := range []string{"/anthropic/v1/organizations/example/members", "/anthropic/v1/compliance/activities"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Api-Key", "team-token")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s status = %d body = %s", path, rec.Code, rec.Body.String())
+		}
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("upstream requests = %d", got)

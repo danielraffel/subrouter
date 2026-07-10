@@ -266,3 +266,15 @@ func TestReadDefaultValueDecodesQuotedSecrets(t *testing.T) {
 		t.Fatalf("literal escape value = %q, want %q", got, literalEscape)
 	}
 }
+
+func TestReadDefaultValueUsesLastAssignment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subrouter")
+	contents := "SUBROUTER_OPENAI_GATEWAY_TOKEN=compromised\n" +
+		"SUBROUTER_OPENAI_GATEWAY_TOKEN='rotated-token'\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDefaultValue(path, "SUBROUTER_OPENAI_GATEWAY_TOKEN"); got != "rotated-token" {
+		t.Fatalf("gateway token = %q, want rotated-token", got)
+	}
+}
