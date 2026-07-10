@@ -170,9 +170,11 @@ type teamGatewayCredential struct {
 	enabled      bool
 }
 
-func validateTeamGatewayCredentials(addr, adminToken string, gateways ...teamGatewayCredential) error {
+func validateTeamGatewayCredentials(addr string, inheritedListener bool, adminToken string, gateways ...teamGatewayCredential) error {
 	adminToken = strings.TrimSpace(adminToken)
 	anyEnabled := false
+	providerKeys := make(map[string]struct{})
+	gatewayTokens := make([]string, 0, len(gateways))
 	for _, gateway := range gateways {
 		providerKey := strings.TrimSpace(gateway.providerKey)
 		gatewayToken := strings.TrimSpace(gateway.gatewayToken)
@@ -182,8 +184,19 @@ func validateTeamGatewayCredentials(addr, adminToken string, gateways ...teamGat
 		if adminToken != "" && (adminToken == providerKey || adminToken == gatewayToken) {
 			return errors.New("SUBROUTER_ADMIN_TOKEN must differ from every provider key and gateway token")
 		}
+		if providerKey != "" {
+			providerKeys[providerKey] = struct{}{}
+		}
+		if gatewayToken != "" {
+			gatewayTokens = append(gatewayTokens, gatewayToken)
+		}
 	}
-	if anyEnabled && adminToken == "" && !listenAddressIsLoopback(addr) {
+	for _, gatewayToken := range gatewayTokens {
+		if _, exposed := providerKeys[gatewayToken]; exposed {
+			return errors.New("provider keys must differ from every client-facing gateway token")
+		}
+	}
+	if anyEnabled && adminToken == "" && (inheritedListener || !listenAddressIsLoopback(addr)) {
 		return errors.New("SUBROUTER_ADMIN_TOKEN is required when a team gateway listens on a non-loopback address")
 	}
 	return nil
@@ -258,7 +271,12 @@ func serve(args []string) error {
 	anthropicGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN"))
 	openAIAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY"))
 	openAIGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN"))
-	if err := validateTeamGatewayCredentials(*addr, *adminToken,
+	listenPID, listenFDCount, listenEnvSet, err := systemdListenFDs(os.Getpid(), os.Getenv)
+	if err != nil {
+		return err
+	}
+	inheritedListener := listenEnvSet && listenPID == os.Getpid() && listenFDCount > 0
+	if err := validateTeamGatewayCredentials(*addr, inheritedListener, *adminToken,
 		teamGatewayCredential{providerKey: geminiAPIKey, gatewayToken: geminiGatewayToken},
 		teamGatewayCredential{providerKey: anthropicAPIKey, gatewayToken: anthropicGatewayToken},
 		teamGatewayCredential{providerKey: openAIAPIKey, gatewayToken: openAIGatewayToken},

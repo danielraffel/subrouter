@@ -49,19 +49,29 @@ func TestValidateTeamGatewayCredentials(t *testing.T) {
 	t.Parallel()
 
 	gateway := teamGatewayCredential{providerKey: "provider-key", gatewayToken: "team-token"}
-	if err := validateTeamGatewayCredentials("0.0.0.0:31415", "", gateway); err == nil {
+	if err := validateTeamGatewayCredentials("0.0.0.0:31415", false, "", gateway); err == nil {
 		t.Fatal("non-loopback gateway started without an admin token")
 	}
-	if err := validateTeamGatewayCredentials("127.0.0.1:31415", "", gateway); err != nil {
+	if err := validateTeamGatewayCredentials("127.0.0.1:31415", false, "", gateway); err != nil {
 		t.Fatalf("loopback gateway without admin token: %v", err)
 	}
+	if err := validateTeamGatewayCredentials("127.0.0.1:31415", true, "", gateway); err == nil {
+		t.Fatal("inherited listener gateway started without an admin token")
+	}
 	for _, reused := range []string{"provider-key", "team-token"} {
-		if err := validateTeamGatewayCredentials("0.0.0.0:31415", reused, gateway); err == nil {
+		if err := validateTeamGatewayCredentials("0.0.0.0:31415", false, reused, gateway); err == nil {
 			t.Fatalf("admin token reused credential %q", reused)
 		}
 	}
-	if err := validateTeamGatewayCredentials("0.0.0.0:31415", "admin-token", gateway); err != nil {
+	if err := validateTeamGatewayCredentials("0.0.0.0:31415", false, "admin-token", gateway); err != nil {
 		t.Fatalf("separate credentials rejected: %v", err)
+	}
+	crossCollision := []teamGatewayCredential{
+		{providerKey: "provider-a", gatewayToken: "team-a"},
+		{providerKey: "team-a", gatewayToken: "team-b"},
+	}
+	if err := validateTeamGatewayCredentials("0.0.0.0:31415", false, "admin-token", crossCollision...); err == nil {
+		t.Fatal("gateway token reused as another provider key")
 	}
 }
 

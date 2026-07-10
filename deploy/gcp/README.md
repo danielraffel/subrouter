@@ -102,11 +102,12 @@ Health check:
 curl http://<tailscale-ip>:31415/_subrouter/health
 ```
 
-For team API clients, regenerate the current defaults, then use a protected editor to set the six `SUBROUTER_{ANTHROPIC,OPENAI,GEMINI}_{API_KEY,GATEWAY_TOKEN}` values. Do not put secrets in command arguments or shell history.
+For team API clients, regenerate the current defaults, generate a separate admin token, then use a protected editor to set `SUBROUTER_ADMIN_TOKEN` and the six `SUBROUTER_{ANTHROPIC,OPENAI,GEMINI}_{API_KEY,GATEWAY_TOKEN}` values. Paste the generated admin token into the defaults file. Do not put secrets in command arguments or shell history.
 
 ```bash
 sudo sr install-systemd --start=false
 sudo chmod 600 /etc/default/subrouter
+openssl rand -hex 32
 sudoedit /etc/default/subrouter
 sudo systemctl restart subrouter
 ```
