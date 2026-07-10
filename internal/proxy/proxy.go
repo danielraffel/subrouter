@@ -947,8 +947,8 @@ func (s Server) Handler() http.Handler {
 		blockedPathPrefixes:   []string{"/v1/organization"},
 		blockedAPIKeyPrefixes: []string{"sk-admin-"},
 	})
-	mux.Handle("/api", openAIHandler)
-	mux.Handle("/api/", openAIHandler)
+	mux.Handle("/api/v1", openAIHandler)
+	mux.Handle("/api/v1/", openAIHandler)
 	mux.Handle("/openai", openAIHandler)
 	mux.Handle("/openai/", openAIHandler)
 	mux.Handle("/", s.proxyHandler())

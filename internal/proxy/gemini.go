@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -94,8 +95,7 @@ func (s Server) geminiHandler() http.Handler {
 			Transport: s.Gemini.Transport,
 		}
 		rp.ModifyResponse = func(response *http.Response) error {
-			rewriteGeminiUploadURL(response.Header, upstream, r, s.Gemini.GatewayToken)
-			return nil
+			return rewriteGeminiUploadURLs(response.Header, upstream, r, s.Gemini.GatewayToken)
 		}
 		if rp.Transport == nil {
 			rp.Transport = s.transport()
@@ -117,14 +117,32 @@ func (s Server) geminiHandler() http.Handler {
 	})
 }
 
-func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *http.Request, gatewayToken string) {
-	raw := strings.TrimSpace(headers.Get("X-Goog-Upload-Url"))
-	if raw == "" || upstream == nil || request == nil || request.Host == "" {
-		return
+func rewriteGeminiUploadURLs(headers http.Header, upstream *url.URL, request *http.Request, gatewayToken string) error {
+	for _, header := range []string{"X-Goog-Upload-Url", "X-Goog-Upload-Control-Url"} {
+		if err := rewriteGeminiUploadURLHeader(headers, header, upstream, request, gatewayToken); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream *url.URL, request *http.Request, gatewayToken string) error {
+	raw := strings.TrimSpace(headers.Get(header))
+	if raw == "" {
+		return nil
+	}
+	if upstream == nil || request == nil || request.Host == "" {
+		return errors.New("cannot sanitize Gemini upload URL")
 	}
 	uploadURL, err := url.Parse(raw)
-	if err != nil || !uploadURL.IsAbs() || !strings.EqualFold(uploadURL.Host, upstream.Host) {
-		return
+	if err != nil {
+		return errors.New("cannot sanitize Gemini upload URL")
+	}
+	if !uploadURL.IsAbs() {
+		uploadURL = upstream.ResolveReference(uploadURL)
+	}
+	if !strings.EqualFold(uploadURL.Host, upstream.Host) {
+		return errors.New("cannot sanitize Gemini upload URL")
 	}
 	scheme := "http"
 	if request.TLS != nil {
@@ -148,7 +166,8 @@ func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *htt
 	uploadURL.Path = "/gemini" + uploadPath
 	uploadURL.RawPath = ""
 	addGeminiUploadCapability(uploadURL, gatewayToken, time.Now().Add(geminiUploadCapabilityTTL))
-	headers.Set("X-Goog-Upload-Url", uploadURL.String())
+	headers.Set(header, uploadURL.String())
+	return nil
 }
 
 func addGeminiUploadCapability(uploadURL *url.URL, gatewayToken string, expires time.Time) {

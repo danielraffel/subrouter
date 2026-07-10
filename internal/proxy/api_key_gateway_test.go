@@ -454,7 +454,7 @@ func TestGatewaysRejectEncodedDotSegments(t *testing.T) {
 		path string
 		auth func(http.Header)
 	}{
-		{"/api/%2e%2e/debug", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/api/v1/%2e%2e/debug", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/anthropic/%2e%2e/debug", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/gemini/%2e%2e/debug", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 	}
@@ -589,7 +589,7 @@ func TestAPIKeyGatewayRoutesDoNotCaptureRootProxyPaths(t *testing.T) {
 		MaxBodyBytes:  1024,
 		OpenAIGateway: &APIKeyGatewayConfig{Upstream: gatewayURL, APIKey: "provider", GatewayToken: "team"},
 	}.Handler()
-	for index, path := range []string{"/v1/responses", "/responses"} {
+	for index, path := range []string{"/v1/responses", "/responses", "/api/oauth/usage"} {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}"))
 		req.Header.Set("X-Subrouter-Session", "root-session-"+string(rune('a'+index)))
 		rec := httptest.NewRecorder()
@@ -598,7 +598,7 @@ func TestAPIKeyGatewayRoutesDoNotCaptureRootProxyPaths(t *testing.T) {
 			t.Fatalf("%s status = %d body = %s", path, rec.Code, rec.Body.String())
 		}
 	}
-	if got := rootRequests.Load(); got != 2 {
+	if got := rootRequests.Load(); got != 3 {
 		t.Fatalf("root upstream requests = %d", got)
 	}
 	if got := gatewayRequests.Load(); got != 0 {
