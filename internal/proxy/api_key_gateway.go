@@ -145,8 +145,13 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = stripGatewayPathPrefix(proxyRequest.URL.Path, spec.prefixes)
 		proxyRequest.URL.RawPath = ""
+		joinedUpstreamPath := joinGatewayUpstreamPath(upstream.Path, proxyRequest.URL.Path)
+		if gatewayPathIsUnsafe(&url.URL{Path: joinedUpstreamPath}) {
+			http.Error(w, spec.name+" gateway upstream path is invalid", http.StatusServiceUnavailable)
+			return
+		}
 		for _, prefix := range spec.blockedPathPrefixes {
-			if proxyRequest.URL.Path == prefix || strings.HasPrefix(proxyRequest.URL.Path, prefix+"/") {
+			if gatewayPathUsesBlockedPrefix(proxyRequest.URL.Path, prefix) || gatewayPathUsesBlockedPrefix(joinedUpstreamPath, prefix) {
 				http.Error(w, spec.name+" administrative route not allowed", http.StatusForbidden)
 				return
 			}
@@ -240,6 +245,26 @@ func (s Server) validateReloadedGatewayCredentials(loaded []accounts.Account) er
 		}
 	}
 	return nil
+}
+
+func joinGatewayUpstreamPath(basePath, requestPath string) string {
+	baseSlash := strings.HasSuffix(basePath, "/")
+	requestSlash := strings.HasPrefix(requestPath, "/")
+	switch {
+	case baseSlash && requestSlash:
+		return basePath + requestPath[1:]
+	case !baseSlash && !requestSlash:
+		return basePath + "/" + requestPath
+	default:
+		return basePath + requestPath
+	}
+}
+
+func gatewayPathUsesBlockedPrefix(requestPath, blockedPrefix string) bool {
+	if requestPath == blockedPrefix || strings.HasPrefix(requestPath, blockedPrefix+"/") {
+		return true
+	}
+	return strings.Contains(requestPath, blockedPrefix+"/") || strings.HasSuffix(requestPath, blockedPrefix)
 }
 
 func gatewayMethodCanReflectCredentials(method string) bool {

@@ -427,6 +427,20 @@ func TestOpenAIGatewayRejectsAdministrativeAccess(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("organization route status = %d body = %s", rec.Code, rec.Body.String())
 	}
+	customBaseURL, err := url.Parse(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	customBaseHandler := Server{OpenAIGateway: &APIKeyGatewayConfig{
+		Upstream: customBaseURL, APIKey: "custom-provider-secret", GatewayToken: "team-token",
+	}}.Handler()
+	req = httptest.NewRequest(http.MethodPost, "/openai/organization/projects/example/service_accounts", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer team-token")
+	rec = httptest.NewRecorder()
+	customBaseHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("custom-base organization route status = %d body = %s", rec.Code, rec.Body.String())
+	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("upstream requests = %d", got)
 	}
@@ -469,6 +483,20 @@ func TestAnthropicGatewayRejectsPrivilegedAccess(t *testing.T) {
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("%s status = %d body = %s", path, rec.Code, rec.Body.String())
 		}
+	}
+	customBaseURL, err := url.Parse(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	customBaseHandler := Server{AnthropicGateway: &APIKeyGatewayConfig{
+		Upstream: customBaseURL, APIKey: "custom-inference-key", GatewayToken: "team-token",
+	}}.Handler()
+	req := httptest.NewRequest(http.MethodGet, "/anthropic/organizations/example/members", nil)
+	req.Header.Set("X-Api-Key", "team-token")
+	rec := httptest.NewRecorder()
+	customBaseHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("custom-base organization route status = %d body = %s", rec.Code, rec.Body.String())
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("upstream requests = %d", got)
