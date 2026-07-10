@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T) {
@@ -246,5 +248,73 @@ func TestRewriteGeminiUploadURLUsesForwardedHTTPS(t *testing.T) {
 	rewriteGeminiUploadURL(headers, upstream, request)
 	if got := headers.Get("X-Goog-Upload-Url"); got != "https://gateway.example.com/upload/v1beta/files?upload_id=abc" {
 		t.Fatalf("upload URL = %q", got)
+	}
+}
+
+func TestGeminiGatewayProxiesLiveWebSocket(t *testing.T) {
+	t.Parallel()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" {
+			t.Errorf("upstream path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("key") != "" {
+			t.Errorf("query key leaked upstream")
+		}
+		if got := r.Header.Get("X-Goog-Api-Key"); got != "provider-secret" {
+			t.Errorf("X-Goog-Api-Key = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization leaked upstream: %q", got)
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		messageType, message, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read message: %v", err)
+			return
+		}
+		if err := conn.WriteMessage(messageType, append([]byte("echo:"), message...)); err != nil {
+			t.Errorf("write message: %v", err)
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{Gemini: &GeminiConfig{
+		Upstream: upstreamURL, APIKey: "provider-secret", GatewayToken: "team-token",
+	}}.Handler()
+	gateway := httptest.NewServer(handler)
+	defer gateway.Close()
+	wsURL := "ws" + strings.TrimPrefix(gateway.URL, "http") +
+		"/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=client-secret"
+	headers := http.Header{
+		"X-Goog-Api-Key": []string{"team-token"},
+		"Authorization":  []string{"Bearer client-secret"},
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			defer response.Body.Close()
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	_, message, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(message); got != "echo:hello" {
+		t.Fatalf("message = %q", got)
 	}
 }

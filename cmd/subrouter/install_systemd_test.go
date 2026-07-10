@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -242,5 +243,22 @@ func TestReadDefaultValueUnquotesEnvFileValue(t *testing.T) {
 	want := "--transcript-gcs-uri=gs://bucket/prefix --fetch-usage=false"
 	if got != want {
 		t.Fatalf("extra args = %q, want %q", got, want)
+	}
+}
+
+func TestReadDefaultValueDecodesQuotedSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subrouter")
+	doubleQuoted := `team\token"quoted`
+	singleQuoted := `team\single-token`
+	contents := "DOUBLE=" + strconv.Quote(doubleQuoted) + "\n" +
+		"SINGLE='" + singleQuoted + "'\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readDefaultValue(path, "DOUBLE"); got != doubleQuoted {
+		t.Fatalf("double-quoted value = %q, want %q", got, doubleQuoted)
+	}
+	if got := readDefaultValue(path, "SINGLE"); got != singleQuoted {
+		t.Fatalf("single-quoted value = %q, want %q", got, singleQuoted)
 	}
 }

@@ -932,6 +932,8 @@ func (s Server) Handler() http.Handler {
 	// available at the listener root.
 	mux.Handle("/upload/v1beta/", s.geminiHandler())
 	mux.Handle("/v1beta/", s.geminiHandler())
+	// Gemini Live uses a native WebSocket method path at the listener root.
+	mux.Handle("/ws/", s.geminiHandler())
 	anthropicHandler := s.apiKeyGatewayHandler(s.AnthropicGateway, apiKeyGatewaySpec{
 		name: "anthropic", prefixes: []string{"anthropic"}, auth: apiKeyGatewayXAPIKeyOrBearer,
 	})

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -324,11 +325,23 @@ func readDefaultValue(path, keyName string) string {
 		if !ok || strings.TrimSpace(key) != keyName {
 			continue
 		}
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"`)
-		return value
+		return decodeSystemdDefaultValue(value)
 	}
 	return ""
+}
+
+func decodeSystemdDefaultValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		return value[1 : len(value)-1]
+	}
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		if decoded, err := strconv.Unquote(value); err == nil {
+			return decoded
+		}
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 func stopLegacySystemdServices(runner commandRunner) {
