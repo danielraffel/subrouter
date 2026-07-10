@@ -82,6 +82,20 @@ func TestValidateTeamGatewayCredentials(t *testing.T) {
 	}
 }
 
+func TestCredentialIsolationNeedsAdminKeys(t *testing.T) {
+	t.Parallel()
+
+	if credentialIsolationNeedsAdminKeys("") {
+		t.Fatal("empty credentials require admin-key store")
+	}
+	if !credentialIsolationNeedsAdminKeys("admin-token") {
+		t.Fatal("admin token did not require admin-key store")
+	}
+	if !credentialIsolationNeedsAdminKeys("", "", "gateway-token") {
+		t.Fatal("gateway token did not require admin-key store")
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",

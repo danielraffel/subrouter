@@ -214,6 +214,18 @@ func listenAddressIsLoopback(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func credentialIsolationNeedsAdminKeys(adminToken string, gatewayTokens ...string) bool {
+	if strings.TrimSpace(adminToken) != "" {
+		return true
+	}
+	for _, token := range gatewayTokens {
+		if strings.TrimSpace(token) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
@@ -334,9 +346,11 @@ func serve(args []string) error {
 		return err
 	}
 	var adminKeys []accounts.AdminKeyEntry
-	gatewayTokensConfigured := geminiGatewayToken != "" || anthropicGatewayToken != "" || openAIGatewayToken != "" ||
-		(*bedrockEnable && resolvedBedrockGatewayToken != "")
-	if gatewayTokensConfigured {
+	bedrockGatewayTokenIfEnabled := ""
+	if *bedrockEnable {
+		bedrockGatewayTokenIfEnabled = resolvedBedrockGatewayToken
+	}
+	if credentialIsolationNeedsAdminKeys(*adminToken, geminiGatewayToken, anthropicGatewayToken, openAIGatewayToken, bedrockGatewayTokenIfEnabled) {
 		adminKeys, err = codexStore.ListAdminKeys()
 		if err != nil {
 			return err
@@ -352,15 +366,11 @@ func serve(args []string) error {
 		return err
 	}
 	inheritedListener := listenEnvSet && listenPID == os.Getpid() && listenFDCount > 0
-	bedrockGatewayTokenForValidation := ""
-	if *bedrockEnable {
-		bedrockGatewayTokenForValidation = resolvedBedrockGatewayToken
-	}
 	gatewayCredentials := []teamGatewayCredential{
 		{providerKey: geminiAPIKey, gatewayToken: geminiGatewayToken},
 		{providerKey: anthropicAPIKey, gatewayToken: anthropicGatewayToken},
 		{providerKey: openAIAPIKey, gatewayToken: openAIGatewayToken},
-		{gatewayToken: bedrockGatewayTokenForValidation, enabled: *bedrockEnable},
+		{gatewayToken: bedrockGatewayTokenIfEnabled, enabled: *bedrockEnable},
 		{providerKey: claudeFableAPIKey},
 	}
 	for _, account := range append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...) {
