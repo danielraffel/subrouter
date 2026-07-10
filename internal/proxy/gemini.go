@@ -76,10 +76,12 @@ func (s Server) geminiHandler() http.Handler {
 		proxyRequest.URL.RawPath = ""
 		query := proxyRequest.URL.Query()
 		query.Del("key")
+		query.Del("$userProject")
 		query.Del(geminiUploadCapabilityParam)
 		query.Del(geminiUploadExpiryParam)
 		proxyRequest.URL.RawQuery = query.Encode()
 		proxyRequest.Header.Del("Authorization")
+		proxyRequest.Header.Del("X-Goog-User-Project")
 		proxyRequest.Header.Set("X-Goog-Api-Key", strings.TrimSpace(s.Gemini.APIKey))
 		session.StripSubrouterHeaders(proxyRequest.Header)
 		stripOutboundForwardingHeaders(proxyRequest.Header)

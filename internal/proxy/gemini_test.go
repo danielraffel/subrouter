@@ -28,6 +28,12 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		if r.URL.Query().Get("key") != "" {
 			t.Fatalf("query key leaked upstream")
 		}
+		if r.URL.Query().Get("$userProject") != "" {
+			t.Fatalf("Google billing project leaked upstream")
+		}
+		if got := r.Header.Get("X-Goog-User-Project"); got != "" {
+			t.Fatalf("X-Goog-User-Project leaked upstream: %q", got)
+		}
 		if got := r.Header.Get("X-Subrouter-User-Email"); got != "" {
 			t.Fatalf("X-Subrouter-User-Email leaked upstream: %q", got)
 		}
@@ -60,12 +66,13 @@ func TestGeminiGatewayReplacesClientCredentialAndPreservesAPIPaths(t *testing.T)
 		"/upload/v1beta/files",
 		"/v1beta/interactions",
 	} {
-		req := httptest.NewRequest(http.MethodPost, path+"?key=client-secret", strings.NewReader("{}"))
+		req := httptest.NewRequest(http.MethodPost, path+"?key=client-secret&%24userProject=client-project", strings.NewReader("{}"))
 		req.Header.Set("X-Goog-Api-Key", "team-token")
 		req.Header.Set("Authorization", "Bearer client-secret")
 		req.Header.Set("X-Subrouter-User-Email", "alice@example.com")
 		req.Header.Set("X-Subrouter-Session", "session-secret")
 		req.Header.Set("X-Subrouter-Admin-Token", "admin-secret")
+		req.Header.Set("X-Goog-User-Project", "client-project")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
