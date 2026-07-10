@@ -73,7 +73,7 @@ func (s Server) geminiHandler() http.Handler {
 			Transport: s.Gemini.Transport,
 		}
 		rp.ModifyResponse = func(response *http.Response) error {
-			rewriteGeminiUploadURL(response.Header, upstream, r)
+			rewriteGeminiUploadURL(response.Header, upstream, r, s.Gemini.GatewayToken)
 			return nil
 		}
 		if rp.Transport == nil {
@@ -96,7 +96,7 @@ func (s Server) geminiHandler() http.Handler {
 	})
 }
 
-func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *http.Request) {
+func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *http.Request, gatewayToken string) {
 	raw := strings.TrimSpace(headers.Get("X-Goog-Upload-Url"))
 	if raw == "" || upstream == nil || request == nil || request.Host == "" {
 		return
@@ -116,6 +116,9 @@ func rewriteGeminiUploadURL(headers http.Header, upstream *url.URL, request *htt
 	}
 	uploadURL.Scheme = scheme
 	uploadURL.Host = request.Host
+	query := uploadURL.Query()
+	query.Set("key", strings.TrimSpace(gatewayToken))
+	uploadURL.RawQuery = query.Encode()
 	headers.Set("X-Goog-Upload-Url", uploadURL.String())
 }
 
