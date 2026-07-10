@@ -181,13 +181,27 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 }
 
 func writeSystemdDefaults(path string, contents []byte, mode os.FileMode) error {
-	if err := os.WriteFile(path, contents, mode); err != nil {
+	if mode.Perm() != 0o600 {
+		return os.WriteFile(path, contents, mode)
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
 		return err
 	}
-	if mode.Perm() == 0o600 {
-		return os.Chmod(path, 0o600)
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return err
 	}
-	return nil
+	if _, err := temp.Write(contents); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 func validateSystemdConfig(config systemdConfig) error {

@@ -7,6 +7,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+
+	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
 // GeminiConfig enables a transparent Gemini Developer API gateway. Clients
@@ -57,6 +59,7 @@ func (s Server) geminiHandler() http.Handler {
 		proxyRequest.URL.RawQuery = query.Encode()
 		proxyRequest.Header.Del("Authorization")
 		proxyRequest.Header.Set("X-Goog-Api-Key", strings.TrimSpace(s.Gemini.APIKey))
+		session.StripSubrouterHeaders(proxyRequest.Header)
 		stripOutboundForwardingHeaders(proxyRequest.Header)
 		if s.Logger != nil {
 			s.Logger.Info("gemini proxy request", "method", r.Method, "path", proxyRequest.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r))

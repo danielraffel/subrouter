@@ -105,6 +105,7 @@ curl http://<tailscale-ip>:31415/_subrouter/health
 For Gemini clients, configure the VM once with the provider key and a separate team token:
 
 ```bash
+sudo chmod 600 /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_GEMINI_API_KEY=.*|SUBROUTER_GEMINI_API_KEY="<provider-key>"|' /etc/default/subrouter
 sudo sed -i 's|^SUBROUTER_GEMINI_GATEWAY_TOKEN=.*|SUBROUTER_GEMINI_GATEWAY_TOKEN="<team-token>"|' /etc/default/subrouter
 sudo systemctl restart subrouter
