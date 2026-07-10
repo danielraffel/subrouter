@@ -285,7 +285,7 @@ func TestRewriteGeminiUploadURLUsesForwardedHTTPS(t *testing.T) {
 	request.Host = "gateway.example.com"
 	request.Header.Set("X-Forwarded-Proto", "https, http")
 	headers := http.Header{
-		"X-Goog-Upload-Url": []string{"https://generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc"},
+		"X-Goog-Upload-Url": []string{"https://provider-user:provider-pass@generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc&api_key=provider-key&access_token=provider-oauth&oauth_token=provider-legacy#provider-fragment"},
 	}
 	if err := rewriteGeminiUploadURLs(headers, upstream, nil, request, "team-token"); err != nil {
 		t.Fatal(err)
@@ -462,8 +462,12 @@ func requireGeminiUploadCapabilityURL(t *testing.T, raw, scheme, host, path, gat
 	if parsed.Scheme != scheme || parsed.Host != host || parsed.Path != path {
 		t.Fatalf("upload URL = %q", raw)
 	}
+	if parsed.User != nil || parsed.Fragment != "" {
+		t.Fatalf("upload URL retained embedded credentials: %q", raw)
+	}
 	query := parsed.Query()
 	if query.Get("upload_id") != "abc" || query.Get("key") != "" ||
+		query.Get("api_key") != "" || query.Get("access_token") != "" || query.Get("oauth_token") != "" ||
 		query.Get(geminiUploadCapabilityParam) == "" || query.Get(geminiUploadExpiryParam) == "" {
 		t.Fatalf("upload URL query = %q", parsed.RawQuery)
 	}

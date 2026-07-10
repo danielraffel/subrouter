@@ -162,6 +162,9 @@ func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream, 
 	}
 	uploadURL.Scheme = scheme
 	uploadURL.Host = host
+	uploadURL.User = nil
+	uploadURL.Fragment = ""
+	uploadURL.RawFragment = ""
 	uploadPath := uploadURL.Path
 	basePath := strings.TrimSuffix(upstream.Path, "/")
 	if basePath != "" {
@@ -221,6 +224,9 @@ func geminiPublicOrigin(request *http.Request, publicURL *url.URL) (string, stri
 func addGeminiUploadCapability(uploadURL *url.URL, gatewayToken string, expires time.Time) {
 	query := uploadURL.Query()
 	query.Del("key")
+	query.Del("api_key")
+	query.Del("access_token")
+	query.Del("oauth_token")
 	query.Del(geminiUploadCapabilityParam)
 	query.Set(geminiUploadExpiryParam, strconv.FormatInt(expires.Unix(), 10))
 	uploadURL.RawQuery = query.Encode()

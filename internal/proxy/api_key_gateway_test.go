@@ -721,6 +721,8 @@ func TestRootProxyRejectsMisroutedGatewayCredentials(t *testing.T) {
 	}{
 		{"gemini header", "/v1/models", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 		{"gemini query", "/v1alpha/models?key=gemini-team", func(http.Header) {}},
+		{"gemini access token", "/v1alpha/models?access_token=gemini-team", func(http.Header) {}},
+		{"anthropic oauth token", "/v1/messages?oauth_token=anthropic-team", func(http.Header) {}},
 		{"anthropic header", "/v1/messages", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"openai bearer", "/v1/responses", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"openai websocket", "/v1/realtime", func(h http.Header) {

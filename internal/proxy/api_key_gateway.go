@@ -93,6 +93,8 @@ func (s Server) requestUsesConfiguredGatewayCredential(r *http.Request) bool {
 	query := r.URL.Query()
 	presented = append(presented, query["key"]...)
 	presented = append(presented, query["api_key"]...)
+	presented = append(presented, query["access_token"]...)
+	presented = append(presented, query["oauth_token"]...)
 	for _, candidate := range presented {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" {
