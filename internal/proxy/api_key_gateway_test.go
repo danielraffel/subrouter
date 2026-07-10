@@ -772,7 +772,51 @@ func TestRootProxyRejectsMisroutedGatewayCredentials(t *testing.T) {
 			}
 		})
 	}
+	probe := httptest.NewRequest(http.MethodHead, "/", nil)
+	probe.Header.Set("X-Goog-Api-Key", "gemini-team")
+	probeRec := httptest.NewRecorder()
+	handler.ServeHTTP(probeRec, probe)
+	if probeRec.Code != http.StatusNoContent {
+		t.Fatalf("Gemini root probe status = %d body = %s", probeRec.Code, probeRec.Body.String())
+	}
 	if got := rootRequests.Load(); got != 0 {
 		t.Fatalf("misrouted credentials reached root upstream: requests = %d", got)
+	}
+}
+
+func TestConfigurableGatewaysRejectSubrouterManagementPaths(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL + "/proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		OpenAIGateway: &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "openai-provider", GatewayToken: "openai-team"},
+		Gemini:        &GeminiConfig{Upstream: upstreamURL, APIKey: "gemini-provider", GatewayToken: "gemini-team"},
+	}.Handler()
+	tests := []struct {
+		path string
+		auth func(http.Header)
+	}{
+		{"/openai/_subrouter/drain", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/gemini/_subrouter/transcripts", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
+	}
+	for _, test := range tests {
+		req := httptest.NewRequest(http.MethodPost, test.path, nil)
+		test.auth(req.Header)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s status = %d body = %s", test.path, rec.Code, rec.Body.String())
+		}
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("management requests reached configurable upstream: %d", got)
 	}
 }

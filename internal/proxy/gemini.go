@@ -79,6 +79,15 @@ func (s Server) geminiHandler() http.Handler {
 		proxyRequest.URL = cloneURL(r.URL)
 		proxyRequest.URL.Path = stripProviderPathPrefix(proxyRequest.URL.Path, "gemini")
 		proxyRequest.URL.RawPath = ""
+		joinedUpstreamPath := joinGatewayUpstreamPath(upstream.Path, proxyRequest.URL.Path)
+		if gatewayPathIsUnsafe(&url.URL{Path: joinedUpstreamPath}) {
+			http.Error(w, "gemini gateway upstream path is invalid", http.StatusServiceUnavailable)
+			return
+		}
+		if gatewayPathUsesBlockedPrefix(proxyRequest.URL.Path, "/_subrouter") || gatewayPathUsesBlockedPrefix(joinedUpstreamPath, "/_subrouter") {
+			http.Error(w, "subrouter management route not allowed", http.StatusForbidden)
+			return
+		}
 		query := proxyRequest.URL.Query()
 		query.Del("key")
 		query.Del("api_key")

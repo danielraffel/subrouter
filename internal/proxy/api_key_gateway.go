@@ -49,6 +49,10 @@ type apiKeyGatewaySpec struct {
 
 func (s Server) rejectMisroutedGatewayCredentials(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if baseURLProbeRequest(r) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if s.requestUsesConfiguredGatewayCredential(r) {
 			http.Error(w, "gateway credential used outside its gateway route", http.StatusBadRequest)
 			return
@@ -148,6 +152,10 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		joinedUpstreamPath := joinGatewayUpstreamPath(upstream.Path, proxyRequest.URL.Path)
 		if gatewayPathIsUnsafe(&url.URL{Path: joinedUpstreamPath}) {
 			http.Error(w, spec.name+" gateway upstream path is invalid", http.StatusServiceUnavailable)
+			return
+		}
+		if gatewayPathUsesBlockedPrefix(proxyRequest.URL.Path, "/_subrouter") || gatewayPathUsesBlockedPrefix(joinedUpstreamPath, "/_subrouter") {
+			http.Error(w, "subrouter management route not allowed", http.StatusForbidden)
 			return
 		}
 		for _, prefix := range spec.blockedPathPrefixes {
