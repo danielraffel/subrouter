@@ -131,6 +131,9 @@ func authorizeGeminiGateway(r *http.Request, configuredToken string) bool {
 			got = strings.TrimSpace(value)
 		}
 	}
+	if got == "" {
+		got = strings.TrimSpace(r.URL.Query().Get("key"))
+	}
 	if len(got) != len(token) {
 		return false
 	}

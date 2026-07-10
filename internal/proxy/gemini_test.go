@@ -294,12 +294,8 @@ func TestGeminiGatewayProxiesLiveWebSocket(t *testing.T) {
 	gateway := httptest.NewServer(handler)
 	defer gateway.Close()
 	wsURL := "ws" + strings.TrimPrefix(gateway.URL, "http") +
-		"/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=client-secret"
-	headers := http.Header{
-		"X-Goog-Api-Key": []string{"team-token"},
-		"Authorization":  []string{"Bearer client-secret"},
-	}
-	conn, response, err := websocket.DefaultDialer.Dial(wsURL, headers)
+		"/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=team-token"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		if response != nil && response.Body != nil {
 			defer response.Body.Close()

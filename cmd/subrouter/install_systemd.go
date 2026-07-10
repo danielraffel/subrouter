@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -336,12 +335,38 @@ func decodeSystemdDefaultValue(value string) string {
 		return value[1 : len(value)-1]
 	}
 	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
-		if decoded, err := strconv.Unquote(value); err == nil {
-			return decoded
+		value = value[1 : len(value)-1]
+		var decoded strings.Builder
+		decoded.Grow(len(value))
+		for index := 0; index < len(value); index++ {
+			if value[index] == '\\' && index+1 < len(value) {
+				switch value[index+1] {
+				case '\\', '"', '$', '`':
+					index++
+					decoded.WriteByte(value[index])
+					continue
+				}
+			}
+			decoded.WriteByte(value[index])
 		}
-		return value[1 : len(value)-1]
+		return decoded.String()
 	}
 	return value
+}
+
+func quoteSystemdDefaultValue(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for index := 0; index < len(value); index++ {
+		switch value[index] {
+		case '\\', '"', '$', '`':
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteByte(value[index])
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
 }
 
 func stopLegacySystemdServices(runner commandRunner) {
@@ -384,17 +409,26 @@ func systemdDefaults(config systemdConfig) string {
 SUBROUTER_STATE_DIR=%s
 SUBROUTER_SESSIONS=%s
 SUBROUTER_TRANSCRIPTS=%s
-SUBROUTER_TRANSCRIPT_ARGS=%q
+SUBROUTER_TRANSCRIPT_ARGS=%s
 SUBROUTER_SR_SWITCH_INTERVAL=%s
-SUBROUTER_ADMIN_TOKEN=%q
-SUBROUTER_GEMINI_API_KEY=%q
-SUBROUTER_GEMINI_GATEWAY_TOKEN=%q
-SUBROUTER_ANTHROPIC_API_KEY=%q
-SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=%q
-SUBROUTER_OPENAI_API_KEY=%q
-SUBROUTER_OPENAI_GATEWAY_TOKEN=%q
-SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.GeminiAPIKey, config.GeminiGatewayKey, config.AnthropicAPIKey, config.AnthropicGatewayKey, config.OpenAIAPIKey, config.OpenAIGatewayKey, config.ExtraArgs)
+SUBROUTER_ADMIN_TOKEN=%s
+SUBROUTER_GEMINI_API_KEY=%s
+SUBROUTER_GEMINI_GATEWAY_TOKEN=%s
+SUBROUTER_ANTHROPIC_API_KEY=%s
+SUBROUTER_ANTHROPIC_GATEWAY_TOKEN=%s
+SUBROUTER_OPENAI_API_KEY=%s
+SUBROUTER_OPENAI_GATEWAY_TOKEN=%s
+SUBROUTER_EXTRA_ARGS=%s
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir,
+		quoteSystemdDefaultValue(transcriptArgs), config.SRSwitchInterval,
+		quoteSystemdDefaultValue(config.AdminToken),
+		quoteSystemdDefaultValue(config.GeminiAPIKey),
+		quoteSystemdDefaultValue(config.GeminiGatewayKey),
+		quoteSystemdDefaultValue(config.AnthropicAPIKey),
+		quoteSystemdDefaultValue(config.AnthropicGatewayKey),
+		quoteSystemdDefaultValue(config.OpenAIAPIKey),
+		quoteSystemdDefaultValue(config.OpenAIGatewayKey),
+		quoteSystemdDefaultValue(config.ExtraArgs))
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

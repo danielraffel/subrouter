@@ -4,7 +4,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -250,8 +249,10 @@ func TestReadDefaultValueDecodesQuotedSecrets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "subrouter")
 	doubleQuoted := `team\token"quoted`
 	singleQuoted := `team\single-token`
-	contents := "DOUBLE=" + strconv.Quote(doubleQuoted) + "\n" +
-		"SINGLE='" + singleQuoted + "'\n"
+	literalEscape := `team\x41-token`
+	contents := "DOUBLE=" + quoteSystemdDefaultValue(doubleQuoted) + "\n" +
+		"SINGLE='" + singleQuoted + "'\n" +
+		`LITERAL="team\x41-token"` + "\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -260,5 +261,8 @@ func TestReadDefaultValueDecodesQuotedSecrets(t *testing.T) {
 	}
 	if got := readDefaultValue(path, "SINGLE"); got != singleQuoted {
 		t.Fatalf("single-quoted value = %q, want %q", got, singleQuoted)
+	}
+	if got := readDefaultValue(path, "LITERAL"); got != literalEscape {
+		t.Fatalf("literal escape value = %q, want %q", got, literalEscape)
 	}
 }

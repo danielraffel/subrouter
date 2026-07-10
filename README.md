@@ -363,9 +363,9 @@ Subrouter exposes separate team API gateways without changing root subscription 
 |---|---|---|---|
 | Anthropic | `http://<subrouter>:31415/anthropic` | `x-api-key` or Bearer | `SUBROUTER_ANTHROPIC_API_KEY`, `SUBROUTER_ANTHROPIC_GATEWAY_TOKEN` |
 | OpenAI | `http://<subrouter>:31415/api/v1` | Bearer | `SUBROUTER_OPENAI_API_KEY`, `SUBROUTER_OPENAI_GATEWAY_TOKEN` |
-| Gemini | `http://<subrouter>:31415` | `x-goog-api-key` | `SUBROUTER_GEMINI_API_KEY`, `SUBROUTER_GEMINI_GATEWAY_TOKEN` |
+| Gemini | `http://<subrouter>:31415` (default `v1beta`) | `x-goog-api-key` | `SUBROUTER_GEMINI_API_KEY`, `SUBROUTER_GEMINI_GATEWAY_TOKEN` |
 
-`/openai/v1/*` is an alias for `/api/v1/*`. `/gemini/*` is an alias for raw Gemini HTTP clients. Root `/v1/*` and `/responses` requests continue through subscription/account routing.
+`/openai/v1/*` is an alias for `/api/v1/*`. Gemini SDKs using the default `v1beta` use the listener root; clients selecting `v1` or `v1alpha` must use `http://<subrouter>:31415/gemini` as their base URL. Root `/v1/*` and `/responses` requests continue through subscription/account routing.
 Use `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, or `--gemini-upstream` to point a gateway at another API-compatible backend without changing root routing.
 
 ```bash

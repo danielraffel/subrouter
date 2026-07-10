@@ -116,7 +116,7 @@ sudo sed -i 's|^SUBROUTER_GEMINI_GATEWAY_TOKEN=.*|SUBROUTER_GEMINI_GATEWAY_TOKEN
 sudo systemctl restart subrouter
 ```
 
-Anthropic SDK clients use `http://subrouter-team:31415/anthropic`, OpenAI SDK clients use `http://subrouter-team:31415/api/v1`, and Gemini SDK clients use `http://subrouter-team:31415`. Provider keys remain on the VM.
+Anthropic SDK clients use `http://subrouter-team:31415/anthropic`, OpenAI SDK clients use `http://subrouter-team:31415/api/v1`, and default `v1beta` Gemini clients use `http://subrouter-team:31415`. Gemini clients selecting `v1` or `v1alpha` use `http://subrouter-team:31415/gemini`. Provider keys remain on the VM.
 
 Sessions:
 

@@ -46,7 +46,7 @@ sudo sed -i 's|^SUBROUTER_GEMINI_GATEWAY_TOKEN=.*|SUBROUTER_GEMINI_GATEWAY_TOKEN
 sudo systemctl restart subrouter
 ```
 
-Anthropic SDKs use `http://<server>:31415/anthropic`; OpenAI SDKs use `http://<server>:31415/api/v1` (`/openai/v1` is an alias). Gemini SDKs use `http://<server>:31415` because resumable uploads require native `/upload/v1beta/*` and `/v1beta/*` paths. Existing root `/v1/*` and `/responses` routes retain subscription/account routing. Override gateway destinations with `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, and `--gemini-upstream` without changing root provider routing.
+Anthropic SDKs use `http://<server>:31415/anthropic`; OpenAI SDKs use `http://<server>:31415/api/v1` (`/openai/v1` is an alias). Gemini SDKs using default `v1beta` use `http://<server>:31415`; clients selecting `v1` or `v1alpha` use `http://<server>:31415/gemini`. Existing root `/v1/*` and `/responses` routes retain subscription/account routing. Override gateway destinations with `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, and `--gemini-upstream` without changing root provider routing.
 
 ## Transcripts
 
