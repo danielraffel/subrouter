@@ -48,6 +48,8 @@ sudo systemctl restart subrouter
 
 Anthropic SDKs use `http://<server>:31415/anthropic`; OpenAI SDKs use `http://<server>:31415/api/v1` (`/openai/v1` is an alias). Gemini SDKs using default `v1beta` use `http://<server>:31415`; clients selecting `v1` or `v1alpha` use `http://<server>:31415/gemini`. Existing root `/v1/*` and `/responses` routes retain subscription/account routing. Override gateway destinations with `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, and `--gemini-upstream` without changing root provider routing.
 
+Gemini Live requires HTTPS termination because official Python clients dial `wss`. The terminating proxy must forward `/ws/*` and set `X-Forwarded-Proto: https`; use its `https://` URL as the Gemini SDK base.
+
 ## Transcripts
 
 Transcript recording is off by default because it stores full request and response payloads and can grow quickly. For a shared server, only enable it with cloud upload and local cleanup:

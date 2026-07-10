@@ -150,6 +150,25 @@ func TestGeminiGatewayReportsMissingGatewayToken(t *testing.T) {
 	}
 }
 
+func TestGeminiGatewayRejectsReusedProviderKey(t *testing.T) {
+	t.Parallel()
+
+	upstreamURL, err := url.Parse("https://generativelanguage.googleapis.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{Gemini: &GeminiConfig{
+		Upstream: upstreamURL, APIKey: "same-secret", GatewayToken: "same-secret",
+	}}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/gemini/v1beta/interactions", strings.NewReader("{}"))
+	req.Header.Set("X-Goog-Api-Key", "same-secret")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestGeminiGatewayRejectsRequestsWhileDraining(t *testing.T) {
 	t.Parallel()
 

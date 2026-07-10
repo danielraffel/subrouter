@@ -314,6 +314,12 @@ func TestAPIKeyGatewaysFailClosed(t *testing.T) {
 	}{
 		{"anthropic missing config", "/anthropic/v1/messages", func(s *Server) { s.AnthropicGateway = &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "provider"} }, func(http.Header) {}, http.StatusServiceUnavailable},
 		{"openai missing config", "/api/v1/responses", func(s *Server) { s.OpenAIGateway = &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "provider"} }, func(http.Header) {}, http.StatusServiceUnavailable},
+		{"anthropic reused provider key", "/anthropic/v1/messages", func(s *Server) {
+			s.AnthropicGateway = &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "same-secret", GatewayToken: "same-secret"}
+		}, func(h http.Header) { h.Set("X-Api-Key", "same-secret") }, http.StatusServiceUnavailable},
+		{"openai reused provider key", "/api/v1/responses", func(s *Server) {
+			s.OpenAIGateway = &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "same-secret", GatewayToken: "same-secret"}
+		}, func(h http.Header) { h.Set("Authorization", "Bearer same-secret") }, http.StatusServiceUnavailable},
 		{"anthropic missing auth", "/anthropic/v1/messages", func(s *Server) {
 			s.AnthropicGateway = &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "provider", GatewayToken: "team"}
 		}, func(http.Header) {}, http.StatusUnauthorized},

@@ -22,10 +22,12 @@ type GeminiConfig struct {
 }
 
 func (c *GeminiConfig) configured() bool {
-	return c != nil &&
-		c.Upstream != nil &&
-		strings.TrimSpace(c.APIKey) != "" &&
-		strings.TrimSpace(c.GatewayToken) != ""
+	if c == nil || c.Upstream == nil {
+		return false
+	}
+	apiKey := strings.TrimSpace(c.APIKey)
+	gatewayToken := strings.TrimSpace(c.GatewayToken)
+	return apiKey != "" && gatewayToken != "" && apiKey != gatewayToken
 }
 
 func (s Server) geminiHandler() http.Handler {
