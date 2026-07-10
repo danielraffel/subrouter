@@ -93,6 +93,9 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 		proxyRequest.URL.RawQuery = query.Encode()
 		proxyRequest.Header.Del("Authorization")
 		proxyRequest.Header.Del("X-Api-Key")
+		if spec.auth == apiKeyGatewayBearer {
+			stripOpenAIWebSocketCredential(proxyRequest.Header)
+		}
 		for _, header := range spec.stripHeaders {
 			proxyRequest.Header.Del(header)
 		}
@@ -139,21 +142,33 @@ func gatewayMethodCanReflectCredentials(method string) bool {
 }
 
 func gatewayPathIsUnsafe(requestURL *url.URL) bool {
-	if requestURL == nil || !strings.HasPrefix(requestURL.Path, "/") ||
-		strings.Contains(requestURL.Path, "//") || strings.Contains(requestURL.Path, `\`) {
+	if requestURL == nil {
 		return true
 	}
-	for _, segment := range strings.Split(requestURL.Path, "/") {
-		if segment == "." || segment == ".." {
-			return true
+	for _, candidate := range []string{requestURL.Path, requestURL.RawPath} {
+		if candidate == "" {
+			continue
 		}
-	}
-	// Reject encoded and double-encoded separators. Different upstream stacks
-	// normalize these at different layers, which can otherwise change the route
-	// after the administrative-route checks above.
-	for _, value := range []string{requestURL.RawPath, requestURL.Path} {
-		value = strings.ToLower(value)
-		if strings.Contains(value, "%2f") || strings.Contains(value, "%5c") {
+		for range 8 {
+			if !strings.HasPrefix(candidate, "/") || strings.Contains(candidate, "//") || strings.Contains(candidate, `\`) {
+				return true
+			}
+			for _, segment := range strings.Split(candidate, "/") {
+				if segment == "." || segment == ".." {
+					return true
+				}
+			}
+			decoded, err := url.PathUnescape(candidate)
+			if err != nil {
+				return true
+			}
+			if decoded == candidate {
+				candidate = ""
+				break
+			}
+			candidate = decoded
+		}
+		if candidate != "" {
 			return true
 		}
 	}
@@ -175,10 +190,44 @@ func authorizeAPIKeyGateway(r *http.Request, configuredToken string, auth apiKey
 			got = strings.TrimSpace(value)
 		}
 	}
+	if got == "" && auth == apiKeyGatewayBearer {
+		got = openAIWebSocketCredential(r.Header)
+	}
 	if len(got) != len(token) {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+const openAIWebSocketCredentialPrefix = "openai-insecure-api-key."
+
+func openAIWebSocketCredential(headers http.Header) string {
+	for _, value := range headers.Values("Sec-WebSocket-Protocol") {
+		for _, protocol := range strings.Split(value, ",") {
+			protocol = strings.TrimSpace(protocol)
+			if strings.HasPrefix(protocol, openAIWebSocketCredentialPrefix) {
+				return strings.TrimPrefix(protocol, openAIWebSocketCredentialPrefix)
+			}
+		}
+	}
+	return ""
+}
+
+func stripOpenAIWebSocketCredential(headers http.Header) {
+	var kept []string
+	for _, value := range headers.Values("Sec-WebSocket-Protocol") {
+		for _, protocol := range strings.Split(value, ",") {
+			protocol = strings.TrimSpace(protocol)
+			if protocol != "" && !strings.HasPrefix(protocol, openAIWebSocketCredentialPrefix) {
+				kept = append(kept, protocol)
+			}
+		}
+	}
+	if len(kept) == 0 {
+		headers.Del("Sec-WebSocket-Protocol")
+		return
+	}
+	headers.Set("Sec-WebSocket-Protocol", strings.Join(kept, ", "))
 }
 
 func stripGatewayPathPrefix(path string, prefixes []string) string {

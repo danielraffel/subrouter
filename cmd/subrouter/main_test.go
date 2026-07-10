@@ -73,6 +73,13 @@ func TestValidateTeamGatewayCredentials(t *testing.T) {
 	if err := validateTeamGatewayCredentials("0.0.0.0:31415", false, "admin-token", crossCollision...); err == nil {
 		t.Fatal("gateway token reused as another provider key")
 	}
+	existingProviderCollision := []teamGatewayCredential{
+		{gatewayToken: "team-token"},
+		{providerKey: "team-token"},
+	}
+	if err := validateTeamGatewayCredentials("127.0.0.1:31415", false, "admin-token", existingProviderCollision...); err == nil {
+		t.Fatal("gateway token reused as an existing account provider key")
+	}
 }
 
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {

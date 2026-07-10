@@ -271,19 +271,7 @@ func serve(args []string) error {
 	anthropicGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_ANTHROPIC_GATEWAY_TOKEN"))
 	openAIAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_API_KEY"))
 	openAIGatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_OPENAI_GATEWAY_TOKEN"))
-	listenPID, listenFDCount, listenEnvSet, err := systemdListenFDs(os.Getpid(), os.Getenv)
-	if err != nil {
-		return err
-	}
-	inheritedListener := listenEnvSet && listenPID == os.Getpid() && listenFDCount > 0
-	if err := validateTeamGatewayCredentials(*addr, inheritedListener, *adminToken,
-		teamGatewayCredential{providerKey: geminiAPIKey, gatewayToken: geminiGatewayToken},
-		teamGatewayCredential{providerKey: anthropicAPIKey, gatewayToken: anthropicGatewayToken},
-		teamGatewayCredential{providerKey: openAIAPIKey, gatewayToken: openAIGatewayToken},
-		teamGatewayCredential{gatewayToken: resolvedBedrockGatewayToken, enabled: *bedrockEnable},
-	); err != nil {
-		return err
-	}
+	claudeFableAPIKey := strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"))
 
 	var upstream *url.URL
 	if *upstreamRaw != "" {
@@ -349,6 +337,26 @@ func serve(args []string) error {
 	if err != nil {
 		slog.Warn("Claude accounts skipped", "error", err)
 		claudeAccounts = nil
+	}
+	listenPID, listenFDCount, listenEnvSet, err := systemdListenFDs(os.Getpid(), os.Getenv)
+	if err != nil {
+		return err
+	}
+	inheritedListener := listenEnvSet && listenPID == os.Getpid() && listenFDCount > 0
+	gatewayCredentials := []teamGatewayCredential{
+		{providerKey: geminiAPIKey, gatewayToken: geminiGatewayToken},
+		{providerKey: anthropicAPIKey, gatewayToken: anthropicGatewayToken},
+		{providerKey: openAIAPIKey, gatewayToken: openAIGatewayToken},
+		{gatewayToken: resolvedBedrockGatewayToken, enabled: *bedrockEnable},
+		{providerKey: claudeFableAPIKey},
+	}
+	for _, account := range append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...) {
+		if account.AuthMode == accounts.AuthModeAPIKey {
+			gatewayCredentials = append(gatewayCredentials, teamGatewayCredential{providerKey: account.Token})
+		}
+	}
+	if err := validateTeamGatewayCredentials(*addr, inheritedListener, *adminToken, gatewayCredentials...); err != nil {
+		return err
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -440,7 +448,7 @@ func serve(args []string) error {
 			GatewayToken: openAIGatewayToken,
 			Transport:    outboundTransport,
 		},
-		ClaudeFableAPIKey:   strings.TrimSpace(os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY")),
+		ClaudeFableAPIKey:   claudeFableAPIKey,
 		FableBedrockPrimary: *fableBedrockPrimary || envTrue("SUBROUTER_FABLE_BEDROCK_PRIMARY"),
 		Transcripts:         transcript.NewRecorder(*transcriptDir),
 	}

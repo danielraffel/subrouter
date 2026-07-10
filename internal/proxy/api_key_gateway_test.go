@@ -227,16 +227,19 @@ func TestOpenAIGatewayAlias(t *testing.T) {
 	}
 }
 
-func TestOpenAIGatewayProxiesRealtimeWebSocket(t *testing.T) {
+func TestOpenAIGatewayProxiesRealtimeWebSocketWithSubprotocolAuth(t *testing.T) {
 	t.Parallel()
 
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }, Subprotocols: []string{"realtime"}}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer provider-key" {
 			t.Errorf("Authorization = %q", got)
 		}
 		if got := r.Header.Get("OpenAI-Organization"); got != "" {
 			t.Errorf("OpenAI-Organization leaked upstream: %q", got)
+		}
+		if got := r.Header.Get("Sec-WebSocket-Protocol"); got != "realtime, openai-beta.realtime-v1" {
+			t.Errorf("Sec-WebSocket-Protocol = %q", got)
 		}
 		if r.URL.Path != "/v1/realtime" || r.URL.Query().Get("model") != "gpt-realtime" {
 			t.Errorf("upstream URL = %s", r.URL.String())
@@ -268,11 +271,12 @@ func TestOpenAIGatewayProxiesRealtimeWebSocket(t *testing.T) {
 	defer gateway.Close()
 	wsURL := "ws" + strings.TrimPrefix(gateway.URL, "http") + "/api/v1/realtime?model=gpt-realtime"
 	headers := http.Header{
-		"Authorization":       []string{"Bearer team-token"},
 		"OpenAI-Organization": []string{"client-org"},
 		"OpenAI-Beta":         []string{"realtime=v1"},
 	}
-	conn, response, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	dialer := *websocket.DefaultDialer
+	dialer.Subprotocols = []string{"realtime", "openai-insecure-api-key.team-token", "openai-beta.realtime-v1"}
+	conn, response, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		if response != nil && response.Body != nil {
 			defer response.Body.Close()
@@ -280,6 +284,9 @@ func TestOpenAIGatewayProxiesRealtimeWebSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	if got := conn.Subprotocol(); got != "realtime" {
+		t.Fatalf("negotiated subprotocol = %q", got)
+	}
 	if err := conn.WriteMessage(websocket.TextMessage, []byte("hello")); err != nil {
 		t.Fatal(err)
 	}
@@ -457,9 +464,11 @@ func TestGatewaysRejectAmbiguousPaths(t *testing.T) {
 		{"/api/v1/%2e%2e/debug", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/api/v1/%2forganization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/api/v1/%252forganization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/api/v1/x/%252e%252e/organization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/anthropic/%2e%2e/debug", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/anthropic/v1/%5corganizations/example", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/gemini/%2e%2e/debug", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
+		{"/gemini/x/%252e%252e/%252e%252e/admin", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 	}
 	for _, test := range tests {
 		req := httptest.NewRequest(http.MethodGet, test.path, nil)
