@@ -174,6 +174,7 @@ func serve(args []string) error {
 	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
 	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
 	geminiUpstreamRaw := flags.String("gemini-upstream", "https://generativelanguage.googleapis.com", "Gemini Developer API upstream base URL")
+	geminiPublicURLRaw := flags.String("gemini-public-url", "", "public HTTP(S) origin used in Gemini resumable upload URLs")
 	anthropicGatewayUpstreamRaw := flags.String("anthropic-gateway-upstream", "https://api.anthropic.com", "Anthropic team gateway upstream base URL")
 	openAIGatewayUpstreamRaw := flags.String("openai-gateway-upstream", "https://api.openai.com", "OpenAI team gateway upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
@@ -242,6 +243,15 @@ func serve(args []string) error {
 	geminiUpstream, err := url.Parse(*geminiUpstreamRaw)
 	if err != nil {
 		return err
+	}
+	var geminiPublicURL *url.URL
+	if raw := strings.TrimSpace(*geminiPublicURLRaw); raw != "" {
+		geminiPublicURL, err = url.Parse(raw)
+		if err != nil || (geminiPublicURL.Scheme != "http" && geminiPublicURL.Scheme != "https") ||
+			geminiPublicURL.Host == "" || (geminiPublicURL.Path != "" && geminiPublicURL.Path != "/") ||
+			geminiPublicURL.RawQuery != "" || geminiPublicURL.Fragment != "" || geminiPublicURL.User != nil {
+			return errors.New("--gemini-public-url must be an HTTP(S) origin without credentials, path, query, or fragment")
+		}
 	}
 	anthropicGatewayUpstream, err := url.Parse(*anthropicGatewayUpstreamRaw)
 	if err != nil {
@@ -344,6 +354,7 @@ func serve(args []string) error {
 		Bedrock:        bedrockConfig,
 		Gemini: &proxy.GeminiConfig{
 			Upstream:     geminiUpstream,
+			PublicURL:    geminiPublicURL,
 			APIKey:       strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_API_KEY")),
 			GatewayToken: strings.TrimSpace(os.Getenv("SUBROUTER_GEMINI_GATEWAY_TOKEN")),
 			Transport:    outboundTransport,
@@ -894,7 +905,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--api-upstream URL] [--claude-upstream URL] [--anthropic-gateway-upstream URL] [--openai-gateway-upstream URL] [--gemini-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--api-upstream URL] [--claude-upstream URL] [--anthropic-gateway-upstream URL] [--openai-gateway-upstream URL] [--gemini-upstream URL] [--gemini-public-url ORIGIN] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

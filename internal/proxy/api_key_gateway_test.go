@@ -433,7 +433,7 @@ func TestAnthropicGatewayRejectsPrivilegedAccess(t *testing.T) {
 	}
 }
 
-func TestGatewaysRejectEncodedDotSegments(t *testing.T) {
+func TestGatewaysRejectAmbiguousPaths(t *testing.T) {
 	t.Parallel()
 
 	var requests atomic.Int32
@@ -455,7 +455,10 @@ func TestGatewaysRejectEncodedDotSegments(t *testing.T) {
 		auth func(http.Header)
 	}{
 		{"/api/v1/%2e%2e/debug", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/api/v1/%2forganization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/api/v1/%252forganization/projects", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
 		{"/anthropic/%2e%2e/debug", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
+		{"/anthropic/v1/%5corganizations/example", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
 		{"/gemini/%2e%2e/debug", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
 	}
 	for _, test := range tests {
@@ -465,6 +468,47 @@ func TestGatewaysRejectEncodedDotSegments(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s status = %d body = %s", test.path, rec.Code, rec.Body.String())
+		}
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("upstream requests = %d", got)
+	}
+}
+
+func TestGatewaysRejectCredentialReflectionMethods(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		AnthropicGateway: &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "anthropic-provider", GatewayToken: "anthropic-team"},
+		OpenAIGateway:    &APIKeyGatewayConfig{Upstream: upstreamURL, APIKey: "openai-provider", GatewayToken: "openai-team"},
+		Gemini:           &GeminiConfig{Upstream: upstreamURL, APIKey: "gemini-provider", GatewayToken: "gemini-team"},
+	}.Handler()
+	tests := []struct {
+		path string
+		auth func(http.Header)
+	}{
+		{"/api/v1/models", func(h http.Header) { h.Set("Authorization", "Bearer openai-team") }},
+		{"/anthropic/v1/messages", func(h http.Header) { h.Set("X-Api-Key", "anthropic-team") }},
+		{"/gemini/v1beta/models", func(h http.Header) { h.Set("X-Goog-Api-Key", "gemini-team") }},
+	}
+	for _, method := range []string{"TRACE", "TRACK"} {
+		for _, test := range tests {
+			req := httptest.NewRequest(method, test.path, nil)
+			test.auth(req.Header)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("%s %s status = %d body = %s", method, test.path, rec.Code, rec.Body.String())
+			}
 		}
 	}
 	if got := requests.Load(); got != 0 {

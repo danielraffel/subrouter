@@ -29,6 +29,7 @@ const (
 // with the provider key before forwarding the request.
 type GeminiConfig struct {
 	Upstream     *url.URL
+	PublicURL    *url.URL
 	APIKey       string
 	GatewayToken string
 	Transport    http.RoundTripper
@@ -54,7 +55,11 @@ func (s Server) geminiHandler() http.Handler {
 			http.Error(w, "gemini gateway token required", http.StatusUnauthorized)
 			return
 		}
-		if gatewayPathHasDotSegment(r.URL.Path) {
+		if gatewayMethodCanReflectCredentials(r.Method) {
+			http.Error(w, "gateway method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if gatewayPathIsUnsafe(r.URL) {
 			http.Error(w, "invalid gateway path", http.StatusBadRequest)
 			return
 		}
@@ -97,7 +102,7 @@ func (s Server) geminiHandler() http.Handler {
 			Transport: s.Gemini.Transport,
 		}
 		rp.ModifyResponse = func(response *http.Response) error {
-			return rewriteGeminiUploadURLs(response.Header, upstream, r, s.Gemini.GatewayToken)
+			return rewriteGeminiUploadURLs(response.Header, upstream, s.Gemini.PublicURL, r, s.Gemini.GatewayToken)
 		}
 		if rp.Transport == nil {
 			rp.Transport = s.transport()
@@ -119,21 +124,21 @@ func (s Server) geminiHandler() http.Handler {
 	})
 }
 
-func rewriteGeminiUploadURLs(headers http.Header, upstream *url.URL, request *http.Request, gatewayToken string) error {
+func rewriteGeminiUploadURLs(headers http.Header, upstream, publicURL *url.URL, request *http.Request, gatewayToken string) error {
 	for _, header := range []string{"X-Goog-Upload-Url", "X-Goog-Upload-Control-Url"} {
-		if err := rewriteGeminiUploadURLHeader(headers, header, upstream, request, gatewayToken); err != nil {
+		if err := rewriteGeminiUploadURLHeader(headers, header, upstream, publicURL, request, gatewayToken); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream *url.URL, request *http.Request, gatewayToken string) error {
+func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream, publicURL *url.URL, request *http.Request, gatewayToken string) error {
 	raw := strings.TrimSpace(headers.Get(header))
 	if raw == "" {
 		return nil
 	}
-	if upstream == nil || request == nil || request.Host == "" {
+	if upstream == nil || request == nil || (request.Host == "" && publicURL == nil) {
 		return errors.New("cannot sanitize Gemini upload URL")
 	}
 	uploadURL, err := url.Parse(raw)
@@ -146,17 +151,12 @@ func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream *
 	if !strings.EqualFold(uploadURL.Host, upstream.Host) {
 		return errors.New("cannot sanitize Gemini upload URL")
 	}
-	scheme := "http"
-	if request.TLS != nil {
-		scheme = "https"
-	} else {
-		forwardedProto, _, _ := strings.Cut(request.Header.Get("X-Forwarded-Proto"), ",")
-		if strings.EqualFold(strings.TrimSpace(forwardedProto), "https") {
-			scheme = "https"
-		}
+	scheme, host := geminiPublicOrigin(request, publicURL)
+	if scheme == "" || host == "" {
+		return errors.New("cannot sanitize Gemini upload URL")
 	}
 	uploadURL.Scheme = scheme
-	uploadURL.Host = request.Host
+	uploadURL.Host = host
 	uploadPath := uploadURL.Path
 	basePath := strings.TrimSuffix(upstream.Path, "/")
 	if basePath != "" && (uploadPath == basePath || strings.HasPrefix(uploadPath, basePath+"/")) {
@@ -170,6 +170,22 @@ func rewriteGeminiUploadURLHeader(headers http.Header, header string, upstream *
 	addGeminiUploadCapability(uploadURL, gatewayToken, time.Now().Add(geminiUploadCapabilityTTL))
 	headers.Set(header, uploadURL.String())
 	return nil
+}
+
+func geminiPublicOrigin(request *http.Request, publicURL *url.URL) (string, string) {
+	if publicURL != nil {
+		return publicURL.Scheme, publicURL.Host
+	}
+	scheme := "http"
+	if request.TLS != nil {
+		scheme = "https"
+	} else {
+		forwardedProto, _, _ := strings.Cut(request.Header.Get("X-Forwarded-Proto"), ",")
+		if strings.EqualFold(strings.TrimSpace(forwardedProto), "https") {
+			scheme = "https"
+		}
+	}
+	return scheme, request.Host
 }
 
 func addGeminiUploadCapability(uploadURL *url.URL, gatewayToken string, expires time.Time) {

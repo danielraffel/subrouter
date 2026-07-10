@@ -276,10 +276,33 @@ func TestRewriteGeminiUploadURLUsesForwardedHTTPS(t *testing.T) {
 	headers := http.Header{
 		"X-Goog-Upload-Url": []string{"https://generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc"},
 	}
-	if err := rewriteGeminiUploadURLs(headers, upstream, request, "team-token"); err != nil {
+	if err := rewriteGeminiUploadURLs(headers, upstream, nil, request, "team-token"); err != nil {
 		t.Fatal(err)
 	}
 	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "https", "gateway.example.com", "/gemini/upload/v1beta/files", "team-token")
+}
+
+func TestRewriteGeminiUploadURLUsesConfiguredPublicOrigin(t *testing.T) {
+	t.Parallel()
+
+	upstream, err := url.Parse("https://generativelanguage.googleapis.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicURL, err := url.Parse("https://gemini.team.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/gemini/upload/v1beta/files", nil)
+	request.Host = "127.0.0.1:31415"
+	request.Header.Set("X-Forwarded-Host", "attacker.example")
+	headers := http.Header{
+		"X-Goog-Upload-Url": []string{"https://generativelanguage.googleapis.com/upload/v1beta/files?upload_id=abc"},
+	}
+	if err := rewriteGeminiUploadURLs(headers, upstream, publicURL, request, "team-token"); err != nil {
+		t.Fatal(err)
+	}
+	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "https", "gemini.team.example", "/gemini/upload/v1beta/files", "team-token")
 }
 
 func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
@@ -294,7 +317,7 @@ func TestRewriteGeminiUploadURLContainsCustomUpstreamBasePath(t *testing.T) {
 	headers := http.Header{
 		"X-Goog-Upload-Url": []string{"https://proxy.example.com/google/upload/v1beta/files?upload_id=abc"},
 	}
-	if err := rewriteGeminiUploadURLs(headers, upstream, request, "team-token"); err != nil {
+	if err := rewriteGeminiUploadURLs(headers, upstream, nil, request, "team-token"); err != nil {
 		t.Fatal(err)
 	}
 	requireGeminiUploadCapabilityURL(t, headers.Get("X-Goog-Upload-Url"), "http", "gateway.example.com", "/gemini/upload/v1beta/files", "team-token")
@@ -311,7 +334,7 @@ func TestRewriteGeminiUploadURLsRejectsForeignControlURL(t *testing.T) {
 	headers := http.Header{
 		"X-Goog-Upload-Control-Url": []string{"https://attacker.example/upload?key=provider-secret"},
 	}
-	if err := rewriteGeminiUploadURLs(headers, upstream, request, "team-token"); err == nil {
+	if err := rewriteGeminiUploadURLs(headers, upstream, nil, request, "team-token"); err == nil {
 		t.Fatal("foreign upload control URL was accepted")
 	}
 }

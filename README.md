@@ -368,7 +368,7 @@ Subrouter exposes separate team API gateways without changing root subscription 
 `/openai/v1/*` is an alias for `/api/v1/*`. Gemini SDKs using the default `v1beta` use the listener root; clients selecting `v1` or `v1alpha` must use `http://<subrouter>:31415/gemini` as their base URL. Root `/v1/*` and `/responses` requests continue through subscription/account routing.
 Use `--anthropic-gateway-upstream`, `--openai-gateway-upstream`, or `--gemini-upstream` to point a gateway at another API-compatible backend without changing root routing.
 
-The plaintext `http://` examples support HTTP APIs and SSE. Official Python Gemini Live clients always dial `wss`, so Live requires an HTTPS-terminating proxy in front of Subrouter that forwards `/ws/*` and sets `X-Forwarded-Proto: https`; configure the SDK with that proxy's `https://` URL.
+The plaintext `http://` examples support HTTP APIs and SSE. Official Python Gemini Live clients always dial `wss`, so Live requires an HTTPS-terminating proxy in front of Subrouter that forwards `/ws/*` and sets `X-Forwarded-Proto: https`; configure the SDK with that proxy's `https://` URL. If the proxy replaces the `Host` header, pass `--gemini-public-url https://<public-host>` so resumable upload URLs use the external origin.
 
 ```bash
 SUBROUTER_ANTHROPIC_API_KEY=<anthropic-provider-key> \
@@ -377,8 +377,11 @@ SUBROUTER_OPENAI_API_KEY=<openai-provider-key> \
 SUBROUTER_OPENAI_GATEWAY_TOKEN=<openai-team-token> \
 SUBROUTER_GEMINI_API_KEY=<provider-key> \
 SUBROUTER_GEMINI_GATEWAY_TOKEN=<team-token> \
+SUBROUTER_ADMIN_TOKEN=<separate-admin-token> \
 subrouter serve --addr 0.0.0.0:31415
 ```
+
+The admin token must differ from every provider key and team gateway token. It protects `/_subrouter/*` management endpoints on the shared listener.
 
 Python SDK setup:
 

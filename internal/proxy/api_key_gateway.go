@@ -61,7 +61,11 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 			http.Error(w, spec.name+" gateway token required", http.StatusUnauthorized)
 			return
 		}
-		if gatewayPathHasDotSegment(r.URL.Path) {
+		if gatewayMethodCanReflectCredentials(r.Method) {
+			http.Error(w, "gateway method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if gatewayPathIsUnsafe(r.URL) {
 			http.Error(w, "invalid gateway path", http.StatusBadRequest)
 			return
 		}
@@ -130,9 +134,26 @@ func (s Server) apiKeyGatewayHandler(config *APIKeyGatewayConfig, spec apiKeyGat
 	})
 }
 
-func gatewayPathHasDotSegment(path string) bool {
-	for _, segment := range strings.Split(path, "/") {
+func gatewayMethodCanReflectCredentials(method string) bool {
+	return strings.EqualFold(method, "TRACE") || strings.EqualFold(method, "TRACK")
+}
+
+func gatewayPathIsUnsafe(requestURL *url.URL) bool {
+	if requestURL == nil || !strings.HasPrefix(requestURL.Path, "/") ||
+		strings.Contains(requestURL.Path, "//") || strings.Contains(requestURL.Path, `\`) {
+		return true
+	}
+	for _, segment := range strings.Split(requestURL.Path, "/") {
 		if segment == "." || segment == ".." {
+			return true
+		}
+	}
+	// Reject encoded and double-encoded separators. Different upstream stacks
+	// normalize these at different layers, which can otherwise change the route
+	// after the administrative-route checks above.
+	for _, value := range []string{requestURL.RawPath, requestURL.Path} {
+		value = strings.ToLower(value)
+		if strings.Contains(value, "%2f") || strings.Contains(value, "%5c") {
 			return true
 		}
 	}
