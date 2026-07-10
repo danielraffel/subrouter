@@ -8,7 +8,7 @@ Use this checklist before putting a shared Subrouter on a tailnet or a public-fa
 - Keep `/_subrouter/health` unauthenticated for liveness checks.
 - Use `/_subrouter/ready` for readiness checks. It returns 503 while the process is draining.
 - Set `SUBROUTER_ADMIN_TOKEN` for any non-loopback listener. Sensitive admin endpoints then require `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`.
-- Set `SUBROUTER_GEMINI_GATEWAY_TOKEN` whenever the Gemini gateway is enabled on a shared listener. It protects `/gemini/*` without exposing the provider key.
+- Set `SUBROUTER_GEMINI_GATEWAY_TOKEN` whenever the Gemini gateway is enabled. It protects the Gemini routes without exposing the provider key, and the gateway stays disabled when the token is missing.
 
 ## Linux install
 

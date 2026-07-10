@@ -10,7 +10,7 @@ import (
 )
 
 // GeminiConfig enables a transparent Gemini Developer API gateway. Clients
-// present the optional gateway token as x-goog-api-key; the gateway replaces it
+// present the gateway token as x-goog-api-key; the gateway replaces it
 // with the provider key before forwarding the request.
 type GeminiConfig struct {
 	Upstream     *url.URL
@@ -20,7 +20,10 @@ type GeminiConfig struct {
 }
 
 func (c *GeminiConfig) configured() bool {
-	return c != nil && c.Upstream != nil && strings.TrimSpace(c.APIKey) != ""
+	return c != nil &&
+		c.Upstream != nil &&
+		strings.TrimSpace(c.APIKey) != "" &&
+		strings.TrimSpace(c.GatewayToken) != ""
 }
 
 func (s Server) geminiHandler() http.Handler {
@@ -83,7 +86,7 @@ func (s Server) geminiHandler() http.Handler {
 func authorizeGeminiGateway(r *http.Request, configuredToken string) bool {
 	token := strings.TrimSpace(configuredToken)
 	if token == "" {
-		return true
+		return false
 	}
 	got := strings.TrimSpace(r.Header.Get("X-Goog-Api-Key"))
 	if got == "" {

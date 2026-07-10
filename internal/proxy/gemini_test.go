@@ -107,3 +107,31 @@ func TestGeminiGatewayReportsMissingProviderCredential(t *testing.T) {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestGeminiGatewayReportsMissingGatewayToken(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{Gemini: &GeminiConfig{
+		Upstream: upstreamURL,
+		APIKey:   "provider-secret",
+	}}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/gemini/v1beta/interactions", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("upstream requests = %d", got)
+	}
+}

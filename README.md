@@ -359,7 +359,7 @@ For a shared server, replace `127.0.0.1` with the server URL. Subrouter recogniz
 
 Gemini has its own `sr gemini` namespace and a transparent Developer API gateway. Configure the server with `SUBROUTER_GEMINI_API_KEY`; official Gemini SDK clients use `http://<subrouter>:31415` as their base URL. The gateway replaces client credentials before forwarding Files and Interactions API requests, so teammates never receive the provider key. `/gemini/*` remains available as an explicit alias for raw HTTP clients.
 
-For a shared listener, also set `SUBROUTER_GEMINI_GATEWAY_TOKEN`. Clients present that token as `x-goog-api-key`. A tailnet-only server may omit the gateway token, but public listeners must not expose an unauthenticated Gemini route.
+Set `SUBROUTER_GEMINI_GATEWAY_TOKEN` whenever the Gemini gateway is enabled. Clients present that token as `x-goog-api-key`; the gateway stays disabled when either credential is missing.
 
 ```bash
 SUBROUTER_GEMINI_API_KEY=<provider-key> \
