@@ -382,6 +382,10 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.Lifecycle != nil && s.Lifecycle.Draining() {
+		http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxSessionLeaseRequestBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
