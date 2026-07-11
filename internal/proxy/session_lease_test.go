@@ -401,6 +401,76 @@ func TestCodexPiSessionLeaseSelectsOnlyOAuthAccounts(t *testing.T) {
 	})
 }
 
+func TestSessionLeaseCreationIgnoresCallerAccountRoutingHeaders(t *testing.T) {
+	accountsList := []accounts.Account{
+		{
+			ID:        "scheduled@example.com",
+			Provider:  accounts.ProviderCodex,
+			AuthMode:  accounts.AuthModeOAuth,
+			Token:     "scheduled-token",
+			AccountID: "scheduled-chatgpt",
+		},
+		{
+			ID:        "forced@example.com",
+			Provider:  accounts.ProviderCodex,
+			AuthMode:  accounts.AuthModeOAuth,
+			Token:     "forced-token",
+			AccountID: "forced-chatgpt",
+		},
+	}
+	newHandler := func() http.Handler {
+		return Server{
+			Accounts:      accountsList,
+			Sessions:      newSessionStore(t),
+			Scheduler:     selectacct.NewScheduler(nil),
+			sessionLeases: newSessionLeaseStore(),
+			AdminToken:    "service-admin-token",
+			MaxBodyBytes:  1024,
+		}.Handler()
+	}
+
+	baseline, _ := issueSessionLease(t, newHandler(), "codex", "gpt-5.4")
+	forcedAccountID := accountsList[0].ID
+	if forcedAccountID == baseline.Assignment.AccountID {
+		forcedAccountID = accountsList[1].ID
+	}
+	req := newSessionLeaseRequest(t, "codex", "gpt-5.4")
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	req.Header.Set("X-Subrouter-Account-ID", forcedAccountID)
+	recorder := httptest.NewRecorder()
+	newHandler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("lease status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var routed sessionLeaseResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &routed); err != nil {
+		t.Fatal(err)
+	}
+	if routed.Assignment.AccountID != baseline.Assignment.AccountID {
+		t.Fatalf("caller forced account %q, scheduler assigned %q", routed.Assignment.AccountID, baseline.Assignment.AccountID)
+	}
+}
+
+func TestSessionLeaseScopeKeyHasUnambiguousTenantBoundaries(t *testing.T) {
+	left := sessionLeaseRequest{
+		OrganizationID: "a",
+		WorkspaceID:    "b\x00c",
+		ConversationID: "conversation",
+		InvocationID:   "invocation",
+		AgentSessionID: "agent-session",
+	}
+	right := left
+	right.OrganizationID = "a\x00b"
+	right.WorkspaceID = "c"
+
+	leftKey := sessionLeaseScopeKey(left, accounts.ProviderCodex, "gpt-5.4")
+	rightKey := sessionLeaseScopeKey(right, accounts.ProviderCodex, "gpt-5.4")
+	if leftKey == rightKey {
+		t.Fatal("distinct tenant scopes produced the same lease key")
+	}
+}
+
 func TestSessionLeaseDoesNotFailOverToDifferentClaudeAccount(t *testing.T) {
 	var assignedCalls atomic.Int32
 	var otherCalls atomic.Int32
