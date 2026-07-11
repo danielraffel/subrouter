@@ -19,23 +19,38 @@ import (
 
 const (
 	defaultSessionLeaseTTL      = 15 * time.Minute
+	sessionLeaseRotationGrace   = 30 * time.Second
+	sessionLeaseRenewRetryTTL   = 2 * time.Minute
 	maxSessionLeaseRequestBytes = 64 << 10
 	sessionLeaseTokenType       = "SRLEASE"
 	syntheticChatGPTAccountID   = "cloudmux-broker"
 )
 
-var errInvalidSessionLease = errors.New("invalid or expired session lease")
+var (
+	errInvalidSessionLease  = errors.New("invalid or expired session lease")
+	errSessionLeaseNotFound = errors.New("session lease not found")
+)
 
 // sessionLeaseStore keeps short-lived broker credentials in memory. The
 // underlying provider credentials remain in Subrouter's account store and are
 // never returned to the caller.
 type sessionLeaseStore struct {
-	mu      sync.Mutex
-	byID    map[string]sessionLease
-	byScope map[string]string
-	byToken map[[32]byte]string
-	now     func() time.Time
-	ttl     time.Duration
+	mu         sync.Mutex
+	byID       map[string]sessionLease
+	byScope    map[string]string
+	byToken    map[[32]byte]sessionLeaseTokenBinding
+	tokensByID map[string]map[[32]byte]struct{}
+	now        func() time.Time
+	ttl        time.Duration
+}
+
+// sessionLeaseTokenBinding separates the short overlap in which a rotated
+// token can still authorize an in-flight model request from the longer window
+// in which a timed-out renewal can be retried idempotently.
+type sessionLeaseTokenBinding struct {
+	LeaseID          string
+	RequestExpiresAt time.Time
+	RenewExpiresAt   time.Time
 }
 
 // sessionLease is the server-side binding for one Cloudmux invocation. Token
@@ -55,6 +70,7 @@ type sessionLease struct {
 	AccountID      string
 	AuthMode       accounts.AuthMode
 	Model          string
+	ProxyBaseURL   string
 	CreatedAt      time.Time
 	ExpiresAt      time.Time
 }
@@ -120,11 +136,12 @@ type sessionLeaseOpenAIAuthClaim struct {
 
 func newSessionLeaseStore() *sessionLeaseStore {
 	return &sessionLeaseStore{
-		byID:    make(map[string]sessionLease),
-		byScope: make(map[string]string),
-		byToken: make(map[[32]byte]string),
-		now:     time.Now,
-		ttl:     defaultSessionLeaseTTL,
+		byID:       make(map[string]sessionLease),
+		byScope:    make(map[string]string),
+		byToken:    make(map[[32]byte]sessionLeaseTokenBinding),
+		tokensByID: make(map[string]map[[32]byte]struct{}),
+		now:        time.Now,
+		ttl:        defaultSessionLeaseTTL,
 	}
 }
 
@@ -156,7 +173,7 @@ func (s *sessionLeaseStore) put(template sessionLease) (sessionLease, error) {
 	template.ExpiresAt = expiresAt
 	s.byID[id] = template
 	s.byScope[template.ScopeKey] = id
-	s.byToken[sha256.Sum256([]byte(token))] = id
+	s.bindTokenLocked(id, token, expiresAt, expiresAt)
 	return template, nil
 }
 
@@ -168,11 +185,58 @@ func (s *sessionLeaseStore) resolve(token string) (sessionLease, error) {
 	defer s.mu.Unlock()
 	now := s.now().UTC()
 	s.removeExpiredLocked(now)
-	id := s.byToken[sha256.Sum256([]byte(token))]
-	lease, ok := s.byID[id]
+	binding, ok := s.byToken[sha256.Sum256([]byte(token))]
+	if !ok || !now.Before(binding.RequestExpiresAt) {
+		return sessionLease{}, errInvalidSessionLease
+	}
+	lease, ok := s.byID[binding.LeaseID]
 	if !ok {
 		return sessionLease{}, errInvalidSessionLease
 	}
+	return lease, nil
+}
+
+// renew rotates a lease token without changing any of its tenant, session,
+// provider, account, or model bindings. The caller must prove possession of
+// the current token. A recently rotated token returns the already-current
+// lease, which makes concurrent calls and retries after a lost response
+// idempotent instead of producing out-of-order token-file writes.
+func (s *sessionLeaseStore) renew(id, presentedToken string) (sessionLease, error) {
+	if s == nil {
+		return sessionLease{}, errSessionLeaseNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now().UTC()
+	s.removeExpiredLocked(now)
+	lease, ok := s.byID[id]
+	if !ok {
+		return sessionLease{}, errSessionLeaseNotFound
+	}
+	presentedHash := sha256.Sum256([]byte(presentedToken))
+	binding, ok := s.byToken[presentedHash]
+	if !ok || binding.LeaseID != id || !now.Before(binding.RenewExpiresAt) {
+		return sessionLease{}, errInvalidSessionLease
+	}
+	currentHash := sha256.Sum256([]byte(lease.Token))
+	if presentedHash != currentHash {
+		return lease, nil
+	}
+
+	expiresAt := now.Add(s.ttl)
+	token, err := newSessionLeaseToken(now, expiresAt)
+	if err != nil {
+		return sessionLease{}, err
+	}
+	oldBinding := s.byToken[currentHash]
+	oldBinding.RequestExpiresAt = earlierTime(oldBinding.RequestExpiresAt, now.Add(sessionLeaseRotationGrace))
+	oldBinding.RenewExpiresAt = earlierTime(expiresAt, now.Add(sessionLeaseRenewRetryTTL))
+	s.byToken[currentHash] = oldBinding
+
+	lease.Token = token
+	lease.ExpiresAt = expiresAt
+	s.byID[id] = lease
+	s.bindTokenLocked(id, token, expiresAt, expiresAt)
 	return lease, nil
 }
 
@@ -197,14 +261,50 @@ func (s *sessionLeaseStore) removeExpiredLocked(now time.Time) {
 			s.removeLocked(lease)
 		}
 	}
+	for tokenHash, binding := range s.byToken {
+		if !now.Before(binding.RenewExpiresAt) {
+			s.removeTokenBindingLocked(tokenHash, binding.LeaseID)
+		}
+	}
 }
 
 func (s *sessionLeaseStore) removeLocked(lease sessionLease) {
 	delete(s.byID, lease.ID)
-	delete(s.byToken, sha256.Sum256([]byte(lease.Token)))
+	for tokenHash := range s.tokensByID[lease.ID] {
+		delete(s.byToken, tokenHash)
+	}
+	delete(s.tokensByID, lease.ID)
 	if s.byScope[lease.ScopeKey] == lease.ID {
 		delete(s.byScope, lease.ScopeKey)
 	}
+}
+
+func (s *sessionLeaseStore) bindTokenLocked(id, token string, requestExpiresAt, renewExpiresAt time.Time) {
+	tokenHash := sha256.Sum256([]byte(token))
+	s.byToken[tokenHash] = sessionLeaseTokenBinding{
+		LeaseID:          id,
+		RequestExpiresAt: requestExpiresAt,
+		RenewExpiresAt:   renewExpiresAt,
+	}
+	if s.tokensByID[id] == nil {
+		s.tokensByID[id] = make(map[[32]byte]struct{})
+	}
+	s.tokensByID[id][tokenHash] = struct{}{}
+}
+
+func (s *sessionLeaseStore) removeTokenBindingLocked(tokenHash [32]byte, id string) {
+	delete(s.byToken, tokenHash)
+	delete(s.tokensByID[id], tokenHash)
+	if len(s.tokensByID[id]) == 0 {
+		delete(s.tokensByID, id)
+	}
+}
+
+func earlierTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 func randomLeaseValue(prefix string, size int) (string, error) {
@@ -334,27 +434,61 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		AccountID:      account.ID,
 		AuthMode:       account.AuthMode,
 		Model:          model,
+		ProxyBaseURL:   proxyBaseURL,
 	})
 	if err != nil {
 		http.Error(w, "create session lease", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, sessionLeaseResponseFor(lease, proxyBaseURL))
+	writeSessionLeaseResponse(w, lease)
 }
 
 func (s Server) handleSessionLease(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	relativePath := strings.Trim(strings.TrimPrefix(r.URL.Path, "/internal/v1/session-leases/"), "/")
+	parts := strings.Split(relativePath, "/")
+	if relativePath == "" || len(parts) > 2 || parts[0] == "" {
+		http.NotFound(w, r)
 		return
 	}
-	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/internal/v1/session-leases/"))
-	if id == "" || strings.Contains(id, "/") {
-		http.NotFound(w, r)
+	id := parts[0]
+	if len(parts) == 2 {
+		if parts[1] != "renew" {
+			http.NotFound(w, r)
+			return
+		}
+		s.handleSessionLeaseRenew(w, r, id)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	// Deletion is idempotent so actor cleanup can retry after a timeout.
 	s.sessionLeases.release(id)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s Server) handleSessionLeaseRenew(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	presentedToken := strings.TrimSpace(r.Header.Get("X-Subrouter-Lease"))
+	if !looksLikeSessionLeaseToken(presentedToken) {
+		http.Error(w, "session lease token required", http.StatusUnauthorized)
+		return
+	}
+	lease, err := s.sessionLeases.renew(id, presentedToken)
+	switch {
+	case errors.Is(err, errSessionLeaseNotFound):
+		http.NotFound(w, r)
+	case errors.Is(err, errInvalidSessionLease):
+		http.Error(w, "invalid or expired session lease", http.StatusUnauthorized)
+	case err != nil:
+		http.Error(w, "renew session lease", http.StatusInternalServerError)
+	default:
+		writeSessionLeaseResponse(w, lease)
+	}
 }
 
 func (s Server) resolveSessionLease(r *http.Request) (sessionLease, bool, error) {
@@ -567,8 +701,8 @@ func sessionLeaseScopeKey(request sessionLeaseRequest, provider accounts.Provide
 	}, "\x00")
 }
 
-func sessionLeaseResponseFor(lease sessionLease, proxyBaseURL string) sessionLeaseResponse {
-	baseURL := strings.TrimRight(proxyBaseURL, "/")
+func sessionLeaseResponseFor(lease sessionLease) sessionLeaseResponse {
+	baseURL := strings.TrimRight(lease.ProxyBaseURL, "/")
 	piBaseURL := baseURL
 	api := "openai-codex-responses"
 	switch lease.Provider {
@@ -620,4 +754,9 @@ func sessionLeaseResponseFor(lease sessionLease, proxyBaseURL string) sessionLea
 			Model:                     lease.Model,
 		},
 	}
+}
+
+func writeSessionLeaseResponse(w http.ResponseWriter, lease sessionLease) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, sessionLeaseResponseFor(lease))
 }

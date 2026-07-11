@@ -44,9 +44,26 @@ unique. Subrouter authorizes only an exact SHA-256 token-hash match in its
 in-memory lease store. It does not trust the public claims or expose the
 selected upstream account ID in them.
 
-`DELETE /internal/v1/session-leases/<leaseId>` revokes the broker token and is
-idempotent. Leases also expire after 15 minutes and are lost on Subrouter
-restart, so callers must reacquire them when resuming work.
+`POST /internal/v1/session-leases/<leaseId>/renew` extends a running agent loop.
+It requires the same admin authentication as lease creation plus the current
+broker token in `X-Subrouter-Lease`. It has no request body and returns the same
+response shape as creation with a rotated broker token and a fresh 15-minute
+`expiresAt`. Organization, workspace, conversation, invocation, agent session,
+provider, account, auth mode, and model bindings cannot change during renewal.
+
+The previous token can authorize model requests for 30 seconds so requests that
+started during rotation can finish. It can authenticate an idempotent renewal
+retry for two minutes. Concurrent retries with the same previous token return
+the already-current token instead of rotating again. Cloudmux should run one
+renewal loop per lease, renew before expiry, and atomically replace its token
+file only after receiving a successful response. A token file must use mode
+`0600` and live outside the agent's Git working tree.
+
+Renewal returns `401` when the broker token is missing or invalid and `404`
+after expiry or release. `DELETE /internal/v1/session-leases/<leaseId>` removes
+every token generation and is idempotent. A release serialized before renewal
+cannot be undone by that renewal. Leases are lost on Subrouter restart, so
+callers must reacquire them when resuming work.
 
 ## Core model
 

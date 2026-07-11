@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -263,6 +264,162 @@ func TestSessionLeaseExpiryRejectsBrokerToken(t *testing.T) {
 	}
 }
 
+func TestSessionLeaseRenewalRotatesSafelyAndPreservesScope(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	store := newSessionLeaseStore()
+	store.now = func() time.Time { return now }
+	lease, err := store.put(sessionLease{
+		ScopeKey:       "organization-1\x00workspace-1\x00conversation-1\x00invocation-1",
+		OrganizationID: "organization-1",
+		WorkspaceID:    "workspace-1",
+		ConversationID: "conversation-1",
+		InvocationID:   "invocation-1",
+		SessionKey:     "session-1",
+		Agent:          "pi",
+		Provider:       accounts.ProviderCodex,
+		AccountID:      "oauth@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          "gpt-5.4",
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalToken := lease.Token
+	originalExpiry := lease.ExpiresAt
+	handler := Server{sessionLeases: store, AdminToken: "service-admin-token"}.Handler()
+
+	now = now.Add(10 * time.Minute)
+	renewed := renewSessionLease(t, handler, lease.ID, originalToken, http.StatusOK)
+	renewedToken := renewed.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"]
+	if renewedToken == "" || renewedToken == originalToken {
+		t.Fatal("renewal did not rotate the broker token")
+	}
+	if renewed.LeaseID != lease.ID || renewed.SessionKey != lease.SessionKey {
+		t.Fatalf("renewal changed lease identity: %+v", renewed)
+	}
+	if renewed.Assignment.AccountID != lease.AccountID || renewed.Assignment.Provider != string(lease.Provider) || renewed.Assignment.AuthMode != string(lease.AuthMode) || renewed.Assignment.Model != lease.Model {
+		t.Fatalf("renewal changed assignment: %+v", renewed.Assignment)
+	}
+	if renewed.Pi.BaseURL != "http://subrouter:31415/backend-api" || renewed.Pi.Model != lease.Model {
+		t.Fatalf("renewal changed Pi routing: %+v", renewed.Pi)
+	}
+	renewedExpiry, err := time.Parse(time.RFC3339Nano, renewed.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !renewedExpiry.After(originalExpiry) || !renewedExpiry.Equal(now.Add(defaultSessionLeaseTTL)) {
+		t.Fatalf("renewed expiry = %v, want %v", renewedExpiry, now.Add(defaultSessionLeaseTTL))
+	}
+	_, payload, _ := decodeSessionLeaseToken(t, renewedToken)
+	if payload.ExpiresAt != renewedExpiry.Unix() {
+		t.Fatalf("token exp = %d, response expiry = %d", payload.ExpiresAt, renewedExpiry.Unix())
+	}
+	resolved, err := store.resolve(renewedToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.OrganizationID != lease.OrganizationID || resolved.WorkspaceID != lease.WorkspaceID || resolved.ConversationID != lease.ConversationID || resolved.InvocationID != lease.InvocationID || resolved.ScopeKey != lease.ScopeKey {
+		t.Fatalf("renewal changed Cloudmux scope: %+v", resolved)
+	}
+	if _, err := store.resolve(originalToken); err != nil {
+		t.Fatalf("old token should cover in-flight requests during rotation grace: %v", err)
+	}
+
+	// A concurrent call or a retry after a lost response presents the old token.
+	// It must return the same current token instead of rotating again.
+	retry := renewSessionLease(t, handler, lease.ID, originalToken, http.StatusOK)
+	if retry.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"] != renewedToken || retry.ExpiresAt != renewed.ExpiresAt {
+		t.Fatal("retry with the prior token was not idempotent")
+	}
+
+	now = now.Add(sessionLeaseRotationGrace + time.Second)
+	if _, err := store.resolve(originalToken); !errors.Is(err, errInvalidSessionLease) {
+		t.Fatalf("old token remained usable after rotation grace: %v", err)
+	}
+	assertLeaseModelRequestRejected(t, handler, originalToken)
+	retry = renewSessionLease(t, handler, lease.ID, originalToken, http.StatusOK)
+	if retry.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"] != renewedToken {
+		t.Fatal("timed-out renewal retry did not recover the current token")
+	}
+
+	secondRenewal := renewSessionLease(t, handler, lease.ID, renewedToken, http.StatusOK)
+	secondRenewedToken := secondRenewal.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"]
+	if secondRenewedToken == renewedToken || secondRenewedToken == originalToken {
+		t.Fatal("serialized renewal did not rotate to a third token generation")
+	}
+	secondRetry := renewSessionLease(t, handler, lease.ID, renewedToken, http.StatusOK)
+	if secondRetry.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"] != secondRenewedToken {
+		t.Fatal("serialized renewal retry did not return the third token generation")
+	}
+
+	renewSessionLease(t, handler, lease.ID, "not-a-lease-token", http.StatusUnauthorized)
+	renewSessionLease(t, handler, "lease_missing", secondRenewedToken, http.StatusNotFound)
+	releaseSessionLease(t, handler, lease.ID)
+	for name, token := range map[string]string{"original": originalToken, "renewed": renewedToken, "second-renewed": secondRenewedToken} {
+		if _, err := store.resolve(token); !errors.Is(err, errInvalidSessionLease) {
+			t.Fatalf("%s token resolved after release: %v", name, err)
+		}
+		assertLeaseModelRequestRejected(t, handler, token)
+	}
+	renewSessionLease(t, handler, lease.ID, secondRenewedToken, http.StatusNotFound)
+}
+
+func TestConcurrentSessionLeaseRenewalsReturnOneCurrentToken(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	store := newSessionLeaseStore()
+	store.now = func() time.Time { return now }
+	lease, err := store.put(sessionLease{
+		ScopeKey:     "scope",
+		SessionKey:   "session",
+		Provider:     accounts.ProviderCodex,
+		ProxyBaseURL: "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 16
+	results := make(chan sessionLease, callers)
+	errorsSeen := make(chan error, callers)
+	var wait sync.WaitGroup
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			renewed, renewErr := store.renew(lease.ID, lease.Token)
+			if renewErr != nil {
+				errorsSeen <- renewErr
+				return
+			}
+			results <- renewed
+		}()
+	}
+	wait.Wait()
+	close(results)
+	close(errorsSeen)
+	for renewErr := range errorsSeen {
+		t.Fatalf("concurrent renewal failed: %v", renewErr)
+	}
+	var currentToken string
+	for renewed := range results {
+		if currentToken == "" {
+			currentToken = renewed.Token
+		}
+		if renewed.Token != currentToken {
+			t.Fatalf("concurrent renewals returned different tokens")
+		}
+	}
+	if currentToken == "" || currentToken == lease.Token {
+		t.Fatal("concurrent renewal did not produce one new current token")
+	}
+
+	store.release(lease.ID)
+	if _, err := store.renew(lease.ID, currentToken); !errors.Is(err, errSessionLeaseNotFound) {
+		t.Fatalf("renewal resurrected a released lease: %v", err)
+	}
+}
+
 func TestSessionLeaseProviderRejectsConflictingModelPrefix(t *testing.T) {
 	if _, _, err := sessionLeaseProvider("codex", "anthropic/claude-sonnet-4-5"); err == nil {
 		t.Fatal("expected conflicting provider and model prefix to fail")
@@ -290,11 +447,26 @@ func issueSessionLease(t *testing.T, handler http.Handler, provider, model strin
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("lease status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("lease response Cache-Control = %q, want no-store", recorder.Header().Get("Cache-Control"))
+	}
 	var response sessionLeaseResponse
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
 	return response, recorder.Body.String()
+}
+
+func assertLeaseModelRequestRejected(t *testing.T, handler http.Handler, token string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/backend-api/codex/responses", strings.NewReader(`{"model":"gpt-5.4"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("model request with invalid lease status = %d, want 401; body = %s", recorder.Code, recorder.Body.String())
+	}
 }
 
 func newSessionLeaseRequest(t *testing.T, provider, model string) *http.Request {
@@ -329,6 +501,30 @@ func releaseSessionLease(t *testing.T, handler http.Handler, leaseID string) {
 		body, _ := io.ReadAll(recorder.Result().Body)
 		t.Fatalf("release status = %d, body = %s", recorder.Code, string(body))
 	}
+}
+
+func renewSessionLease(t *testing.T, handler http.Handler, leaseID, leaseToken string, wantStatus int) sessionLeaseResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/internal/v1/session-leases/"+url.PathEscape(leaseID)+"/renew", nil)
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	req.Header.Set("X-Subrouter-Lease", leaseToken)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != wantStatus {
+		t.Fatalf("renew status = %d, want %d; body = %s", recorder.Code, wantStatus, recorder.Body.String())
+	}
+	if wantStatus != http.StatusOK {
+		return sessionLeaseResponse{}
+	}
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("renewal response Cache-Control = %q, want no-store", recorder.Header().Get("Cache-Control"))
+	}
+	var response sessionLeaseResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
 }
 
 func newSessionStore(t *testing.T) *session.Store {
