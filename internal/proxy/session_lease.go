@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/session"
 )
 
 const (
@@ -412,11 +414,12 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 	if model != "" {
 		r.Header.Set("X-Subrouter-Model", model)
 	}
-	account, sessionKey, _, err := s.accountForSessionProvider(
+	account, sessionKey, _, err := s.accountForSessionProviderWithOptions(
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
 		request.AgentSessionID,
 		r,
+		accountSelectionOptions{oauthOnly: provider == accounts.ProviderCodex},
 	)
 	if err != nil {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
@@ -518,6 +521,157 @@ func (lease sessionLease) allowsRequest(r *http.Request) bool {
 		return r.URL.Path == "/zai/v1/messages"
 	default:
 		return false
+	}
+}
+
+func (lease sessionLease) allowsAccount(account accounts.Account) bool {
+	return account.ID == lease.AccountID &&
+		accountProviderOrCodex(account) == lease.Provider &&
+		account.AuthMode == lease.AuthMode
+}
+
+// validateRequestModel verifies the model that the provider will receive. It
+// deliberately ignores Subrouter routing headers because those are stripped
+// before forwarding and therefore cannot prove what the JSON request selects.
+func (lease sessionLease) validateRequestModel(r *http.Request) error {
+	if lease.Model == "" {
+		return nil
+	}
+	if r == nil {
+		return errors.New("request is required")
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return errors.New("request query is invalid")
+	}
+	for _, value := range query["model"] {
+		model := session.NormalizeModel(value)
+		if model == "" || model != lease.Model {
+			return errors.New("request query model conflicts with lease")
+		}
+	}
+	models, err := requestJSONModels(r, replayablePostMaxBodyBytes)
+	if err != nil {
+		return err
+	}
+	if len(models) == 0 {
+		return errors.New("request body model is required")
+	}
+	for _, model := range models {
+		if model != lease.Model {
+			return errors.New("request body model conflicts with lease")
+		}
+	}
+	return nil
+}
+
+// requestJSONModels returns every top-level model value, including duplicate
+// JSON keys. Reading into a map would collapse duplicates and allow a parser
+// disagreement to bypass a model-bound lease. The request body is restored for
+// the normal proxy path after validation.
+func requestJSONModels(r *http.Request, maxBytes int64) ([]string, error) {
+	if r.Body == nil || maxBytes <= 0 {
+		return nil, errors.New("JSON request body is required")
+	}
+	if contentType := strings.ToLower(r.Header.Get("Content-Type")); !strings.Contains(contentType, "json") {
+		return nil, errors.New("JSON request body is required")
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	if err != nil {
+		return nil, errors.New("read request body")
+	}
+	if int64(len(body)) > maxBytes {
+		r.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), r.Body),
+			Closer: r.Body,
+		}
+		return nil, errors.New("request body is too large to validate")
+	}
+	if err := r.Body.Close(); err != nil {
+		return nil, errors.New("close request body")
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+	r.ContentLength = int64(len(body))
+
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, errors.New("request body is not valid JSON")
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return nil, errors.New("request body must be a JSON object")
+	}
+	models := make([]string, 0, 1)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, errors.New("request body is not valid JSON")
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, errors.New("request body is not valid JSON")
+		}
+		if key != "model" {
+			if err := skipJSONValue(decoder); err != nil {
+				return nil, errors.New("request body is not valid JSON")
+			}
+			continue
+		}
+		var value string
+		if err := decoder.Decode(&value); err != nil {
+			return nil, errors.New("request body model must be a string")
+		}
+		model := session.NormalizeModel(value)
+		if model == "" {
+			return nil, errors.New("request body model is invalid")
+		}
+		models = append(models, model)
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') {
+		return nil, errors.New("request body is not valid JSON")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("request body has trailing JSON")
+	}
+	return models, nil
+}
+
+func skipJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return err
+			}
+			if err := skipJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case '[':
+		for decoder.More() {
+			if err := skipJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	default:
+		return errors.New("unexpected JSON delimiter")
 	}
 }
 

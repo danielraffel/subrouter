@@ -36,6 +36,25 @@ the selected account credential before forwarding. Provider credentials never
 cross the Subrouter boundary. A lease can call only its provider's model
 endpoint and, when assigned, its exact model.
 
+Codex Pi leases select only OAuth subscription accounts because Pi's
+`openai-codex-responses` adapter and `/backend-api` route are ChatGPT-specific.
+If no Codex OAuth account is available, lease creation returns `503` without
+creating a lease or sticky session assignment. Claude, Kimi, and ZAI leases may
+use API-key accounts supported by their returned Pi adapter configuration.
+
+A model-bound lease requires a top-level `model` string in the forwarded JSON
+body. Every body occurrence and any forwarded `model` query value must match
+the lease exactly. Subrouter routing headers do not satisfy this check because
+they are removed before the upstream request. Missing, malformed, duplicate
+conflicting, or oversized model-bearing bodies are rejected before proxying.
+
+Lease-authenticated requests stay on the response's advertised account,
+provider, and auth mode. Subrouter returns that account's quota or credential
+failure directly and does not use another subscription account, Bedrock, or a
+dedicated fallback API key. Transport-level replay may retry the same account.
+If the assigned account disappears or changes auth mode, the request returns
+`503`; the actor can release and acquire a new lease explicitly.
+
 The token has three JWT-shaped segments so Pi's `openai-codex-responses`
 adapter can read an account claim. Its public header has `typ: "SRLEASE"`; its
 payload has `cloudmux_session_lease: true` and the constant synthetic account

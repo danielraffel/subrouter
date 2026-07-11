@@ -270,34 +270,46 @@ func TestSessionLeaseValidatesForwardedModelInsteadOfRoutingHeaders(t *testing.T
 	leaseToken := lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"]
 
 	tests := []struct {
-		name   string
-		url    string
-		body   string
-		header string
+		name        string
+		url         string
+		body        string
+		header      string
+		contentType string
 	}{
 		{
-			name:   "routing header hides conflicting body",
-			url:    "http://subrouter:31415/backend-api/codex/responses",
-			body:   `{"model":"gpt-5.4-mini","input":"attacker-selected"}`,
-			header: "gpt-5.4",
+			name:        "routing header hides conflicting body",
+			url:         "http://subrouter:31415/backend-api/codex/responses",
+			body:        `{"model":"gpt-5.4-mini","input":"attacker-selected"}`,
+			header:      "gpt-5.4",
+			contentType: "application/json",
 		},
 		{
-			name:   "routing header hides missing body model",
-			url:    "http://subrouter:31415/backend-api/codex/responses",
-			body:   `{"input":"missing model"}`,
-			header: "gpt-5.4",
+			name:        "routing header hides missing body model",
+			url:         "http://subrouter:31415/backend-api/codex/responses",
+			body:        `{"input":"missing model"}`,
+			header:      "gpt-5.4",
+			contentType: "application/json",
 		},
 		{
-			name:   "duplicate body model conflicts",
-			url:    "http://subrouter:31415/backend-api/codex/responses",
-			body:   `{"model":"gpt-5.4","model":"gpt-5.4-mini","input":"duplicate key"}`,
-			header: "gpt-5.4",
+			name:        "duplicate body model conflicts",
+			url:         "http://subrouter:31415/backend-api/codex/responses",
+			body:        `{"model":"gpt-5.4","model":"gpt-5.4-mini","input":"duplicate key"}`,
+			header:      "gpt-5.4",
+			contentType: "application/json",
 		},
 		{
-			name:   "query model conflicts with body",
-			url:    "http://subrouter:31415/backend-api/codex/responses?model=gpt-5.4-mini",
-			body:   `{"model":"gpt-5.4","input":"query conflict"}`,
-			header: "gpt-5.4",
+			name:        "query model conflicts with body",
+			url:         "http://subrouter:31415/backend-api/codex/responses?model=gpt-5.4-mini",
+			body:        `{"model":"gpt-5.4","input":"query conflict"}`,
+			header:      "gpt-5.4",
+			contentType: "application/json",
+		},
+		{
+			name:        "non JSON body cannot establish model",
+			url:         "http://subrouter:31415/backend-api/codex/responses",
+			body:        `{"model":"gpt-5.4","input":"wrong content type"}`,
+			header:      "gpt-5.4",
+			contentType: "text/plain",
 		},
 	}
 	for _, test := range tests {
@@ -305,7 +317,7 @@ func TestSessionLeaseValidatesForwardedModelInsteadOfRoutingHeaders(t *testing.T
 			before := upstreamCalls.Load()
 			req := httptest.NewRequest(http.MethodPost, test.url, strings.NewReader(test.body))
 			req.Header.Set("Authorization", "Bearer "+leaseToken)
-			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Content-Type", test.contentType)
 			req.Header.Set("X-Subrouter-Model", test.header)
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, req)
@@ -441,6 +453,50 @@ func TestSessionLeaseDoesNotFailOverToDifferentClaudeAccount(t *testing.T) {
 	assignment, ok := sessionStore.Get("pi", lease.SessionKey)
 	if !ok || assignment.AccountID != "assigned@example.com" {
 		t.Fatalf("sticky assignment = %+v, want assigned account", assignment)
+	}
+}
+
+func TestSessionLeaseMayRetryTheSameAssignedAccount(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer assigned-token" {
+			http.Error(w, "unexpected credential", http.StatusUnauthorized)
+			return
+		}
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"same-account-retry"}`))
+	}))
+	defer upstream.Close()
+
+	handler := Server{
+		ClaudeUpstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{{
+			ID:       "assigned@example.com",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "assigned-token",
+		}},
+		Sessions:      newSessionStore(t),
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+	}.Handler()
+	lease, _ := issueSessionLease(t, handler, "claude", "anthropic/claude-sonnet-4-5")
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[]}`))
+	req.Header.Set("X-Api-Key", lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"])
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "same-account-retry") {
+		t.Fatalf("status = %d body = %s, want successful same-account retry", recorder.Code, recorder.Body.String())
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("assigned account calls = %d, want 2", calls.Load())
 	}
 }
 

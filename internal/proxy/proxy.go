@@ -1711,6 +1711,7 @@ func (s Server) proxyHandler() http.Handler {
 		agentType := session.ExtractAgentType(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
+		var boundLease *sessionLease
 		if lease, presented, err := s.resolveSessionLease(r); presented {
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -1720,6 +1721,11 @@ func (s Server) proxyHandler() http.Handler {
 				http.Error(w, "session lease does not allow the requested endpoint", http.StatusForbidden)
 				return
 			}
+			if err := lease.validateRequestModel(r); err != nil {
+				http.Error(w, "session lease does not allow the requested model", http.StatusForbidden)
+				return
+			}
+			boundLease = &lease
 			agentType = lease.Agent
 			sessionID = lease.SessionKey
 			requestProvider = lease.Provider
@@ -1727,11 +1733,6 @@ func (s Server) proxyHandler() http.Handler {
 			r.Header.Set("X-Subrouter-Session", lease.SessionKey)
 			r.Header.Set("X-Subrouter-Account-ID", lease.AccountID)
 			if lease.Model != "" {
-				requestedModel := session.ExtractModel(r, s.MaxBodyBytes)
-				if requestedModel != "" && requestedModel != lease.Model {
-					http.Error(w, "session lease does not allow the requested model", http.StatusForbidden)
-					return
-				}
 				r.Header.Set("X-Subrouter-Model", lease.Model)
 			}
 		}
@@ -1751,7 +1752,7 @@ func (s Server) proxyHandler() http.Handler {
 		if requestProvider == accounts.ProviderClaude {
 			requestModel := session.ExtractModel(r, s.MaxBodyBytes)
 			requestPoolModel = claudePoolModel(requestModel)
-			fableFallbackConfigured = s.claudeFableEnabled() && claudeFableModel(requestModel) &&
+			fableFallbackConfigured = boundLease == nil && s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
 		// Bedrock-primary: when enabled, serve Fable straight from Bedrock before
@@ -1772,12 +1773,20 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
+		if boundLease != nil && !boundLease.allowsAccount(account) {
+			http.Error(w, "session lease account binding is unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		account, err = s.refreshSelectedAccount(r.Context(), requestProvider, sessionAgentType, sessionID, userEmail, r, account)
 		if err != nil {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
 			http.Error(w, "refresh selected account: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		if boundLease != nil && !boundLease.allowsAccount(account) {
+			http.Error(w, "session lease account binding is unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -1840,7 +1849,7 @@ func (s Server) proxyHandler() http.Handler {
 			},
 		}
 		transport := s.transport()
-		if retryPost && postReplayable &&
+		if boundLease == nil && retryPost && postReplayable &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
 			account.AuthMode == accounts.AuthModeOAuth {
 			var fableFallback func() (*http.Response, bool)
@@ -2700,10 +2709,21 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 }
 
 func (s Server) accountForSessionProvider(provider accounts.Provider, agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
+	return s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
+}
+
+type accountSelectionOptions struct {
+	oauthOnly bool
+}
+
+func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, error) {
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := session.ExtractAccountID(r)
 	model := session.ExtractModel(r, s.MaxBodyBytes)
 	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
+	if options.oauthOnly {
+		availableAccounts = oauthAccounts(availableAccounts)
+	}
 	if forcedAccountID != "" {
 		account, ok := findAccount(availableAccounts, forcedAccountID)
 		if !ok {
