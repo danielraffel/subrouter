@@ -419,7 +419,10 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		agentTypeForProviderSession(request.Agent, provider),
 		request.AgentSessionID,
 		r,
-		accountSelectionOptions{oauthOnly: provider == accounts.ProviderCodex},
+		accountSelectionOptions{
+			ignoreForcedAccount: true,
+			oauthOnly:           provider == accounts.ProviderCodex,
+		},
 	)
 	if err != nil {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
@@ -844,7 +847,8 @@ func sessionLeaseProxyBaseURL(r *http.Request, override string) (string, error) 
 }
 
 func sessionLeaseScopeKey(request sessionLeaseRequest, provider accounts.Provider, model string) string {
-	return strings.Join([]string{
+	var key strings.Builder
+	for _, component := range []string{
 		request.OrganizationID,
 		request.WorkspaceID,
 		request.ConversationID,
@@ -852,7 +856,11 @@ func sessionLeaseScopeKey(request sessionLeaseRequest, provider accounts.Provide
 		request.AgentSessionID,
 		string(provider),
 		model,
-	}, "\x00")
+	} {
+		fmt.Fprintf(&key, "%d:", len(component))
+		key.WriteString(component)
+	}
+	return key.String()
 }
 
 func sessionLeaseResponseFor(lease sessionLease) sessionLeaseResponse {

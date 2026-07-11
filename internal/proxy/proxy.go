@@ -2713,12 +2713,16 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 }
 
 type accountSelectionOptions struct {
-	oauthOnly bool
+	ignoreForcedAccount bool
+	oauthOnly           bool
 }
 
 func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, error) {
 	userEmail := session.ExtractUserEmail(r)
-	forcedAccountID := session.ExtractAccountID(r)
+	forcedAccountID := ""
+	if !options.ignoreForcedAccount {
+		forcedAccountID = session.ExtractAccountID(r)
+	}
 	model := session.ExtractModel(r, s.MaxBodyBytes)
 	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
 	if options.oauthOnly {
