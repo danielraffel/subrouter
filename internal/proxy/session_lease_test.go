@@ -56,6 +56,38 @@ func TestSessionLeaseRequiresConfiguredAdminTokenForNetworkCaller(t *testing.T) 
 	}
 }
 
+func TestSessionLeaseCreationRejectsNewWorkWhileDraining(t *testing.T) {
+	lifecycle := NewLifecycle()
+	lifecycle.Drain()
+	sessionStore := newSessionStore(t)
+	handler := Server{
+		Accounts: []accounts.Account{{
+			ID:        "oauth@example.com",
+			Provider:  accounts.ProviderCodex,
+			AuthMode:  accounts.AuthModeOAuth,
+			Token:     "oauth-token",
+			AccountID: "chatgpt-account",
+		}},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		Lifecycle:     lifecycle,
+		MaxBodyBytes:  1024,
+	}.Handler()
+	req := newSessionLeaseRequest(t, "codex", "gpt-5.4")
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("draining lease status = %d, want 503; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if _, exists := sessionStore.Get(agentTypeForProviderSession("pi", accounts.ProviderCodex), "agent-session-1"); exists {
+		t.Fatal("draining lease creation persisted a session assignment")
+	}
+}
+
 func TestCodexOAuthSessionLeaseIsIdempotentAndBrokersWithoutCredentialDisclosure(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
