@@ -2,6 +2,52 @@
 
 Subrouter should be an account router, not another API-key vault.
 
+## Cloudmux session leases
+
+`POST /internal/v1/session-leases` gives an authenticated Cloudmux actor a
+short-lived, invocation-scoped broker token and a concrete account/model
+assignment. Network callers must use the configured Subrouter admin token.
+The request uses camel-case Cloudmux IDs:
+
+```json
+{
+  "organizationId": "organization-1",
+  "workspaceId": "workspace-1",
+  "conversationId": "conversation-1",
+  "invocationId": "invocation-1",
+  "agentSessionId": "agent-session-1",
+  "agent": "pi",
+  "provider": "codex",
+  "model": "gpt-5.4",
+  "proxyBaseUrl": "http://subrouter:31415"
+}
+```
+
+The response includes `leaseId`, `sessionKey`, `expiresAt`, an ephemeral
+environment, safe assignment metadata, and a `pi` block describing the
+isolated `models.json` provider. The actor must keep the environment in memory,
+set the named API-key environment variable, and select the returned Pi model.
+For Codex, `pi.baseUrl` is `<proxyBaseUrl>/backend-api` because Pi appends
+`/codex/responses`; `OPENAI_BASE_URL` remains `<proxyBaseUrl>/v1` for generic
+OpenAI-compatible clients.
+The broker token works as a normal bearer token for OpenAI-compatible requests
+or `X-Api-Key` for Anthropic-compatible requests. Subrouter replaces it with
+the selected account credential before forwarding. Provider credentials never
+cross the Subrouter boundary. A lease can call only its provider's model
+endpoint and, when assigned, its exact model.
+
+The token has three JWT-shaped segments so Pi's `openai-codex-responses`
+adapter can read an account claim. Its public header has `typ: "SRLEASE"`; its
+payload has `cloudmux_session_lease: true` and the constant synthetic account
+ID `cloudmux-broker`. A random nonce and signature segment make each token
+unique. Subrouter authorizes only an exact SHA-256 token-hash match in its
+in-memory lease store. It does not trust the public claims or expose the
+selected upstream account ID in them.
+
+`DELETE /internal/v1/session-leases/<leaseId>` revokes the broker token and is
+idempotent. Leases also expire after 15 minutes and are lost on Subrouter
+restart, so callers must reacquire them when resuming work.
+
 ## Core model
 
 Each incoming request maps to:

@@ -156,6 +156,7 @@ func TestExtractAgentTypeFromClaudeCodeUserAgent(t *testing.T) {
 
 func TestStripSubrouterHeaders(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	req.Header.Set("X-Subrouter-Lease", "lease-token")
 	req.Header.Set("X-Subrouter-Session", "session-1")
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-User-Email", "alice@example.com")
@@ -169,6 +170,9 @@ func TestStripSubrouterHeaders(t *testing.T) {
 
 	StripSubrouterHeaders(req.Header)
 
+	if got := req.Header.Get("X-Subrouter-Lease"); got != "" {
+		t.Fatalf("X-Subrouter-Lease = %q, want empty", got)
+	}
 	if got := req.Header.Get("X-Subrouter-Session"); got != "" {
 		t.Fatalf("X-Subrouter-Session = %q, want empty", got)
 	}

@@ -55,6 +55,7 @@ type Server struct {
 	ActiveSessions   *ActiveSessions
 	Lifecycle        *Lifecycle
 	AdminToken       string
+	sessionLeases    *sessionLeaseStore
 	MaxBodyBytes     int64
 	Transcripts      *transcript.Recorder
 	ReadCache        *readCache
@@ -899,7 +900,12 @@ func (s Server) Handler() http.Handler {
 	if s.ReadCache == nil {
 		s.ReadCache = newReadCache()
 	}
+	if s.sessionLeases == nil {
+		s.sessionLeases = newSessionLeaseStore()
+	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
+	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
 	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
@@ -1704,13 +1710,37 @@ func (s Server) proxyHandler() http.Handler {
 
 		agentType := session.ExtractAgentType(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
+		requestProvider := providerForRequest(agentType, r.URL.Path)
+		if lease, presented, err := s.resolveSessionLease(r); presented {
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+			if !lease.allowsRequest(r) {
+				http.Error(w, "session lease does not allow the requested endpoint", http.StatusForbidden)
+				return
+			}
+			agentType = lease.Agent
+			sessionID = lease.SessionKey
+			requestProvider = lease.Provider
+			r.Header.Set("X-Subrouter-Agent", lease.Agent)
+			r.Header.Set("X-Subrouter-Session", lease.SessionKey)
+			r.Header.Set("X-Subrouter-Account-ID", lease.AccountID)
+			if lease.Model != "" {
+				requestedModel := session.ExtractModel(r, s.MaxBodyBytes)
+				if requestedModel != "" && requestedModel != lease.Model {
+					http.Error(w, "session lease does not allow the requested model", http.StatusForbidden)
+					return
+				}
+				r.Header.Set("X-Subrouter-Model", lease.Model)
+			}
+		}
 		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
 			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
 			return
 		}
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
-		requestProvider := providerForRequest(agentType, r.URL.Path)
 		// Claude Fable routing order: subscription pool (Max accounts) first, then
 		// AWS Bedrock, then the dedicated Anthropic API key. The fallback stages
 		// run when the pool gives up (usageLimitRetryTransport exhausts failover)
