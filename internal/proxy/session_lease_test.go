@@ -108,7 +108,7 @@ func TestCodexOAuthSessionLeaseIsIdempotentAndBrokersWithoutCredentialDisclosure
 	if first.Pi.API != "openai-codex-responses" || first.Pi.BaseURL != "http://subrouter:31415/backend-api" {
 		t.Fatalf("unexpected Pi config: %+v", first.Pi)
 	}
-	if first.Environment["OPENAI_BASE_URL"] != "http://subrouter:31415/v1" {
+	if first.Environment["OPENAI_BASE_URL"] != "http://subrouter:31415/backend-api/codex" {
 		t.Fatalf("OpenAI compatibility base URL = %q", first.Environment["OPENAI_BASE_URL"])
 	}
 	leaseToken := first.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"]
