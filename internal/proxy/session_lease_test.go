@@ -240,6 +240,312 @@ func TestClaudeAPIKeySessionLeaseUsesEphemeralTokenAtSandboxBoundary(t *testing.
 	}
 }
 
+func TestSessionLeaseValidatesForwardedModelInsteadOfRoutingHeaders(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if got := r.Header.Get("X-Subrouter-Model"); got != "" {
+			t.Errorf("routing header reached upstream: %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := Server{
+		CodexUpstream: mustParseURL(t, upstream.URL+"/backend-api/codex"),
+		Accounts: []accounts.Account{{
+			ID:        "oauth@example.com",
+			Provider:  accounts.ProviderCodex,
+			AuthMode:  accounts.AuthModeOAuth,
+			Token:     "oauth-access-secret",
+			AccountID: "chatgpt-account-1",
+		}},
+		Sessions:      newSessionStore(t),
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+	}.Handler()
+	lease, _ := issueSessionLease(t, handler, "codex", "openai/gpt-5.4")
+	leaseToken := lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"]
+
+	tests := []struct {
+		name   string
+		url    string
+		body   string
+		header string
+	}{
+		{
+			name:   "routing header hides conflicting body",
+			url:    "http://subrouter:31415/backend-api/codex/responses",
+			body:   `{"model":"gpt-5.4-mini","input":"attacker-selected"}`,
+			header: "gpt-5.4",
+		},
+		{
+			name:   "routing header hides missing body model",
+			url:    "http://subrouter:31415/backend-api/codex/responses",
+			body:   `{"input":"missing model"}`,
+			header: "gpt-5.4",
+		},
+		{
+			name:   "duplicate body model conflicts",
+			url:    "http://subrouter:31415/backend-api/codex/responses",
+			body:   `{"model":"gpt-5.4","model":"gpt-5.4-mini","input":"duplicate key"}`,
+			header: "gpt-5.4",
+		},
+		{
+			name:   "query model conflicts with body",
+			url:    "http://subrouter:31415/backend-api/codex/responses?model=gpt-5.4-mini",
+			body:   `{"model":"gpt-5.4","input":"query conflict"}`,
+			header: "gpt-5.4",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			before := upstreamCalls.Load()
+			req := httptest.NewRequest(http.MethodPost, test.url, strings.NewReader(test.body))
+			req.Header.Set("Authorization", "Bearer "+leaseToken)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Subrouter-Model", test.header)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body = %s", recorder.Code, recorder.Body.String())
+			}
+			if upstreamCalls.Load() != before {
+				t.Fatal("model-conflicting lease request reached upstream")
+			}
+		})
+	}
+
+	valid := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/backend-api/codex/responses", strings.NewReader(`{"model":"gpt-5.4","input":"valid"}`))
+	valid.Header.Set("Authorization", "Bearer "+leaseToken)
+	valid.Header.Set("Content-Type", "application/json")
+	validRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(validRecorder, valid)
+	if validRecorder.Code != http.StatusNoContent {
+		t.Fatalf("valid status = %d, want 204; body = %s", validRecorder.Code, validRecorder.Body.String())
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("valid upstream calls = %d, want 1", upstreamCalls.Load())
+	}
+}
+
+func TestCodexPiSessionLeaseSelectsOnlyOAuthAccounts(t *testing.T) {
+	apiKey := accounts.Account{
+		ID:       "apikey:openai",
+		Provider: accounts.ProviderCodex,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "sk-openai-secret",
+	}
+	oauth := accounts.Account{
+		ID:        "oauth@example.com",
+		Provider:  accounts.ProviderCodex,
+		AuthMode:  accounts.AuthModeOAuth,
+		Token:     "oauth-access-secret",
+		AccountID: "chatgpt-account-1",
+	}
+
+	t.Run("mixed pool selects OAuth", func(t *testing.T) {
+		handler := Server{
+			Accounts:      []accounts.Account{apiKey, oauth},
+			Sessions:      newSessionStore(t),
+			Scheduler:     selectacct.NewScheduler(nil),
+			sessionLeases: newSessionLeaseStore(),
+			AdminToken:    "service-admin-token",
+			MaxBodyBytes:  1024,
+		}.Handler()
+		lease, _ := issueSessionLease(t, handler, "codex", "openai/gpt-5.4")
+		if lease.Assignment.AccountID != oauth.ID || lease.Assignment.AuthMode != string(accounts.AuthModeOAuth) {
+			t.Fatalf("assignment = %+v, want OAuth account %q", lease.Assignment, oauth.ID)
+		}
+	})
+
+	t.Run("API key only pool is rejected without mutating session state", func(t *testing.T) {
+		leaseStore := newSessionLeaseStore()
+		sessionStore := newSessionStore(t)
+		handler := Server{
+			Accounts:      []accounts.Account{apiKey},
+			Sessions:      sessionStore,
+			Scheduler:     selectacct.NewScheduler(nil),
+			sessionLeases: leaseStore,
+			AdminToken:    "service-admin-token",
+			MaxBodyBytes:  1024,
+		}.Handler()
+		req := newSessionLeaseRequest(t, "codex", "openai/gpt-5.4")
+		req.RemoteAddr = "100.64.0.2:12345"
+		req.Header.Set("Authorization", "Bearer service-admin-token")
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", recorder.Code)
+		}
+		if len(leaseStore.byID) != 0 {
+			t.Fatal("rejected API-key lease was persisted")
+		}
+		if _, ok := sessionStore.Get("pi", "agent-session-1"); ok {
+			t.Fatal("rejected API-key lease changed the sticky session assignment")
+		}
+	})
+}
+
+func TestSessionLeaseDoesNotFailOverToDifferentClaudeAccount(t *testing.T) {
+	var assignedCalls atomic.Int32
+	var otherCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer assigned-token":
+			assignedCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
+		case "Bearer other-token":
+			otherCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"different-account-response"}`))
+		default:
+			http.Error(w, "unexpected credential", http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	sessionStore := newSessionStore(t)
+	handler := Server{
+		ClaudeUpstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{
+			{ID: "assigned@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "assigned-token"},
+			{ID: "other@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "other-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+	}.Handler()
+	lease, _ := issueSessionLease(t, handler, "claude", "anthropic/claude-sonnet-4-5")
+	if lease.Assignment.AccountID != "assigned@example.com" {
+		t.Fatalf("lease account = %q, want assigned@example.com", lease.Assignment.AccountID)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[]}`))
+	req.Header.Set("X-Api-Key", lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"])
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want assigned account's 429; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if assignedCalls.Load() != 1 || otherCalls.Load() != 0 {
+		t.Fatalf("upstream calls assigned=%d other=%d, want 1 and 0", assignedCalls.Load(), otherCalls.Load())
+	}
+	assignment, ok := sessionStore.Get("pi", lease.SessionKey)
+	if !ok || assignment.AccountID != "assigned@example.com" {
+		t.Fatalf("sticky assignment = %+v, want assigned account", assignment)
+	}
+}
+
+func TestSessionLeaseDoesNotUseClaudeFableBedrockPrimary(t *testing.T) {
+	var bedrockCalls atomic.Int32
+	var assignedCalls atomic.Int32
+	bedrockTransport := bedrockRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		bedrockCalls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"model":"claude-fable-5","content":[{"type":"text","text":"bedrock"}]}`)),
+		}, nil
+	})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		assignedCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"source":"assigned-account"}`))
+	}))
+	defer upstream.Close()
+
+	handler := Server{
+		ClaudeUpstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{{
+			ID:       "assigned@example.com",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "assigned-token",
+		}},
+		Sessions:            newSessionStore(t),
+		Scheduler:           selectacct.NewScheduler(nil),
+		sessionLeases:       newSessionLeaseStore(),
+		AdminToken:          "service-admin-token",
+		MaxBodyBytes:        1024,
+		FableBedrockPrimary: true,
+		Bedrock: &BedrockConfig{
+			Regions:     []string{"us-east-1"},
+			Credentials: staticBedrockCreds(),
+			Transport:   bedrockTransport,
+		},
+	}.Handler()
+	lease, _ := issueSessionLease(t, handler, "claude", "anthropic/claude-fable-5")
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/v1/messages", strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
+	req.Header.Set("X-Api-Key", lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"])
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "assigned-account") {
+		t.Fatalf("status = %d body = %s, want assigned account response", recorder.Code, recorder.Body.String())
+	}
+	if bedrockCalls.Load() != 0 || assignedCalls.Load() != 1 {
+		t.Fatalf("calls bedrock=%d assigned=%d, want 0 and 1", bedrockCalls.Load(), assignedCalls.Load())
+	}
+}
+
+func TestSessionLeaseDoesNotUseClaudeFallbackWhenAssignedAccountIsGone(t *testing.T) {
+	var fallbackCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") == "sk-ant-fable-fallback" {
+			fallbackCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"source":"fallback"}`))
+	}))
+	defer upstream.Close()
+
+	leaseStore := newSessionLeaseStore()
+	lease, err := leaseStore.put(sessionLease{
+		ScopeKey:       "gone-account-scope",
+		OrganizationID: "organization-1",
+		WorkspaceID:    "workspace-1",
+		ConversationID: "conversation-1",
+		InvocationID:   "invocation-1",
+		SessionKey:     "agent-session-1",
+		Agent:          "pi",
+		Provider:       accounts.ProviderClaude,
+		AccountID:      "removed@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          "claude-fable-5",
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream:    mustParseURL(t, upstream.URL),
+		Sessions:          newSessionStore(t),
+		Scheduler:         selectacct.NewScheduler(nil),
+		sessionLeases:     leaseStore,
+		MaxBodyBytes:      1024,
+		ClaudeFableAPIKey: "sk-ant-fable-fallback",
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/v1/messages", strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
+	req.Header.Set("X-Api-Key", lease.Token)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 from missing assigned account; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if fallbackCalls.Load() != 0 {
+		t.Fatalf("fallback calls = %d, want 0", fallbackCalls.Load())
+	}
+}
+
 func TestSessionLeaseExpiryRejectsBrokerToken(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	store := newSessionLeaseStore()
