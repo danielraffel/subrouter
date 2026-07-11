@@ -230,6 +230,22 @@ func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testi
 	}
 }
 
+func TestRequiredSessionLeaseAlsoClosesBedrockGateway(t *testing.T) {
+	handler := Server{
+		RequireSessionLease: true,
+		Bedrock: &BedrockConfig{
+			Regions:     []string{"us-east-1"},
+			Credentials: staticBedrockCreds(),
+		},
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/anthropic.claude/invoke", strings.NewReader(`{}`))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unleased Bedrock status = %d, want 401; body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 	tests := []struct {
 		name          string
