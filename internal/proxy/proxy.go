@@ -49,16 +49,17 @@ type Server struct {
 	ScoreAccounts  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
 	// RefreshAccountFn, when set, replaces the default OAuth refresh path. Test
 	// seam for simulating dead/expired refresh tokens; nil in production.
-	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
-	Transport        http.RoundTripper
-	Logger           *slog.Logger
-	ActiveSessions   *ActiveSessions
-	Lifecycle        *Lifecycle
-	AdminToken       string
-	sessionLeases    *sessionLeaseStore
-	MaxBodyBytes     int64
-	Transcripts      *transcript.Recorder
-	ReadCache        *readCache
+	RefreshAccountFn    func(context.Context, accounts.Account) (accounts.Account, error)
+	Transport           http.RoundTripper
+	Logger              *slog.Logger
+	ActiveSessions      *ActiveSessions
+	Lifecycle           *Lifecycle
+	AdminToken          string
+	RequireSessionLease bool
+	sessionLeases       *sessionLeaseStore
+	MaxBodyBytes        int64
+	Transcripts         *transcript.Recorder
+	ReadCache           *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic

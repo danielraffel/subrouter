@@ -191,6 +191,135 @@ func TestCodexOAuthSessionLeaseIsIdempotentAndBrokersWithoutCredentialDisclosure
 	}
 }
 
+func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := Server{
+		APIUpstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{{
+			ID:       "apikey:openai",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeAPIKey,
+			Token:    "underlying-secret",
+		}},
+		Sessions:            newSessionStore(t),
+		Scheduler:           selectacct.NewScheduler(nil),
+		MaxBodyBytes:        1024,
+		RequireSessionLease: true,
+	}.Handler()
+
+	for _, authorization := range []string{"", "Bearer subrouter", "Bearer malformed.lease.token"} {
+		req := httptest.NewRequest(http.MethodPost, "http://subrouter:31415/v1/responses", strings.NewReader(`{"model":"gpt-5.4"}`))
+		req.Header.Set("Content-Type", "application/json")
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("authorization %q status = %d, want 401; body = %s", authorization, recorder.Code, recorder.Body.String())
+		}
+	}
+	if upstreamCalls.Load() != 0 {
+		t.Fatalf("unleased requests reached upstream %d times", upstreamCalls.Load())
+	}
+}
+
+func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
+	tests := []struct {
+		name          string
+		provider      string
+		model         string
+		account       accounts.Account
+		configure     func(*Server, *url.URL)
+		wantAPI       string
+		adapterSuffix string
+		wantPath      string
+		useAPIKey     bool
+	}{
+		{
+			name:     "kimi anthropic messages",
+			provider: "kimi",
+			model:    "kimi-for-coding",
+			account: accounts.Account{
+				ID: "kimi:main", Provider: accounts.ProviderKimi,
+				AuthMode: accounts.AuthModeAPIKey, Token: "kimi-secret",
+			},
+			configure: func(server *Server, upstream *url.URL) {
+				server.KimiUpstream = upstream
+			},
+			wantAPI:       "anthropic-messages",
+			adapterSuffix: "/v1/messages",
+			wantPath:      "/coding/v1/messages",
+			useAPIKey:     true,
+		},
+		{
+			name:     "zai OpenAI completions",
+			provider: "zai",
+			model:    "glm-5.2",
+			account: accounts.Account{
+				ID: "zai:main", Provider: accounts.ProviderZAI,
+				AuthMode: accounts.AuthModeAPIKey, Token: "zai-secret",
+			},
+			configure: func(server *Server, upstream *url.URL) {
+				server.ZAIUpstream = upstream
+			},
+			wantAPI:       "openai-completions",
+			adapterSuffix: "/chat/completions",
+			wantPath:      "/api/coding/paas/v4/chat/completions",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != test.wantPath {
+					t.Fatalf("upstream path = %q, want %q", r.URL.Path, test.wantPath)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+			upstreamURL := mustParseURL(t, upstream.URL)
+			if test.provider == "kimi" {
+				upstreamURL.Path = "/coding/v1"
+			} else {
+				upstreamURL.Path = "/api/coding/paas/v4"
+			}
+			server := Server{
+				Accounts:      []accounts.Account{test.account},
+				Sessions:      newSessionStore(t),
+				Scheduler:     selectacct.NewScheduler(nil),
+				sessionLeases: newSessionLeaseStore(),
+				AdminToken:    "service-admin-token",
+				MaxBodyBytes:  1024,
+			}
+			test.configure(&server, upstreamURL)
+			handler := server.Handler()
+			lease, _ := issueSessionLease(t, handler, test.provider, test.model)
+			if lease.Pi.API != test.wantAPI {
+				t.Fatalf("Pi API = %q, want %q", lease.Pi.API, test.wantAPI)
+			}
+			req := httptest.NewRequest(http.MethodPost, strings.TrimRight(lease.Pi.BaseURL, "/")+test.adapterSuffix, strings.NewReader(`{"model":"`+test.model+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			if test.useAPIKey {
+				req.Header.Set("X-Api-Key", lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"])
+			} else {
+				req.Header.Set("Authorization", "Bearer "+lease.Environment["CLOUDMUX_SUBROUTER_LEASE_TOKEN"])
+			}
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusNoContent {
+				t.Fatalf("proxy status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestClaudeAPIKeySessionLeaseUsesEphemeralTokenAtSandboxBoundary(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Api-Key"); got != "sk-ant-underlying-secret" {
