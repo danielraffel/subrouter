@@ -622,6 +622,28 @@ func TestSessionLeaseDoesNotUseClaudeFableBedrockPrimary(t *testing.T) {
 	}
 }
 
+func TestClaudeFableLeaseCanBindDirectlyToAPIKeyPoolAccount(t *testing.T) {
+	handler := Server{
+		Accounts: []accounts.Account{{
+			ID:       "claude:pool-api-key",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeAPIKey,
+			Token:    "sk-ant-pool-account",
+		}},
+		Sessions:          newSessionStore(t),
+		Scheduler:         selectacct.NewScheduler(nil),
+		sessionLeases:     newSessionLeaseStore(),
+		AdminToken:        "service-admin-token",
+		MaxBodyBytes:      1024,
+		ClaudeFableAPIKey: "sk-ant-ordinary-fallback",
+	}.Handler()
+
+	lease, _ := issueSessionLease(t, handler, "claude", "anthropic/claude-fable-5")
+	if lease.Assignment.AccountID != "claude:pool-api-key" || lease.Assignment.AuthMode != string(accounts.AuthModeAPIKey) {
+		t.Fatalf("assignment = %+v, want direct API-key pool account", lease.Assignment)
+	}
+}
+
 func TestSessionLeaseDoesNotUseClaudeFallbackWhenAssignedAccountIsGone(t *testing.T) {
 	var fallbackCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
