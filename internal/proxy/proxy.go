@@ -1686,29 +1686,6 @@ func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if baseURLProbeRequest(r) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		// Serve from cache for heavy read-only polling endpoints (e.g. plugins/installed).
-		// Check before account selection so constrained accounts aren't hammered by polls.
-		if r.Method == http.MethodGet {
-			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
-				if entry, ok := s.ReadCache.get(r.URL.Path); ok {
-					for k, vs := range entry.headers {
-						for _, v := range vs {
-							w.Header().Add(k, v)
-						}
-					}
-					w.Header().Set("X-Subrouter-Cache", "HIT")
-					w.WriteHeader(entry.statusCode)
-					_, _ = w.Write(entry.body)
-					return
-				}
-			}
-		}
-
 		agentType := session.ExtractAgentType(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
@@ -1739,6 +1716,29 @@ func (s Server) proxyHandler() http.Handler {
 		} else if s.RequireSessionLease {
 			http.Error(w, "session lease required", http.StatusUnauthorized)
 			return
+		}
+
+		if baseURLProbeRequest(r) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// Serve from cache for heavy read-only polling endpoints (e.g. plugins/installed).
+		// Check before account selection so constrained accounts aren't hammered by polls.
+		if r.Method == http.MethodGet {
+			if cacheTTL := cacheablePath(r.URL.Path); cacheTTL > 0 {
+				if entry, ok := s.ReadCache.get(r.URL.Path); ok {
+					for k, vs := range entry.headers {
+						for _, v := range vs {
+							w.Header().Add(k, v)
+						}
+					}
+					w.Header().Set("X-Subrouter-Cache", "HIT")
+					w.WriteHeader(entry.statusCode)
+					_, _ = w.Write(entry.body)
+					return
+				}
+			}
 		}
 		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
 			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
