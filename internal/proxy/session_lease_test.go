@@ -199,6 +199,14 @@ func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testi
 	}))
 	defer upstream.Close()
 
+	cache := newReadCache()
+	cache.set(
+		"/backend-api/ps/plugins/installed",
+		http.StatusOK,
+		http.Header{"Content-Type": []string{"application/json"}},
+		[]byte(`{"cached":true}`),
+		time.Minute,
+	)
 	handler := Server{
 		APIUpstream: mustParseURL(t, upstream.URL),
 		Accounts: []accounts.Account{{
@@ -210,6 +218,7 @@ func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testi
 		Sessions:            newSessionStore(t),
 		Scheduler:           selectacct.NewScheduler(nil),
 		MaxBodyBytes:        1024,
+		ReadCache:           cache,
 		RequireSessionLease: true,
 	}.Handler()
 
@@ -227,6 +236,16 @@ func TestRequiredSessionLeaseRejectsMissingOrUnrecognizableCapabilities(t *testi
 	}
 	if upstreamCalls.Load() != 0 {
 		t.Fatalf("unleased requests reached upstream %d times", upstreamCalls.Load())
+	}
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodHead, "/", nil),
+		httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/installed", nil),
+	} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("unleased %s %s status = %d, want 401", request.Method, request.URL.Path, recorder.Code)
+		}
 	}
 }
 
