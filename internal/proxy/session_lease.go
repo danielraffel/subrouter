@@ -522,7 +522,7 @@ func (lease sessionLease) allowsRequest(r *http.Request) bool {
 	case accounts.ProviderKimi:
 		return r.URL.Path == "/kimi/v1/messages"
 	case accounts.ProviderZAI:
-		return r.URL.Path == "/zai/v1/messages"
+		return r.URL.Path == "/zai/chat/completions"
 	default:
 		return false
 	}
@@ -882,14 +882,14 @@ func sessionLeaseResponseFor(lease sessionLease) sessionLeaseResponse {
 		baseURL += "/kimi"
 		piBaseURL += "/kimi"
 	case accounts.ProviderZAI:
-		api = "anthropic-messages"
+		api = "openai-completions"
 		baseURL += "/zai"
 		piBaseURL += "/zai"
 	}
 	environment := map[string]string{
 		"CLOUDMUX_SUBROUTER_LEASE_TOKEN": lease.Token,
 	}
-	if lease.Provider == accounts.ProviderCodex {
+	if lease.Provider == accounts.ProviderCodex || lease.Provider == accounts.ProviderZAI {
 		environment["OPENAI_API_KEY"] = lease.Token
 		environment["OPENAI_BASE_URL"] = baseURL
 	} else {

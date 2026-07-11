@@ -36,6 +36,11 @@ the selected account credential before forwarding. Provider credentials never
 cross the Subrouter boundary. A lease can call only its provider's model
 endpoint and, when assigned, its exact model.
 
+Cloudmux deployments run Subrouter with `--require-session-leases`. In this
+mode every proxy request must resolve an exact capability from the in-memory
+lease store. Omitting a token or changing its public token shape cannot fall
+through to normal account routing.
+
 Codex Pi leases select only OAuth subscription accounts because Pi's
 `openai-codex-responses` adapter and `/backend-api` route are ChatGPT-specific.
 If no Codex OAuth account is available, lease creation returns `503` without

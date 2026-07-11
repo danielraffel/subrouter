@@ -1736,6 +1736,9 @@ func (s Server) proxyHandler() http.Handler {
 			if lease.Model != "" {
 				r.Header.Set("X-Subrouter-Model", lease.Model)
 			}
+		} else if s.RequireSessionLease {
+			http.Error(w, "session lease required", http.StatusUnauthorized)
+			return
 		}
 		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
 			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
@@ -2645,7 +2648,14 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 		return path
 	}
 	if account.Provider == accounts.ProviderKimi {
-		return stripProviderPathPrefix(path, "kimi")
+		path = stripProviderPathPrefix(path, "kimi")
+		if path == "/v1" {
+			return "/"
+		}
+		if strings.HasPrefix(path, "/v1/") {
+			return strings.TrimPrefix(path, "/v1")
+		}
+		return path
 	}
 	if account.Provider == accounts.ProviderZAI {
 		return stripProviderPathPrefix(path, "zai")
