@@ -870,7 +870,7 @@ func sessionLeaseResponseFor(lease sessionLease) sessionLeaseResponse {
 	api := "openai-codex-responses"
 	switch lease.Provider {
 	case accounts.ProviderCodex:
-		baseURL += "/v1"
+		baseURL += "/backend-api/codex"
 		// Pi's openai-codex-responses adapter appends /codex/responses.
 		// Point it at the ChatGPT-compatible prefix instead of the generic
 		// OpenAI-compatible /v1 prefix.

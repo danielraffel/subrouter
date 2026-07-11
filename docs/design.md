@@ -28,8 +28,8 @@ environment, safe assignment metadata, and a `pi` block describing the
 isolated `models.json` provider. The actor must keep the environment in memory,
 set the named API-key environment variable, and select the returned Pi model.
 For Codex, `pi.baseUrl` is `<proxyBaseUrl>/backend-api` because Pi appends
-`/codex/responses`; `OPENAI_BASE_URL` remains `<proxyBaseUrl>/v1` for generic
-OpenAI-compatible clients.
+`/codex/responses`; `OPENAI_BASE_URL` is
+`<proxyBaseUrl>/backend-api/codex` for generic Responses clients.
 The broker token works as a normal bearer token for OpenAI-compatible requests
 or `X-Api-Key` for Anthropic-compatible requests. Subrouter replaces it with
 the selected account credential before forwarding. Provider credentials never

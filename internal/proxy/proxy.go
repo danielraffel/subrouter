@@ -2649,11 +2649,17 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 	}
 	if account.Provider == accounts.ProviderKimi {
 		path = stripProviderPathPrefix(path, "kimi")
-		if path == "/v1" {
-			return "/"
+		upstreamPath := ""
+		if s.KimiUpstream != nil {
+			upstreamPath = strings.TrimRight(s.KimiUpstream.Path, "/")
 		}
-		if strings.HasPrefix(path, "/v1/") {
-			return strings.TrimPrefix(path, "/v1")
+		if strings.HasSuffix(upstreamPath, "/v1") {
+			if path == "/v1" {
+				return "/"
+			}
+			if strings.HasPrefix(path, "/v1/") {
+				return strings.TrimPrefix(path, "/v1")
+			}
 		}
 		return path
 	}
