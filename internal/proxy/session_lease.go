@@ -420,8 +420,9 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		request.AgentSessionID,
 		r,
 		accountSelectionOptions{
-			ignoreForcedAccount: true,
-			oauthOnly:           provider == accounts.ProviderCodex,
+			allowFableAPIKeyPool: true,
+			ignoreForcedAccount:  true,
+			oauthOnly:            provider == accounts.ProviderCodex,
 		},
 	)
 	if err != nil {

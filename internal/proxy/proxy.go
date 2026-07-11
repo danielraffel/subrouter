@@ -2713,8 +2713,9 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 }
 
 type accountSelectionOptions struct {
-	ignoreForcedAccount bool
-	oauthOnly           bool
+	allowFableAPIKeyPool bool
+	ignoreForcedAccount  bool
+	oauthOnly            bool
 }
 
 func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, error) {
@@ -2745,7 +2746,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
-	if provider == accounts.ProviderClaude && s.claudeFableEnabled() && claudeFableModel(model) {
+	if provider == accounts.ProviderClaude && !options.allowFableAPIKeyPool && s.claudeFableEnabled() && claudeFableModel(model) {
 		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
 		// metered API-key pool accounts never preempt the Bedrock stage. With no
 		// OAuth account usable, selection fails and the handler serves the
