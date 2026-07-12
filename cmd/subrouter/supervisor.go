@@ -173,11 +173,24 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 	}
 	go func() { generation.setWaitError(command.Wait()) }()
 	if err := waitForWorkerReady(generation, config.ReadyTimeout); err != nil {
-		_ = command.Process.Signal(syscall.SIGTERM)
+		terminateWorker(generation, time.Second)
 		return nil, err
 	}
 	slog.Info("subrouter worker ready", "generation", generation.id, "pid", command.Process.Pid, "addr", address)
 	return generation, nil
+}
+
+func terminateWorker(worker *workerGeneration, gracePeriod time.Duration) {
+	_ = worker.command.Process.Signal(syscall.SIGTERM)
+	timer := time.NewTimer(gracePeriod)
+	defer timer.Stop()
+	select {
+	case <-worker.done:
+		return
+	case <-timer.C:
+	}
+	_ = worker.command.Process.Kill()
+	<-worker.done
 }
 
 func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) error {
@@ -295,15 +308,12 @@ func (s *supervisor) upgradeLocked() error {
 
 func (s *supervisor) monitorWorker(worker *workerGeneration) {
 	err := worker.waitError()
-	if s.router.Active().ID != worker.id {
-		return
-	}
-	slog.Error("active subrouter worker exited", "generation", worker.id, "pid", worker.command.Process.Pid, "error", err)
 	s.upgradeMu.Lock()
 	defer s.upgradeMu.Unlock()
 	if s.router.Active().ID != worker.id {
 		return
 	}
+	slog.Error("active subrouter worker exited", "generation", worker.id, "pid", worker.command.Process.Pid, "error", err)
 	if replaceErr := s.upgradeLocked(); replaceErr != nil {
 		slog.Error("subrouter worker recovery failed", "generation", worker.id, "error", replaceErr)
 	}

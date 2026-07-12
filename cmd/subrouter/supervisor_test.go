@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"os/signal"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -96,5 +100,41 @@ func TestInheritedListenerFromEnv(t *testing.T) {
 	_ = file.Close()
 	if value := os.Getenv(inheritedListenerFDEnv); value != "" {
 		t.Fatalf("%s was not cleared", inheritedListenerFDEnv)
+	}
+}
+
+func TestTerminateWorkerKillsAfterGracePeriod(t *testing.T) {
+	if os.Getenv("SUBROUTER_TEST_IGNORE_TERM") == "1" {
+		signal.Ignore(syscall.SIGTERM)
+		fmt.Println("ready")
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=TestTerminateWorkerKillsAfterGracePeriod")
+	command.Env = append(os.Environ(), "SUBROUTER_TEST_IGNORE_TERM=1")
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stderr = os.Stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+		}
+	})
+	worker := &workerGeneration{command: command, done: make(chan struct{})}
+	go func() { worker.setWaitError(command.Wait()) }()
+	if !bufio.NewScanner(stdout).Scan() {
+		t.Fatal("worker helper did not become ready")
+	}
+
+	terminateWorker(worker, 10*time.Millisecond)
+	if command.ProcessState == nil || command.ProcessState.Success() {
+		t.Fatalf("worker was not killed after grace period: %v", command.ProcessState)
 	}
 }

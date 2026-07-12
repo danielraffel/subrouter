@@ -143,12 +143,12 @@ func (r *Router) Serve(listener net.Listener) error {
 		if err != nil {
 			return err
 		}
-		go r.serveConnection(client)
+		state := r.acquireActive()
+		go r.serveConnection(client, state)
 	}
 }
 
-func (r *Router) serveConnection(client net.Conn) {
-	state := r.acquireActive()
+func (r *Router) serveConnection(client net.Conn, state *backendState) {
 	defer r.release(state)
 	defer client.Close()
 

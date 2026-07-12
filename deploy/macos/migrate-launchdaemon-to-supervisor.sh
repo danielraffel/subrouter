@@ -26,7 +26,7 @@ fi
 }
 
 prepared="${PLIST}.supervised"
-PLIST="$PLIST" PREPARED="$prepared" WORKER_BIN="$WORKER_BIN" \
+public_addr="$(PLIST="$PLIST" PREPARED="$prepared" WORKER_BIN="$WORKER_BIN" \
 SUPERVISOR_BIN="$SUPERVISOR_BIN" CONTROL_ADDR="$CONTROL_ADDR" python3 <<'PY'
 import os
 import plistlib
@@ -82,7 +82,9 @@ with open(temporary, "wb") as stream:
     plistlib.dump(plist, stream, fmt=plistlib.FMT_XML, sort_keys=False)
 os.chmod(temporary, 0o644)
 os.replace(temporary, destination)
+print(public_addr)
 PY
+)"
 
 plutil -lint "$prepared"
 echo "Prepared $prepared"
@@ -99,7 +101,7 @@ launchctl bootstrap system "$PLIST"
 
 i=0
 until curl -fsS "http://${CONTROL_ADDR}/_subrouter/supervisor-status" >/dev/null 2>&1 \
-  && curl -fsS "http://127.0.0.1:31415/_subrouter/health" >/dev/null 2>&1; do
+  && curl -fsS "http://${public_addr}/_subrouter/health" >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "$i" -ge 60 ]; then
     echo "supervised service failed health checks; restore $backup" >&2
