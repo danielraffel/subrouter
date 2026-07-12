@@ -1717,13 +1717,15 @@ func (s Server) proxyHandler() http.Handler {
 		// or cannot start (no usable OAuth account). Other Claude models use the
 		// normal pool unchanged.
 		requestPoolModel := ""
+		retryPoolModel := ""
 		if requestProvider == accounts.ProviderCodex {
-			requestPoolModel = session.ExtractModel(r, s.MaxBodyBytes)
+			retryPoolModel = session.ExtractModel(r, s.MaxBodyBytes)
 		}
 		fableFallbackConfigured := false
 		if requestProvider == accounts.ProviderClaude {
 			requestModel := session.ExtractModel(r, s.MaxBodyBytes)
 			requestPoolModel = claudePoolModel(requestModel)
+			retryPoolModel = requestPoolModel
 			fableFallbackConfigured = s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
@@ -1844,7 +1846,7 @@ func (s Server) proxyHandler() http.Handler {
 				path:          proxyRequest.URL.Path,
 				upstream:      upstream.Host,
 				maxAttempts:   s.usageLimitRetryMaxAttempts(requestProvider),
-				poolModel:     requestPoolModel,
+				poolModel:     retryPoolModel,
 				fableFallback: fableFallback,
 			}
 		}
