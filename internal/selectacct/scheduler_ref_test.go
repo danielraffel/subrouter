@@ -285,6 +285,38 @@ func TestPoolScopedRefreshWithoutPoolEvidenceKeepsExpiry(t *testing.T) {
 	}
 }
 
+func TestModelIncompatibilitySurvivesHealthyPoolRefresh(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.MarkModelIncompatibleUntil(accounts.ProviderCodex, "incompatible@example.com", model, time.Now().Add(time.Hour))
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID:     "incompatible@example.com",
+		Provider:      accounts.ProviderCodex,
+		Headroom:      0.8,
+		ShortHeadroom: 0.8,
+		Fresh:         true,
+		ModelScores: map[string]Score{
+			model: {
+				AccountID:     "incompatible@example.com",
+				Provider:      accounts.ProviderCodex,
+				Headroom:      0.8,
+				ShortHeadroom: 0.8,
+				Fresh:         true,
+			},
+		},
+	}}), true)
+
+	if _, ok := ref.ModelIncompatibleUntilFor(accounts.ProviderCodex, "incompatible@example.com", model); !ok {
+		t.Fatal("quota refresh must not clear account/model incompatibility")
+	}
+	if !ref.Get().ForModel(model).Exhausted(accounts.ProviderCodex, "incompatible@example.com") {
+		t.Fatal("incompatible account must remain excluded for the rejected model")
+	}
+	if ref.Get().Exhausted(accounts.ProviderCodex, "incompatible@example.com") {
+		t.Fatal("model incompatibility must not exhaust the base account score")
+	}
+}
+
 func TestPoolScopedRetainLeavesOtherPoolMark(t *testing.T) {
 	const (
 		fable = "claudefable"
