@@ -3236,6 +3236,35 @@ func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *te
 	}
 }
 
+func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID:     "incompatible@example.com",
+		Provider:      accounts.ProviderCodex,
+		Headroom:      0.8,
+		ShortHeadroom: 0.8,
+	}}))
+	server := Server{SchedulerRef: schedulerRef}
+	response := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)),
+	}
+	server.captureResponseBody(response, "codex", "session-1", "incompatible@example.com", accounts.ProviderCodex, "", "gpt-5.6-sol", "/v1/responses")
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, modelMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !modelMarked {
+		t.Fatal("passive compatibility inspection must mark the rejected model")
+	}
+	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
+		t.Fatal("passive compatibility inspection must not mark the whole account")
+	}
+}
+
 func TestHandlerMarksWebSocketModelCompatibilityAndReroutesReconnect(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	var auths []string
