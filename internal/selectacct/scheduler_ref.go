@@ -90,7 +90,10 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
 // refresh, by evidence class:
-//   - Score shows headroom (or is gone): the mark is superseded; drop the expiry.
+//   - A pool-scoped mark has no matching refreshed pool score: keep the expiry;
+//     the refresh has no evidence about that pool.
+//   - A matching score shows headroom (or the account is gone): the mark is
+//     superseded; drop the expiry.
 //   - Carried-forward zero (the account's own usage fetch failed, seed dragged
 //     along, Fresh=false): keep the existing expiry. Clearing it would make the
 //     request-time mark permanent again, recreating the stranded-recovered-
@@ -111,9 +114,11 @@ func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
 		}
 		score, ok := r.scheduler.scores[scoreKey]
 		if ok && poolKey != "" {
-			if modelScore, modelOK := score.ModelScores[poolKey]; modelOK {
-				score = modelScore
+			modelScore, modelOK := score.ModelScores[poolKey]
+			if !modelOK {
+				continue
 			}
+			score = modelScore
 		}
 		switch {
 		case !ok || !score.exhausted():
