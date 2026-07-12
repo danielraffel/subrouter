@@ -2016,36 +2016,69 @@ func cloneWebSocketResponseHeaders(headers http.Header) http.Header {
 }
 
 type webSocketModelState struct {
-	mu    sync.RWMutex
-	model string
+	mu      sync.RWMutex
+	model   string
+	pending []string
 }
 
 func (s *webSocketModelState) observe(body []byte) {
-	model := codexWebSocketRequestModel(body)
-	if model == "" {
+	model, ok := codexWebSocketRequestModelEvent(body)
+	if !ok {
 		return
 	}
 	s.mu.Lock()
-	s.model = model
+	if model == "" {
+		model = s.model
+	}
+	s.pending = append(s.pending, model)
 	s.mu.Unlock()
 }
 
 func (s *webSocketModelState) current() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if len(s.pending) > 0 {
+		return s.pending[0]
+	}
 	return s.model
 }
 
+func (s *webSocketModelState) complete() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) > 0 {
+		s.pending = s.pending[1:]
+	}
+}
+
 func codexWebSocketRequestModel(body []byte) string {
+	model, _ := codexWebSocketRequestModelEvent(body)
+	return model
+}
+
+func codexWebSocketRequestModelEvent(body []byte) (string, bool) {
 	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil || !strings.EqualFold(stringField(event, "type"), "response.create") {
-		return ""
+		return "", false
 	}
 	if model := session.NormalizeModel(stringField(event, "model")); model != "" {
-		return model
+		return model, true
 	}
 	response, _ := event["response"].(map[string]any)
-	return session.NormalizeModel(stringField(response, "model"))
+	return session.NormalizeModel(stringField(response, "model")), true
+}
+
+func codexWebSocketResponseFinished(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	switch strings.ToLower(stringField(event, "type")) {
+	case "error", "response.completed", "response.failed", "response.incomplete":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn) {
@@ -2071,6 +2104,9 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel
 				if model := modelState.current(); model != "" {
 					s.markAccountExhausted(provider, accountID, model)
 				}
+			}
+			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
+				modelState.complete()
 			}
 		}
 		if err := dst.WriteMessage(messageType, body); err != nil {
