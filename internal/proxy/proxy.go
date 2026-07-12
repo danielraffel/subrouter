@@ -1779,7 +1779,7 @@ func (s Server) proxyHandler() http.Handler {
 			return
 		}
 		if websocket.IsWebSocketUpgrade(r) {
-			s.proxyWebSocket(w, r, account, sessionAgentType, sessionID, userEmail, requestPoolModel, upstream)
+			s.proxyWebSocket(w, r, account, sessionAgentType, sessionID, userEmail, requestPoolModel, retryPoolModel, upstream)
 			return
 		}
 		proxyRequest := r.Clone(r.Context())
@@ -1928,7 +1928,7 @@ func baseURLProbeRequest(r *http.Request) bool {
 	return r.Method == http.MethodHead && (r.URL.Path == "" || r.URL.Path == "/")
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail, poolModel string, upstream *url.URL) {
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL) {
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
 	upstreamURL.Host = upstream.Host
@@ -1970,16 +1970,17 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	}
 	defer clientConn.Close()
 
+	modelState := &webSocketModelState{model: compatibilityModel}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, "client_to_upstream", clientConn, upstreamConn)
+		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn)
 		_ = upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, "upstream_to_client", upstreamConn, clientConn)
+		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -2014,7 +2015,41 @@ func cloneWebSocketResponseHeaders(headers http.Header) http.Header {
 	return out
 }
 
-func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel, direction string, src, dst *websocket.Conn) {
+type webSocketModelState struct {
+	mu    sync.RWMutex
+	model string
+}
+
+func (s *webSocketModelState) observe(body []byte) {
+	model := codexWebSocketRequestModel(body)
+	if model == "" {
+		return
+	}
+	s.mu.Lock()
+	s.model = model
+	s.mu.Unlock()
+}
+
+func (s *webSocketModelState) current() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.model
+}
+
+func codexWebSocketRequestModel(body []byte) string {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil || !strings.EqualFold(stringField(event, "type"), "response.create") {
+		return ""
+	}
+	if model := session.NormalizeModel(stringField(event, "model")); model != "" {
+		return model
+	}
+	response, _ := event["response"].(map[string]any)
+	return session.NormalizeModel(stringField(response, "model"))
+}
+
+func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn) {
+	provider := providerForRequest(agentType, "")
 	for {
 		messageType, body, err := src.ReadMessage()
 		if err != nil {
@@ -2025,8 +2060,18 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel
 				"opcode": websocketMessageType(messageType),
 			})
 		}
-		if direction == "upstream_to_client" && messageType == websocket.TextMessage && usageLimitJSON(body) {
-			s.markAccountExhausted(providerForRequest(agentType, ""), accountID, poolModel)
+		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
+			modelState.observe(body)
+		}
+		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
+			switch {
+			case usageLimitJSON(body):
+				s.markAccountExhausted(provider, accountID, poolModel)
+			case provider == accounts.ProviderCodex && codexChatGPTModelUnsupportedJSON(body):
+				if model := modelState.current(); model != "" {
+					s.markAccountExhausted(provider, accountID, model)
+				}
+			}
 		}
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
