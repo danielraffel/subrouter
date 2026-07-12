@@ -3374,6 +3374,19 @@ func TestCodexWebSocketRequestModel(t *testing.T) {
 	}
 }
 
+func TestCodexWebSocketResponseFinished(t *testing.T) {
+	for _, eventType := range []string{"response.completed", "response.failed", "response.incomplete", "response.done", "error"} {
+		t.Run(eventType, func(t *testing.T) {
+			if !codexWebSocketResponseFinished([]byte(`{"type":"` + eventType + `"}`)) {
+				t.Fatalf("%s should finish the current WebSocket response", eventType)
+			}
+		})
+	}
+	if codexWebSocketResponseFinished([]byte(`{"type":"response.output_text.delta"}`)) {
+		t.Fatal("streaming delta must not finish the current WebSocket response")
+	}
+}
+
 func TestWebSocketModelStateTracksSequentialResponses(t *testing.T) {
 	state := &webSocketModelState{model: "default-model"}
 	state.observe([]byte(`{"type":"response.create","model":"model-a"}`))
