@@ -3071,6 +3071,7 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 		t.Fatal(err)
 	}
 	req.Header.Set("X-Subrouter-Session", "session-1")
+	req.Header.Set("Content-Type", "application/json")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -3095,10 +3096,12 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 	if assignment.AccountID != "compatible@example.com" {
 		t.Fatalf("AccountID = %q, want compatible@example.com", assignment.AccountID)
 	}
-	if _, ok := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !ok {
-		t.Fatal("missing model-scoped incompatibility mark")
+	_, modelMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol")
+	_, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "")
+	if !modelMarked {
+		t.Fatalf("missing model-scoped incompatibility mark (account_marked=%t)", accountMarked)
 	}
-	if _, ok := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); ok {
+	if accountMarked {
 		t.Fatal("model incompatibility must not mark the whole account exhausted")
 	}
 }

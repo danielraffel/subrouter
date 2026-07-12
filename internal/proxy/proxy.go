@@ -1717,6 +1717,9 @@ func (s Server) proxyHandler() http.Handler {
 		// or cannot start (no usable OAuth account). Other Claude models use the
 		// normal pool unchanged.
 		requestPoolModel := ""
+		if requestProvider == accounts.ProviderCodex {
+			requestPoolModel = session.ExtractModel(r, s.MaxBodyBytes)
+		}
 		fableFallbackConfigured := false
 		if requestProvider == accounts.ProviderClaude {
 			requestModel := session.ExtractModel(r, s.MaxBodyBytes)
@@ -2142,6 +2145,29 @@ func usageLimitMessage(value string) bool {
 	lower := strings.ToLower(value)
 	return strings.Contains(lower, "usage limit") &&
 		(strings.Contains(lower, "reached") || strings.Contains(lower, "hit") || strings.Contains(lower, "exceeded"))
+}
+
+func codexChatGPTModelUnsupportedJSON(body []byte) bool {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return false
+	}
+	return codexChatGPTModelUnsupportedMap(event)
+}
+
+func codexChatGPTModelUnsupportedMap(event map[string]any) bool {
+	message := strings.ToLower(stringField(event, "message"))
+	if strings.Contains(message, "model is not supported when using codex with a chatgpt account") ||
+		(strings.Contains(message, "model") &&
+			strings.Contains(message, "not supported") &&
+			strings.Contains(message, "codex") &&
+			strings.Contains(message, "chatgpt account")) {
+		return true
+	}
+	if nested, ok := event["error"].(map[string]any); ok {
+		return codexChatGPTModelUnsupportedMap(nested)
+	}
+	return false
 }
 
 func stringField(values map[string]any, key string) string {
@@ -3463,10 +3489,27 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			return response, nil
 		}
-		if !usageLimited {
+		modelUnsupported := false
+		if !usageLimited && t.provider == accounts.ProviderCodex {
+			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+			if inspectErr != nil {
+				if t.logger != nil {
+					t.logger.Warn("codex model compatibility response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+				}
+				return response, nil
+			}
+		}
+		if !usageLimited && !modelUnsupported {
 			return response, nil
 		}
 		exhausted := true
+		exhaustionPool := selectacct.ModelKey(t.poolModel)
+		if t.provider == accounts.ProviderCodex && usageLimited {
+			// Codex usage_limit_reached exhausts the subscription account, not
+			// only the model named by this request. Model compatibility errors
+			// below remain scoped to the rejected model.
+			exhaustionPool = ""
+		}
 		if t.provider == accounts.ProviderClaude {
 			// Surface the genuine upstream rate-limit signal. The active retry
 			// path consumes this 429 before the passive ModifyResponse capture
@@ -3481,7 +3524,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers (codex responses lack these headers and fall back
 			// to the default TTL inside claudeExhaustionExpiry).
-			t.server.markAccountExhaustedFromResponse(t.provider, accountID, selectacct.ModelKey(t.poolModel), response.StatusCode, response.Header)
+			t.server.markAccountExhaustedFromResponse(t.provider, accountID, exhaustionPool, response.StatusCode, response.Header)
 		}
 		if attempt == maxAttempts || t.server == nil {
 			reason := "max_attempts"
@@ -3760,6 +3803,34 @@ func responseUsageLimit(response *http.Response) (bool, error) {
 		return false, closeErr
 	}
 	return usageLimitJSON(prefix), nil
+}
+
+func responseCodexChatGPTModelUnsupported(response *http.Response) (bool, error) {
+	if response == nil || response.Body == nil || response.StatusCode != http.StatusBadRequest {
+		return false, nil
+	}
+	body := response.Body
+	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
+	if err != nil {
+		response.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(prefix), body),
+			Closer: body,
+		}
+		return false, err
+	}
+	if int64(len(prefix)) > usageLimitInspectMaxBytes {
+		response.Body = prefixReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(prefix), body),
+			Closer: body,
+		}
+		return false, nil
+	}
+	closeErr := body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(prefix))
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return codexChatGPTModelUnsupportedJSON(prefix), nil
 }
 
 func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
