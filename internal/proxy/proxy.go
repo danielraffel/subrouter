@@ -2074,7 +2074,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 		return false
 	}
 	switch strings.ToLower(stringField(event, "type")) {
-	case "error", "response.completed", "response.failed", "response.incomplete":
+	case "error", "response.completed", "response.failed", "response.incomplete", "response.done":
 		return true
 	default:
 		return false
