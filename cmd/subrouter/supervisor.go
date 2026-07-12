@@ -68,6 +68,7 @@ type supervisor struct {
 	fatal  chan error
 
 	upgradeMu sync.Mutex
+	stopping  bool
 	workersMu sync.Mutex
 	workers   map[string]*workerGeneration
 }
@@ -284,9 +285,10 @@ func (s *supervisor) run() error {
 	}
 	defer os.Remove(s.config.ControlSocket)
 	controlServer := &http.Server{Handler: s.controlHandler(), ReadHeaderTimeout: 5 * time.Second}
-	errCh := make(chan error, 2)
-	go func() { errCh <- s.router.Serve(listener) }()
-	go func() { errCh <- controlServer.Serve(controlListener) }()
+	routerErrCh := make(chan error, 1)
+	controlErrCh := make(chan error, 1)
+	go func() { routerErrCh <- s.router.Serve(listener) }()
+	go func() { controlErrCh <- controlServer.Serve(controlListener) }()
 
 	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_socket", s.config.ControlSocket, "worker", s.router.Active().ID)
 	sigCh := make(chan os.Signal, 2)
@@ -298,12 +300,19 @@ func (s *supervisor) run() error {
 		case err := <-s.fatal:
 			_ = listener.Close()
 			_ = controlServer.Close()
+			s.beginShutdown()
+			<-routerErrCh
 			s.stopAllWorkers()
 			return err
-		case err := <-errCh:
+		case err := <-routerErrCh:
+			if !errors.Is(err, net.ErrClosed) {
+				_ = controlServer.Close()
+				s.stopAllWorkers()
+				return err
+			}
+		case err := <-controlErrCh:
 			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 				_ = listener.Close()
-				_ = controlServer.Close()
 				s.stopAllWorkers()
 				return err
 			}
@@ -318,6 +327,10 @@ func (s *supervisor) run() error {
 			}
 			_ = listener.Close()
 			_ = controlServer.Close()
+			s.beginShutdown()
+			// Join the accept loop before checking connection counts. Accept and
+			// acquireActive are synchronous, so no connection can appear afterward.
+			<-routerErrCh
 			drainCtx, cancel := context.WithTimeout(context.Background(), s.config.DrainTimeout)
 			if err := s.router.WaitAllIdle(drainCtx); err != nil {
 				slog.Warn("subrouter supervisor drain timed out", "timeout", s.config.DrainTimeout, "error", err)
@@ -327,6 +340,12 @@ func (s *supervisor) run() error {
 			return nil
 		}
 	}
+}
+
+func (s *supervisor) beginShutdown() {
+	s.upgradeMu.Lock()
+	s.stopping = true
+	s.upgradeMu.Unlock()
 }
 
 func prepareControlSocket(path string) error {
@@ -353,6 +372,9 @@ func (s *supervisor) upgrade() error {
 }
 
 func (s *supervisor) upgradeLocked() error {
+	if s.stopping {
+		return errors.New("supervisor is shutting down")
+	}
 	next, err := startWorkerGeneration(s.config)
 	if err != nil {
 		return err

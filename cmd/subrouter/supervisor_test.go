@@ -91,6 +91,14 @@ func TestMonitorWorkerReportsFatalWhenRecoveryFails(t *testing.T) {
 	}
 }
 
+func TestUpgradeRejectedAfterShutdownBegins(t *testing.T) {
+	s := &supervisor{stopping: true}
+	err := s.upgradeLocked()
+	if err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("upgrade error = %v, want shutdown rejection", err)
+	}
+}
+
 func TestValidateSupervisorConfigRejectsRelativeControlSocket(t *testing.T) {
 	config := supervisorConfig{
 		Addr:          "0.0.0.0:31415",
