@@ -2,6 +2,7 @@ package front
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -72,6 +73,36 @@ func TestWaitIdleDoesNotRaceWithConnectionSelection(t *testing.T) {
 	case <-idle:
 	case <-time.After(time.Second):
 		t.Fatal("old backend did not become idle after its connection closed")
+	}
+}
+
+func TestWaitAllIdleWaitsForAcceptedConnections(t *testing.T) {
+	backend := startLineBackend(t, "a")
+	router, err := NewRouter(Backend{ID: "a", Address: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() { _ = router.Serve(listener) }()
+
+	connection := dialLineClient(t, listener.Addr().String())
+	assertReply(t, connection, "one", "a:one")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	idle := make(chan error, 1)
+	go func() { idle <- router.WaitAllIdle(ctx) }()
+	select {
+	case err := <-idle:
+		t.Fatalf("router became idle while connection was open: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	_ = connection.Close()
+	if err := <-idle; err != nil {
+		t.Fatal(err)
 	}
 }
 

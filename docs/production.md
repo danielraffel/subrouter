@@ -63,6 +63,7 @@ Current production-safe behavior:
 - systemd units use `TimeoutStopSec=10min`.
 - On macOS, `subrouter supervise` owns the stable client listener and starts workers on inherited private sockets. `POST /_subrouter/upgrade` starts and health-checks the replacement worker, routes new connections to it, and keeps every existing connection pinned to the old worker until it closes.
 - The supervisor binary is installed separately and is not replaced by routine worker updates.
+- SIGTERM/SIGINT closes the supervisor listener, waits up to `--drain-timeout` (default `10m`) for accepted connections, then stops its workers.
 
 The macOS updater and one-time LaunchDaemon migration scripts live in `deploy/macos/`. Run the migration without `--activate` first to prepare and validate the supervised plist. Activation is the last upgrade that replaces the public listener; later worker upgrades do not restart the supervisor.
 

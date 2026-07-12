@@ -1,6 +1,7 @@
 package front
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +36,7 @@ type backendState struct {
 type Router struct {
 	mu       sync.Mutex
 	changed  *sync.Cond
+	activity chan struct{}
 	active   *backendState
 	backends map[string]*backendState
 	dial     func(network, address string) (net.Conn, error)
@@ -49,6 +51,7 @@ func NewRouter(initial Backend) (*Router, error) {
 	router := &Router{
 		active:   state,
 		backends: map[string]*backendState{initial.ID: state},
+		activity: make(chan struct{}),
 		dial: func(network, address string) (net.Conn, error) {
 			return net.DialTimeout(network, address, 10*time.Second)
 		},
@@ -134,6 +137,31 @@ func (r *Router) WaitIdle(id string) {
 	}
 }
 
+// WaitAllIdle waits until every accepted client connection has closed or the
+// context expires.
+func (r *Router) WaitAllIdle(ctx context.Context) error {
+	for {
+		r.mu.Lock()
+		idle := true
+		for _, state := range r.backends {
+			if state.connections != 0 {
+				idle = false
+				break
+			}
+		}
+		activity := r.activity
+		r.mu.Unlock()
+		if idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-activity:
+		}
+	}
+}
+
 // Forget removes an idle, inactive backend from status tracking.
 func (r *Router) Forget(id string) error {
 	r.mu.Lock()
@@ -190,6 +218,8 @@ func (r *Router) release(state *backendState) {
 	r.mu.Lock()
 	state.connections--
 	r.changed.Broadcast()
+	close(r.activity)
+	r.activity = make(chan struct{})
 	r.mu.Unlock()
 }
 

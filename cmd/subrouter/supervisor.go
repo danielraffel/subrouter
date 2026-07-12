@@ -29,6 +29,7 @@ type supervisorConfig struct {
 	ControlSocket string
 	WorkerBin     string
 	ReadyTimeout  time.Duration
+	DrainTimeout  time.Duration
 	WorkerArgs    []string
 }
 
@@ -105,6 +106,7 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-supervisor.sock", "permissioned supervisor control socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
+	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "maximum time to drain connections during supervisor shutdown")
 	if err := flags.Parse(args); err != nil {
 		return supervisorConfig{}, err
 	}
@@ -127,6 +129,9 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if config.ReadyTimeout <= 0 {
 		return errors.New("ready-timeout must be positive")
+	}
+	if config.DrainTimeout <= 0 {
+		return errors.New("drain-timeout must be positive")
 	}
 	for i, arg := range config.WorkerArgs {
 		if arg == "--addr" || strings.HasPrefix(arg, "--addr=") {
@@ -313,6 +318,11 @@ func (s *supervisor) run() error {
 			}
 			_ = listener.Close()
 			_ = controlServer.Close()
+			drainCtx, cancel := context.WithTimeout(context.Background(), s.config.DrainTimeout)
+			if err := s.router.WaitAllIdle(drainCtx); err != nil {
+				slog.Warn("subrouter supervisor drain timed out", "timeout", s.config.DrainTimeout, "error", err)
+			}
+			cancel()
 			s.stopAllWorkers()
 			return nil
 		}
