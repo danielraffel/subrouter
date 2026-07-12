@@ -2375,6 +2375,9 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 }
 
 func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
+	if provider == "" {
+		provider = accounts.ProviderCodex
+	}
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
