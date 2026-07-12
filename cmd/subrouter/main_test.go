@@ -45,6 +45,19 @@ func TestConfigureDefaultLoggerLeavesServeLoggerAlone(t *testing.T) {
 	}
 }
 
+func TestConfigureDefaultLoggerLeavesSupervisorLoggerAlone(t *testing.T) {
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+
+	sentinel := slog.New(slog.NewTextHandler(io.Discard, nil))
+	slog.SetDefault(sentinel)
+
+	configureDefaultLogger("subrouter", []string{"supervise"})
+	if slog.Default() != sentinel {
+		t.Fatal("supervise should keep the process logger")
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",
