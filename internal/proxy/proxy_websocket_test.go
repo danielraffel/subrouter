@@ -3346,6 +3346,20 @@ func TestCodexWebSocketRequestModel(t *testing.T) {
 	}
 }
 
+func TestWebSocketModelStateTracksSequentialResponses(t *testing.T) {
+	state := &webSocketModelState{model: "default-model"}
+	state.observe([]byte(`{"type":"response.create","model":"model-a"}`))
+	state.observe([]byte(`{"type":"response.create","model":"model-b"}`))
+
+	if got := state.current(); got != "model-a" {
+		t.Fatalf("first current model = %q, want model-a", got)
+	}
+	state.complete()
+	if got := state.current(); got != "model-b" {
+		t.Fatalf("second current model = %q, want model-b", got)
+	}
+}
+
 func TestHandlerRetriesHTTPUsageLimitToBelowThresholdFallback(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
