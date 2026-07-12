@@ -2906,7 +2906,10 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Subrouter-Session": []string{"session-1"}})
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"X-Subrouter-Session": []string{"session-1"},
+		"X-Subrouter-Model":   []string{"gpt-5.6-sol"},
+	})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -2921,6 +2924,12 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		t.Fatalf("websocket body = %q, want usage limit error", string(body))
 	}
 	_ = conn.Close()
+	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
+		t.Fatal("Codex usage limit must mark the whole account exhausted")
+	}
+	if _, modelMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", "gpt-5.6-sol"); modelMarked {
+		t.Fatal("Codex usage limit must not be scoped to the request model")
+	}
 
 	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{}`))
 	if err != nil {
