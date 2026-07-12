@@ -33,10 +33,12 @@ type supervisorConfig struct {
 }
 
 type workerGeneration struct {
-	id      string
-	address string
-	command *exec.Cmd
-	done    chan struct{}
+	id        string
+	network   string
+	address   string
+	socketDir string
+	command   *exec.Cmd
+	done      chan struct{}
 
 	mu  sync.Mutex
 	err error
@@ -46,6 +48,9 @@ func (g *workerGeneration) setWaitError(err error) {
 	g.mu.Lock()
 	g.err = err
 	g.mu.Unlock()
+	if g.socketDir != "" {
+		_ = os.RemoveAll(g.socketDir)
+	}
 	close(g.done)
 }
 
@@ -78,7 +83,7 @@ func supervise(args []string) error {
 	if err != nil {
 		return err
 	}
-	router, err := front.NewRouter(front.Backend{ID: initial.id, Address: initial.address})
+	router, err := front.NewRouter(front.Backend{ID: initial.id, Network: initial.network, Address: initial.address})
 	if err != nil {
 		_ = initial.command.Process.Signal(syscall.SIGTERM)
 		return err
@@ -132,21 +137,37 @@ func validateSupervisorConfig(config supervisorConfig) error {
 }
 
 func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	socketDir, err := os.MkdirTemp("", "subrouter-worker-")
 	if err != nil {
 		return nil, err
 	}
-	tcpListener, ok := listener.(*net.TCPListener)
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		_ = os.RemoveAll(socketDir)
+		return nil, err
+	}
+	address := filepath.Join(socketDir, "worker.sock")
+	listener, err := net.Listen("unix", address)
+	if err != nil {
+		_ = os.RemoveAll(socketDir)
+		return nil, err
+	}
+	if err := os.Chmod(address, 0o600); err != nil {
+		_ = listener.Close()
+		_ = os.RemoveAll(socketDir)
+		return nil, err
+	}
+	fileListener, ok := listener.(interface{ File() (*os.File, error) })
 	if !ok {
 		_ = listener.Close()
-		return nil, errors.New("worker listener is not TCP")
+		_ = os.RemoveAll(socketDir)
+		return nil, errors.New("worker listener cannot be inherited")
 	}
-	file, err := tcpListener.File()
+	file, err := fileListener.File()
 	if err != nil {
 		_ = listener.Close()
+		_ = os.RemoveAll(socketDir)
 		return nil, err
 	}
-	address := listener.Addr().String()
 	workerArgs := append([]string{"serve", "--addr", address}, config.WorkerArgs...)
 	command := exec.Command(config.WorkerBin, workerArgs...)
 	command.ExtraFiles = []*os.File{file}
@@ -156,16 +177,19 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 	if err := command.Start(); err != nil {
 		_ = file.Close()
 		_ = listener.Close()
+		_ = os.RemoveAll(socketDir)
 		return nil, err
 	}
 	_ = file.Close()
 	_ = listener.Close()
 
 	generation := &workerGeneration{
-		id:      fmt.Sprintf("%d-%d", time.Now().UTC().UnixNano(), command.Process.Pid),
-		address: address,
-		command: command,
-		done:    make(chan struct{}),
+		id:        fmt.Sprintf("%d-%d", time.Now().UTC().UnixNano(), command.Process.Pid),
+		network:   "unix",
+		address:   address,
+		socketDir: socketDir,
+		command:   command,
+		done:      make(chan struct{}),
 	}
 	go func() { generation.setWaitError(command.Wait()) }()
 	if err := waitForWorkerReady(generation, config.ReadyTimeout); err != nil {
@@ -193,8 +217,8 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			connection, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, address)
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			connection, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, generation.network, generation.address)
 			if err != nil {
 				return nil, err
 			}
@@ -207,7 +231,7 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: time.Second, Transport: transport}
-	readyURL := "http://" + generation.address + "/_subrouter/ready"
+	readyURL := "http://subrouter-worker/_subrouter/ready"
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -328,7 +352,7 @@ func (s *supervisor) upgradeLocked() error {
 	s.workersMu.Unlock()
 	go s.monitorWorker(next)
 	previous := s.router.Active()
-	if err := s.router.Switch(front.Backend{ID: next.id, Address: next.address}); err != nil {
+	if err := s.router.Switch(front.Backend{ID: next.id, Network: next.network, Address: next.address}); err != nil {
 		_ = next.command.Process.Signal(syscall.SIGTERM)
 		return err
 	}

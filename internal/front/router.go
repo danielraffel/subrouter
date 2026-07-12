@@ -11,6 +11,7 @@ import (
 
 // Backend identifies one worker generation behind the stable front listener.
 type Backend struct {
+	Network string `json:"network"`
 	ID      string `json:"id"`
 	Address string `json:"address"`
 }
@@ -18,6 +19,7 @@ type Backend struct {
 // BackendStatus is a point-in-time view of a worker generation.
 type BackendStatus struct {
 	ID          string `json:"id"`
+	Network     string `json:"network"`
 	Address     string `json:"address"`
 	Connections int    `json:"connections"`
 	Active      bool   `json:"active"`
@@ -39,6 +41,7 @@ type Router struct {
 }
 
 func NewRouter(initial Backend) (*Router, error) {
+	initial = normalizeBackend(initial)
 	if err := validateBackend(initial); err != nil {
 		return nil, err
 	}
@@ -61,12 +64,23 @@ func validateBackend(backend Backend) error {
 	if backend.Address == "" {
 		return errors.New("backend address is required")
 	}
+	if backend.Network != "tcp" && backend.Network != "unix" {
+		return fmt.Errorf("unsupported backend network %q", backend.Network)
+	}
 	return nil
+}
+
+func normalizeBackend(backend Backend) Backend {
+	if backend.Network == "" {
+		backend.Network = "tcp"
+	}
+	return backend
 }
 
 // Switch atomically selects backend for new connections. Existing connections
 // remain pinned to their original backend.
 func (r *Router) Switch(backend Backend) error {
+	backend = normalizeBackend(backend)
 	if err := validateBackend(backend); err != nil {
 		return err
 	}
@@ -98,6 +112,7 @@ func (r *Router) Status() []BackendStatus {
 	for _, state := range r.backends {
 		statuses = append(statuses, BackendStatus{
 			ID:          state.backend.ID,
+			Network:     state.backend.Network,
 			Address:     state.backend.Address,
 			Connections: state.connections,
 			Active:      state == r.active,
@@ -152,7 +167,7 @@ func (r *Router) serveConnection(client net.Conn, state *backendState) {
 	defer r.release(state)
 	defer client.Close()
 
-	upstream, err := r.dial("tcp", state.backend.Address)
+	upstream, err := r.dial(state.backend.Network, state.backend.Address)
 	if err != nil {
 		return
 	}

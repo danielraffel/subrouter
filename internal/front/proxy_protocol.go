@@ -42,16 +42,18 @@ func NewProxyProtocolListener(listener net.Listener) net.Listener {
 }
 
 func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	connection, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		connection, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		wrapped, err := readProxyProtocolHeader(connection)
+		if err != nil {
+			_ = connection.Close()
+			continue
+		}
+		return wrapped, nil
 	}
-	wrapped, err := readProxyProtocolHeader(connection)
-	if err != nil {
-		_ = connection.Close()
-		return nil, err
-	}
-	return wrapped, nil
 }
 
 type proxyProtocolConn struct {
