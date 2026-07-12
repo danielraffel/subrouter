@@ -1866,7 +1866,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, proxyRequest.URL.Path)
+			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			return nil
 		}
 		if s.Logger != nil {
@@ -2374,7 +2374,7 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 	s.Transcripts.RecordPayloadSummary(agentType, sessionID, "http_body", "client_to_upstream", streamID, bytesRead, hex.EncodeToString(hasher.Sum(nil)), chunks, nil)
 }
 
-func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, path string) {
+func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
@@ -2425,12 +2425,14 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 			}, claudeRateLimitHeaderFields(response.Header)...)...)
 	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !claudeUnusable) {
+	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
+		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectModelCompatibility && !claudeUnusable) {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
 	var inspect func([]byte)
-	if inspectUsageLimit || claudeUnusable {
+	if inspectUsageLimit || inspectModelCompatibility || claudeUnusable {
 		loggedBody := false
 		inspect = func(body []byte) {
 			if inspectUsageLimit && usageLimitJSON(body) {
@@ -2438,6 +2440,9 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 				// above is recomputed identically, not overwritten with the short
 				// default TTL.
 				s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
+			}
+			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
+				s.markAccountExhausted(provider, accountID, compatibilityModel)
 			}
 			// Only log the body for the original hard rate-limit statuses
 			// (429/401), whose body is a known rate-limit/auth error envelope. A
