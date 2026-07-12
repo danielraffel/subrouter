@@ -3106,6 +3106,127 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 	}
 }
 
+func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "apikey:team-codex-1", AuthMode: accounts.AuthModeAPIKey, Token: "api-token"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+			{AccountID: "apikey:team-codex-1", Headroom: 0.01, ShortHeadroom: 0.01},
+		})),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	req.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.StatusCode)
+	}
+	want := []string{"Bearer incompatible-token"}
+	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, want)
+	}
+}
+
+func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer incompatible-token" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+	}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	subrouter := httptest.NewServer(handler)
+	defer subrouter.Close()
+
+	requestBody := `{"input":"` + strings.Repeat("x", (8<<20)+1) + `","model":"gpt-5.6-sol"}`
+	req, err := http.NewRequest(http.MethodPost, subrouter.URL+"/v1/responses", strings.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	req.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", response.StatusCode)
+	}
+	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
+		t.Fatal("unknown compatibility model must not mark the whole account exhausted")
+	}
+}
+
 func TestHandlerRetriesHTTPUsageLimitToBelowThresholdFallback(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
