@@ -8,7 +8,7 @@ LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
 PLIST="${SUBROUTER_PLIST:-/Library/LaunchDaemons/${LABEL}.plist}"
 WORKER_BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervisor}"
-CONTROL_ADDR="${SUBROUTER_CONTROL_ADDR:-127.0.0.1:31414}"
+CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-/var/run/subrouter-supervisor.sock}"
 ACTIVATE=0
 [ "${1:-}" = "--activate" ] && ACTIVATE=1
 
@@ -27,7 +27,7 @@ fi
 
 prepared="${PLIST}.supervised"
 public_addr="$(PLIST="$PLIST" PREPARED="$prepared" WORKER_BIN="$WORKER_BIN" \
-SUPERVISOR_BIN="$SUPERVISOR_BIN" CONTROL_ADDR="$CONTROL_ADDR" python3 <<'PY'
+SUPERVISOR_BIN="$SUPERVISOR_BIN" CONTROL_SOCKET="$CONTROL_SOCKET" python3 <<'PY'
 import os
 import plistlib
 
@@ -35,7 +35,7 @@ source = os.environ["PLIST"]
 destination = os.environ["PREPARED"]
 worker_bin = os.environ["WORKER_BIN"]
 supervisor_bin = os.environ["SUPERVISOR_BIN"]
-control_addr = os.environ["CONTROL_ADDR"]
+control_socket = os.environ["CONTROL_SOCKET"]
 
 with open(source, "rb") as stream:
     plist = plistlib.load(stream)
@@ -68,7 +68,7 @@ plist["ProgramArguments"] = [
     supervisor_bin,
     "supervise",
     "--addr", public_addr,
-    "--control-addr", control_addr,
+    "--control-socket", control_socket,
     "--worker-bin", worker_bin,
     "--",
     *filtered,
@@ -100,7 +100,7 @@ launchctl bootout "system/${LABEL}" 2>/dev/null || true
 launchctl bootstrap system "$PLIST"
 
 i=0
-until curl -fsS "http://${CONTROL_ADDR}/_subrouter/supervisor-status" >/dev/null 2>&1 \
+until curl -fsS --unix-socket "$CONTROL_SOCKET" "http://localhost/_subrouter/supervisor-status" >/dev/null 2>&1 \
   && curl -fsS "http://${public_addr}/_subrouter/health" >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "$i" -ge 60 ]; then

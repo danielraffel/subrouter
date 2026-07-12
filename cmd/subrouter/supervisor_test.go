@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ import (
 func TestParseSupervisorConfigSeparatesWorkerArguments(t *testing.T) {
 	config, err := parseSupervisorConfig([]string{
 		"--addr", "0.0.0.0:31415",
-		"--control-addr", "127.0.0.1:31414",
+		"--control-socket", "/var/run/subrouter-test.sock",
 		"--worker-bin", "/usr/local/bin/subrouter",
 		"--",
 		"serve", "--sr-switch-interval", "10m", "--bedrock",
@@ -26,31 +27,51 @@ func TestParseSupervisorConfigSeparatesWorkerArguments(t *testing.T) {
 	if config.Addr != "0.0.0.0:31415" || config.WorkerBin != "/usr/local/bin/subrouter" {
 		t.Fatalf("unexpected config: %+v", config)
 	}
+	if config.ControlSocket != "/var/run/subrouter-test.sock" {
+		t.Fatalf("control socket = %q", config.ControlSocket)
+	}
 	want := []string{"--sr-switch-interval", "10m", "--bedrock"}
 	if fmt.Sprint(config.WorkerArgs) != fmt.Sprint(want) {
 		t.Fatalf("worker args = %v, want %v", config.WorkerArgs, want)
 	}
 }
 
-func TestValidateSupervisorConfigRejectsPublicControlAddress(t *testing.T) {
+func TestPrepareControlSocketRefusesRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.sock")
+	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareControlSocket(path); err == nil {
+		t.Fatal("expected regular control-socket path to be rejected")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "keep" {
+		t.Fatalf("regular file was modified: %q", body)
+	}
+}
+
+func TestValidateSupervisorConfigRejectsRelativeControlSocket(t *testing.T) {
 	config := supervisorConfig{
-		Addr:         "0.0.0.0:31415",
-		ControlAddr:  "0.0.0.0:31414",
-		WorkerBin:    "/usr/local/bin/subrouter",
-		ReadyTimeout: time.Second,
+		Addr:          "0.0.0.0:31415",
+		ControlSocket: "subrouter.sock",
+		WorkerBin:     "/usr/local/bin/subrouter",
+		ReadyTimeout:  time.Second,
 	}
 	if err := validateSupervisorConfig(config); err == nil {
-		t.Fatal("expected public control address to be rejected")
+		t.Fatal("expected relative control socket to be rejected")
 	}
 }
 
 func TestValidateSupervisorConfigRejectsWorkerAddress(t *testing.T) {
 	config := supervisorConfig{
-		Addr:         "0.0.0.0:31415",
-		ControlAddr:  "127.0.0.1:31414",
-		WorkerBin:    "/usr/local/bin/subrouter",
-		ReadyTimeout: time.Second,
-		WorkerArgs:   []string{"--addr", "127.0.0.1:1"},
+		Addr:          "0.0.0.0:31415",
+		ControlSocket: "/var/run/subrouter-test.sock",
+		WorkerBin:     "/usr/local/bin/subrouter",
+		ReadyTimeout:  time.Second,
+		WorkerArgs:    []string{"--addr", "127.0.0.1:1"},
 	}
 	if err := validateSupervisorConfig(config); err == nil {
 		t.Fatal("expected worker --addr to be rejected")

@@ -31,8 +31,8 @@ Replace the worker binary atomically, then ask the stable supervisor to create a
 ```bash
 install -m 0755 ./subrouter /usr/local/bin/subrouter.new
 mv -f /usr/local/bin/subrouter.new /usr/local/bin/subrouter
-curl -fsS -X POST http://127.0.0.1:31414/_subrouter/upgrade
-curl -fsS http://127.0.0.1:31414/_subrouter/supervisor-status | jq
+curl -fsS --unix-socket /var/run/subrouter-supervisor.sock -X POST http://localhost/_subrouter/upgrade
+curl -fsS --unix-socket /var/run/subrouter-supervisor.sock http://localhost/_subrouter/supervisor-status | jq
 ```
 
 `deploy/macos/subrouter-autoupdate.sh` performs the same sequence with release checksum verification and automatic worker-binary rollback when readiness fails.
@@ -169,10 +169,10 @@ For a successful compact, expect a `subrouter_meta` row for `POST /responses/com
 
 ## Supervisor status
 
-The loopback-only control endpoint reports the active generation and the connection count pinned to every draining generation:
+The permissioned Unix control socket reports the active generation and the connection count pinned to every draining generation. Browser pages cannot reach this socket or trigger upgrades:
 
 ```bash
-curl -fsS http://127.0.0.1:31414/_subrouter/supervisor-status | jq
+curl -fsS --unix-socket /var/run/subrouter-supervisor.sock http://localhost/_subrouter/supervisor-status | jq
 ```
 
 There is intentionally no drain timeout. A routine upgrade never terminates a worker that still owns a client connection.

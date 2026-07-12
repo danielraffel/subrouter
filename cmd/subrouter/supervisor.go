@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,11 +25,11 @@ import (
 const inheritedListenerFDEnv = "SUBROUTER_LISTEN_FD"
 
 type supervisorConfig struct {
-	Addr         string
-	ControlAddr  string
-	WorkerBin    string
-	ReadyTimeout time.Duration
-	WorkerArgs   []string
+	Addr          string
+	ControlSocket string
+	WorkerBin     string
+	ReadyTimeout  time.Duration
+	WorkerArgs    []string
 }
 
 type workerGeneration struct {
@@ -94,7 +95,7 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags := flag.NewFlagSet("supervise", flag.ContinueOnError)
 	config := supervisorConfig{}
 	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "stable client listen address")
-	flags.StringVar(&config.ControlAddr, "control-addr", "127.0.0.1:31414", "loopback supervisor control address")
+	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-supervisor.sock", "permissioned supervisor control socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
 	if err := flags.Parse(args); err != nil {
@@ -111,15 +112,8 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	if strings.TrimSpace(config.Addr) == "" {
 		return errors.New("addr is required")
 	}
-	if strings.TrimSpace(config.ControlAddr) == "" {
-		return errors.New("control-addr is required")
-	}
-	controlHost, _, err := net.SplitHostPort(config.ControlAddr)
-	if err != nil {
-		return fmt.Errorf("control-addr must include host and port: %w", err)
-	}
-	if controlHost != "127.0.0.1" && controlHost != "localhost" && controlHost != "::1" {
-		return fmt.Errorf("control-addr must be loopback, got %q", config.ControlAddr)
+	if !filepath.IsAbs(config.ControlSocket) {
+		return fmt.Errorf("control-socket must be an absolute path, got %q", config.ControlSocket)
 	}
 	if strings.TrimSpace(config.WorkerBin) == "" {
 		return errors.New("worker-bin is required")
@@ -239,18 +233,31 @@ func (s *supervisor) run() error {
 		s.stopAllWorkers()
 		return err
 	}
-	controlListener, err := net.Listen("tcp", s.config.ControlAddr)
+	if err := prepareControlSocket(s.config.ControlSocket); err != nil {
+		_ = listener.Close()
+		s.stopAllWorkers()
+		return err
+	}
+	controlListener, err := net.Listen("unix", s.config.ControlSocket)
 	if err != nil {
 		_ = listener.Close()
 		s.stopAllWorkers()
 		return err
 	}
+	if err := os.Chmod(s.config.ControlSocket, 0o600); err != nil {
+		_ = listener.Close()
+		_ = controlListener.Close()
+		_ = os.Remove(s.config.ControlSocket)
+		s.stopAllWorkers()
+		return err
+	}
+	defer os.Remove(s.config.ControlSocket)
 	controlServer := &http.Server{Handler: s.controlHandler(), ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 2)
 	go func() { errCh <- s.router.Serve(listener) }()
 	go func() { errCh <- controlServer.Serve(controlListener) }()
 
-	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_addr", s.config.ControlAddr, "worker", s.router.Active().ID)
+	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_socket", s.config.ControlSocket, "worker", s.router.Active().ID)
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
@@ -279,6 +286,23 @@ func (s *supervisor) run() error {
 			return nil
 		}
 	}
+}
+
+func prepareControlSocket(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("control-socket path exists and is not a socket: %s", path)
+	}
+	return os.Remove(path)
 }
 
 func (s *supervisor) upgrade() error {

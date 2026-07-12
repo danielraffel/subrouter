@@ -8,7 +8,7 @@ set -euo pipefail
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
 BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
-CONTROL_URL="${SUBROUTER_CONTROL_URL:-http://127.0.0.1:31414}"
+CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-/var/run/subrouter-supervisor.sock}"
 HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 
 log() { echo "subrouter-autoupdate: $*"; }
@@ -46,7 +46,7 @@ cp -p "$BIN" "$backup"
 install -m 0755 "${tmp}/${asset}" "${BIN}.new"
 mv -f "${BIN}.new" "$BIN"
 
-if ! response="$(curl -fsS -X POST "${CONTROL_URL}/_subrouter/upgrade")"; then
+if ! response="$(curl -fsS --unix-socket "$CONTROL_SOCKET" -X POST "http://localhost/_subrouter/upgrade")"; then
   log "new worker failed readiness; restoring previous worker binary"
   install -m 0755 "$backup" "${BIN}.rollback"
   mv -f "${BIN}.rollback" "$BIN"
@@ -57,7 +57,7 @@ if ! curl -fsS "$HEALTH_URL" >/dev/null; then
   log "new generation switched but public health failed; rolling new connections back"
   install -m 0755 "$backup" "${BIN}.rollback"
   mv -f "${BIN}.rollback" "$BIN"
-  curl -fsS -X POST "${CONTROL_URL}/_subrouter/upgrade" >/dev/null || true
+  curl -fsS --unix-socket "$CONTROL_SOCKET" -X POST "http://localhost/_subrouter/upgrade" >/dev/null || true
   exit 1
 fi
 
