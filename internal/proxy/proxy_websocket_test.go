@@ -3322,7 +3322,6 @@ func TestHandlerMarksWebSocketModelCompatibilityAndReroutesReconnect(t *testing.
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
 	header := http.Header{
 		"X-Subrouter-Session": []string{"session-1"},
-		"X-Subrouter-Model":   []string{"gpt-5.6-sol"},
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
