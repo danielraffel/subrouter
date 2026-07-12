@@ -59,6 +59,7 @@ func (g *workerGeneration) waitError() error {
 type supervisor struct {
 	config supervisorConfig
 	router *front.Router
+	fatal  chan error
 
 	upgradeMu sync.Mutex
 	workersMu sync.Mutex
@@ -85,6 +86,7 @@ func supervise(args []string) error {
 	s := &supervisor{
 		config:  config,
 		router:  router,
+		fatal:   make(chan error, 1),
 		workers: map[string]*workerGeneration{initial.id: initial},
 	}
 	go s.monitorWorker(initial)
@@ -264,6 +266,11 @@ func (s *supervisor) run() error {
 
 	for {
 		select {
+		case err := <-s.fatal:
+			_ = listener.Close()
+			_ = controlServer.Close()
+			s.stopAllWorkers()
+			return err
 		case err := <-errCh:
 			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 				_ = listener.Close()
@@ -340,6 +347,10 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 	slog.Error("active subrouter worker exited", "generation", worker.id, "pid", worker.command.Process.Pid, "error", err)
 	if replaceErr := s.upgradeLocked(); replaceErr != nil {
 		slog.Error("subrouter worker recovery failed", "generation", worker.id, "error", replaceErr)
+		select {
+		case s.fatal <- fmt.Errorf("active worker recovery failed: %w", replaceErr):
+		default:
+		}
 	}
 }
 

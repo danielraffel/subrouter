@@ -3,12 +3,24 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
+	"unsafe"
+)
+
+const lockFileExclusiveLock = 0x00000002
+
+var (
+	kernel32     = syscall.NewLazyDLL("kernel32.dll")
+	lockFileEx   = kernel32.NewProc("LockFileEx")
+	unlockFileEx = kernel32.NewProc("UnlockFileEx")
 )
 
 type storeFileLock struct {
-	file *os.File
+	file       *os.File
+	overlapped syscall.Overlapped
 }
 
 func lockSessionStore(path string) (*storeFileLock, error) {
@@ -19,9 +31,33 @@ func lockSessionStore(path string) (*storeFileLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &storeFileLock{file: file}, nil
+	lock := &storeFileLock{file: file}
+	result, _, callErr := lockFileEx.Call(
+		file.Fd(),
+		lockFileExclusiveLock,
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&lock.overlapped)),
+	)
+	if result == 0 {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock session store: %w", callErr)
+	}
+	return lock, nil
 }
 
 func (l *storeFileLock) Close() error {
-	return l.file.Close()
+	result, _, callErr := unlockFileEx.Call(
+		l.file.Fd(),
+		0,
+		uintptr(^uint32(0)),
+		uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&l.overlapped)),
+	)
+	closeErr := l.file.Close()
+	if result == 0 {
+		return fmt.Errorf("unlock session store: %w", callErr)
+	}
+	return closeErr
 }

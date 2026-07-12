@@ -2,15 +2,19 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/front"
 )
 
 func TestParseSupervisorConfigSeparatesWorkerArguments(t *testing.T) {
@@ -50,6 +54,40 @@ func TestPrepareControlSocketRefusesRegularFile(t *testing.T) {
 	}
 	if string(body) != "keep" {
 		t.Fatalf("regular file was modified: %q", body)
+	}
+}
+
+func TestMonitorWorkerReportsFatalWhenRecoveryFails(t *testing.T) {
+	router, err := front.NewRouter(front.Backend{ID: "failed", Address: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	close(done)
+	worker := &workerGeneration{
+		id:      "failed",
+		command: &exec.Cmd{Process: &os.Process{Pid: 12345}},
+		done:    done,
+		err:     errors.New("worker exited"),
+	}
+	s := &supervisor{
+		config: supervisorConfig{
+			WorkerBin:    filepath.Join(t.TempDir(), "missing-subrouter"),
+			ReadyTimeout: time.Second,
+		},
+		router:  router,
+		fatal:   make(chan error, 1),
+		workers: map[string]*workerGeneration{"failed": worker},
+	}
+
+	s.monitorWorker(worker)
+	select {
+	case fatalErr := <-s.fatal:
+		if !strings.Contains(fatalErr.Error(), "active worker recovery failed") {
+			t.Fatalf("fatal error = %v", fatalErr)
+		}
+	default:
+		t.Fatal("failed active-worker recovery was not reported as fatal")
 	}
 }
 
