@@ -3786,8 +3786,8 @@ func isTerminalCredentialError(err error) bool {
 // metered API-key pool account never preempts the Bedrock stage (the dedicated
 // Fable API key is the chain's own last stage).
 func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
-	if model != "" {
-		s.markAccountExhausted(provider, accountID, model)
+	if model != "" && s.SchedulerRef != nil {
+		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
 	}
 	if tried == nil {
 		tried = make(map[string]struct{}, 1)

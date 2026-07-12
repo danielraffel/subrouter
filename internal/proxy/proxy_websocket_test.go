@@ -2927,7 +2927,7 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
 		t.Fatal("Codex usage limit must mark the whole account exhausted")
 	}
-	if _, modelMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", "gpt-5.6-sol"); modelMarked {
+	if _, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "empty@example.com", "gpt-5.6-sol"); modelMarked {
 		t.Fatal("Codex usage limit must not be scoped to the request model")
 	}
 
@@ -3105,7 +3105,7 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 	if assignment.AccountID != "compatible@example.com" {
 		t.Fatalf("AccountID = %q, want compatible@example.com", assignment.AccountID)
 	}
-	_, modelMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol")
+	_, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol")
 	_, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "")
 	if !modelMarked {
 		t.Fatalf("missing model-scoped incompatibility mark (account_marked=%t)", accountMarked)
@@ -3257,7 +3257,7 @@ func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, modelMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !modelMarked {
+	if _, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !modelMarked {
 		t.Fatal("passive compatibility inspection must mark the rejected model")
 	}
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
@@ -3348,7 +3348,7 @@ func TestHandlerMarksWebSocketModelCompatibilityAndReroutesReconnect(t *testing.
 	if strings.Join(auths, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("auths = %#v, want %#v", auths, want)
 	}
-	if _, modelMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !modelMarked {
+	if _, modelMarked := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderCodex, "incompatible@example.com", "gpt-5.6-sol"); !modelMarked {
 		t.Fatal("WebSocket compatibility error must mark the rejected model")
 	}
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
