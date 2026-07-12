@@ -1975,12 +1975,12 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn)
 		_ = upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
-		s.copyWebSocketMessages(agentType, sessionID, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn)
+		s.copyWebSocketMessages(r.Context(), agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn)
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
@@ -2081,7 +2081,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 	}
 }
 
-func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn) {
+func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn) {
 	provider := providerForRequest(agentType, "")
 	for {
 		messageType, body, err := src.ReadMessage()
@@ -2102,7 +2102,7 @@ func (s Server) copyWebSocketMessages(agentType, sessionID, accountID, poolModel
 				s.markAccountExhausted(provider, accountID, poolModel)
 			case provider == accounts.ProviderCodex && codexChatGPTModelUnsupportedJSON(body):
 				if model := modelState.current(); model != "" {
-					s.markAccountExhausted(provider, accountID, model)
+					_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
 				}
 			}
 			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
@@ -2431,6 +2431,10 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
+	responseCtx := context.Background()
+	if response.Request != nil {
+		responseCtx = response.Request.Context()
+	}
 	var inspect func([]byte)
 	if inspectUsageLimit || inspectModelCompatibility || claudeUnusable {
 		loggedBody := false
@@ -2442,7 +2446,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 				s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
 			}
 			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
-				s.markAccountExhausted(provider, accountID, compatibilityModel)
+				_, _ = s.rerouteModelIncompatibility(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel, nil)
 			}
 			// Only log the body for the original hard rate-limit statuses
 			// (429/401), whose body is a known rate-limit/auth error envelope. A
@@ -3608,7 +3612,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// "allowed"/"allowed_warning" 429 still fails over for this request.
 			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
 		}
-		if t.server != nil && exhausted && (!modelUnsupported || exhaustionPool != "") {
+		var compatibilityNext accounts.Account
+		var compatibilityPickErr error
+		if modelUnsupported && t.server != nil {
+			compatibilityNext, compatibilityPickErr = t.server.rerouteModelIncompatibility(
+				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
+			)
+		}
+		if t.server != nil && exhausted && !modelUnsupported {
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers (codex responses lack these headers and fall back
 			// to the default TTL inside claudeExhaustionExpiry).
@@ -3625,7 +3636,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
 			return response, nil
 		}
-		nextAccount, pickErr := t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil || modelUnsupported)
+		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
+		if !modelUnsupported {
+			nextAccount, pickErr = t.server.oauthRetryAccount(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil)
+		}
 		if pickErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
@@ -3768,6 +3782,29 @@ func isTerminalCredentialError(err error) bool {
 // pool to OAuth accounts; Fable requests with a fallback chain set it so a
 // metered API-key pool account never preempts the Bedrock stage (the dedicated
 // Fable API key is the chain's own last stage).
+func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
+	if model != "" {
+		s.markAccountExhausted(provider, accountID, model)
+	}
+	if tried == nil {
+		tried = make(map[string]struct{}, 1)
+	}
+	if accountID != "" {
+		tried[accountID] = struct{}{}
+	}
+	account, err := s.oauthRetryAccount(ctx, provider, agentType, sessionID, userEmail, model, tried, true)
+	if err != nil && s.Logger != nil {
+		s.Logger.Warn("model incompatibility has no alternate OAuth account",
+			"provider", provider,
+			"agent", agentType,
+			"session", sessionID,
+			"account", accountID,
+			"model", model,
+			"error", err)
+	}
+	return account, err
+}
+
 func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
 	allCandidates := filterAccountsForProvider(s.accountList(), provider)
 	if len(allCandidates) == 0 {
