@@ -58,7 +58,7 @@ func configureDefaultLogger(program string, args []string) {
 }
 
 func shouldUseProcessLogger(_ string, args []string) bool {
-	return len(args) > 0 && args[0] == "serve"
+	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise")
 }
 
 func newCLIFileLogHandler(path string) slog.Handler {
@@ -100,6 +100,8 @@ func runForProgram(program string, args []string) error {
 	switch args[0] {
 	case "serve":
 		return serve(args[1:])
+	case "supervise":
+		return supervise(args[1:])
 	case "accounts":
 		return listAccounts()
 	case "codex":
@@ -581,6 +583,16 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 }
 
 func listenAndServeHTTP(server *http.Server, logger *slog.Logger) error {
+	listener, err := inheritedListenerFromEnv()
+	if err != nil {
+		return err
+	}
+	if listener != nil {
+		if logger != nil {
+			logger.Info("using inherited supervisor socket", "addr", listener.Addr().String())
+		}
+		return server.Serve(listener)
+	}
 	listeners, err := inheritedSystemdListeners()
 	if err != nil {
 		return err
@@ -862,6 +874,7 @@ Usage:
   %[1]s gemini             Manage Gemini profiles
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--drain-timeout 10m] -- [serve flags]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent
