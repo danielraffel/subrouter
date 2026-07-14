@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 )
 
@@ -110,5 +111,55 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 	}
 	if !strings.Contains(got, "args=--dangerously-skip-permissions --resume 1721c0ce-b3bd-4d73-8b33-b3d02b677074") {
 		t.Fatalf("Claude did not receive flags:\n%s", got)
+	}
+}
+
+func TestClaudeCodexLaunchesClaudeWithBridgeEnvironment(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(home, "claude-codex-run.txt")
+	claudePath := filepath.Join(binDir, "claude")
+	script := "#!/bin/sh\nprintf 'base=%s\\nauth=%s\\ncustom=%s\\noauth=%s\\nargs=%s\\n' \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\" \"$CLAUDE_CODE_OAUTH_TOKEN\" \"$*\" > " + shellQuote(recordPath) + "\n"
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Leaked: value")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-leak")
+
+	store := accounts.CodexStore{Dir: filepath.Join(home, "codex", "accounts")}
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{Name: "team", URL: "http://subrouter-team:31415"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.claudeCodex(context.Background(), []string{"-p", "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	for _, want := range []string{
+		"base=http://subrouter-team:31415/claude-codex",
+		"auth=subrouter",
+		"custom=",
+		"oauth=",
+		"args=-p hello",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in launch environment:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(out.String(), "Claude Code -> gpt-5.6-sol (medium) via Subrouter http://subrouter-team:31415") {
+		t.Fatalf("missing route banner: %q", out.String())
 	}
 }

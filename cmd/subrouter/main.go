@@ -133,6 +133,7 @@ var directSRCommands = map[string]struct{}{
 	"breadcrumbs":      {},
 	"claude":           {},
 	"claude-aws":       {},
+	"claude-codex":     {},
 	"claude-direct":    {},
 	"cost":             {},
 	"g":                {},
@@ -868,6 +869,8 @@ Usage:
   %[1]s claude             Manage Claude Code profiles
   %[1]s claude-aws [--model fable] [claude args...]
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
+  %[1]s claude-codex [claude args...]
+                           Launch Claude Code on GPT-5.6 Sol medium via ChatGPT Pro
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
   %[1]s spend              Show AWS Bedrock spend tracked by the server

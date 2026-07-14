@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -508,6 +509,45 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
 	}
 	cmd.Env = env
+	return cmd.Run()
+}
+
+// claudeCodex launches the real Claude Code CLI while routing its Anthropic
+// Messages traffic into Subrouter's Claude-to-Codex bridge. The bridge selects
+// a pooled ChatGPT OAuth account and always runs GPT-5.6 Sol at medium
+// reasoning effort. The placeholder token only satisfies Claude Code's client
+// auth check; Subrouter replaces it with the selected ChatGPT credential.
+func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
+	server, ok, err := r.defaultRemoteServer()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("sr claude-codex needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
+	}
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, args...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+	env := envWithout(os.Environ(), []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_CUSTOM_HEADERS",
+		"CLAUDE_CODE_OAUTH_TOKEN",
+		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_USE_VERTEX",
+	})
+	cmd.Env = append(env,
+		"ANTHROPIC_BASE_URL="+strings.TrimRight(server.URL, "/")+"/claude-codex",
+		"ANTHROPIC_AUTH_TOKEN=subrouter",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+	)
+	fmt.Fprintf(r.errOut, "Claude Code -> %s (%s) via Subrouter %s\n", proxy.ClaudeCodexModelName(), proxy.ClaudeCodexReasoningEffortName(), server.URL)
 	return cmd.Run()
 }
 
