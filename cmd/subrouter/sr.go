@@ -231,6 +231,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.claudeAWS(ctx, args[1:])
 	case "claude-codex":
 		return r.claudeCodex(ctx, args[1:])
+	case "claude-codex-hook":
+		return r.claudeCodexHook(ctx, args[1:])
 	case "claude-direct":
 		return r.claudeDirect(ctx, args[1:])
 	case "spend", "cost":
@@ -247,7 +249,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "claude", "claude-aws", "claude-codex", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+	case "server", "servers", "claude", "claude-aws", "claude-codex", "claude-codex-hook", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
 		return false
 	default:
 		return true

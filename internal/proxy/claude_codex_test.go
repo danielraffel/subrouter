@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -68,6 +69,30 @@ func TestTranslateClaudeRequestUsesGPT56SolMediumAndTools(t *testing.T) {
 	tool, _ := tools[0].(map[string]any)
 	if tool["name"] != "Read" {
 		t.Fatalf("tool = %#v", tool)
+	}
+}
+
+func TestClaudeCodexCompactionDetectionAndMetadata(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Your task is to create a detailed summary of the conversation so far. Preserve state."}]}]}`)
+	if !isClaudeCompactionRequest(body) {
+		t.Fatal("expected Claude compaction request to be detected")
+	}
+	claudeCodexPendingCompactions.Store("compact-session", claudeCodexPendingCompaction{Trigger: "manual", CreatedAt: time.Now()})
+	pending, ok := claudeCodexCompactionForRequest("compact-session", body)
+	if !ok || pending.Trigger != "manual" {
+		t.Fatalf("compaction = %#v, %v", pending, ok)
+	}
+	metadata := claudeCodexCompactionMetadata("compact-session", pending.Trigger)
+	var turn map[string]any
+	if err := json.Unmarshal([]byte(metadata["x-codex-turn-metadata"]), &turn); err != nil {
+		t.Fatal(err)
+	}
+	if turn["request_kind"] != "compaction" {
+		t.Fatalf("turn metadata = %#v", turn)
+	}
+	compaction, _ := turn["compaction"].(map[string]any)
+	if compaction["trigger"] != "manual" || compaction["implementation"] != "responses" {
+		t.Fatalf("compaction metadata = %#v", compaction)
 	}
 }
 

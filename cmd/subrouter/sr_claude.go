@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -529,6 +531,13 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
 	claudeArgs := claudeCodexArgs(args)
+	hookURL := strings.TrimRight(server.URL, "/") + "/claude-codex/hooks/pre-compact"
+	hookExecutable, executableErr := os.Executable()
+	if executableErr != nil {
+		hookExecutable = r.programOrSubrouter()
+	}
+	hookCommand := shellQuote(hookExecutable) + " claude-codex-hook " + shellQuote(hookURL)
+	claudeArgs = claudeCodexHookArgs(claudeArgs, hookCommand)
 	cmd := exec.CommandContext(ctx, claudePath, claudeArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
@@ -598,6 +607,64 @@ func claudeCodexArgs(args []string) []string {
 		}
 	}
 	return append([]string{"--model", "claude-codex-sol"}, args...)
+}
+
+func claudeCodexHookArgs(args []string, hookCommand string) []string {
+	for _, arg := range args {
+		if arg == "--settings" || strings.HasPrefix(arg, "--settings=") {
+			return args
+		}
+	}
+	settings, err := json.Marshal(map[string]any{
+		"hooks": map[string]any{
+			"PreCompact": []any{map[string]any{
+				"matcher": "",
+				"hooks": []any{map[string]any{
+					"type": "command", "command": hookCommand, "timeout": 10,
+				}},
+			}},
+		},
+	})
+	if err != nil {
+		return args
+	}
+	return append([]string{"--settings", string(settings)}, args...)
+}
+
+func (r srRunner) claudeCodexHook(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("invalid claude-codex hook invocation")
+	}
+	body, err := io.ReadAll(io.LimitReader(r.in, 64*1024+1))
+	if err != nil {
+		return fmt.Errorf("read Claude hook: %w", err)
+	}
+	if len(body) > 64*1024 {
+		return fmt.Errorf("Claude hook payload is too large")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, args[0], bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create Claude hook request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := r.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send Claude hook: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	if err != nil {
+		return fmt.Errorf("read Claude hook response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("Claude hook returned HTTP %s", response.Status)
+	}
+	_, err = r.out.Write(responseBody)
+	return err
 }
 
 // claudeDirect launches Claude Code straight against Anthropic on the user's own

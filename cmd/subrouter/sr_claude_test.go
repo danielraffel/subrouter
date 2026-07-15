@@ -167,7 +167,9 @@ func TestClaudeCodexLaunchesClaudeWithBridgeEnvironment(t *testing.T) {
 		"haiku=claude-codex-luna",
 		"haiku_name=Codex Luna",
 		"effort=",
-		"args=--model claude-codex-sol -p hello",
+		"claude-codex-hook 'http://subrouter-team:31415/claude-codex/hooks/pre-compact'",
+		"args=--settings {\"hooks\":{\"PreCompact\":[{\"hooks\":[{\"command\":",
+		"\"timeout\":10,\"type\":\"command\"}],\"matcher\":\"\"}]}} --model claude-codex-sol -p hello",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in launch environment:\n%s", want, got)
@@ -188,5 +190,12 @@ func TestClaudeCodexArgsPreservesExplicitModel(t *testing.T) {
 	want = []string{"--model=claude-codex-luna", "-p", "hello"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestClaudeCodexHookArgsPreservesExplicitSettings(t *testing.T) {
+	args := []string{"--settings", "/tmp/custom.json", "-p", "hello"}
+	if got := claudeCodexHookArgs(args, "sr claude-codex-hook http://subrouter"); !slices.Equal(got, args) {
+		t.Fatalf("args = %q, want %q", got, args)
 	}
 }

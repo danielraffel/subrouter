@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -28,6 +30,20 @@ var claudeCodexModels = map[string]string{
 	"gpt-5.6-terra":      "gpt-5.6-terra",
 	"gpt-5.6-luna":       "gpt-5.6-luna",
 }
+
+type claudeCodexCompactionHook struct {
+	SessionID          string `json:"session_id"`
+	HookEventName      string `json:"hook_event_name"`
+	Trigger            string `json:"trigger"`
+	CustomInstructions string `json:"custom_instructions"`
+}
+
+type claudeCodexPendingCompaction struct {
+	Trigger   string
+	CreatedAt time.Time
+}
+
+var claudeCodexPendingCompactions sync.Map
 
 func ClaudeCodexModelName() string {
 	return claudeCodexModel
@@ -58,6 +74,10 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if strings.HasSuffix(r.URL.Path, "/hooks/pre-compact") {
+		s.serveClaudeCodexPreCompactHook(w, r)
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/count_tokens") {
 		s.serveClaudeCodexCountTokens(w, r)
 		return
@@ -81,6 +101,7 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 		writeClaudeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	compaction, isCompaction := claudeCodexCompactionForRequest(sessionID, body)
 
 	// Use a distinct session namespace while selecting from the Codex account
 	// pool. A Claude session and a native Codex session may carry the same ID;
@@ -160,6 +181,9 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 	if sessionID != "" {
 		wsRequest["prompt_cache_key"] = "claude-codex:" + sessionID
 	}
+	if isCompaction {
+		wsRequest["client_metadata"] = claudeCodexCompactionMetadata(sessionID, compaction.Trigger)
+	}
 	if err := connection.WriteJSON(wsRequest); err != nil {
 		writeClaudeError(w, http.StatusBadGateway, "api_error", "send Codex request")
 		return
@@ -169,8 +193,11 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 	w.Header().Set("X-Subrouter-Upstream-Provider", "codex-chatgpt")
 	w.Header().Set("X-Subrouter-Upstream-Model", upstreamModel)
 	w.Header().Set("X-Subrouter-Reasoning-Effort", reasoningEffort)
+	if isCompaction {
+		w.Header().Set("X-Subrouter-Compaction", "codex-responses")
+	}
 	if s.Logger != nil {
-		s.Logger.Info("claude codex bridge request", "agent", bridgeAgent, "session", sessionID, "account", account.ID, "model", upstreamModel, "reasoning_effort", reasoningEffort, "upstream", upstream.Host)
+		s.Logger.Info("claude codex bridge request", "agent", bridgeAgent, "session", sessionID, "account", account.ID, "model", upstreamModel, "reasoning_effort", reasoningEffort, "request_kind", map[bool]string{true: "compaction", false: "turn"}[isCompaction], "upstream", upstream.Host)
 	}
 	if s.SchedulerRef != nil {
 		s.SchedulerRef.NoteRouted(accounts.ProviderCodex, account.ID)
@@ -199,6 +226,83 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(translated)
+}
+
+func (s Server) serveClaudeCodexPreCompactHook(w http.ResponseWriter, r *http.Request) {
+	var hook claudeCodexCompactionHook
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&hook); err != nil {
+		writeClaudeError(w, http.StatusBadRequest, "invalid_request_error", "invalid PreCompact hook payload")
+		return
+	}
+	if hook.HookEventName != "PreCompact" || hook.SessionID == "" || len(hook.SessionID) > 256 {
+		writeClaudeError(w, http.StatusBadRequest, "invalid_request_error", "invalid PreCompact hook event")
+		return
+	}
+	trigger := hook.Trigger
+	if trigger != "manual" && trigger != "auto" {
+		trigger = "auto"
+	}
+	claudeCodexPendingCompactions.Store(hook.SessionID, claudeCodexPendingCompaction{
+		Trigger: trigger, CreatedAt: time.Now(),
+	})
+	if s.Logger != nil {
+		s.Logger.Info("claude codex compaction hook", "session", hook.SessionID, "trigger", trigger)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(w, "{}\n")
+}
+
+func claudeCodexCompactionForRequest(sessionID string, body []byte) (claudeCodexPendingCompaction, bool) {
+	if !isClaudeCompactionRequest(body) {
+		return claudeCodexPendingCompaction{}, false
+	}
+	if value, ok := claudeCodexPendingCompactions.LoadAndDelete(sessionID); ok {
+		pending, valid := value.(claudeCodexPendingCompaction)
+		if valid && time.Since(pending.CreatedAt) <= 5*time.Minute {
+			return pending, true
+		}
+	}
+	return claudeCodexPendingCompaction{Trigger: "auto", CreatedAt: time.Now()}, true
+}
+
+func isClaudeCompactionRequest(body []byte) bool {
+	var request struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if json.Unmarshal(body, &request) != nil {
+		return false
+	}
+	for i := len(request.Messages) - 1; i >= 0; i-- {
+		var message struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(request.Messages[i], &message) != nil || message.Role != "user" {
+			continue
+		}
+		text := anthropicText(message.Content)
+		return strings.Contains(text, "Your task is to create a detailed summary of the conversation so far") ||
+			strings.Contains(text, "Before providing your final summary, wrap your analysis in <analysis> tags")
+	}
+	return false
+}
+
+func claudeCodexCompactionMetadata(sessionID, trigger string) map[string]string {
+	metadata := map[string]any{
+		"session_id":   sessionID,
+		"thread_id":    sessionID,
+		"request_kind": "compaction",
+		"compaction": map[string]any{
+			"trigger": trigger, "reason": map[bool]string{true: "user_requested", false: "context_limit"}[trigger == "manual"],
+			"implementation": "responses", "phase": "standalone_turn", "strategy": "memento",
+		},
+	}
+	encoded, _ := json.Marshal(metadata)
+	return map[string]string{
+		"session_id":            sessionID,
+		"thread_id":             sessionID,
+		"x-codex-turn-metadata": string(encoded),
+	}
 }
 
 func (s Server) serveClaudeCodexCountTokens(w http.ResponseWriter, r *http.Request) {
