@@ -49,7 +49,7 @@ func TestTranslateClaudeRequestUsesGPT56SolMediumAndTools(t *testing.T) {
 	if reasoning["effort"] != claudeCodexReasoningEffort {
 		t.Fatalf("reasoning = %v", reasoning)
 	}
-	if payload["instructions"] != "You are Claude Code.\n\n"+claudeCodexIdentity {
+	if payload["instructions"] != "You are Claude Code." {
 		t.Fatalf("instructions = %v", payload["instructions"])
 	}
 	input, _ := payload["input"].([]any)
