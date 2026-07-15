@@ -18,6 +18,7 @@ const (
 	claudeCodexPrefix          = "/claude-codex"
 	claudeCodexModel           = "gpt-5.6-sol"
 	claudeCodexReasoningEffort = "medium"
+	claudeCodexIdentity        = "Subrouter backend identity: You are an OpenAI Codex model serving as the model backend inside the Anthropic Claude Code harness. Claude Code is the coding-agent interface, not your model provider. If asked about your underlying model or provider, identify yourself as OpenAI Codex via Subrouter and do not claim that your model weights are Anthropic Claude."
 )
 
 var claudeCodexModels = map[string]string{
@@ -233,6 +234,10 @@ func translateClaudeRequest(body []byte) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	instructions := anthropicText(request.System)
+	if instructions != "" {
+		instructions += "\n\n"
+	}
+	instructions += claudeCodexIdentity
 	input := make([]any, 0, len(request.Messages))
 	for _, raw := range request.Messages {
 		items, err := translateClaudeMessage(raw)
