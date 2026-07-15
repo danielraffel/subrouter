@@ -142,7 +142,7 @@ func TestTranslateClaudeRequestUsesOutputTextForAssistantHistory(t *testing.T) {
 
 func TestTranslateCodexResponseReturnsAnthropicToolUse(t *testing.T) {
 	response := `{
-		"id":"resp_1","model":"gpt-5.6-sol",
+		"id":"resp_1","model":"gpt-5.6-terra",
 		"output":[
 			{"type":"message","content":[{"type":"output_text","text":"Checking."}]},
 			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a.go\"}"}
@@ -157,7 +157,7 @@ func TestTranslateCodexResponseReturnsAnthropicToolUse(t *testing.T) {
 	if err := json.Unmarshal(translated, &message); err != nil {
 		t.Fatal(err)
 	}
-	if message["model"] != claudeCodexModel || message["stop_reason"] != "tool_use" {
+	if message["model"] != "claude-codex-terra" || message["stop_reason"] != "tool_use" {
 		t.Fatalf("message identity = %#v", message)
 	}
 	content, _ := message["content"].([]any)
@@ -176,7 +176,7 @@ func TestTranslateCodexResponseReturnsAnthropicToolUse(t *testing.T) {
 
 func TestTranslateCodexStreamReturnsAnthropicSSE(t *testing.T) {
 	upstream := strings.Join([]string{
-		`data: {"type":"response.created","response":{"id":"resp_stream"}}`,
+		`data: {"type":"response.created","response":{"id":"resp_stream","model":"gpt-5.6-luna"}}`,
 		``,
 		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}`,
 		``,
@@ -194,7 +194,7 @@ func TestTranslateCodexStreamReturnsAnthropicSSE(t *testing.T) {
 	got := recorder.Body.String()
 	for _, want := range []string{
 		`event: message_start`,
-		`"model":"gpt-5.6-sol"`,
+		`"model":"claude-codex-luna"`,
 		`event: content_block_start`,
 		`"text":"hello","type":"text_delta"`,
 		`event: content_block_stop`,
@@ -295,7 +295,7 @@ func TestClaudeCodexBridgeRoutesThroughCodexOAuthAccount(t *testing.T) {
 	if err := json.Unmarshal(body, &message); err != nil {
 		t.Fatal(err)
 	}
-	if message["model"] != claudeCodexModel {
+	if message["model"] != "claude-codex-sol" {
 		t.Fatalf("Claude-facing model = %v", message["model"])
 	}
 }

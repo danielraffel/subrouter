@@ -288,6 +288,17 @@ func resolveClaudeCodexModel(model string) (string, error) {
 	return "", fmt.Errorf("unsupported Claude-Codex model %q; choose Sol, Terra, or Luna with /model", model)
 }
 
+func claudeCodexClientModel(model string) string {
+	switch model {
+	case "gpt-5.6-terra":
+		return "claude-codex-terra"
+	case "gpt-5.6-luna":
+		return "claude-codex-luna"
+	default:
+		return "claude-codex-sol"
+	}
+}
+
 func resolveClaudeCodexEffort(effort string) (string, error) {
 	if effort == "" || effort == "auto" {
 		return claudeCodexReasoningEffort, nil
@@ -465,7 +476,7 @@ func translateCodexResponse(body io.Reader) ([]byte, error) {
 		response.ID = "msg_subrouter_codex"
 	}
 	return json.Marshal(map[string]any{
-		"id": response.ID, "type": "message", "role": "assistant", "model": claudeCodexModel,
+		"id": response.ID, "type": "message", "role": "assistant", "model": claudeCodexClientModel(response.Model),
 		"content": content, "stop_reason": stopReason, "stop_sequence": nil,
 		"usage": claudeUsage(response.Usage.InputTokens, response.Usage.OutputTokens, response.Usage.InputTokensDetails.CachedTokens),
 	})
@@ -476,6 +487,7 @@ type claudeCodexStreamState struct {
 	flusher      http.Flusher
 	started      bool
 	messageID    string
+	model        string
 	nextIndex    int
 	blocks       map[int]int
 	blockTypes   map[int]string
@@ -642,9 +654,13 @@ func (s *claudeCodexStreamState) consume(data []byte) error {
 	switch eventType {
 	case "response.created", "response.in_progress":
 		var response struct {
-			ID string `json:"id"`
+			ID    string `json:"id"`
+			Model string `json:"model"`
 		}
 		_ = json.Unmarshal(event["response"], &response)
+		if response.Model != "" {
+			s.model = claudeCodexClientModel(response.Model)
+		}
 		s.start(response.ID)
 	case "response.output_item.added":
 		s.start("")
@@ -688,6 +704,7 @@ func (s *claudeCodexStreamState) consume(data []byte) error {
 		}
 	case "response.completed", "response.done":
 		var response struct {
+			Model string `json:"model"`
 			Usage struct {
 				InputTokens        int `json:"input_tokens"`
 				OutputTokens       int `json:"output_tokens"`
@@ -697,6 +714,9 @@ func (s *claudeCodexStreamState) consume(data []byte) error {
 			} `json:"usage"`
 		}
 		_ = json.Unmarshal(event["response"], &response)
+		if response.Model != "" {
+			s.model = claudeCodexClientModel(response.Model)
+		}
 		s.inputTokens = response.Usage.InputTokens
 		s.outputTokens = response.Usage.OutputTokens
 		s.cachedTokens = response.Usage.InputTokensDetails.CachedTokens
@@ -716,8 +736,11 @@ func (s *claudeCodexStreamState) start(id string) {
 	}
 	s.messageID = id
 	s.started = true
+	if s.model == "" {
+		s.model = "claude-codex-sol"
+	}
 	s.emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{
-		"id": id, "type": "message", "role": "assistant", "model": claudeCodexModel,
+		"id": id, "type": "message", "role": "assistant", "model": s.model,
 		"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
 		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 	}})
