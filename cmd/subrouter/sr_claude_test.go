@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -158,21 +159,34 @@ func TestClaudeCodexLaunchesClaudeWithBridgeEnvironment(t *testing.T) {
 		"auth=subrouter",
 		"custom=",
 		"oauth=",
-		"model=claude-codex-sol",
+		"model=",
 		"fable=claude-codex-sol",
 		"fable_name=Codex Sol",
-		"opus=",
+		"opus=claude-codex-sol",
 		"sonnet=claude-codex-terra",
 		"haiku=claude-codex-luna",
 		"haiku_name=Codex Luna",
 		"effort=",
-		"args=-p hello",
+		"args=--model claude-codex-sol -p hello",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in launch environment:\n%s", want, got)
 		}
 	}
-	if !strings.Contains(out.String(), "Claude Code -> Codex Sol/Terra/Luna via Subrouter http://subrouter-team:31415 (default Sol; choose with /model and /effort)") {
+	if !strings.Contains(out.String(), "Claude Code -> Codex Sol/Terra/Luna via Subrouter http://subrouter-team:31415 (default Sol; subagents: Luna=haiku, Terra=sonnet, Sol=opus/inherit)") {
 		t.Fatalf("missing route banner: %q", out.String())
+	}
+}
+
+func TestClaudeCodexArgsPreservesExplicitModel(t *testing.T) {
+	got := claudeCodexArgs([]string{"--model", "claude-codex-terra", "-p", "hello"})
+	want := []string{"--model", "claude-codex-terra", "-p", "hello"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+	got = claudeCodexArgs([]string{"--model=claude-codex-luna", "-p", "hello"})
+	want = []string{"--model=claude-codex-luna", "-p", "hello"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("args = %q, want %q", got, want)
 	}
 }

@@ -528,7 +528,8 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, args...)
+	claudeArgs := claudeCodexArgs(args)
+	cmd := exec.CommandContext(ctx, claudePath, claudeArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
@@ -568,11 +569,14 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 	cmd.Env = append(env,
 		"ANTHROPIC_BASE_URL="+strings.TrimRight(server.URL, "/")+"/claude-codex",
 		"ANTHROPIC_AUTH_TOKEN=subrouter",
-		"ANTHROPIC_MODEL=claude-codex-sol",
 		"ANTHROPIC_DEFAULT_FABLE_MODEL=claude-codex-sol",
 		"ANTHROPIC_DEFAULT_FABLE_MODEL_NAME=Codex Sol",
 		"ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION=GPT-5.6 Sol via Subrouter",
 		"ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL=claude-codex-sol",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Codex Sol (Opus tier)",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION=GPT-5.6 Sol for complex Subrouter subagents",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
 		"ANTHROPIC_DEFAULT_SONNET_MODEL=claude-codex-terra",
 		"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Codex Terra",
 		"ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION=GPT-5.6 Terra via Subrouter",
@@ -583,8 +587,17 @@ func (r srRunner) claudeCodex(ctx context.Context, args []string) error {
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 	)
-	fmt.Fprintf(r.errOut, "Claude Code -> Codex Sol/Terra/Luna via Subrouter %s (default Sol; choose with /model and /effort)\n", server.URL)
+	fmt.Fprintf(r.errOut, "Claude Code -> Codex Sol/Terra/Luna via Subrouter %s (default Sol; subagents: Luna=haiku, Terra=sonnet, Sol=opus/inherit)\n", server.URL)
 	return cmd.Run()
+}
+
+func claudeCodexArgs(args []string) []string {
+	for _, arg := range args {
+		if arg == "--model" || strings.HasPrefix(arg, "--model=") {
+			return args
+		}
+	}
+	return append([]string{"--model", "claude-codex-sol"}, args...)
 }
 
 // claudeDirect launches Claude Code straight against Anthropic on the user's own

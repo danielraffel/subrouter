@@ -364,7 +364,22 @@ sr claude-codex
 sr claude-codex -p "inspect this repository"
 ```
 
-This launches the installed `claude` binary and points its Messages API at Subrouter's `/claude-codex` bridge. The bridge translates messages, streaming text, tool calls, and tool results to the Responses WebSocket protocol. Its upstream is fixed to `gpt-5.6-sol` with medium reasoning effort. The wrapper prints that model, effort, and Subrouter server before launch. Bridge responses also include `X-Subrouter-Bridge`, `X-Subrouter-Upstream-Provider`, `X-Subrouter-Upstream-Model`, and `X-Subrouter-Reasoning-Effort` headers.
+This launches the installed `claude` binary and points its Messages API at Subrouter's `/claude-codex` bridge. The bridge translates messages, streaming text, tool calls, and tool results to the Responses WebSocket protocol. Sol is the default; `/model` can select Sol, Terra, or Luna and `/effort` controls reasoning effort. The wrapper prints the routing policy and Subrouter server before launch. Bridge responses also include `X-Subrouter-Bridge`, `X-Subrouter-Upstream-Provider`, `X-Subrouter-Upstream-Model`, and `X-Subrouter-Reasoning-Effort` headers.
+
+Inside `sr claude-codex`, `/model` exposes Codex Sol, Terra, and Luna, while
+`/effort` controls the Responses reasoning effort. Claude Code subagent tiers
+stay dynamic: `haiku` routes to Luna for fast exploration, `sonnet` routes to
+Terra for balanced implementation and review, and `opus` routes to Sol for
+complex work. Subagents using `inherit` stay on the parent Codex model. The
+wrapper deliberately clears `CLAUDE_CODE_SUBAGENT_MODEL` instead of forcing one
+model for every child.
+
+The model chosen on an individual `Agent` invocation takes precedence over the
+subagent definition. This lets the parent send trivial read-only children to
+Luna even when a reusable agent definition names a larger tier, while explicit
+`sonnet` and `opus` invocations still route to Terra and Sol. The bridge rejects
+all model IDs outside the three Codex routes, so a child cannot silently fall
+through to an Anthropic model.
 
 Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
 
