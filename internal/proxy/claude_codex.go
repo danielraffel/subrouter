@@ -138,6 +138,12 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 		return
 	}
 	wsRequest["type"] = "response.create"
+	// Keep successive turns from one Claude Code conversation on the same
+	// OpenAI prompt-cache routing key. The translated instructions, tools, and
+	// prior messages remain deterministic, so their shared prefix can be reused.
+	if sessionID != "" {
+		wsRequest["prompt_cache_key"] = "claude-codex:" + sessionID
+	}
 	if err := connection.WriteJSON(wsRequest); err != nil {
 		writeClaudeError(w, http.StatusBadGateway, "api_error", "send Codex request")
 		return
@@ -305,9 +311,13 @@ func translateClaudeMessage(raw json.RawMessage) ([]any, error) {
 }
 
 func responsesMessage(role, text string) map[string]any {
+	contentType := "input_text"
+	if role == "assistant" {
+		contentType = "output_text"
+	}
 	return map[string]any{
 		"type": "message", "role": role,
-		"content": []any{map[string]any{"type": "input_text", "text": text}},
+		"content": []any{map[string]any{"type": contentType, "text": text}},
 	}
 }
 
@@ -374,8 +384,11 @@ func translateCodexResponse(body io.Reader) ([]byte, error) {
 			} `json:"content"`
 		} `json:"output"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			InputTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(body).Decode(&response); err != nil {
@@ -408,7 +421,7 @@ func translateCodexResponse(body io.Reader) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"id": response.ID, "type": "message", "role": "assistant", "model": claudeCodexModel,
 		"content": content, "stop_reason": stopReason, "stop_sequence": nil,
-		"usage": map[string]any{"input_tokens": response.Usage.InputTokens, "output_tokens": response.Usage.OutputTokens},
+		"usage": claudeUsage(response.Usage.InputTokens, response.Usage.OutputTokens, response.Usage.InputTokensDetails.CachedTokens),
 	})
 }
 
@@ -423,6 +436,7 @@ type claudeCodexStreamState struct {
 	toolCalls    bool
 	inputTokens  int
 	outputTokens int
+	cachedTokens int
 }
 
 func translateCodexWebsocketStream(w http.ResponseWriter, connection *websocket.Conn) error {
@@ -629,13 +643,17 @@ func (s *claudeCodexStreamState) consume(data []byte) error {
 	case "response.completed", "response.done":
 		var response struct {
 			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens        int `json:"input_tokens"`
+				OutputTokens       int `json:"output_tokens"`
+				InputTokensDetails struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"input_tokens_details"`
 			} `json:"usage"`
 		}
 		_ = json.Unmarshal(event["response"], &response)
 		s.inputTokens = response.Usage.InputTokens
 		s.outputTokens = response.Usage.OutputTokens
+		s.cachedTokens = response.Usage.InputTokensDetails.CachedTokens
 		s.finish()
 	case "error", "response.failed", "response.incomplete":
 		return fmt.Errorf("Responses stream failed: %s", string(data))
@@ -682,8 +700,24 @@ func (s *claudeCodexStreamState) finish() {
 	if s.toolCalls {
 		stopReason = "tool_use"
 	}
-	s.emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": map[string]any{"input_tokens": s.inputTokens, "output_tokens": s.outputTokens}})
+	s.emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil}, "usage": claudeUsage(s.inputTokens, s.outputTokens, s.cachedTokens)})
 	s.emit("message_stop", map[string]any{"type": "message_stop"})
+}
+
+func claudeUsage(inputTokens, outputTokens, cachedTokens int) map[string]any {
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	uncachedTokens := inputTokens - cachedTokens
+	if uncachedTokens < 0 {
+		uncachedTokens = 0
+	}
+	return map[string]any{
+		"input_tokens":                uncachedTokens,
+		"output_tokens":               outputTokens,
+		"cache_creation_input_tokens": 0,
+		"cache_read_input_tokens":     cachedTokens,
+	}
 }
 
 func (s *claudeCodexStreamState) emit(event string, payload any) {

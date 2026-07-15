@@ -70,6 +70,41 @@ func TestTranslateClaudeRequestUsesGPT56SolMediumAndTools(t *testing.T) {
 	}
 }
 
+func TestTranslateClaudeRequestUsesOutputTextForAssistantHistory(t *testing.T) {
+	body := []byte(`{
+		"stream":true,
+		"messages":[
+			{"role":"user","content":"first"},
+			{"role":"assistant","content":"answer"},
+			{"role":"user","content":"second"}
+		]
+	}`)
+	translated, _, err := translateClaudeRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Input []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(translated, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := payload.Input[0].Content[0].Type; got != "input_text" {
+		t.Fatalf("user content type = %q, want input_text", got)
+	}
+	if got := payload.Input[1].Content[0].Type; got != "output_text" {
+		t.Fatalf("assistant content type = %q, want output_text", got)
+	}
+	if got := payload.Input[2].Content[0].Type; got != "input_text" {
+		t.Fatalf("user content type = %q, want input_text", got)
+	}
+}
+
 func TestTranslateCodexResponseReturnsAnthropicToolUse(t *testing.T) {
 	response := `{
 		"id":"resp_1","model":"gpt-5.6-sol",
@@ -77,7 +112,7 @@ func TestTranslateCodexResponseReturnsAnthropicToolUse(t *testing.T) {
 			{"type":"message","content":[{"type":"output_text","text":"Checking."}]},
 			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"Read","arguments":"{\"path\":\"a.go\"}"}
 		],
-		"usage":{"input_tokens":42,"output_tokens":7}
+		"usage":{"input_tokens":42,"output_tokens":7,"input_tokens_details":{"cached_tokens":30}}
 	}`
 	translated, err := translateCodexResponse(strings.NewReader(response))
 	if err != nil {
@@ -98,6 +133,10 @@ func TestTranslateCodexResponseReturnsAnthropicToolUse(t *testing.T) {
 	if tool["type"] != "tool_use" || tool["id"] != "call_1" || tool["name"] != "Read" {
 		t.Fatalf("tool block = %#v", tool)
 	}
+	usage, _ := message["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(12) || usage["cache_read_input_tokens"] != float64(30) {
+		t.Fatalf("usage = %#v", usage)
+	}
 }
 
 func TestTranslateCodexStreamReturnsAnthropicSSE(t *testing.T) {
@@ -110,7 +149,7 @@ func TestTranslateCodexStreamReturnsAnthropicSSE(t *testing.T) {
 		``,
 		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}`,
 		``,
-		`data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}`,
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":8}}}}`,
 		``,
 	}, "\n")
 	recorder := httptest.NewRecorder()
@@ -125,6 +164,8 @@ func TestTranslateCodexStreamReturnsAnthropicSSE(t *testing.T) {
 		`"text":"hello","type":"text_delta"`,
 		`event: content_block_stop`,
 		`"stop_reason":"end_turn"`,
+		`"cache_read_input_tokens":8`,
+		`"input_tokens":4`,
 		`event: message_stop`,
 	} {
 		if !strings.Contains(got, want) {
@@ -204,6 +245,9 @@ func TestClaudeCodexBridgeRoutesThroughCodexOAuthAccount(t *testing.T) {
 	}
 	if upstreamPayload["model"] != claudeCodexModel {
 		t.Fatalf("upstream model = %v", upstreamPayload["model"])
+	}
+	if upstreamPayload["prompt_cache_key"] != "claude-codex:claude-session-1" {
+		t.Fatalf("prompt cache key = %v", upstreamPayload["prompt_cache_key"])
 	}
 	reasoning, _ := upstreamPayload["reasoning"].(map[string]any)
 	if reasoning["effort"] != claudeCodexReasoningEffort {
