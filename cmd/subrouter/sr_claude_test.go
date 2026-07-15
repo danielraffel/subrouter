@@ -122,12 +122,17 @@ func TestClaudeCodexLaunchesClaudeWithBridgeEnvironment(t *testing.T) {
 	}
 	recordPath := filepath.Join(home, "claude-codex-run.txt")
 	claudePath := filepath.Join(binDir, "claude")
-	script := "#!/bin/sh\nprintf 'base=%s\\nauth=%s\\ncustom=%s\\noauth=%s\\nargs=%s\\n' \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\" \"$CLAUDE_CODE_OAUTH_TOKEN\" \"$*\" > " + shellQuote(recordPath) + "\n"
+	script := "#!/bin/sh\nprintf 'base=%s\\nauth=%s\\ncustom=%s\\noauth=%s\\nmodel=%s\\nfable=%s\\nfable_name=%s\\nopus=%s\\nsonnet=%s\\nhaiku=%s\\nhaiku_name=%s\\neffort=%s\\nargs=%s\\n' \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\" \"$CLAUDE_CODE_OAUTH_TOKEN\" \"$ANTHROPIC_MODEL\" \"$ANTHROPIC_DEFAULT_FABLE_MODEL\" \"$ANTHROPIC_DEFAULT_FABLE_MODEL_NAME\" \"$ANTHROPIC_DEFAULT_OPUS_MODEL\" \"$ANTHROPIC_DEFAULT_SONNET_MODEL\" \"$ANTHROPIC_DEFAULT_HAIKU_MODEL\" \"$ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME\" \"$CLAUDE_CODE_EFFORT_LEVEL\" \"$*\" > " + shellQuote(recordPath) + "\n"
 	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Leaked: value")
+	t.Setenv("ANTHROPIC_MODEL", "claude-fable-5")
+	t.Setenv("ANTHROPIC_DEFAULT_FABLE_MODEL", "claude-fable-5")
+	t.Setenv("ANTHROPIC_CUSTOM_MODEL_OPTION", "claude-fable-5")
+	t.Setenv("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", "Fable 5")
+	t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", "high")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-leak")
 
 	store := accounts.CodexStore{Dir: filepath.Join(home, "codex", "accounts")}
@@ -153,13 +158,21 @@ func TestClaudeCodexLaunchesClaudeWithBridgeEnvironment(t *testing.T) {
 		"auth=subrouter",
 		"custom=",
 		"oauth=",
+		"model=claude-codex-sol",
+		"fable=claude-codex-sol",
+		"fable_name=Codex Sol",
+		"opus=",
+		"sonnet=claude-codex-terra",
+		"haiku=claude-codex-luna",
+		"haiku_name=Codex Luna",
+		"effort=",
 		"args=-p hello",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in launch environment:\n%s", want, got)
 		}
 	}
-	if !strings.Contains(out.String(), "Claude Code -> gpt-5.6-sol (medium) via Subrouter http://subrouter-team:31415") {
+	if !strings.Contains(out.String(), "Claude Code -> Codex Sol/Terra/Luna via Subrouter http://subrouter-team:31415 (default Sol; choose with /model and /effort)") {
 		t.Fatalf("missing route banner: %q", out.String())
 	}
 }

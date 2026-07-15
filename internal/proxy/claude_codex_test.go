@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,7 +21,7 @@ import (
 
 func TestTranslateClaudeRequestUsesGPT56SolMediumAndTools(t *testing.T) {
 	body := []byte(`{
-		"model":"claude-opus-4-6","stream":true,
+		"model":"claude-codex-sol","stream":true,
 		"system":[{"type":"text","text":"You are Claude Code."}],
 		"messages":[
 			{"role":"user","content":[{"type":"text","text":"inspect"}]},
@@ -67,6 +68,40 @@ func TestTranslateClaudeRequestUsesGPT56SolMediumAndTools(t *testing.T) {
 	tool, _ := tools[0].(map[string]any)
 	if tool["name"] != "Read" {
 		t.Fatalf("tool = %#v", tool)
+	}
+}
+
+func TestTranslateClaudeRequestRoutesModelAndEffort(t *testing.T) {
+	tests := []struct {
+		model      string
+		effort     string
+		wantModel  string
+		wantEffort string
+	}{
+		{model: "claude-codex-sol", effort: "low", wantModel: "gpt-5.6-sol", wantEffort: "low"},
+		{model: "claude-codex-terra", effort: "high", wantModel: "gpt-5.6-terra", wantEffort: "high"},
+		{model: "claude-codex-luna", effort: "max", wantModel: "gpt-5.6-luna", wantEffort: "max"},
+	}
+	for _, test := range tests {
+		t.Run(test.model+"/"+test.effort, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"model":%q,"output_config":{"effort":%q},"messages":[{"role":"user","content":"hello"}]}`, test.model, test.effort))
+			translated, _, err := translateClaudeRequest(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload struct {
+				Model     string `json:"model"`
+				Reasoning struct {
+					Effort string `json:"effort"`
+				} `json:"reasoning"`
+			}
+			if err := json.Unmarshal(translated, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Model != test.wantModel || payload.Reasoning.Effort != test.wantEffort {
+				t.Fatalf("route = %s/%s, want %s/%s", payload.Model, payload.Reasoning.Effort, test.wantModel, test.wantEffort)
+			}
+		})
 	}
 }
 
@@ -220,7 +255,7 @@ func TestClaudeCodexBridgeRoutesThroughCodexOAuthAccount(t *testing.T) {
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	requestBody := `{"model":"claude-opus-4-6","stream":false,"system":"test","messages":[{"role":"user","content":"reply"}],"tools":[]}`
+	requestBody := `{"model":"claude-codex-sol","stream":false,"system":"test","messages":[{"role":"user","content":"reply"}],"tools":[]}`
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/claude-codex/v1/messages", bytes.NewBufferString(requestBody))
 	if err != nil {
 		t.Fatal(err)

@@ -20,6 +20,15 @@ const (
 	claudeCodexReasoningEffort = "medium"
 )
 
+var claudeCodexModels = map[string]string{
+	"claude-codex-sol":   "gpt-5.6-sol",
+	"claude-codex-terra": "gpt-5.6-terra",
+	"claude-codex-luna":  "gpt-5.6-luna",
+	"gpt-5.6-sol":        "gpt-5.6-sol",
+	"gpt-5.6-terra":      "gpt-5.6-terra",
+	"gpt-5.6-luna":       "gpt-5.6-luna",
+}
+
 func ClaudeCodexModelName() string {
 	return claudeCodexModel
 }
@@ -29,11 +38,15 @@ func ClaudeCodexReasoningEffortName() string {
 }
 
 type claudeCodexRequest struct {
-	System     json.RawMessage   `json:"system"`
-	Messages   []json.RawMessage `json:"messages"`
-	Tools      []json.RawMessage `json:"tools"`
-	ToolChoice json.RawMessage   `json:"tool_choice"`
-	Stream     bool              `json:"stream"`
+	System       json.RawMessage   `json:"system"`
+	Messages     []json.RawMessage `json:"messages"`
+	Tools        []json.RawMessage `json:"tools"`
+	ToolChoice   json.RawMessage   `json:"tool_choice"`
+	Model        string            `json:"model"`
+	OutputConfig struct {
+		Effort string `json:"effort"`
+	} `json:"output_config"`
+	Stream bool `json:"stream"`
 }
 
 func claudeCodexRequestPath(path string) bool {
@@ -138,6 +151,9 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 		return
 	}
 	wsRequest["type"] = "response.create"
+	upstreamModel, _ := wsRequest["model"].(string)
+	reasoning, _ := wsRequest["reasoning"].(map[string]any)
+	reasoningEffort, _ := reasoning["effort"].(string)
 	// Keep successive turns from one Claude Code conversation on the same
 	// OpenAI prompt-cache routing key. The translated instructions, tools, and
 	// prior messages remain deterministic, so their shared prefix can be reused.
@@ -151,10 +167,10 @@ func (s Server) serveClaudeCodex(w http.ResponseWriter, r *http.Request, agentTy
 
 	w.Header().Set("X-Subrouter-Bridge", "claude-codex")
 	w.Header().Set("X-Subrouter-Upstream-Provider", "codex-chatgpt")
-	w.Header().Set("X-Subrouter-Upstream-Model", claudeCodexModel)
-	w.Header().Set("X-Subrouter-Reasoning-Effort", claudeCodexReasoningEffort)
+	w.Header().Set("X-Subrouter-Upstream-Model", upstreamModel)
+	w.Header().Set("X-Subrouter-Reasoning-Effort", reasoningEffort)
 	if s.Logger != nil {
-		s.Logger.Info("claude codex bridge request", "agent", bridgeAgent, "session", sessionID, "account", account.ID, "model", claudeCodexModel, "reasoning_effort", claudeCodexReasoningEffort, "upstream", upstream.Host)
+		s.Logger.Info("claude codex bridge request", "agent", bridgeAgent, "session", sessionID, "account", account.ID, "model", upstreamModel, "reasoning_effort", reasoningEffort, "upstream", upstream.Host)
 	}
 	if s.SchedulerRef != nil {
 		s.SchedulerRef.NoteRouted(accounts.ProviderCodex, account.ID)
@@ -208,6 +224,14 @@ func translateClaudeRequest(body []byte) ([]byte, bool, error) {
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, false, fmt.Errorf("decode Claude request: %w", err)
 	}
+	model, err := resolveClaudeCodexModel(request.Model)
+	if err != nil {
+		return nil, false, err
+	}
+	effort, err := resolveClaudeCodexEffort(request.OutputConfig.Effort)
+	if err != nil {
+		return nil, false, err
+	}
 	instructions := anthropicText(request.System)
 	input := make([]any, 0, len(request.Messages))
 	for _, raw := range request.Messages {
@@ -236,13 +260,13 @@ func translateClaudeRequest(body []byte) ([]byte, bool, error) {
 		})
 	}
 	payload := map[string]any{
-		"model":               claudeCodexModel,
+		"model":               model,
 		"instructions":        instructions,
 		"input":               input,
 		"tools":               tools,
 		"tool_choice":         "auto",
 		"parallel_tool_calls": true,
-		"reasoning":           map[string]any{"effort": claudeCodexReasoningEffort},
+		"reasoning":           map[string]any{"effort": effort},
 		"store":               false,
 		"stream":              true,
 		"include":             []string{"reasoning.encrypted_content"},
@@ -252,6 +276,28 @@ func translateClaudeRequest(body []byte) ([]byte, bool, error) {
 	}
 	translated, err := json.Marshal(payload)
 	return translated, request.Stream, err
+}
+
+func resolveClaudeCodexModel(model string) (string, error) {
+	if model == "" {
+		return claudeCodexModel, nil
+	}
+	if upstream, ok := claudeCodexModels[model]; ok {
+		return upstream, nil
+	}
+	return "", fmt.Errorf("unsupported Claude-Codex model %q; choose Sol, Terra, or Luna with /model", model)
+}
+
+func resolveClaudeCodexEffort(effort string) (string, error) {
+	if effort == "" || effort == "auto" {
+		return claudeCodexReasoningEffort, nil
+	}
+	switch effort {
+	case "low", "medium", "high", "xhigh", "max":
+		return effort, nil
+	default:
+		return "", fmt.Errorf("unsupported Claude-Codex effort %q; choose low, medium, high, xhigh, or max", effort)
+	}
 }
 
 func translateClaudeMessage(raw json.RawMessage) ([]any, error) {
