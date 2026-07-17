@@ -158,6 +158,36 @@ func TestHandlerForwardsUpstreamWebSocketCloseHandshake(t *testing.T) {
 	}
 }
 
+func TestForwardWebSocketCloseTranslatesTransportReset(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		forwardWebSocketClose(conn, io.ErrUnexpectedEOF)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer response.Body.Close()
+	defer conn.Close()
+
+	_, _, err = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want WebSocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseInternalServerErr {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseInternalServerErr)
+	}
+}
+
 func TestHandlerProxiesWebSocketWhenAllOAuthAccountsBelowProtectedHeadroom(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

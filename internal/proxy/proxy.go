@@ -2118,6 +2118,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 	for {
 		messageType, body, err := src.ReadMessage()
 		if err != nil {
+			forwardWebSocketClose(dst, err)
 			return
 		}
 		if s.Transcripts != nil {
@@ -2144,6 +2145,36 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
 		}
+	}
+}
+
+const webSocketCloseWriteTimeout = time.Second
+
+// forwardWebSocketClose preserves the close handshake across the proxy. A raw
+// TCP close makes the other peer report abnormal closure 1006 even when the
+// first peer sent a valid WebSocket close frame. Unexpected transport loss is
+// translated to 1011 so the proxy still terminates with a valid close frame.
+func forwardWebSocketClose(dst *websocket.Conn, readErr error) {
+	code := websocket.CloseInternalServerErr
+	reason := "peer connection closed unexpectedly"
+	var closeErr *websocket.CloseError
+	if errors.As(readErr, &closeErr) && webSocketCloseCodeCanBeForwarded(closeErr.Code) {
+		code = closeErr.Code
+		reason = closeErr.Text
+	}
+	_ = dst.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, reason),
+		time.Now().Add(webSocketCloseWriteTimeout),
+	)
+}
+
+func webSocketCloseCodeCanBeForwarded(code int) bool {
+	switch code {
+	case websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseTLSHandshake:
+		return false
+	default:
+		return true
 	}
 }
 
