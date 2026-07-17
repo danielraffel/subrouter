@@ -8,10 +8,31 @@ set -euo pipefail
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
 BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
-CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-/var/run/subrouter-supervisor.sock}"
+LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
+PLIST="${SUBROUTER_PLIST:-/Library/LaunchDaemons/${LABEL}.plist}"
+CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-}"
 HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 
 log() { echo "subrouter-autoupdate: $*"; }
+
+if [ -z "$CONTROL_SOCKET" ] && [ -f "$PLIST" ]; then
+  # The migration script places the control socket in the service's state
+  # directory; read the authoritative path from the LaunchDaemon.
+  CONTROL_SOCKET="$(PLIST="$PLIST" python3 - <<'PY'
+import os, plistlib
+with open(os.environ["PLIST"], "rb") as stream:
+    arguments = plistlib.load(stream).get("ProgramArguments") or []
+for i, argument in enumerate(arguments):
+    if argument == "--control-socket" and i + 1 < len(arguments):
+        print(arguments[i + 1])
+        break
+    if argument.startswith("--control-socket="):
+        print(argument.split("=", 1)[1])
+        break
+PY
+)"
+fi
+CONTROL_SOCKET="${CONTROL_SOCKET:-/var/run/subrouter-supervisor.sock}"
 
 case "$(uname -m)" in
   x86_64|amd64) arch="amd64" ;;
