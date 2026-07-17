@@ -31,9 +31,11 @@ Replace the worker binary atomically, then ask the stable supervisor to create a
 ```bash
 install -m 0755 ./subrouter /usr/local/bin/subrouter.new
 mv -f /usr/local/bin/subrouter.new /usr/local/bin/subrouter
-curl -fsS --unix-socket /var/run/subrouter-supervisor.sock -X POST http://localhost/_subrouter/upgrade
-curl -fsS --unix-socket /var/run/subrouter-supervisor.sock http://localhost/_subrouter/supervisor-status | jq
+curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock -X POST http://localhost/_subrouter/upgrade
+curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status | jq
 ```
+
+The control socket lives in the service's state directory (`/var/lib/subrouter/supervisor.sock` for a `_subrouter` service user) because a non-root service cannot bind inside root-owned `/var/run`. The migration script writes the chosen path into the LaunchDaemon `--control-socket` argument, and `subrouter-autoupdate.sh` reads it back from the plist.
 
 `deploy/macos/subrouter-autoupdate.sh` performs the same sequence with release checksum verification and automatic worker-binary rollback when readiness fails.
 
@@ -172,7 +174,7 @@ For a successful compact, expect a `subrouter_meta` row for `POST /responses/com
 The permissioned Unix control socket reports the active generation and the connection count pinned to every draining generation. Browser pages cannot reach this socket or trigger upgrades:
 
 ```bash
-curl -fsS --unix-socket /var/run/subrouter-supervisor.sock http://localhost/_subrouter/supervisor-status | jq
+curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status | jq
 ```
 
 There is intentionally no drain timeout. A routine upgrade never terminates a worker that still owns a client connection.

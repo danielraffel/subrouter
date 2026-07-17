@@ -8,7 +8,7 @@ LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
 PLIST="${SUBROUTER_PLIST:-/Library/LaunchDaemons/${LABEL}.plist}"
 WORKER_BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervisor}"
-CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-/var/run/subrouter-supervisor.sock}"
+CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-}"
 ACTIVATE=0
 [ "${1:-}" = "--activate" ] && ACTIVATE=1
 
@@ -26,7 +26,7 @@ fi
 }
 
 prepared="${PLIST}.supervised"
-public_addr="$(PLIST="$PLIST" PREPARED="$prepared" WORKER_BIN="$WORKER_BIN" \
+transform_output="$(PLIST="$PLIST" PREPARED="$prepared" WORKER_BIN="$WORKER_BIN" \
 SUPERVISOR_BIN="$SUPERVISOR_BIN" CONTROL_SOCKET="$CONTROL_SOCKET" python3 <<'PY'
 import os
 import plistlib
@@ -39,6 +39,17 @@ control_socket = os.environ["CONTROL_SOCKET"]
 
 with open(source, "rb") as stream:
     plist = plistlib.load(stream)
+
+if not control_socket:
+    # A non-root service user cannot bind a unix socket inside root-owned
+    # /var/run, so default to the service's own state directory.
+    if plist.get("UserName"):
+        state_dir = (plist.get("EnvironmentVariables") or {}).get(
+            "SUBROUTER_STATE_DIR", "/var/lib/subrouter"
+        )
+        control_socket = os.path.join(state_dir, "supervisor.sock")
+    else:
+        control_socket = "/var/run/subrouter-supervisor.sock"
 
 arguments = list(plist.get("ProgramArguments") or [])
 if len(arguments) < 2 or arguments[1] != "serve":
@@ -83,11 +94,14 @@ with open(temporary, "wb") as stream:
 os.chmod(temporary, 0o644)
 os.replace(temporary, destination)
 print(public_addr)
+print(control_socket)
 PY
 )"
+public_addr="$(printf '%s\n' "$transform_output" | sed -n 1p)"
+CONTROL_SOCKET="$(printf '%s\n' "$transform_output" | sed -n 2p)"
 
 plutil -lint "$prepared"
-echo "Prepared $prepared"
+echo "Prepared $prepared (control socket: $CONTROL_SOCKET)"
 if [ "$ACTIVATE" -ne 1 ]; then
   echo "Not activated. Re-run with --activate for the one-time listener transition."
   exit 0
