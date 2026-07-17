@@ -162,13 +162,18 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 		_ = os.RemoveAll(socketDir)
 		return nil, err
 	}
-	fileListener, ok := listener.(interface{ File() (*os.File, error) })
+	unixListener, ok := listener.(*net.UnixListener)
 	if !ok {
 		_ = listener.Close()
 		_ = os.RemoveAll(socketDir)
 		return nil, errors.New("worker listener cannot be inherited")
 	}
-	file, err := fileListener.File()
+	// The supervisor closes its copy of the listener after the worker
+	// inherits the fd, but it keeps dialing the socket path for readiness
+	// checks and client routing. Without this, Close unlinks the path and
+	// every dial fails until the readiness timeout kills the worker.
+	unixListener.SetUnlinkOnClose(false)
+	file, err := unixListener.File()
 	if err != nil {
 		_ = listener.Close()
 		_ = os.RemoveAll(socketDir)
@@ -240,6 +245,7 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 	readyURL := "http://subrouter-worker/_subrouter/ready"
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	var lastErr error
 	for {
 		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
 		response, err := client.Do(request)
@@ -248,11 +254,17 @@ func waitForWorkerReady(generation *workerGeneration, timeout time.Duration) err
 			if response.StatusCode == http.StatusOK {
 				return nil
 			}
+			lastErr = fmt.Errorf("ready check returned status %d", response.StatusCode)
+		} else {
+			lastErr = err
 		}
 		select {
 		case <-generation.done:
 			return fmt.Errorf("worker exited before readiness: %w", generation.waitError())
 		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("worker readiness timed out after %s: last error: %w", timeout, lastErr)
+			}
 			return fmt.Errorf("worker readiness timed out after %s", timeout)
 		case <-ticker.C:
 		}
