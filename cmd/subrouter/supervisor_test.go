@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -16,6 +17,35 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
+
+// TestMain lets the test binary double as a minimal supervised worker so
+// startWorkerGeneration can be exercised end to end without a real build.
+func TestMain(m *testing.M) {
+	if os.Getenv("SUBROUTER_TEST_FAKE_WORKER") == "1" {
+		runFakeWorker()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func runFakeWorker() {
+	listener, err := inheritedListenerFromEnv()
+	if err != nil || listener == nil {
+		fmt.Fprintln(os.Stderr, "fake worker: no inherited listener:", err)
+		os.Exit(1)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_subrouter/ready", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("fake-worker"))
+	})
+	if err := (&http.Server{Handler: mux}).Serve(listener); err != nil {
+		fmt.Fprintln(os.Stderr, "fake worker:", err)
+		os.Exit(1)
+	}
+}
 
 func TestParseSupervisorConfigSeparatesWorkerArguments(t *testing.T) {
 	config, err := parseSupervisorConfig([]string{
@@ -203,5 +233,49 @@ func TestTerminateWorkerKillsAfterGracePeriod(t *testing.T) {
 	terminateWorker(worker, 10*time.Millisecond)
 	if command.ProcessState == nil || command.ProcessState.Success() {
 		t.Fatalf("worker was not killed after grace period: %v", command.ProcessState)
+	}
+}
+
+// Regression: the supervisor closes its copy of the worker's unix listener
+// after the fork. That close must not unlink the socket path, because the
+// supervisor keeps dialing that path for readiness checks and client routing.
+func TestStartWorkerGenerationKeepsSocketPathDialable(t *testing.T) {
+	t.Setenv("SUBROUTER_TEST_FAKE_WORKER", "1")
+	config := supervisorConfig{
+		WorkerBin:    os.Args[0],
+		ReadyTimeout: 10 * time.Second,
+	}
+	generation, err := startWorkerGeneration(config)
+	if err != nil {
+		t.Fatalf("startWorkerGeneration: %v", err)
+	}
+	t.Cleanup(func() { terminateWorker(generation, time.Second) })
+
+	info, err := os.Lstat(generation.address)
+	if err != nil {
+		t.Fatalf("worker socket path was unlinked: %v", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("worker socket path is not a socket: %v", info.Mode())
+	}
+
+	connection, err := net.DialTimeout(generation.network, generation.address, time.Second)
+	if err != nil {
+		t.Fatalf("dial worker socket: %v", err)
+	}
+	defer connection.Close()
+	if err := front.WriteProxyProtocolHeader(connection, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(connection, "GET /_subrouter/ready HTTP/1.0\r\nHost: worker\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+	status, err := bufio.NewReader(connection).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read worker response: %v", err)
+	}
+	if !strings.Contains(status, "200") {
+		t.Fatalf("worker ready status = %q", status)
 	}
 }
