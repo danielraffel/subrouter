@@ -93,19 +93,75 @@ if [ "$ACTIVATE" -ne 1 ]; then
   exit 0
 fi
 
+health_host="$public_addr"
+case "$health_host" in
+  0.0.0.0:*) health_host="127.0.0.1:${public_addr#0.0.0.0:}" ;;
+  \[::\]:*) health_host="127.0.0.1:${public_addr#\[::\]:}" ;;
+esac
+
+wait_for_bootout() {
+  # launchctl bootout returns before the job is unloaded; bootstrapping while
+  # the old job is still terminating fails with "Input/output error".
+  local i=0
+  while launchctl print "system/${LABEL}" >/dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -ge 120 ]; then
+      echo "system/${LABEL} did not unload after bootout" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+bootstrap_with_retry() {
+  local i=0
+  until launchctl bootstrap system "$PLIST"; do
+    i=$((i + 1))
+    if [ "$i" -ge 10 ]; then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+wait_healthy() {
+  local i=0
+  until curl -fsS "http://${health_host}/_subrouter/health" >/dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -ge 60 ]; then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 backup="${PLIST}.backup-$(date +%Y%m%d-%H%M%S)"
 cp -p "$PLIST" "$backup"
+
+rollback() {
+  echo "activation failed; rolling back to $backup" >&2
+  launchctl bootout "system/${LABEL}" 2>/dev/null || true
+  wait_for_bootout || true
+  cp -p "$backup" "$PLIST"
+  if bootstrap_with_retry && wait_healthy; then
+    echo "rolled back to previous unsupervised service" >&2
+  else
+    echo "ROLLBACK FAILED; service is down. Restore manually from $backup" >&2
+  fi
+  exit 1
+}
+
 mv -f "$prepared" "$PLIST"
 launchctl bootout "system/${LABEL}" 2>/dev/null || true
-launchctl bootstrap system "$PLIST"
+wait_for_bootout || rollback
+bootstrap_with_retry || rollback
 
 i=0
 until curl -fsS --unix-socket "$CONTROL_SOCKET" "http://localhost/_subrouter/supervisor-status" >/dev/null 2>&1 \
-  && curl -fsS "http://${public_addr}/_subrouter/health" >/dev/null 2>&1; do
+  && curl -fsS "http://${health_host}/_subrouter/health" >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "$i" -ge 60 ]; then
-    echo "supervised service failed health checks; restore $backup" >&2
-    exit 1
+    rollback
   fi
   sleep 1
 done
