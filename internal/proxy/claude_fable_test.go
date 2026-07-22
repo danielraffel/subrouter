@@ -56,6 +56,68 @@ func TestClaudeFableRequestDetection(t *testing.T) {
 	}
 }
 
+func TestClaudeFableAlwaysUsesSubscriptionBeforeFallbacks(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-subscription-first", "fresh@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	subscriptionCalls := 0
+	apiKeyCalls := 0
+	server.Transport = bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("X-Api-Key") != "" {
+			apiKeyCalls++
+		} else {
+			subscriptionCalls++
+			if got := req.Header.Get("Authorization"); got != "Bearer tok-fresh" {
+				t.Errorf("subscription Authorization = %q, want fresh OAuth token", got)
+			}
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message","route":"subscription"}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+
+	bedrockCalls := 0
+	server.Bedrock = &BedrockConfig{
+		Regions: []string{"us-east-1"},
+		Sources: []BedrockCredentialSource{{Name: "aw0", Credentials: staticBedrockCreds()}},
+		Transport: bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			bedrockCalls++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"type":"message","route":"bedrock"}`)),
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+			}, nil
+		}),
+	}
+	server.ClaudeFableAPIKey = "sk-ant-fable-key"
+	server.FableBedrockPrimary = true
+	server.MaxBodyBytes = 1 << 20
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-subscription-first")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if subscriptionCalls != 1 {
+		t.Fatalf("subscription calls = %d, want 1", subscriptionCalls)
+	}
+	if bedrockCalls != 0 {
+		t.Fatalf("bedrock calls = %d, want 0 while a subscription is usable", bedrockCalls)
+	}
+	if apiKeyCalls != 0 {
+		t.Fatalf("api-key calls = %d, want 0 while a subscription is usable", apiKeyCalls)
+	}
+}
+
 func TestServeClaudeFableFallbackViaAPIKey(t *testing.T) {
 	var captured *http.Request
 	var capturedBody string
