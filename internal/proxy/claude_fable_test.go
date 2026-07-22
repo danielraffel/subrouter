@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -95,6 +96,7 @@ func TestClaudeFableAlwaysUsesSubscriptionBeforeFallbacks(t *testing.T) {
 	}
 	server.ClaudeFableAPIKey = "sk-ant-fable-key"
 	server.FableBedrockPrimary = true
+	server.ClaudeUpstream = &url.URL{Scheme: "https", Host: "api.anthropic.com"}
 	server.MaxBodyBytes = 1 << 20
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
@@ -597,59 +599,5 @@ func TestClaudeFableBedrockStripsUnsupportedFields(t *testing.T) {
 	}
 	if !strings.Contains(forwarded, "anthropic_version") {
 		t.Fatalf("bedrock body missing anthropic_version: %s", forwarded)
-	}
-}
-
-// bedrockPrimaryServer builds a Server with the Bedrock gateway configured and
-// FableBedrockPrimary enabled, whose Bedrock upstream returns the given status
-// and body.
-func bedrockPrimaryServer(status int, body string) Server {
-	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: status,
-			Body:       io.NopCloser(strings.NewReader(body)),
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-		}, nil
-	})
-	return Server{
-		MaxBodyBytes:        1 << 20,
-		FableBedrockPrimary: true,
-		Bedrock:             &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt},
-	}
-}
-
-func TestServeClaudeFableBedrockPrimarySuccess(t *testing.T) {
-	s := bedrockPrimaryServer(200, `{"model":"claude-fable-5","content":[{"type":"text","text":"ok"}]}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-fable-5","max_tokens":8,"messages":[]}`))
-	rec := httptest.NewRecorder()
-	if !s.serveClaudeFableBedrockPrimary(rec, req) {
-		t.Fatal("expected bedrock-primary to serve a 2xx Bedrock response")
-	}
-	if rec.Code != 200 {
-		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "claude-fable-5") {
-		t.Fatalf("body = %q, want forwarded Bedrock body", rec.Body.String())
-	}
-}
-
-func TestServeClaudeFableBedrockPrimaryFallsThroughOnNon2xx(t *testing.T) {
-	s := bedrockPrimaryServer(429, `{"message":"Too many requests"}`)
-	bodyStr := `{"model":"claude-fable-5","max_tokens":8,"messages":[]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(bodyStr))
-	rec := httptest.NewRecorder()
-	if s.serveClaudeFableBedrockPrimary(rec, req) {
-		t.Fatal("expected bedrock-primary to fall through on a non-2xx Bedrock response")
-	}
-	if rec.Code != 200 { // httptest default; nothing should have been written
-		t.Fatalf("status = %d, want untouched recorder (nothing written)", rec.Code)
-	}
-	// Body must be restored so the pool path can read it.
-	restored, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatalf("read restored body: %v", err)
-	}
-	if string(restored) != bodyStr {
-		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
 	}
 }
