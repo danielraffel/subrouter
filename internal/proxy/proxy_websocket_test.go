@@ -3040,7 +3040,7 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 		auths = append(auths, auth)
 		if auth == "Bearer incompatible-token" {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+			_, _ = w.Write([]byte(`{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}`))
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
