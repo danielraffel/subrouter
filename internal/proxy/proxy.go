@@ -286,12 +286,13 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
-	Active             bool                             `json:"active,omitempty"`
-	PlanType           string                           `json:"plan_type,omitempty"`
-	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
-	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
-	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
-	UsageFresh         bool                             `json:"-"`
+	Active                 bool                              `json:"active,omitempty"`
+	PlanType               string                            `json:"plan_type,omitempty"`
+	Windows                []accounts.UsageWindow            `json:"windows,omitempty"`
+	Credits                *accounts.CreditsInfo             `json:"credits,omitempty"`
+	ComplimentaryReset     *accounts.ComplimentaryResetInfo  `json:"complimentary_reset,omitempty"`
+	ModelIncompatibilities []selectacct.ModelIncompatibility `json:"model_incompatibilities,omitempty"`
+	UsageFresh             bool                              `json:"-"`
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
@@ -1087,8 +1088,16 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 	}
 	now := time.Now()
 	out := append([]AccountUsageStatus(nil), statuses...)
+	issuesByAccount := make(map[string][]selectacct.ModelIncompatibility)
+	for _, issue := range s.SchedulerRef.ModelIncompatibilities() {
+		key := selectacct.ScoreKey(issue.Provider, issue.AccountID)
+		issuesByAccount[key] = append(issuesByAccount[key], issue)
+	}
 	for i := range out {
 		status := &out[i]
+		if issues := issuesByAccount[selectacct.ScoreKey(status.Provider, status.ID)]; len(issues) > 0 {
+			status.ModelIncompatibilities = append([]selectacct.ModelIncompatibility(nil), issues...)
+		}
 		if status.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
@@ -2097,12 +2106,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 			modelState.observe(body)
 		}
 		if direction == "upstream_to_client" && messageType == websocket.TextMessage {
-			switch {
-			case usageLimitJSON(body):
+			if usageLimitJSON(body) {
 				s.markAccountExhausted(provider, accountID, poolModel)
-			case provider == accounts.ProviderCodex && codexChatGPTModelUnsupportedJSON(body):
-				if model := modelState.current(); model != "" {
-					_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, nil)
+			} else if provider == accounts.ProviderCodex {
+				if message, unsupported := codexChatGPTModelUnsupportedDetailJSON(body); unsupported {
+					if model := modelState.current(); model != "" {
+						_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, message, nil)
+					}
 				}
 			}
 			if provider == accounts.ProviderCodex && codexWebSocketResponseFinished(body) {
@@ -2231,26 +2241,62 @@ func usageLimitMessage(value string) bool {
 }
 
 func codexChatGPTModelUnsupportedJSON(body []byte) bool {
-	var event map[string]any
-	if err := json.Unmarshal(body, &event); err != nil {
-		return false
-	}
-	return codexChatGPTModelUnsupportedMap(event)
+	_, unsupported := codexChatGPTModelUnsupportedDetailJSON(body)
+	return unsupported
 }
 
-func codexChatGPTModelUnsupportedMap(event map[string]any) bool {
-	message := strings.ToLower(stringField(event, "message"))
-	if strings.Contains(message, "model is not supported when using codex with a chatgpt account") ||
-		(strings.Contains(message, "model") &&
-			strings.Contains(message, "not supported") &&
-			strings.Contains(message, "codex") &&
-			strings.Contains(message, "chatgpt account")) {
-		return true
+func codexChatGPTModelUnsupportedDetailJSON(body []byte) (string, bool) {
+	var event any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return "", false
 	}
-	if nested, ok := event["error"].(map[string]any); ok {
-		return codexChatGPTModelUnsupportedMap(nested)
+	return codexChatGPTModelUnsupportedValue(event)
+}
+
+func codexChatGPTModelUnsupportedValue(value any) (string, bool) {
+	switch value := value.(type) {
+	case string:
+		message := strings.Join(strings.Fields(value), " ")
+		lower := strings.ToLower(message)
+		unsupported := strings.Contains(lower, "model is not supported when using codex with a chatgpt account") ||
+			(strings.Contains(lower, "model") &&
+				strings.Contains(lower, "not supported") &&
+				strings.Contains(lower, "codex") &&
+				strings.Contains(lower, "chatgpt account"))
+		return message, unsupported
+	case map[string]any:
+		// Upstream has used both {"error":{"message":...}} and
+		// {"detail":...}. Inspect the common envelope keys first, then recurse
+		// through the rest so a harmless schema wrapper cannot disable failover.
+		visited := make(map[string]bool, len(value))
+		for _, key := range []string{"detail", "message", "error"} {
+			visited[key] = true
+			if nested, ok := value[key]; ok {
+				if message, unsupported := codexChatGPTModelUnsupportedValue(nested); unsupported {
+					return message, true
+				}
+			}
+		}
+		keys := make([]string, 0, len(value))
+		for key := range value {
+			if !visited[key] {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if message, unsupported := codexChatGPTModelUnsupportedValue(value[key]); unsupported {
+				return message, true
+			}
+		}
+	case []any:
+		for _, nested := range value {
+			if message, unsupported := codexChatGPTModelUnsupportedValue(nested); unsupported {
+				return message, true
+			}
+		}
 	}
-	return false
+	return "", false
 }
 
 func stringField(values map[string]any, key string) string {
@@ -2448,8 +2494,10 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 				// default TTL.
 				s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
 			}
-			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
-				_, _ = s.rerouteModelIncompatibility(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel, nil)
+			if inspectModelCompatibility {
+				if message, unsupported := codexChatGPTModelUnsupportedDetailJSON(body); unsupported {
+					_, _ = s.rerouteModelIncompatibility(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel, message, nil)
+				}
 			}
 			// Only log the body for the original hard rate-limit statuses
 			// (429/401), whose body is a known rate-limit/auth error envelope. A
@@ -2818,6 +2866,18 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 		// OAuth account usable, selection fails and the handler serves the
 		// fallback chain directly.
 		availableAccounts = oauthAccounts(availableAccounts)
+	}
+	if provider == accounts.ProviderCodex && model != "" && s.SchedulerRef != nil {
+		compatible := make([]accounts.Account, 0, len(availableAccounts))
+		for _, account := range availableAccounts {
+			if !s.SchedulerRef.ModelIncompatible(account.Provider, account.ID, model) {
+				compatible = append(compatible, account)
+			}
+		}
+		if len(compatible) == 0 {
+			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no %s accounts support model %q", provider, model)
+		}
+		availableAccounts = compatible
 	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
 		s.refreshUsageScoresIfStale(r.Context())
@@ -3585,8 +3645,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			return response, nil
 		}
 		modelUnsupported := false
+		modelUnsupportedMessage := ""
 		if !usageLimited && t.provider == accounts.ProviderCodex {
-			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+			modelUnsupportedMessage, modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
 			if inspectErr != nil {
 				if t.logger != nil {
 					t.logger.Warn("codex model compatibility response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
@@ -3619,7 +3680,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		var compatibilityPickErr error
 		if modelUnsupported && t.server != nil {
 			compatibilityNext, compatibilityPickErr = t.server.rerouteModelIncompatibility(
-				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
+				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, t.poolModel, modelUnsupportedMessage, tried,
 			)
 		}
 		if t.server != nil && exhausted && !modelUnsupported {
@@ -3785,9 +3846,24 @@ func isTerminalCredentialError(err error) bool {
 // pool to OAuth accounts; Fable requests with a fallback chain set it so a
 // metered API-key pool account never preempts the Bedrock stage (the dedicated
 // Fable API key is the chain's own last stage).
-func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
+func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model, message string, tried map[string]struct{}) (accounts.Account, error) {
 	if model != "" && s.SchedulerRef != nil {
-		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
+		persistErr := s.SchedulerRef.MarkModelIncompatible(provider, accountID, model, message)
+		if s.Logger != nil {
+			fields := []any{
+				"provider", provider,
+				"agent", agentType,
+				"session", sessionID,
+				"account", accountID,
+				"model", model,
+				"message", message,
+			}
+			if persistErr != nil {
+				s.Logger.Error("model incompatibility persistence failed", append(fields, "error", persistErr)...)
+			} else {
+				s.Logger.Warn("account excluded from incompatible model", fields...)
+			}
+		}
 	}
 	if tried == nil {
 		tried = make(map[string]struct{}, 1)
@@ -3933,9 +4009,9 @@ func responseUsageLimit(response *http.Response) (bool, error) {
 	return usageLimitJSON(prefix), nil
 }
 
-func responseCodexChatGPTModelUnsupported(response *http.Response) (bool, error) {
+func responseCodexChatGPTModelUnsupported(response *http.Response) (string, bool, error) {
 	if response == nil || response.Body == nil || response.StatusCode != http.StatusBadRequest {
-		return false, nil
+		return "", false, nil
 	}
 	body := response.Body
 	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
@@ -3944,21 +4020,22 @@ func responseCodexChatGPTModelUnsupported(response *http.Response) (bool, error)
 			Reader: io.MultiReader(bytes.NewReader(prefix), body),
 			Closer: body,
 		}
-		return false, err
+		return "", false, err
 	}
 	if int64(len(prefix)) > usageLimitInspectMaxBytes {
 		response.Body = prefixReadCloser{
 			Reader: io.MultiReader(bytes.NewReader(prefix), body),
 			Closer: body,
 		}
-		return false, nil
+		return "", false, nil
 	}
 	closeErr := body.Close()
 	response.Body = io.NopCloser(bytes.NewReader(prefix))
 	if closeErr != nil {
-		return false, closeErr
+		return "", false, closeErr
 	}
-	return codexChatGPTModelUnsupportedJSON(prefix), nil
+	message, unsupported := codexChatGPTModelUnsupportedDetailJSON(prefix)
+	return message, unsupported, nil
 }
 
 func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {

@@ -1109,6 +1109,41 @@ func TestUsageStatusEndpointIncludesClaudeRequestTimeExhaustion(t *testing.T) {
 	t.Fatalf("missing Fable window: %+v", statuses[0].Windows)
 }
 
+func TestUsageStatusEndpointIncludesModelIncompatibility(t *testing.T) {
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	message := "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
+	if err := ref.MarkModelIncompatible(accounts.ProviderCodex, "free@example.com", "gpt-5.6-sol", message); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{{
+			ID:       "free@example.com",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth,
+			Email:    "free@example.com",
+		}},
+		SchedulerRef: ref,
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var statuses []AccountUsageStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &statuses); err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || len(statuses[0].ModelIncompatibilities) != 1 {
+		t.Fatalf("statuses = %+v", statuses)
+	}
+	issue := statuses[0].ModelIncompatibilities[0]
+	if issue.Model != "gpt-5.6-sol" || issue.Message != message {
+		t.Fatalf("issue = %+v", issue)
+	}
+}
+
 func TestReloadAccountsHotLoadsNewAccountWithoutRestart(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	accountStore := accounts.CodexStore{Dir: t.TempDir()}
@@ -3112,6 +3147,63 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 	}
 	if accountMarked {
 		t.Fatal("model incompatibility must not mark the whole account exhausted")
+	}
+	issues := schedulerRef.ModelIncompatibilities()
+	if len(issues) != 1 || issues[0].Model != "gpt-5.6-sol" {
+		t.Fatalf("model incompatibilities = %+v, want original model name", issues)
+	}
+}
+
+func TestHandlerNeverRoutesKnownModelIncompatibility(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID:     "free@example.com",
+		Provider:      accounts.ProviderCodex,
+		Headroom:      0.80,
+		ShortHeadroom: 0.80,
+	}}))
+	if err := schedulerRef.MarkModelIncompatible(accounts.ProviderCodex, "free@example.com", "gpt-5.6-sol", "unsupported"); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "free@example.com",
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "free-token",
+		}},
+		Sessions:     store,
+		SchedulerRef: schedulerRef,
+		MaxBodyBytes: 1024,
+	}.Handler()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":[]}`))
+	request.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", upstreamCalls)
+	}
+	if !strings.Contains(recorder.Body.String(), `no codex accounts support model "gpt-5.6-sol"`) {
+		t.Fatalf("body = %q", recorder.Body.String())
 	}
 }
 
