@@ -62,3 +62,24 @@ func TestModelIncompatibilityStoreKeepsOverlappingWorkerWrites(t *testing.T) {
 		t.Fatalf("issues = %+v, want both worker writes", issues)
 	}
 }
+
+func TestRunningWorkerReadsModelIncompatibilityWrittenByPeer(t *testing.T) {
+	store := ModelIncompatibilityStore{Dir: t.TempDir()}
+	scheduler := NewScheduler([]Score{{
+		AccountID: "blocked@example.com", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+	}})
+	writer, err := NewSchedulerRefWithModelStore(scheduler, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewSchedulerRefWithModelStore(scheduler, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.MarkModelIncompatible(accounts.ProviderCodex, "blocked@example.com", "gpt-5.6-sol", "peer observation"); err != nil {
+		t.Fatal(err)
+	}
+	if !reader.ModelIncompatible(accounts.ProviderCodex, "blocked@example.com", "gpt-5.6-sol") {
+		t.Fatal("running worker did not observe peer's durable model exclusion")
+	}
+}
