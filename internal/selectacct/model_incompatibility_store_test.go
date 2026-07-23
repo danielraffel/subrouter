@@ -79,6 +79,10 @@ func TestRunningWorkerReadsModelIncompatibilityWrittenByPeer(t *testing.T) {
 	if err := writer.MarkModelIncompatible(accounts.ProviderCodex, "blocked@example.com", "gpt-5.6-sol", "peer observation"); err != nil {
 		t.Fatal(err)
 	}
+	issues := reader.ModelIncompatibilities()
+	if len(issues) != 1 || issues[0].AccountID != "blocked@example.com" || issues[0].Model != "gpt-5.6-sol" {
+		t.Fatalf("running worker status issues = %+v, want peer's durable exclusion", issues)
+	}
 	if !reader.ModelIncompatible(accounts.ProviderCodex, "blocked@example.com", "gpt-5.6-sol") {
 		t.Fatal("running worker did not observe peer's durable model exclusion")
 	}

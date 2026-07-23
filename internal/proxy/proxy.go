@@ -1875,6 +1875,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			if requestProvider == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
+				if err := s.replaceEscapedCodexModelCompatibilityResponse(response, sessionAgentType, sessionID, userEmail, account.ID, retryPoolModel); err != nil {
+					return err
+				}
+			}
 			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			return nil
 		}
@@ -1937,21 +1942,8 @@ func baseURLProbeRequest(r *http.Request) bool {
 	return r.Method == http.MethodHead && (r.URL.Path == "" || r.URL.Path == "/")
 }
 
-func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL) {
-	upstreamURL := cloneURL(r.URL)
-	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
-	upstreamURL.Host = upstream.Host
-	upstreamURL.Path = joinURLPath(upstream.Path, s.pathForUpstream(upstreamURL.Path, account))
-	upstreamURL.RawPath = ""
-
-	headers := r.Header.Clone()
-	stripWebSocketDialHeaders(headers)
-	session.StripSubrouterHeaders(headers)
-	stripOutboundForwardingHeaders(headers)
-	setAccountAuthHeaders(headers, account)
-	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
-
-	upstreamConn, response, err := websocket.DefaultDialer.Dial(upstreamURL.String(), headers)
+func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, agentType, sessionID, userEmail, poolModel, compatibilityModel string, _ *url.URL) {
+	upstreamConn, response, err := s.dialWebSocketAccount(r.Context(), r, account, agentType, sessionID, userEmail)
 	if err != nil {
 		status := 502
 		if response != nil {
@@ -1980,6 +1972,10 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	defer clientConn.Close()
 
 	modelState := &webSocketModelState{model: compatibilityModel}
+	if providerForRequest(agentType, r.URL.Path) == accounts.ProviderCodex {
+		s.proxyCodexWebSocket(r.Context(), r, clientConn, upstreamConn, account, agentType, sessionID, userEmail, modelState)
+		return
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -1993,6 +1989,265 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		_ = clientConn.Close()
 	}()
 	wg.Wait()
+}
+
+func (s Server) dialWebSocketAccount(ctx context.Context, r *http.Request, account accounts.Account, agentType, sessionID, userEmail string) (*websocket.Conn, *http.Response, error) {
+	upstream := s.upstreamForRequest(r.URL.Path, account)
+	if upstream == nil {
+		return nil, nil, errors.New("no upstream configured")
+	}
+	upstreamURL := cloneURL(r.URL)
+	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
+	upstreamURL.Host = upstream.Host
+	upstreamURL.Path = joinURLPath(upstream.Path, s.pathForUpstream(r.URL.Path, account))
+	upstreamURL.RawPath = ""
+
+	headers := r.Header.Clone()
+	stripWebSocketDialHeaders(headers)
+	session.StripSubrouterHeaders(headers)
+	stripOutboundForwardingHeaders(headers)
+	setAccountAuthHeaders(headers, account)
+	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
+	return websocket.DefaultDialer.DialContext(ctx, upstreamURL.String(), headers)
+}
+
+type webSocketReadResult struct {
+	generation  uint64
+	messageType int
+	body        []byte
+	err         error
+}
+
+type codexWebSocketTurn struct {
+	messageType int
+	body        []byte
+	model       string
+	tried       map[string]struct{}
+}
+
+func readWebSocketResults(ctx context.Context, conn *websocket.Conn, generation uint64, out chan<- webSocketReadResult) {
+	for {
+		messageType, body, err := conn.ReadMessage()
+		result := webSocketReadResult{generation: generation, messageType: messageType, body: body, err: err}
+		select {
+		case out <- result:
+		case <-ctx.Done():
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// proxyCodexWebSocket owns the account and turn together. A client WebSocket
+// exists longer than any one response, and the model is not known until a
+// response.create frame arrives. Keeping both decisions in this coordinator
+// lets it check durable compatibility before forwarding a turn and replay the
+// same frame on a replacement upstream without exposing the rejected response.
+func (s Server) proxyCodexWebSocket(ctx context.Context, r *http.Request, clientConn, initialUpstream *websocket.Conn, initialAccount accounts.Account, agentType, sessionID, userEmail string, modelState *webSocketModelState) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	clientReads := make(chan webSocketReadResult, 16)
+	upstreamReads := make(chan webSocketReadResult, 16)
+	go readWebSocketResults(ctx, clientConn, 0, clientReads)
+
+	activeConn := initialUpstream
+	defer func() { _ = activeConn.Close() }()
+	activeAccount := initialAccount
+	generation := uint64(1)
+	go readWebSocketResults(ctx, activeConn, generation, upstreamReads)
+	turns := make([]codexWebSocketTurn, 0, 1)
+
+	record := func(direction string, result webSocketReadResult) {
+		if s.Transcripts == nil || result.err != nil {
+			return
+		}
+		s.Transcripts.RecordPayload(agentType, sessionID, "websocket_message", direction, result.body, map[string]any{
+			"opcode": websocketMessageType(result.messageType),
+		})
+	}
+
+	switchAccount := func(next accounts.Account) error {
+		nextConn, response, err := s.dialWebSocketAccount(ctx, r, next, agentType, sessionID, userEmail)
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if err != nil {
+			return err
+		}
+		oldConn := activeConn
+		activeConn = nextConn
+		activeAccount = next
+		generation++
+		go readWebSocketResults(ctx, activeConn, generation, upstreamReads)
+		_ = oldConn.Close()
+		return nil
+	}
+
+	ensureCompatibleAccount := func(turn *codexWebSocketTurn) error {
+		if turn == nil || turn.model == "" || s.SchedulerRef == nil || !s.SchedulerRef.ModelIncompatible(accounts.ProviderCodex, activeAccount.ID, turn.model) {
+			return nil
+		}
+		if turn.tried == nil {
+			turn.tried = make(map[string]struct{})
+		}
+		turn.tried[activeAccount.ID] = struct{}{}
+		for {
+			next, err := s.compatibilityRetryAccount(ctx, accounts.ProviderCodex, agentType, sessionID, userEmail, turn.model, turn.tried)
+			if err != nil {
+				return err
+			}
+			turn.tried[next.ID] = struct{}{}
+			if err := switchAccount(next); err == nil {
+				return nil
+			}
+		}
+	}
+
+	sendFrontTurn := func() error {
+		if len(turns) == 0 {
+			return nil
+		}
+		turn := &turns[0]
+		if err := ensureCompatibleAccount(turn); err != nil {
+			return err
+		}
+		return activeConn.WriteMessage(turn.messageType, turn.body)
+	}
+
+	finishFrontTurn := func() error {
+		if len(turns) > 0 {
+			turns = turns[1:]
+			modelState.complete()
+		}
+		return sendFrontTurn()
+	}
+
+	writeUnavailable := func(model string) error {
+		return clientConn.WriteMessage(websocket.TextMessage, codexWebSocketModelUnavailableEvent(model))
+	}
+
+	for {
+		select {
+		case result := <-clientReads:
+			if result.err != nil {
+				return
+			}
+			record("client_to_upstream", result)
+			if result.messageType == websocket.TextMessage {
+				if model, create := codexWebSocketRequestModelEvent(result.body); create {
+					if model == "" {
+						model = modelState.current()
+					}
+					modelState.observe(result.body)
+					turns = append(turns, codexWebSocketTurn{
+						messageType: result.messageType,
+						body:        append([]byte(nil), result.body...),
+						model:       model,
+						tried:       map[string]struct{}{activeAccount.ID: {}},
+					})
+					if len(turns) > 1 {
+						continue
+					}
+					if err := sendFrontTurn(); err != nil {
+						if writeErr := writeUnavailable(model); writeErr != nil {
+							return
+						}
+						_ = finishFrontTurn()
+					}
+					continue
+				}
+			}
+			if err := activeConn.WriteMessage(result.messageType, result.body); err != nil {
+				return
+			}
+
+		case result := <-upstreamReads:
+			if result.generation != generation {
+				continue
+			}
+			if result.err != nil {
+				return
+			}
+			record("upstream_to_client", result)
+			if result.messageType == websocket.TextMessage {
+				if message, unsupported := codexWebSocketModelUnsupportedDetailJSON(result.body); unsupported {
+					model := codexModelFromUnsupportedMessage(message)
+					var turn *codexWebSocketTurn
+					if len(turns) > 0 {
+						turn = &turns[0]
+						if turn.model != "" {
+							model = turn.model
+						}
+					}
+					tried := map[string]struct{}{activeAccount.ID: {}}
+					if turn != nil {
+						if turn.tried == nil {
+							turn.tried = tried
+						}
+						tried = turn.tried
+					}
+					next, retryErr := s.rerouteModelIncompatibility(ctx, accounts.ProviderCodex, agentType, sessionID, userEmail, activeAccount.ID, model, message, tried)
+					for retryErr == nil && turn != nil {
+						tried[next.ID] = struct{}{}
+						retryErr = switchAccount(next)
+						if retryErr == nil {
+							retryErr = activeConn.WriteMessage(turn.messageType, turn.body)
+						}
+						if retryErr == nil {
+							break
+						}
+						next, retryErr = s.compatibilityRetryAccount(ctx, accounts.ProviderCodex, agentType, sessionID, userEmail, model, tried)
+					}
+					if retryErr == nil && turn != nil {
+						if s.Logger != nil {
+							s.Logger.Warn("retrying Codex WebSocket turn after model incompatibility", "agent", agentType, "session", sessionID, "account", activeAccount.ID, "model", model)
+						}
+						continue
+					}
+					if s.Logger != nil {
+						s.Logger.Warn("Codex model incompatibility suppressed before WebSocket client", "agent", agentType, "session", sessionID, "account", activeAccount.ID, "model", model, "error", retryErr)
+					}
+					if err := writeUnavailable(model); err != nil {
+						return
+					}
+					if err := finishFrontTurn(); err != nil {
+						return
+					}
+					continue
+				}
+				if usageLimitJSON(result.body) {
+					s.markAccountExhausted(accounts.ProviderCodex, activeAccount.ID, "")
+				}
+			}
+			if err := clientConn.WriteMessage(result.messageType, result.body); err != nil {
+				return
+			}
+			if result.messageType == websocket.TextMessage && codexWebSocketResponseFinished(result.body) {
+				if err := finishFrontTurn(); err != nil {
+					return
+				}
+			}
+		}
+	}
+}
+
+func codexWebSocketModelUnavailableEvent(model string) []byte {
+	errorBody := map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "subrouter_model_unavailable",
+			"code":    codexNoCompatibleAccountCode,
+			"message": "Subrouter has no compatible account for the requested model. Run `sr` to inspect blocked accounts.",
+		},
+	}
+	if model = session.NormalizeModel(model); model != "" {
+		errorBody["error"].(map[string]any)["model"] = model
+	}
+	body, _ := json.Marshal(errorBody)
+	return body
 }
 
 func stripWebSocketDialHeaders(headers http.Header) {
@@ -2109,7 +2364,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 			if usageLimitJSON(body) {
 				s.markAccountExhausted(provider, accountID, poolModel)
 			} else if provider == accounts.ProviderCodex {
-				if message, unsupported := codexChatGPTModelUnsupportedDetailJSON(body); unsupported {
+				if message, unsupported := codexWebSocketModelUnsupportedDetailJSON(body); unsupported {
 					if model := modelState.current(); model != "" {
 						_, _ = s.rerouteModelIncompatibility(ctx, provider, agentType, sessionID, userEmail, accountID, model, message, nil)
 					}
@@ -2246,57 +2501,92 @@ func codexChatGPTModelUnsupportedJSON(body []byte) bool {
 }
 
 func codexChatGPTModelUnsupportedDetailJSON(body []byte) (string, bool) {
-	var event any
+	var event map[string]any
 	if err := json.Unmarshal(body, &event); err != nil {
 		return "", false
 	}
-	return codexChatGPTModelUnsupportedValue(event)
-}
-
-func codexChatGPTModelUnsupportedValue(value any) (string, bool) {
-	switch value := value.(type) {
+	// Only documented error-envelope fields are evidence. Recursing through an
+	// arbitrary response frame lets ordinary assistant text or tool arguments
+	// impersonate an upstream error and permanently quarantine a healthy
+	// account.
+	for _, key := range []string{"detail", "message"} {
+		if message, unsupported := codexChatGPTModelUnsupportedMessage(event[key]); unsupported {
+			return message, true
+		}
+	}
+	switch value := event["error"].(type) {
 	case string:
-		message := strings.Join(strings.Fields(value), " ")
-		lower := strings.ToLower(message)
-		unsupported := strings.Contains(lower, "model is not supported when using codex with a chatgpt account") ||
-			(strings.Contains(lower, "model") &&
-				strings.Contains(lower, "not supported") &&
-				strings.Contains(lower, "codex") &&
-				strings.Contains(lower, "chatgpt account"))
-		return message, unsupported
+		return codexChatGPTModelUnsupportedMessage(value)
 	case map[string]any:
-		// Upstream has used both {"error":{"message":...}} and
-		// {"detail":...}. Inspect the common envelope keys first, then recurse
-		// through the rest so a harmless schema wrapper cannot disable failover.
-		visited := make(map[string]bool, len(value))
-		for _, key := range []string{"detail", "message", "error"} {
-			visited[key] = true
-			if nested, ok := value[key]; ok {
-				if message, unsupported := codexChatGPTModelUnsupportedValue(nested); unsupported {
-					return message, true
-				}
-			}
-		}
-		keys := make([]string, 0, len(value))
-		for key := range value {
-			if !visited[key] {
-				keys = append(keys, key)
-			}
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			if message, unsupported := codexChatGPTModelUnsupportedValue(value[key]); unsupported {
-				return message, true
-			}
-		}
-	case []any:
-		for _, nested := range value {
-			if message, unsupported := codexChatGPTModelUnsupportedValue(nested); unsupported {
+		for _, key := range []string{"message", "detail"} {
+			if message, unsupported := codexChatGPTModelUnsupportedMessage(value[key]); unsupported {
 				return message, true
 			}
 		}
 	}
 	return "", false
+}
+
+func codexChatGPTModelUnsupportedMessage(value any) (string, bool) {
+	message, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+	message = strings.Join(strings.Fields(message), " ")
+	lower := strings.ToLower(message)
+	return message, strings.Contains(lower, "model is not supported when using codex with a chatgpt account")
+}
+
+func codexModelFromUnsupportedMessage(message string) string {
+	lower := strings.ToLower(message)
+	marker := " model is not supported when using codex with a chatgpt account"
+	markerIndex := strings.Index(lower, marker)
+	if markerIndex < 0 {
+		return ""
+	}
+	prefix := message[:markerIndex]
+	end := strings.LastIndex(prefix, "'")
+	if end <= 0 {
+		return ""
+	}
+	start := strings.LastIndex(prefix[:end], "'")
+	if start < 0 || start+1 >= end {
+		return ""
+	}
+	return session.NormalizeModel(prefix[start+1 : end])
+}
+
+func codexWebSocketModelUnsupportedDetailJSON(body []byte) (string, bool) {
+	var event map[string]any
+	if err := json.Unmarshal(body, &event); err != nil {
+		return "", false
+	}
+	eventType := stringField(event, "type")
+	if eventType != "" && !strings.EqualFold(eventType, "error") {
+		return "", false
+	}
+	// The Responses WebSocket protocol normally wraps failures in a typed error
+	// event. Some ChatGPT gateways instead send the same HTTP-style root detail
+	// or error envelope after the upgrade. Accept those exact envelope shapes,
+	// while still rejecting response/tool frames whose nested text merely quotes
+	// the compatibility message.
+	if eventType == "" {
+		if message, unsupported := codexChatGPTModelUnsupportedMessage(event["detail"]); unsupported {
+			return message, true
+		}
+		switch value := event["error"].(type) {
+		case string:
+			return codexChatGPTModelUnsupportedMessage(value)
+		case map[string]any:
+			for _, key := range []string{"message", "detail"} {
+				if message, unsupported := codexChatGPTModelUnsupportedMessage(value[key]); unsupported {
+					return message, true
+				}
+			}
+		}
+		return "", false
+	}
+	return codexChatGPTModelUnsupportedDetailJSON(body)
 }
 
 func stringField(values map[string]any, key string) string {
@@ -2799,6 +3089,32 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 	return path
 }
 
+// routeRequestToAccount reapplies the same account-specific upstream mapping
+// used by the handler's first attempt. Compatibility failover can cross from a
+// ChatGPT subscription to the OpenAI API-key endpoint, so swapping only the
+// Authorization header would send the right credential to the wrong host.
+func (s Server) routeRequestToAccount(r *http.Request, publicPath string, account accounts.Account) error {
+	if r == nil || r.URL == nil {
+		return errors.New("request URL is required")
+	}
+	// Direct transport tests and embedders may supply an already-routed base
+	// RoundTripper without configuring Server upstream URLs. In that mode the
+	// transport remains the routing owner, as it was before cross-host retry.
+	if s.Upstream == nil && s.CodexUpstream == nil && s.APIUpstream == nil {
+		return nil
+	}
+	upstream := s.upstreamForRequest(publicPath, account)
+	if upstream == nil {
+		return errors.New("no upstream configured for retry account")
+	}
+	r.URL.Scheme = upstream.Scheme
+	r.URL.Host = upstream.Host
+	r.URL.Path = joinURLPath(upstream.Path, s.pathForUpstream(publicPath, account))
+	r.URL.RawPath = ""
+	r.Host = ""
+	return nil
+}
+
 func chatGPTBackendUpstream(codexUpstream *url.URL) *url.URL {
 	upstream := cloneURL(codexUpstream)
 	if upstream == nil {
@@ -2851,6 +3167,9 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 		if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q cannot be used for ChatGPT backend paths", forcedAccountID)
 		}
+		if provider == accounts.ProviderCodex && model != "" && s.SchedulerRef != nil && s.SchedulerRef.ModelIncompatible(provider, account.ID, model) {
+			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q does not support model %q", forcedAccountID, model)
+		}
 		assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
@@ -2870,7 +3189,7 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	if provider == accounts.ProviderCodex && model != "" && s.SchedulerRef != nil {
 		compatible := make([]accounts.Account, 0, len(availableAccounts))
 		for _, account := range availableAccounts {
-			if !s.SchedulerRef.ModelIncompatible(account.Provider, account.ID, model) {
+			if !s.SchedulerRef.ModelIncompatible(provider, account.ID, model) {
 				compatible = append(compatible, account)
 			}
 		}
@@ -3579,6 +3898,15 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
+	// A compatibility rejection is account-specific. Give a replayable Codex
+	// request enough attempts to exhaust every configured subscription before
+	// its final API-key candidate, even when the generic usage-limit retry budget
+	// is smaller than the account pool.
+	if t.provider == accounts.ProviderCodex && t.poolModel != "" && t.server != nil {
+		if accountCount := len(filterAccountsForProvider(t.server.accountList(), t.provider)); accountCount > maxAttempts {
+			maxAttempts = accountCount
+		}
+	}
 	base := t.base
 	if base == nil {
 		base = http.DefaultTransport
@@ -3697,6 +4025,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if fallback, ok := t.fableFallbackResponse(response, accountID, reason); ok {
 				return fallback, nil
 			}
+			if modelUnsupported {
+				return codexModelUnavailableResponse(response, t.poolModel), nil
+			}
 			t.logClaudeFailoverExhausted(response, accountID, reason, attempt, maxAttempts, len(tried))
 			return response, nil
 		}
@@ -3710,6 +4041,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			if fallback, ok := t.fableFallbackResponse(response, accountID, "no_alternate_account"); ok {
 				return fallback, nil
+			}
+			if modelUnsupported {
+				return codexModelUnavailableResponse(response, t.poolModel), nil
 			}
 			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
 			return response, nil
@@ -3735,9 +4069,18 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
 		attemptReq.ContentLength = req.ContentLength
+		if t.provider == accounts.ProviderCodex {
+			if err := t.server.routeRequestToAccount(attemptReq, t.path, nextAccount); err != nil {
+				return nil, err
+			}
+		}
 		setAccountAuthHeaders(attemptReq.Header, nextAccount)
 		if t.logger != nil {
-			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
+			message := "retrying replayable upstream request after usage limit"
+			if modelUnsupported {
+				message = "retrying replayable upstream request after model incompatibility"
+			}
+			t.logger.Warn(message, "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", attemptReq.URL.Host, "attempt", attempt+1, "max_attempts", maxAttempts)
 		}
 	}
 	return base.RoundTrip(req)
@@ -3871,9 +4214,11 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 	if accountID != "" {
 		tried[accountID] = struct{}{}
 	}
-	account, err := s.oauthRetryAccount(ctx, provider, agentType, sessionID, userEmail, model, tried, true)
+	// Try every compatible subscription before a metered account. The second
+	// pass admits API keys only after the OAuth pool is incompatible or unusable.
+	account, err := s.compatibilityRetryAccount(ctx, provider, agentType, sessionID, userEmail, model, tried)
 	if err != nil && s.Logger != nil {
-		s.Logger.Warn("model incompatibility has no alternate OAuth account",
+		s.Logger.Warn("model incompatibility has no compatible fallback account",
 			"provider", provider,
 			"agent", agentType,
 			"session", sessionID,
@@ -3882,6 +4227,14 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 			"error", err)
 	}
 	return account, err
+}
+
+func (s Server) compatibilityRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, model string, tried map[string]struct{}) (accounts.Account, error) {
+	account, err := s.oauthRetryAccount(ctx, provider, agentType, sessionID, userEmail, model, tried, true)
+	if err == nil {
+		return account, nil
+	}
+	return s.oauthRetryAccount(ctx, provider, agentType, sessionID, userEmail, model, tried, false)
 }
 
 func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
@@ -3907,6 +4260,9 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 				continue
 			}
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
+				continue
+			}
+			if poolModel != "" && s.SchedulerRef != nil && s.SchedulerRef.ModelIncompatible(provider, account.ID, poolModel) {
 				continue
 			}
 			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(account.Provider, account.ID) {
@@ -4010,7 +4366,7 @@ func responseUsageLimit(response *http.Response) (bool, error) {
 }
 
 func responseCodexChatGPTModelUnsupported(response *http.Response) (string, bool, error) {
-	if response == nil || response.Body == nil || response.StatusCode != http.StatusBadRequest {
+	if response == nil || response.Body == nil || response.StatusCode < http.StatusBadRequest || response.StatusCode >= http.StatusInternalServerError {
 		return "", false, nil
 	}
 	body := response.Body
@@ -4036,6 +4392,69 @@ func responseCodexChatGPTModelUnsupported(response *http.Response) (string, bool
 	}
 	message, unsupported := codexChatGPTModelUnsupportedDetailJSON(prefix)
 	return message, unsupported, nil
+}
+
+// replaceEscapedCodexModelCompatibilityResponse is the final HTTP boundary.
+// Active retry normally consumes compatibility failures inside the transport,
+// but oversized/non-replayable requests and future transport changes still
+// pass through ModifyResponse. This guard makes the raw upstream rejection
+// impossible to write to a client.
+func (s Server) replaceEscapedCodexModelCompatibilityResponse(response *http.Response, agentType, sessionID, userEmail, accountID, model string) error {
+	message, unsupported, err := responseCodexChatGPTModelUnsupported(response)
+	if err != nil || !unsupported {
+		return err
+	}
+	if model == "" {
+		model = codexModelFromUnsupportedMessage(message)
+	}
+	if model != "" {
+		responseCtx := context.Background()
+		if response.Request != nil {
+			responseCtx = response.Request.Context()
+		}
+		_, _ = s.rerouteModelIncompatibility(responseCtx, accounts.ProviderCodex, agentType, sessionID, userEmail, accountID, model, message, nil)
+	}
+	if s.Logger != nil {
+		s.Logger.Warn("Codex model incompatibility suppressed before HTTP client", "agent", agentType, "session", sessionID, "account", accountID, "model", model)
+	}
+	replacement := codexModelUnavailableResponse(response, model)
+	*response = *replacement
+	return nil
+}
+
+const codexNoCompatibleAccountCode = "subrouter_no_compatible_account"
+
+func codexModelUnavailableResponse(original *http.Response, model string) *http.Response {
+	if original == nil {
+		original = &http.Response{}
+	}
+	if original.Body != nil {
+		_ = original.Body.Close()
+	}
+	model = session.NormalizeModel(model)
+	payload := map[string]any{
+		"error": map[string]any{
+			"type":    "subrouter_model_unavailable",
+			"code":    codexNoCompatibleAccountCode,
+			"message": "Subrouter has no compatible account for the requested model. Run `sr` to inspect blocked accounts.",
+		},
+	}
+	if model != "" {
+		payload["error"].(map[string]any)["model"] = model
+	}
+	body, _ := json.Marshal(payload)
+	body = append(body, '\n')
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	header.Set("X-Subrouter-Error", codexNoCompatibleAccountCode)
+	return &http.Response{
+		StatusCode:    http.StatusServiceUnavailable,
+		Status:        fmt.Sprintf("%d %s", http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable)),
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       original.Request,
+	}
 }
 
 func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {

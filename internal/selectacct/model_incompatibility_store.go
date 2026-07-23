@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,6 +42,47 @@ type modelIncompatibilityFile struct {
 // overlap during a zero-disruption deploy.
 type ModelIncompatibilityStore struct {
 	Dir string
+}
+
+// Get reads one deterministic account/model record directly from the durable
+// store. Workers keep positive records in memory, but a cache miss must consult
+// disk so a still-running generation observes evidence written by a peer
+// immediately instead of waiting for its next restart.
+func (s ModelIncompatibilityStore) Get(provider accounts.Provider, accountID, model string) (ModelIncompatibility, bool, error) {
+	if strings.TrimSpace(s.Dir) == "" {
+		return ModelIncompatibility{}, false, nil
+	}
+	query, err := normalizeModelIncompatibility(ModelIncompatibility{
+		Provider:  provider,
+		AccountID: accountID,
+		Model:     model,
+	})
+	if err != nil {
+		return ModelIncompatibility{}, false, err
+	}
+	path := filepath.Join(s.Dir, modelIncompatibilityFilename(query))
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return ModelIncompatibility{}, false, nil
+	}
+	if err != nil {
+		return ModelIncompatibility{}, false, fmt.Errorf("read model incompatibility %s: %w", path, err)
+	}
+	var file modelIncompatibilityFile
+	if err := json.Unmarshal(body, &file); err != nil {
+		return ModelIncompatibility{}, false, fmt.Errorf("read model incompatibility %s: %w", path, err)
+	}
+	if file.Version != modelIncompatibilitySchemaVersion {
+		return ModelIncompatibility{}, false, fmt.Errorf("read model incompatibility %s: unsupported version %d", path, file.Version)
+	}
+	issue, err := normalizeModelIncompatibility(file.Issue)
+	if err != nil {
+		return ModelIncompatibility{}, false, fmt.Errorf("read model incompatibility %s: %w", path, err)
+	}
+	if modelIncompatibilityKey(issue.Provider, issue.AccountID, issue.Model) != modelIncompatibilityKey(query.Provider, query.AccountID, query.Model) {
+		return ModelIncompatibility{}, false, fmt.Errorf("read model incompatibility %s: record identity mismatch", path)
+	}
+	return issue, true, nil
 }
 
 func (s ModelIncompatibilityStore) Load() ([]ModelIncompatibility, error) {

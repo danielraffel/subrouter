@@ -268,6 +268,7 @@ func (r *SchedulerRef) ModelIncompatibleUntilFor(provider accounts.Provider, acc
 }
 
 func (r *SchedulerRef) ModelIncompatibilities() []ModelIncompatibility {
+	r.refreshModelIncompatibilitiesFromStore()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	issues := make([]ModelIncompatibility, 0, len(r.modelIncompatibilities))
@@ -282,10 +283,52 @@ func (r *SchedulerRef) ModelIncompatible(provider accounts.Provider, accountID, 
 	if ModelKey(model) == "" {
 		return false
 	}
+	key := modelIncompatibilityKey(provider, accountID, model)
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	_, ok := r.modelIncompatibilities[modelIncompatibilityKey(provider, accountID, model)]
-	return ok
+	_, ok := r.modelIncompatibilities[key]
+	store := r.modelIncompatibilityStore
+	r.mu.RUnlock()
+	if ok || store == nil {
+		return ok
+	}
+	issue, found, err := store.Get(provider, accountID, model)
+	if err != nil {
+		// Compatibility evidence is a safety boundary. A corrupt or unreadable
+		// record must fail closed so a storage incident cannot route traffic back
+		// to an account that may be known-incompatible.
+		return true
+	}
+	if !found {
+		return false
+	}
+	r.mu.Lock()
+	if r.modelIncompatibilities == nil {
+		r.modelIncompatibilities = make(map[string]ModelIncompatibility)
+	}
+	r.modelIncompatibilities[key] = issue
+	r.mu.Unlock()
+	return true
+}
+
+func (r *SchedulerRef) refreshModelIncompatibilitiesFromStore() {
+	r.mu.RLock()
+	store := r.modelIncompatibilityStore
+	r.mu.RUnlock()
+	if store == nil {
+		return
+	}
+	issues, err := store.Load()
+	if err != nil || len(issues) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.modelIncompatibilities == nil {
+		r.modelIncompatibilities = make(map[string]ModelIncompatibility, len(issues))
+	}
+	for _, issue := range issues {
+		r.modelIncompatibilities[modelIncompatibilityKey(issue.Provider, issue.AccountID, issue.Model)] = issue
+	}
 }
 
 var permanentModelIncompatibilityUntil = time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
