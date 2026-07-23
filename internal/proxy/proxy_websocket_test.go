@@ -2917,11 +2917,15 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		t.Fatalf("write create: %v", err)
 	}
 	_, body, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read usage error: %v", err)
+	if err == nil {
+		t.Fatalf("websocket body = %q, want retryable close instead of usage limit", string(body))
 	}
-	if !strings.Contains(string(body), "usage_limit_reached") {
-		t.Fatalf("websocket body = %q, want usage limit error", string(body))
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want WebSocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseServiceRestart)
 	}
 	_ = conn.Close()
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "empty@example.com", ""); !accountMarked {
@@ -3048,21 +3052,47 @@ func TestHandlerRetriesWebSocketUsageLimitOnAlternateOAuthAccount(t *testing.T) 
 	}
 
 	_, first, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("websocket body = %q, want retryable close instead of usage limit", string(first))
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("read error = %v, want WebSocket close frame", err)
+	}
+	if closeErr.Code != websocket.CloseServiceRestart {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseServiceRestart)
+	}
+	if strings.Contains(closeErr.Text, "usage") {
+		t.Fatalf("close reason must not surface terminal usage error: %q", closeErr.Text)
+	}
+	_ = conn.Close()
+
+	retryConn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"X-Subrouter-Session": []string{"session-1"},
+	})
+	if err != nil {
+		t.Fatalf("retry dial: %v", err)
+	}
+	defer retryConn.Close()
+	if err := retryConn.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("retry create: %v", err)
+	}
+	_, first, err = retryConn.ReadMessage()
 	if err != nil {
 		t.Fatalf("read created: %v", err)
 	}
 	if usageLimitJSON(first) {
-		t.Fatalf("client received usage limit instead of transparent failover: %s", first)
+		t.Fatalf("client received usage limit after account retry: %s", first)
 	}
 	if !strings.Contains(string(first), `"response.created"`) {
-		t.Fatalf("first event = %s, want response.created", first)
+		t.Fatalf("first retry event = %s, want response.created", first)
 	}
-	_, second, err := conn.ReadMessage()
+	_, second, err := retryConn.ReadMessage()
 	if err != nil {
 		t.Fatalf("read completed: %v", err)
 	}
 	if !strings.Contains(string(second), `"response.completed"`) {
-		t.Fatalf("second event = %s, want response.completed", second)
+		t.Fatalf("second retry event = %s, want response.completed", second)
 	}
 
 	mu.Lock()
