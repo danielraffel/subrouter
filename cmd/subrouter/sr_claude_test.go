@@ -112,3 +112,46 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 		t.Fatalf("Claude did not receive flags:\n%s", got)
 	}
 }
+
+func TestPrepareClaudeLoginFastPathSeedsFreshDir(t *testing.T) {
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, "profile")
+	if err := prepareClaudeLoginFastPath(configDir); err != nil {
+		t.Fatalf("prepareClaudeLoginFastPath: %v", err)
+	}
+	state, err := os.ReadFile(filepath.Join(configDir, ".claude.json"))
+	if err != nil {
+		t.Fatalf("read .claude.json: %v", err)
+	}
+	if !strings.Contains(string(state), `"hasCompletedOnboarding": true`) {
+		t.Fatalf("onboarding not seeded:\n%s", state)
+	}
+	settings, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings.json: %v", err)
+	}
+	if !strings.Contains(string(settings), `"forceLoginMethod": "claudeai"`) {
+		t.Fatalf("login method not seeded:\n%s", settings)
+	}
+}
+
+func TestPrepareClaudeLoginFastPathPreservesExistingChoices(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"theme":"light"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"forceLoginMethod":"console"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareClaudeLoginFastPath(dir); err != nil {
+		t.Fatalf("prepareClaudeLoginFastPath: %v", err)
+	}
+	state, _ := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if !strings.Contains(string(state), `"theme": "light"`) || !strings.Contains(string(state), `"hasCompletedOnboarding": true`) {
+		t.Fatalf("existing state not preserved:\n%s", state)
+	}
+	settings, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if !strings.Contains(string(settings), `"forceLoginMethod":"console"`) {
+		t.Fatalf("existing login method overwritten:\n%s", settings)
+	}
+}

@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -155,6 +157,9 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		}
 	}
 	claudeConfigDir := r.store.PreferredInstancePath(instancePath)
+	if err := prepareClaudeLoginFastPath(claudeConfigDir); err != nil {
+		fmt.Fprintf(r.errOut, "Warning: could not pre-seed the login fast path: %s\n", err)
+	}
 
 	fmt.Fprintln(r.out, "Starting Claude Code...")
 	fmt.Fprintln(r.out, "Complete the OAuth login in your browser; Claude closes automatically once the login lands.")
@@ -217,6 +222,53 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	fmt.Fprintf(r.out, "\n  sr claude switch %s\n", profileName)
 	fmt.Fprintf(r.out, "  sr claude run %s\n", profileName)
 	return nil
+}
+
+// prepareClaudeLoginFastPath seeds a fresh profile's config dir so Claude
+// Code boots straight into the browser OAuth flow instead of walking the
+// first-run wizard: onboarding is marked complete (skips the theme picker
+// and tour) and the login method is pinned to the Claude-account flow
+// (skips the claude.ai-vs-Console picker). Existing values are preserved,
+// so re-running add against a lived-in profile changes nothing.
+func prepareClaudeLoginFastPath(configDir string) error {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return err
+	}
+	statePath := filepath.Join(configDir, ".claude.json")
+	state := map[string]any{}
+	if body, err := os.ReadFile(statePath); err == nil {
+		if err := json.Unmarshal(body, &state); err != nil {
+			return fmt.Errorf("parse %s: %w", statePath, err)
+		}
+	}
+	if onboarded, _ := state["hasCompletedOnboarding"].(bool); !onboarded {
+		state["hasCompletedOnboarding"] = true
+		out, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			return err
+		}
+		out = append(out, '\n')
+		if err := os.WriteFile(statePath, out, 0o600); err != nil {
+			return err
+		}
+	}
+	settingsPath := filepath.Join(configDir, "settings.json")
+	settings := map[string]any{}
+	if body, err := os.ReadFile(settingsPath); err == nil {
+		if err := json.Unmarshal(body, &settings); err != nil {
+			return fmt.Errorf("parse %s: %w", settingsPath, err)
+		}
+	}
+	if _, ok := settings["forceLoginMethod"]; ok {
+		return nil
+	}
+	settings["forceLoginMethod"] = "claudeai"
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return os.WriteFile(settingsPath, out, 0o600)
 }
 
 func (r claudeRunner) list(ctx context.Context, numbered bool) error {
