@@ -3249,7 +3249,7 @@ func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
 		Header:     http.Header{},
 		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)),
 	}
-	server.captureResponseBody(response, "codex", "session-1", "incompatible@example.com", "", "", "gpt-5.6-sol", "/v1/responses")
+	server.captureResponseBody(response, context.Background(), "codex", "session-1", "incompatible@example.com", "", "", "gpt-5.6-sol", "/v1/responses")
 	if _, err := io.Copy(io.Discard, response.Body); err != nil {
 		t.Fatal(err)
 	}

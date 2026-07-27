@@ -1866,7 +1866,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			s.captureResponseBody(response, r.Context(), sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			return nil
 		}
 		if s.Logger != nil {
@@ -2374,7 +2374,26 @@ func (s Server) recordReplayableRequestBody(r *http.Request, agentType, sessionI
 	s.Transcripts.RecordPayloadSummary(agentType, sessionID, "http_body", "client_to_upstream", streamID, bytesRead, hex.EncodeToString(hasher.Sum(nil)), chunks, nil)
 }
 
-func (s Server) captureResponseBody(response *http.Response, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
+// streamCancelAttribution reports which side ended a response stream. A read
+// error is only meaningful once you know whether the downstream client hung up
+// or the cancellation came from inside the proxy: both surface as
+// "context canceled" on the upstream body, but only the second is our bug.
+func streamCancelAttribution(clientCtx context.Context, err error) (string, error) {
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return "upstream", nil
+	}
+	if clientCtx == nil {
+		return "unknown", nil
+	}
+	if clientErr := clientCtx.Err(); clientErr != nil {
+		return "client", clientErr
+	}
+	// The upstream read was canceled while the client was still connected, so
+	// something on our side dropped a live stream.
+	return "proxy", nil
+}
+
+func (s Server) captureResponseBody(response *http.Response, clientCtx context.Context, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
 	if provider == "" {
 		provider = accounts.ProviderCodex
 	}
@@ -2467,6 +2486,7 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 			}
 		}
 	}
+	streamStarted := time.Now()
 	response.Body = newStreamingTranscriptReadCloser(streamingTranscriptConfig{
 		ReadCloser: response.Body,
 		Recorder:   s.Transcripts,
@@ -2480,7 +2500,8 @@ func (s Server) captureResponseBody(response *http.Response, agentType, sessionI
 		OnInspect:  inspect,
 		onReadError: func(err error, bytesRead int) {
 			if s.Logger != nil {
-				s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err)
+				canceledBy, clientErr := streamCancelAttribution(clientCtx, err)
+				s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err, "canceled_by", canceledBy, "client_ctx_err", clientErr, "stream_age_ms", time.Since(streamStarted).Milliseconds())
 			}
 		},
 	})
