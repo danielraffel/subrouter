@@ -28,9 +28,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
 )
 
 type Server struct {
@@ -55,12 +55,12 @@ type Server struct {
 	ActiveSessions   *ActiveSessions
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
-	StreamDrops *StreamDropStats
-	Lifecycle        *Lifecycle
-	AdminToken       string
-	MaxBodyBytes     int64
-	Transcripts      *transcript.Recorder
-	ReadCache        *readCache
+	StreamDrops  *StreamDropStats
+	Lifecycle    *Lifecycle
+	AdminToken   string
+	MaxBodyBytes int64
+	Transcripts  *transcript.Recorder
+	ReadCache    *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -1958,6 +1958,27 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		status := 502
 		if response != nil {
 			status = response.StatusCode
+		}
+		// Log it. A failed dial previously produced no log line at all, so a
+		// client seeing "Connection reset without closing handshake" left
+		// nothing behind to explain it: the whole log had zero websocket
+		// entries despite every attempt failing. The upstream's status and the
+		// first bytes of its body are what distinguish an edge challenge from
+		// an origin rejection, and they are discarded once this returns.
+		if s.Logger != nil {
+			s.Logger.Error("websocket upstream dial failed",
+				"agent", agentType,
+				"session", sessionID,
+				"account", account.ID,
+				"upstream", upstreamURL.Host,
+				"path", upstreamURL.Path,
+				"status", status,
+				"error", err,
+				"upstream_server", websocketResponseHeader(response, "Server"),
+				"cf_mitigated", websocketResponseHeader(response, "Cf-Mitigated"),
+				"cf_ray", websocketResponseHeader(response, "Cf-Ray"),
+				"content_type", websocketResponseHeader(response, "Content-Type"),
+				"body", websocketDialFailureBody(response))
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -4241,4 +4262,30 @@ func writeJSON(w http.ResponseWriter, value any) {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	_ = encoder.Encode(value)
+}
+
+// websocketDialFailureBodyMax bounds how much of a failed websocket dial's
+// response body is logged. Edge challenge pages are large HTML documents, and
+// only the opening bytes are needed to tell them apart from an origin error.
+const websocketDialFailureBodyMax = 240
+
+func websocketResponseHeader(response *http.Response, key string) string {
+	if response == nil {
+		return ""
+	}
+	return response.Header.Get(key)
+}
+
+// websocketDialFailureBody returns a bounded, single-line excerpt of the
+// upstream's response body so the reason survives in the log.
+func websocketDialFailureBody(response *http.Response) string {
+	if response == nil || response.Body == nil {
+		return ""
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, websocketDialFailureBodyMax))
+	if err != nil && len(body) == 0 {
+		return ""
+	}
+	return strings.Join(strings.Fields(string(body)), " ")
 }
