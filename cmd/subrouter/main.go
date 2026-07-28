@@ -554,7 +554,11 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 	}()
 
 	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGUSR1)
+	watched := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if retireSignal != nil {
+		watched = append(watched, retireSignal)
+	}
+	signal.Notify(sigCh, watched...)
 	defer signal.Stop(sigCh)
 
 	for {
@@ -562,7 +566,7 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 		case err := <-errCh:
 			return err
 		case sig := <-sigCh:
-			if sig == syscall.SIGUSR1 {
+			if retireSignal != nil && sig == retireSignal {
 				// Retired by the supervisor: a newer generation now owns new
 				// connections, but clients holding keep-alive connections would
 				// otherwise stay pinned to this worker indefinitely, since the
