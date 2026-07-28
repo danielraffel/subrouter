@@ -53,6 +53,9 @@ type Server struct {
 	Transport        http.RoundTripper
 	Logger           *slog.Logger
 	ActiveSessions   *ActiveSessions
+	// StreamDrops counts dropped response streams by which side ended them,
+	// so the expected client-hangup case is countable without a log line each.
+	StreamDrops *StreamDropStats
 	Lifecycle        *Lifecycle
 	AdminToken       string
 	MaxBodyBytes     int64
@@ -902,6 +905,7 @@ func (s Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
+	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
 	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
 	mux.HandleFunc("/_subrouter/drain-status", s.requireAdmin(s.handleDrainStatus))
 	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
@@ -925,6 +929,13 @@ func (s Server) Handler() http.Handler {
 
 func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleStreamStats reports dropped response streams grouped by which side
+// ended them. A non-zero "proxy" count is the signal that subrouter dropped a
+// stream while the client was still connected.
+func (s Server) handleStreamStats(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, s.StreamDrops.Snapshot())
 }
 
 func (s Server) handleReady(w http.ResponseWriter, _ *http.Request) {
@@ -2499,10 +2510,20 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 		InspectMax: usageLimitInspectMaxBytes,
 		OnInspect:  inspect,
 		onReadError: func(err error, bytesRead int) {
-			if s.Logger != nil {
-				canceledBy, clientErr := streamCancelAttribution(clientCtx, err)
-				s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err, "canceled_by", canceledBy, "client_ctx_err", clientErr, "stream_age_ms", time.Since(streamStarted).Milliseconds())
+			canceledBy, clientErr := streamCancelAttribution(clientCtx, err)
+			s.StreamDrops.Observe(canceledBy, time.Now())
+			if s.Logger == nil {
+				return
 			}
+			// A client hanging up and retrying is expected and happens ~1000
+			// times a day; it is counted, not written, so the log stays
+			// bounded. Everything else is rare and actionable, so it keeps a
+			// full line.
+			if canceledBy == "client" {
+				s.Logger.Debug("proxy response stream ended by client", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "bytes", bytesRead, "stream_age_ms", time.Since(streamStarted).Milliseconds())
+				return
+			}
+			s.Logger.Error("proxy response stream read failed", "agent", agentType, "session", sessionID, "account", accountID, "path", path, "status", response.StatusCode, "bytes", bytesRead, "error", err, "canceled_by", canceledBy, "client_ctx_err", clientErr, "stream_age_ms", time.Since(streamStarted).Milliseconds())
 		},
 	})
 }
