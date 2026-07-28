@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -53,20 +54,27 @@ func TestNewOutboundTransportPoolsConnectionsPerHost(t *testing.T) {
 
 // Concurrent requests to one host must reuse connections rather than dial per
 // request. This is the behavior whose absence exhausted the port range.
+//
+// Asserting on a total connection count is racy: the pool only gets a
+// connection back once its body is closed, so a burst can legitimately dial an
+// extra one or two. Instead, drive one warm-up burst, then repeat it and
+// require that the second burst dials nothing. With a pool large enough for the
+// concurrency, every connection is idle and reusable by then. With the default
+// pool of 2, the other connections were discarded and must be re-dialed.
 func TestOutboundTransportReusesConnectionsUnderConcurrency(t *testing.T) {
+	const concurrency = 8
+
 	var mu sync.Mutex
 	conns := make(map[string]struct{})
 
 	server := newTestServerCountingConns(t, &mu, conns)
 	defer server.Close()
 
-	transport := NewOutboundTransport()
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	client := &http.Client{Transport: NewOutboundTransport(), Timeout: 10 * time.Second}
 
-	// Two sequential rounds: the second must reuse the first round's pool.
-	for round := range 2 {
+	burst := func(round int) {
 		var wg sync.WaitGroup
-		for range 8 {
+		for range concurrency {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -75,18 +83,26 @@ func TestOutboundTransportReusesConnectionsUnderConcurrency(t *testing.T) {
 					t.Errorf("round %d: %v", round, err)
 					return
 				}
+				// Drain and close so the connection returns to the pool.
+				_, _ = io.Copy(io.Discard, response.Body)
 				_ = response.Body.Close()
 			}()
 		}
 		wg.Wait()
 	}
 
+	burst(1)
 	mu.Lock()
-	distinct := len(conns)
+	afterWarmup := len(conns)
 	mu.Unlock()
 
-	// 16 requests over 8-way concurrency should not open 16 connections.
-	if distinct > 8 {
-		t.Fatalf("opened %d distinct connections for 16 requests; connections are not being reused", distinct)
+	burst(2)
+	mu.Lock()
+	afterReuse := len(conns)
+	mu.Unlock()
+
+	if afterReuse != afterWarmup {
+		t.Fatalf("second burst opened %d new connections (%d -> %d); a warm pool should have served all %d requests without dialing",
+			afterReuse-afterWarmup, afterWarmup, afterReuse, concurrency)
 	}
 }
