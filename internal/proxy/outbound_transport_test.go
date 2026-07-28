@@ -143,3 +143,20 @@ func TestOutboundTransportReusesConnectionsUnderConcurrency(t *testing.T) {
 			dialed, afterWarmup)
 	}
 }
+
+// Pooling a connection for longer than the upstream keeps it alive guarantees
+// checking out a connection the peer already closed. The next write then fails
+// with "use of closed network connection" and the client sees a 502. Go's
+// default of 90s is 6x the measured upstream idle close, so this must be set
+// explicitly rather than inherited from DefaultTransport.
+func TestOutboundIdleTimeoutStaysUnderUpstreamIdleClose(t *testing.T) {
+	transport := NewOutboundTransport()
+
+	if transport.IdleConnTimeout >= upstreamIdleCloseAfter {
+		t.Fatalf("IdleConnTimeout = %s, must be below the measured upstream idle close of %s; otherwise pooled connections are handed out already closed",
+			transport.IdleConnTimeout, upstreamIdleCloseAfter)
+	}
+	if transport.IdleConnTimeout <= 0 {
+		t.Fatalf("IdleConnTimeout = %s, want a positive value", transport.IdleConnTimeout)
+	}
+}
