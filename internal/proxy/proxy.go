@@ -1962,9 +1962,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		// Log it. A failed dial previously produced no log line at all, so a
 		// client seeing "Connection reset without closing handshake" left
 		// nothing behind to explain it: the whole log had zero websocket
-		// entries despite every attempt failing. The upstream's status and the
-		// first bytes of its body are what distinguish an edge challenge from
-		// an origin rejection, and they are discarded once this returns.
+		// entries despite every attempt failing. The upstream status and headers
+		// identify the rejecting layer without logging a response body, which can
+		// reflect request credentials. Both are discarded once this returns.
 		if s.Logger != nil {
 			s.Logger.Error("websocket upstream dial failed",
 				"agent", agentType,
