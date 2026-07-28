@@ -28,9 +28,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
 )
 
 type Server struct {
@@ -55,12 +55,12 @@ type Server struct {
 	ActiveSessions   *ActiveSessions
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
-	StreamDrops *StreamDropStats
-	Lifecycle        *Lifecycle
-	AdminToken       string
-	MaxBodyBytes     int64
-	Transcripts      *transcript.Recorder
-	ReadCache        *readCache
+	StreamDrops  *StreamDropStats
+	Lifecycle    *Lifecycle
+	AdminToken   string
+	MaxBodyBytes int64
+	Transcripts  *transcript.Recorder
+	ReadCache    *readCache
 	// Bedrock, when set, enables the /bedrock/* SigV4 signing gateway.
 	Bedrock *BedrockConfig
 	// ClaudeFableAPIKey, when set, serves Claude Fable requests via this Anthropic
@@ -1959,6 +1959,26 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		if response != nil {
 			status = response.StatusCode
 		}
+		// Log it. A failed dial previously produced no log line at all, so a
+		// client seeing "Connection reset without closing handshake" left
+		// nothing behind to explain it: the whole log had zero websocket
+		// entries despite every attempt failing. The upstream's status and the
+		// first bytes of its body are what distinguish an edge challenge from
+		// an origin rejection, and they are discarded once this returns.
+		if s.Logger != nil {
+			s.Logger.Error("websocket upstream dial failed",
+				"agent", agentType,
+				"session", sessionID,
+				"account", account.ID,
+				"upstream", upstreamURL.Host,
+				"path", upstreamURL.Path,
+				"status", status,
+				"error", err,
+				"upstream_server", websocketResponseHeader(response, "Server"),
+				"cf_mitigated", websocketResponseHeader(response, "Cf-Mitigated"),
+				"cf_ray", websocketResponseHeader(response, "Cf-Ray"),
+				"content_type", websocketResponseHeader(response, "Content-Type"))
+		}
 		http.Error(w, err.Error(), status)
 		return
 	}
@@ -2097,6 +2117,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 	for {
 		messageType, body, err := src.ReadMessage()
 		if err != nil {
+			forwardWebSocketClose(dst, err)
 			return
 		}
 		if s.Transcripts != nil {
@@ -2123,6 +2144,36 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 		if err := dst.WriteMessage(messageType, body); err != nil {
 			return
 		}
+	}
+}
+
+const webSocketCloseWriteTimeout = time.Second
+
+// forwardWebSocketClose preserves the close handshake across the proxy. A raw
+// TCP close makes the other peer report abnormal closure 1006 even when the
+// first peer sent a valid WebSocket close frame. Unexpected transport loss is
+// translated to 1011 so the proxy still terminates with a valid close frame.
+func forwardWebSocketClose(dst *websocket.Conn, readErr error) {
+	code := websocket.CloseInternalServerErr
+	reason := "peer connection closed unexpectedly"
+	var closeErr *websocket.CloseError
+	if errors.As(readErr, &closeErr) && webSocketCloseCodeCanBeForwarded(closeErr.Code) {
+		code = closeErr.Code
+		reason = closeErr.Text
+	}
+	_ = dst.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, reason),
+		time.Now().Add(webSocketCloseWriteTimeout),
+	)
+}
+
+func webSocketCloseCodeCanBeForwarded(code int) bool {
+	switch code {
+	case websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseTLSHandshake:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -4241,4 +4292,11 @@ func writeJSON(w http.ResponseWriter, value any) {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	_ = encoder.Encode(value)
+}
+
+func websocketResponseHeader(response *http.Response, key string) string {
+	if response == nil {
+		return ""
+	}
+	return response.Header.Get(key)
 }
