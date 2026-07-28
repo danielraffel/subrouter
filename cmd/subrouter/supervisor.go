@@ -434,8 +434,8 @@ func (s *supervisor) reapWhenIdle(id string) {
 	s.workersMu.Lock()
 	retiring := s.workers[id]
 	s.workersMu.Unlock()
-	if retiring != nil && retiring.command != nil && retiring.command.Process != nil {
-		if err := retiring.command.Process.Signal(syscall.SIGUSR1); err != nil {
+	if retireSignal != nil && retiring != nil && retiring.command != nil && retiring.command.Process != nil {
+		if err := retiring.command.Process.Signal(retireSignal); err != nil {
 			slog.Warn("subrouter worker retire signal failed", "generation", id, "error", err)
 		}
 	}
