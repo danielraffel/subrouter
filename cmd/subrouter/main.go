@@ -312,6 +312,7 @@ func serve(args []string) error {
 	})
 
 	server := proxy.Server{
+		StreamDrops:         &proxy.StreamDropStats{},
 		Upstream:            upstream,
 		CodexUpstream:       codexUpstream,
 		APIUpstream:         apiUpstream,
