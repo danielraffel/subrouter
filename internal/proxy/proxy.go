@@ -4023,9 +4023,23 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
-		if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
-			closer.CloseIdleConnections()
-		}
+		// Deliberately do NOT call CloseIdleConnections here.
+		//
+		// It used to run on every retry, to avoid handing the next attempt
+		// another connection the peer had already closed. But t.base is the one
+		// transport shared by every session, so a single retry discarded the
+		// entire pool for every host and every caller. Under failure that is a
+		// feedback loop: failures cause retries, retries empty the pool, every
+		// subsequent request has to dial, the extra dials exhaust the machine's
+		// ephemeral ports, and the resulting dial failures cause more retries.
+		// That is how cmux-mac-mini ran out of ports a second time, with
+		// 33k sockets in TIME_WAIT against a 32k range.
+		//
+		// The staleness this guarded against is now prevented at the source:
+		// IdleConnTimeout is held below the upstream's measured 15s idle close,
+		// so a pooled connection is dropped by us before the peer drops it. Go's
+		// transport also retires the specific connection that just errored, so
+		// the next attempt will not reuse it.
 		attemptReq = req.Clone(req.Context())
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
