@@ -4054,8 +4054,29 @@ func NewOutboundTransport() *http.Transport {
 		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	}
 	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	// Pool aggressively per host. HTTP/1.1 cannot multiplex, so each in-flight
+	// request needs its own connection, and DefaultTransport only keeps
+	// MaxIdleConnsPerHost (2) for reuse. Every concurrent request past the
+	// second one therefore built a fresh TCP+TLS connection and discarded it,
+	// leaving a socket in TIME_WAIT for 2*MSL. Because nearly all traffic goes
+	// to a handful of hosts, that churn exhausted the machine's ephemeral port
+	// range and upstream dials began failing with EADDRNOTAVAIL
+	// ("can't assign requested address"), which surfaced to clients as 502.
+	transport.MaxIdleConnsPerHost = outboundMaxIdleConnsPerHost
+	transport.MaxIdleConns = outboundMaxIdleConns
+	transport.IdleConnTimeout = outboundIdleConnTimeout
 	return transport
 }
+
+const (
+	// Sized for many concurrent streaming requests against a small number of
+	// upstream hosts, which is the shape of this proxy's traffic.
+	outboundMaxIdleConnsPerHost = 256
+	outboundMaxIdleConns        = 1024
+	// Long enough to span a user's think time between turns so the next
+	// request reuses a warm connection instead of dialing again.
+	outboundIdleConnTimeout = 120 * time.Second
+)
 
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
