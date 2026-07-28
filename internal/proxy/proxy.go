@@ -1953,7 +1953,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	setAccountAuthHeaders(headers, account)
 	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
 
-	upstreamConn, response, err := websocket.DefaultDialer.Dial(upstreamURL.String(), headers)
+	upstreamConn, response, err := outboundWebSocketDialer().Dial(upstreamURL.String(), headers)
 	if err != nil {
 		status := 502
 		if response != nil {
@@ -4300,3 +4300,44 @@ func websocketResponseHeader(response *http.Response, key string) string {
 	}
 	return response.Header.Get(key)
 }
+
+// outboundWebSocketDialer matches the TLS and dial behavior of
+// NewOutboundTransport, which is the configuration our upstreams actually
+// accept.
+//
+// websocket.DefaultDialer offers no ALPN and dials dual-stack. The plain HTTP
+// path deliberately does neither: it pins http/1.1 and dials IPv4, because the
+// upstream edge treats protocols differently. Probing the same URL showed a
+// bot challenge over HTTP/2 versus a real origin response over HTTP/1.1.
+//
+// Left on the default dialer, a websocket upgrade to
+// chatgpt.com/backend-api/codex/responses closed with EOF before any response
+// headers arrived (no status, no Server, no Cf-Ray), which reached clients as
+// "Connection reset without closing handshake".
+func outboundWebSocketDialer() *websocket.Dialer {
+	outboundWebSocketDialerOnce.Do(func() {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		outboundWebSocketDialerValue = &websocket.Dialer{
+			Proxy:            http.ProxyFromEnvironment,
+			HandshakeTimeout: websocketHandshakeTimeout,
+			NetDialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp4", addr)
+			},
+			// Pin http/1.1. A websocket upgrade cannot proceed over h2, and
+			// advertising nothing lets the edge choose, which is what differs
+			// from the working HTTP path.
+			TLSClientConfig:   &tls.Config{NextProtos: []string{"http/1.1"}},
+			EnableCompression: true,
+		}
+	})
+	return outboundWebSocketDialerValue
+}
+
+// websocketHandshakeTimeout bounds the upgrade itself. The default dialer has
+// no timeout, so a silent upstream could hang the handshake indefinitely.
+const websocketHandshakeTimeout = 30 * time.Second
+
+var (
+	outboundWebSocketDialerOnce  sync.Once
+	outboundWebSocketDialerValue *websocket.Dialer
+)
