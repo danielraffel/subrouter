@@ -24,9 +24,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
-	"github.com/manaflow-ai/subrouter/internal/transcript"
 )
 
 func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {

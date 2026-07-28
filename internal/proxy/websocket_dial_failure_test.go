@@ -18,16 +18,16 @@ import (
 
 // A websocket dial that the upstream rejects used to produce no log line at
 // all, so a client reporting "Connection reset without closing handshake" left
-// nothing behind to diagnose. The upstream's status and body are the only
-// things that distinguish an edge challenge from an origin rejection, and they
-// are discarded once the handler returns.
+// nothing behind to diagnose. The upstream's status and headers identify the
+// rejecting layer without logging an arbitrary response body that could reflect
+// request credentials.
 func TestWebSocketDialFailureIsLoggedWithUpstreamDetail(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Server", "cloudflare")
 		w.Header().Set("Cf-Mitigated", "challenge")
 		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, "<html>\n  <head>\n    <title>Just a moment...</title>\n  </head>\n</html>")
+		_, _ = io.WriteString(w, "<html>reflected Authorization: Bearer secret-token</html>")
 	}))
 	defer upstream.Close()
 
@@ -82,31 +82,12 @@ func TestWebSocketDialFailureIsLoggedWithUpstreamDetail(t *testing.T) {
 			t.Errorf("log missing %q, which is what identifies the rejecting layer.\nlogs:\n%s", want, got)
 		}
 	}
-	if !strings.Contains(got, "Just a moment") {
-		t.Errorf("log missing the upstream body excerpt.\nlogs:\n%s", got)
-	}
-}
-
-func TestWebSocketDialFailureBodyIsBoundedAndSingleLine(t *testing.T) {
-	huge := strings.Repeat("<html>challenge page\n", 500)
-	response := &http.Response{Body: io.NopCloser(strings.NewReader(huge))}
-
-	got := websocketDialFailureBody(response)
-	if len(got) > websocketDialFailureBodyMax {
-		t.Fatalf("body excerpt is %d bytes, want at most %d; challenge pages must not flood the log", len(got), websocketDialFailureBodyMax)
-	}
-	if strings.ContainsAny(got, "\n\r") {
-		t.Fatalf("body excerpt contains newlines, which would break one-line-per-event parsing: %q", got)
-	}
-	if got == "" {
-		t.Fatal("body excerpt is empty, want the opening bytes of the response")
+	if strings.Contains(got, "secret-token") {
+		t.Errorf("log contains a credential reflected in the upstream body.\nlogs:\n%s", got)
 	}
 }
 
 func TestWebSocketDialFailureHelpersHandleNilResponse(t *testing.T) {
-	if got := websocketDialFailureBody(nil); got != "" {
-		t.Fatalf("nil response body = %q, want empty", got)
-	}
 	if got := websocketResponseHeader(nil, "Server"); got != "" {
 		t.Fatalf("nil response header = %q, want empty", got)
 	}

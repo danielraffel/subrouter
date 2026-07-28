@@ -1977,8 +1977,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 				"upstream_server", websocketResponseHeader(response, "Server"),
 				"cf_mitigated", websocketResponseHeader(response, "Cf-Mitigated"),
 				"cf_ray", websocketResponseHeader(response, "Cf-Ray"),
-				"content_type", websocketResponseHeader(response, "Content-Type"),
-				"body", websocketDialFailureBody(response))
+				"content_type", websocketResponseHeader(response, "Content-Type"))
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -4295,28 +4294,9 @@ func writeJSON(w http.ResponseWriter, value any) {
 	_ = encoder.Encode(value)
 }
 
-// websocketDialFailureBodyMax bounds how much of a failed websocket dial's
-// response body is logged. Edge challenge pages are large HTML documents, and
-// only the opening bytes are needed to tell them apart from an origin error.
-const websocketDialFailureBodyMax = 240
-
 func websocketResponseHeader(response *http.Response, key string) string {
 	if response == nil {
 		return ""
 	}
 	return response.Header.Get(key)
-}
-
-// websocketDialFailureBody returns a bounded, single-line excerpt of the
-// upstream's response body so the reason survives in the log.
-func websocketDialFailureBody(response *http.Response) string {
-	if response == nil || response.Body == nil {
-		return ""
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(response.Body, websocketDialFailureBodyMax))
-	if err != nil && len(body) == 0 {
-		return ""
-	}
-	return strings.Join(strings.Fields(string(body)), " ")
 }
