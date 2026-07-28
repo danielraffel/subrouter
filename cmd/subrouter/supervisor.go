@@ -423,6 +423,23 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 }
 
 func (s *supervisor) reapWhenIdle(id string) {
+	// Tell the retired worker to stop reusing connections before waiting on it.
+	// WaitIdle has no timeout, so without this a client holding a keep-alive
+	// connection pins an obsolete generation indefinitely: a worker from four
+	// hours and two upgrades ago was still serving 64 connections, which meant
+	// deployed fixes never took effect for those clients. SIGUSR1 makes the
+	// worker answer with "Connection: close", so each client finishes its
+	// current request and reconnects onto the current generation. Nothing in
+	// flight is interrupted.
+	s.workersMu.Lock()
+	retiring := s.workers[id]
+	s.workersMu.Unlock()
+	if retiring != nil && retiring.command != nil && retiring.command.Process != nil {
+		if err := retiring.command.Process.Signal(syscall.SIGUSR1); err != nil {
+			slog.Warn("subrouter worker retire signal failed", "generation", id, "error", err)
+		}
+	}
+
 	s.router.WaitIdle(id)
 	s.workersMu.Lock()
 	worker := s.workers[id]
