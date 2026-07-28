@@ -353,6 +353,7 @@ func serve(args []string) error {
 			Sessions:     store,
 			SchedulerRef: schedulerRef,
 			Logger:       slog.Default(),
+			Lease:        newSRAutoSwitchLease(storepath.StateDir()),
 		})
 	} else if srSwitchInterval > 0 {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
