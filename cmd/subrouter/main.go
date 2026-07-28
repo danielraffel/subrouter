@@ -553,34 +553,59 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 		errCh <- err
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGUSR1)
 	defer signal.Stop(sigCh)
 
-	select {
-	case err := <-errCh:
-		return err
-	case sig := <-sigCh:
-		if lifecycle != nil {
-			lifecycle.Drain()
-		}
-		if logger != nil {
-			logger.Info("subrouter shutdown signal received", "signal", sig.String(), "timeout", shutdownTimeout.String())
-		}
-		if shutdownTimeout < 0 {
-			shutdownTimeout = 0
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			if logger != nil {
-				logger.Error("subrouter graceful shutdown failed", "error", err)
-			}
-			_ = server.Close()
+	for {
+		select {
+		case err := <-errCh:
 			return err
+		case sig := <-sigCh:
+			if sig == syscall.SIGUSR1 {
+				// Retired by the supervisor: a newer generation now owns new
+				// connections, but clients holding keep-alive connections would
+				// otherwise stay pinned to this worker indefinitely, since the
+				// drain has no timeout. Disabling keep-alives makes every
+				// response carry "Connection: close", so each client finishes
+				// its current request and reconnects onto the new generation.
+				// In-flight requests and streams are unaffected.
+				retireServer(server, logger)
+				continue
+			}
+			return shutdownOnSignal(server, lifecycle, sig, shutdownTimeout, logger, errCh)
 		}
-		return <-errCh
 	}
+}
+
+// retireServer stops connection reuse without interrupting anything in flight.
+func retireServer(server *http.Server, logger *slog.Logger) {
+	server.SetKeepAlivesEnabled(false)
+	if logger != nil {
+		logger.Info("subrouter worker retired; closing idle connections and asking clients to reconnect")
+	}
+}
+
+func shutdownOnSignal(server *http.Server, lifecycle *proxy.Lifecycle, sig os.Signal, shutdownTimeout time.Duration, logger *slog.Logger, errCh chan error) error {
+	if lifecycle != nil {
+		lifecycle.Drain()
+	}
+	if logger != nil {
+		logger.Info("subrouter shutdown signal received", "signal", sig.String(), "timeout", shutdownTimeout.String())
+	}
+	if shutdownTimeout < 0 {
+		shutdownTimeout = 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		if logger != nil {
+			logger.Error("subrouter graceful shutdown failed", "error", err)
+		}
+		_ = server.Close()
+		return err
+	}
+	return <-errCh
 }
 
 func listenAndServeHTTP(server *http.Server, logger *slog.Logger) error {
