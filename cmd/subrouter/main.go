@@ -362,6 +362,17 @@ func serve(args []string) error {
 		Addr:              *addr,
 		Handler:           server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bound how long an idle client connection can pin this worker. The
+		// supervisor's drain waits for a retired generation's connections to
+		// close and never times out, so without this a client that simply holds
+		// a keep-alive connection keeps an obsolete worker alive forever: one
+		// from 4.5 hours and two upgrades earlier was still serving 64
+		// connections on a pool sizing that had since been fixed, so deployed
+		// fixes never reached it. Closing a connection that has been idle this
+		// long costs a client nothing (it reconnects on its next request, onto
+		// the current generation) and never interrupts work in flight, since
+		// IdleTimeout only applies between requests.
+		IdleTimeout: workerIdleTimeout,
 	}
 
 	if upstream != nil {
@@ -542,6 +553,12 @@ func numericAWSProfileSuffix(name string) (int, bool) {
 	n, err := strconv.Atoi(name[2:])
 	return n, err == nil
 }
+
+// workerIdleTimeout caps how long a client connection may sit idle on this
+// worker. It has to be short enough that an upgraded-away generation actually
+// drains, and long enough that an ordinary pause between an agent's turns does
+// not churn connections.
+const workerIdleTimeout = 90 * time.Second
 
 func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
