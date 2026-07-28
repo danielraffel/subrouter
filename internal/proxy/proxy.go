@@ -4037,8 +4037,52 @@ func (t replayablePostRetryTransport) RoundTrip(req *http.Request) (*http.Respon
 				t.logger.Warn("retrying replayable upstream request after transport failure", "agent", t.agent, "session", t.session, "account", t.account, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts, "error", err)
 			}
 		}
+		if !sleepForRetry(req.Context(), retryBackoff(attempt)) {
+			return response, err
+		}
 	}
 	return t.roundTrip(req)
+}
+
+// retryBackoff returns how long to wait before the attempt after n.
+//
+// Retries used to fire back to back, so all six attempts completed within
+// microseconds. That is the worst possible strategy against an upstream that is
+// briefly refusing connections: the whole retry budget burns before the far end
+// recovers, and the client gets a 502. Backing off gives it time to come back,
+// while the cap keeps the added latency bounded on a genuinely dead upstream.
+func retryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	backoff := retryBaseBackoff << (attempt - 1)
+	if backoff > retryMaxBackoff {
+		backoff = retryMaxBackoff
+	}
+	return backoff
+}
+
+const (
+	retryBaseBackoff = 100 * time.Millisecond
+	// Bounds the worst case: with six attempts the added latency stays near a
+	// couple of seconds, far better than surfacing a 502 to the caller.
+	retryMaxBackoff = 800 * time.Millisecond
+)
+
+// sleepForRetry waits for the backoff, reporting false if the caller gave up
+// first so a client that has already hung up is not kept waiting.
+func sleepForRetry(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (t replayablePostRetryTransport) roundTrip(req *http.Request) (*http.Response, error) {
