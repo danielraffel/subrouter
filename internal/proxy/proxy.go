@@ -4115,9 +4115,21 @@ const (
 	// upstream hosts, which is the shape of this proxy's traffic.
 	outboundMaxIdleConnsPerHost = 256
 	outboundMaxIdleConns        = 1024
-	// Long enough to span a user's think time between turns so the next
-	// request reuses a warm connection instead of dialing again.
-	outboundIdleConnTimeout = 120 * time.Second
+	// upstreamIdleCloseAfter is how long our upstreams keep an idle connection
+	// before closing it. Measured 2026-07-27 from the mac mini by opening a TLS
+	// connection and waiting for EOF:
+	//
+	//	chatgpt.com:443       peer closed after 15s
+	//	api.anthropic.com:443 peer closed after 15s
+	//
+	// Pooling a connection past this point guarantees handing out one the peer
+	// already closed, which fails the next write with "use of closed network
+	// connection" and surfaces to clients as 502 upstream request failed.
+	upstreamIdleCloseAfter = 15 * time.Second
+	// Comfortably below upstreamIdleCloseAfter so a pooled connection is always
+	// dropped by us before the peer drops it. Still long enough to absorb the
+	// bursts of concurrent requests that pooling exists to serve.
+	outboundIdleConnTimeout = 10 * time.Second
 )
 
 func (s Server) scheduler() selectacct.Scheduler {
