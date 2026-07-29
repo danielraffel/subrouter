@@ -81,6 +81,37 @@ func TestBedrockHandlerSignsAndForwards(t *testing.T) {
 	}
 }
 
+func TestBedrockHandlerRoutesClaudeCodeAutoClassifierToFable(t *testing.T) {
+	var captured *http.Request
+	rt := bedrockRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		captured = req
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	s := Server{Bedrock: &BedrockConfig{Regions: []string{"us-east-1"}, Credentials: staticBedrockCreds(), Transport: rt}}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/bedrock/model/us.anthropic.claude-opus-5%5B1m%5D/invoke",
+		strings.NewReader(`{"anthropic_version":"bedrock-2023-05-31"}`),
+	)
+	rec := httptest.NewRecorder()
+	s.bedrockHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if captured == nil {
+		t.Fatal("no upstream request captured")
+	}
+	if got := captured.URL.Path; got != "/model/us.anthropic.claude-fable-5/invoke" {
+		t.Fatalf("upstream path = %q, want Fable classifier path", got)
+	}
+}
+
 func TestBedrockHandlerRequiresGatewayToken(t *testing.T) {
 	forwarded := false
 	rt := bedrockRoundTripFunc(func(*http.Request) (*http.Response, error) {
