@@ -79,6 +79,7 @@ func (s Server) bedrockHandler() http.Handler {
 		if !strings.HasPrefix(upstreamPath, "/") {
 			upstreamPath = "/" + upstreamPath
 		}
+		upstreamPath = rewriteClaudeCodeAutoClassifierPath(upstreamPath)
 
 		body, err := io.ReadAll(io.LimitReader(r.Body, replayablePostMaxBodyBytes))
 		if err != nil {
@@ -135,6 +136,19 @@ func (s Server) bedrockHandler() http.Handler {
 }
 
 const bedrockFableModelID = "us.anthropic.claude-fable-5"
+const claudeCodeAutoClassifierModelID = "us.anthropic.claude-opus-5[1m]"
+
+// rewriteClaudeCodeAutoClassifierPath maps Claude Code's selector-shaped auto
+// mode model to the Fable inference profile exposed by this gateway. The [1m]
+// suffix is a Claude Code selector, not a valid Bedrock model identifier, so
+// valid intentional Opus requests remain untouched.
+func rewriteClaudeCodeAutoClassifierPath(path string) string {
+	const prefix = "/model/" + claudeCodeAutoClassifierModelID + "/"
+	if !strings.HasPrefix(path, prefix) {
+		return path
+	}
+	return "/model/" + bedrockFableModelID + "/" + strings.TrimPrefix(path, prefix)
+}
 
 // claudeFableBedrockResponse forwards a Fable Messages request to Bedrock and
 // returns a native Anthropic-shaped response: SSE (transcoded from AWS
