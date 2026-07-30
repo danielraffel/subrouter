@@ -252,6 +252,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"status",
 		"storage",
 		"switch",
+		"tenant",
+		"tenants",
 		"team",
 		"trace",
 		"usage",

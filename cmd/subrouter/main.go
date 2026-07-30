@@ -28,6 +28,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
@@ -168,6 +169,8 @@ var directSRCommands = map[string]struct{}{
 	"status":           {},
 	"storage":          {},
 	"switch":           {},
+	"tenant":           {},
+	"tenants":          {},
 	"team":             {},
 	"trace":            {},
 	"usage":            {},
@@ -204,6 +207,7 @@ func serve(args []string) error {
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
+	multiTenant := flags.Bool("multi-tenant", false, "reject unknown srt_ tenant keys even before the first tenant exists; tenant routing itself activates automatically once tenants exist")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
@@ -412,9 +416,15 @@ func serve(args []string) error {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
 
+	multiTenantHandler := &proxy.MultiTenant{
+		Base:          server,
+		Registry:      tenant.NewRegistry(storepath.StateDir()),
+		TranscriptDir: *transcriptDir,
+		Enabled:       *multiTenant,
+	}
 	httpServer := &http.Server{
 		Addr:              *addr,
-		Handler:           server.Handler(),
+		Handler:           multiTenantHandler.Handler(server.Handler()),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Bound how long an idle client connection can pin this worker. The
 		// supervisor's drain waits for a retired generation's connections to
@@ -1027,6 +1037,11 @@ Usage:
   %[1]s server login <name> [--device-auth]
   %[1]s server sync <name> [--device-auth] [--yes]
 
+  %[1]s tenant create <name> [--server <name>]     Create an isolated per-tenant account pool
+  %[1]s tenant list [--server <name>]
+  %[1]s tenant key create <tenant> [--server <name>]
+  %[1]s tenant key revoke <tenant> <key-prefix> [--server <name>]
+
   %[1]s admin-keys         List stored OpenAI admin keys
   %[1]s add-admin-key      Add an sk-admin-* key
   %[1]s remove-admin-key <label>
@@ -1040,7 +1055,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--drain-timeout 10m] -- [serve flags]
   %[1]s accounts
   %[1]s codex [codex args...]

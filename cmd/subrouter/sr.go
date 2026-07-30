@@ -97,6 +97,11 @@ Running agents:
   sr server login <name> [--device-auth]
   sr server sync <name> [--device-auth] [--yes]
 
+  sr tenant create <name> [--server <name>]
+  sr tenant list [--server <name>]
+  sr tenant key create <tenant> [--server <name>]
+  sr tenant key revoke <tenant> <key-prefix> [--server <name>]
+
   sr admin-keys         List stored OpenAI admin keys
   sr add-admin-key      Add an sk-admin-* key
   sr remove-admin-key <label>
@@ -289,6 +294,11 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "tenant", "tenants":
+		return r.tenant(ctx, args[1:])
+	case "help", "-h", "--help":
+		fmt.Fprint(r.out, srHelp)
+		return nil
 	case "daemon":
 		return runDaemonCommand(ctx, args[1:], r.out, r.errOut)
 	case "setup":
@@ -313,7 +323,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+	case "server", "servers", "tenant", "tenants", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
