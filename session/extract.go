@@ -167,6 +167,7 @@ func NormalizeAccountID(value string) string {
 }
 
 func StripSubrouterHeaders(headers http.Header) {
+	headers.Del("X-Subrouter-Lease")
 	headers.Del("X-Subrouter-Session")
 	headers.Del("X-Subrouter-Agent")
 	headers.Del("X-Subrouter-User-Email")

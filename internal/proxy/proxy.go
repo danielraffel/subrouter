@@ -59,10 +59,15 @@ type Server struct {
 	// CredentialBroker selects a team account and returns an access-only,
 	// short-lived lease. When configured, local refresh-token stores and the
 	// local scheduler are bypassed entirely.
-	CredentialBroker CredentialBroker
-	Transport        http.RoundTripper
-	Logger           *slog.Logger
-	ActiveSessions   *ActiveSessions
+	CredentialBroker    CredentialBroker
+	Transport           http.RoundTripper
+	Logger              *slog.Logger
+	ActiveSessions      *ActiveSessions
+	RequireSessionLease bool
+	// ForwardSessionHeaders preserves the selected session identity across an
+	// explicitly configured Subrouter-to-Subrouter delegation hop.
+	ForwardSessionHeaders bool
+	sessionLeases         *sessionLeaseStore
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
 	StreamDrops *StreamDropStats
@@ -918,10 +923,15 @@ func (s Server) Handler() http.Handler {
 	if s.ReadCache == nil {
 		s.ReadCache = newReadCache()
 	}
+	if s.sessionLeases == nil {
+		s.sessionLeases = newSessionLeaseStore()
+	}
 	if s.CacheFlight == nil {
 		s.CacheFlight = newSingleFlight()
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
+	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
 	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
@@ -939,7 +949,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
 	mux.HandleFunc("/_subrouter/bedrock-cost", s.requireAdmin(s.handleBedrockCost))
 	mux.HandleFunc("/_subrouter/", http.NotFound)
-	if s.Bedrock != nil {
+	if s.Bedrock != nil && !s.RequireSessionLease {
 		mux.Handle("/bedrock/", s.bedrockHandler())
 	}
 	mux.Handle("/", s.proxyHandler())
@@ -1724,6 +1734,50 @@ func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agentType := session.ExtractAgentType(r)
+		sessionID := session.ExtractID(r, s.MaxBodyBytes)
+		requestProvider := providerForRequest(agentType, r.URL.Path)
+		var boundLease *sessionLease
+		if lease, presented, err := s.resolveSessionLease(r); presented {
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+			if !lease.allowsRequest(r) {
+				http.Error(w, "session lease does not allow the requested endpoint", http.StatusForbidden)
+				return
+			}
+			if err := lease.validateRequestModel(r); err != nil {
+				if s.Logger != nil {
+					s.Logger.Warn("session lease model request rejected",
+						"provider", lease.Provider,
+						"model", lease.Model,
+						"method", r.Method,
+						"path", r.URL.Path,
+						"content_type", r.Header.Get("Content-Type"),
+						"content_encoding", r.Header.Get("Content-Encoding"),
+						"content_length", r.ContentLength,
+						"reason", err,
+					)
+				}
+				http.Error(w, "session lease does not allow the requested model", http.StatusForbidden)
+				return
+			}
+			boundLease = &lease
+			agentType = lease.Agent
+			sessionID = lease.SessionKey
+			requestProvider = lease.Provider
+			r.Header.Set("X-Subrouter-Agent", lease.Agent)
+			r.Header.Set("X-Subrouter-Session", lease.SessionKey)
+			r.Header.Set("X-Subrouter-Account-ID", lease.AccountID)
+			if lease.Model != "" {
+				r.Header.Set("X-Subrouter-Model", lease.Model)
+			}
+		} else if s.RequireSessionLease {
+			http.Error(w, "session lease required", http.StatusUnauthorized)
+			return
+		}
+
 		if baseURLProbeRequest(r) {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -1750,16 +1804,12 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 		}
-
-		agentType := session.ExtractAgentType(r)
-		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		if s.Lifecycle != nil && s.Lifecycle.Draining() && !s.allowDrainingProxyRequest(agentType, sessionID) {
 			http.Error(w, "subrouter is draining", http.StatusServiceUnavailable)
 			return
 		}
 		endProxyRequest := s.Lifecycle.BeginProxyRequest()
 		defer endProxyRequest()
-		requestProvider := providerForRequest(agentType, r.URL.Path)
 		// Claude Fable routing order: subscription pool (Max accounts) first, then
 		// AWS Bedrock, then the dedicated Anthropic API key. The fallback stages
 		// run when the pool gives up (usageLimitRetryTransport exhausts failover)
@@ -1775,7 +1825,7 @@ func (s Server) proxyHandler() http.Handler {
 			requestModel := session.ExtractModel(r, s.MaxBodyBytes)
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
-			fableFallbackConfigured = s.CredentialBroker == nil &&
+			fableFallbackConfigured = boundLease == nil && s.CredentialBroker == nil &&
 				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
@@ -1843,6 +1893,14 @@ func (s Server) proxyHandler() http.Handler {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
+		// A broker lease already carries its own short-lived credential and the
+		// account is not in the local store, so refreshing it here would strip
+		// the very token the lease provided. The non-broker branch above does
+		// its own refresh.
+		if boundLease != nil && !boundLease.allowsAccount(account) {
+			http.Error(w, "session lease account binding is unavailable", http.StatusServiceUnavailable)
+			return
+		}
 
 		auth := account.AuthorizationHeader()
 		if auth == "" {
@@ -1875,6 +1933,7 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
+		s.setDelegatedSessionHeaders(proxyRequest.Header, sessionAgentType, sessionID)
 		stripOutboundForwardingHeaders(proxyRequest.Header)
 		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
 		postReplayable := false
@@ -1903,7 +1962,7 @@ func (s Server) proxyHandler() http.Handler {
 			},
 		}
 		transport := s.transport()
-		if retryPost && postReplayable &&
+		if boundLease == nil && retryPost && postReplayable &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) &&
 			account.AuthMode == accounts.AuthModeOAuth &&
 			s.CredentialBroker == nil {
@@ -2221,6 +2280,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	headers := r.Header.Clone()
 	stripWebSocketDialHeaders(headers)
 	session.StripSubrouterHeaders(headers)
+	s.setDelegatedSessionHeaders(headers, agentType, sessionID)
 	stripOutboundForwardingHeaders(headers)
 	setAccountAuthHeaders(headers, account)
 	s.recordWebSocketMeta(r, upstreamURL, headers, agentType, sessionID, userEmail, account, upstream)
@@ -2324,6 +2384,17 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			nil,
 		)
 	}
+}
+
+// setDelegatedSessionHeaders preserves routing affinity only for an explicit
+// --upstream proxy chain. Provider endpoints never receive these internal
+// headers through their normal provider-specific upstream configuration.
+func (s Server) setDelegatedSessionHeaders(headers http.Header, agentType, sessionID string) {
+	if s.Upstream == nil || !s.ForwardSessionHeaders {
+		return
+	}
+	headers.Set("X-Subrouter-Agent", agentType)
+	headers.Set("X-Subrouter-Session", sessionID)
 }
 
 func stripWebSocketDialHeaders(headers http.Header) {
@@ -3167,7 +3238,20 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 		return path
 	}
 	if account.Provider == accounts.ProviderKimi {
-		return stripProviderPathPrefix(path, "kimi")
+		path = stripProviderPathPrefix(path, "kimi")
+		upstreamPath := ""
+		if s.KimiUpstream != nil {
+			upstreamPath = strings.TrimRight(s.KimiUpstream.Path, "/")
+		}
+		if strings.HasSuffix(upstreamPath, "/v1") {
+			if path == "/v1" {
+				return "/"
+			}
+			if strings.HasPrefix(path, "/v1/") {
+				return strings.TrimPrefix(path, "/v1")
+			}
+		}
+		return path
 	}
 	if account.Provider == accounts.ProviderZAI {
 		return stripProviderPathPrefix(path, "zai")
@@ -3232,10 +3316,26 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 }
 
 func (s Server) accountForSessionProvider(provider accounts.Provider, agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
+	return s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
+}
+
+type accountSelectionOptions struct {
+	allowFableAPIKeyPool bool
+	ignoreForcedAccount  bool
+	oauthOnly            bool
+}
+
+func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider, agentType, sessionID string, r *http.Request, options accountSelectionOptions) (accounts.Account, string, string, error) {
 	userEmail := session.ExtractUserEmail(r)
-	forcedAccountID := session.ExtractAccountID(r)
+	forcedAccountID := ""
+	if !options.ignoreForcedAccount {
+		forcedAccountID = session.ExtractAccountID(r)
+	}
 	model := session.ExtractModel(r, s.MaxBodyBytes)
 	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
+	if options.oauthOnly {
+		availableAccounts = oauthAccounts(availableAccounts)
+	}
 	if forcedAccountID != "" {
 		account, ok := findAccount(availableAccounts, forcedAccountID)
 		if !ok {
@@ -3253,7 +3353,7 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
-	if provider == accounts.ProviderClaude && s.claudeFableEnabled() && claudeFableModel(model) {
+	if provider == accounts.ProviderClaude && !options.allowFableAPIKeyPool && s.claudeFableEnabled() && claudeFableModel(model) {
 		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
 		// metered API-key pool accounts never preempt the Bedrock stage. With no
 		// OAuth account usable, selection fails and the handler serves the
@@ -3560,11 +3660,14 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 	if err == nil {
 		return refreshed, nil
 	}
-	if provider != accounts.ProviderClaude || session.ExtractAccountID(r) != "" {
+	if session.ExtractAccountID(r) != "" || (provider != accounts.ProviderClaude && provider != accounts.ProviderCodex) {
+		return account, err
+	}
+	if provider == accounts.ProviderCodex && !isTerminalCredentialError(err) {
 		return account, err
 	}
 	if s.Logger != nil {
-		s.Logger.Warn("selected Claude account refresh failed, trying another account", "account", account.ID, "error", err)
+		s.Logger.Warn("selected OAuth account refresh failed, trying another account", "provider", provider, "account", account.ID, "error", err)
 	}
 	tried := map[string]struct{}{account.ID: {}}
 	s.markAccountExhaustedRefreshFailure(provider, account.ID, "", err)
@@ -3579,10 +3682,13 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		if err == nil {
 			return refreshed, nil
 		}
+		if provider == accounts.ProviderCodex && !isTerminalCredentialError(err) {
+			return next, err
+		}
 		lastErr = err
 		s.markAccountExhaustedRefreshFailure(provider, next.ID, "", err)
 		if s.Logger != nil {
-			s.Logger.Warn("retry Claude account refresh failed", "account", next.ID, "error", err)
+			s.Logger.Warn("retry OAuth account refresh failed", "provider", provider, "account", next.ID, "error", err)
 		}
 	}
 }
@@ -4216,9 +4322,21 @@ func isTerminalCredentialError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	var storedCodexFailure *accounts.CodexStoredRefreshFailureError
+	if errors.As(err, &storedCodexFailure) {
+		return true
+	}
+	var codexRefreshFailure *accounts.CodexAuthRefreshError
+	if errors.As(err, &codexRefreshFailure) {
+		return codexRefreshFailure.StatusCode == http.StatusUnauthorized ||
+			codexRefreshFailure.ProviderCode == "refresh_token_reused" ||
+			codexRefreshFailure.ProviderCode == "invalid_grant"
+	}
 	msg := strings.ToLower(err.Error())
 	for _, terminal := range []string{
 		"invalid_grant",
+		"refresh_token_reused",
+		"reauth required",
 		"refresh token not found",
 		"no refresh token",
 		"has no refresh token",

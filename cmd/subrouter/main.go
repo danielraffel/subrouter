@@ -205,6 +205,7 @@ func serve(args []string) error {
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
+	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	multiTenant := flags.Bool("multi-tenant", false, "reject unknown srt_ tenant keys even before the first tenant exists; tenant routing itself activates automatically once tenants exist")
@@ -367,29 +368,31 @@ func serve(args []string) error {
 	}
 
 	server := proxy.Server{
-		StreamDrops:         &proxy.StreamDropStats{},
-		Upstream:            upstream,
-		CodexUpstream:       codexUpstream,
-		APIUpstream:         apiUpstream,
-		ClaudeUpstream:      claudeUpstream,
-		KimiUpstream:        kimiUpstream,
-		ZAIUpstream:         zaiUpstream,
-		Accounts:            nil,
-		AccountRef:          accountRef,
-		CredentialBroker:    credentialBroker,
-		Sessions:            store,
-		SchedulerRef:        schedulerRef,
-		UsageScoreTTL:       usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
-		Transport:           outboundTransport,
-		Logger:              slog.Default(),
-		Lifecycle:           proxy.NewLifecycle(),
-		AdminToken:          *adminToken,
-		LocalProxyToken:     cloudServerProxyToken(cloudConfig),
-		MaxBodyBytes:        *maxBodyBytes,
-		Bedrock:             bedrockConfig,
-		ClaudeFableAPIKey:   fableAPIKey,
-		FableBedrockPrimary: fableBedrockEnabled,
-		Transcripts:         transcript.NewRecorder(*transcriptDir),
+		StreamDrops:           &proxy.StreamDropStats{},
+		Upstream:              upstream,
+		CodexUpstream:         codexUpstream,
+		APIUpstream:           apiUpstream,
+		ClaudeUpstream:        claudeUpstream,
+		KimiUpstream:          kimiUpstream,
+		ZAIUpstream:           zaiUpstream,
+		Accounts:              nil,
+		AccountRef:            accountRef,
+		CredentialBroker:      credentialBroker,
+		Sessions:              store,
+		SchedulerRef:          schedulerRef,
+		UsageScoreTTL:         usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		Transport:             outboundTransport,
+		Logger:                slog.Default(),
+		Lifecycle:             proxy.NewLifecycle(),
+		AdminToken:            *adminToken,
+		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
+		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
+		LocalProxyToken:       cloudServerProxyToken(cloudConfig),
+		MaxBodyBytes:          *maxBodyBytes,
+		Bedrock:               bedrockConfig,
+		ClaudeFableAPIKey:     fableAPIKey,
+		FableBedrockPrimary:   fableBedrockEnabled,
+		Transcripts:           transcript.NewRecorder(*transcriptDir),
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,
