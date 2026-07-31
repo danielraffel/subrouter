@@ -1,6 +1,6 @@
 .DS_Store
 /subrouter
-bin/
+/bin/
 !npm/bin/
 !npm/bin/*.js
 *.test
