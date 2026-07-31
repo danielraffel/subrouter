@@ -73,7 +73,7 @@ func FetchPublicConfig(ctx context.Context, httpClient *http.Client, cmuxBaseURL
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return PublicConfig{}, responseError("load CLI configuration", res)
+		return PublicConfig{}, publicConfigResponseError(res)
 	}
 	var config PublicConfig
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&config); err != nil {
@@ -427,12 +427,29 @@ func (c Client) httpClient() *http.Client {
 
 func responseError(action string, res *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+	return responseErrorFromBody(action, res.StatusCode, body)
+}
+
+func publicConfigResponseError(res *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+	var envelope struct {
+		Error string `json:"error"`
+	}
+	if res.StatusCode == http.StatusServiceUnavailable &&
+		json.Unmarshal(body, &envelope) == nil &&
+		envelope.Error == "cli_auth_unavailable" {
+		return errors.New("cmux.com login is temporarily unavailable; try again later")
+	}
+	return responseErrorFromBody("load CLI configuration", res.StatusCode, body)
+}
+
+func responseErrorFromBody(action string, statusCode int, body []byte) error {
 	message := strings.TrimSpace(string(body))
 	if message == "" {
-		message = http.StatusText(res.StatusCode)
+		message = http.StatusText(statusCode)
 	}
 	return &HTTPError{
-		Action: action, StatusCode: res.StatusCode, Message: message,
+		Action: action, StatusCode: statusCode, Message: message,
 	}
 }
 
