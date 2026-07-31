@@ -217,14 +217,14 @@ func proxyClaudeInvocation(
 
 func cloudClaudeEnvironment(
 	environ []string,
-	local string,
-	localProxyToken string,
+	baseURL string,
+	proxyToken string,
 ) []string {
-	baseURL := strings.TrimRight(local, "/")
+	baseURL = strings.TrimRight(baseURL, "/")
 	baseURL = strings.TrimSuffix(baseURL, "/v1")
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
-	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", localProxyToken)
+	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", proxyToken)
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {

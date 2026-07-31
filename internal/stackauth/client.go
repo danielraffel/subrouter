@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -89,6 +90,35 @@ type Client struct {
 	ProjectID            string
 	PublishableClientKey string
 	HTTPClient           *http.Client
+}
+
+type HTTPError struct {
+	Action     string
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf(
+		"%s: HTTP %d: %s",
+		e.Action,
+		e.StatusCode,
+		e.Message,
+	)
+}
+
+// Retryable reports whether a failed Stack request is safe to retry while an
+// existing CLI login deadline and context still bound the operation.
+func Retryable(err error) bool {
+	var responseErr *HTTPError
+	if errors.As(err, &responseErr) {
+		return responseErr.StatusCode == http.StatusRequestTimeout ||
+			responseErr.StatusCode == http.StatusTooManyRequests ||
+			responseErr.StatusCode >= http.StatusInternalServerError
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) &&
+		(networkErr.Timeout() || networkErr.Temporary())
 }
 
 type CLIStart struct {
@@ -401,7 +431,9 @@ func responseError(action string, res *http.Response) error {
 	if message == "" {
 		message = http.StatusText(res.StatusCode)
 	}
-	return fmt.Errorf("%s: HTTP %d: %s", action, res.StatusCode, message)
+	return &HTTPError{
+		Action: action, StatusCode: res.StatusCode, Message: message,
+	}
 }
 
 func validateHTTPSOriginOrURL(raw string) error {
@@ -415,7 +447,10 @@ func validateHTTPSOriginOrURL(raw string) error {
 	if parsed.Scheme == "https" {
 		return nil
 	}
-	if parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1") {
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	ip := net.ParseIP(host)
+	if parsed.Scheme == "http" &&
+		(host == "localhost" || (ip != nil && ip.IsLoopback())) {
 		return nil
 	}
 	return errors.New("URL must use HTTPS, except on loopback")

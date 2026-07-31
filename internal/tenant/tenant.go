@@ -132,16 +132,18 @@ func DeriveKey(secret []byte, namespace, externalID string) (string, error) {
 	return KeyPrefix + hex.EncodeToString(mac.Sum(nil)[:keyRandomBytes]), nil
 }
 
-// ValidExternalID permits identity-provider IDs as directory names while
-// rejecting separators and traversal.
+// ValidExternalID permits lowercase identity-provider IDs as directory names
+// while rejecting separators, traversal, and case-folding collisions.
 func ValidExternalID(value string) bool {
 	value = strings.TrimSpace(value)
 	if value == "" || len(value) > 128 || value == "." || value == ".." {
 		return false
 	}
+	if value != strings.ToLower(value) {
+		return false
+	}
 	for _, ch := range value {
 		if (ch >= 'a' && ch <= 'z') ||
-			(ch >= 'A' && ch <= 'Z') ||
 			(ch >= '0' && ch <= '9') ||
 			ch == '-' || ch == '_' || ch == '.' {
 			continue

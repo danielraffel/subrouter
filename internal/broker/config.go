@@ -113,7 +113,8 @@ func (c Config) Normalized() Config {
 }
 
 func (c Config) Validate() error {
-	baseURL, err := url.Parse(c.Normalized().BaseURL)
+	normalized := c.Normalized()
+	baseURL, err := url.Parse(normalized.BaseURL)
 	if err != nil {
 		return fmt.Errorf("invalid cmux.com base URL: %w", err)
 	}
@@ -122,16 +123,11 @@ func (c Config) Validate() error {
 		baseURL.RawQuery != "" || baseURL.Fragment != "" {
 		return errors.New("cmux.com base URL must be an origin without credentials, path, query, or fragment")
 	}
-	host := strings.ToLower(baseURL.Hostname())
-	loopback := host == "localhost"
-	if ip := net.ParseIP(host); ip != nil {
-		loopback = ip.IsLoopback()
-	}
 	if baseURL.Scheme != "https" &&
-		!(baseURL.Scheme == "http" && loopback) {
+		!(baseURL.Scheme == "http" && isLoopbackHost(baseURL.Hostname())) {
 		return errors.New("cmux.com base URL must use HTTPS, except for a loopback development server")
 	}
-	switch c.Normalized().CredentialSource {
+	switch normalized.CredentialSource {
 	case "", CredentialSourceTeam, CredentialSourceLocal, CredentialSourceLegacy, CredentialSourceHosted:
 	default:
 		return fmt.Errorf(
@@ -142,7 +138,6 @@ func (c Config) Validate() error {
 			CredentialSourceHosted,
 		)
 	}
-	normalized := c.Normalized()
 	if normalized.CredentialSource == CredentialSourceHosted {
 		if !tenant.ValidKeyFormat(normalized.TenantKey) {
 			return errors.New("hosted credential source requires a valid tenant key")

@@ -101,7 +101,7 @@ Running agents:
   sr claude [args]      Run claude through Subrouter
   sr gemini [args]      Run gemini through Subrouter
 
-  sr server             Manage Subrouter servers
+  sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
   sr server use <name|local> [--no-codex-config]
   sr server rename <old> <new>

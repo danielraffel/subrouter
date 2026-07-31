@@ -357,6 +357,11 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	base := strings.TrimRight(strings.TrimSpace(m.PublicURL), "/")
+	if base == "" {
+		http.Error(w, "hosted proxy URL is not configured", http.StatusInternalServerError)
+		return
+	}
 	key, err := tenant.DeriveKey(m.StackTenantKeySecret, claims.ProjectID, teamID)
 	if err != nil {
 		http.Error(w, "tenant key unavailable", http.StatusInternalServerError)
@@ -370,8 +375,8 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tenant unavailable", http.StatusInternalServerError)
 		return
 	}
-	base := strings.TrimRight(strings.TrimSpace(m.PublicURL), "/")
 	proxyURL := base + "/t/" + key
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, map[string]any{
 		"tenantId": created.ID, "tenantName": created.Name,
 		"tenantKey": key, "proxyUrl": proxyURL,
@@ -396,8 +401,12 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	bodyLimit := server.MaxBodyBytes
+	if bodyLimit <= 0 {
+		bodyLimit = 1 << 20
+	}
 	var input tenantAccountUpload
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&input); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, bodyLimit)).Decode(&input); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
@@ -471,6 +480,10 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 }
 
 func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/_subrouter/accounts/"))
 	if id == "" {
 		http.NotFound(w, r)

@@ -200,6 +200,10 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 			Provider string `json:"provider"`
 			AuthMode string `json:"auth_mode"`
 			Email    string `json:"email"`
+			Health   *struct {
+				OK      bool   `json:"ok"`
+				Message string `json:"message,omitempty"`
+			} `json:"health,omitempty"`
 		}
 		if err := c.doHostedJSON(ctx, http.MethodGet, "/_subrouter/accounts", nil, &items); err != nil {
 			return nil, err
@@ -218,7 +222,9 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 			if label == "" {
 				label = item.ID
 			}
-			out = append(out, SharedAccount{ID: item.ID, Kind: kind, Label: label})
+			out = append(out, SharedAccount{
+				ID: item.ID, Kind: kind, Label: label, Health: item.Health,
+			})
 		}
 		return out, nil
 	}
@@ -326,7 +332,22 @@ func (c *Client) doHostedJSON(
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("hosted Subrouter request failed (%d): %s", response.StatusCode, http.StatusText(response.StatusCode))
+		message := http.StatusText(response.StatusCode)
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(data, &body) == nil &&
+			strings.TrimSpace(body.Error) != "" {
+			message = strings.TrimSpace(body.Error)
+		}
+		if message == "" {
+			message = "request failed"
+		}
+		return fmt.Errorf(
+			"hosted Subrouter request failed (%d): %s",
+			response.StatusCode,
+			message,
+		)
 	}
 	if out == nil || len(data) == 0 {
 		return nil

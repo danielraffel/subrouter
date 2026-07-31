@@ -216,7 +216,7 @@ func serve(args []string) error {
 	stackAPIURL := flags.String("stack-api-url", "", "Stack Auth API base URL; defaults to SUBROUTER_STACK_API_URL")
 	stackProjectID := flags.String("stack-project-id", "", "Stack Auth project ID enabling hosted login; defaults to SUBROUTER_STACK_PROJECT_ID")
 	stackPublishableClientKey := flags.String("stack-publishable-client-key", "", "Stack Auth publishable client key; defaults to SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY")
-	stackTenantKeySecret := flags.String("stack-tenant-key-secret", "", "server secret for stable Stack-team tenant keys; defaults to SUBROUTER_STACK_TENANT_KEY_SECRET")
+	stackTenantKeySecret := flags.String("stack-tenant-key-secret", "", "local-development override for stable Stack-team tenant keys; deployments use SUBROUTER_STACK_TENANT_KEY_SECRET")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
@@ -263,10 +263,13 @@ func serve(args []string) error {
 		}
 	}
 	if stackLoginConfigured != 0 && stackLoginConfigured != len(stackLoginValues) {
-		return errors.New("hosted Stack login requires SUBROUTER_STACK_PROJECT_ID, SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY, and SUBROUTER_STACK_TENANT_KEY_SECRET")
+		return errors.New("hosted Stack login requires all of --stack-project-id, --stack-publishable-client-key, and --stack-tenant-key-secret (or SUBROUTER_STACK_PROJECT_ID, SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY, and SUBROUTER_STACK_TENANT_KEY_SECRET)")
 	}
 	if *stackTenantKeySecret != "" && len(*stackTenantKeySecret) < 32 {
-		return errors.New("SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")
+		return errors.New("--stack-tenant-key-secret or SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")
+	}
+	if err := validatePublicSubrouterURL(*publicURL); err != nil {
+		return err
 	}
 
 	var upstream *url.URL
@@ -501,6 +504,27 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+}
+
+func validatePublicSubrouterURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("--public-url or SUBROUTER_PUBLIC_URL must be an origin such as https://sr.example.com")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	ip := net.ParseIP(host)
+	loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+	if parsed.Scheme != "https" &&
+		!(parsed.Scheme == "http" && loopback) {
+		return errors.New("--public-url or SUBROUTER_PUBLIC_URL must use HTTPS, except on loopback")
+	}
+	return nil
 }
 
 func loadProxyAccounts(

@@ -389,7 +389,7 @@ func (s Store) initInstanceDir(instancePath string) error {
 	if err := s.prepareSharedState(instancePath); err != nil {
 		return err
 	}
-	if s.SharedStateDir == "" {
+	if strings.TrimSpace(s.SharedStateDir) == "" {
 		for _, name := range claudeHighGrowthDirs {
 			if err := os.MkdirAll(filepath.Join(instancePath, name), 0o700); err != nil {
 				return err
@@ -432,7 +432,11 @@ func migrateDirectoryToShared(source, target string) error {
 		if readErr != nil {
 			return readErr
 		}
-		currentAbs, _ := filepath.Abs(filepath.Join(filepath.Dir(source), current))
+		currentPath := current
+		if !filepath.IsAbs(currentPath) {
+			currentPath = filepath.Join(filepath.Dir(source), currentPath)
+		}
+		currentAbs, _ := filepath.Abs(currentPath)
 		targetAbs, _ := filepath.Abs(target)
 		if currentAbs == targetAbs {
 			return os.MkdirAll(target, 0o700)
@@ -734,7 +738,10 @@ func (s Store) UpsertCredentialProfile(name string, credential CredentialInfo) (
 	if err := s.RegisterProfile(name, dir); err != nil {
 		return Profile{}, err
 	}
-	profile, _ := s.FindProfile(name)
+	profile, ok := s.FindProfile(name)
+	if !ok {
+		return Profile{}, fmt.Errorf("Claude profile %q was not readable after registration", name)
+	}
 	return profile, nil
 }
 

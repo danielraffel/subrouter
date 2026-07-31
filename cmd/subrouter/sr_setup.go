@@ -270,6 +270,11 @@ func runCleanupWith(controller serviceController, store accounts.CodexStore, yes
 					cloudConfig.AccessToken,
 					cloudConfig.RefreshToken,
 				)
+			} else {
+				fmt.Fprintln(
+					out,
+					"warning: this legacy session cannot be revoked because its retired auth endpoint no longer exists; revoke it in the cmux.com dashboard",
+				)
 			}
 			cancel()
 			if logoutErr != nil {

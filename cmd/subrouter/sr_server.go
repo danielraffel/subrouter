@@ -91,6 +91,7 @@ func srRemoteHelp(command string) string {
   %[1]s use local
   %[1]s use cmux
   %[1]s add <name> <url> [--tenant-key srt_<hex>]
+  %[1]s rename <old> <new>
   %[1]s remove <name>
 
 cmux is built in and becomes usable after 'sr login'.
@@ -466,31 +467,62 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 	if !ok {
 		return fmt.Errorf("server %q not found", name)
 	}
+	var (
+		hostedConfigPath string
+		previousHosted   broker.Config
+		hostedSaved      bool
+	)
+	if server.Name == "cmux" && strings.TrimSpace(server.TenantKey) != "" {
+		hostedConfigPath, err = broker.DefaultConfigPath()
+		if err != nil {
+			return err
+		}
+		previousHosted, err = broker.LoadConfig(hostedConfigPath)
+		if err != nil {
+			return err
+		}
+		nextHosted := previousHosted
+		nextHosted.CredentialSource = broker.CredentialSourceHosted
+		nextHosted.HostedURL = server.URL
+		nextHosted.TenantKey = server.TenantKey
+		if !nextHosted.HostedReady() {
+			return fmt.Errorf("cmux hosted requires login and a selected team; run 'sr login'")
+		}
+		if err := broker.SaveConfig(hostedConfigPath, nextHosted); err != nil {
+			return err
+		}
+		hostedSaved = true
+	}
+	rollbackHosted := func(cause error) error {
+		if !hostedSaved {
+			return cause
+		}
+		if rollbackErr := broker.SaveConfig(hostedConfigPath, previousHosted); rollbackErr != nil {
+			return errors.Join(cause, fmt.Errorf("restore hosted configuration: %w", rollbackErr))
+		}
+		return cause
+	}
+	previousFile := file
 	file.Default = name
 	if err := store.save(file); err != nil {
-		return err
+		return rollbackHosted(err)
 	}
-	fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
 	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
 		path, err := writeCodexConfigForServer(server)
 		if err != nil {
-			return err
+			restoreErr := store.save(previousFile)
+			if restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore remote selection: %w", restoreErr))
+			}
+			return rollbackHosted(err)
 		}
+		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
+	} else {
+		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
 	}
-	if server.Name == "cmux" && strings.TrimSpace(server.TenantKey) != "" {
-		path, err := broker.DefaultConfigPath()
-		if err != nil {
-			return err
-		}
-		config, err := broker.LoadConfig(path)
-		if err != nil {
-			return err
-		}
-		config.CredentialSource = broker.CredentialSourceHosted
-		config.HostedURL = server.URL
-		config.TenantKey = server.TenantKey
-		return broker.SaveConfig(path, config)
+	if hostedSaved {
+		return nil
 	}
 	return r.cloudStorage([]string{"legacy"})
 }

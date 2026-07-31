@@ -85,20 +85,22 @@ func (r srRunner) cloudLogin(ctx context.Context, args []string) error {
 	var refreshToken string
 	for {
 		poll, pollErr := stackClient.PollCLI(ctx, start.PollingCode)
-		if pollErr != nil {
+		if pollErr != nil && !stackauth.Retryable(pollErr) {
 			return fmt.Errorf("poll cmux.com login: %w", pollErr)
 		}
-		switch poll.Status {
-		case "waiting":
-		case "success":
-			if poll.RefreshToken == "" {
-				return fmt.Errorf("cmux.com approved login without a refresh token")
+		if pollErr == nil {
+			switch poll.Status {
+			case "waiting":
+			case "success":
+				if poll.RefreshToken == "" {
+					return fmt.Errorf("cmux.com approved login without a refresh token")
+				}
+				refreshToken = poll.RefreshToken
+			case "expired", "used":
+				return fmt.Errorf("login %s", poll.Status)
+			default:
+				return fmt.Errorf("login returned unexpected status %q", poll.Status)
 			}
-			refreshToken = poll.RefreshToken
-		case "expired", "used":
-			return fmt.Errorf("login %s", poll.Status)
-		default:
-			return fmt.Errorf("login returned unexpected status %q", poll.Status)
 		}
 		if refreshToken != "" {
 			break
@@ -200,7 +202,21 @@ func matchNativeStackTeam(teams []stackauth.Team, selector string) (stackauth.Te
 	}
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
-		return teams[0], nil
+		if len(teams) == 1 {
+			return teams[0], nil
+		}
+		available := make([]string, 0, len(teams))
+		for _, team := range teams {
+			available = append(
+				available,
+				fmt.Sprintf("%s (%s)", team.DisplayName, team.ID),
+			)
+		}
+		sort.Strings(available)
+		return stackauth.Team{}, fmt.Errorf(
+			"multiple Stack teams are available: %s; rerun 'sr login --team <id-or-name>'",
+			strings.Join(available, ", "),
+		)
 	}
 	for _, team := range teams {
 		if team.ID == selector || strings.EqualFold(team.DisplayName, selector) {
@@ -421,8 +437,14 @@ func (r srRunner) cloudLogout(ctx context.Context) error {
 	if err := broker.SaveConfig(path, config); err != nil {
 		return err
 	}
+	if err := r.clearDefaultServer(defaultSRServerStore(r.store), true); err != nil {
+		return fmt.Errorf(
+			"logout incomplete: the cmux.com session was cleared, but the hosted remote and tenant key remain; rerun 'sr logout': %w",
+			err,
+		)
+	}
 	fmt.Fprintln(r.out, "Logged out of cmux.com. Credential storage is now local.")
-	return r.clearDefaultServer(defaultSRServerStore(r.store), true)
+	return nil
 }
 
 func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
@@ -432,6 +454,13 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 	config, path, _, err := loadCloudClient(false)
 	if err != nil {
 		return err
+	}
+	if args[0] == "current" {
+		if config.TeamID == "" {
+			return fmt.Errorf("no team selected; run 'sr team list' then 'sr team use <team>'")
+		}
+		fmt.Fprintf(r.out, "%s (%s)\n", config.TeamName, config.TeamID)
+		return nil
 	}
 	if config.StackProjectID == "" || config.StackPublishable == "" {
 		return fmt.Errorf("this login predates native Stack Auth; run 'sr login' again")
@@ -443,6 +472,9 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 	}
 	config.AccessToken = tokens.AccessToken
 	config.RefreshToken = tokens.RefreshToken
+	if err := broker.SaveConfig(path, config); err != nil {
+		return fmt.Errorf("persist refreshed Stack session: %w", err)
+	}
 	stackTeams, err := client.ListTeams(ctx, tokens.AccessToken)
 	if err != nil {
 		return err
@@ -456,12 +488,6 @@ func (r srRunner) cloudTeam(ctx context.Context, args []string) error {
 			}
 			fmt.Fprintf(r.out, "%s %-28s %s\n", marker, team.DisplayName, team.ID)
 		}
-		return broker.SaveConfig(path, config)
-	case "current":
-		if config.TeamID == "" {
-			return fmt.Errorf("no team selected; run 'sr team list' then 'sr team use <team>'")
-		}
-		fmt.Fprintf(r.out, "%s (%s)\n", config.TeamName, config.TeamID)
 		return nil
 	case "use":
 		if len(args) != 2 {
@@ -552,7 +578,7 @@ func (r srRunner) cloudStorage(args []string) error {
 	}
 	config, err := cloudModeConfig()
 	if err != nil {
-		if source == broker.CredentialSourceTeam {
+		if source == broker.CredentialSourceHosted {
 			return err
 		}
 		var recovered bool
@@ -567,8 +593,12 @@ func (r srRunner) cloudStorage(args []string) error {
 			)
 		}
 	}
-	if source == broker.CredentialSourceTeam && !config.Ready() {
-		return fmt.Errorf("team credential storage requires login and a selected team; run 'sr login'")
+	if source == broker.CredentialSourceHosted {
+		candidate := config
+		candidate.CredentialSource = source
+		if !candidate.HostedReady() {
+			return fmt.Errorf("hosted cmux requires login and a selected team; run 'sr login'")
+		}
 	}
 	config.CredentialSource = source
 	if err := broker.SaveConfig(path, config); err != nil {

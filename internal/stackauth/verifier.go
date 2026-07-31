@@ -2,6 +2,7 @@ package stackauth
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/sha256"
@@ -34,11 +35,17 @@ type Verifier struct {
 	ProjectID  string
 	HTTPClient *http.Client
 	CacheTTL   time.Duration
-	Now        func() time.Time
+	// ForceRefreshInterval bounds signature-triggered JWKS refreshes.
+	ForceRefreshInterval time.Duration
+	Now                  func() time.Time
 
-	mu        sync.Mutex
-	keys      map[string]*ecdsa.PublicKey
-	fetchedAt time.Time
+	mu           sync.Mutex
+	keys         map[string]*ecdsa.PublicKey
+	fetchedAt    time.Time
+	forcedAt     time.Time
+	fetching     bool
+	fetchDone    chan struct{}
+	lastFetchErr error
 }
 
 func (v *Verifier) Verify(ctx context.Context, token string) (Claims, error) {
@@ -132,28 +139,86 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Claims, error) {
 }
 
 func (v *Verifier) key(ctx context.Context, keyID string, force bool) (*ecdsa.PublicKey, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	ttl := v.CacheTTL
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	if !force && time.Since(v.fetchedAt) < ttl {
+	forceInterval := v.ForceRefreshInterval
+	if forceInterval <= 0 {
+		forceInterval = 30 * time.Second
+	}
+
+	v.mu.Lock()
+	now := v.now()
+	fresh := !v.fetchedAt.IsZero() && now.Sub(v.fetchedAt) < ttl
+	if !force && fresh {
 		if key := v.keys[keyID]; key != nil {
+			v.mu.Unlock()
 			return key, nil
 		}
+		// An unknown key ID may be a real key rotation. Give it one bounded
+		// refresh attempt instead of letting arbitrary IDs bypass the cache.
+		force = true
 	}
-	if err := v.fetchKeys(ctx); err != nil {
+	if v.fetching {
+		done := v.fetchDone
+		v.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+		}
+		v.mu.Lock()
+		key := v.keys[keyID]
+		fetchErr := v.lastFetchErr
+		v.mu.Unlock()
+		if key != nil {
+			return key, nil
+		}
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		return nil, fmt.Errorf("Stack signing key %q not found", keyID)
+	}
+	if force && !v.forcedAt.IsZero() &&
+		now.Sub(v.forcedAt) < forceInterval {
+		key := v.keys[keyID]
+		v.mu.Unlock()
+		if key != nil {
+			return key, nil
+		}
+		return nil, fmt.Errorf("Stack signing key %q not found", keyID)
+	}
+	v.fetching = true
+	v.fetchDone = make(chan struct{})
+	v.lastFetchErr = nil
+	if force {
+		v.forcedAt = now
+	}
+	v.mu.Unlock()
+
+	keys, err := v.fetchKeys(ctx)
+
+	v.mu.Lock()
+	if err == nil {
+		v.keys = keys
+		v.fetchedAt = v.now()
+	}
+	v.lastFetchErr = err
+	v.fetching = false
+	close(v.fetchDone)
+	key := v.keys[keyID]
+	v.mu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	key := v.keys[keyID]
 	if key == nil {
 		return nil, fmt.Errorf("Stack signing key %q not found", keyID)
 	}
 	return key, nil
 }
 
-func (v *Verifier) fetchKeys(ctx context.Context) error {
+func (v *Verifier) fetchKeys(ctx context.Context) (map[string]*ecdsa.PublicKey, error) {
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodGet,
@@ -161,7 +226,7 @@ func (v *Verifier) fetchKeys(ctx context.Context) error {
 		nil,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	client := v.HTTPClient
 	if client == nil {
@@ -169,11 +234,11 @@ func (v *Verifier) fetchKeys(ctx context.Context) error {
 	}
 	res, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("load Stack signing keys: %w", err)
+		return nil, fmt.Errorf("load Stack signing keys: %w", err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return responseError("load Stack signing keys", res)
+		return nil, responseError("load Stack signing keys", res)
 	}
 	var document struct {
 		Keys []struct {
@@ -186,7 +251,7 @@ func (v *Verifier) fetchKeys(ctx context.Context) error {
 		} `json:"keys"`
 	}
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&document); err != nil {
-		return fmt.Errorf("decode Stack signing keys: %w", err)
+		return nil, fmt.Errorf("decode Stack signing keys: %w", err)
 	}
 	keys := make(map[string]*ecdsa.PublicKey, len(document.Keys))
 	for _, item := range document.Keys {
@@ -195,20 +260,30 @@ func (v *Verifier) fetchKeys(ctx context.Context) error {
 		}
 		x, errX := base64.RawURLEncoding.DecodeString(item.X)
 		y, errY := base64.RawURLEncoding.DecodeString(item.Y)
-		if errX != nil || errY != nil {
+		if errX != nil || errY != nil || len(x) > 32 || len(y) > 32 {
+			continue
+		}
+		point := make([]byte, 65)
+		point[0] = 4
+		copy(point[33-len(x):33], x)
+		copy(point[65-len(y):], y)
+		if _, err := ecdh.P256().NewPublicKey(point); err != nil {
 			continue
 		}
 		key := &ecdsa.PublicKey{Curve: elliptic.P256(), X: new(big.Int).SetBytes(x), Y: new(big.Int).SetBytes(y)}
-		if key.Curve.IsOnCurve(key.X, key.Y) {
-			keys[item.KeyID] = key
-		}
+		keys[item.KeyID] = key
 	}
 	if len(keys) == 0 {
-		return errors.New("Stack JWKS contained no usable ES256 keys")
+		return nil, errors.New("Stack JWKS contained no usable ES256 keys")
 	}
-	v.keys = keys
-	v.fetchedAt = time.Now()
-	return nil
+	return keys, nil
+}
+
+func (v *Verifier) now() time.Time {
+	if v.Now != nil {
+		return v.Now()
+	}
+	return time.Now()
 }
 
 func (v *Verifier) apiURL() string {
