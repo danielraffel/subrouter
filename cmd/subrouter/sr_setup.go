@@ -262,7 +262,15 @@ func runCleanupWith(controller serviceController, store accounts.CodexStore, yes
 		cloudConfig, loadErr := broker.LoadConfig(cloudPath)
 		if loadErr == nil && cloudConfig.LoggedIn() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			logoutErr := broker.NewClient(cloudConfig).Logout(ctx)
+			var logoutErr error
+			if cloudConfig.StackProjectID != "" &&
+				cloudConfig.StackPublishable != "" {
+				logoutErr = nativeStackClient(cloudConfig, nil).SignOut(
+					ctx,
+					cloudConfig.AccessToken,
+					cloudConfig.RefreshToken,
+				)
+			}
 			cancel()
 			if logoutErr != nil {
 				return fmt.Errorf(
