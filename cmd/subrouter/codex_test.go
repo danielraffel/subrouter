@@ -173,6 +173,17 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 	}
 }
 
+func TestCodexArgsKeepsCustomProviderAuthInResumableArguments(t *testing.T) {
+	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "", "team-codex-1")
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`) {
+		t.Fatalf("args depend on process-only environment and will fail when Codex is resumed directly:\n%s", joined)
+	}
+	if !strings.Contains(joined, `experimental_bearer_token="subrouter"`) {
+		t.Fatalf("args lack self-contained provider authentication:\n%s", joined)
+	}
+}
+
 func TestCodexArgsInjectsUserEmailAndAccountID(t *testing.T) {
 	got := codexArgs([]string{"exec", "prompt"}, "http://127.0.0.1:31415/v1", "alice@example.com", "apikey:paid")
 	headers := `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-User-Email"="alice@example.com","X-Subrouter-Account-ID"="apikey:paid"}`
