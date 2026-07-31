@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -666,7 +667,9 @@ func TestAccountListIncludesUnhealthyOAuthStatus(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
 		}, nil
 	})}
-	server := Server{AccountRef: NewAccountRef(store, []accounts.Account{account}, client)}
+	accountRef := NewAccountRef(store, []accounts.Account{account}, client)
+	accountRef.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+	server := Server{AccountRef: accountRef}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(
 		response,
