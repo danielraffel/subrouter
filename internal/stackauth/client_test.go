@@ -89,3 +89,19 @@ func TestFetchPublicConfigRejectsIncompleteResponse(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestFetchPublicConfigExplainsUnavailableCLIAuth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"cli_auth_unavailable"}`))
+	}))
+	defer server.Close()
+
+	_, err := FetchPublicConfig(context.Background(), server.Client(), server.URL)
+	if err == nil || !strings.Contains(err.Error(), "cmux.com login is temporarily unavailable") {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(err.Error(), "Stack") {
+		t.Fatalf("provider leaked through public error: %v", err)
+	}
+}
