@@ -11,7 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -74,9 +74,13 @@ func TestVerifierRejectsAnonymousAndWrongProject(t *testing.T) {
 		Now: func() time.Time { return now },
 	}
 	for name, overrides := range map[string]map[string]any{
-		"anonymous":     {"is_anonymous": true},
-		"wrong project": {"project_id": "project-2"},
-		"missing team":  {"selected_team_id": ""},
+		"anonymous":      {"is_anonymous": true},
+		"wrong project":  {"project_id": "project-2"},
+		"missing team":   {"selected_team_id": ""},
+		"expired":        {"exp": now.Add(-time.Hour).Unix()},
+		"wrong issuer":   {"iss": "https://issuer.invalid"},
+		"wrong audience": {"aud": []string{"project-2"}},
+		"restricted":     {"is_restricted": true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			claims := map[string]any{
@@ -93,6 +97,57 @@ func TestVerifierRejectsAnonymousAndWrongProject(t *testing.T) {
 				t.Fatal("expected rejection")
 			}
 		})
+	}
+}
+
+func TestVerifierThrottlesForcedRefreshForRepeatedInvalidSignatures(t *testing.T) {
+	trusted, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attacker, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fetches atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kid": "key-1", "kty": "EC", "crv": "P-256", "alg": "ES256",
+			"x": encodeBigInt(trusted.X), "y": encodeBigInt(trusted.Y),
+		}}})
+	}))
+	defer server.Close()
+	now := time.Unix(2_000_000_000, 0)
+	claims := map[string]any{
+		"sub": "user-1", "project_id": "project-1", "selected_team_id": "team-1",
+		"role": "authenticated", "iss": server.URL + "/projects/project-1",
+		"aud": []string{"project-1"}, "exp": now.Add(time.Hour).Unix(),
+	}
+	verifier := &Verifier{
+		APIURL: server.URL, ProjectID: "project-1", HTTPClient: server.Client(),
+		Now: func() time.Time { return now },
+	}
+	if _, err := verifier.Verify(context.Background(), signedToken(t, trusted, claims)); err != nil {
+		t.Fatal(err)
+	}
+	badToken := signedToken(t, attacker, claims)
+	for range 2 {
+		if _, err := verifier.Verify(context.Background(), badToken); err == nil {
+			t.Fatal("invalid signature accepted")
+		}
+	}
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("JWKS fetches = %d, want initial fetch plus one forced refresh", got)
+	}
+}
+
+func TestVerifierRejectsNonES256Algorithm(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","kid":"key-1"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{}`))
+	verifier := &Verifier{ProjectID: "project-1"}
+	if _, err := verifier.Verify(context.Background(), header+"."+payload+".signature"); err == nil {
+		t.Fatal("non-ES256 token accepted")
 	}
 }
 
@@ -126,8 +181,5 @@ func TestAudienceContains(t *testing.T) {
 		audienceContains(json.RawMessage(`["x"]`), "p") ||
 		audienceContains(json.RawMessage(`null`), "p") {
 		t.Fatal("audience matching failed")
-	}
-	if !strings.Contains((Claims{}).ExpiresAt.String(), "0001") {
-		t.Fatal("keep Claims.ExpiresAt usable")
 	}
 }

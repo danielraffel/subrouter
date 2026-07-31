@@ -124,10 +124,25 @@ func TestExternalTenantRejectsTraversalAndWeakSecret(t *testing.T) {
 	if _, err := DeriveKey([]byte("short"), "stack", "team"); err == nil {
 		t.Fatal("weak secret accepted")
 	}
-	for _, id := range []string{"", ".", "..", "../team", "team/other", "team other"} {
+	for _, id := range []string{"", ".", "..", "../team", "team/other", "team other", "Team-A"} {
 		if ValidExternalID(id) {
 			t.Fatalf("invalid external ID %q accepted", id)
 		}
+	}
+	first, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-a", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-a", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherNamespace, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-b", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != again || first == otherNamespace {
+		t.Fatalf("derived keys = %q, %q, %q", first, again, otherNamespace)
 	}
 }
 

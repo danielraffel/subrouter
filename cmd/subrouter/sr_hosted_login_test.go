@@ -22,6 +22,8 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 	accessToken := testUnverifiedStackToken(t, map[string]any{
 		"sub": "user", "project_id": "project", "selected_team_id": "team-1",
 	})
+	var exchangeAuthorization string
+	var pollAttempts int
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -41,6 +43,11 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 				"expires_at": time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano),
 			})
 		case "/auth/cli/poll":
+			pollAttempts++
+			if pollAttempts == 1 {
+				http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"status": "success", "refresh_token": "refresh",
@@ -54,9 +61,7 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 				"id": "team-1", "display_name": "Acme",
 			}}})
 		case "/_subrouter/auth/stack":
-			if r.Header.Get("Authorization") != "Bearer "+accessToken {
-				t.Fatalf("exchange authorization = %q", r.Header.Get("Authorization"))
-			}
+			exchangeAuthorization = r.Header.Get("Authorization")
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"tenantId": "team-1", "tenantName": "Acme",
 				"tenantKey": tenantKey, "proxyUrl": server.URL + "/t/" + tenantKey,
@@ -101,18 +106,27 @@ func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
 	if !strings.Contains(string(codexConfig), server.URL+"/t/"+tenantKey+"/v1") {
 		t.Fatalf("Codex config = %s", codexConfig)
 	}
+	if exchangeAuthorization != "Bearer "+accessToken {
+		t.Fatalf("exchange authorization = %q", exchangeAuthorization)
+	}
+	if pollAttempts != 2 {
+		t.Fatalf("poll attempts = %d", pollAttempts)
+	}
 }
 
 func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 	tenantKey := "srt_0123456789abcdef0123456789abcdef"
 	var uploaded broker.AccountUpload
+	var uploadDecodeErr error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/t/"+tenantKey+"/_subrouter/accounts" {
 			http.NotFound(w, r)
 			return
 		}
 		if err := json.NewDecoder(r.Body).Decode(&uploaded); err != nil {
-			t.Fatal(err)
+			uploadDecodeErr = err
+			http.Error(w, "invalid upload", http.StatusBadRequest)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"account": map[string]string{
@@ -159,8 +173,25 @@ func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 	if err := runner.cloudAccountAdd(context.Background(), client, []string{"codex"}); err != nil {
 		t.Fatal(err)
 	}
+	if uploadDecodeErr != nil {
+		t.Fatal(uploadDecodeErr)
+	}
 	if uploaded["provider"] != "codex" || uploaded["label"] != "hosted@example.com" {
 		t.Fatalf("upload = %#v", uploaded)
+	}
+	tokens, ok := uploaded["tokens"].(map[string]any)
+	if !ok {
+		t.Fatalf("tokens = %#v", uploaded["tokens"])
+	}
+	for key, want := range map[string]string{
+		"accessToken":  command.loginAuth.Tokens.AccessToken,
+		"refreshToken": command.loginAuth.Tokens.RefreshToken,
+		"idToken":      command.loginAuth.Tokens.IDToken,
+		"accountID":    command.loginAuth.Tokens.AccountID,
+	} {
+		if got, _ := tokens[key].(string); got != want {
+			t.Fatalf("tokens[%q] = %q, want %q", key, got, want)
+		}
 	}
 	body, err := os.ReadFile(filepath.Join(localCodexHome, "auth.json"))
 	if err != nil {

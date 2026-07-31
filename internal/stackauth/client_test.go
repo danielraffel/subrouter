@@ -12,6 +12,7 @@ import (
 
 func TestNativeCLIFlowAndRefresh(t *testing.T) {
 	var sawStackHeaders bool
+	var refreshGrantType, refreshClientID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Stack-Project-Id") == "project" &&
 			r.Header.Get("X-Hexclave-Project-Id") == "project" {
@@ -32,11 +33,11 @@ func TestNativeCLIFlowAndRefresh(t *testing.T) {
 			})
 		case "/auth/oauth/token":
 			if err := r.ParseForm(); err != nil {
-				t.Fatal(err)
+				http.Error(w, "invalid form", http.StatusBadRequest)
+				return
 			}
-			if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("client_id") != "project" {
-				t.Fatalf("bad refresh form: %v", r.Form)
-			}
+			refreshGrantType = r.Form.Get("grant_type")
+			refreshClientID = r.Form.Get("client_id")
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"access_token":  "access",
 				"refresh_token": "rotated",
@@ -69,6 +70,9 @@ func TestNativeCLIFlowAndRefresh(t *testing.T) {
 	}
 	if tokens.AccessToken != "access" || tokens.RefreshToken != "rotated" {
 		t.Fatalf("tokens = %#v", tokens)
+	}
+	if refreshGrantType != "refresh_token" || refreshClientID != "project" {
+		t.Fatalf("refresh form = grant_type %q, client_id %q", refreshGrantType, refreshClientID)
 	}
 	if !sawStackHeaders {
 		t.Fatal("native Stack/Hexclave client headers were not sent")

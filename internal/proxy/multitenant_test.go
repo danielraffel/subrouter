@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
@@ -428,6 +430,9 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 		if response.Code != http.StatusOK {
 			t.Fatalf("exchange status = %d: %s", response.Code, response.Body.String())
 		}
+		if got := response.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("cache-control = %q", got)
+		}
 		var body map[string]any
 		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
@@ -462,20 +467,53 @@ func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T
 	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "openai-apikey:work") {
 		t.Fatalf("accounts = %d: %s", list.Code, list.Body.String())
 	}
+	remove := httptest.NewRecorder()
+	handler.ServeHTTP(
+		remove,
+		httptest.NewRequest(
+			http.MethodDelete,
+			"/t/"+key+"/_subrouter/accounts/apikey:openai-apikey:work",
+			nil,
+		),
+	)
+	if remove.Code != http.StatusOK {
+		t.Fatalf("delete = %d: %s", remove.Code, remove.Body.String())
+	}
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(
+		missing,
+		httptest.NewRequest(
+			http.MethodDelete,
+			"/t/"+key+"/_subrouter/accounts/missing",
+			nil,
+		),
+	)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing delete = %d: %s", missing.Code, missing.Body.String())
+	}
 }
 
 func TestStackLoginRejectsInvalidTokenAndMismatchedTeam(t *testing.T) {
 	registry := tenant.NewRegistry(t.TempDir())
 	base := Server{MaxBodyBytes: 1024}
-	for name, verifier := range map[string]fakeStackVerifier{
-		"invalid token": {err: errors.New("bad token")},
-		"wrong team": {claims: stackauth.Claims{
-			ProjectID: "project", SelectedTeamID: "other-team",
-		}},
+	for name, testCase := range map[string]struct {
+		verifier fakeStackVerifier
+		status   int
+	}{
+		"invalid token": {
+			verifier: fakeStackVerifier{err: errors.New("bad token")},
+			status:   http.StatusUnauthorized,
+		},
+		"wrong team": {
+			verifier: fakeStackVerifier{claims: stackauth.Claims{
+				ProjectID: "project", SelectedTeamID: "other-team",
+			}},
+			status: http.StatusForbidden,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			handler := (&MultiTenant{
-				Base: base, Registry: registry, StackVerifier: verifier,
+				Base: base, Registry: registry, StackVerifier: testCase.verifier,
 				StackTeams:           fakeStackTeams{},
 				StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
 			}).Handler(base.Handler())
@@ -487,8 +525,8 @@ func TestStackLoginRejectsInvalidTokenAndMismatchedTeam(t *testing.T) {
 			req.Header.Set("Authorization", "Bearer access")
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, req)
-			if response.Code != http.StatusUnauthorized && response.Code != http.StatusForbidden {
-				t.Fatalf("status = %d", response.Code)
+			if response.Code != testCase.status {
+				t.Fatalf("status = %d, want %d", response.Code, testCase.status)
 			}
 		})
 	}
@@ -535,5 +573,119 @@ func TestStackLoginAcceptsAnotherTeamAfterMembershipCheck(t *testing.T) {
 	}
 	if body["tenantKey"] != expectedKey {
 		t.Fatalf("tenant key = %v, want %s", body["tenantKey"], expectedKey)
+	}
+}
+
+func TestStackLoginRequiresPublicURL(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry,
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "team-123",
+		}},
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/auth/stack",
+		strings.NewReader(`{"teamId":"team-123"}`),
+	)
+	req.Header.Set("Authorization", "Bearer access")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusInternalServerError ||
+		!strings.Contains(response.Body.String(), "proxy URL") {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestStackLoginReturnsUnavailableWhenMembershipLookupCannotRun(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	for name, teams := range map[string]interface {
+		ListTeams(context.Context, string) ([]stackauth.Team, error)
+	}{
+		"missing": nil,
+		"failed":  fakeStackTeams{err: errors.New("Stack unavailable")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			handler := (&MultiTenant{
+				Base: base, Registry: registry, PublicURL: "https://sr.example",
+				StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+					ProjectID: "project", SelectedTeamID: "selected-team",
+				}},
+				StackTeams:           teams,
+				StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+			}).Handler(base.Handler())
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/_subrouter/auth/stack",
+				strings.NewReader(`{"teamId":"other-team"}`),
+			)
+			req.Header.Set("Authorization", "Bearer access")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestTenantAccountDeleteReturnsUnavailableWithoutAccountStore(t *testing.T) {
+	response := httptest.NewRecorder()
+	handleTenantAccountDelete(
+		&Server{},
+		response,
+		httptest.NewRequest(http.MethodDelete, "/_subrouter/accounts/account", nil),
+	)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAccountListIncludesUnhealthyOAuthStatus(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	stored := proxyStoredOAuthAccount(
+		"broken@example.com",
+		"broken",
+		time.Now().Add(-time.Hour),
+	)
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := stored.Account(stored.SourcePath(store))
+	if !ok {
+		t.Fatal("stored account was not loadable")
+	}
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
+		}, nil
+	})}
+	server := Server{AccountRef: NewAccountRef(store, []accounts.Account{account}, client)}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	var items []struct {
+		Health *struct {
+			OK      bool   `json:"ok"`
+			Message string `json:"message"`
+		} `json:"health"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Health == nil || items[0].Health.OK ||
+		items[0].Health.Message == "" {
+		t.Fatalf("items = %#v", items)
 	}
 }

@@ -62,4 +62,7 @@ func TestExistingProfileHistoryMigratesAndPreservesConflicts(t *testing.T) {
 	if body, _ := os.ReadFile(filepath.Join(shared, "projects", "same.jsonl.subrouter-legacy-1")); string(body) != "profile" {
 		t.Fatalf("profile conflict lost: %q", body)
 	}
+	if err := store.prepareSharedState(instance); err != nil {
+		t.Fatalf("second migration failed: %v", err)
+	}
 }
