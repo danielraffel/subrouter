@@ -241,6 +241,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"logout",
 		"ls",
 		"pick",
+		"remote",
+		"remotes",
 		"remove",
 		"remove-admin-key",
 		"reset",

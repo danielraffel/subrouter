@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,10 +14,29 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
+
+type fakeStackVerifier struct {
+	claims stackauth.Claims
+	err    error
+}
+
+func (f fakeStackVerifier) Verify(context.Context, string) (stackauth.Claims, error) {
+	return f.claims, f.err
+}
+
+type fakeStackTeams struct {
+	teams []stackauth.Team
+	err   error
+}
+
+func (f fakeStackTeams) ListTeams(context.Context, string) ([]stackauth.Team, error) {
+	return f.teams, f.err
+}
 
 // newMultiTenantFixture builds an upstream that echoes the Authorization
 // header it received, a legacy single-tenant base Server with one account, and
@@ -379,5 +400,140 @@ func TestMultiTenantStripsKeyBeforeUpstream(t *testing.T) {
 	}
 	if lastXAPIKey != "" || strings.Contains(lastAuth, key) {
 		t.Fatalf("tenant key leaked upstream: x-api-key=%q auth=%q", lastXAPIKey, lastAuth)
+	}
+}
+
+func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	multi := &MultiTenant{
+		Base: base, Registry: registry, PublicURL: "https://sr.example",
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "team-123",
+			Email: "user@example.com",
+		}},
+	}
+	handler := multi.Handler(base.Handler())
+	exchange := func() map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/_subrouter/auth/stack",
+			strings.NewReader(`{"teamId":"team-123","teamName":"Acme"}`),
+		)
+		req.Header.Set("Authorization", "Bearer stack-access")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != http.StatusOK {
+			t.Fatalf("exchange status = %d: %s", response.Code, response.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	first := exchange()
+	second := exchange()
+	if first["tenantKey"] != second["tenantKey"] {
+		t.Fatalf("tenant key changed: %v != %v", first["tenantKey"], second["tenantKey"])
+	}
+	key, _ := first["tenantKey"].(string)
+	if !tenant.ValidKeyFormat(key) {
+		t.Fatalf("bad tenant key %q", key)
+	}
+	if first["proxyUrl"] != "https://sr.example/t/"+key {
+		t.Fatalf("proxy URL = %v", first["proxyUrl"])
+	}
+
+	upload := httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(`{"provider":"openai-apikey","label":"work","apiKey":"sk-test"}`),
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, upload)
+	if response.Code != http.StatusOK {
+		t.Fatalf("upload status = %d: %s", response.Code, response.Body.String())
+	}
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/t/"+key+"/_subrouter/accounts", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "openai-apikey:work") {
+		t.Fatalf("accounts = %d: %s", list.Code, list.Body.String())
+	}
+}
+
+func TestStackLoginRejectsInvalidTokenAndMismatchedTeam(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	for name, verifier := range map[string]fakeStackVerifier{
+		"invalid token": {err: errors.New("bad token")},
+		"wrong team": {claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "other-team",
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			handler := (&MultiTenant{
+				Base: base, Registry: registry, StackVerifier: verifier,
+				StackTeams:           fakeStackTeams{},
+				StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+			}).Handler(base.Handler())
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/_subrouter/auth/stack",
+				strings.NewReader(`{"teamId":"team-123"}`),
+			)
+			req.Header.Set("Authorization", "Bearer access")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != http.StatusUnauthorized && response.Code != http.StatusForbidden {
+				t.Fatalf("status = %d", response.Code)
+			}
+		})
+	}
+}
+
+func TestStackLoginAcceptsAnotherTeamAfterMembershipCheck(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry, PublicURL: "https://sr.example",
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "selected-team",
+		}},
+		StackTeams: fakeStackTeams{teams: []stackauth.Team{{
+			ID: "requested-team", DisplayName: "Requested Team",
+		}}},
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/auth/stack",
+		strings.NewReader(`{"teamId":"requested-team"}`),
+	)
+	req.Header.Set("Authorization", "Bearer access")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["tenantName"] != "Requested Team" {
+		t.Fatalf("tenant name = %v", body["tenantName"])
+	}
+	expectedKey, err := tenant.DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"project",
+		"requested-team",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body["tenantKey"] != expectedKey {
+		t.Fatalf("tenant key = %v, want %s", body["tenantKey"], expectedKey)
 	}
 }
