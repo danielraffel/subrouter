@@ -276,7 +276,13 @@ fn is_hop_by_hop(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Json;
+    use axum::extract::{Query, State};
+    use axum::routing::get;
+    use serde_json::json;
 
     use super::*;
 
@@ -289,6 +295,10 @@ mod tests {
         let first = flight_key(&Method::GET, &uri, &headers);
         let reordered: Uri = "/ps/plugins/list?a=1&b=2".parse().unwrap();
         assert_eq!(first, flight_key(&Method::GET, &reordered, &headers));
+        let page_two: Uri = "/ps/plugins/list?a=1&b=2&pageToken=cursor-2"
+            .parse()
+            .unwrap();
+        assert_ne!(first, flight_key(&Method::GET, &page_two, &headers));
         headers.insert("chatgpt-account-id", "account-2".parse().unwrap());
         assert_ne!(first, flight_key(&Method::GET, &uri, &headers));
         assert!(!first.contains("account-1"));
@@ -336,5 +346,93 @@ mod tests {
             })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn completed_call_releases_buffered_response() {
+        let flight = SingleFlight::default();
+        let response = flight
+            .run("release".into(), || async {
+                BufferedResponse {
+                    status: 200,
+                    headers: HeaderMap::new(),
+                    body: bytes::Bytes::from(vec![0_u8; 1 << 20]),
+                }
+            })
+            .await;
+        let response_weak = Arc::downgrade(&response);
+        drop(response);
+        tokio::task::yield_now().await;
+        assert!(
+            response_weak.upgrade().is_none(),
+            "completed single-flight response remained retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_walk_collapses_fourteen_pages_without_a_continuation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route("/ps/plugins/list", get(catalog_page))
+            .with_state(Arc::clone(&calls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let uri: Uri = "/ps/plugins/list?limit=170".parse().unwrap();
+        let upstream = Url::parse(&format!("http://{address}/ps/plugins/list?limit=170")).unwrap();
+        let result = aggregate_catalog_pages(
+            &Client::new(),
+            &Method::GET,
+            &uri,
+            &upstream,
+            &HeaderMap::new(),
+            serde_json::to_vec(&catalog_page_body(0)).unwrap().into(),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert!(result.aggregated);
+        assert_eq!(result.pages, 14);
+        assert_eq!(result.entries, 2_380);
+        assert_eq!(calls.load(Ordering::SeqCst), 13);
+        assert!(next_page_token(&result.body).is_none());
+        let payload: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(
+            payload
+                .get("plugins")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2_380)
+        );
+    }
+
+    async fn catalog_page(
+        State(calls): State<Arc<AtomicUsize>>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let page = query
+            .get("pageToken")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default();
+        Json(catalog_page_body(page))
+    }
+
+    fn catalog_page_body(page: usize) -> Value {
+        const PAGES: usize = 14;
+        const PER_PAGE: usize = 170;
+        let plugins = (0..PER_PAGE)
+            .map(|entry| json!({"id": format!("plugin-{page}-{entry}")}))
+            .collect::<Vec<_>>();
+        let pagination = if page + 1 < PAGES {
+            json!({"next_page_token": (page + 1).to_string()})
+        } else {
+            json!({})
+        };
+        json!({"plugins": plugins, "pagination": pagination})
     }
 }
