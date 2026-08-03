@@ -1,6 +1,7 @@
 package tenant
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,6 +65,23 @@ func TestCreateKeyAddsSecondKey(t *testing.T) {
 	}
 }
 
+func TestCreateKeyRejectsRetiredTenant(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	created, _, err := registry.Create("acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := registry.RetireExternal(created.ID); err != nil || !retired {
+		t.Fatalf("retire = %v, %v", retired, err)
+	}
+	if _, _, err := registry.CreateKey(created.ID); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("retired tenant accepted a new key: %v", err)
+	}
+	if deleted, err := registry.DeleteRetired(created.ID); err != nil || !deleted {
+		t.Fatalf("delete = %v, %v", deleted, err)
+	}
+}
+
 func TestDuplicateTenantNameRejected(t *testing.T) {
 	registry := NewRegistry(t.TempDir())
 	if _, _, err := registry.Create("acme"); err != nil {
@@ -117,6 +135,50 @@ func TestEnsureExternalIsStableAndUpdatesName(t *testing.T) {
 	}
 	if resolved, ok, err := registry.Resolve(key); err != nil || !ok || resolved.ID != "team-123" {
 		t.Fatalf("resolve = %#v, %v, %v", resolved, ok, err)
+	}
+}
+
+func TestDeleteRetiredTombstonesAnAbsentTenantDeletionIntent(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	deleted, err := registry.DeleteRetired("team-absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted {
+		t.Fatal("absent tenant reported deleted")
+	}
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project",
+		"team-absent",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-absent", "Team", key); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("absent tenant deletion intent did not block a racing exchange: %v", err)
+	}
+}
+
+func TestRetireExternalAtomicallyBlocksAnAbsentTenantExchange(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	retired, err := registry.RetireExternal("team-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired {
+		t.Fatal("absent tenant reported retired")
+	}
+	key, err := DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"stack-project",
+		"team-race",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-race", "Team", key); !errors.Is(err, ErrTenantRetired) {
+		t.Fatalf("exchange raced past retirement intent: %v", err)
 	}
 }
 

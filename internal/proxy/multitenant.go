@@ -39,9 +39,8 @@ type MultiTenant struct {
 	// TranscriptDir, when set, scopes each tenant's transcripts under
 	// <TranscriptDir>/tenants/<id>.
 	TranscriptDir string
-	// Enabled forces tenant-key semantics for header-borne keys even before
-	// the first tenant exists (the --multi-tenant serve flag). Path-borne
-	// /t/<key>/ requests are always tenant-scoped.
+	// Enabled is retained for --multi-tenant CLI compatibility. Tenant-shaped
+	// credentials now always fail closed when they do not resolve.
 	Enabled bool
 	// StackVerifier enables normal-user tenant exchange at
 	// /_subrouter/auth/stack. StackTenantKeySecret deterministically derives
@@ -52,18 +51,28 @@ type MultiTenant struct {
 	StackTeams interface {
 		ListTeams(context.Context, string) ([]stackauth.Team, error)
 	}
-	StackTenantKeySecret []byte
-	PublicURL            string
+	StackTenantKeySecret   []byte
+	StackTenantDeleteToken []byte
+	PublicURL              string
 
 	mu       sync.Mutex
 	servers  map[string]*Server
 	handlers map[string]http.Handler
+
+	deletionMu   sync.Mutex
+	deletions    map[string]struct{}
+	resumeDelete sync.Once
 }
 
 // Handler wraps the legacy single-tenant handler with tenant routing and the
 // admin tenant CRUD endpoints.
 func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
+	m.resumeDelete.Do(m.resumeTenantDeletions)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/_subrouter/auth/stack/tenant" {
+			m.handleStackTenantDelete(w, r)
+			return
+		}
 		if r.URL.Path == "/_subrouter/auth/stack" {
 			m.handleStackAuth(w, r)
 			return
@@ -83,16 +92,14 @@ func (m *MultiTenant) Handler(fallback http.Handler) http.Handler {
 				return
 			}
 			if ok {
-				m.serveResolvedTenant(w, r, resolved, r.URL.Path)
+				m.serveResolvedTenant(w, r, resolved, r.URL.Path, key)
 				return
 			}
-			// A key-shaped credential that resolves to nothing is rejected once
-			// multi-tenant mode is active; before that, legacy traffic that
-			// happens to carry such a token keeps today's behavior.
-			if m.Enabled || m.Registry.HasTenants() {
-				http.Error(w, "unknown tenant key", http.StatusUnauthorized)
-				return
-			}
+			// srt_ credentials belong exclusively to tenant routing. Always fail
+			// closed, including after the last tenant has been deleted, so a
+			// retired key can never fall through to the legacy global pool.
+			http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/_subrouter/reload-accounts" && isLoopbackRemote(r.RemoteAddr) {
 			// The account-upload flow POSTs the global reload endpoint from
@@ -143,10 +150,31 @@ func (m *MultiTenant) serveTenant(w http.ResponseWriter, r *http.Request, key, r
 		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
 		return
 	}
-	m.serveResolvedTenant(w, r, resolved, rest)
+	m.serveResolvedTenant(w, r, resolved, rest, key)
 }
 
-func (m *MultiTenant) serveResolvedTenant(w http.ResponseWriter, r *http.Request, t tenant.Tenant, path string) {
+func (m *MultiTenant) serveResolvedTenant(
+	w http.ResponseWriter,
+	r *http.Request,
+	t tenant.Tenant,
+	path string,
+	key string,
+) {
+	useLock, err := m.Registry.AcquireUse(t.ID)
+	if err != nil {
+		http.Error(w, "tenant unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer useLock.Close()
+	fresh, ok, err := m.Registry.ResolveFresh(key)
+	if err != nil {
+		http.Error(w, "tenant registry error", http.StatusInternalServerError)
+		return
+	}
+	if !ok || subtle.ConstantTimeCompare([]byte(fresh.ID), []byte(t.ID)) != 1 {
+		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
+		return
+	}
 	handler, err := m.handlerFor(r.Context(), t)
 	if err != nil {
 		if m.Base.Logger != nil {
@@ -356,7 +384,8 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 	if teamID == "" {
 		teamID = claims.SelectedTeamID
 	}
-	if subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.SelectedTeamID)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.SelectedTeamID)) != 1 &&
+		subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.Subject)) != 1 {
 		if m.StackTeams == nil {
 			http.Error(w, "Stack team membership cannot be verified", http.StatusServiceUnavailable)
 			return
@@ -404,6 +433,10 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := m.Registry.EnsureExternal(teamID, teamName, key)
 	if err != nil {
+		if errors.Is(err, tenant.ErrTenantRetired) {
+			http.Error(w, "tenant is retired", http.StatusGone)
+			return
+		}
 		http.Error(w, "tenant unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -413,6 +446,226 @@ func (m *MultiTenant) handleStackAuth(w http.ResponseWriter, r *http.Request) {
 		"tenantId": created.ID, "tenantName": created.Name,
 		"tenantKey": key, "proxyUrl": proxyURL,
 	})
+}
+
+func (m *MultiTenant) handleStackTenantDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if m.StackVerifier == nil || len(m.StackTenantKeySecret) < 32 || len(m.StackTenantDeleteToken) < 32 {
+		http.NotFound(w, r)
+		return
+	}
+	deleteToken := strings.TrimSpace(r.Header.Get("X-Subrouter-Tenant-Delete-Token"))
+	if subtle.ConstantTimeCompare([]byte(deleteToken), m.StackTenantDeleteToken) != 1 {
+		http.Error(w, "trusted tenant deletion credential required", http.StatusUnauthorized)
+		return
+	}
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		http.Error(w, "Stack access token required", http.StatusUnauthorized)
+		return
+	}
+	claims, err := m.StackVerifier.Verify(r.Context(), token)
+	if err != nil {
+		if m.Base.Logger != nil {
+			m.Base.Logger.Warn("Stack tenant deletion rejected", "error", err)
+		}
+		http.Error(w, "invalid Stack access token", http.StatusUnauthorized)
+		return
+	}
+	var input struct {
+		TeamID string `json:"teamId"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, tenantAdminMaxBodyBytes)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	teamID := strings.TrimSpace(input.TeamID)
+	if teamID == "" {
+		teamID = claims.SelectedTeamID
+	}
+	if !tenant.ValidExternalID(teamID) {
+		http.Error(w, "team ID is invalid", http.StatusBadRequest)
+		return
+	}
+	authorized := subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.SelectedTeamID)) == 1 ||
+		subtle.ConstantTimeCompare([]byte(teamID), []byte(claims.Subject)) == 1
+	if !authorized {
+		if m.StackTeams == nil {
+			http.Error(w, "Stack team membership cannot be verified", http.StatusServiceUnavailable)
+			return
+		}
+		teams, err := m.StackTeams.ListTeams(r.Context(), token)
+		if err != nil {
+			if m.Base.Logger != nil {
+				m.Base.Logger.Warn("Stack tenant deletion membership lookup failed", "error", err)
+			}
+			http.Error(w, "Stack team membership unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		for _, candidate := range teams {
+			if subtle.ConstantTimeCompare([]byte(candidate.ID), []byte(teamID)) == 1 {
+				authorized = true
+				break
+			}
+		}
+	}
+	if !authorized {
+		http.Error(w, "Stack access token does not belong to that team", http.StatusForbidden)
+		return
+	}
+	retired, err := m.Registry.RetireExternal(teamID)
+	if err != nil {
+		m.scheduleTenantDeletion(teamID)
+		http.Error(w, "tenant retirement failed", http.StatusInternalServerError)
+		return
+	}
+	useLock, acquired, err := m.Registry.TryAcquireExclusiveUse(teamID)
+	if err != nil {
+		m.scheduleTenantDeletion(teamID)
+		http.Error(w, "tenant retirement failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if !acquired {
+		m.scheduleTenantDeletion(teamID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]any{"ok": false, "deletionPending": true})
+		return
+	}
+	defer useLock.Close()
+	deleted, err := m.deleteRetiredTenant(teamID)
+	if err != nil {
+		m.scheduleTenantDeletion(teamID)
+		http.Error(w, "tenant deletion failed", http.StatusInternalServerError)
+		return
+	}
+	m.forgetTenant(teamID)
+	writeJSON(w, map[string]any{"ok": true, "deleted": retired || deleted})
+}
+
+func (m *MultiTenant) resumeTenantDeletions() {
+	if m.Registry == nil {
+		return
+	}
+	if err := m.scanPendingTenantDeletions(); err == nil {
+		return
+	} else {
+		m.logTenantDeletionRecoveryFailure(err)
+	}
+	go m.retryTenantDeletionRecovery()
+}
+
+func (m *MultiTenant) scanPendingTenantDeletions() error {
+	ids, err := m.Registry.PendingDeletionIDs()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		m.scheduleTenantDeletion(id)
+	}
+	return nil
+}
+
+func (m *MultiTenant) retryTenantDeletionRecovery() {
+	backoff := 100 * time.Millisecond
+	for {
+		if m.Base.Lifecycle != nil && m.Base.Lifecycle.Draining() {
+			return
+		}
+		timer := time.NewTimer(backoff)
+		<-timer.C
+		if err := m.scanPendingTenantDeletions(); err == nil {
+			return
+		} else {
+			m.logTenantDeletionRecoveryFailure(err)
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func (m *MultiTenant) logTenantDeletionRecoveryFailure(err error) {
+	if m.Base.Logger != nil {
+		m.Base.Logger.Error("tenant deletion recovery scan failed", "error", err)
+	}
+}
+
+func (m *MultiTenant) scheduleTenantDeletion(id string) {
+	m.deletionMu.Lock()
+	if m.deletions == nil {
+		m.deletions = map[string]struct{}{}
+	}
+	if _, exists := m.deletions[id]; exists {
+		m.deletionMu.Unlock()
+		return
+	}
+	m.deletions[id] = struct{}{}
+	m.deletionMu.Unlock()
+
+	go func() {
+		defer func() {
+			m.deletionMu.Lock()
+			delete(m.deletions, id)
+			m.deletionMu.Unlock()
+		}()
+		backoff := 100 * time.Millisecond
+		for {
+			_, err := m.Registry.RetireExternal(id)
+			if err == nil {
+				var deletionLock *tenant.UseLock
+				deletionLock, err = m.Registry.AcquireExclusiveUse(id)
+				if err == nil {
+					_, err = m.deleteRetiredTenant(id)
+					closeErr := deletionLock.Close()
+					if err == nil {
+						err = closeErr
+					}
+				}
+			}
+			if err == nil {
+				m.forgetTenant(id)
+				return
+			}
+			if m.Base.Logger != nil {
+				m.Base.Logger.Error("background tenant deletion failed", "tenant", id, "error", err)
+			}
+			if m.Base.Lifecycle != nil && m.Base.Lifecycle.Draining() {
+				return
+			}
+			timer := time.NewTimer(backoff)
+			<-timer.C
+			if backoff < 30*time.Second {
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			}
+		}
+	}()
+}
+
+func (m *MultiTenant) deleteRetiredTenant(id string) (bool, error) {
+	if m.TranscriptDir != "" {
+		if err := os.RemoveAll(filepath.Join(m.TranscriptDir, "tenants", id)); err != nil {
+			return false, err
+		}
+	}
+	return m.Registry.DeleteRetired(id)
+}
+
+func (m *MultiTenant) forgetTenant(id string) {
+	m.mu.Lock()
+	delete(m.servers, id)
+	delete(m.handlers, id)
+	m.mu.Unlock()
 }
 
 func validStackTeamName(name string) bool {

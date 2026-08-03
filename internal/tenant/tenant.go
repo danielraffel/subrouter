@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type Tenant struct {
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"createdAt"`
 	Keys      []Key     `json:"keys,omitempty"`
+	Retired   bool      `json:"retired,omitempty"`
 }
 
 type registryFile struct {
@@ -53,6 +55,8 @@ type Registry struct {
 	size     int64
 }
 
+var ErrTenantRetired = errors.New("tenant is retired")
+
 func NewRegistry(stateDir string) *Registry {
 	return &Registry{stateDir: stateDir}
 }
@@ -68,6 +72,14 @@ func (r *Registry) TenantsDir() string {
 // Dir returns the tenant's isolated state dir.
 func (r *Registry) Dir(id string) string {
 	return filepath.Join(r.TenantsDir(), id)
+}
+
+func (r *Registry) retiredPath(id string) string {
+	return filepath.Join(r.stateDir, "retired-tenants", id)
+}
+
+func (r *Registry) retiringPath(id string) string {
+	return filepath.Join(r.stateDir, "retiring-tenants", id)
 }
 
 // ValidKeyFormat reports whether value is shaped like a tenant key
@@ -330,10 +342,20 @@ func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error)
 	if err != nil {
 		return Tenant{}, err
 	}
+	for _, marker := range []string{r.retiredPath(id), r.retiringPath(id)} {
+		if _, err := os.Stat(marker); err == nil {
+			return Tenant{}, ErrTenantRetired
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return Tenant{}, err
+		}
+	}
 	hash := HashKey(plaintextKey)
 	for i := range file.Tenants {
 		if file.Tenants[i].ID != id {
 			continue
+		}
+		if file.Tenants[i].Retired {
+			return Tenant{}, ErrTenantRetired
 		}
 		changed := false
 		if file.Tenants[i].Name != name {
@@ -381,6 +403,216 @@ func (r *Registry) EnsureExternal(id, name, plaintextKey string) (Tenant, error)
 	return created, nil
 }
 
+// RetireExternal revokes every key and records deletion intent under one
+// interprocess registry lock. This prevents a first exchange from creating an
+// absent tenant between retirement and deletion. It is idempotent while active
+// requests drain.
+func (r *Registry) RetireExternal(id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if !ValidExternalID(id) {
+		return false, errors.New("invalid external tenant ID")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
+	if err != nil {
+		return false, err
+	}
+	found := false
+	changed := false
+	for i := range file.Tenants {
+		if file.Tenants[i].ID != id {
+			continue
+		}
+		found = true
+		if !file.Tenants[i].Retired || len(file.Tenants[i].Keys) != 0 {
+			file.Tenants[i].Retired = true
+			file.Tenants[i].Keys = nil
+			changed = true
+		}
+		break
+	}
+	if changed {
+		if err := r.save(file); err != nil {
+			return false, err
+		}
+	}
+	retiredExists, err := pathExists(r.retiredPath(id))
+	if err != nil {
+		return false, err
+	}
+	if found || !retiredExists {
+		retiringExists, err := pathExists(r.retiringPath(id))
+		if err != nil {
+			return false, err
+		}
+		if !retiringExists {
+			if err := writeRetirementMarker(r.retiringPath(id)); err != nil {
+				return false, err
+			}
+		}
+	}
+	return found, nil
+}
+
+// DeleteRetired permanently removes a retired tenant's credential-bearing
+// state. A durable tombstone prevents a still-valid Stack token from
+// recreating the tenant in the interval before the owning identity is deleted.
+// The caller must hold the tenant's exclusive use lock.
+func (r *Registry) DeleteRetired(id string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if !ValidExternalID(id) {
+		return false, errors.New("invalid external tenant ID")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
+	if err != nil {
+		return false, err
+	}
+	found := false
+	kept := make([]Tenant, 0, len(file.Tenants))
+	for _, existing := range file.Tenants {
+		if existing.ID != id {
+			kept = append(kept, existing)
+			continue
+		}
+		if !existing.Retired || len(existing.Keys) != 0 {
+			return false, errors.New("tenant must be retired before deletion")
+		}
+		found = true
+	}
+	hadState := false
+	if _, err := os.Lstat(r.Dir(id)); err == nil {
+		hadState = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	retiredPath := r.retiredPath(id)
+	retiringPath := r.retiringPath(id)
+	retiredExists, err := pathExists(retiredPath)
+	if err != nil {
+		return false, err
+	}
+	retiringExists, err := pathExists(retiringPath)
+	if err != nil {
+		return false, err
+	}
+	if !found && !hadState {
+		if retiredExists {
+			return true, nil
+		}
+		if retiringExists {
+			if err := finalizeRetirementMarker(retiringPath, retiredPath); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		// The trusted deletion caller may race a first tenant exchange. Record
+		// the deletion intent even when no state exists yet so that exchange
+		// cannot recreate the identity before its Stack account is removed.
+		if err := writeRetirementMarker(retiredPath); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if !retiringExists {
+		if err := writeRetirementMarker(retiringPath); err != nil {
+			return false, err
+		}
+	}
+	if err := os.RemoveAll(r.Dir(id)); err != nil {
+		return false, err
+	}
+	if found {
+		file.Tenants = kept
+		if err := r.save(file); err != nil {
+			return false, err
+		}
+	}
+	if err := finalizeRetirementMarker(retiringPath, retiredPath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func writeRetirementMarker(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, nil, 0o600)
+}
+
+func finalizeRetirementMarker(retiringPath, retiredPath string) error {
+	if exists, err := pathExists(retiredPath); err != nil {
+		return err
+	} else if exists {
+		return os.Remove(retiringPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(retiredPath), 0o700); err != nil {
+		return err
+	}
+	return os.Rename(retiringPath, retiredPath)
+}
+
+// PendingDeletionIDs lists retired registry entries and crash-recovery markers
+// that need credential-state deletion after active requests drain.
+func (r *Registry) PendingDeletionIDs() ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Close()
+	file, err := r.loadFresh()
+	if err != nil {
+		return nil, err
+	}
+	ids := map[string]struct{}{}
+	for _, existing := range file.Tenants {
+		if existing.Retired && ValidExternalID(existing.ID) {
+			ids[existing.ID] = struct{}{}
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(r.stateDir, "retiring-tenants"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && ValidExternalID(entry.Name()) {
+			ids[entry.Name()] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 // CreateKey mints an additional key for an existing tenant and returns it in
 // plaintext.
 func (r *Registry) CreateKey(tenantID string) (Tenant, string, error) {
@@ -398,6 +630,9 @@ func (r *Registry) CreateKey(tenantID string) (Tenant, string, error) {
 	for i := range file.Tenants {
 		if file.Tenants[i].ID != tenantID {
 			continue
+		}
+		if file.Tenants[i].Retired {
+			return Tenant{}, "", ErrTenantRetired
 		}
 		plaintext, key, err := newKey()
 		if err != nil {
@@ -475,6 +710,32 @@ func (r *Registry) Resolve(key string) (Tenant, bool, error) {
 		return Tenant{}, false, err
 	}
 	for _, t := range file.Tenants {
+		for _, k := range t.Keys {
+			if k.Hash == hash {
+				return t, true, nil
+			}
+		}
+	}
+	return Tenant{}, false, nil
+}
+
+// ResolveFresh bypasses the metadata cache after a request has acquired its
+// shared use lock. This closes the cross-process race with tenant retirement.
+func (r *Registry) ResolveFresh(key string) (Tenant, bool, error) {
+	if !ValidKeyFormat(key) {
+		return Tenant{}, false, nil
+	}
+	hash := HashKey(key)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	file, err := r.loadFresh()
+	if err != nil {
+		return Tenant{}, false, err
+	}
+	for _, t := range file.Tenants {
+		if t.Retired {
+			continue
+		}
 		for _, k := range t.Keys {
 			if k.Hash == hash {
 				return t, true, nil

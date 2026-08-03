@@ -675,6 +675,89 @@ esac
 	}
 }
 
+func TestReleaseMainVerificationStreamsLargeComparison(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq", "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	revision := strings.Repeat("a", 40)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
+case "$*" in
+  *'/commits/'*) printf '%s\n' "$TEST_REVISION" ;;
+  *'/compare/'*)
+    python3 - "$TEST_REVISION" <<'PY'
+import json
+import sys
+json.dump({
+    "merge_base_commit": {"sha": sys.argv[1]},
+    "status": "ahead",
+    "padding": "x" * (2 * 1024 * 1024),
+}, sys.stdout)
+PY
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		mustLookPath(t, "bash"),
+		helper,
+		"manaflow-ai/subrouter",
+		"v0.1.51",
+		revision,
+	)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TEST_REVISION="+revision,
+	)
+	output, err := runDeployTestCommand(command)
+	if ctx.Err() != nil {
+		t.Fatalf("release verification deadlocked on a large comparison: %v\n%s", ctx.Err(), output)
+	}
+	if err != nil || strings.TrimSpace(string(output)) != revision {
+		t.Fatalf("release verification = %q, %v", output, err)
+	}
+}
+
+func TestReleaseMainVerificationReportsComparisonTransportFailure(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	revision := strings.Repeat("a", 40)
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "gh"), `#!/bin/sh
+case "$*" in
+  *'/commits/'*) printf '%s\n' "$TEST_REVISION" ;;
+  *'/compare/'*) exit 23 ;;
+  *) exit 2 ;;
+esac
+	`)
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "verify-release-on-main.sh")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		mustLookPath(t, "bash"),
+		helper,
+		"manaflow-ai/subrouter",
+		"v0.1.51",
+		revision,
+	)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TEST_REVISION="+revision,
+	)
+	output, err := runDeployTestCommand(command)
+	if err == nil {
+		t.Fatalf("comparison transport failure succeeded: %s", output)
+	}
+	if !strings.Contains(string(output), "failed to fetch comparison") ||
+		strings.Contains(string(output), "is not on main") {
+		t.Fatalf("comparison transport failure was misclassified: %v: %s", err, output)
+	}
+}
+
 func TestDeploymentContractValidatesTargetAndManifest(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
