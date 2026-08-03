@@ -218,6 +218,41 @@ def command_validate_instance_binding(args: argparse.Namespace) -> None:
         fail("live GCE instance is too old for fresh VM acceptance")
 
 
+def command_validate_legacy_supervisor_status(args: argparse.Namespace) -> None:
+    document = load_json(args.path, "legacy supervisor status")
+    has_accepting = "accepting" in document
+    has_retiring = "retiring" in document
+    if has_accepting != has_retiring:
+        fail("legacy supervisor lifecycle fields must both be present or both be absent")
+    if has_accepting:
+        if document["accepting"] is not True:
+            fail("legacy supervisor accepting must be true")
+        if document["retiring"] is not False:
+            fail("legacy supervisor retiring must be false")
+    active = document.get("active")
+    if not isinstance(active, dict):
+        fail("legacy supervisor active generation is missing")
+    active_id = active.get("id")
+    if not isinstance(active_id, str) or not active_id:
+        fail("legacy supervisor active generation ID is invalid")
+    backends = document.get("backends")
+    if not isinstance(backends, list) or not backends:
+        fail("legacy supervisor backends are missing")
+    active_matches = 0
+    for backend in backends:
+        if not isinstance(backend, dict):
+            fail("legacy supervisor backend is invalid")
+        connections = backend.get("connections")
+        if isinstance(connections, bool) or not isinstance(connections, int) or connections < 0:
+            fail("legacy supervisor backend connections are invalid")
+        if backend.get("id") == active_id:
+            active_matches += 1
+            if backend.get("active") is not True:
+                fail("legacy supervisor active backend is not marked active")
+    if active_matches != 1:
+        fail("legacy supervisor active generation must match exactly one backend")
+
+
 def command_probe_slot_endpoint(args: argparse.Namespace) -> None:
     if args.port < 1 or args.port > 65535:
         fail("slot endpoint port is invalid")
@@ -424,6 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
     binding.add_argument("live_identity")
     binding.add_argument("--now")
     binding.set_defaults(handler=command_validate_instance_binding)
+
+    legacy_status = commands.add_parser("validate-legacy-supervisor-status")
+    add_path(legacy_status, "path")
+    legacy_status.set_defaults(handler=command_validate_legacy_supervisor_status)
 
     probe = commands.add_parser("probe-slot-endpoint")
     probe.add_argument("port", type=int)
