@@ -42,6 +42,7 @@ type transportEvent struct {
 	ConnectionID string `json:"connection_id,omitempty"`
 	Direction    string `json:"direction,omitempty"`
 	Bytes        int64  `json:"bytes,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
 }
 
 type eventRecorder struct {
@@ -329,11 +330,22 @@ func (r *countingReadCloser) Read(p []byte) (int, error) {
 
 type countingResponseWriter struct {
 	http.ResponseWriter
-	observer *observer
-	meta     requestEvidence
+	observer   *observer
+	meta       requestEvidence
+	statusCode int
+}
+
+func (w *countingResponseWriter) WriteHeader(statusCode int) {
+	w.ResponseWriter.WriteHeader(statusCode)
+	if statusCode >= http.StatusOK || statusCode == http.StatusSwitchingProtocols {
+		w.recordFinalStatus(statusCode)
+	}
 }
 
 func (w *countingResponseWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.recordFinalStatus(http.StatusOK)
+	}
 	n, err := w.ResponseWriter.Write(p)
 	if n > 0 {
 		event := w.meta.event("response_chunk")
@@ -342,6 +354,22 @@ func (w *countingResponseWriter) Write(p []byte) (int, error) {
 		w.observer.emit(event)
 	}
 	return n, err
+}
+
+func (w *countingResponseWriter) recordFinalStatus(statusCode int) {
+	if w.statusCode != 0 {
+		return
+	}
+	w.statusCode = statusCode
+	event := w.meta.event("response_status")
+	event.StatusCode = statusCode
+	w.observer.emit(event)
+}
+
+func (w *countingResponseWriter) finish() {
+	if w.statusCode == 0 {
+		w.recordFinalStatus(http.StatusOK)
+	}
 }
 
 func (w *countingResponseWriter) Flush() {
@@ -366,6 +394,7 @@ func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	w.recordFinalStatus(http.StatusSwitchingProtocols)
 	// ReverseProxy writes the HTTP 101 control response through buffered. The
 	// wrapped connection sees only post-handshake WebSocket frame bytes.
 	return &countingConn{Conn: connection, observer: w.observer, meta: w.meta}, buffered, nil
@@ -515,7 +544,9 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 			request.Body = &countingReadCloser{ReadCloser: request.Body, observer: observation, meta: meta}
 		}
 		request = request.WithContext(context.WithValue(request.Context(), requestEvidenceContextKey{}, meta))
-		proxy.ServeHTTP(&countingResponseWriter{ResponseWriter: w, observer: observation, meta: meta}, request)
+		responseWriter := &countingResponseWriter{ResponseWriter: w, observer: observation, meta: meta}
+		proxy.ServeHTTP(responseWriter, request)
+		responseWriter.finish()
 		observation.emit(meta.event("request_completed"))
 	})
 }

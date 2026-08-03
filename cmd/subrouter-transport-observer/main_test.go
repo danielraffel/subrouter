@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +130,74 @@ func TestObserverRecordsActualHTTPAndWebSocketHandshakesWithoutHeaderValues(t *t
 		if strings.Contains(got, secret) {
 			t.Fatalf("observer events leaked %q:\n%s", secret, got)
 		}
+	}
+}
+
+func TestObserverRecordsResponseStatusWithoutBodyContent(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events bytes.Buffer
+	handler := newObserverHandler(upstreamURL, &events)
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "http://observer/v1/responses", nil))
+
+	statusRecorded := false
+	decoder := json.NewDecoder(&events)
+	for decoder.More() {
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event["kind"] == "response_status" && event["status_code"] == float64(http.StatusServiceUnavailable) {
+			statusRecorded = true
+		}
+	}
+	if !statusRecorded {
+		t.Fatalf("response status missing from observer evidence:\n%s", events.String())
+	}
+	if strings.Contains(events.String(), "body") {
+		t.Fatal("observer evidence recorded response body content")
+	}
+}
+
+func TestObserverRecordsFinalResponseStatusAfterInformationalStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("response-body-must-not-appear"))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var events bytes.Buffer
+	handler := newObserverHandler(upstreamURL, &events)
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "http://observer/v1/responses", nil))
+
+	var statuses []int
+	decoder := json.NewDecoder(&events)
+	for decoder.More() {
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event["kind"] == "response_status" {
+			statuses = append(statuses, int(event["status_code"].(float64)))
+		}
+	}
+	if len(statuses) != 1 || statuses[0] != http.StatusServiceUnavailable {
+		t.Fatalf("recorded response statuses = %v, want [%d]\n%s", statuses, http.StatusServiceUnavailable, events.String())
+	}
+	if strings.Contains(events.String(), "response-body-must-not-appear") {
+		t.Fatal("observer evidence recorded response body content")
 	}
 }
 
