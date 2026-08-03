@@ -1,21 +1,46 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
+
+type fakeStackVerifier struct {
+	claims stackauth.Claims
+	err    error
+}
+
+func (f fakeStackVerifier) Verify(context.Context, string) (stackauth.Claims, error) {
+	return f.claims, f.err
+}
+
+type fakeStackTeams struct {
+	teams []stackauth.Team
+	err   error
+}
+
+func (f fakeStackTeams) ListTeams(context.Context, string) ([]stackauth.Team, error) {
+	return f.teams, f.err
+}
 
 // newMultiTenantFixture builds an upstream that echoes the Authorization
 // header it received, a legacy single-tenant base Server with one account, and
@@ -291,6 +316,52 @@ func TestMultiTenantScopedControlEndpoints(t *testing.T) {
 	}
 }
 
+func TestMultiTenantAccountImportUsesTenantKeyAndStaysInTenantPool(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	created, key, err := registry.Create("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := `{
+		"provider":"codex",
+		"codex":{
+			"email":"apikey:tenant-import",
+			"provider":"codex",
+			"auth":{"auth_mode":"apikey","OPENAI_API_KEY":"sk-tenant-import"}
+		}
+	}`
+	request := httptest.NewRequest(http.MethodPost, "/t/"+key+"/_subrouter/account-import", strings.NewReader(payload))
+	request.RemoteAddr = "100.64.0.20:4321"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("tenant import status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := (accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].Email != "apikey:tenant-import" {
+		t.Fatalf("tenant stored accounts = %+v", stored)
+	}
+	proxied := doProxyRequest(t, handler, "/t/"+key+"/v1/responses", "tenant-import-session")
+	if proxied.Code != http.StatusOK || proxied.Body.String() != "Bearer sk-tenant-import" {
+		t.Fatalf("tenant imported account was not hot-loaded: %d %q", proxied.Code, proxied.Body.String())
+	}
+
+	global := httptest.NewRequest(http.MethodPost, "/_subrouter/account-import", strings.NewReader(payload))
+	global.RemoteAddr = "100.64.0.20:4321"
+	global.Header.Set("Content-Type", "application/json")
+	globalResponse := httptest.NewRecorder()
+	handler.ServeHTTP(globalResponse, global)
+	if globalResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unscoped import status = %d, want 401", globalResponse.Code)
+	}
+}
+
 func TestMultiTenantAdminCRUDRequiresAdminToken(t *testing.T) {
 	registry, _, _ := newMultiTenantFixture(t)
 	base := Server{AdminToken: "secret", MaxBodyBytes: 1024}
@@ -379,5 +450,395 @@ func TestMultiTenantStripsKeyBeforeUpstream(t *testing.T) {
 	}
 	if lastXAPIKey != "" || strings.Contains(lastAuth, key) {
 		t.Fatalf("tenant key leaked upstream: x-api-key=%q auth=%q", lastXAPIKey, lastAuth)
+	}
+}
+
+func TestStackLoginCreatesStableTenantAndAcceptsDirectAccountUpload(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	// A hosted server always has operator tokens. Tenant account reads must
+	// still authorize with the tenant path key rather than falling through to
+	// the unrelated server-admin gate.
+	base := Server{
+		MaxBodyBytes:       1024,
+		AdminToken:         "operator-secret",
+		AccountImportToken: "import-secret",
+	}
+	multi := &MultiTenant{
+		Base: base, Registry: registry, PublicURL: "https://sr.example",
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "team-123",
+			Email: "user@example.com",
+		}},
+	}
+	handler := multi.Handler(base.Handler())
+	exchange := func() map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/_subrouter/auth/stack",
+			strings.NewReader(`{"teamId":"team-123","teamName":"Acme"}`),
+		)
+		req.Header.Set("Authorization", "Bearer stack-access")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != http.StatusOK {
+			t.Fatalf("exchange status = %d: %s", response.Code, response.Body.String())
+		}
+		if got := response.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("cache-control = %q", got)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	first := exchange()
+	second := exchange()
+	if first["tenantKey"] != second["tenantKey"] {
+		t.Fatalf("tenant key changed: %v != %v", first["tenantKey"], second["tenantKey"])
+	}
+	key, _ := first["tenantKey"].(string)
+	if !tenant.ValidKeyFormat(key) {
+		t.Fatalf("bad tenant key %q", key)
+	}
+	if first["proxyUrl"] != "https://sr.example/t/"+key {
+		t.Fatalf("proxy URL = %v", first["proxyUrl"])
+	}
+
+	upload := httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(`{"provider":"openai-apikey","label":"work","apiKey":"sk-test"}`),
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, upload)
+	if response.Code != http.StatusOK {
+		t.Fatalf("upload status = %d: %s", response.Code, response.Body.String())
+	}
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/t/"+key+"/_subrouter/accounts", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "openai-apikey:work") {
+		t.Fatalf("accounts = %d: %s", list.Code, list.Body.String())
+	}
+	remove := httptest.NewRecorder()
+	handler.ServeHTTP(
+		remove,
+		httptest.NewRequest(
+			http.MethodDelete,
+			"/t/"+key+"/_subrouter/accounts/apikey:openai-apikey:work",
+			nil,
+		),
+	)
+	if remove.Code != http.StatusOK {
+		t.Fatalf("delete = %d: %s", remove.Code, remove.Body.String())
+	}
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(
+		missing,
+		httptest.NewRequest(
+			http.MethodDelete,
+			"/t/"+key+"/_subrouter/accounts/missing",
+			nil,
+		),
+	)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing delete = %d: %s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestTenantAccountUploadValidatesRepairTargetAndBodyShape(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/t/" + key + "/_subrouter/accounts"
+	request := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(
+			response,
+			httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)),
+		)
+		return response
+	}
+
+	mismatch := request(`{
+		"provider":"openai-apikey",
+		"label":"work",
+		"apiKey":"sk-test",
+		"targetAccountID":"apikey:openai-apikey:other"
+	}`)
+	if mismatch.Code != http.StatusConflict {
+		t.Fatalf("mismatched repair status = %d, body = %s", mismatch.Code, mismatch.Body.String())
+	}
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, path, nil))
+	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
+		t.Fatalf("mismatched repair mutated accounts: %d %s", list.Code, list.Body.String())
+	}
+
+	for name, body := range map[string]string{
+		"unknown field":  `{"provider":"openai-apikey","label":"work","apiKey":"sk-test","refreshToken":"secret"}`,
+		"trailing value": `{"provider":"openai-apikey","label":"work","apiKey":"sk-test"}{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := request(body)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	matching := request(`{
+		"provider":"openai-apikey",
+		"label":"work",
+		"apiKey":"sk-test",
+		"targetAccountID":"apikey:openai-apikey:work"
+	}`)
+	if matching.Code != http.StatusOK {
+		t.Fatalf("matching repair status = %d, body = %s", matching.Code, matching.Body.String())
+	}
+}
+
+func TestStackLoginRejectsInvalidTokenAndMismatchedTeam(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	for name, testCase := range map[string]struct {
+		verifier fakeStackVerifier
+		status   int
+	}{
+		"invalid token": {
+			verifier: fakeStackVerifier{err: errors.New("bad token")},
+			status:   http.StatusUnauthorized,
+		},
+		"wrong team": {
+			verifier: fakeStackVerifier{claims: stackauth.Claims{
+				ProjectID: "project", SelectedTeamID: "other-team",
+			}},
+			status: http.StatusForbidden,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			handler := (&MultiTenant{
+				Base: base, Registry: registry, StackVerifier: testCase.verifier,
+				StackTeams:           fakeStackTeams{},
+				StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+			}).Handler(base.Handler())
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/_subrouter/auth/stack",
+				strings.NewReader(`{"teamId":"team-123"}`),
+			)
+			req.Header.Set("Authorization", "Bearer access")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != testCase.status {
+				t.Fatalf("status = %d, want %d", response.Code, testCase.status)
+			}
+		})
+	}
+}
+
+func TestStackLoginRejectsUnsafeTeamNames(t *testing.T) {
+	for name, teamName := range map[string]string{
+		"oversized": strings.Repeat("x", 321),
+		"control":   "Acme\nInjected",
+	} {
+		t.Run(name, func(t *testing.T) {
+			registry := tenant.NewRegistry(t.TempDir())
+			base := Server{MaxBodyBytes: 1024}
+			handler := (&MultiTenant{
+				Base: base, Registry: registry, PublicURL: "https://sr.example",
+				StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+					ProjectID: "project", SelectedTeamID: "team-123",
+				}},
+				StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+			}).Handler(base.Handler())
+			body, err := json.Marshal(map[string]string{"teamId": "team-123", "teamName": teamName})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/_subrouter/auth/stack", strings.NewReader(string(body)))
+			request.Header.Set("Authorization", "Bearer access")
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", response.Code, response.Body.String())
+			}
+			tenants, err := registry.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tenants) != 0 {
+				t.Fatalf("unsafe team name was persisted: %+v", tenants)
+			}
+		})
+	}
+}
+
+func TestStackLoginAcceptsAnotherTeamAfterMembershipCheck(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry, PublicURL: "https://sr.example",
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "selected-team",
+		}},
+		StackTeams: fakeStackTeams{teams: []stackauth.Team{{
+			ID: "requested-team", DisplayName: "Requested Team",
+		}}},
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/auth/stack",
+		strings.NewReader(`{"teamId":"requested-team"}`),
+	)
+	req.Header.Set("Authorization", "Bearer access")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["tenantName"] != "Requested Team" {
+		t.Fatalf("tenant name = %v", body["tenantName"])
+	}
+	expectedKey, err := tenant.DeriveKey(
+		[]byte("0123456789abcdef0123456789abcdef"),
+		"project",
+		"requested-team",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body["tenantKey"] != expectedKey {
+		t.Fatalf("tenant key = %v, want %s", body["tenantKey"], expectedKey)
+	}
+}
+
+func TestStackLoginRequiresPublicURL(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	handler := (&MultiTenant{
+		Base: base, Registry: registry,
+		StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+			ProjectID: "project", SelectedTeamID: "team-123",
+		}},
+		StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+	}).Handler(base.Handler())
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/auth/stack",
+		strings.NewReader(`{"teamId":"team-123"}`),
+	)
+	req.Header.Set("Authorization", "Bearer access")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusInternalServerError ||
+		!strings.Contains(response.Body.String(), "proxy URL") {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestStackLoginReturnsUnavailableWhenMembershipLookupCannotRun(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	base := Server{MaxBodyBytes: 1024}
+	for name, teams := range map[string]interface {
+		ListTeams(context.Context, string) ([]stackauth.Team, error)
+	}{
+		"missing": nil,
+		"failed":  fakeStackTeams{err: errors.New("Stack unavailable")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			handler := (&MultiTenant{
+				Base: base, Registry: registry, PublicURL: "https://sr.example",
+				StackVerifier: fakeStackVerifier{claims: stackauth.Claims{
+					ProjectID: "project", SelectedTeamID: "selected-team",
+				}},
+				StackTeams:           teams,
+				StackTenantKeySecret: []byte("0123456789abcdef0123456789abcdef"),
+			}).Handler(base.Handler())
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/_subrouter/auth/stack",
+				strings.NewReader(`{"teamId":"other-team"}`),
+			)
+			req.Header.Set("Authorization", "Bearer access")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestTenantAccountDeleteReturnsUnavailableWithoutAccountStore(t *testing.T) {
+	response := httptest.NewRecorder()
+	handleTenantAccountDelete(
+		&Server{},
+		response,
+		httptest.NewRequest(http.MethodDelete, "/_subrouter/accounts/account", nil),
+	)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	stored := proxyStoredOAuthAccount(
+		"broken@example.com",
+		"broken",
+		time.Now().Add(-time.Hour),
+	)
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := stored.Account(stored.SourcePath(store))
+	if !ok {
+		t.Fatal("stored account was not loadable")
+	}
+	var upstreamRequests atomic.Int32
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		upstreamRequests.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
+		}, nil
+	})}
+	accountRef := NewAccountRef(store, []accounts.Account{account}, client)
+	accountRef.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+	server := Server{AccountRef: accountRef}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	if upstreamRequests.Load() != 0 {
+		t.Fatalf("account list made %d provider request(s)", upstreamRequests.Load())
+	}
+	if _, ok := items[0]["health"]; ok {
+		t.Fatalf("account list presented uncached health: %#v", items[0])
 	}
 }

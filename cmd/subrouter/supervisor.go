@@ -25,12 +25,14 @@ import (
 const inheritedListenerFDEnv = "SUBROUTER_LISTEN_FD"
 
 type supervisorConfig struct {
-	Addr          string
-	ControlSocket string
-	WorkerBin     string
-	ReadyTimeout  time.Duration
-	DrainTimeout  time.Duration
-	WorkerArgs    []string
+	Addr                string
+	ControlSocket       string
+	WorkerBin           string
+	ReadyTimeout        time.Duration
+	DrainTimeout        time.Duration
+	WorkerStopGrace     time.Duration
+	ExpectProxyProtocol bool
+	WorkerArgs          []string
 }
 
 type workerGeneration struct {
@@ -67,10 +69,13 @@ type supervisor struct {
 	router *front.Router
 	fatal  chan error
 
-	upgradeMu sync.Mutex
-	stopping  bool
-	workersMu sync.Mutex
-	workers   map[string]*workerGeneration
+	upgradeMu   sync.Mutex
+	lifecycleMu sync.RWMutex
+	stopping    bool
+	retiring    bool
+	retireCh    chan struct{}
+	workersMu   sync.Mutex
+	workers     map[string]*workerGeneration
 }
 
 func supervise(args []string) error {
@@ -91,10 +96,11 @@ func supervise(args []string) error {
 		return err
 	}
 	s := &supervisor{
-		config:  config,
-		router:  router,
-		fatal:   make(chan error, 1),
-		workers: map[string]*workerGeneration{initial.id: initial},
+		config:   config,
+		router:   router,
+		fatal:    make(chan error, 1),
+		retireCh: make(chan struct{}),
+		workers:  map[string]*workerGeneration{initial.id: initial},
 	}
 	go s.monitorWorker(initial)
 	return s.run()
@@ -107,7 +113,9 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-supervisor.sock", "permissioned supervisor control socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
-	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "maximum time to drain connections during supervisor shutdown")
+	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "interval for reporting retired worker connections that remain pinned")
+	flags.DurationVar(&config.WorkerStopGrace, "worker-stop-grace", 30*time.Second, "maximum time for a retired worker to exit after SIGTERM")
+	flags.BoolVar(&config.ExpectProxyProtocol, "expect-proxy-protocol", false, "require PROXY protocol from the stable private front")
 	if err := flags.Parse(args); err != nil {
 		return supervisorConfig{}, err
 	}
@@ -133,6 +141,9 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if config.DrainTimeout <= 0 {
 		return errors.New("drain-timeout must be positive")
+	}
+	if config.WorkerStopGrace <= 0 {
+		return errors.New("worker-stop-grace must be positive")
 	}
 	for i, arg := range config.WorkerArgs {
 		if arg == "--addr" || strings.HasPrefix(arg, "--addr=") {
@@ -299,7 +310,8 @@ func (s *supervisor) run() error {
 	controlServer := &http.Server{Handler: s.controlHandler(), ReadHeaderTimeout: 5 * time.Second}
 	routerErrCh := make(chan error, 1)
 	controlErrCh := make(chan error, 1)
-	go func() { routerErrCh <- s.router.Serve(listener) }()
+	routerListener := supervisorRouterListener(listener, s.config.ExpectProxyProtocol)
+	go func() { routerErrCh <- s.router.Serve(routerListener) }()
 	go func() { controlErrCh <- controlServer.Serve(controlListener) }()
 
 	slog.Info("subrouter supervisor listening", "addr", s.config.Addr, "control_socket", s.config.ControlSocket, "worker", s.router.Active().ID)
@@ -328,6 +340,19 @@ func (s *supervisor) run() error {
 				s.stopAllWorkers()
 				return err
 			}
+		case <-s.retireCh:
+			// A slot retirement stops only new public connections. The control
+			// listener stays available while existing streams drain without a
+			// deadline, then every worker is terminated before this process exits.
+			_ = listener.Close()
+			<-routerErrCh
+			if err := s.router.WaitAllIdle(context.Background()); err != nil {
+				return err
+			}
+			s.terminateAllWorkers()
+			_ = controlServer.Close()
+			<-controlErrCh
+			return nil
 		case sig := <-sigCh:
 			if sig == syscall.SIGHUP {
 				go func() {
@@ -354,10 +379,25 @@ func (s *supervisor) run() error {
 	}
 }
 
+func supervisorRouterListener(listener net.Listener, expectProxyProtocol bool) net.Listener {
+	if expectProxyProtocol {
+		return front.NewProxyProtocolListener(listener)
+	}
+	return listener
+}
+
 func (s *supervisor) beginShutdown() {
 	s.upgradeMu.Lock()
+	s.lifecycleMu.Lock()
 	s.stopping = true
+	s.lifecycleMu.Unlock()
 	s.upgradeMu.Unlock()
+}
+
+func (s *supervisor) lifecycleStatus() (accepting, retiring bool) {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	return !s.stopping, s.retiring
 }
 
 func prepareControlSocket(path string) error {
@@ -384,7 +424,8 @@ func (s *supervisor) upgrade() error {
 }
 
 func (s *supervisor) upgradeLocked() error {
-	if s.stopping {
+	accepting, _ := s.lifecycleStatus()
+	if !accepting {
 		return errors.New("supervisor is shutting down")
 	}
 	next, err := startWorkerGeneration(s.config)
@@ -409,6 +450,10 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 	err := worker.waitError()
 	s.upgradeMu.Lock()
 	defer s.upgradeMu.Unlock()
+	accepting, _ := s.lifecycleStatus()
+	if !accepting {
+		return
+	}
 	if s.router.Active().ID != worker.id {
 		return
 	}
@@ -424,8 +469,8 @@ func (s *supervisor) monitorWorker(worker *workerGeneration) {
 
 func (s *supervisor) reapWhenIdle(id string) {
 	// Tell the retired worker to stop reusing connections before waiting on it.
-	// WaitIdle has no timeout, so without this a client holding a keep-alive
-	// connection pins an obsolete generation indefinitely: a worker from four
+	// A client holding a keep-alive connection pins an obsolete generation
+	// indefinitely: a worker from four
 	// hours and two upgrades ago was still serving 64 connections, which meant
 	// deployed fixes never took effect for those clients. SIGUSR1 makes the
 	// worker answer with "Connection: close", so each client finishes its
@@ -440,31 +485,56 @@ func (s *supervisor) reapWhenIdle(id string) {
 		}
 	}
 
-	s.router.WaitIdle(id)
+	for {
+		drainCtx, cancel := context.WithTimeout(context.Background(), s.config.DrainTimeout)
+		err := s.router.ForgetWhenIdleContext(drainCtx, id)
+		cancel()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			slog.Warn("subrouter retired backend could not be forgotten", "generation", id, "error", err)
+			return
+		}
+		slog.Warn("subrouter retired worker still draining",
+			"generation", id,
+			"stale_after", s.config.DrainTimeout,
+			"connections", backendConnectionCount(s.router.Status(), id))
+	}
 	s.workersMu.Lock()
 	worker := s.workers[id]
 	s.workersMu.Unlock()
-	if worker == nil {
-		return
+	if worker != nil {
+		slog.Info("subrouter worker drained", "generation", id, "pid", worker.command.Process.Pid)
+		terminateWorker(worker, s.config.WorkerStopGrace)
+		if err := worker.waitError(); err != nil {
+			slog.Warn("subrouter worker exited after drain", "generation", id, "error", err)
+		}
 	}
-	slog.Info("subrouter worker drained", "generation", id, "pid", worker.command.Process.Pid)
-	_ = worker.command.Process.Signal(syscall.SIGTERM)
-	if err := worker.waitError(); err != nil {
-		slog.Warn("subrouter worker exited after drain", "generation", id, "error", err)
-	}
-	_ = s.router.Forget(id)
 	s.workersMu.Lock()
 	delete(s.workers, id)
 	s.workersMu.Unlock()
 }
 
+func backendConnectionCount(statuses []front.BackendStatus, id string) int {
+	for _, status := range statuses {
+		if status.ID == id {
+			return status.Connections
+		}
+	}
+	return 0
+}
+
 func (s *supervisor) controlHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_subrouter/supervisor-status", func(w http.ResponseWriter, _ *http.Request) {
+		accepting, retiring := s.lifecycleStatus()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"active":   s.router.Active(),
-			"backends": s.router.Status(),
+			"accepting": accepting,
+			"retiring":  retiring,
+			"active":    s.router.Active(),
+			"backends":  s.router.Status(),
 		})
 	})
 	mux.HandleFunc("POST /_subrouter/upgrade", func(w http.ResponseWriter, _ *http.Request) {
@@ -475,7 +545,71 @@ func (s *supervisor) controlHandler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"active": s.router.Active()})
 	})
+	if s.config.ExpectProxyProtocol {
+		mux.HandleFunc("POST /_subrouter/retire", func(w http.ResponseWriter, _ *http.Request) {
+			if err := s.requestRetirement(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"active": s.router.Active(), "retired": true})
+		})
+	}
 	return mux
+}
+
+// requestRetirement begins the one-way shutdown of a private slot supervisor.
+// It stops worker keep-alive reuse first, then wakes run to close the slot's
+// client listener and wait indefinitely for pinned streams. Repeated calls are
+// harmless. Legacy public supervisors never expose this transition.
+func (s *supervisor) requestRetirement() error {
+	s.upgradeMu.Lock()
+	defer s.upgradeMu.Unlock()
+	if !s.config.ExpectProxyProtocol {
+		return errors.New("slot retirement requires --expect-proxy-protocol")
+	}
+	accepting, retiring := s.lifecycleStatus()
+	if retiring {
+		return nil
+	}
+	if !accepting {
+		return errors.New("supervisor is shutting down")
+	}
+	if s.retireCh == nil {
+		return errors.New("supervisor retirement channel is unavailable")
+	}
+	if retireSignal == nil {
+		return errors.New("worker retirement is unsupported on this platform")
+	}
+	id := s.router.Active().ID
+	s.workersMu.Lock()
+	worker := s.workers[id]
+	s.workersMu.Unlock()
+	if worker == nil || worker.command == nil || worker.command.Process == nil {
+		return fmt.Errorf("active worker %q is unavailable", id)
+	}
+	if err := worker.command.Process.Signal(retireSignal); err != nil {
+		return fmt.Errorf("retire active worker %q: %w", id, err)
+	}
+	s.lifecycleMu.Lock()
+	s.retiring = true
+	s.stopping = true
+	s.lifecycleMu.Unlock()
+	close(s.retireCh)
+	slog.Info("subrouter active worker retired", "generation", id, "pid", worker.command.Process.Pid)
+	return nil
+}
+
+func (s *supervisor) terminateAllWorkers() {
+	s.workersMu.Lock()
+	workers := make([]*workerGeneration, 0, len(s.workers))
+	for _, worker := range s.workers {
+		workers = append(workers, worker)
+	}
+	s.workersMu.Unlock()
+	for _, worker := range workers {
+		terminateWorker(worker, s.config.WorkerStopGrace)
+	}
 }
 
 func (s *supervisor) stopAllWorkers() {

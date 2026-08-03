@@ -94,6 +94,92 @@ func TestValidKeyFormat(t *testing.T) {
 	}
 }
 
+func TestEnsureExternalIsStableAndUpdatesName(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	key, err := DeriveKey(secret, "stack-project", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := registry.EnsureExternal("team-123", "Old name", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := registry.EnsureExternal("team-123", "New name", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != "team-123" || second.Name != "New name" {
+		t.Fatalf("tenants = %#v %#v", first, second)
+	}
+	if len(second.Keys) != 1 {
+		t.Fatalf("repeated login accumulated %d keys", len(second.Keys))
+	}
+	if resolved, ok, err := registry.Resolve(key); err != nil || !ok || resolved.ID != "team-123" {
+		t.Fatalf("resolve = %#v, %v, %v", resolved, ok, err)
+	}
+}
+
+func TestEnsureExternalDoesNotPersistBeforeAccountDirectoryExists(t *testing.T) {
+	root := t.TempDir()
+	registry := NewRegistry(root)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	firstKey, err := DeriveKey(secret, "stack-project", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-123", "Old name", firstKey); err != nil {
+		t.Fatal(err)
+	}
+	codexDir := filepath.Join(registry.Dir("team-123"), "codex")
+	if err := os.RemoveAll(codexDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codexDir, []byte("blocks directory creation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondKey, err := DeriveKey(secret, "stack-project-2", "team-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternal("team-123", "New name", secondKey); err == nil {
+		t.Fatal("directory failure unexpectedly succeeded")
+	}
+	resolved, ok, err := registry.Resolve(firstKey)
+	if err != nil || !ok || resolved.Name != "Old name" {
+		t.Fatalf("original tenant changed after failed update: %#v, %v, %v", resolved, ok, err)
+	}
+	if _, ok, err := registry.Resolve(secondKey); err != nil || ok {
+		t.Fatalf("failed key was persisted: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestExternalTenantRejectsTraversalAndWeakSecret(t *testing.T) {
+	if _, err := DeriveKey([]byte("short"), "stack", "team"); err == nil {
+		t.Fatal("weak secret accepted")
+	}
+	for _, id := range []string{"", ".", "..", "../team", "team/other", "team other", "Team-A"} {
+		if ValidExternalID(id) {
+			t.Fatalf("invalid external ID %q accepted", id)
+		}
+	}
+	first, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-a", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-a", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherNamespace, err := DeriveKey([]byte("0123456789abcdef0123456789abcdef"), "stack-b", "team-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != again || first == otherNamespace {
+		t.Fatalf("derived keys = %q, %q, %q", first, again, otherNamespace)
+	}
+}
+
 func mustRead(t *testing.T, path string) string {
 	t.Helper()
 	body, err := os.ReadFile(path)

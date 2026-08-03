@@ -27,6 +27,7 @@ import (
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -60,7 +61,7 @@ func configureDefaultLogger(program string, args []string) {
 }
 
 func shouldUseProcessLogger(_ string, args []string) bool {
-	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise")
+	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front")
 }
 
 func newCLIFileLogHandler(path string) slog.Handler {
@@ -86,6 +87,43 @@ func envTrue(name string) bool {
 	}
 }
 
+const maxSecretFileBytes = 64 << 10
+
+func secretFromEnvironment(valueName, fileName string) (string, error) {
+	direct := strings.TrimSpace(os.Getenv(valueName))
+	path := strings.TrimSpace(os.Getenv(fileName))
+	if direct != "" && path != "" {
+		return "", fmt.Errorf("%s and %s cannot both be set", valueName, fileName)
+	}
+	if path == "" {
+		return direct, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileName, err)
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, maxSecretFileBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileName, err)
+	}
+	if len(body) > maxSecretFileBytes {
+		return "", fmt.Errorf("read %s: secret exceeds %d bytes", fileName, maxSecretFileBytes)
+	}
+	secret := strings.TrimSpace(string(body))
+	if secret == "" {
+		return "", fmt.Errorf("read %s: secret is empty", fileName)
+	}
+	return secret, nil
+}
+
+func secretValue(explicit, valueName, fileName string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	return secretFromEnvironment(valueName, fileName)
+}
+
 func run(args []string) error {
 	return runForProgram("subrouter", args)
 }
@@ -108,6 +146,10 @@ func runForProgram(program string, args []string) error {
 		return serve(args[1:])
 	case "supervise":
 		return supervise(args[1:])
+	case "front":
+		return runFront(args[1:])
+	case "probe":
+		return probe(args[1:])
 	case "accounts":
 		return listAccounts()
 	case "codex":
@@ -127,6 +169,49 @@ func runForProgram(program string, args []string) error {
 		}
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func probe(args []string) error {
+	flags := flag.NewFlagSet("probe", flag.ContinueOnError)
+	baseURL := flags.String("url", "http://127.0.0.1:31415", "Subrouter base URL")
+	timeout := flags.Duration("timeout", 2*time.Second, "health request timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *timeout <= 0 {
+		return errors.New("probe timeout must be positive")
+	}
+	target, err := url.Parse(strings.TrimSpace(*baseURL))
+	if err != nil {
+		return fmt.Errorf("probe URL: %w", err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return fmt.Errorf("probe URL uses unsupported scheme %q", target.Scheme)
+	}
+	if target.Host == "" {
+		return errors.New("probe URL has no host")
+	}
+	target.Path = "/_subrouter/health"
+	target.RawPath = ""
+	target.RawQuery = ""
+	target.Fragment = ""
+	client := &http.Client{Timeout: *timeout}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return fmt.Errorf("probe %s: %w", target.Redacted(), err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("probe %s: %w", target.Redacted(), err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("probe %s returned status %d", target.Redacted(), response.StatusCode)
+	}
+	return nil
 }
 
 var directSRCommands = map[string]struct{}{
@@ -160,6 +245,8 @@ var directSRCommands = map[string]struct{}{
 	"pick":             {},
 	"remove":           {},
 	"remove-admin-key": {},
+	"remote":           {},
+	"remotes":          {},
 	"reset":            {},
 	"rm":               {},
 	"server":           {},
@@ -205,10 +292,16 @@ func serve(args []string) error {
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
 	adminToken := flags.String("admin-token", "", "admin token required for non-loopback _subrouter endpoints; defaults to SUBROUTER_ADMIN_TOKEN")
+	accountImportToken := flags.String("account-import-token", "", "token limited to protected account import; defaults to SUBROUTER_ACCOUNT_IMPORT_TOKEN")
 	requireSessionLeases := flags.Bool("require-session-leases", false, "reject proxy requests without a valid session lease; defaults to SUBROUTER_REQUIRE_SESSION_LEASES")
 	maxBodyBytes := flags.Int64("max-body-bytes", 1<<20, "max JSON request body bytes to inspect for session IDs")
 	fetchUsage := flags.Bool("fetch-usage", true, "fetch Codex usage on startup for account selection")
 	multiTenant := flags.Bool("multi-tenant", false, "reject unknown srt_ tenant keys even before the first tenant exists; tenant routing itself activates automatically once tenants exist")
+	publicURL := flags.String("public-url", "", "public Subrouter origin used in hosted tenant responses; defaults to SUBROUTER_PUBLIC_URL")
+	stackAPIURL := flags.String("stack-api-url", "", "Stack Auth API base URL; defaults to SUBROUTER_STACK_API_URL")
+	stackProjectID := flags.String("stack-project-id", "", "Stack Auth project ID enabling hosted login; defaults to SUBROUTER_STACK_PROJECT_ID")
+	stackPublishableClientKey := flags.String("stack-publishable-client-key", "", "Stack Auth publishable client key; defaults to SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY")
+	stackTenantKeySecret := flags.String("stack-tenant-key-secret", "", "local-development override for stable Stack-team tenant keys; deployments use SUBROUTER_STACK_TENANT_KEY_SECRET")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
@@ -216,6 +309,8 @@ func serve(args []string) error {
 	bedrockAutoBump := flags.Bool("bedrock-autobump", false, "request a Service Quotas increase (2x, deduped) when Bedrock throttles Fable/Opus")
 	fableBedrockPrimary := flags.Bool("fable-bedrock-primary", false, "route Claude Fable to Bedrock first (before the subscription pool); defaults to SUBROUTER_FABLE_BEDROCK_PRIMARY")
 	cloudConfigPath := flags.String("cloud-config", "", "cmux.com team credential config; defaults to ~/.config/subrouter/cloud.json")
+	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
+	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -226,8 +321,53 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("transcript-max-local-bytes: %w", err)
 	}
-	if *adminToken == "" {
-		*adminToken = strings.TrimSpace(os.Getenv("SUBROUTER_ADMIN_TOKEN"))
+	*adminToken, err = secretValue(*adminToken, "SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE")
+	if err != nil {
+		return err
+	}
+	*accountImportToken, err = secretValue(*accountImportToken, "SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return err
+	}
+	if *publicURL == "" {
+		*publicURL = strings.TrimSpace(os.Getenv("SUBROUTER_PUBLIC_URL"))
+	}
+	if *stackAPIURL == "" {
+		*stackAPIURL = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_API_URL"))
+	}
+	if *stackAPIURL == "" {
+		*stackAPIURL = stackauth.DefaultAPIURL
+	}
+	if *stackProjectID == "" {
+		*stackProjectID = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_PROJECT_ID"))
+	}
+	if *stackPublishableClientKey == "" {
+		*stackPublishableClientKey = strings.TrimSpace(os.Getenv("SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY"))
+	}
+	*stackTenantKeySecret, err = secretValue(
+		*stackTenantKeySecret,
+		"SUBROUTER_STACK_TENANT_KEY_SECRET",
+		"SUBROUTER_STACK_TENANT_KEY_SECRET_FILE",
+	)
+	if err != nil {
+		return err
+	}
+	stackLoginValues := []string{*stackProjectID, *stackPublishableClientKey, *stackTenantKeySecret}
+	stackLoginConfigured := 0
+	for _, value := range stackLoginValues {
+		if value != "" {
+			stackLoginConfigured++
+		}
+	}
+	if stackLoginConfigured != 0 && stackLoginConfigured != len(stackLoginValues) {
+		return errors.New("hosted Stack login requires all of --stack-project-id, --stack-publishable-client-key, and --stack-tenant-key-secret (or their SUBROUTER_STACK_* environment or secret-file equivalents)")
+	}
+	if *stackTenantKeySecret != "" && len(*stackTenantKeySecret) < 32 {
+		return errors.New("--stack-tenant-key-secret or SUBROUTER_STACK_TENANT_KEY_SECRET must be at least 32 bytes")
+	}
+	*publicURL, err = normalizePublicSubrouterURL(*publicURL)
+	if err != nil {
+		return err
 	}
 
 	var upstream *url.URL
@@ -263,18 +403,39 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("load cmux.com config: %w", err)
 	}
+	if strings.TrimSpace(*cloudBaseURL) != "" {
+		cloudConfig.BaseURL = *cloudBaseURL
+	}
+	if strings.TrimSpace(*cloudCredentialSource) != "" {
+		cloudConfig.CredentialSource = broker.CredentialSource(*cloudCredentialSource)
+	}
+	cloudConfig = cloudConfig.Normalized()
+	if err := cloudConfig.Validate(); err != nil {
+		return fmt.Errorf("configure cmux.com client: %w", err)
+	}
 	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
 		cloudConfig.LoggedIn() &&
 		cloudConfig.TeamID == "" {
 		return errors.New("cmux.com login has no selected team; run 'sr team use <team>'")
 	}
 	if cloudConfig.EffectiveCredentialSource() == broker.CredentialSourceTeam &&
-		!cloudConfig.Ready() {
-		return errors.New("team credential storage requires login and a selected team; run 'sr login'")
+		!cloudConfig.TeamModeReady() {
+		return errors.New("team credential storage requires login and a hosted tenant; run 'sr login'")
 	}
 	if cloudConfig.TeamModeReady() &&
 		strings.TrimSpace(cloudConfig.LocalProxyToken) == "" {
 		return errors.New("team credential storage has no local proxy secret; run 'sr setup' to repair it")
+	}
+	localProxyToken := cloudServerProxyToken(cloudConfig)
+	configuredProxyToken, err := secretFromEnvironment("SUBROUTER_PROXY_TOKEN", "SUBROUTER_PROXY_TOKEN_FILE")
+	if err != nil {
+		return err
+	}
+	if configuredProxyToken != "" {
+		if localProxyToken != "" && localProxyToken != configuredProxyToken {
+			return errors.New("configured proxy secret does not match the cloud config proxy secret")
+		}
+		localProxyToken = configuredProxyToken
 	}
 	fableAPIKey := strings.TrimSpace(
 		os.Getenv("SUBROUTER_CLAUDE_FABLE_API_KEY"),
@@ -291,6 +452,7 @@ func serve(args []string) error {
 	if cloudConfig.TeamModeReady() {
 		credentialBroker = broker.NewClient(cloudConfig)
 	}
+	outboundTransport := proxy.NewOutboundTransport()
 
 	store, err := session.NewStore(*sessionPath)
 	if err != nil {
@@ -298,14 +460,27 @@ func serve(args []string) error {
 	}
 
 	codexStore := accounts.DefaultCodexStore()
-	codexAccounts, claudeAccounts, err := loadProxyAccounts(
-		context.Background(),
-		credentialBroker != nil,
-		codexStore,
-		agentclaude.DefaultStore(),
-	)
-	if err != nil {
-		return err
+	claudeStore := agentclaude.DefaultStore()
+	var accountRef *proxy.AccountRef
+	var accountGeneration uint64
+	var codexAccounts, claudeAccounts []accounts.Account
+	if credentialBroker == nil {
+		accountRef, err = proxy.OpenAccountRef(codexStore, claudeStore, &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: outboundTransport,
+		})
+		if err != nil {
+			return err
+		}
+		initialAccounts, generation := accountRef.Snapshot()
+		accountGeneration = generation
+		for _, account := range initialAccounts {
+			if account.Provider == accounts.ProviderClaude {
+				claudeAccounts = append(claudeAccounts, account)
+			} else {
+				codexAccounts = append(codexAccounts, account)
+			}
+		}
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -314,18 +489,19 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
+	schedulerRef.AdvanceAccountGeneration(accountGeneration)
 	if *fetchUsage && credentialBroker == nil {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
 			if successful > 0 {
-				schedulerRef.Set(selectacct.NewScheduler(fetchedScores))
+				if !schedulerRef.SetForAccountGeneration(selectacct.NewScheduler(fetchedScores), accountGeneration) {
+					slog.Debug("initial usage score fetch discarded after account reload")
+				}
 			} else {
 				slog.Warn("initial usage score fetch skipped", "reason", "no fresh OAuth usage scores")
 			}
 		}()
 	}
-	outboundTransport := proxy.NewOutboundTransport()
-
 	var bedrockConfig *proxy.BedrockConfig
 	if *bedrockEnable {
 		token := strings.TrimSpace(*bedrockGatewayToken)
@@ -357,16 +533,6 @@ func serve(args []string) error {
 		slog.Info("bedrock gateway enabled", "regions", strings.Join(regions, ","), "auth", token != "", "autobump", *bedrockAutoBump, "profiles", strings.Join(bedrockSourceNames(sources), ","))
 	}
 
-	initialAccounts := append([]accounts.Account(nil), codexAccounts...)
-	initialAccounts = append(initialAccounts, claudeAccounts...)
-	var accountRef *proxy.AccountRef
-	if credentialBroker == nil {
-		accountRef = proxy.NewAccountRef(codexStore, initialAccounts, &http.Client{
-			Timeout:   15 * time.Second,
-			Transport: outboundTransport,
-		})
-	}
-
 	server := proxy.Server{
 		StreamDrops:           &proxy.StreamDropStats{},
 		Upstream:              upstream,
@@ -385,9 +551,10 @@ func serve(args []string) error {
 		Logger:                slog.Default(),
 		Lifecycle:             proxy.NewLifecycle(),
 		AdminToken:            *adminToken,
+		AccountImportToken:    *accountImportToken,
 		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
 		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
-		LocalProxyToken:       cloudServerProxyToken(cloudConfig),
+		LocalProxyToken:       localProxyToken,
 		MaxBodyBytes:          *maxBodyBytes,
 		Bedrock:               bedrockConfig,
 		ClaudeFableAPIKey:     fableAPIKey,
@@ -408,12 +575,12 @@ func serve(args []string) error {
 	}
 	if srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil {
 		go runSRAutoSwitch(context.Background(), srAutoSwitchConfig{
-			Interval:     srSwitchInterval,
-			AccountsFunc: accountRef.All,
-			Sessions:     store,
-			SchedulerRef: schedulerRef,
-			Logger:       slog.Default(),
-			Lease:        newSRAutoSwitchLease(storepath.StateDir()),
+			Interval:             srSwitchInterval,
+			AccountsSnapshotFunc: accountRef.Snapshot,
+			Sessions:             store,
+			SchedulerRef:         schedulerRef,
+			Logger:               slog.Default(),
+			Lease:                newSRAutoSwitchLease(storepath.StateDir()),
 		})
 	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
@@ -424,6 +591,20 @@ func serve(args []string) error {
 		Registry:      tenant.NewRegistry(storepath.StateDir()),
 		TranscriptDir: *transcriptDir,
 		Enabled:       *multiTenant,
+		PublicURL:     *publicURL,
+	}
+	if *stackProjectID != "" {
+		stackHTTPClient := &http.Client{Timeout: 15 * time.Second}
+		multiTenantHandler.StackVerifier = &stackauth.Verifier{
+			APIURL: *stackAPIURL, ProjectID: *stackProjectID,
+			HTTPClient: stackHTTPClient,
+		}
+		multiTenantHandler.StackTeams = &stackauth.Client{
+			APIURL: *stackAPIURL, ProjectID: *stackProjectID,
+			PublishableClientKey: *stackPublishableClientKey,
+			HTTPClient:           stackHTTPClient,
+		}
+		multiTenantHandler.StackTenantKeySecret = []byte(*stackTenantKeySecret)
 	}
 	httpServer := &http.Server{
 		Addr:              *addr,
@@ -448,6 +629,35 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+}
+
+func validatePublicSubrouterURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("--public-url or SUBROUTER_PUBLIC_URL must be an origin such as https://sr.example.com")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	ip := net.ParseIP(host)
+	loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+	if parsed.Scheme != "https" &&
+		!(parsed.Scheme == "http" && loopback) {
+		return errors.New("--public-url or SUBROUTER_PUBLIC_URL must use HTTPS, except on loopback")
+	}
+	return nil
+}
+
+func normalizePublicSubrouterURL(raw string) (string, error) {
+	normalized := strings.TrimSpace(raw)
+	if err := validatePublicSubrouterURL(normalized); err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(normalized, "/"), nil
 }
 
 func loadProxyAccounts(
@@ -983,7 +1193,7 @@ Getting started:
 
 Credential storage:
   %[1]s storage            Show the active credential source
-  %[1]s storage team       Use credentials shared with the selected Stack team
+  %[1]s storage hosted     Use credentials hosted for the selected Stack team
   %[1]s storage local      Keep and use credentials only on this machine
   %[1]s storage legacy     Use the selected legacy remote Subrouter server
 
@@ -1024,6 +1234,13 @@ Usage:
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
 
+  %[1]s remote -v          List local, cmux hosted, and self-hosted remotes
+  %[1]s remote use local   Route agents through this computer
+  %[1]s remote use cmux    Route agents through hosted cmux
+  %[1]s remote add <name> <url>
+                           Add a self-hosted Subrouter
+  %[1]s remote use <name>  Route agents through a self-hosted Subrouter
+
   %[1]s daemon start       Start this machine's local proxy
   %[1]s daemon stop        Stop this machine's local proxy
   %[1]s daemon restart     Restart this machine's local proxy
@@ -1061,7 +1278,9 @@ Usage:
   %[1]s gemini             Manage Gemini profiles
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
-  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--drain-timeout 10m] -- [serve flags]
+  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
+  %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock]
+  %[1]s probe [--url http://127.0.0.1:31415]
   %[1]s accounts
   %[1]s codex [codex args...]
   %[1]s install-daemon [--start=true]       macOS LaunchAgent

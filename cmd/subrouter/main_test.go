@@ -16,6 +16,23 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
+func TestSecretValueUsesFileEnvironmentWithoutOverridingFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tenant-secret")
+	if err := os.WriteFile(path, []byte("file-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_SECRET", "")
+	t.Setenv("TEST_SECRET_FILE", path)
+	got, err := secretValue("", "TEST_SECRET", "TEST_SECRET_FILE")
+	if err != nil || got != "file-secret" {
+		t.Fatalf("secret = %q, %v", got, err)
+	}
+	got, err = secretValue("flag-secret", "TEST_SECRET", "TEST_SECRET_FILE")
+	if err != nil || got != "flag-secret" {
+		t.Fatalf("flag secret = %q, %v", got, err)
+	}
+}
+
 func TestConfigureDefaultLoggerWritesCLIToStateLog(t *testing.T) {
 	previous := slog.Default()
 	defer slog.SetDefault(previous)
@@ -59,6 +76,39 @@ func TestConfigureDefaultLoggerLeavesSupervisorLoggerAlone(t *testing.T) {
 	configureDefaultLogger("subrouter", []string{"supervise"})
 	if slog.Default() != sentinel {
 		t.Fatal("supervise should keep the process logger")
+	}
+}
+
+func TestValidatePublicSubrouterURLRequiresAnHTTPSOrigin(t *testing.T) {
+	for _, valid := range []string{
+		"",
+		"https://sr.example.com",
+		"https://sr.example.com/",
+		"http://127.0.0.1:31415",
+	} {
+		if err := validatePublicSubrouterURL(valid); err != nil {
+			t.Fatalf("%q: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{
+		"https://sr.example.com/path",
+		"https://user@sr.example.com",
+		"https://sr.example.com?query=1",
+		"http://sr.example.com",
+	} {
+		if err := validatePublicSubrouterURL(invalid); err == nil {
+			t.Fatalf("%q was accepted", invalid)
+		}
+	}
+}
+
+func TestNormalizePublicSubrouterURLTrimsFlagValues(t *testing.T) {
+	got, err := normalizePublicSubrouterURL("  https://sr.example.com/  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://sr.example.com" {
+		t.Fatalf("normalized public URL = %q, want https://sr.example.com", got)
 	}
 }
 
@@ -145,6 +195,33 @@ func TestTeamModeRejectsPersonalFableKeyFallback(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
 		t.Fatal("team mode did not reject personal Fable credential fallback")
+	}
+}
+
+// Docker team mode accepts a copied workstation config. In production that
+// config can still describe legacy storage and a loopback development API, so
+// the container must explicitly select team storage and the hosted API without
+// rewriting the read-only credential secret.
+func TestServeCloudOverridesUpgradeCopiedLegacyConfigForTeamContainer(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "http://127.0.0.1:3928",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceLegacy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--cloud-base-url", "https://cmux.com",
+		"--cloud-credential-source", "team",
+		"--addr", "invalid:::",
+		"--bedrock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatalf("serve error = %v, want team-mode validation after Docker overrides", err)
 	}
 }
 
@@ -241,6 +318,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"logout",
 		"ls",
 		"pick",
+		"remote",
+		"remotes",
 		"remove",
 		"remove-admin-key",
 		"reset",

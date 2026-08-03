@@ -17,6 +17,15 @@ type CodexStore struct {
 	Dir string
 }
 
+type StorageKeyCollisionError struct {
+	Identifier         string
+	ExistingIdentifier string
+}
+
+func (e *StorageKeyCollisionError) Error() string {
+	return fmt.Sprintf("account identifier %q collides with stored account %q", e.Identifier, e.ExistingIdentifier)
+}
+
 type StoredCodexAccount struct {
 	Email         string                `json:"email"`
 	Provider      Provider              `json:"provider,omitempty"`
@@ -206,8 +215,8 @@ func (a StoredCodexAccount) Account(source string) (Account, bool) {
 }
 
 func (s CodexStore) SaveStored(account StoredCodexAccount) error {
-	if strings.TrimSpace(account.Email) == "" {
-		return errors.New("account email is required")
+	if err := validateStoredAccountIdentifier(account.Email); err != nil {
+		return err
 	}
 	lock, err := s.lockStoredAccount(account.Email)
 	if err != nil {
@@ -218,8 +227,40 @@ func (s CodexStore) SaveStored(account StoredCodexAccount) error {
 }
 
 func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
-	if strings.TrimSpace(account.Email) == "" {
-		return errors.New("account email is required")
+	if err := validateStoredAccountIdentifier(account.Email); err != nil {
+		return err
+	}
+	stored, err := s.ListStored()
+	if err != nil {
+		return err
+	}
+	var canonical string
+	for _, existing := range stored {
+		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
+			continue
+		}
+		if canonical != "" && canonical != existing.Email {
+			return fmt.Errorf("multiple stored accounts differ only by case: %q and %q", canonical, existing.Email)
+		}
+		canonical = existing.Email
+	}
+	if canonical != "" {
+		account.Email = canonical
+	}
+	path := filepath.Join(s.Dir, emailToFilename(account.Email))
+	if body, err := os.ReadFile(path); err == nil {
+		var existing StoredCodexAccount
+		if err := json.Unmarshal(body, &existing); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(existing.Email), strings.TrimSpace(account.Email)) {
+			return &StorageKeyCollisionError{
+				Identifier:         account.Email,
+				ExistingIdentifier: existing.Email,
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	if account.AddedAt == "" {
 		account.AddedAt = time.Now().UTC().Format(time.RFC3339)
@@ -232,7 +273,18 @@ func (s CodexStore) saveStoredUnlocked(account StoredCodexAccount) error {
 		return err
 	}
 	body = append(body, '\n')
-	return writeFileAtomic(filepath.Join(s.Dir, emailToFilename(account.Email)), body, 0o600)
+	return writeFileAtomic(path, body, 0o600)
+}
+
+func validateStoredAccountIdentifier(identifier string) error {
+	trimmed := strings.TrimSpace(identifier)
+	if trimmed == "" {
+		return errors.New("account email is required")
+	}
+	if strings.HasPrefix(emailToFilename(trimmed), ".") {
+		return errors.New("account identifier cannot create a hidden store entry")
+	}
+	return nil
 }
 
 func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, error) {
@@ -246,7 +298,9 @@ func (s CodexStore) FindStored(identifier string) (StoredCodexAccount, bool, err
 		if err := json.Unmarshal(body, &account); err != nil {
 			return StoredCodexAccount{}, false, err
 		}
-		return account, true, nil
+		if strings.EqualFold(strings.TrimSpace(account.Email), needle) {
+			return account, true, nil
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return StoredCodexAccount{}, false, err
 	}
@@ -328,6 +382,10 @@ func emailToFilename(email string) string {
 		}
 	}
 	return b.String() + ".json"
+}
+
+func accountLockFilename(identifier string) string {
+	return emailToFilename(strings.ToLower(strings.TrimSpace(identifier)))
 }
 
 func writeFileAtomic(path string, body []byte, perm os.FileMode) error {

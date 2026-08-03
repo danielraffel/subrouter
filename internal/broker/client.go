@@ -16,21 +16,6 @@ import (
 	"github.com/manaflow-ai/subrouter/account"
 )
 
-type AuthStart struct {
-	DeviceCode       string `json:"deviceCode"`
-	UserCode         string `json:"userCode"`
-	VerificationURL  string `json:"verificationUrl"`
-	ExpiresInSeconds int    `json:"expiresInSeconds"`
-	IntervalSeconds  int    `json:"intervalSeconds"`
-}
-
-type AuthPoll struct {
-	Status       string `json:"status"`
-	Client       string `json:"client,omitempty"`
-	AccessToken  string `json:"accessToken,omitempty"`
-	RefreshToken string `json:"refreshToken,omitempty"`
-}
-
 type Team struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
@@ -190,34 +175,6 @@ func NewClient(config Config) *Client {
 	}
 }
 
-func (c *Client) StartAuth(ctx context.Context) (AuthStart, error) {
-	var response AuthStart
-	err := c.doJSON(ctx, http.MethodPost, "/api/vault/cli/auth/start", map[string]any{
-		"client": "subrouter",
-	}, false, &response)
-	return response, err
-}
-
-func (c *Client) PollAuth(ctx context.Context, deviceCode string) (AuthPoll, error) {
-	var response AuthPoll
-	err := c.doJSON(ctx, http.MethodPost, "/api/vault/cli/auth/poll", map[string]string{
-		"deviceCode": deviceCode,
-	}, false, &response)
-	return response, err
-}
-
-// Logout revokes the exact Stack session stored in this client's config.
-func (c *Client) Logout(ctx context.Context) error {
-	return c.doJSON(
-		ctx,
-		http.MethodPost,
-		"/api/subrouter/logout",
-		nil,
-		true,
-		nil,
-	)
-}
-
 func (c *Client) ListTeams(ctx context.Context) ([]Team, string, error) {
 	var response teamsEnvelope
 	if err := c.doJSON(ctx, http.MethodGet, "/api/subrouter/teams", nil, true, &response); err != nil {
@@ -237,6 +194,43 @@ func (c *Client) ListTeams(ctx context.Context) ([]Team, string, error) {
 }
 
 func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
+	if c.Config.HostedReady() {
+		var items []struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+			AuthMode string `json:"auth_mode"`
+			Email    string `json:"email"`
+			Health   *struct {
+				OK      bool   `json:"ok"`
+				Message string `json:"message,omitempty"`
+			} `json:"health,omitempty"`
+		}
+		if err := c.doHostedJSON(ctx, http.MethodGet, "/_subrouter/accounts", nil, &items); err != nil {
+			return nil, err
+		}
+		out := make([]SharedAccount, 0, len(items))
+		for _, item := range items {
+			kind := item.Provider
+			if item.AuthMode == "apikey" {
+				switch item.Provider {
+				case "claude":
+					kind = "anthropic-apikey"
+				case "codex":
+					kind = "openai-apikey"
+				default:
+					return nil, fmt.Errorf("unsupported hosted account provider %q", item.Provider)
+				}
+			}
+			label := item.Email
+			if label == "" {
+				label = item.ID
+			}
+			out = append(out, SharedAccount{
+				ID: item.ID, Kind: kind, Label: label, Health: item.Health,
+			})
+		}
+		return out, nil
+	}
 	var response accountsEnvelope
 	if err := c.doJSON(ctx, http.MethodGet, "/api/subrouter/accounts", nil, true, &response); err != nil {
 		return nil, err
@@ -245,6 +239,13 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 }
 
 func (c *Client) UploadAccount(ctx context.Context, input AccountUpload) (SharedAccount, error) {
+	if c.Config.HostedReady() {
+		var response struct {
+			Account SharedAccount `json:"account"`
+		}
+		err := c.doHostedJSON(ctx, http.MethodPost, "/_subrouter/accounts", input, &response)
+		return response.Account, err
+	}
 	var response struct {
 		Account SharedAccount `json:"account"`
 	}
@@ -260,6 +261,15 @@ func (c *Client) UploadAccount(ctx context.Context, input AccountUpload) (Shared
 }
 
 func (c *Client) DeleteAccount(ctx context.Context, accountID string) error {
+	if c.Config.HostedReady() {
+		return c.doHostedJSON(
+			ctx,
+			http.MethodDelete,
+			"/_subrouter/accounts/"+url.PathEscape(accountID),
+			nil,
+			nil,
+		)
+	}
 	path := "/api/subrouter/accounts/" + url.PathEscape(accountID)
 	return c.doJSON(ctx, http.MethodDelete, path, nil, true, nil)
 }
@@ -269,6 +279,14 @@ func (c *Client) RepairAccount(
 	accountID string,
 	input AccountUpload,
 ) (SharedAccount, error) {
+	if c.Config.HostedReady() {
+		repair := make(AccountUpload, len(input)+1)
+		for key, value := range input {
+			repair[key] = value
+		}
+		repair["targetAccountID"] = accountID
+		return c.UploadAccount(ctx, repair)
+	}
 	path := "/api/subrouter/accounts/" +
 		url.PathEscape(accountID) +
 		"/repair?adopt=1"
@@ -277,6 +295,75 @@ func (c *Client) RepairAccount(
 	}
 	err := c.doJSON(ctx, http.MethodPost, path, input, true, &response)
 	return response.Account, err
+}
+
+func (c *Client) doHostedJSON(
+	ctx context.Context,
+	method string,
+	path string,
+	body any,
+	out any,
+) error {
+	if err := c.Config.Validate(); err != nil {
+		return err
+	}
+	var payload []byte
+	var err error
+	if body != nil {
+		payload, err = json.Marshal(body)
+		if err != nil {
+			return err
+		}
+	}
+	root := strings.TrimRight(c.Config.HostedURL, "/") +
+		"/t/" + url.PathEscape(c.Config.TenantKey)
+	request, err := http.NewRequestWithContext(
+		ctx,
+		method,
+		root+path,
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "application/json")
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := c.httpClient().Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	if err != nil {
+		return err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		message := http.StatusText(response.StatusCode)
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(data, &body) == nil &&
+			strings.TrimSpace(body.Error) != "" {
+			message = strings.TrimSpace(body.Error)
+		}
+		if message == "" {
+			message = "request failed"
+		}
+		return fmt.Errorf(
+			"hosted Subrouter request failed (%d): %s",
+			response.StatusCode,
+			message,
+		)
+	}
+	if out == nil || len(data) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return errors.New("hosted Subrouter returned an invalid response")
+	}
+	return nil
 }
 
 func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
@@ -320,7 +407,13 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 		body["requiredAuthMode"] = input.RequiredAuthMode
 	}
 	var response leaseEnvelope
-	if err := c.doJSON(ctx, http.MethodPost, "/api/subrouter/leases", body, true, &response); err != nil {
+	var err error
+	if c.usesHostedLeaseAPI() {
+		err = c.doHostedJSON(ctx, http.MethodPost, "/_subrouter/leases", body, &response)
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, "/api/subrouter/leases", body, true, &response)
+	}
+	if err != nil {
 		return Lease{}, err
 	}
 	lease, err := parseLease(response.Lease)
@@ -361,13 +454,24 @@ func (c *Client) Report(
 		body["retryAt"] = report.RetryAt.UnixMilli()
 	}
 	path := "/api/subrouter/leases/" + url.PathEscape(leaseID) + "/events"
-	err := c.doJSON(ctx, http.MethodPost, path, body, true, nil)
+	var err error
+	if c.usesHostedLeaseAPI() {
+		hostedPath := "/_subrouter/leases/" + url.PathEscape(leaseID) + "/events"
+		err = c.doHostedJSON(ctx, http.MethodPost, hostedPath, body, nil)
+	} else {
+		err = c.doJSON(ctx, http.MethodPost, path, body, true, nil)
+	}
 	if report.Outcome == LeaseUnauthorized ||
 		report.Outcome == LeaseForbidden ||
 		report.Outcome == LeaseRateLimited {
 		c.invalidateLease(leaseID)
 	}
 	return err
+}
+
+func (c *Client) usesHostedLeaseAPI() bool {
+	return c.Config.CredentialSource == CredentialSourceTeam &&
+		c.Config.TeamModeReady()
 }
 
 func (c *Client) invalidateLease(leaseID string) {

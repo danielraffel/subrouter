@@ -1,11 +1,10 @@
 package main
 
 import (
-	"archive/tar"
 	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,15 +14,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-
-	"golang.org/x/term"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"golang.org/x/term"
 )
 
 // serverControlBaseURL is the base for a server's _subrouter endpoints. A
@@ -50,6 +49,13 @@ func (r srRunner) serverCommand() string {
 	return r.program + " server"
 }
 
+func (r srRunner) remoteCommand() string {
+	if r.program == "" {
+		return "sr remote"
+	}
+	return r.program + " remote"
+}
+
 func srServerHelp(command string) string {
 	return fmt.Sprintf(`%[1]s - Manage Subrouter servers
 
@@ -61,7 +67,7 @@ This machine's daemon:
 
 Named servers:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--tenant-key srt_<hex>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
@@ -72,6 +78,22 @@ Named servers:
   %[1]s login <name> [--device-auth]
   %[1]s sync <name> [--device-auth] [--all] [--email <email>] [--dry-run] [--yes]
 
+`, command)
+}
+
+func srRemoteHelp(command string) string {
+	return fmt.Sprintf(`%[1]s - Switch between local, cmux hosted, and self-hosted Subrouter
+
+  %[1]s -v
+  %[1]s current
+  %[1]s use local
+  %[1]s use cmux
+  %[1]s use cmux-local
+  %[1]s add <name> <url> [--tenant-key srt_<hex>]
+  %[1]s rename <old> <new>
+  %[1]s remove <name>
+
+cmux and cmux-local are built in and become usable after 'sr login'.
 `, command)
 }
 
@@ -88,6 +110,9 @@ type srServerConfig struct {
 	GCPZone     string `json:"gcpZone,omitempty"`
 	GCPInstance string `json:"gcpInstance,omitempty"`
 	AdminToken  string `json:"adminToken,omitempty"`
+	// AccountImportToken grants only protected HTTP account import. Keeping it
+	// separate prevents a self-service login from gaining administrator access.
+	AccountImportToken string `json:"accountImportToken,omitempty"`
 	// TenantKey scopes this entry to one tenant on a multi-tenant server:
 	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
 	// tenant-scoped endpoints, and account uploads land in the tenant dir.
@@ -163,6 +188,106 @@ func (r srRunner) server(ctx context.Context, args []string) error {
 	}
 }
 
+func (r srRunner) remote(ctx context.Context, args []string) error {
+	store := defaultSRServerStore(r.store)
+	command := r.remoteCommand()
+	if len(args) == 0 || args[0] == "-v" || args[0] == "list" || args[0] == "ls" {
+		return r.remoteList(store)
+	}
+	switch args[0] {
+	case "use":
+		if len(args) >= 2 && isCMUXLocalServerName(args[1]) {
+			return r.useCMUXLocal(store, args[2:])
+		}
+		if len(args) == 2 && args[1] == "cmux" {
+			if _, ok, err := store.find("cmux"); err != nil {
+				return err
+			} else if !ok {
+				return fmt.Errorf("cmux hosted needs your team identity; run 'sr login'")
+			}
+		}
+		return r.serverUse(store, args[1:])
+	case "current", "default":
+		return r.remoteCurrent(store)
+	case "add":
+		if len(args) >= 3 && !strings.HasPrefix(args[2], "-") {
+			serverArgs := append([]string{args[1], "--url", args[2]}, args[3:]...)
+			return r.serverAdd(store, serverArgs)
+		}
+		return r.serverAdd(store, args[1:])
+	case "remove", "rm":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: %s remove <name>", command)
+		}
+		if args[1] == "local" || args[1] == "cmux" || isCMUXLocalServerName(args[1]) {
+			return fmt.Errorf("%s is a built-in remote and cannot be removed", args[1])
+		}
+		return r.serverRemove(store, args[1])
+	case "rename", "mv":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: %s rename <old> <new>", command)
+		}
+		return r.serverRename(store, args[1], args[2])
+	case "help", "-h", "--help":
+		fmt.Fprint(r.out, srRemoteHelp(command))
+		return nil
+	default:
+		return fmt.Errorf("unknown remote command %q\n%s", args[0], srRemoteHelp(command))
+	}
+}
+
+func (r srRunner) remoteList(store srServerStore) error {
+	file, err := store.load()
+	if err != nil {
+		return err
+	}
+	cmuxLocalDefault := false
+	if file.Default == "" {
+		if config, configErr := cloudModeConfig(); configErr == nil {
+			cmuxLocalDefault = config.TeamModeReady()
+		}
+	}
+	localMarker := ""
+	if file.Default == "" && !cmuxLocalDefault {
+		localMarker = "\t(default)"
+	}
+	fmt.Fprintf(r.out, "local\thttp://127.0.0.1:31415%s\n", localMarker)
+	cmuxLocalMarker := ""
+	if cmuxLocalDefault {
+		cmuxLocalMarker = "\t(default)"
+	}
+	fmt.Fprintf(r.out, "cmux-local\thttp://127.0.0.1:31415%s\n", cmuxLocalMarker)
+	haveCMUX := false
+	for _, server := range file.Servers {
+		if server.Name == "cmux" {
+			haveCMUX = true
+		}
+		marker := ""
+		if server.Name == file.Default {
+			marker = "\t(default)"
+		}
+		fmt.Fprintf(r.out, "%s\t%s%s\n", server.Name, server.URL, marker)
+	}
+	if !haveCMUX {
+		fmt.Fprintln(r.out, "cmux\thttps://sr.cmux.com\t(login required)")
+	}
+	return nil
+}
+
+func (r srRunner) remoteCurrent(store srServerStore) error {
+	file, err := store.load()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(file.Default) == "" {
+		if config, configErr := cloudModeConfig(); configErr == nil && config.TeamModeReady() {
+			fmt.Fprintln(r.out, "Default Codex server: cmux-local\thttp://127.0.0.1:31415")
+			return nil
+		}
+	}
+	return r.serverCurrent(store)
+}
+
 func defaultSRServerStore(store accounts.CodexStore) srServerStore {
 	return srServerStore{Path: filepath.Join(store.StoreDir(), "servers.json")}
 }
@@ -197,11 +322,57 @@ func (s srServerStore) save(file srServerFile) error {
 		return err
 	}
 	body = append(body, '\n')
-	tmp := s.Path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+	return writeFileAtomic(s.Path, body, 0o600)
+}
+
+func (s srServerStore) update(mutate func(*srServerFile) error) (err error) {
+	lock, err := lockSRServerStore(s.Path)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.Path)
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	file, err := s.load()
+	if err != nil {
+		return err
+	}
+	if err := mutate(&file); err != nil {
+		return err
+	}
+	return s.save(file)
+}
+
+func selectSRServerDefault(store srServerStore, name string) (srServerConfig, string, error) {
+	var selected srServerConfig
+	var previous string
+	err := store.update(func(file *srServerFile) error {
+		server, ok := file.find(name)
+		if !ok {
+			return fmt.Errorf("server %q not found", name)
+		}
+		selected = server
+		previous = file.Default
+		file.Default = name
+		return nil
+	})
+	return selected, previous, err
+}
+
+func rollbackSRServerDefault(store srServerStore, expected, previous string, cause error) error {
+	rollbackErr := store.update(func(file *srServerFile) error {
+		if file.Default != expected {
+			return fmt.Errorf("default changed concurrently to %q", file.Default)
+		}
+		file.Default = previous
+		return nil
+	})
+	if rollbackErr != nil {
+		return errors.Join(cause, fmt.Errorf("restore remote selection: %w", rollbackErr))
+	}
+	return cause
 }
 
 func (s srServerStore) find(name string) (srServerConfig, bool, error) {
@@ -248,9 +419,12 @@ func (r srRunner) serverList(store srServerStore) error {
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
+		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	}
 	name := args[0]
+	if isBuiltInRemoteName(name) {
+		return fmt.Errorf("%s is a built-in remote and cannot be added", strings.TrimSpace(name))
+	}
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	serverURL := flags.String("url", "", "subrouter base URL, such as http://100.64.0.1:31415")
@@ -258,6 +432,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
 	adminToken := flags.String("admin-token", "", "admin token for non-loopback _subrouter endpoints")
+	accountImportToken := flags.String("account-import-token", "", "token limited to protected HTTP account import")
 	tenantKey := flags.String("tenant-key", "", "tenant key (srt_...) scoping this entry to one tenant on a multi-tenant server")
 	makeDefault := flags.Bool("default", false, "make this the default server for sr codex")
 	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
@@ -265,10 +440,14 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		return err
 	}
 	adminTokenSet := false
+	accountImportTokenSet := false
 	tenantKeySet := false
 	flags.Visit(func(flag *flag.Flag) {
 		if flag.Name == "admin-token" {
 			adminTokenSet = true
+		}
+		if flag.Name == "account-import-token" {
+			accountImportTokenSet = true
 		}
 		if flag.Name == "tenant-key" {
 			tenantKeySet = true
@@ -286,40 +465,42 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	if (*gcpInstance == "") != (*gcpZone == "") {
 		return fmt.Errorf("--gcp-instance and --gcp-zone must be set together")
 	}
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
 	next := srServerConfig{
-		Name:        name,
-		URL:         strings.TrimRight(*serverURL, "/"),
-		GCPProject:  *gcpProject,
-		GCPZone:     *gcpZone,
-		GCPInstance: *gcpInstance,
-		AdminToken:  *adminToken,
-		TenantKey:   strings.TrimSpace(*tenantKey),
+		Name:               name,
+		URL:                strings.TrimRight(*serverURL, "/"),
+		GCPProject:         *gcpProject,
+		GCPZone:            *gcpZone,
+		GCPInstance:        *gcpInstance,
+		AdminToken:         *adminToken,
+		AccountImportToken: strings.TrimSpace(*accountImportToken),
+		TenantKey:          strings.TrimSpace(*tenantKey),
 	}
 	replaced := false
-	for i := range file.Servers {
-		if file.Servers[i].Name == name {
-			if !adminTokenSet {
-				next.AdminToken = file.Servers[i].AdminToken
+	if err := store.update(func(file *srServerFile) error {
+		for i := range file.Servers {
+			if file.Servers[i].Name == name {
+				if !adminTokenSet {
+					next.AdminToken = file.Servers[i].AdminToken
+				}
+				if !accountImportTokenSet {
+					next.AccountImportToken = file.Servers[i].AccountImportToken
+				}
+				if !tenantKeySet {
+					next.TenantKey = file.Servers[i].TenantKey
+				}
+				file.Servers[i] = next
+				replaced = true
+				break
 			}
-			if !tenantKeySet {
-				next.TenantKey = file.Servers[i].TenantKey
-			}
-			file.Servers[i] = next
-			replaced = true
-			break
 		}
-	}
-	if !replaced {
-		file.Servers = append(file.Servers, next)
-	}
-	if *makeDefault {
-		file.Default = name
-	}
-	if err := store.save(file); err != nil {
+		if !replaced {
+			file.Servers = append(file.Servers, next)
+		}
+		if *makeDefault {
+			file.Default = name
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	if replaced {
@@ -359,29 +540,127 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	if isLocalServerName(name) {
-		return r.clearDefaultServer(store, shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig))
+		return r.clearDefaultServer(
+			store,
+			shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig),
+		)
 	}
-	file, err := store.load()
+	server, previousDefault, err := selectSRServerDefault(store, name)
 	if err != nil {
 		return err
 	}
-	server, ok := file.find(name)
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
+	rollbackSelection := func(cause error) error {
+		return rollbackSRServerDefault(store, name, previousDefault, cause)
 	}
-	file.Default = name
-	if err := store.save(file); err != nil {
-		return err
+	var (
+		hostedConfigPath string
+		previousHosted   broker.Config
+		hostedSaved      bool
+	)
+	if server.Name == "cmux" && strings.TrimSpace(server.TenantKey) != "" {
+		hostedConfigPath, err = broker.DefaultConfigPath()
+		if err != nil {
+			return rollbackSelection(err)
+		}
+		previousHosted, err = broker.LoadConfig(hostedConfigPath)
+		if err != nil {
+			return rollbackSelection(err)
+		}
+		nextHosted := previousHosted
+		nextHosted.CredentialSource = broker.CredentialSourceHosted
+		nextHosted.HostedURL = server.URL
+		nextHosted.TenantKey = server.TenantKey
+		if !nextHosted.HostedReady() {
+			return rollbackSelection(fmt.Errorf("cmux hosted requires login and a selected team; run 'sr login'"))
+		}
+		if err := broker.SaveConfig(hostedConfigPath, nextHosted); err != nil {
+			return rollbackSelection(err)
+		}
+		hostedSaved = true
 	}
-	fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
+	rollbackHosted := func(cause error) error {
+		if !hostedSaved {
+			return cause
+		}
+		if rollbackErr := broker.SaveConfig(hostedConfigPath, previousHosted); rollbackErr != nil {
+			return errors.Join(cause, fmt.Errorf("restore hosted configuration: %w", rollbackErr))
+		}
+		return cause
+	}
 	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
 		path, err := writeCodexConfigForServer(server)
 		if err != nil {
-			return err
+			return rollbackHosted(rollbackSelection(err))
+		}
+		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
+		fmt.Fprintf(r.out, "Codex config: %s\n", path)
+	} else {
+		fmt.Fprintf(r.out, "Default Codex server: %s\n", name)
+	}
+	if hostedSaved {
+		return nil
+	}
+	if err := r.cloudStorage([]string{"legacy"}); err != nil {
+		return rollbackSelection(err)
+	}
+	return nil
+}
+
+func (r srRunner) useCMUXLocal(store srServerStore, args []string) error {
+	command := r.remoteCommand()
+	flags := flag.NewFlagSet(command+" use", flag.ContinueOnError)
+	flags.SetOutput(r.errOut)
+	writeCodexConfig, noCodexConfig := addCodexConfigSwitchFlags(flags)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	configPath, err := broker.DefaultConfigPath()
+	if err != nil {
+		return err
+	}
+	previousConfig, err := broker.LoadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	nextConfig := previousConfig
+	nextConfig.CredentialSource = broker.CredentialSourceTeam
+	if !nextConfig.TeamModeReady() {
+		return fmt.Errorf("cmux local egress requires login and a hosted tenant; run 'sr login'")
+	}
+	if err := broker.SaveConfig(configPath, nextConfig); err != nil {
+		return err
+	}
+	rollbackConfig := func(cause error) error {
+		if rollbackErr := broker.SaveConfig(configPath, previousConfig); rollbackErr != nil {
+			return errors.Join(cause, fmt.Errorf("restore credential storage: %w", rollbackErr))
+		}
+		return cause
+	}
+	previousDefault := ""
+	if err := store.update(func(file *srServerFile) error {
+		previousDefault = file.Default
+		file.Default = ""
+		return nil
+	}); err != nil {
+		return rollbackConfig(err)
+	}
+	rollbackAll := func(cause error) error {
+		cause = rollbackSRServerDefault(store, "", previousDefault, cause)
+		return rollbackConfig(cause)
+	}
+	if shouldWriteCodexConfig(*writeCodexConfig, *noCodexConfig) {
+		path, err := writeCodexConfigForLocal()
+		if err != nil {
+			return rollbackAll(err)
 		}
 		fmt.Fprintf(r.out, "Codex config: %s\n", path)
 	}
-	return r.cloudStorage([]string{"legacy"})
+	fmt.Fprintln(r.out, "Default Codex server: cmux-local")
+	fmt.Fprintf(r.out, "Credential storage: team (%s, %s)\n", nextConfig.TeamName, nextConfig.TeamID)
+	return restartInstalledDaemon()
 }
 
 func (r srRunner) serverCurrent(store srServerStore) error {
@@ -416,12 +695,10 @@ func (r srRunner) serverClearDefault(store srServerStore, args []string) error {
 }
 
 func (r srRunner) clearDefaultServer(store srServerStore, updateCodexConfig bool) error {
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
-	file.Default = ""
-	if err := store.save(file); err != nil {
+	if err := store.update(func(file *srServerFile) error {
+		file.Default = ""
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintln(r.out, "Default Codex server: local")
@@ -452,6 +729,21 @@ func isLocalServerName(name string) bool {
 	default:
 		return false
 	}
+}
+
+func isCMUXLocalServerName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "cmux-local", "local-egress":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBuiltInRemoteName(name string) bool {
+	return isLocalServerName(name) ||
+		strings.EqualFold(strings.TrimSpace(name), "cmux") ||
+		isCMUXLocalServerName(name)
 }
 
 func (r srRunner) defaultRemoteServer() (srServerConfig, bool, error) {
@@ -500,32 +792,33 @@ func (r srRunner) serverRename(store srServerStore, oldName, newName string) err
 	if oldName == "" || newName == "" {
 		return fmt.Errorf("server names are required")
 	}
+	if isBuiltInRemoteName(oldName) || isBuiltInRemoteName(newName) {
+		return fmt.Errorf("built-in remotes cannot be renamed")
+	}
 	if oldName == newName {
 		fmt.Fprintf(r.out, "Server name unchanged: %s\n", oldName)
 		return nil
 	}
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
-	if _, ok := file.find(newName); ok {
-		return fmt.Errorf("server %q already exists", newName)
-	}
-	renamed := false
-	for i := range file.Servers {
-		if file.Servers[i].Name == oldName {
-			file.Servers[i].Name = newName
-			renamed = true
-			break
+	if err := store.update(func(file *srServerFile) error {
+		if _, ok := file.find(newName); ok {
+			return fmt.Errorf("server %q already exists", newName)
 		}
-	}
-	if !renamed {
-		return fmt.Errorf("server %q not found", oldName)
-	}
-	if file.Default == oldName {
-		file.Default = newName
-	}
-	if err := store.save(file); err != nil {
+		renamed := false
+		for i := range file.Servers {
+			if file.Servers[i].Name == oldName {
+				file.Servers[i].Name = newName
+				renamed = true
+				break
+			}
+		}
+		if !renamed {
+			return fmt.Errorf("server %q not found", oldName)
+		}
+		if file.Default == oldName {
+			file.Default = newName
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Renamed server: %s -> %s\n", oldName, newName)
@@ -533,27 +826,25 @@ func (r srRunner) serverRename(store srServerStore, oldName, newName string) err
 }
 
 func (r srRunner) serverRemove(store srServerStore, name string) error {
-	file, err := store.load()
-	if err != nil {
-		return err
-	}
-	out := file.Servers[:0]
-	removed := false
-	for _, server := range file.Servers {
-		if server.Name == name {
-			removed = true
-			continue
+	if err := store.update(func(file *srServerFile) error {
+		out := file.Servers[:0]
+		removed := false
+		for _, server := range file.Servers {
+			if server.Name == name {
+				removed = true
+				continue
+			}
+			out = append(out, server)
 		}
-		out = append(out, server)
-	}
-	if !removed {
-		return fmt.Errorf("server %q not found", name)
-	}
-	file.Servers = out
-	if file.Default == name {
-		file.Default = ""
-	}
-	if err := store.save(file); err != nil {
+		if !removed {
+			return fmt.Errorf("server %q not found", name)
+		}
+		file.Servers = out
+		if file.Default == name {
+			file.Default = ""
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Removed server: %s\n", name)
@@ -979,7 +1270,6 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	flags.StringVar(&srSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&srSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	extraArgs := flags.String("extra-args", "", "extra arguments appended to subrouter serve")
-	tailscaleHostname := flags.String("tailscale-hostname", "", "hostname for tailscale up when TAILSCALE_AUTH_KEY is set")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -993,34 +1283,80 @@ func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args [
 	if server.GCPInstance == "" || server.GCPZone == "" {
 		return fmt.Errorf("server %s has no GCP target", server.Name)
 	}
-	hostname := *tailscaleHostname
-	if hostname == "" {
-		hostname = server.GCPInstance
+	server, err = ensureServerControlTokens(store, server)
+	if err != nil {
+		return err
 	}
-	tailscaleAuthKey := strings.TrimSpace(os.Getenv("TAILSCALE_AUTH_KEY"))
 	remoteCommand := strings.Join([]string{
 		"set -eu",
-		"tailscale_auth_key=''",
-		"read -r tailscale_auth_key || true",
+		"admin_token=''",
+		"account_import_token=''",
+		"read -r admin_token",
+		"read -r account_import_token",
 		"curl -fsSL " + shellQuote(publicInstallScriptURL) + " | sudo env SUBROUTER_VERSION=" + shellQuote(*version) + " sh",
-		"sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --extra-args " + shellQuote(*extraArgs),
-		"if [ -n \"$tailscale_auth_key\" ]; then sudo tailscale up --auth-key \"$tailscale_auth_key\" --hostname " + shellQuote(hostname) + " --ssh --accept-routes=false --accept-dns=false; fi",
+		"printf '%s\\n%s\\n' \"$admin_token\" \"$account_import_token\" | sudo /usr/local/bin/sr install-systemd --addr " + shellQuote(*addr) + " --cx-switch-interval " + shellQuote(srSwitchInterval) + " --admin-token-stdin --account-import-token-stdin --extra-args " + shellQuote(*extraArgs),
 		"i=0; until curl -fsS http://127.0.0.1:31415/_subrouter/health >/dev/null 2>&1; do i=$((i+1)); if [ \"$i\" -ge 30 ]; then exit 1; fi; sleep 1; done",
 		"/usr/local/bin/sr --help >/dev/null",
 	}, "\n")
-	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--command", remoteCommand}
+	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--tunnel-through-iap", "--command", remoteCommand}
 	if server.GCPProject != "" {
 		sshArgs = append(sshArgs, "--project", server.GCPProject)
 	}
-	stdin := strings.NewReader(tailscaleAuthKey + "\n")
+	stdin := strings.NewReader(server.AdminToken + "\n" + server.AccountImportToken + "\n")
 	if err := r.commandRunner().Run(ctx, "gcloud", sshArgs, stdin, r.out, r.errOut); err != nil {
 		return fmt.Errorf("install server: %w", err)
 	}
 	fmt.Fprintf(r.out, "Installed Subrouter server: %s\n", server.Name)
-	if tailscaleAuthKey != "" {
-		fmt.Fprintf(r.out, "Joined Tailscale as: %s\n", hostname)
-	}
 	return nil
+}
+
+func ensureServerControlTokens(store srServerStore, server srServerConfig) (srServerConfig, error) {
+	if strings.TrimSpace(server.AdminToken) != "" && strings.TrimSpace(server.AccountImportToken) != "" {
+		return server, nil
+	}
+	err := store.update(func(file *srServerFile) error {
+		serverIndex := -1
+		for i := range file.Servers {
+			if file.Servers[i].Name == server.Name {
+				serverIndex = i
+				server.AdminToken = file.Servers[i].AdminToken
+				server.AccountImportToken = file.Servers[i].AccountImportToken
+				break
+			}
+		}
+		if serverIndex < 0 {
+			return fmt.Errorf("server %q not found", server.Name)
+		}
+		if strings.TrimSpace(server.AdminToken) == "" {
+			token, err := generateServerControlToken()
+			if err != nil {
+				return fmt.Errorf("generate server control token: %w", err)
+			}
+			server.AdminToken = token
+			file.Servers[serverIndex].AdminToken = token
+		}
+		if strings.TrimSpace(server.AccountImportToken) == "" {
+			token, err := generateServerControlToken()
+			if err != nil {
+				return fmt.Errorf("generate account import token: %w", err)
+			}
+			server.AccountImportToken = token
+			file.Servers[serverIndex].AccountImportToken = token
+		}
+		return nil
+	})
+	if err != nil {
+		return server, err
+	}
+	return server, nil
+}
+
+func generateServerControlToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []string) error {
@@ -1276,6 +1612,12 @@ func printStatusGroup(w io.Writer, label string, emails []string, statuses map[s
 }
 
 func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, deviceAuth bool, expectedEmail string) error {
+	// Fail before opening OAuth when the server cannot securely accept the
+	// resulting refresh-token chain. A completed login must never be discarded
+	// because an old server only knows the retired SSH upload path.
+	if err := r.ensureServerAccountImportAvailable(ctx, server); err != nil {
+		return err
+	}
 	// Serialize concurrent `sr add` / server login. Browser OAuth binds a fixed
 	// localhost callback port, and we must not let one login clobber another's
 	// temporary auth capture.
@@ -1329,7 +1671,10 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	}
 
 	stopProgress := r.startServerUploadProgress(account.Email, server.Name)
-	uploadErr := r.uploadServerAccount(ctx, server, account)
+	uploadErr := r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider: accounts.ProviderCodex,
+		Codex:    &account,
+	})
 	stopProgress()
 	if uploadErr != nil {
 		return uploadErr
@@ -1399,221 +1744,6 @@ func writerIsTerminal(w io.Writer) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
-}
-
-// serverTenantID resolves the tenant directory name for a tenant-scoped server
-// entry by asking the server's tenant-authenticated whoami endpoint. Empty for
-// legacy single-tenant entries.
-func (r srRunner) serverTenantID(ctx context.Context, server srServerConfig) (string, error) {
-	if strings.TrimSpace(server.TenantKey) == "" {
-		return "", nil
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/whoami", nil)
-	if err != nil {
-		return "", err
-	}
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	res, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", fmt.Errorf("resolve tenant for server %s failed: %s", server.Name, res.Status)
-	}
-	var payload struct {
-		TenantID string `json:"tenant_id"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(payload.TenantID) == "" {
-		return "", fmt.Errorf("server %s returned no tenant id", server.Name)
-	}
-	return payload.TenantID, nil
-}
-
-// serverStateSubdir is the archive/remote path prefix under the server state
-// dir: empty for legacy entries, tenants/<id> for tenant-scoped entries.
-func (r srRunner) serverStateSubdir(ctx context.Context, server srServerConfig) (string, error) {
-	tenantID, err := r.serverTenantID(ctx, server)
-	if err != nil {
-		return "", err
-	}
-	if tenantID == "" {
-		return "", nil
-	}
-	return "tenants/" + tenantID, nil
-}
-
-func remoteStatePath(subdir, rest string) string {
-	base := "/var/lib/subrouter"
-	if subdir != "" {
-		base += "/" + subdir
-	}
-	if rest != "" {
-		base += "/" + rest
-	}
-	return base
-}
-
-func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {
-	stateSubdir, err := r.serverStateSubdir(ctx, server)
-	if err != nil {
-		return err
-	}
-	tmpDir, err := os.MkdirTemp("", "sr-server-auth-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpDir)
-	relPath := filepath.Join(stateSubdir, "codex", "accounts", codexAccountFilename(account.Email))
-	body, err := json.MarshalIndent(account, "", "  ")
-	if err != nil {
-		return err
-	}
-	var archive bytes.Buffer
-	gz := gzip.NewWriter(&archive)
-	tw := tar.NewWriter(gz)
-	if err := tw.WriteHeader(&tar.Header{Name: relPath, Mode: 0o600, Size: int64(len(body))}); err != nil {
-		return err
-	}
-	if _, err := tw.Write(body); err != nil {
-		return err
-	}
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		return err
-	}
-	archivePath := filepath.Join(tmpDir, "codex-account.tgz")
-	if err := os.WriteFile(archivePath, archive.Bytes(), 0o600); err != nil {
-		return err
-	}
-
-	if host := sshHostForServer(server); host != "" {
-		if err := r.uploadServerAccountSSH(ctx, server, host, stateSubdir, archive.Bytes()); err == nil {
-			return nil
-		} else if server.GCPInstance == "" || server.GCPZone == "" {
-			return err
-		} else {
-			if r.errOut != nil {
-				fmt.Fprintf(r.errOut, "direct server upload failed, falling back to gcloud: %v\n", err)
-			}
-		}
-	}
-
-	if server.GCPInstance == "" || server.GCPZone == "" {
-		return fmt.Errorf("server %s has no GCP target", server.Name)
-	}
-	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
-	scpArgs := []string{"compute", "scp", archivePath, server.GCPInstance + ":" + remotePath, "--zone", server.GCPZone}
-	if server.GCPProject != "" {
-		scpArgs = append(scpArgs, "--project", server.GCPProject)
-	}
-	if err := r.commandRunner().Run(ctx, "gcloud", scpArgs, nil, r.out, r.errOut); err != nil {
-		return fmt.Errorf("upload account archive: %w", err)
-	}
-	remoteCommand := strings.Join([]string{
-		"set -euo pipefail",
-		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
-		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
-		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
-		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
-		"sudo chown -R \"$sr_owner:$sr_group\" " + shellQuote(remoteStatePath(stateSubdir, "codex")),
-		"sudo rm -f " + shellQuote(remotePath),
-		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
-	}, " && ")
-	sshArgs := []string{"compute", "ssh", server.GCPInstance, "--zone", server.GCPZone, "--command", remoteCommand}
-	if server.GCPProject != "" {
-		sshArgs = append(sshArgs, "--project", server.GCPProject)
-	}
-	if err := r.commandRunner().Run(ctx, "gcloud", sshArgs, nil, r.out, r.errOut); err != nil {
-		return fmt.Errorf("install account on server: %w", err)
-	}
-	return nil
-}
-
-func (r srRunner) uploadServerAccountSSH(ctx context.Context, server srServerConfig, host, stateSubdir string, archive []byte) error {
-	remotePath := fmt.Sprintf("/tmp/sr-server-auth-%d.tgz", time.Now().UnixNano())
-	remoteCommand := strings.Join([]string{
-		"set -euo pipefail",
-		"cat > " + shellQuote(remotePath),
-		"sr_owner=subrouter; sr_group=subrouter; if [ -e /var/lib/subrouter ]; then sr_owner=$(stat -f '%Su' /var/lib/subrouter 2>/dev/null || stat -c '%U' /var/lib/subrouter); sr_group=$(stat -f '%Sg' /var/lib/subrouter 2>/dev/null || stat -c '%G' /var/lib/subrouter); elif id -u _subrouter >/dev/null 2>&1; then sr_owner=_subrouter; sr_group=_subrouter; fi",
-		"reload_status=$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:31415/_subrouter/reload-accounts || true)",
-		"if [ \"$reload_status\" != \"405\" ]; then echo " + shellQuote("Subrouter server is too old for hot account reload; run sr server install "+server.Name+" first.") + " >&2; exit 1; fi",
-		"sudo install -d -o \"$sr_owner\" -g \"$sr_group\" -m 0750 " + shellQuote(remoteStatePath(stateSubdir, "codex/accounts")),
-		"sudo tar -C /var/lib/subrouter -xzf " + shellQuote(remotePath),
-		"sudo find " + shellQuote(remoteStatePath(stateSubdir, "codex")) + " -name '._*' -delete",
-		"sudo chown -R \"$sr_owner:$sr_group\" " + shellQuote(remoteStatePath(stateSubdir, "codex")),
-		"sudo rm -f " + shellQuote(remotePath),
-		"curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts >/dev/null",
-	}, " && ")
-	args := []string{
-		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=15",
-		"-o", "LogLevel=ERROR",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		host,
-		remoteCommand,
-	}
-	uploadCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		if err := r.commandRunner().Run(uploadCtx, "ssh", args, bytes.NewReader(archive), r.out, r.errOut); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		if attempt < 3 {
-			if r.errOut != nil {
-				fmt.Fprintf(r.errOut, "server ssh upload failed, retrying (%d/3): %v\n", attempt, lastErr)
-			}
-			timer := time.NewTimer(time.Duration(attempt) * time.Second)
-			select {
-			case <-uploadCtx.Done():
-				timer.Stop()
-				return fmt.Errorf("install account on server over ssh: %w", uploadCtx.Err())
-			case <-timer.C:
-			}
-		}
-	}
-	if lastErr != nil {
-		return fmt.Errorf("install account on server over ssh: %w", lastErr)
-	}
-	return nil
-}
-
-func sshHostForServer(server srServerConfig) string {
-	parsed, err := url.Parse(server.URL)
-	if err != nil {
-		return ""
-	}
-	host := strings.TrimSpace(parsed.Hostname())
-	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
-		return ""
-	}
-	return host
-}
-
-func codexAccountFilename(email string) string {
-	var b strings.Builder
-	for _, r := range email {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '@' || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	return b.String() + ".json"
 }
 
 func shellQuote(value string) string {

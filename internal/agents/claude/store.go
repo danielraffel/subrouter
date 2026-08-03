@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
@@ -56,6 +57,11 @@ var reservedNames = map[string]bool{
 
 type Store struct {
 	Dir string
+	// SharedStateDir is the user's ordinary Claude Code state directory.
+	// Local credential profiles link high-growth history directories here so
+	// Subrouter does not duplicate trajectories once per profile. Server-side
+	// stores leave it empty because they never launch Claude Code.
+	SharedStateDir string
 }
 
 type Profile struct {
@@ -120,7 +126,12 @@ type ProfileInfo struct {
 }
 
 func DefaultStore() Store {
-	return Store{Dir: storepath.CodexDir()}
+	home, _ := os.UserHomeDir()
+	shared := ""
+	if home != "" {
+		shared = filepath.Join(home, ".claude")
+	}
+	return Store{Dir: storepath.CodexDir(), SharedStateDir: shared}
 }
 
 func (s Store) ProfilesPath() string {
@@ -135,32 +146,248 @@ func (s Store) InstancePath(name string) string {
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	dir := sanitizeName(name)
-	if ok && profile.Dir != "" {
+	if ok && safeProfileDir(profile.Dir) {
 		dir = profile.Dir
 	}
 	return filepath.Join(s.InstancesDir(), dir)
 }
 
 func (s Store) ClaudeConfigDir(name string) string {
-	return s.PreferredInstancePath(s.InstancePath(name))
+	path := s.PreferredInstancePath(s.InstancePath(name))
+	if err := s.prepareSharedState(path); err != nil {
+		slog.Warn("Claude shared history setup failed", "profile", name, "error", err)
+	}
+	return path
 }
 
 func (s Store) PreferredInstancePath(instancePath string) string {
-	cleanDir := filepath.Clean(s.Dir)
 	cleanInstance := filepath.Clean(instancePath)
-	if filepath.Base(cleanDir) != "codex" || filepath.Base(filepath.Dir(cleanDir)) != ".subrouter" {
+	candidate, ok := s.legacyInstancePath(cleanInstance)
+	if !ok {
 		return cleanInstance
 	}
-	rel, err := filepath.Rel(cleanDir, cleanInstance)
-	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." {
-		return cleanInstance
-	}
-	home := filepath.Dir(filepath.Dir(cleanDir))
-	candidate := filepath.Join(home, ".codex-accounts", rel)
 	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
 		return candidate
 	}
 	return cleanInstance
+}
+
+func (s Store) legacyInstancePath(instancePath string) (string, bool) {
+	cleanDir := filepath.Clean(s.Dir)
+	cleanInstance := filepath.Clean(instancePath)
+	if filepath.Base(cleanDir) != "codex" || filepath.Base(filepath.Dir(cleanDir)) != ".subrouter" {
+		return "", false
+	}
+	rel, err := filepath.Rel(cleanDir, cleanInstance)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." {
+		return "", false
+	}
+	home := filepath.Dir(filepath.Dir(cleanDir))
+	return filepath.Join(home, ".codex-accounts", rel), true
+}
+
+func (s Store) profileInstancePaths(dir string) ([]string, error) {
+	if !safeProfileDir(dir) {
+		return nil, errors.New("Claude profile directory is invalid")
+	}
+	canonicalRoot := filepath.Clean(s.InstancesDir())
+	roots := []string{canonicalRoot}
+	if legacyRoot, ok := s.legacyInstancePath(canonicalRoot); ok {
+		roots = append(roots, legacyRoot)
+	}
+	unique := make(map[string]string, len(roots))
+	for _, root := range roots {
+		candidate := filepath.Join(root, dir)
+		if !profileInstancePathWithinRoot(root, candidate) {
+			return nil, errors.New("Claude profile directory escapes its instance root")
+		}
+		candidate = filepath.Clean(candidate)
+		key := candidate
+		if _, exists := unique[key]; !exists {
+			unique[key] = candidate
+		}
+	}
+	paths := make([]string, 0, len(unique))
+	for _, candidate := range unique {
+		paths = append(paths, candidate)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func profileInstancePathWithinRoot(root, path string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && safeProfileDir(relative)
+}
+
+func profileInstancePathKey(path string) string {
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		return filepath.Join(resolvedParent, filepath.Base(path))
+	}
+	return path
+}
+
+func lockProfileCredentialPaths(
+	ctx context.Context,
+	paths []string,
+) (locks []*profileCredentialLock, err error) {
+	keyedPaths := make(map[string]string, len(paths))
+	for _, path := range paths {
+		key := profileInstancePathKey(path)
+		if _, exists := keyedPaths[key]; !exists {
+			keyedPaths[key] = path
+		}
+	}
+	keys := make([]string, 0, len(keyedPaths))
+	for key := range keyedPaths {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		path := keyedPaths[key]
+		lock, lockErr := lockProfileCredential(ctx, path)
+		if lockErr != nil {
+			_ = closeProfileCredentialLocks(locks)
+			return nil, lockErr
+		}
+		locks = append(locks, lock)
+	}
+	return locks, nil
+}
+
+func closeProfileCredentialLocks(locks []*profileCredentialLock) error {
+	var closeErr error
+	for index := len(locks) - 1; index >= 0; index-- {
+		closeErr = errors.Join(closeErr, locks[index].Close())
+	}
+	return closeErr
+}
+
+type stagedProfileInstance struct {
+	originalPath string
+	stagedPath   string
+	stagingRoot  string
+}
+
+func stageProfileInstancePaths(paths []string) ([]stagedProfileInstance, error) {
+	staged := make([]stagedProfileInstance, 0, len(paths))
+	for _, path := range paths {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return nil, errors.Join(err, rollbackStagedProfileInstances(staged))
+		}
+		stagingRoot, err := os.MkdirTemp(
+			filepath.Dir(path),
+			"."+filepath.Base(path)+".remove-*",
+		)
+		if err != nil {
+			return nil, errors.Join(err, rollbackStagedProfileInstances(staged))
+		}
+		entry := stagedProfileInstance{
+			originalPath: path,
+			stagedPath:   filepath.Join(stagingRoot, "instance"),
+			stagingRoot:  stagingRoot,
+		}
+		if err := os.Rename(entry.originalPath, entry.stagedPath); err != nil {
+			_ = os.Remove(stagingRoot)
+			return nil, errors.Join(err, rollbackStagedProfileInstances(staged))
+		}
+		staged = append(staged, entry)
+	}
+	return staged, nil
+}
+
+func rollbackStagedProfileInstances(staged []stagedProfileInstance) error {
+	var rollbackErr error
+	for index := len(staged) - 1; index >= 0; index-- {
+		entry := staged[index]
+		if err := os.Rename(entry.stagedPath, entry.originalPath); err != nil {
+			rollbackErr = errors.Join(rollbackErr, err)
+			continue
+		}
+		rollbackErr = errors.Join(rollbackErr, os.Remove(entry.stagingRoot))
+	}
+	return rollbackErr
+}
+
+func deleteStagedProfileInstances(
+	staged []stagedProfileInstance,
+) error {
+	var cleanupErr error
+	for _, entry := range staged {
+		cleanupErr = errors.Join(cleanupErr, os.RemoveAll(entry.stagingRoot))
+	}
+	return cleanupErr
+}
+
+type profileCredentialBackup struct {
+	path       string
+	credential CredentialInfo
+}
+
+func (s Store) profileCredentialBackups(
+	ctx context.Context,
+	instancePaths []string,
+) ([]profileCredentialBackup, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, nil
+	}
+	backups := make([]profileCredentialBackup, 0, len(instancePaths))
+	for _, path := range instancePaths {
+		credential, err := s.readCredential(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if credential != nil {
+			backups = append(backups, profileCredentialBackup{
+				path:       path,
+				credential: *credential,
+			})
+		}
+	}
+	return backups, nil
+}
+
+func deleteProfileKeychainCredentials(instancePaths []string) error {
+	for _, instancePath := range instancePaths {
+		if err := deleteKeychainCredential(instancePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cloneProfilesFile(data profilesFile) profilesFile {
+	cloned := profilesFile{
+		Active:   data.Active,
+		Profiles: make(map[string]Profile, len(data.Profiles)),
+	}
+	for name, profile := range data.Profiles {
+		cloned.Profiles[name] = profile
+	}
+	return cloned
+}
+
+func (s Store) rollbackProfileRemoval(
+	ctx context.Context,
+	original profilesFile,
+	staged []stagedProfileInstance,
+	backups []profileCredentialBackup,
+) error {
+	if err := rollbackStagedProfileInstances(staged); err != nil {
+		return err
+	}
+	for _, backup := range backups {
+		if err := s.writeCredential(ctx, backup.path, backup.credential); err != nil {
+			return err
+		}
+	}
+	return s.writeProfiles(original)
 }
 
 func (s Store) ListProfiles() []Profile {
@@ -235,6 +462,11 @@ func (s Store) ActiveProfile() string {
 }
 
 func (s Store) SetActiveProfile(name string) error {
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	if !ok {
@@ -250,15 +482,20 @@ func (s Store) CreateProfile(name string) (string, error) {
 	if err := ValidateProfileName(name); err != nil {
 		return "", err
 	}
-	if _, ok := s.FindProfile(name); ok {
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return "", err
+	}
+	defer lock.Close()
+	data := s.readProfiles()
+	if _, ok := data.Profiles[name]; ok {
 		return "", fmt.Errorf("profile %q already exists", name)
 	}
 	dir := sanitizeName(name)
-	instancePath := filepath.Join(s.InstancesDir(), dir)
+	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	if err := s.initInstanceDir(instancePath); err != nil {
 		return "", err
 	}
-	data := s.readProfiles()
 	data.Profiles[name] = Profile{
 		Name:      name,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -272,7 +509,7 @@ func (s Store) CreateProfile(name string) (string, error) {
 
 func (s Store) CreateTempInstance() (string, string, error) {
 	dir := fmt.Sprintf("_p%d", time.Now().UnixMilli())
-	instancePath := filepath.Join(s.InstancesDir(), dir)
+	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	return instancePath, dir, s.initInstanceDir(instancePath)
 }
 
@@ -280,6 +517,14 @@ func (s Store) RegisterProfile(name, dir string) error {
 	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return err
 	}
+	if !safeProfileDir(dir) {
+		return errors.New("Claude profile directory is invalid")
+	}
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	if ok {
@@ -299,11 +544,128 @@ func (s Store) RegisterProfile(name, dir string) error {
 	return s.writeProfiles(data)
 }
 
-func (s Store) RemoveProfile(name string) (bool, error) {
+// ImportProfileCredential installs one server-owned OAuth credential without
+// copying a client-side profile directory. The server derives the directory,
+// writes the secret atomically, then publishes the profile in the registry.
+func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (err error) {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
+		return err
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
+		return errors.New("Claude OAuth access and refresh tokens are required")
+	}
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	data := s.readProfiles()
+	dir := importedProfileDir(name)
+	profile, exists := data.Profiles[name]
+	if exists {
+		if profile.Dir != "" {
+			dir = profile.Dir
+		} else {
+			// Preserve the legacy implicit directory for registries written before
+			// every profile carried an explicit Dir field.
+			dir = sanitizeName(name)
+		}
+	}
+	if !safeProfileDir(dir) {
+		return errors.New("Claude profile directory is invalid")
+	}
+	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
+	if err := os.MkdirAll(instancePath, 0o700); err != nil {
+		return err
+	}
+	instancePaths, err := s.profileInstancePaths(dir)
+	if err != nil {
+		return err
+	}
+	credentialLocks, err := lockProfileCredentialPaths(context.Background(), instancePaths)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); err == nil {
+			err = closeErr
+		}
+	}()
+	body, err := credentialPayload(credential)
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomic(filepath.Join(instancePath, ".credentials.json"), body); err != nil {
+		return err
+	}
+	for _, path := range instancePaths {
+		if err := deleteKeychainCredential(path); err != nil {
+			return err
+		}
+		if profileInstancePathKey(path) == profileInstancePathKey(instancePath) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(path, ".credentials.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if !exists {
+		profile = Profile{Name: name, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	}
+	profile.Dir = dir
+	profile.LastUsed = time.Now().UTC().Format(time.RFC3339)
+	data.Profiles[name] = profile
+	if data.Active == "" {
+		data.Active = name
+	}
+	return s.writeProfiles(data)
+}
+
+func (s Store) RemoveProfile(name string) (removed bool, err error) {
+	lock, err := lockProfileRegistry(s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	data := s.readProfiles()
 	profile, ok := data.Profiles[name]
 	if !ok {
 		return false, nil
+	}
+	dir := profile.Dir
+	if dir == "" {
+		dir = sanitizeName(name)
+	}
+	instancePaths, err := s.profileInstancePaths(dir)
+	if err != nil {
+		return false, err
+	}
+	original := cloneProfilesFile(data)
+	ctx := context.Background()
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); err == nil {
+			err = closeErr
+		}
+	}()
+	credentialBackups, err := s.profileCredentialBackups(ctx, instancePaths)
+	if err != nil {
+		return false, err
+	}
+	staged, err := stageProfileInstancePaths(instancePaths)
+	if err != nil {
+		return false, err
 	}
 	delete(data.Profiles, name)
 	if data.Active == name {
@@ -314,14 +676,27 @@ func (s Store) RemoveProfile(name string) (bool, error) {
 		}
 	}
 	if err := s.writeProfiles(data); err != nil {
-		return false, err
+		return false, errors.Join(err, rollbackStagedProfileInstances(staged))
 	}
-	dir := profile.Dir
-	if dir == "" {
-		dir = sanitizeName(name)
+	if err := deleteProfileKeychainCredentials(instancePaths); err != nil {
+		rollbackErr := s.rollbackProfileRemoval(ctx, original, staged, credentialBackups)
+		if rollbackErr == nil {
+			return false, err
+		}
+		slog.Error(
+			"Claude profile removal cleanup failed and rollback was incomplete; profile remains removed",
+			"profile", name,
+			"cleanup_error", err,
+			"rollback_error", rollbackErr,
+		)
+		return true, nil
 	}
-	if err := os.RemoveAll(filepath.Join(s.InstancesDir(), dir)); err != nil {
-		return false, err
+	if err := deleteStagedProfileInstances(staged); err != nil {
+		slog.Warn(
+			"Claude profile removed with staged credential cleanup pending",
+			"profile", name,
+			"error", err,
+		)
 	}
 	return true, nil
 }
@@ -330,11 +705,28 @@ func (s Store) CleanupInstance(dir string) error {
 	if dir == "" {
 		return nil
 	}
-	return os.RemoveAll(filepath.Join(s.InstancesDir(), dir))
+	instancePaths, err := s.profileInstancePaths(dir)
+	if err != nil {
+		return err
+	}
+	credentialLocks, err := lockProfileCredentialPaths(context.Background(), instancePaths)
+	if err != nil {
+		return err
+	}
+	defer closeProfileCredentialLocks(credentialLocks)
+	for _, instancePath := range instancePaths {
+		if err := deleteKeychainCredential(instancePath); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(instancePath); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s Store) readProfiles() profilesFile {
-	body, err := os.ReadFile(s.ProfilesPath())
+	body, err := readFileForAtomicReplace(s.ProfilesPath())
 	if err != nil {
 		return profilesFile{Profiles: map[string]Profile{}}
 	}
@@ -360,19 +752,179 @@ func (s Store) writeProfiles(data profilesFile) error {
 		return err
 	}
 	body = append(body, '\n')
-	return os.WriteFile(s.ProfilesPath(), body, 0o600)
+	return writePrivateFileAtomic(s.ProfilesPath(), body)
+}
+
+func safeProfileDir(dir string) bool {
+	return dir != "" &&
+		dir != "." &&
+		!filepath.IsAbs(dir) &&
+		filepath.VolumeName(dir) == "" &&
+		filepath.Clean(dir) == dir &&
+		filepath.Base(dir) == dir
+}
+
+func writePrivateFileAtomic(path string, body []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 func (s Store) initInstanceDir(instancePath string) error {
 	if err := os.MkdirAll(instancePath, 0o700); err != nil {
 		return err
 	}
-	for _, name := range []string{"session-env", "todos", "logs", "file-history", "shell-snapshots", "debug", ".anthropic"} {
+	for _, name := range []string{".anthropic"} {
 		if err := os.MkdirAll(filepath.Join(instancePath, name), 0o700); err != nil {
 			return err
 		}
 	}
+	if err := s.prepareSharedState(instancePath); err != nil {
+		return err
+	}
+	if strings.TrimSpace(s.SharedStateDir) == "" {
+		for _, name := range claudeHighGrowthDirs {
+			if err := os.MkdirAll(filepath.Join(instancePath, name), 0o700); err != nil {
+				return err
+			}
+		}
+	}
 	return s.syncMCPServers(instancePath)
+}
+
+var claudeHighGrowthDirs = []string{
+	"projects",
+	"file-history",
+	"session-env",
+	"todos",
+	"logs",
+	"shell-snapshots",
+	"debug",
+}
+
+func (s Store) prepareSharedState(instancePath string) error {
+	if strings.TrimSpace(s.SharedStateDir) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(s.SharedStateDir, 0o700); err != nil {
+		return err
+	}
+	for _, name := range claudeHighGrowthDirs {
+		source := filepath.Join(instancePath, name)
+		target := filepath.Join(s.SharedStateDir, name)
+		if err := migrateDirectoryToShared(source, target); err != nil {
+			return fmt.Errorf("share %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func migrateDirectoryToShared(source, target string) error {
+	if info, err := os.Lstat(source); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		current, readErr := os.Readlink(source)
+		if readErr != nil {
+			return readErr
+		}
+		currentPath := current
+		if !filepath.IsAbs(currentPath) {
+			currentPath = filepath.Join(filepath.Dir(source), currentPath)
+		}
+		currentAbs, _ := filepath.Abs(currentPath)
+		targetAbs, _ := filepath.Abs(target)
+		if currentAbs == targetAbs {
+			return os.MkdirAll(target, 0o700)
+		}
+		return fmt.Errorf("existing symlink points to %s", current)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Stat(source); err == nil {
+		if !info.IsDir() {
+			return errors.New("existing profile state is not a directory")
+		}
+		if err := mergeDirectoryPreservingConflicts(source, target); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(source); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Symlink(target, source)
+}
+
+func mergeDirectoryPreservingConflicts(source, target string) error {
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == source {
+			return nil
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		destination := filepath.Join(target, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(destination, 0o700)
+		}
+		if _, err := os.Lstat(destination); errors.Is(err, os.ErrNotExist) {
+			if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+				return err
+			}
+			return os.Rename(path, destination)
+		} else if err != nil {
+			return err
+		}
+		destination = availableLegacyPath(destination)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+			return err
+		}
+		return os.Rename(path, destination)
+	})
+}
+
+func availableLegacyPath(path string) string {
+	for index := 1; ; index++ {
+		candidate := fmt.Sprintf("%s.subrouter-legacy-%d", path, index)
+		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate
+		}
+	}
 }
 
 func (s Store) syncMCPServers(instancePath string) error {
@@ -429,6 +981,11 @@ func ValidateProfileName(name string) error {
 }
 
 func ValidateProfileNameAllowEmail(name string) error {
+	for _, char := range name {
+		if unicode.IsControl(char) || unicode.In(char, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return errors.New("profile name contains terminal control characters")
+		}
+	}
 	if strings.Contains(name, "@") {
 		if name[0] == '@' || strings.HasSuffix(name, "@") {
 			return errors.New("invalid email profile name")
@@ -467,6 +1024,18 @@ func sanitizeName(name string) string {
 	return strings.ToLower(b.String())
 }
 
+func importedProfileDir(name string) string {
+	base := strings.Trim(sanitizeName(name), "-")
+	if base == "" {
+		base = "profile"
+	}
+	if len(base) > 80 {
+		base = base[:80]
+	}
+	digest := sha256.Sum256([]byte(name))
+	return base + "-" + hex.EncodeToString(digest[:8])
+}
+
 func DetectCLI() (string, bool) {
 	path, err := exec.LookPath("claude")
 	return path, err == nil && path != ""
@@ -498,7 +1067,20 @@ func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*A
 	return &status, nil
 }
 
-func (s Store) ReadCredential(ctx context.Context, instancePath string) (*CredentialInfo, error) {
+func (s Store) ReadCredential(ctx context.Context, instancePath string) (credential *CredentialInfo, err error) {
+	lock, err := lockProfileCredential(ctx, instancePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	return s.readCredential(ctx, instancePath)
+}
+
+func (s Store) readCredential(ctx context.Context, instancePath string) (*CredentialInfo, error) {
 	if credential, ok := readCredentialFile(instancePath); ok {
 		return credential, nil
 	}
@@ -521,27 +1103,100 @@ func (s Store) ReadCredential(ctx context.Context, instancePath string) (*Creden
 }
 
 func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
+	return s.refreshProfileCredential(ctx, client, profile, false)
+}
+
+func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
+	return s.refreshProfileCredential(ctx, client, profile, true)
+}
+
+func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, didRefresh bool, err error) {
 	configDir := s.ClaudeConfigDir(profile.Name)
-	credential, err := s.ReadCredential(ctx, configDir)
+	lock, err := lockProfileCredential(ctx, configDir)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	current, ok := s.FindProfile(profile.Name)
+	if !ok || profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
+		return accounts.Account{}, false, errors.Join(
+			fmt.Errorf("Claude profile %q is no longer current", profile.Name),
+			lock.Close(),
+		)
+	}
+	profile = current
+	credential, err := s.readCredential(ctx, configDir)
+	if err != nil {
+		return accounts.Account{}, false, errors.Join(err, lock.Close())
+	}
+	if credential == nil || credential.AccessToken == "" {
+		return accounts.Account{}, false, errors.Join(
+			fmt.Errorf("Claude profile %q has no access token", profile.Name),
+			lock.Close(),
+		)
+	}
+	if force && credential.RefreshToken == "" {
+		return accounts.Account{}, false, errors.Join(
+			fmt.Errorf("Claude profile %q has no refresh token", profile.Name),
+			lock.Close(),
+		)
+	}
+	shouldRefresh := credential.RefreshToken != "" &&
+		(force || credentialExpired(credential, 60*time.Second))
+	if !shouldRefresh {
+		account, ok = profileAccount(profile, configDir, credential)
+		if !ok {
+			return accounts.Account{}, false, errors.Join(
+				fmt.Errorf("Claude profile %q has no usable credential", profile.Name),
+				lock.Close(),
+			)
+		}
+		if err := lock.Close(); err != nil {
+			return accounts.Account{}, false, err
+		}
+		return account, false, nil
+	}
+
+	credentialBeforeRefresh := *credential
+	profileBeforeRefresh := profile
+	if err := lock.Close(); err != nil {
+		return accounts.Account{}, false, err
+	}
+	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	didRefresh = true
+
+	lock, err = lockProfileCredential(ctx, configDir)
+	if err != nil {
+		return accounts.Account{}, false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	current, ok = s.FindProfile(profile.Name)
+	if !ok ||
+		current.CreatedAt != profileBeforeRefresh.CreatedAt ||
+		profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+	}
+	profile = current
+	credential, err = s.readCredential(ctx, configDir)
 	if err != nil {
 		return accounts.Account{}, false, err
 	}
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
-	didRefresh := false
-	if credential.RefreshToken != "" && credentialExpired(credential, 60*time.Second) {
-		refreshed, err := RefreshCredential(ctx, client, *credential)
-		if err != nil {
-			return accounts.Account{}, false, err
-		}
+	if *credential == credentialBeforeRefresh {
 		credential = &refreshed
-		if err := s.WriteCredential(ctx, configDir, *credential); err != nil {
+		if err := s.writeCredential(ctx, configDir, *credential); err != nil {
 			return accounts.Account{}, false, err
 		}
-		didRefresh = true
 	}
-	account, ok := profileAccount(profile, configDir, credential)
+	account, ok = profileAccount(profile, configDir, credential)
 	if !ok {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 	}
@@ -556,14 +1211,27 @@ func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client,
 	return s.RefreshCredentialIfExpired(ctx, client, profile)
 }
 
-func (s Store) WriteCredential(ctx context.Context, instancePath string, credential CredentialInfo) error {
+func (s Store) WriteCredential(ctx context.Context, instancePath string, credential CredentialInfo) (err error) {
+	lock, err := lockProfileCredential(ctx, instancePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	return s.writeCredential(ctx, instancePath, credential)
+}
+
+func (s Store) writeCredential(ctx context.Context, instancePath string, credential CredentialInfo) error {
 	body, err := credentialPayload(credential)
 	if err != nil {
 		return err
 	}
 	filePath := filepath.Join(instancePath, ".credentials.json")
 	if _, err := os.Stat(filePath); err == nil {
-		return os.WriteFile(filePath, body, 0o600)
+		return writePrivateFileAtomic(filePath, body)
 	}
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("Claude credential persistence is only supported for .credentials.json files on %s", runtime.GOOS)
@@ -580,6 +1248,63 @@ func (s Store) WriteCredential(ctx context.Context, instancePath string, credent
 		return fmt.Errorf("write Claude credential to keychain: %w", err)
 	}
 	return nil
+}
+
+// UpsertCredentialProfile stores one remotely managed Claude credential
+// without invoking Claude Code. Server-side tenant pools use file-backed
+// credentials so systemd services never depend on a login keychain.
+func (s Store) UpsertCredentialProfile(name string, credential CredentialInfo) (Profile, error) {
+	name = strings.TrimSpace(name)
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
+		return Profile{}, err
+	}
+	dir := sanitizeName(name)
+	if dir == "" {
+		return Profile{}, errors.New("invalid Claude profile name")
+	}
+	instancePath := filepath.Join(s.InstancesDir(), dir)
+	if err := s.initInstanceDir(instancePath); err != nil {
+		return Profile{}, err
+	}
+	body, err := credentialPayload(credential)
+	if err != nil {
+		return Profile{}, err
+	}
+	if err := writePrivateFileAtomic(filepath.Join(instancePath, ".credentials.json"), body); err != nil {
+		return Profile{}, err
+	}
+	if err := s.RegisterProfile(name, dir); err != nil {
+		return Profile{}, err
+	}
+	profile, ok := s.FindProfile(name)
+	if !ok {
+		return Profile{}, fmt.Errorf("Claude profile %q was not readable after registration", name)
+	}
+	return profile, nil
+}
+
+func deleteKeychainCredential(instancePath string) error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return err
+	}
+	service := "Claude Code-credentials-" + keychainHash(instancePath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(
+		ctx,
+		"security",
+		"delete-generic-password",
+		"-s", service,
+		"-a", u.Username,
+	).CombinedOutput()
+	if err == nil || strings.Contains(strings.ToLower(string(output)), "could not be found") {
+		return nil
+	}
+	return fmt.Errorf("delete Claude credential from keychain: %w", err)
 }
 
 func readCredentialFile(instancePath string) (*CredentialInfo, bool) {

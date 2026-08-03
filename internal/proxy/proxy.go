@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -73,6 +74,10 @@ type Server struct {
 	StreamDrops *StreamDropStats
 	Lifecycle   *Lifecycle
 	AdminToken  string
+	// AccountImportToken authorizes only the protected account-import endpoint.
+	// It is intentionally distinct from AdminToken, which can read operational
+	// state and transcripts.
+	AccountImportToken string
 	// LocalProxyToken protects provider proxy routes in cloud mode. Health and
 	// readiness stay unauthenticated so supervisors can probe the daemon.
 	LocalProxyToken string
@@ -96,6 +101,10 @@ type Server struct {
 	// normal pool path, which keeps its own Bedrock/API-key fallback. Applies
 	// ONLY to Fable; other Claude models are unaffected.
 	FableBedrockPrimary bool
+	// tenantAccountImportAuthorized is set only on a server reached after the
+	// MultiTenant router has validated its tenant key. Global remote imports
+	// require a configured admin token instead.
+	tenantAccountImportAuthorized bool
 }
 
 type ActiveSessions struct {
@@ -188,11 +197,14 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu          sync.RWMutex
-	accounts    []accounts.Account
-	store       accounts.CodexStore
-	claudeStore agentclaude.Store
-	client      *http.Client
+	mu                sync.RWMutex
+	installMu         sync.Mutex
+	accounts          []accounts.Account
+	accountGeneration uint64
+	diskGeneration    string
+	store             accounts.CodexStore
+	claudeStore       agentclaude.Store
+	client            *http.Client
 
 	usageStatusMu    sync.Mutex
 	usageStatusCache []AccountUsageStatus
@@ -319,40 +331,127 @@ type AccountUsageStatus struct {
 }
 
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
-	return &AccountRef{
+	claudeStore := agentclaude.DefaultStore()
+	ref := &AccountRef{
 		accounts:    append([]accounts.Account(nil), initial...),
 		store:       store,
-		claudeStore: agentclaude.DefaultStore(),
+		claudeStore: claudeStore,
 		client:      client,
 	}
+	transactionLock, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
+	if err != nil {
+		return ref
+	}
+	defer transactionLock.Close()
+	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
+	if err != nil {
+		return ref
+	}
+	// A generation marker means an HTTP import has occurred. Reload while the
+	// transaction lock is held instead of pairing a caller's pre-lock snapshot
+	// with the post-import marker. Legacy stores without a marker retain the
+	// supplied snapshot for test and compatibility callers.
+	if diskGeneration != "" {
+		if loaded, loadErr := loadAccountRefAccounts(store, claudeStore); loadErr == nil {
+			ref.accounts = loaded
+			ref.diskGeneration = diskGeneration
+		}
+		return ref
+	}
+	ref.diskGeneration = diskGeneration
+	return ref
+}
+
+// OpenAccountRef loads accounts and their disk generation under the same
+// cross-process transaction lock. Production callers use this constructor so
+// worker startup can never make a stale snapshot look current.
+func OpenAccountRef(store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client) (*AccountRef, error) {
+	return OpenAccountRefContext(context.Background(), store, claudeStore, client)
+}
+
+// OpenAccountRefContext loads one account snapshot while honoring cancellation
+// if another process is currently committing an import transaction.
+func OpenAccountRefContext(ctx context.Context, store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client) (*AccountRef, error) {
+	transactionLock, err := lockAccountImportTransaction(ctx, store.StoreDir())
+	if err != nil {
+		return nil, err
+	}
+	defer transactionLock.Close()
+	loaded, err := loadAccountRefAccounts(store, claudeStore)
+	if err != nil {
+		return nil, err
+	}
+	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
+	if err != nil {
+		return nil, err
+	}
+	return &AccountRef{
+		accounts:       loaded,
+		diskGeneration: diskGeneration,
+		store:          store,
+		claudeStore:    claudeStore,
+		client:         client,
+	}, nil
+}
+
+func loadAccountRefAccounts(store accounts.CodexStore, claudeStore agentclaude.Store) ([]accounts.Account, error) {
+	loaded, err := store.List()
+	if err != nil {
+		return nil, err
+	}
+	claudeAccounts, err := claudeStore.ListAccounts(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return append(loaded, claudeAccounts...), nil
 }
 
 func (r *AccountRef) All() []accounts.Account {
+	accounts, _ := r.Snapshot()
+	return accounts
+}
+
+func (r *AccountRef) Snapshot() ([]accounts.Account, uint64) {
 	if r == nil {
-		return nil
+		return nil, 0
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return append([]accounts.Account(nil), r.accounts...)
+	return append([]accounts.Account(nil), r.accounts...), r.accountGeneration
+}
+
+func (r *AccountRef) Generation() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.accountGeneration
 }
 
 func (r *AccountRef) Reload() ([]accounts.Account, error) {
+	loaded, _, err := r.ReloadSnapshot()
+	return loaded, err
+}
+
+func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	if r == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
-	loaded, err := r.store.List()
+	loaded, err := loadAccountRefAccounts(r.store, r.claudeStore)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	claudeAccounts, err := r.claudeStore.ListAccounts(context.Background())
+	diskGeneration, err := readAccountDiskGeneration(r.store.StoreDir())
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	loaded = append(loaded, claudeAccounts...)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
-	return append([]accounts.Account(nil), loaded...), nil
+	r.accountGeneration++
+	r.diskGeneration = diskGeneration
+	return append([]accounts.Account(nil), loaded...), r.accountGeneration, nil
 }
 
 func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (accounts.Account, error) {
@@ -464,21 +563,19 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 			Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
 			AuthChecked: true,
 		}
-		account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+		var account accounts.Account
+		var didRefresh bool
+		var err error
+		if forceRefresh {
+			account, didRefresh, err = r.claudeStore.ForceRefreshCredential(ctx, r.client, profile)
+		} else {
+			account, didRefresh, err = r.claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+		}
 		if err != nil {
 			status.AuthValid = false
 			status.Error = err.Error()
 			out = append(out, status)
 			continue
-		}
-		if forceRefresh {
-			account, didRefresh, err = r.forceRefreshClaude(ctx, profile)
-			if err != nil {
-				status.AuthValid = false
-				status.Error = err.Error()
-				out = append(out, status)
-				continue
-			}
 		}
 		status.AuthValid = true
 		status.Refreshed = didRefresh
@@ -684,39 +781,6 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	wg.Wait()
 	promoteUsableClaudeStatus(out[claudeOffset:])
 	return out
-}
-
-func (r *AccountRef) forceRefreshClaude(ctx context.Context, profile agentclaude.Profile) (accounts.Account, bool, error) {
-	configDir := r.claudeStore.ClaudeConfigDir(profile.Name)
-	credential, err := r.claudeStore.ReadCredential(ctx, configDir)
-	if err != nil {
-		return accounts.Account{}, false, err
-	}
-	if credential == nil || credential.RefreshToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
-	}
-	refreshed, err := agentclaude.RefreshCredential(ctx, r.client, *credential)
-	if err != nil {
-		return accounts.Account{}, false, err
-	}
-	if err := r.claudeStore.WriteCredential(ctx, configDir, refreshed); err != nil {
-		return accounts.Account{}, false, err
-	}
-	return claudeAccountFromCredential(profile, configDir, &refreshed), true, nil
-}
-
-func claudeAccountFromCredential(profile agentclaude.Profile, configDir string, credential *agentclaude.CredentialInfo) accounts.Account {
-	addedAt, _ := time.Parse(time.RFC3339, profile.CreatedAt)
-	return accounts.Account{
-		ID:       profile.Name,
-		Provider: accounts.ProviderClaude,
-		AuthMode: accounts.AuthModeOAuth,
-		Label:    profile.Name,
-		Email:    claudeProfileEmail(profile.Name),
-		AddedAt:  addedAt,
-		Token:    credential.AccessToken,
-		Source:   configDir,
-	}
 }
 
 func claudeProfileEmail(name string) string {
@@ -941,6 +1005,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/rate-limit-reset", s.requireAdmin(s.handleRateLimitReset))
 	mux.HandleFunc("/_subrouter/reset-credits", s.requireAdmin(s.handleResetCredits))
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
+	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
@@ -1012,7 +1077,7 @@ func (s Server) lifecycleStatus(ok bool) map[string]any {
 	return status
 }
 
-func (s Server) handleAccounts(w http.ResponseWriter, _ *http.Request) {
+func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	type safeAccount struct {
 		ID       string            `json:"id"`
 		Provider accounts.Provider `json:"provider"`
@@ -1020,7 +1085,7 @@ func (s Server) handleAccounts(w http.ResponseWriter, _ *http.Request) {
 		Email    string            `json:"email,omitempty"`
 		Source   string            `json:"source"`
 	}
-	availableAccounts := s.accountList()
+	availableAccounts := s.accountListContext(r.Context())
 	out := make([]safeAccount, 0, len(availableAccounts))
 	for _, account := range availableAccounts {
 		out = append(out, safeAccount{
@@ -1044,7 +1109,7 @@ func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.AccountRef.Statuses(r.Context(), forceRefresh))
 		return
 	}
-	accounts := s.accountList()
+	accounts := s.accountListContext(r.Context())
 	out := make([]AccountStatus, 0, len(accounts))
 	for _, account := range accounts {
 		out = append(out, AccountStatus{
@@ -1065,11 +1130,11 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.AccountRef != nil {
 		statuses := s.AccountRef.UsageStatuses(r.Context())
-		s.updateSchedulerFromUsageStatuses(statuses)
+		s.updateSchedulerFromUsageStatusesContext(r.Context(), statuses)
 		writeJSON(w, s.withRequestTimeExhaustionWindows(statuses))
 		return
 	}
-	accounts := s.accountList()
+	accounts := s.accountListContext(r.Context())
 	out := make([]AccountUsageStatus, 0, len(accounts))
 	for _, account := range accounts {
 		out = append(out, AccountUsageStatus{
@@ -1086,10 +1151,15 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) {
+	s.updateSchedulerFromUsageStatusesContext(context.Background(), statuses)
+}
+
+func (s Server) updateSchedulerFromUsageStatusesContext(ctx context.Context, statuses []AccountUsageStatus) {
 	if s.SchedulerRef == nil {
 		return
 	}
-	available := oauthAccounts(s.accountList())
+	allAccounts, accountGeneration := s.accountListSnapshotContext(ctx)
+	available := oauthAccounts(allAccounts)
 	if len(available) == 0 {
 		return
 	}
@@ -1123,7 +1193,7 @@ func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) 
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
-	s.SchedulerRef.Set(scheduler)
+	s.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration)
 }
 
 func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
@@ -1197,14 +1267,339 @@ func (s Server) handleReloadAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
+const (
+	maxAccountImportBodyBytes int64 = 128 << 10
+	maxAccountImportAccounts        = 256
+)
+
+type accountImportRequest struct {
+	Provider accounts.Provider            `json:"provider"`
+	Codex    *accounts.StoredCodexAccount `json:"codex,omitempty"`
+	Claude   *claudeAccountImport         `json:"claude,omitempty"`
+}
+
+type claudeAccountImport struct {
+	Name       string                     `json:"name"`
+	Credential agentclaude.CredentialInfo `json:"credential"`
+}
+
+func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
+	if s.AccountRef == nil || s.CredentialBroker != nil {
+		http.Error(w, "account import is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]any{
+			"ok":        true,
+			"providers": []string{"codex", "claude", "kimi", "zai"},
+		})
+		return
+	case http.MethodPost:
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))); !strings.HasPrefix(contentType, "application/json") {
+		http.Error(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+		return
+	}
+	if r.ContentLength > maxAccountImportBodyBytes {
+		http.Error(w, "account import body is too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAccountImportBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "account import body is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var input accountImportRequest
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		return
+	}
+	if err := rejectTrailingJSON(decoder); err != nil {
+		http.Error(w, "invalid account import body", http.StatusBadRequest)
+		return
+	}
+
+	accountID, err := s.installImportedAccount(r.Context(), input)
+	if err != nil {
+		var validationErr *accountImportValidationError
+		if errors.As(err, &validationErr) {
+			http.Error(w, validationErr.Error(), http.StatusBadRequest)
+			return
+		}
+		var capacityErr *accountImportCapacityError
+		if errors.As(err, &capacityErr) {
+			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
+			return
+		}
+		var collisionErr *accounts.StorageKeyCollisionError
+		if errors.As(err, &collisionErr) {
+			http.Error(w, "account identifier conflicts with an existing account", http.StatusConflict)
+			return
+		}
+		if s.Logger != nil {
+			s.Logger.Error("account import failed", "provider", input.Provider, "error", err)
+		}
+		http.Error(w, "account import failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":       true,
+		"provider": input.Provider,
+		"account":  accountID,
+	})
+}
+
+type accountImportValidationError struct {
+	message string
+}
+
+func (e *accountImportValidationError) Error() string { return e.message }
+
+func invalidAccountImport(message string) error {
+	return &accountImportValidationError{message: message}
+}
+
+type accountImportCapacityError struct{}
+
+func (*accountImportCapacityError) Error() string {
+	return "account import pool has reached its capacity"
+}
+
+func rejectTrailingJSON(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
+	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
+		return "", err
+	}
+	defer s.AccountRef.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(ctx, s.AccountRef.store.StoreDir())
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if transactionLock != nil {
+			if closeErr := transactionLock.Close(); err == nil {
+				err = closeErr
+			}
+		}
+	}()
+	switch input.Provider {
+	case accounts.ProviderCodex, accounts.ProviderKimi, accounts.ProviderZAI:
+		if input.Codex == nil || input.Claude != nil {
+			return "", invalidAccountImport("exactly one matching account payload is required")
+		}
+		account, err := validateStoredAccountImport(input.Provider, *input.Codex)
+		if err != nil {
+			return "", err
+		}
+		canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+		if err != nil {
+			return "", err
+		}
+		account.Email = canonicalID
+		if err := s.AccountRef.store.SaveStored(account); err != nil {
+			return "", err
+		}
+		accountID = account.Email
+	case accounts.ProviderClaude:
+		if input.Claude != nil && input.Codex == nil {
+			name, credential, err := validateClaudeAccountImport(*input.Claude)
+			if err != nil {
+				return "", err
+			}
+			canonicalName, err := s.ensureAccountImportCapacity(name, true)
+			if err != nil {
+				return "", err
+			}
+			if err := s.AccountRef.claudeStore.ImportProfileCredential(canonicalName, credential); err != nil {
+				return "", err
+			}
+			accountID = canonicalName
+			break
+		}
+		if input.Codex == nil || input.Claude != nil {
+			return "", invalidAccountImport("exactly one matching account payload is required")
+		}
+		account, err := validateStoredAccountImport(input.Provider, *input.Codex)
+		if err != nil {
+			return "", err
+		}
+		canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+		if err != nil {
+			return "", err
+		}
+		account.Email = canonicalID
+		if err := s.AccountRef.store.SaveStored(account); err != nil {
+			return "", err
+		}
+		accountID = account.Email
+	default:
+		return "", invalidAccountImport("unsupported account provider")
+	}
+	// The marker represents a committed credential mutation. Publishing it
+	// before validation or persistence made rejected imports invalidate every
+	// worker's in-flight scoring despite changing no account state.
+	if err := advanceAccountDiskGeneration(s.AccountRef.store.StoreDir()); err != nil {
+		return "", err
+	}
+	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()
+	if err != nil {
+		return "", err
+	}
+	if s.SchedulerRef != nil {
+		s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+	}
+	if closeErr := transactionLock.Close(); closeErr != nil {
+		return "", closeErr
+	}
+	transactionLock = nil
+	if _, _, err := s.finishAccountReload(ctx, loaded, accountGeneration); err != nil {
+		return "", err
+	}
+	s.AccountRef.InvalidateUsageStatusCache()
+	return accountID, nil
+}
+
+func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool) (string, error) {
+	stored, err := s.AccountRef.store.ListStored()
+	if err != nil {
+		return "", err
+	}
+	profiles := s.AccountRef.claudeStore.ListProfiles()
+	if claudeProfile {
+		for _, profile := range profiles {
+			if strings.EqualFold(profile.Name, accountID) {
+				return profile.Name, nil
+			}
+		}
+	} else {
+		for _, account := range stored {
+			if strings.EqualFold(account.Email, accountID) {
+				return account.Email, nil
+			}
+		}
+	}
+	if len(stored)+len(profiles) >= maxAccountImportAccounts {
+		return "", &accountImportCapacityError{}
+	}
+	return accountID, nil
+}
+
+func validateStoredAccountImport(provider accounts.Provider, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {
+	account.Email = strings.TrimSpace(account.Email)
+	if account.Email == "" || strings.HasPrefix(account.Email, ".") || len(account.Email) > 320 || strings.ContainsAny(account.Email, "/\\") || containsTerminalControl(account.Email) {
+		return account, invalidAccountImport("account identifier is invalid")
+	}
+	account.Provider = provider
+	account.AddedAt = time.Now().UTC().Format(time.RFC3339)
+	account.Breadcrumbs = nil
+	account.Auth.RefreshFailure = nil
+	if account.IsAPIKey() {
+		if account.Auth.Tokens != nil || strings.TrimSpace(account.Auth.OpenAIAPIKey) == "" {
+			return account, invalidAccountImport("API-key account payload is invalid")
+		}
+		prefix := string(provider) + ":"
+		if provider == accounts.ProviderCodex {
+			prefix = "apikey:"
+		}
+		if !strings.HasPrefix(account.Email, prefix) || strings.TrimSpace(strings.TrimPrefix(account.Email, prefix)) == "" {
+			return account, invalidAccountImport("API-key account label does not match its provider")
+		}
+		if provider == accounts.ProviderCodex && !strings.HasPrefix(account.Auth.OpenAIAPIKey, "sk-") {
+			return account, invalidAccountImport("Codex API key format is invalid")
+		}
+		account.Auth.AuthMode = "apikey"
+		return account, nil
+	}
+	if provider != accounts.ProviderCodex || account.Auth.Tokens == nil || account.Auth.OpenAIAPIKey != "" {
+		return account, invalidAccountImport("OAuth account payload is invalid")
+	}
+	tokens := account.Auth.Tokens
+	if strings.TrimSpace(tokens.AccessToken) == "" || strings.TrimSpace(tokens.RefreshToken) == "" || strings.TrimSpace(tokens.IDToken) == "" {
+		return account, invalidAccountImport("OAuth account payload is incomplete")
+	}
+	email, err := accounts.ExtractEmailFromJWT(tokens.IDToken)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(email), account.Email) {
+		return account, invalidAccountImport("OAuth identity does not match the account identifier")
+	}
+	if expiresAt, ok := accounts.JWTExpiryMillis(tokens.AccessToken); !ok || expiresAt <= time.Now().UnixMilli() {
+		return account, invalidAccountImport("OAuth access token is not fresh")
+	}
+	account.Email = strings.TrimSpace(email)
+	return account, nil
+}
+
+func containsTerminalControl(value string) bool {
+	for _, char := range value {
+		if unicode.IsControl(char) || unicode.In(char, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateClaudeAccountImport(input claudeAccountImport) (string, agentclaude.CredentialInfo, error) {
+	name := strings.TrimSpace(input.Name)
+	if name == "" || len(name) > 320 || strings.ContainsAny(name, "\r\n\x00/\\") {
+		return "", input.Credential, invalidAccountImport("Claude profile name is invalid")
+	}
+	if err := agentclaude.ValidateProfileNameAllowEmail(name); err != nil {
+		return "", input.Credential, invalidAccountImport("Claude profile name is invalid")
+	}
+	if strings.TrimSpace(input.Credential.AccessToken) == "" || strings.TrimSpace(input.Credential.RefreshToken) == "" {
+		return "", input.Credential, invalidAccountImport("Claude OAuth payload is incomplete")
+	}
+	return name, input.Credential, nil
+}
+
+func (s Server) reloadAccounts(ctx context.Context) (accountCount int, scoredCount int, err error) {
 	if s.AccountRef == nil {
 		return 0, 0, fmt.Errorf("account reload is not configured")
 	}
-	loaded, err := s.AccountRef.Reload()
+	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
+		return 0, 0, err
+	}
+	defer s.AccountRef.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(ctx, s.AccountRef.store.StoreDir())
 	if err != nil {
 		return 0, 0, err
 	}
+	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()
+	if err != nil {
+		_ = transactionLock.Close()
+		return 0, 0, err
+	}
+	if s.SchedulerRef != nil {
+		s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+	}
+	if err := transactionLock.Close(); err != nil {
+		return 0, 0, err
+	}
+	return s.finishAccountReload(ctx, loaded, accountGeneration)
+}
+
+func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Account, accountGeneration uint64) (int, int, error) {
 	if s.SchedulerRef == nil {
 		return len(loaded), 0, nil
 	}
@@ -1216,7 +1611,11 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	if s.CredentialBroker != nil {
 		return len(loaded), 0, nil
 	}
-	scores, scored := s.scoreAccounts(ctx, loaded)
+	scoreAccounts := s.ScoreAccounts
+	if scoreAccounts == nil {
+		scoreAccounts = s.scoreAccounts
+	}
+	scores, scored := scoreAccounts(ctx, loaded)
 	if scored == 0 {
 		if s.Logger != nil {
 			s.Logger.Warn("account reload usage score update skipped", "reason", "no fresh OAuth usage scores")
@@ -1227,7 +1626,12 @@ func (s Server) reloadAccounts(ctx context.Context) (int, int, error) {
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
-	s.SchedulerRef.Set(scheduler)
+	if !s.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
+		if s.Logger != nil {
+			s.Logger.Debug("account reload usage score update discarded after a newer account reload")
+		}
+		return len(loaded), 0, nil
+	}
 	return len(loaded), scored, nil
 }
 
@@ -1705,25 +2109,53 @@ func (s Server) requireAdmin(next func(http.ResponseWriter, *http.Request)) http
 	}
 }
 
-func (s Server) authorizeAdmin(r *http.Request) bool {
-	if isLoopbackRemote(r.RemoteAddr) {
-		return true
+func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.tenantAccountImportAuthorized {
+			next(w, r)
+			return
+		}
+		if s.matchesConfiguredAccountImportToken(r) || s.matchesConfiguredAdminToken(r) {
+			next(w, r)
+			return
+		}
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
 	}
-	token := strings.TrimSpace(s.AdminToken)
+}
+
+func (s Server) matchesConfiguredAccountImportToken(r *http.Request) bool {
+	return matchesConfiguredBearerToken(r, s.AccountImportToken, "X-Subrouter-Account-Import-Token")
+}
+
+func (s Server) matchesConfiguredAdminToken(r *http.Request) bool {
+	return matchesConfiguredBearerToken(r, s.AdminToken, "X-Subrouter-Admin-Token")
+}
+
+func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHeader string) bool {
+	token := strings.TrimSpace(configuredToken)
 	if token == "" {
-		return true
+		return false
 	}
-	got := strings.TrimSpace(r.Header.Get("X-Subrouter-Admin-Token"))
+	got := strings.TrimSpace(r.Header.Get(dedicatedHeader))
 	if got == "" {
 		auth := strings.TrimSpace(r.Header.Get("Authorization"))
 		if before, after, ok := strings.Cut(auth, " "); ok && strings.EqualFold(before, "Bearer") {
 			got = strings.TrimSpace(after)
 		}
 	}
-	if got == "" || len(got) != len(token) {
-		return false
+	return len(got) == len(token) && subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+func (s Server) authorizeAdmin(r *http.Request) bool {
+	if isLoopbackRemote(r.RemoteAddr) {
+		return true
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	if strings.TrimSpace(s.AdminToken) == "" {
+		// Preserve explicitly unsecured legacy/local configurations, but never let
+		// a scoped import token become the only barrier around remote admin APIs.
+		return strings.TrimSpace(s.AccountImportToken) == ""
+	}
+	return s.matchesConfiguredAdminToken(r)
 }
 
 func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
@@ -1732,6 +2164,23 @@ func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if baseURLProbeRequest(r) {
+			if s.RequireSessionLease || !s.localProxyAuthorized(r) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.localProxyAuthorized(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		agentType := session.ExtractAgentType(r)
 		sessionID := session.ExtractID(r, s.MaxBodyBytes)
 		requestProvider := providerForRequest(agentType, r.URL.Path)
@@ -1773,15 +2222,6 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		} else if s.RequireSessionLease {
 			http.Error(w, "session lease required", http.StatusUnauthorized)
-			return
-		}
-
-		if baseURLProbeRequest(r) {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if !s.localProxyAuthorized(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -1974,7 +2414,7 @@ func (s Server) proxyHandler() http.Handler {
 				method:        r.Method,
 				path:          proxyRequest.URL.Path,
 				upstream:      upstream.Host,
-				maxAttempts:   s.usageLimitRetryMaxAttempts(requestProvider),
+				maxAttempts:   s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
 				poolModel:     retryPoolModel,
 				fableFallback: fableFallback,
 			}
@@ -2261,6 +2701,11 @@ func (s Server) reportCredentialLease(
 }
 
 func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account accounts.Account, credentialLease *broker.Lease, agentType, sessionID, userEmail, poolModel, compatibilityModel string, upstream *url.URL) {
+	if !webSocketOriginAllowed(r) {
+		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
+		return
+	}
+
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
 	upstreamURL.Host = upstream.Host
@@ -2322,10 +2767,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		defer response.Body.Close()
 	}
 
-	upgrader := websocket.Upgrader{
-		CheckOrigin:       func(_ *http.Request) bool { return true },
-		EnableCompression: true,
-	}
+	upgrader := websocket.Upgrader{}
 	responseHeader := http.Header{}
 	if response != nil {
 		responseHeader = cloneWebSocketResponseHeaders(response.Header)
@@ -2335,6 +2777,8 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		return
 	}
 	defer clientConn.Close()
+	clientConn.SetReadLimit(maxWebSocketMessageBytes)
+	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
 	modelState := &webSocketModelState{model: compatibilityModel}
 	var leaseFailureReported atomic.Bool
@@ -2374,6 +2818,17 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 			nil,
 		)
 	}
+}
+
+func webSocketOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Native Codex and Claude clients do not send Origin. Browser clients do,
+		// and must be constrained to the host they reached.
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
 }
 
 // setDelegatedSessionHeaders preserves routing affinity only for an explicit
@@ -2484,17 +2939,7 @@ func codexWebSocketResponseFinished(body []byte) bool {
 
 func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID, userEmail, accountID, poolModel string, modelState *webSocketModelState, direction string, src, dst *websocket.Conn, reportLeaseFailure func(int)) {
 	provider := providerForRequest(agentType, "")
-	for {
-		messageType, body, err := src.ReadMessage()
-		if err != nil {
-			forwardWebSocketClose(dst, err)
-			return
-		}
-		if s.Transcripts != nil {
-			s.Transcripts.RecordPayload(agentType, sessionID, "websocket_message", direction, body, map[string]any{
-				"opcode": websocketMessageType(messageType),
-			})
-		}
+	observeMessage := func(messageType int, body []byte) {
 		if messageType == websocket.TextMessage && direction == "client_to_upstream" && provider == accounts.ProviderCodex {
 			modelState.observe(body)
 		}
@@ -2518,13 +2963,285 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 				modelState.complete()
 			}
 		}
-		if err := dst.WriteMessage(messageType, body); err != nil {
+	}
+	for {
+		err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage)
+		if err != nil {
+			forwardWebSocketClose(dst, err)
 			return
 		}
 	}
 }
 
+func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionID, direction string, src, dst *websocket.Conn, observe func(int, []byte)) error {
+	messageType, reader, err := src.NextReader()
+	if err != nil {
+		return err
+	}
+	observer := newWebSocketMessageObserver(s.Transcripts, agentType, sessionID, direction, messageType)
+	_, release, err := streamWebSocketMessage(ctx, reader, func() (io.WriteCloser, error) {
+		return dst.NextWriter(messageType)
+	}, observer, webSocketForwardBuffers, func(body []byte) {
+		observe(messageType, body)
+	})
+	if release != nil {
+		release()
+	}
+	return err
+}
+
+func streamWebSocketMessage(
+	ctx context.Context,
+	reader io.Reader,
+	openWriter func() (io.WriteCloser, error),
+	observer *webSocketMessageObserver,
+	buffers *webSocketCopyBufferPool,
+	beforeClose func([]byte),
+) ([]byte, func(), error) {
+	buffer, releaseBuffer, err := buffers.acquire(ctx)
+	if err != nil {
+		observer.abort()
+		return nil, nil, err
+	}
+	defer releaseBuffer()
+
+	writer, err := openWriter()
+	if err != nil {
+		observer.abort()
+		return nil, nil, err
+	}
+	writerOpen := true
+	closeWriter := func() error {
+		if !writerOpen {
+			return nil
+		}
+		writerOpen = false
+		return writer.Close()
+	}
+	defer func() { _ = closeWriter() }()
+
+	var total int64
+	for {
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			if total+int64(n) > maxWebSocketMessageBytes {
+				observer.abort()
+				return nil, nil, websocket.ErrReadLimit
+			}
+			chunk := buffer[:n]
+			observer.observe(chunk)
+			_, writeErr := writer.Write(chunk)
+			if writeErr != nil {
+				observer.abort()
+				return nil, nil, writeErr
+			}
+			total += int64(n)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			observer.abort()
+			return nil, nil, readErr
+		}
+	}
+	body, release := observer.finish()
+	if beforeClose != nil {
+		beforeClose(body)
+	}
+	if err := closeWriter(); err != nil {
+		return body, release, err
+	}
+	return body, release, nil
+}
+
 const webSocketCloseWriteTimeout = time.Second
+
+const (
+	maxWebSocketMessageBytes     = 8 << 20
+	webSocketCopyChunkBytes      = 32 << 10
+	webSocketForwardBudgetBytes  = 32 << 20
+	webSocketInspectMessageBytes = maxWebSocketMessageBytes
+	webSocketInspectBudgetBytes  = 32 << 20
+)
+
+var (
+	webSocketForwardBuffers = newWebSocketCopyBufferPool(
+		newWebSocketByteBudget(webSocketForwardBudgetBytes),
+		webSocketCopyChunkBytes,
+	)
+	webSocketInspectBudget = newWebSocketByteBudget(webSocketInspectBudgetBytes)
+)
+
+type webSocketByteBudget struct {
+	mu      sync.Mutex
+	limit   int64
+	used    int64
+	changed chan struct{}
+}
+
+func newWebSocketByteBudget(limit int64) *webSocketByteBudget {
+	return &webSocketByteBudget{limit: limit, changed: make(chan struct{})}
+}
+
+func (b *webSocketByteBudget) reserve(ctx context.Context, bytes int64) (func(), error) {
+	if bytes < 0 || bytes > b.limit {
+		return nil, fmt.Errorf("websocket buffer reservation %d exceeds budget %d", bytes, b.limit)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		b.mu.Lock()
+		if b.used+bytes <= b.limit {
+			b.used += bytes
+			b.mu.Unlock()
+			var once sync.Once
+			return func() { once.Do(func() { b.release(bytes) }) }, nil
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+type webSocketCopyBufferPool struct {
+	budget   *webSocketByteBudget
+	size     int
+	allocate func(int) []byte
+}
+
+func newWebSocketCopyBufferPool(budget *webSocketByteBudget, size int) *webSocketCopyBufferPool {
+	return &webSocketCopyBufferPool{budget: budget, size: size}
+}
+
+func (p *webSocketCopyBufferPool) acquire(ctx context.Context) ([]byte, func(), error) {
+	release, err := p.budget.reserve(ctx, int64(p.size))
+	if err != nil {
+		return nil, nil, err
+	}
+	allocate := p.allocate
+	if allocate == nil {
+		allocate = func(size int) []byte { return make([]byte, size) }
+	}
+	return allocate(p.size), release, nil
+}
+
+func (b *webSocketByteBudget) tryReserve(bytes int64) bool {
+	if bytes < 0 || bytes > b.limit {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.used+bytes > b.limit {
+		return false
+	}
+	b.used += bytes
+	return true
+}
+
+func (b *webSocketByteBudget) release(bytes int64) {
+	b.mu.Lock()
+	b.used -= bytes
+	close(b.changed)
+	b.changed = make(chan struct{})
+	b.mu.Unlock()
+}
+
+type webSocketMessageObserver struct {
+	recorder    *transcript.Recorder
+	agentType   string
+	sessionID   string
+	direction   string
+	messageType int
+	streamID    string
+	hasher      hash.Hash
+	capture     []byte
+	reserved    int64
+	bytesRead   int64
+	chunks      int
+	chunked     bool
+}
+
+func newWebSocketMessageObserver(recorder *transcript.Recorder, agentType, sessionID, direction string, messageType int) *webSocketMessageObserver {
+	return &webSocketMessageObserver{
+		recorder: recorder, agentType: agentType, sessionID: sessionID, direction: direction,
+		messageType: messageType, streamID: nextTranscriptStreamID(), hasher: sha256.New(),
+	}
+}
+
+func (o *webSocketMessageObserver) observe(body []byte) {
+	_, _ = o.hasher.Write(body)
+	if !o.chunked && len(o.capture)+len(body) <= webSocketInspectMessageBytes && webSocketInspectBudget.tryReserve(int64(len(body))) {
+		o.capture = append(o.capture, body...)
+		o.reserved += int64(len(body))
+		o.bytesRead += int64(len(body))
+		return
+	}
+	if !o.chunked {
+		o.chunked = true
+		o.recordChunks(o.capture, 0)
+		if o.reserved > 0 {
+			webSocketInspectBudget.release(o.reserved)
+		}
+		o.reserved = 0
+		o.capture = nil
+	}
+	o.recordChunks(body, o.bytesRead)
+	o.bytesRead += int64(len(body))
+}
+
+func (o *webSocketMessageObserver) recordChunks(body []byte, offset int64) {
+	if o.recorder == nil || !o.recorder.Enabled() {
+		return
+	}
+	payload := map[string]any{"opcode": websocketMessageType(o.messageType)}
+	for len(body) > 0 {
+		chunk := body
+		if len(chunk) > transcriptHTTPChunkBytes {
+			chunk = body[:transcriptHTTPChunkBytes]
+		}
+		o.recorder.RecordPayloadChunk(o.agentType, o.sessionID, "websocket_message", o.direction, o.streamID, o.chunks, offset, chunk, payload)
+		o.chunks++
+		offset += int64(len(chunk))
+		body = body[len(chunk):]
+	}
+}
+
+func (o *webSocketMessageObserver) finish() ([]byte, func()) {
+	payload := map[string]any{"opcode": websocketMessageType(o.messageType)}
+	if o.chunked {
+		if o.recorder != nil && o.recorder.Enabled() {
+			o.recorder.RecordPayloadSummary(o.agentType, o.sessionID, "websocket_message", o.direction, o.streamID, o.bytesRead, hex.EncodeToString(o.hasher.Sum(nil)), o.chunks, payload)
+		}
+		return nil, func() {}
+	}
+	if o.recorder != nil && o.recorder.Enabled() {
+		o.recorder.RecordPayload(o.agentType, o.sessionID, "websocket_message", o.direction, o.capture, payload)
+	}
+	var once sync.Once
+	return o.capture, func() {
+		once.Do(func() {
+			if o.reserved > 0 {
+				webSocketInspectBudget.release(o.reserved)
+			}
+			o.reserved = 0
+			o.capture = nil
+		})
+	}
+}
+
+func (o *webSocketMessageObserver) abort() {
+	if o.reserved > 0 {
+		webSocketInspectBudget.release(o.reserved)
+		o.reserved = 0
+	}
+	o.capture = nil
+}
 
 // forwardWebSocketClose preserves the close handshake across the proxy. A raw
 // TCP close makes the other peer report abnormal closure 1006 even when the
@@ -2534,7 +3251,10 @@ func forwardWebSocketClose(dst *websocket.Conn, readErr error) {
 	code := websocket.CloseInternalServerErr
 	reason := "peer connection closed unexpectedly"
 	var closeErr *websocket.CloseError
-	if errors.As(readErr, &closeErr) && webSocketCloseCodeCanBeForwarded(closeErr.Code) {
+	if errors.Is(readErr, websocket.ErrReadLimit) {
+		code = websocket.CloseMessageTooBig
+		reason = "websocket message exceeds proxy limit"
+	} else if errors.As(readErr, &closeErr) && webSocketCloseCodeCanBeForwarded(closeErr.Code) {
 		code = closeErr.Code
 		reason = closeErr.Text
 	}
@@ -3322,7 +4042,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		forcedAccountID = session.ExtractAccountID(r)
 	}
 	model := session.ExtractModel(r, s.MaxBodyBytes)
-	availableAccounts := filterAccountsForProvider(s.accountList(), provider)
+	availableAccounts := filterAccountsForProvider(s.accountListContext(r.Context()), provider)
 	if options.oauthOnly {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
@@ -3499,17 +4219,21 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.CredentialBroker != nil {
 		return
 	}
-	if s.SchedulerRef == nil || !s.SchedulerRef.BeginRefreshIfStale(s.UsageScoreTTL) {
+	if s.SchedulerRef == nil {
 		return
 	}
-	availableAccounts := oauthAccounts(s.accountList())
+	allAccounts, accountGeneration := s.accountListSnapshotContext(ctx)
+	if !s.SchedulerRef.BeginRefreshIfStaleForAccountGeneration(s.UsageScoreTTL, accountGeneration) {
+		return
+	}
+	availableAccounts := oauthAccounts(allAccounts)
 	scoreAccounts := s.ScoreAccounts
 	if scoreAccounts == nil {
 		scoreAccounts = s.scoreAccounts
 	}
 	scores, scored := scoreAccounts(ctx, availableAccounts)
 	if scored == 0 {
-		s.SchedulerRef.FinishRefresh(selectacct.Scheduler{}, false)
+		s.SchedulerRef.FinishRefreshForAccountGeneration(selectacct.Scheduler{}, false, accountGeneration)
 		if s.Logger != nil {
 			s.Logger.Warn("usage score refresh skipped", "reason", "no fresh OAuth usage scores")
 		}
@@ -3519,7 +4243,12 @@ func (s Server) refreshUsageScoresIfStale(ctx context.Context) {
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(s.Sessions.CountByAccount())
 	}
-	s.SchedulerRef.FinishRefresh(scheduler, true)
+	if !s.SchedulerRef.FinishRefreshForAccountGeneration(scheduler, true, accountGeneration) {
+		if s.Logger != nil {
+			s.Logger.Debug("usage score refresh discarded after account reload")
+		}
+		return
+	}
 	if s.Logger != nil {
 		s.Logger.Debug("usage scores refreshed before account selection", "accounts", len(availableAccounts), "scored", scored)
 	}
@@ -3628,11 +4357,33 @@ func accountProviderOrCodex(account accounts.Account) accounts.Provider {
 }
 
 func (s Server) accountList() []accounts.Account {
+	return s.accountListContext(context.Background())
+}
+
+func (s Server) accountListContext(ctx context.Context) []accounts.Account {
+	accounts, _ := s.accountListSnapshotContext(ctx)
+	return accounts
+}
+
+func (s Server) accountListSnapshot() ([]accounts.Account, uint64) {
+	return s.accountListSnapshotContext(context.Background())
+}
+
+func (s Server) accountListSnapshotContext(ctx context.Context) ([]accounts.Account, uint64) {
 	out := append([]accounts.Account(nil), s.Accounts...)
 	if s.AccountRef != nil {
-		out = append(out, s.AccountRef.All()...)
+		reloaded, accountGeneration, err := s.AccountRef.reloadIfDiskGenerationChanged(ctx)
+		if err != nil && s.Logger != nil {
+			s.Logger.Error("account state generation reload failed", "error", err)
+		}
+		if reloaded && s.SchedulerRef != nil {
+			s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+		}
+		loaded, generation := s.AccountRef.Snapshot()
+		out = append(out, loaded...)
+		return out, generation
 	}
-	return out
+	return out, 0
 }
 
 func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (accounts.Account, error) {
@@ -3684,7 +4435,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 }
 
 func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}) (accounts.Account, error) {
-	candidates := filterAccountsForProvider(s.accountList(), provider)
+	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(candidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
@@ -3723,8 +4474,8 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 const replayablePostMaxBodyBytes = 128 << 20
 const replayablePostMaxAttempts = 6
 
-func (s Server) usageLimitRetryMaxAttempts(provider accounts.Provider) int {
-	count := len(filterAccountsForProvider(s.accountList(), provider))
+func (s Server) usageLimitRetryMaxAttempts(ctx context.Context, provider accounts.Provider) int {
+	count := len(filterAccountsForProvider(s.accountListContext(ctx), provider))
 	if count > replayablePostMaxAttempts {
 		return count
 	}
@@ -4369,7 +5120,7 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 }
 
 func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
-	allCandidates := filterAccountsForProvider(s.accountList(), provider)
+	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
@@ -4807,8 +5558,7 @@ func outboundWebSocketDialer() *websocket.Dialer {
 			// Pin http/1.1. A websocket upgrade cannot proceed over h2, and
 			// advertising nothing lets the edge choose, which is what differs
 			// from the working HTTP path.
-			TLSClientConfig:   &tls.Config{NextProtos: []string{"http/1.1"}},
-			EnableCompression: true,
+			TLSClientConfig: &tls.Config{NextProtos: []string{"http/1.1"}},
 		}
 	})
 	return outboundWebSocketDialerValue
