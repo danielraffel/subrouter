@@ -323,6 +323,18 @@ func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
 				return
 			}
 		}
+		if r.URL.Path == "/_subrouter/accounts/migration/stage" && r.Method == http.MethodPost {
+			handleTenantMigrationStage(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/accounts/migration/activate" && r.Method == http.MethodPost {
+			handleTenantMigrationActivate(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/accounts/migration/rollback" && r.Method == http.MethodPost {
+			handleTenantMigrationRollback(&server, w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/_subrouter/accounts/") && r.Method == http.MethodDelete {
 			handleTenantAccountDelete(&server, w, r)
 			return
@@ -674,6 +686,7 @@ func validStackTeamName(name string) bool {
 
 type tenantAccountUpload struct {
 	Provider        string `json:"provider"`
+	AccountID       string `json:"accountId,omitempty"`
 	Label           string `json:"label"`
 	APIKey          string `json:"apiKey"`
 	TargetAccountID string `json:"targetAccountID,omitempty"`
@@ -684,6 +697,150 @@ type tenantAccountUpload struct {
 		AccountID    string `json:"accountID"`
 	} `json:"tokens"`
 	ClaudeAIOAuth *agentclaude.CredentialInfo `json:"claudeAiOauth"`
+}
+
+type tenantMigrationStageInput struct {
+	MigrationID string                `json:"migrationId"`
+	Accounts    []tenantAccountUpload `json:"accounts"`
+}
+
+type tenantMigrationBatchInput struct {
+	MigrationID string   `json:"migrationId"`
+	AccountIDs  []string `json:"accountIds,omitempty"`
+}
+
+func handleTenantMigrationStage(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var input tenantMigrationStageInput
+	if !decodeTenantMigrationJSON(server, w, r, &input) {
+		return
+	}
+	if len(input.Accounts) == 0 || len(input.Accounts) > 16 {
+		http.Error(w, "migration account count is invalid", http.StatusBadRequest)
+		return
+	}
+	staged := make([]accounts.StoredCodexAccount, 0, len(input.Accounts))
+	ids := make([]string, 0, len(input.Accounts))
+	for _, upload := range input.Accounts {
+		account, err := storedTenantMigrationAccount(upload)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		staged = append(staged, account)
+		ids = append(ids, account.Email)
+	}
+	if err := server.AccountRef.store.StageMigrationBatch(strings.TrimSpace(input.MigrationID), staged); err != nil {
+		http.Error(w, "stage migration accounts", http.StatusConflict)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "accountIds": ids})
+}
+
+func handleTenantMigrationActivate(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var input tenantMigrationBatchInput
+	if !decodeTenantMigrationJSON(server, w, r, &input) {
+		return
+	}
+	batchID := strings.TrimSpace(input.MigrationID)
+	if err := server.AccountRef.store.ActivateMigrationBatch(batchID, input.AccountIDs); err != nil {
+		http.Error(w, "activate migration accounts", http.StatusConflict)
+		return
+	}
+	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
+		_ = server.AccountRef.store.RollbackMigrationBatch(batchID)
+		_, _, _ = server.reloadAccounts(r.Context())
+		http.Error(w, "activate migration accounts", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "activated": input.AccountIDs})
+}
+
+func handleTenantMigrationRollback(server *Server, w http.ResponseWriter, r *http.Request) {
+	if server.AccountRef == nil {
+		http.Error(w, "tenant account store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var input tenantMigrationBatchInput
+	if !decodeTenantMigrationJSON(server, w, r, &input) {
+		return
+	}
+	if err := server.AccountRef.store.RollbackMigrationBatch(strings.TrimSpace(input.MigrationID)); err != nil {
+		http.Error(w, "rollback migration accounts", http.StatusInternalServerError)
+		return
+	}
+	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
+		http.Error(w, "rollback migration accounts", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "rolledBack": true})
+}
+
+func decodeTenantMigrationJSON(server *Server, w http.ResponseWriter, r *http.Request, output any) bool {
+	bodyLimit := server.MaxBodyBytes
+	if bodyLimit <= 0 {
+		bodyLimit = 1 << 20
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, bodyLimit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func storedTenantMigrationAccount(input tenantAccountUpload) (accounts.StoredCodexAccount, error) {
+	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	input.AccountID = strings.TrimSpace(input.AccountID)
+	input.Label = strings.TrimSpace(input.Label)
+	if !validTenantAccountText(input.Label) {
+		return accounts.StoredCodexAccount{}, errors.New("account label is invalid")
+	}
+	if !validTenantAccountText(input.AccountID) {
+		return accounts.StoredCodexAccount{}, errors.New("account id is invalid")
+	}
+	switch input.Provider {
+	case "codex":
+		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
+			return accounts.StoredCodexAccount{}, errors.New("complete Codex OAuth tokens are required")
+		}
+		return accounts.StoredCodexAccount{
+			Email: input.AccountID, Label: input.Label, Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "chatgpt",
+				Tokens: &accounts.CodexTokens{
+					AccessToken: input.Tokens.AccessToken, RefreshToken: input.Tokens.RefreshToken,
+					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
+				},
+			},
+		}, nil
+	case "openai-apikey", "anthropic-apikey":
+		if strings.TrimSpace(input.APIKey) == "" {
+			return accounts.StoredCodexAccount{}, errors.New("API key is required")
+		}
+		provider := accounts.ProviderCodex
+		if input.Provider == "anthropic-apikey" {
+			provider = accounts.ProviderClaude
+		}
+		return accounts.StoredCodexAccount{
+			Email: input.AccountID, Label: input.Label, Provider: provider,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
+		}, nil
+	default:
+		return accounts.StoredCodexAccount{}, errors.New("unsupported migration provider")
+	}
 }
 
 func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Request) {
@@ -707,10 +864,16 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 		return
 	}
 	input.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	input.AccountID = strings.TrimSpace(input.AccountID)
 	input.Label = strings.TrimSpace(input.Label)
 	input.TargetAccountID = strings.TrimSpace(input.TargetAccountID)
-	if input.Label == "" || len(input.Label) > 320 {
-		http.Error(w, "account label is required", http.StatusBadRequest)
+	if !validTenantAccountText(input.Label) {
+		http.Error(w, "account label is invalid", http.StatusBadRequest)
+		return
+	}
+	if input.AccountID != "" &&
+		!validTenantAccountText(input.AccountID) {
+		http.Error(w, "account id is invalid", http.StatusBadRequest)
 		return
 	}
 	var id string
@@ -726,13 +889,16 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "complete Codex OAuth tokens are required", http.StatusBadRequest)
 			return
 		}
-		id, kind = input.Label, "codex"
+		id, kind = input.AccountID, "codex"
+		if id == "" {
+			id = input.Label
+		}
 		if !validateRepairTarget(id) {
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
 		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
-			Email: input.Label, Provider: accounts.ProviderCodex,
+			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
 				Tokens: &accounts.CodexTokens{
@@ -754,13 +920,16 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 		if input.Provider == "anthropic-apikey" {
 			provider = accounts.ProviderClaude
 		}
-		id, kind = "apikey:"+input.Provider+":"+input.Label, input.Provider
+		id, kind = input.AccountID, input.Provider
+		if id == "" {
+			id = "apikey:" + input.Provider + ":" + input.Label
+		}
 		if !validateRepairTarget(id) {
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
 		if err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
-			Email: id, Provider: provider,
+			Email: id, Label: input.Label, Provider: provider,
 			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
 		}); err != nil {
 			http.Error(w, "save API key", http.StatusInternalServerError)
@@ -791,6 +960,10 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 	writeJSON(w, map[string]any{"account": map[string]any{
 		"id": id, "kind": kind, "label": input.Label,
 	}})
+}
+
+func validTenantAccountText(value string) bool {
+	return value != "" && len(value) <= 320 && !containsTerminalControl(value)
 }
 
 func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Request) {
