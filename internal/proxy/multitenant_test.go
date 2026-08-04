@@ -673,7 +673,7 @@ func TestStackUseCredentialCannotManageTenantAccounts(t *testing.T) {
 	}
 }
 
-func TestLegacyDirectStackCredentialIsRejected(t *testing.T) {
+func TestLegacyDirectStackCredentialExpiresAfterDeploymentGrace(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	legacyKey, err := tenant.DeriveKey(secret, "project", "team-123")
 	if err != nil {
@@ -684,21 +684,32 @@ func TestLegacyDirectStackCredentialIsRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := Server{MaxBodyBytes: 1024}
-	handler := (&MultiTenant{
+	now := time.Date(2026, time.August, 4, 0, 0, 0, 0, time.UTC)
+	multi := &MultiTenant{
 		Base: base, Registry: registry, StackProjectID: "project",
 		StackTenantKeySecret: secret,
-	}).Handler(base.Handler())
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(
-		response,
-		httptest.NewRequest(
+		StackLegacyKeyCutoff: now.Add(30 * 24 * time.Hour),
+		Now:                  func() time.Time { return now },
+	}
+	handler := multi.Handler(base.Handler())
+	request := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(
+			response,
+			httptest.NewRequest(
 			http.MethodGet,
 			"/t/"+legacyKey+"/_subrouter/whoami",
 			nil,
-		),
-	)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401: %s", response.Code, response.Body.String())
+			),
+		)
+		return response
+	}
+	if response := request(); response.Code != http.StatusOK {
+		t.Fatalf("grace status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	now = multi.StackLegacyKeyCutoff
+	if response := request(); response.Code != http.StatusUnauthorized {
+		t.Fatalf("expired status = %d, want 401: %s", response.Code, response.Body.String())
 	}
 }
 
