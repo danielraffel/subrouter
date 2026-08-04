@@ -24,6 +24,9 @@ import (
 const KeyPrefix = "srt_"
 const keyRandomBytes = 16
 const keyDisplayPrefixLen = len(KeyPrefix) + 8
+const legacyCredentialCutoffFile = "stack-legacy-key-cutoff"
+
+const MaxLegacyCredentialGrace = 90 * 24 * time.Hour
 
 type Key struct {
 	Hash         string       `json:"hash"`
@@ -83,6 +86,75 @@ func (r *Registry) Path() string {
 
 func (r *Registry) TenantsDir() string {
 	return filepath.Join(r.stateDir, "tenants")
+}
+
+// EnsureLegacyCredentialCutoff creates one durable deadline for credentials
+// issued by the pre-broker Stack exchange. Repeated starts and overlapping
+// worker generations read the original deadline instead of extending it.
+func (r *Registry) EnsureLegacyCredentialCutoff(
+	now time.Time,
+	grace time.Duration,
+) (time.Time, error) {
+	if now.IsZero() {
+		return time.Time{}, errors.New("legacy credential cutoff requires the current time")
+	}
+	if grace <= 0 || grace > MaxLegacyCredentialGrace {
+		return time.Time{}, fmt.Errorf(
+			"legacy credential grace must be positive and at most %s",
+			MaxLegacyCredentialGrace,
+		)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock, err := r.lockRegistry()
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer lock.Close()
+	path := filepath.Join(r.stateDir, legacyCredentialCutoffFile)
+	if info, statErr := os.Lstat(path); statErr == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return time.Time{}, errors.New("legacy credential cutoff is not a regular file")
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return time.Time{}, readErr
+		}
+		cutoff, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(body)))
+		if parseErr != nil {
+			return time.Time{}, fmt.Errorf("parse legacy credential cutoff: %w", parseErr)
+		}
+		return cutoff.UTC(), nil
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return time.Time{}, statErr
+	}
+
+	cutoff := now.UTC().Add(grace)
+	temporary, err := os.CreateTemp(r.stateDir, ".stack-legacy-key-cutoff-*")
+	if err != nil {
+		return time.Time{}, err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return time.Time{}, err
+	}
+	if _, err := fmt.Fprintf(temporary, "%s\n", cutoff.Format(time.RFC3339Nano)); err != nil {
+		_ = temporary.Close()
+		return time.Time{}, err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return time.Time{}, err
+	}
+	if err := temporary.Close(); err != nil {
+		return time.Time{}, err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return time.Time{}, err
+	}
+	return cutoff, nil
 }
 
 // Dir returns the tenant's isolated state dir.

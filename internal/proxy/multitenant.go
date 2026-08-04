@@ -55,7 +55,9 @@ type MultiTenant struct {
 	StackProjectID         string
 	StackTenantKeySecret   []byte
 	StackTenantDeleteToken []byte
+	StackLegacyKeyCutoff   time.Time
 	PublicURL              string
+	Now                    func() time.Time
 
 	mu       sync.Mutex
 	servers  map[string]*Server
@@ -178,7 +180,7 @@ func (m *MultiTenant) serveResolvedTenant(
 		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
 		return
 	}
-	if m.isLegacyStackCredential(fresh.ID, key) {
+	if m.legacyStackCredentialExpired(fresh.ID, key) {
 		http.Error(w, "unknown tenant key", http.StatusUnauthorized)
 		return
 	}
@@ -205,7 +207,7 @@ func (m *MultiTenant) serveResolvedTenant(
 	handler.ServeHTTP(w, scoped)
 }
 
-func (m *MultiTenant) isLegacyStackCredential(tenantID, key string) bool {
+func (m *MultiTenant) legacyStackCredentialExpired(tenantID, key string) bool {
 	if strings.TrimSpace(m.StackProjectID) == "" || len(m.StackTenantKeySecret) < 32 {
 		return false
 	}
@@ -214,7 +216,15 @@ func (m *MultiTenant) isLegacyStackCredential(tenantID, key string) bool {
 		m.StackProjectID,
 		tenantID,
 	)
-	return err == nil && subtle.ConstantTimeCompare([]byte(legacy), []byte(key)) == 1
+	if err != nil || subtle.ConstantTimeCompare([]byte(legacy), []byte(key)) != 1 {
+		return false
+	}
+	now := time.Now()
+	if m.Now != nil {
+		now = m.Now()
+	}
+	return m.StackLegacyKeyCutoff.IsZero() ||
+		!now.Before(m.StackLegacyKeyCutoff)
 }
 
 func tenantCredentialAllows(key tenant.Key, path, method string) bool {

@@ -303,6 +303,7 @@ func serve(args []string) error {
 	stackPublishableClientKey := flags.String("stack-publishable-client-key", "", "Stack Auth publishable client key; defaults to SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY")
 	stackTenantKeySecret := flags.String("stack-tenant-key-secret", "", "local-development override for stable Stack-team tenant keys; deployments use SUBROUTER_STACK_TENANT_KEY_SECRET")
 	stackTenantDeleteToken := flags.String("stack-tenant-delete-token", "", "trusted cmux.com token required for hosted tenant exchange and deletion; deployments use SUBROUTER_STACK_TENANT_DELETE_TOKEN")
+	stackLegacyKeyGrace := flags.Duration("stack-legacy-key-grace", 30*24*time.Hour, "one-time grace for pre-broker Stack tenant keys; capped at 90 days")
 	bedrockEnable := flags.Bool("bedrock", false, "enable the /bedrock/* AWS SigV4 signing gateway for Claude Code Bedrock mode")
 	bedrockRegion := flags.String("bedrock-region", "us-east-1", "comma-separated AWS regions for the Bedrock signing gateway")
 	bedrockGatewayToken := flags.String("bedrock-gateway-token", "", "optional bearer token clients must present to the Bedrock gateway; defaults to SUBROUTER_BEDROCK_GATEWAY_TOKEN")
@@ -602,9 +603,10 @@ func serve(args []string) error {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
 	}
 
+	tenantRegistry := tenant.NewRegistry(storepath.StateDir())
 	multiTenantHandler := &proxy.MultiTenant{
 		Base:          server,
-		Registry:      tenant.NewRegistry(storepath.StateDir()),
+		Registry:      tenantRegistry,
 		TranscriptDir: *transcriptDir,
 		Enabled:       *multiTenant,
 		PublicURL:     *publicURL,
@@ -623,6 +625,18 @@ func serve(args []string) error {
 		multiTenantHandler.StackProjectID = *stackProjectID
 		multiTenantHandler.StackTenantKeySecret = []byte(*stackTenantKeySecret)
 		multiTenantHandler.StackTenantDeleteToken = []byte(*stackTenantDeleteToken)
+		cutoff, err := tenantRegistry.EnsureLegacyCredentialCutoff(
+			time.Now(),
+			*stackLegacyKeyGrace,
+		)
+		if err != nil {
+			return fmt.Errorf("initialize legacy Stack credential cutoff: %w", err)
+		}
+		multiTenantHandler.StackLegacyKeyCutoff = cutoff
+		slog.Info(
+			"legacy Stack tenant credentials have a fixed migration cutoff",
+			"cutoff", cutoff.Format(time.RFC3339),
+		)
 	}
 	httpServer := &http.Server{
 		Addr:              *addr,

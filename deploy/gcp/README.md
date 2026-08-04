@@ -98,9 +98,12 @@ sr codex
 The browser login uses the same Stack identity as cmux. The cmux.com exchange
 broker enforces team permissions and cutover readiness, then requests a
 capability-scoped tenant key from hosted Subrouter. Direct client exchange is
-rejected. The CLI writes the tenant-scoped public URL to the local Codex
-configuration. `sr remote use cmux-local` keeps the proxy on the Mac while
-leasing short-lived access credentials from the same tenant.
+rejected. A durable 30-day cutoff lets tenant keys issued before the broker
+migration survive the deployment without extending their lifetime on restart;
+after the cutoff they fail closed. A fresh `sr login` rotates to the scoped key.
+The CLI writes the tenant-scoped public URL to the local Codex configuration.
+`sr remote use cmux-local` keeps the proxy on the Mac while leasing short-lived
+access credentials from the same tenant.
 
 Operators can add a fresh server-owned Codex OAuth account over authenticated
 HTTP when needed:
