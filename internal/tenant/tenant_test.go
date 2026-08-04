@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCreateResolveRevoke(t *testing.T) {
@@ -274,6 +275,73 @@ func TestExternalTenantRejectsTraversalAndWeakSecret(t *testing.T) {
 	}
 	if first != again || first == otherNamespace {
 		t.Fatalf("derived keys = %q, %q, %q", first, again, otherNamespace)
+	}
+}
+
+func TestLegacyCredentialCutoffIsDurableAndNeverExtended(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.August, 4, 0, 0, 0, 0, time.UTC)
+	first, err := NewRegistry(root).EnsureLegacyCredentialCutoff(
+		now,
+		30*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := now.Add(30 * 24 * time.Hour); !first.Equal(want) {
+		t.Fatalf("cutoff = %s, want %s", first, want)
+	}
+	second, err := NewRegistry(root).EnsureLegacyCredentialCutoff(
+		now.Add(7*24*time.Hour),
+		30*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Equal(first) {
+		t.Fatalf("cutoff extended from %s to %s", first, second)
+	}
+	info, err := os.Stat(filepath.Join(root, "stack-legacy-key-cutoff"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("cutoff mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestLegacyCredentialCutoffReportsDirectorySyncFailure(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	want := errors.New("sync state directory")
+	syncCalls := 0
+	registry.syncStateDir = func() error {
+		syncCalls++
+		if syncCalls == 1 {
+			return want
+		}
+		return nil
+	}
+	now := time.Date(2026, time.August, 4, 0, 0, 0, 0, time.UTC)
+
+	_, err := registry.EnsureLegacyCredentialCutoff(
+		now,
+		30*24*time.Hour,
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("cutoff creation error = %v, want %v", err, want)
+	}
+	cutoff, err := registry.EnsureLegacyCredentialCutoff(
+		now.Add(7*24*time.Hour),
+		30*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantCutoff := now.Add(30 * 24 * time.Hour); !cutoff.Equal(wantCutoff) {
+		t.Fatalf("recovered cutoff = %s, want %s", cutoff, wantCutoff)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("directory sync calls = %d, want 2", syncCalls)
 	}
 }
 
