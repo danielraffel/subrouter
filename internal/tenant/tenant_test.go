@@ -310,6 +310,20 @@ func TestLegacyCredentialCutoffIsDurableAndNeverExtended(t *testing.T) {
 	}
 }
 
+func TestLegacyCredentialCutoffReportsDirectorySyncFailure(t *testing.T) {
+	registry := NewRegistry(t.TempDir())
+	want := errors.New("sync state directory")
+	registry.syncStateDir = func() error { return want }
+
+	_, err := registry.EnsureLegacyCredentialCutoff(
+		time.Date(2026, time.August, 4, 0, 0, 0, 0, time.UTC),
+		30*24*time.Hour,
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("cutoff creation error = %v, want %v", err, want)
+	}
+}
+
 func mustRead(t *testing.T, path string) string {
 	t.Helper()
 	body, err := os.ReadFile(path)
