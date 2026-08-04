@@ -130,6 +130,9 @@ func (r *Registry) EnsureLegacyCredentialCutoff(
 		if parseErr != nil {
 			return time.Time{}, fmt.Errorf("parse legacy credential cutoff: %w", parseErr)
 		}
+		if err := r.syncStateDir(); err != nil {
+			return time.Time{}, fmt.Errorf("sync legacy credential cutoff directory: %w", err)
+		}
 		return cutoff.UTC(), nil
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return time.Time{}, statErr
