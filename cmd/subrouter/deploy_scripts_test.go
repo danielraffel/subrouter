@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -377,6 +379,231 @@ func TestPublishSubrouterRejectsNonHTTPSManagedURLBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestDeployLockReleasesWhenOwningShellIsKilled(t *testing.T) {
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
+	fakeBin := t.TempDir()
+	holderPID := filepath.Join(t.TempDir(), "holder.pid")
+	longChildPID := filepath.Join(t.TempDir(), "long-child.pid")
+	remoteLock := filepath.Join(t.TempDir(), "remote.lock")
+	lockLog := filepath.Join(t.TempDir(), "deploy-lock.log")
+	acquired := filepath.Join(t.TempDir(), "acquired")
+	if err := os.WriteFile(lockLog, []byte("STALE\nLOCKED\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$$" >"$HOLDER_PID_FILE"
+: >"$REMOTE_LOCK_FILE"
+cleanup() { unlink "$REMOTE_LOCK_FILE" 2>/dev/null || true; }
+trap cleanup EXIT
+printf 'LOCKED\n'
+while IFS= read -r heartbeat; do printf 'ACK %s\n' "$heartbeat"; done
+`)
+
+	harness := `
+set -euo pipefail
+source "$1"
+GCLOUD_BINARY="$2"
+INSTANCE=subrouter-staging
+PROJECT_ID=project
+ZONE=us-south1-a
+DEPLOY_LOCK_FILE=/run/lock/subrouter-deploy.lock
+subrouter_acquire_deploy_lock "$3" "$GCLOUD_BINARY" "$INSTANCE" "$PROJECT_ID" "$ZONE" "$DEPLOY_LOCK_FILE"
+printf 'acquired\n' >"$4"
+sleep 30 >/dev/null 2>&1 &
+printf '%s\n' "$!" >"$5"
+wait
+`
+	var output strings.Builder
+	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-test", helper, fakeGcloud, lockLog, acquired, longChildPID)
+	command.Env = append(os.Environ(),
+		"HOLDER_PID_FILE="+holderPID,
+		"REMOTE_LOCK_FILE="+remoteLock,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
+	)
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = command.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		if childPIDBytes, err := os.ReadFile(longChildPID); err == nil {
+			childPID, parseErr := strconv.Atoi(strings.TrimSpace(string(childPIDBytes)))
+			if parseErr != nil {
+				t.Errorf("parse long-lived child pid: %v", parseErr)
+			} else if child, findErr := os.FindProcess(childPID); findErr != nil {
+				t.Errorf("find long-lived child process: %v", findErr)
+			} else if killErr := child.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+				t.Errorf("kill long-lived child process: %v", killErr)
+			}
+		}
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("deploy lock process tree did not exit\n%s", output.String())
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, acquiredErr := os.Stat(acquired); acquiredErr == nil {
+			if _, childErr := os.Stat(longChildPID); childErr != nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if _, lockErr := os.Stat(remoteLock); lockErr != nil {
+				t.Fatalf("helper reported acquisition without a held lock: %v", lockErr)
+			}
+			lockOutput, readErr := os.ReadFile(lockLog)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if strings.Contains(string(lockOutput), "STALE") {
+				t.Fatalf("deployment lock accepted a stale acquisition marker:\n%s", lockOutput)
+			}
+			break
+		}
+		select {
+		case <-done:
+			t.Fatalf("lock owner exited before acquisition: %v\n%s", waitErr, output.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			_ = command.Process.Kill()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out acquiring fake deployment lock and its process tree did not exit\n%s", output.String())
+			}
+			t.Fatalf("timed out acquiring fake deployment lock\n%s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("deploy lock descendants outlived the killed owner; holder pid file %s\n%s", holderPID, output.String())
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(remoteLock); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("remote lock survived owner death; holder pid file %s\n%s", holderPID, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDeployLockTerminatesOwnerWhenHeartbeatAcknowledgementsStop(t *testing.T) {
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
+	fakeBin := t.TempDir()
+	remoteLock := filepath.Join(t.TempDir(), "remote.lock")
+	lockLog := filepath.Join(t.TempDir(), "deploy-lock.log")
+	acquired := filepath.Join(t.TempDir(), "acquired")
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+: >"$REMOTE_LOCK_FILE"
+cleanup() { unlink "$REMOTE_LOCK_FILE" 2>/dev/null || true; }
+trap cleanup EXIT
+printf 'LOCKED\n'
+while IFS= read -r _; do :; done
+`)
+
+	harness := `
+set -euo pipefail
+source "$1"
+subrouter_acquire_deploy_lock "$2" "$3" instance project zone /run/lock/subrouter-deploy.lock
+printf 'acquired\n' >"$4"
+while :; do sleep 1; done
+`
+	var output strings.Builder
+	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-ack-test", helper, lockLog, fakeGcloud, acquired)
+	command.Env = append(os.Environ(),
+		"REMOTE_LOCK_FILE="+remoteLock,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=10",
+	)
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = command.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("unacknowledged deploy lock process tree did not exit\n%s", output.String())
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, acquiredErr := os.Stat(acquired); acquiredErr == nil {
+			if _, lockErr := os.Stat(remoteLock); lockErr != nil {
+				t.Fatalf("helper reported acquisition without a held lock: %v", lockErr)
+			}
+			break
+		}
+		select {
+		case <-done:
+			t.Fatalf("lock owner exited before acquisition: %v\n%s", waitErr, output.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out acquiring fake deployment lock\n%s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	select {
+	case <-done:
+		if waitErr == nil {
+			t.Fatalf("lock owner exited successfully after acknowledgement loss\n%s", output.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("lock owner kept running without remote heartbeat acknowledgements\n%s", output.String())
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(remoteLock); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("remote lock survived acknowledgement failure\n%s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "dd", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -523,7 +750,7 @@ case "$*" in
   "config get-value account") printf '%s\n' operator@example.com ;;
   "config get-value project") printf '%s\n' project ;;
   *"instances describe subrouter-team"*) cat "$LIVE_INSTANCE_FIXTURE" ;;
-  *"flock -x -w 300"*) printf '%s\n' LOCKED ;;
+  *"flock -x -w 300"*) printf '%s\n' LOCKED; cat >/dev/null ;;
   *"then echo fresh-prepared"*) printf '%s\n' fresh-prepared ;;
   *"subrouter-verify-fresh-vm"*) cat "$FRESH_TOPOLOGY_FIXTURE" ;;
 esac
