@@ -213,6 +213,7 @@ esac
 	t.Setenv(goldenFakeStreamReleaseStateEnv, streamReleaseState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE", processState)
 	t.Setenv("SUBROUTER_GOLDEN_FAKE_PROCESS_PARENT_OWNED", "1")
+	t.Setenv("SUBROUTER_GOLDEN_FAKE_MIGRATION_RETRY_ONCE", "1")
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	artifacts := filepath.Join(root, "artifacts")
 	err = runGolden([]string{
@@ -251,6 +252,15 @@ esac
 	if !result.Passed || !result.PrivateWorkspaceRemoved || !result.FreshLocalLeaseObserved ||
 		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 17 {
 		t.Fatalf("incomplete result: %#v", result)
+	}
+	retryAccepted := false
+	rejectedPresent := false
+	for _, session := range result.Sessions {
+		retryAccepted = retryAccepted || session.Label == "migration-candidate-front-rehearsal-destination-direct-attempt-2"
+		rejectedPresent = rejectedPresent || session.Label == "migration-candidate-front-rehearsal-destination-direct"
+	}
+	if !retryAccepted || rejectedPresent {
+		t.Fatalf("retry summary accepted=%t rejected_present=%t", retryAccepted, rejectedPresent)
 	}
 	allEvidence := readGoldenArtifacts(t, artifacts)
 	for _, forbidden := range []string{

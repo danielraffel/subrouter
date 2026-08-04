@@ -604,6 +604,51 @@ while :; do sleep 1; done
 	}
 }
 
+func TestDeployLockOwnerCleanupRemovesRunScopedSamplerSentinel(t *testing.T) {
+	requireDeployScriptTools(t, "awk", "bash", "chmod", "grep", "kill", "mkfifo", "mktemp", "rmdir", "sleep", "unlink")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "deploy-lock.sh")
+	fakeBin := t.TempDir()
+	sentinel := filepath.Join(t.TempDir(), "subrouter-rss-owner-cleanup-front.running")
+	lockLog := filepath.Join(t.TempDir(), "deploy-lock.log")
+	if err := os.WriteFile(sentinel, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+remote_command="$*"
+cleanup() {
+  if [[ "${remote_command}" == *"subrouter-rss-owner-cleanup-*.running"* ]]; then
+    unlink "${REMOTE_SAMPLER_SENTINEL}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+printf 'LOCKED\n'
+while IFS= read -r heartbeat; do printf 'ACK %s\n' "$heartbeat"; done
+`)
+
+	harness := `
+set -euo pipefail
+source "$1"
+subrouter_acquire_deploy_lock "$2" "$3" instance project zone /run/lock/subrouter-deploy.lock owner-cleanup
+subrouter_release_deploy_lock
+`
+	command := exec.Command(mustLookPath(t, "bash"), "-c", harness, "deploy-lock-cleanup-test", helper, lockLog, fakeGcloud)
+	command.Env = append(os.Environ(),
+		"REMOTE_SAMPLER_SENTINEL="+sentinel,
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_INTERVAL_SECONDS=0.05",
+		"SUBROUTER_DEPLOY_LOCK_ACK_TIMEOUT_SECONDS=1",
+		"SUBROUTER_DEPLOY_LOCK_HEARTBEAT_TIMEOUT_SECONDS=2",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("deploy lock cleanup harness: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("run-scoped sampler sentinel survived lock release: %v", err)
+	}
+}
+
 func TestCreateVMTempFilesSurviveInterruptedAndRepeatedMacOSRuns(t *testing.T) {
 	requireDeployScriptTools(t, "bash", "dd", "tr")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -1264,7 +1309,7 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	}
 
 	proof := filepath.Join(t.TempDir(), "proof.json")
-	proofBody := `{"schema":"subrouter.gcp.destination-proof/v1","challenge":"challenge","operation":"final-cutover","destination":"front","destination_generation":"generation-b","source":"legacy","source_generation":"generation-a","source_snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_source_connections":2,"original_continuity_verified":true,"fresh_public_connection":true,"connection_id":"connection","observed_at":"2026-08-03T10:00:29.999Z"}`
+	proofBody := `{"schema":"subrouter.gcp.destination-proof/v1","challenge":"challenge","operation":"final-cutover","destination":"front","destination_generation":"generation-b","source":"legacy","source_generation":"generation-a","source_snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_source_connections":2,"original_continuity_verified":true,"fresh_public_connection":true,"connection_id":"connection","session_id":"session-id","observed_at":"2026-08-03T10:00:29.999Z"}`
 	if err := os.WriteFile(proof, []byte(proofBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1277,6 +1322,12 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	}
 	if output, err := run(proofArgs...); err == nil {
 		t.Fatalf("empty destination connection succeeded: %s", output)
+	}
+	if err := os.WriteFile(proof, []byte(strings.Replace(proofBody, `"session_id":"session-id"`, `"session_id":""`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := run(proofArgs...); err == nil {
+		t.Fatalf("empty destination session succeeded: %s", output)
 	}
 }
 
