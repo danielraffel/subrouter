@@ -65,7 +65,8 @@ type registryFile struct {
 // Registry reads and writes tenants.json under a server state dir. Reads are
 // cached on file modtime+size so the per-request key resolution is one stat.
 type Registry struct {
-	stateDir string
+	stateDir     string
+	syncStateDir func() error
 
 	mu       sync.Mutex
 	cached   registryFile
@@ -77,7 +78,12 @@ type Registry struct {
 var ErrTenantRetired = errors.New("tenant is retired")
 
 func NewRegistry(stateDir string) *Registry {
-	return &Registry{stateDir: stateDir}
+	return &Registry{
+		stateDir: stateDir,
+		syncStateDir: func() error {
+			return syncDirectory(stateDir)
+		},
+	}
 }
 
 func (r *Registry) Path() string {
@@ -154,7 +160,22 @@ func (r *Registry) EnsureLegacyCredentialCutoff(
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return time.Time{}, err
 	}
+	if err := r.syncStateDir(); err != nil {
+		return time.Time{}, fmt.Errorf("sync legacy credential cutoff directory: %w", err)
+	}
 	return cutoff, nil
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
 }
 
 // Dir returns the tenant's isolated state dir.
