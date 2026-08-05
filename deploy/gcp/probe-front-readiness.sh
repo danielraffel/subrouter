@@ -36,12 +36,12 @@ canary_request() {
     --write-out '%{http_code}' --connect-timeout 5 --max-time 10
 }
 
-unauthorized_code="$(canary_request "${SESSION_ID}-denied" "")" || unauthorized_code=""
-[[ "${unauthorized_code}" == 403 ]] \
-  || { printf 'front-readiness-probe: unprotected public canary returned %s\n' "${unauthorized_code:-no status}" >&2; exit 1; }
 authorized_code="$(canary_request "${SESSION_ID}" "${canary_token}")" || authorized_code=""
 [[ "${authorized_code}" == 400 ]] \
   || { printf 'front-readiness-probe: authenticated public canary returned %s\n' "${authorized_code:-no status}" >&2; exit 1; }
+unauthorized_code="$(canary_request "${SESSION_ID}-denied" "")" || unauthorized_code=""
+[[ "${unauthorized_code}" == 403 ]] \
+  || { printf 'front-readiness-probe: unprotected public canary returned %s\n' "${unauthorized_code:-no status}" >&2; exit 1; }
 
 exec "${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
   --project "${PROJECT_ID}" --global --format=json
