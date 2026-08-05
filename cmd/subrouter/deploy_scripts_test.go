@@ -153,6 +153,150 @@ pathMatchers:
 	}
 }
 
+func TestGCPCanarySecurityPolicyRequiresAnAuthenticatedHeader(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "canary-security-policy.py")
+	policy := filepath.Join(t.TempDir(), "policy.json")
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	token := strings.Repeat("a", 64)
+	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name := "subrouter-staging-front-canary-policy"
+	host := "front-canary.staging.sr.cmux.internal"
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "render", policy, name, host, "--token-file", tokenPath,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("render canary security policy: %v\n%s", err, output)
+	}
+	output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host, "--token-file", tokenPath,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("validate canary security policy: %v\n%s", err, output)
+	}
+	var access struct {
+		Attached             bool   `json:"attached"`
+		UnauthorizedStatus   int64  `json:"unauthorized_status"`
+		AuthorizedStatus     int64  `json:"authorized_status"`
+		KeyRedacted          bool   `json:"key_redacted_before_backend"`
+		KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
+	}
+	if err := json.Unmarshal(output, &access); err != nil {
+		t.Fatal(err)
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	if !access.Attached || access.UnauthorizedStatus != 403 || access.AuthorizedStatus != 400 || !access.KeyRedacted ||
+		access.KeyFingerprintSHA256 != fmt.Sprintf("%x", tokenHash) {
+		t.Fatalf("unexpected canary access evidence: %+v", access)
+	}
+	discovered, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("validate persisted canary policy without plaintext key: %v\n%s", err, discovered)
+	}
+	var discoveredAccess struct {
+		KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
+	}
+	if err := json.Unmarshal(discovered, &discoveredAccess); err != nil || discoveredAccess.KeyFingerprintSHA256 != access.KeyFingerprintSHA256 {
+		t.Fatalf("persisted policy fingerprint changed: %v %+v", err, discoveredAccess)
+	}
+
+	policyBody, err := os.ReadFile(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policyJSON map[string]any
+	if err := json.Unmarshal(policyBody, &policyJSON); err != nil {
+		t.Fatal(err)
+	}
+	rules := policyJSON["rules"].([]any)
+	rules[1].(map[string]any)["action"] = "allow"
+	unprotected := filepath.Join(t.TempDir(), "unprotected.json")
+	unprotectedBody, err := json.Marshal(policyJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unprotected, unprotectedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", unprotected, name, host,
+	).CombinedOutput(); err == nil {
+		t.Fatalf("policy with an allow fallback was accepted:\n%s", output)
+	}
+
+	wrongTokenPath := filepath.Join(t.TempDir(), "wrong-token")
+	if err := os.WriteFile(wrongTokenPath, []byte(strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host, "--token-file", wrongTokenPath,
+	).CombinedOutput(); err == nil {
+		t.Fatalf("policy accepted the wrong canary token:\n%s", output)
+	}
+}
+
+func TestGCPFrontReadinessProbeChecksDeniedAndAuthenticatedCanaries(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	probe := filepath.Join(repoRoot, "deploy", "gcp", "probe-front-readiness.sh")
+	fakeBin := t.TempDir()
+	capture := filepath.Join(t.TempDir(), "curl-configs")
+	fakeCurl := filepath.Join(fakeBin, "curl")
+	writeExecutableTestFile(t, fakeCurl, `#!/bin/sh
+body="$(cat)"
+printf '%s\n--request--\n' "$body" >>"$PROBE_CAPTURE"
+if printf '%s\n' "$body" | grep -q 'X-Subrouter-Canary-Token:'; then printf 400; else printf 403; fi
+`)
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/bin/sh
+printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
+`)
+	cloudConfig := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(cloudConfig, []byte(`{"tenantKey":"srt_1234567890abcdef"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte(strings.Repeat("c", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(mustLookPath(t, "bash"), probe)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PROBE_CAPTURE="+capture,
+		"GCLOUD_BIN="+fakeGcloud,
+		"SUBROUTER_GCP_PROJECT=test-project",
+		"SUBROUTER_GCP_FRONT_BACKEND_SERVICE=front-backend",
+		"SUBROUTER_CANARY_PUBLIC_BASE_URL=https://staging.example.test",
+		"SUBROUTER_CANARY_HOST=front-canary.staging.sr.cmux.internal",
+		"SUBROUTER_CLOUD_CONFIG="+cloudConfig,
+		"SUBROUTER_CANARY_SESSION=canary-test-1",
+		"SUBROUTER_CANARY_TOKEN_FILE="+tokenPath,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("paired front readiness probe failed: %v\n%s", err, output)
+	}
+	var health []map[string]any
+	if err := json.Unmarshal(output, &health); err != nil || len(health) != 1 {
+		t.Fatalf("probe did not emit backend health: %v\n%s", err, output)
+	}
+	captured, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(captured)
+	if strings.Count(body, "--request--") != 2 ||
+		strings.Count(body, "X-Subrouter-Canary-Token:") != 1 ||
+		!strings.Contains(body, "X-Subrouter-Session: canary-test-1-denied") ||
+		!strings.Contains(body, "X-Subrouter-Session: canary-test-1") {
+		t.Fatalf("probe did not pair denied and authenticated canaries:\n%s", body)
+	}
+}
+
 func TestGCPBackendHealthRequiresEveryStatusStableAcrossTheWindow(t *testing.T) {
 	requireDeployScriptTools(t, "python3", "sh")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
