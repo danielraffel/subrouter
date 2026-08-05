@@ -235,7 +235,7 @@ func fakeAction(args []string) {
 			"destination_proof": map[string]any{
 				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge,
 				"connection_id": proof.ConnectionID, "session_id": proof.SessionID,
-				"original_continuity_verified": true, "fresh_public_connection": true,
+				"original_continuity_verified": true, "fresh_public_connection": true, "journal_correlated": true,
 				"observed_at": activated.Format(time.RFC3339Nano), "received_at": proofReceived.Format(time.RFC3339Nano),
 			},
 			"source": map[string]any{

@@ -934,6 +934,12 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         "destination_proof.original_continuity_verified",
     )
     exact(
+        boolean(field(proof, "journal_correlated", "destination_proof"),
+                "destination_proof.journal_correlated"),
+        True,
+        "destination_proof.journal_correlated",
+    )
+    exact(
         timestamp(field(proof, "observed_at", "destination_proof"), "destination_proof.observed_at"),
         activated,
         "destination_proof.observed_at",
@@ -989,15 +995,15 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     delta = integer(
         field(destination, "connection_count_delta", "destination"),
         "destination.connection_count_delta",
-        minimum=1,
+        minimum=-(1 << 63),
     )
     exact(
         delta,
         destination_after["generation_connections"] - destination_before["generation_connections"],
         "destination.connection_count_delta",
     )
-    if destination_after["public_connections"] < destination_before["public_connections"] + 1:
-        fail("destination public connection count did not increase for the golden proof")
+    if destination_after["public_connections"] < 1 or destination_after["generation_connections"] < 1:
+        fail("destination had no live connection after the journal-correlated golden proof")
     metrics = obj(field(document, "metrics", "root"), "metrics")
     exact(
         field(metrics, "source_service", "metrics"),

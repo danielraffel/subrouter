@@ -91,6 +91,21 @@ func TestGoldenMigrationAllowsConcurrentDestinationConnectionDrain(t *testing.T)
 	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err != nil {
 		t.Fatalf("Python validator rejected journal-correlated destination proof after concurrent drains: %v: %s", err, output)
 	}
+
+	evidence.DestinationProof.JournalCorrelated = false
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted a destination proof without journal correlation")
+	}
+	data, err = json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted a destination proof without journal correlation: %s", output)
+	}
 }
 
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
@@ -958,7 +973,7 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 	evidence.DestinationProof = goldenMigrationDestinationProof{
 		SHA256: strings.Repeat("8", 64), Challenge: strings.Repeat("9", 32), ConnectionID: strings.Repeat("a", 64),
 		SessionID:                  "golden-session",
-		OriginalContinuityVerified: true, FreshPublicConnection: true,
+		OriginalContinuityVerified: true, FreshPublicConnection: true, JournalCorrelated: true,
 		ObservedAt: "2026-08-02T00:00:01Z", ReceivedAt: "2026-08-02T00:00:01.5Z",
 	}
 	legacyMetrics := goldenMigrationLegacyMetrics{

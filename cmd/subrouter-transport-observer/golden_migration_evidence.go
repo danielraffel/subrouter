@@ -145,6 +145,7 @@ type goldenMigrationDestinationProof struct {
 	SessionID                  string `json:"session_id"`
 	OriginalContinuityVerified bool   `json:"original_continuity_verified"`
 	FreshPublicConnection      bool   `json:"fresh_public_connection"`
+	JournalCorrelated          bool   `json:"journal_correlated"`
 	ObservedAt                 string `json:"observed_at"`
 	ReceivedAt                 string `json:"received_at"`
 }
@@ -466,9 +467,8 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 	if evidence.Destination.Before.Generation == "" ||
 		evidence.Destination.Before.Generation != evidence.Destination.After.Generation ||
 		evidence.Destination.Before.InactiveConnections != 0 || evidence.Destination.After.InactiveConnections != 0 ||
-		evidence.Destination.ConnectionCountDelta < 1 ||
 		evidence.Destination.After.GenerationConnections-evidence.Destination.Before.GenerationConnections != evidence.Destination.ConnectionCountDelta ||
-		evidence.Destination.After.PublicConnections < evidence.Destination.Before.PublicConnections+1 {
+		evidence.Destination.After.PublicConnections < 1 || evidence.Destination.After.GenerationConnections < 1 {
 		return failGolden("migration_destination_connection_count_invalid")
 	}
 	requested, activated, err := goldenPhaseDurationWithin(
@@ -485,7 +485,7 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 		!validGoldenSHA256(evidence.DestinationProof.SHA256) || !validGoldenChallenge(evidence.DestinationProof.Challenge) ||
 		!validGoldenSHA256(evidence.DestinationProof.ConnectionID) || !validGoldenOpaqueID(evidence.DestinationProof.SessionID) ||
 		!evidence.DestinationProof.OriginalContinuityVerified ||
-		!evidence.DestinationProof.FreshPublicConnection {
+		!evidence.DestinationProof.FreshPublicConnection || !evidence.DestinationProof.JournalCorrelated {
 		return failGolden("migration_destination_proof_invalid")
 	}
 	if err := validateGoldenMigrationMetrics(evidence); err != nil {

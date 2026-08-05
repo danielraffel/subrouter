@@ -431,9 +431,13 @@ done
 [[ "${destination_correlated}" == true ]] \
   || die "golden fresh public session did not reach the destination within ${proof_max_attempts} attempts"
 destination_after="$(supervisor_snapshot "${destination_kind}")"
-jq -e --arg generation "${destination_generation}" --argjson before "${destination_before}" \
-  '.generation == $generation and .public_connections >= ($before.public_connections + 1) and
-   .generation_connections >= ($before.generation_connections + 1) and .inactive_connections == 0' \
+# Earlier proof attempts drain asynchronously, so their departures can hide the
+# accepted proof in an aggregate before/after delta. The journal match above
+# correlates the exact session; this snapshot proves it is still live on the
+# expected generation.
+jq -e --arg generation "${destination_generation}" \
+  '.generation == $generation and .public_connections >= 1 and
+   .generation_connections >= 1 and .inactive_connections == 0' \
   < <(stream_shell_value "${destination_after}") >/dev/null \
   || die "golden fresh public connection was not correlated to the destination generation"
 destination_connection_delta="$(( $(jq -r '.generation_connections' < <(stream_shell_value "${destination_after}")) - $(jq -r '.generation_connections' < <(stream_shell_value "${destination_before}")) ))"
@@ -501,7 +505,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
       evidence_emitted_at:$emitted_at},
     destination_proof:{sha256:$proof_sha,challenge:$challenge,connection_id:$connection_id,
       session_id:$session_id,
-      original_continuity_verified:true,fresh_public_connection:true,
+      original_continuity_verified:true,fresh_public_connection:true,journal_correlated:true,
       observed_at:$activated_at,received_at:$proof_received_at},
     destination:{before:$destination_before,after:$destination_after,
       connection_count_delta:$destination_delta},
