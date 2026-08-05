@@ -1863,6 +1863,29 @@ func TestDeploymentContractValidatesGoldenTransitionProofs(t *testing.T) {
 	if output, err := run(proofArgs...); err == nil {
 		t.Fatalf("empty destination session succeeded: %s", output)
 	}
+
+	liveness := filepath.Join(t.TempDir(), "liveness.json")
+	connectionID := strings.Repeat("b", 64)
+	snapshotSHA := strings.Repeat("c", 64)
+	livenessBody := fmt.Sprintf(`{"schema":"subrouter.gcp.destination-liveness/v1","challenge":"challenge","operation":"final-cutover","destination":"front","destination_generation":"generation-b","connection_id":%q,"session_id":"session-id","destination_snapshot_sha256":%q,"requested_at":"2026-08-03T10:01:00Z","response_chunk_at":"2026-08-03T10:01:00.500Z"}`, connectionID, snapshotSHA)
+	if err := os.WriteFile(liveness, []byte(livenessBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	livenessArgs := []string{
+		"validate-destination-liveness", liveness, "challenge", "final-cutover", "front", "generation-b",
+		connectionID, "session-id", snapshotSHA, "2026-08-03T10:01:00Z", "2026-08-03T10:01:00.750Z",
+	}
+	if output, err := run(livenessArgs...); err != nil || len(output) != 0 {
+		t.Fatalf("destination liveness result = %q, %v", output, err)
+	}
+	lateLiveness := strings.Replace(livenessBody, "10:01:00.500Z", "10:01:10.000Z", 1)
+	if err := os.WriteFile(liveness, []byte(lateLiveness), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	livenessArgs[len(livenessArgs)-1] = "2026-08-03T10:01:10.000Z"
+	if output, err := run(livenessArgs...); err == nil {
+		t.Fatalf("ten-second destination liveness boundary succeeded: %s", output)
+	}
 }
 
 func TestDeploymentContractProbesSlotEndpoint(t *testing.T) {

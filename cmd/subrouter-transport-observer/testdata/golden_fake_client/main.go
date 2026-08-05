@@ -203,6 +203,53 @@ func fakeAction(args []string) {
 		}
 		proofReceived := time.Now().UTC()
 		proofDigest := sha256.Sum256(proofData)
+		destinationAfter := map[string]any{
+			"kind": destination, "generation": destinationGeneration,
+			"public_connections": 1, "generation_connections": 1, "inactive_connections": 0,
+		}
+		destinationSnapshotData, err := json.Marshal(destinationAfter)
+		if err != nil {
+			os.Exit(9)
+		}
+		destinationSnapshotDigest := sha256.Sum256(destinationSnapshotData)
+		destinationSnapshotSHA := fmt.Sprintf("%x", destinationSnapshotDigest[:])
+		livenessChallenge := strings.Repeat("7", 32)
+		livenessRequested := time.Now().UTC()
+		livenessRequest := map[string]any{
+			"schema": "subrouter.gcp.destination-liveness-request/v1", "challenge": livenessChallenge,
+			"operation": migrationOperation, "destination": destination,
+			"destination_generation": destinationGeneration, "connection_id": proof.ConnectionID,
+			"session_id": proof.SessionID, "destination_snapshot_sha256": destinationSnapshotSHA,
+			"requested_at": livenessRequested.Format(time.RFC3339Nano),
+		}
+		livenessRequestPath := proofPath + ".liveness-request"
+		livenessProofPath := proofPath + ".liveness-proof"
+		if fakeWriteJSON(livenessRequestPath, livenessRequest) != nil {
+			os.Exit(9)
+		}
+		livenessProofData, err := fakeWaitFile(livenessProofPath, 10*time.Second)
+		var livenessProof struct {
+			Schema                    string `json:"schema"`
+			Challenge                 string `json:"challenge"`
+			ConnectionID              string `json:"connection_id"`
+			SessionID                 string `json:"session_id"`
+			DestinationSnapshotSHA256 string `json:"destination_snapshot_sha256"`
+			RequestedAt               string `json:"requested_at"`
+			ResponseChunkAt           string `json:"response_chunk_at"`
+		}
+		if err != nil || json.Unmarshal(livenessProofData, &livenessProof) != nil ||
+			livenessProof.Schema != "subrouter.gcp.destination-liveness/v1" ||
+			livenessProof.Challenge != livenessChallenge || livenessProof.ConnectionID != proof.ConnectionID ||
+			livenessProof.SessionID != proof.SessionID ||
+			livenessProof.DestinationSnapshotSHA256 != destinationSnapshotSHA ||
+			livenessProof.RequestedAt != livenessRequested.Format(time.RFC3339Nano) {
+			os.Exit(9)
+		}
+		livenessReceived := time.Now().UTC()
+		if _, err := time.Parse(time.RFC3339Nano, livenessProof.ResponseChunkAt); err != nil {
+			os.Exit(9)
+		}
+		livenessProofDigest := sha256.Sum256(livenessProofData)
 		predecessorLinux := "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323"
 		legacy := map[string]any{"service": "subrouter.service", "generation": "legacy-generation", "checksum": predecessorLinux}
 		front := map[string]any{"slot": "slot-a", "generation": "front-generation", "checksum": candidate, "control_checksum": candidate, "worker_checksum": goldenFakeBootstrapSHA256}
@@ -235,15 +282,23 @@ func fakeAction(args []string) {
 			"destination_proof": map[string]any{
 				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge,
 				"connection_id": proof.ConnectionID, "session_id": proof.SessionID,
-				"original_continuity_verified": true, "fresh_public_connection": true,
+				"original_continuity_verified": true, "fresh_public_connection": true, "journal_correlated": true,
 				"observed_at": activated.Format(time.RFC3339Nano), "received_at": proofReceived.Format(time.RFC3339Nano),
+				"post_snapshot_liveness": map[string]any{
+					"sha256": fmt.Sprintf("%x", livenessProofDigest[:]), "challenge": livenessChallenge,
+					"connection_id": proof.ConnectionID, "session_id": proof.SessionID,
+					"destination_snapshot_sha256": destinationSnapshotSHA,
+					"requested_at":                livenessRequested.Format(time.RFC3339Nano),
+					"response_chunk_at":           livenessProof.ResponseChunkAt,
+					"received_at":                 livenessReceived.Format(time.RFC3339Nano),
+				},
 			},
 			"source": map[string]any{
 				"before": snapshot(source, sourceGeneration, expected), "after": snapshot(source, sourceGeneration, expected),
 				"accepting_new_public_before": true, "accepting_new_public_after": false,
 			},
 			"destination": map[string]any{
-				"before": snapshot(destination, destinationGeneration, 0), "after": snapshot(destination, destinationGeneration, 1),
+				"before": snapshot(destination, destinationGeneration, 0), "after": destinationAfter,
 				"connection_count_delta": 1,
 			},
 			"metrics": map[string]any{

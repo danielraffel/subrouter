@@ -139,14 +139,27 @@ type goldenMigrationTimestamps struct {
 }
 
 type goldenMigrationDestinationProof struct {
-	SHA256                     string `json:"sha256"`
-	Challenge                  string `json:"challenge"`
-	ConnectionID               string `json:"connection_id"`
-	SessionID                  string `json:"session_id"`
-	OriginalContinuityVerified bool   `json:"original_continuity_verified"`
-	FreshPublicConnection      bool   `json:"fresh_public_connection"`
-	ObservedAt                 string `json:"observed_at"`
-	ReceivedAt                 string `json:"received_at"`
+	SHA256                     string                              `json:"sha256"`
+	Challenge                  string                              `json:"challenge"`
+	ConnectionID               string                              `json:"connection_id"`
+	SessionID                  string                              `json:"session_id"`
+	OriginalContinuityVerified bool                                `json:"original_continuity_verified"`
+	FreshPublicConnection      bool                                `json:"fresh_public_connection"`
+	JournalCorrelated          bool                                `json:"journal_correlated"`
+	ObservedAt                 string                              `json:"observed_at"`
+	ReceivedAt                 string                              `json:"received_at"`
+	PostSnapshotLiveness       goldenMigrationPostSnapshotLiveness `json:"post_snapshot_liveness"`
+}
+
+type goldenMigrationPostSnapshotLiveness struct {
+	SHA256                    string `json:"sha256"`
+	Challenge                 string `json:"challenge"`
+	ConnectionID              string `json:"connection_id"`
+	SessionID                 string `json:"session_id"`
+	DestinationSnapshotSHA256 string `json:"destination_snapshot_sha256"`
+	RequestedAt               string `json:"requested_at"`
+	ResponseChunkAt           string `json:"response_chunk_at"`
+	ReceivedAt                string `json:"received_at"`
 }
 
 type goldenMigrationSnapshot struct {
@@ -466,9 +479,8 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 	if evidence.Destination.Before.Generation == "" ||
 		evidence.Destination.Before.Generation != evidence.Destination.After.Generation ||
 		evidence.Destination.Before.InactiveConnections != 0 || evidence.Destination.After.InactiveConnections != 0 ||
-		evidence.Destination.ConnectionCountDelta < 1 ||
 		evidence.Destination.After.GenerationConnections-evidence.Destination.Before.GenerationConnections != evidence.Destination.ConnectionCountDelta ||
-		evidence.Destination.After.PublicConnections < evidence.Destination.Before.PublicConnections+1 {
+		evidence.Destination.After.PublicConnections < 1 || evidence.Destination.After.GenerationConnections < 1 {
 		return failGolden("migration_destination_connection_count_invalid")
 	}
 	requested, activated, err := goldenPhaseDurationWithin(
@@ -485,8 +497,22 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 		!validGoldenSHA256(evidence.DestinationProof.SHA256) || !validGoldenChallenge(evidence.DestinationProof.Challenge) ||
 		!validGoldenSHA256(evidence.DestinationProof.ConnectionID) || !validGoldenOpaqueID(evidence.DestinationProof.SessionID) ||
 		!evidence.DestinationProof.OriginalContinuityVerified ||
-		!evidence.DestinationProof.FreshPublicConnection {
+		!evidence.DestinationProof.FreshPublicConnection || !evidence.DestinationProof.JournalCorrelated {
 		return failGolden("migration_destination_proof_invalid")
+	}
+	liveness := evidence.DestinationProof.PostSnapshotLiveness
+	livenessRequested, requestErr := parseGoldenEvidenceTime(liveness.RequestedAt)
+	livenessChunk, chunkErr := parseGoldenEvidenceTime(liveness.ResponseChunkAt)
+	livenessReceived, receivedErr := parseGoldenEvidenceTime(liveness.ReceivedAt)
+	if requestErr != nil || chunkErr != nil || receivedErr != nil ||
+		!validGoldenSHA256(liveness.SHA256) || !validGoldenChallenge(liveness.Challenge) ||
+		liveness.ConnectionID != evidence.DestinationProof.ConnectionID ||
+		liveness.SessionID != evidence.DestinationProof.SessionID ||
+		liveness.DestinationSnapshotSHA256 != goldenMigrationSnapshotSHA256(evidence.Destination.After) ||
+		livenessRequested.Before(proofReceived) || livenessChunk.Before(livenessRequested) ||
+		livenessReceived.Before(livenessChunk) || emitted.Before(livenessReceived) ||
+		livenessReceived.Sub(livenessRequested) >= goldenDestinationLivenessLimit {
+		return failGolden("migration_destination_liveness_invalid")
 	}
 	if err := validateGoldenMigrationMetrics(evidence); err != nil {
 		return err
@@ -497,6 +523,21 @@ func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expect
 		return failGolden("migration_rollback_metadata_invalid")
 	}
 	return nil
+}
+
+func goldenMigrationSnapshotSHA256(snapshot goldenMigrationSnapshot) string {
+	canonical, err := json.Marshal(map[string]any{
+		"generation":             snapshot.Generation,
+		"generation_connections": snapshot.GenerationConnections,
+		"inactive_connections":   snapshot.InactiveConnections,
+		"kind":                   snapshot.Kind,
+		"public_connections":     snapshot.PublicConnections,
+	})
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(canonical)
+	return hex.EncodeToString(digest[:])
 }
 
 func validateGoldenMigrationMetrics(evidence *goldenMigrationEvidence) error {

@@ -436,6 +436,42 @@ def command_validate_destination_proof(args: argparse.Namespace) -> None:
     )
 
 
+def command_validate_destination_liveness(args: argparse.Namespace) -> None:
+    if re.fullmatch(r"[0-9a-f]{64}", args.connection_id) is None:
+        fail("destination liveness connection_id is invalid")
+    if re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", args.session_id) is None:
+        fail("destination liveness session_id is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", args.destination_snapshot_sha256) is None:
+        fail("destination liveness snapshot SHA-256 is invalid")
+    document = load_json(args.path, "destination liveness proof")
+    expect_exact(
+        document,
+        {
+            "schema": "subrouter.gcp.destination-liveness/v1",
+            "challenge": args.challenge,
+            "operation": args.operation,
+            "destination": args.destination,
+            "destination_generation": args.destination_generation,
+            "connection_id": args.connection_id,
+            "session_id": args.session_id,
+            "destination_snapshot_sha256": args.destination_snapshot_sha256,
+            "requested_at": args.requested_at,
+        },
+        "destination liveness proof",
+    )
+    requested = parse_timestamp(args.requested_at, "destination liveness requested time")
+    response_chunk = parse_timestamp(document.get("response_chunk_at"), "destination liveness response chunk time")
+    received = parse_timestamp(args.received_at, "destination liveness received time")
+    validate_ordered_window(
+        requested,
+        requested,
+        response_chunk,
+        received,
+        "destination liveness proof",
+        timedelta(seconds=10),
+    )
+
+
 def add_path(parser: argparse.ArgumentParser, name: str) -> None:
     parser.add_argument(name, type=Path)
 
@@ -528,6 +564,19 @@ def build_parser() -> argparse.ArgumentParser:
     proof.add_argument("requested_at")
     proof.add_argument("received_at")
     proof.set_defaults(handler=command_validate_destination_proof)
+
+    liveness = commands.add_parser("validate-destination-liveness")
+    add_path(liveness, "path")
+    liveness.add_argument("challenge")
+    liveness.add_argument("operation")
+    liveness.add_argument("destination")
+    liveness.add_argument("destination_generation")
+    liveness.add_argument("connection_id")
+    liveness.add_argument("session_id")
+    liveness.add_argument("destination_snapshot_sha256")
+    liveness.add_argument("requested_at")
+    liveness.add_argument("received_at")
+    liveness.set_defaults(handler=command_validate_destination_liveness)
 
     return parser
 
