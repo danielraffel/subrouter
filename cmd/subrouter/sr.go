@@ -747,7 +747,7 @@ func (r srRunner) status(ctx context.Context) error {
 		return err
 	}
 	switch config.EffectiveCredentialSource() {
-	case broker.CredentialSourceTeam:
+	case broker.CredentialSourceTeam, broker.CredentialSourceHosted:
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
@@ -827,7 +827,7 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 		return err
 	}
 	switch config.EffectiveCredentialSource() {
-	case broker.CredentialSourceTeam:
+	case broker.CredentialSourceTeam, broker.CredentialSourceHosted:
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
