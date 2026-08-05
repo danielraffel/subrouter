@@ -196,7 +196,7 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 
 	shortCanary := clone(valid)
 	shortCanaryProof := shortCanary["routing"].(map[string]any)["canary"].(map[string]any)
-	shortCanaryProof["verified_at"] = "2026-08-02T00:04:59.999Z"
+	shortCanaryProof["first_observed_at"] = "2026-08-02T00:00:00.001Z"
 	shortCanaryProof["stable_duration_ms"] = 299_999
 	if err := validateGo(shortCanary); err == nil {
 		t.Fatal("Go validator accepted a sub-five-minute front canary proof")
