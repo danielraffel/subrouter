@@ -1993,16 +1993,23 @@ func waitGoldenObserverRequestConnectionsClosed(ctx context.Context, stats *obse
 		return failGolden("observer_stats_missing")
 	}
 	for {
-		requests, _, observerErrors := stats.snapshot()
-		if observerErrors != 0 {
-			return failGolden("observer_evidence_error")
-		}
+		requests, _, _ := stats.snapshot()
 		requestConnections := make(map[string]struct{})
+		responseRequests := make(map[string]struct{})
 		for _, request := range requests {
 			if request.ConnectionID == "" {
 				return failGolden("observer_request_connection_missing")
 			}
 			requestConnections[request.ConnectionID] = struct{}{}
+			if request.Path == "/v1/responses" || request.Path == "/responses" {
+				responseRequests[request.RequestID+"\x00"+request.ConnectionID] = struct{}{}
+			}
+		}
+		if observerScopedErrorCount(stats, func(event transportEvent) bool {
+			_, relevant := responseRequests[event.RequestID+"\x00"+event.ConnectionID]
+			return relevant
+		}) != 0 {
+			return failGolden("observer_evidence_error")
 		}
 		opened := make(map[string]int)
 		for _, connection := range stats.openedSnapshot() {
@@ -3023,6 +3030,26 @@ func responseRequests(stats *observerStats) []transportEvent {
 	return result
 }
 
+func observerScopedErrorCount(stats *observerStats, matchesProxyError func(transportEvent) bool) int {
+	if stats == nil {
+		return 1
+	}
+	count := 0
+	for _, event := range stats.errorSnapshot() {
+		if event.Kind == "recording_error" ||
+			(event.Kind == "proxy_error" && matchesProxyError != nil && matchesProxyError(event)) {
+			count++
+		}
+	}
+	return count
+}
+
+func observerResponseErrorCount(stats *observerStats) int {
+	return observerScopedErrorCount(stats, func(event transportEvent) bool {
+		return event.Path == "/v1/responses" || event.Path == "/responses"
+	})
+}
+
 func goldenSessionResponseChunks(session *goldenSession) []transportEvent {
 	if session == nil || session.observer == nil || session.observer.stats == nil {
 		return nil
@@ -3237,8 +3264,8 @@ func validateObserverTurns(sessions []*goldenSession, expectedRequests int) erro
 		if _, err := validatedGoldenResponseRequests(session, expectedRequests); err != nil {
 			return err
 		}
-		_, chunks, proxyErrors := session.observer.stats.snapshot()
-		if proxyErrors != 0 {
+		_, chunks, _ := session.observer.stats.snapshot()
+		if observerResponseErrorCount(session.observer.stats) != 0 {
 			return failGolden("observer_proxy_error")
 		}
 		responseBytes := int64(0)
@@ -4281,12 +4308,13 @@ func summarizeGoldenSession(session, resume *goldenSession, _ int, before, after
 		requests []transportEvent
 		chunks   []transportEvent
 	}
-	requests, chunks, proxyErrors := session.observer.stats.snapshot()
+	requests, chunks, _ := session.observer.stats.snapshot()
+	proxyErrors := observerResponseErrorCount(session.observer.stats)
 	snapshots := []observerSnapshot{{scope: "initial", requests: requests, chunks: chunks}}
 	if resume != nil && resume.observer != nil && resume.observer != session.observer {
-		resumeRequests, resumeChunks, resumeProxyErrors := resume.observer.stats.snapshot()
+		resumeRequests, resumeChunks, _ := resume.observer.stats.snapshot()
 		snapshots = append(snapshots, observerSnapshot{scope: "resume", requests: resumeRequests, chunks: resumeChunks})
-		proxyErrors += resumeProxyErrors
+		proxyErrors += observerResponseErrorCount(resume.observer.stats)
 	}
 	responseRequests := 0
 	connections := make(map[string]bool)

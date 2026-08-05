@@ -194,6 +194,110 @@ func TestGoldenMigrationPostSnapshotLivenessUsesExactTransportConnection(t *test
 	}
 }
 
+func TestGoldenMigrationPostSnapshotLivenessIgnoresUnrelatedRequestErrors(t *testing.T) {
+	connectionID := strings.Repeat("a", 64)
+	requestID := "request-response"
+	boundary := time.Now().UTC()
+	want := boundary.Add(time.Millisecond)
+	stats := newObserverStats()
+	session := &goldenSession{
+		observer: &runningGoldenObserver{stats: stats},
+		done:     make(chan struct{}),
+	}
+	stats.observe(transportEvent{
+		Kind: "request_started", Transport: "http", Method: "POST", Path: "/v1/responses",
+		RequestID: requestID, ConnectionID: connectionID, Timestamp: boundary.Add(-time.Millisecond).Format(time.RFC3339Nano),
+	})
+	stats.observe(transportEvent{
+		Kind: "proxy_error", Transport: "http", Method: "GET", Path: "/other",
+		RequestID: "request-metadata", ConnectionID: strings.Repeat("b", 64),
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: want.Format(time.RFC3339Nano),
+		Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 8,
+	})
+
+	got, err := waitGoldenConnectionResponseChunkAfter(context.Background(), session, connectionID, boundary)
+	if err != nil {
+		t.Fatalf("unrelated request error invalidated exact connection liveness: %v", err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("response chunk timestamp = %s, want %s", got, want)
+	}
+}
+
+func TestGoldenResponseValidationScopesObserverErrors(t *testing.T) {
+	newSession := func(errorEvent transportEvent) *goldenSession {
+		stats := newObserverStats()
+		connectionID := strings.Repeat("a", 64)
+		requestID := "request-response"
+		stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Transport: "http", Method: "POST", Path: "/v1/responses",
+			RequestID: requestID, ConnectionID: connectionID,
+		})
+		stats.observe(transportEvent{
+			Kind: "response_chunk", Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 8,
+		})
+		stats.observe(errorEvent)
+		return &goldenSession{
+			transport: "http", observer: &runningGoldenObserver{stats: stats}, done: make(chan struct{}),
+		}
+	}
+
+	unrelated := newSession(transportEvent{
+		Kind: "proxy_error", Path: "/other", RequestID: "request-metadata", ConnectionID: strings.Repeat("b", 64),
+	})
+	if err := validateObserverTurns([]*goldenSession{unrelated}, 1); err != nil {
+		t.Fatalf("unrelated request error invalidated the response turn: %v", err)
+	}
+
+	responseFailure := newSession(transportEvent{
+		Kind: "proxy_error", Path: "/v1/responses", RequestID: "request-response", ConnectionID: strings.Repeat("a", 64),
+	})
+	if err := validateObserverTurns([]*goldenSession{responseFailure}, 1); err == nil {
+		t.Fatal("response request proxy error was ignored")
+	}
+
+	recordingFailure := newSession(transportEvent{Kind: "recording_error"})
+	if err := validateObserverTurns([]*goldenSession{recordingFailure}, 1); err == nil {
+		t.Fatal("global evidence recording error was ignored")
+	}
+}
+
+func TestGoldenObserverClosureScopesErrorsToResponseRequests(t *testing.T) {
+	newStats := func(errorEvent transportEvent) *observerStats {
+		stats := newObserverStats()
+		for _, event := range []transportEvent{
+			{Kind: "connection_opened", ConnectionID: "response-connection"},
+			{Kind: "connection_opened", ConnectionID: "metadata-connection"},
+			{Kind: "request_started", Path: "/v1/responses", RequestID: "response-request", ConnectionID: "response-connection"},
+			{Kind: "request_started", Path: "/other", RequestID: "metadata-request", ConnectionID: "metadata-connection"},
+			errorEvent,
+			{Kind: "connection_closed", ConnectionID: "response-connection"},
+			{Kind: "connection_closed", ConnectionID: "metadata-connection"},
+		} {
+			stats.observe(event)
+		}
+		return stats
+	}
+
+	unrelated := newStats(transportEvent{
+		Kind: "proxy_error", Path: "/other", RequestID: "metadata-request", ConnectionID: "metadata-connection",
+	})
+	if err := waitGoldenObserverRequestConnectionsClosed(context.Background(), unrelated); err != nil {
+		t.Fatalf("unrelated request error invalidated observer closure: %v", err)
+	}
+
+	responseFailure := newStats(transportEvent{
+		Kind: "proxy_error", Path: "/v1/responses", RequestID: "response-request", ConnectionID: "response-connection",
+	})
+	if err := waitGoldenObserverRequestConnectionsClosed(context.Background(), responseFailure); err == nil {
+		t.Fatal("response request proxy error was ignored during observer closure")
+	}
+}
+
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
