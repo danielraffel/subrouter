@@ -206,19 +206,25 @@ func fakeAction(args []string) {
 		legacyMetric := map[string]any{"nrestarts": map[string]any{"before": 0, "after": 0}, "oom_kill": map[string]any{"before": 0, "after": 0}, "run_scoped_peak_rss_bytes": 1 << 20, "rss_limit_bytes": 192 << 20}
 		slotMetric := metric(192 << 20)
 		slotMetric["id"] = "slot-a"
+		priorRouting, ok := prior["routing"].(map[string]any)
+		if !ok {
+			os.Exit(9)
+		}
+		routing := make(map[string]any, len(priorRouting)+4)
+		for key, value := range priorRouting {
+			routing[key] = value
+		}
+		routing["before"] = source
+		routing["after"] = destination
+		routing["source_backend_url"] = map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source]
+		routing["destination_backend_url"] = map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[destination]
 		evidence = map[string]any{
 			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": evidenceType, "mode": mode, "success": true,
 			"prior_evidence_type": priorType, "prior_evidence_sha256": priorSHA, "preparation_evidence_sha256": preparationSHA,
-			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "subrouter-staging"},
 			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
-			"routing": map[string]any{
-				"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
-				"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test",
-				"before": source, "after": destination,
-				"source_backend_url":      map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source],
-				"destination_backend_url": map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[destination],
-			},
-			"legacy": legacy, "front": front,
+			"routing": routing,
+			"legacy":  legacy, "front": front,
 			"timestamps": map[string]any{"transition_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
 			"destination_proof": map[string]any{
 				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge,

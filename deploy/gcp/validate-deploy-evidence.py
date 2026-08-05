@@ -166,6 +166,33 @@ def validate_run(value: Any) -> dict[str, Any]:
     return result
 
 
+def validate_migration_routing_selectors(
+    run: dict[str, Any], routing: dict[str, Any], front_url: str
+) -> dict[str, Any]:
+    expected_routing = {
+        "subrouter-staging": (
+            "staging-subrouter",
+            "staging-subrouter-front-canary",
+            "front-canary.staging.sr.cmux.internal",
+        ),
+        "subrouter-team": (
+            "__root__",
+            "subrouter-front-canary",
+            "front-canary.sr.cmux.internal",
+        ),
+    }
+    target = expected_routing.get(run["instance"])
+    if target is None:
+        fail("front migration targets an unsupported instance")
+    active_matcher, canary_matcher, canary_host = target
+    exact(field(routing, "active_matcher", "routing"), active_matcher, "routing.active_matcher")
+    canary = obj(field(routing, "canary", "routing"), "routing.canary")
+    exact(field(canary, "host", "routing.canary"), canary_host, "routing.canary.host")
+    exact(field(canary, "matcher", "routing.canary"), canary_matcher, "routing.canary.matcher")
+    exact(field(canary, "backend_url", "routing.canary"), front_url, "routing.canary.backend_url")
+    return canary
+
+
 def validate_release(value: Any) -> dict[str, Any]:
     result = obj(value, "release")
     tag = text(field(result, "tag", "release"), "release.tag")
@@ -616,27 +643,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
         fail("migration backend URLs must be distinct HTTPS resources")
     exact(field(routing, "current", "routing"), "legacy", "routing.current")
-    expected_routing = {
-        "subrouter-staging": (
-            "staging-subrouter",
-            "staging-subrouter-front-canary",
-            "front-canary.staging.sr.cmux.internal",
-        ),
-        "subrouter-team": (
-            "__root__",
-            "subrouter-front-canary",
-            "front-canary.sr.cmux.internal",
-        ),
-    }
-    target = expected_routing.get(run["instance"])
-    if target is None:
-        fail("front migration preparation targets an unsupported instance")
-    active_matcher, canary_matcher, canary_host = target
-    exact(field(routing, "active_matcher", "routing"), active_matcher, "routing.active_matcher")
-    canary = obj(field(routing, "canary", "routing"), "routing.canary")
-    exact(field(canary, "host", "routing.canary"), canary_host, "routing.canary.host")
-    exact(field(canary, "matcher", "routing.canary"), canary_matcher, "routing.canary.matcher")
-    exact(field(canary, "backend_url", "routing.canary"), front_url, "routing.canary.backend_url")
+    canary = validate_migration_routing_selectors(run, routing, front_url)
     map_updated_at = timestamp(
         field(canary, "map_updated_at", "routing.canary"),
         "routing.canary.map_updated_at",
@@ -773,7 +780,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     exact(field(document, "prior_evidence_type", "root"), expected_prior, "prior_evidence_type")
     sha(field(document, "prior_evidence_sha256", "root"), "prior_evidence_sha256")
     sha(field(document, "preparation_evidence_sha256", "root"), "preparation_evidence_sha256")
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
@@ -785,6 +792,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         text(field(routing, name, "routing"), f"routing.{name}")
     legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
     front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    validate_migration_routing_selectors(run, routing, front_url)
     exact(field(routing, "before", "routing"), source_kind, "routing.before")
     exact(field(routing, "after", "routing"), destination_kind, "routing.after")
     expected_source_url = legacy_url if source_kind == "legacy" else front_url

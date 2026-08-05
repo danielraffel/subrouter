@@ -43,6 +43,39 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	}
 }
 
+func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	validatePython := func(value *goldenMigrationEvidence) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "transition.json")
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return err
+		}
+		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+		return exec.Command("python3", validator, "--expect", "front-migration-cutover", path).Run()
+	}
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
+		t.Fatalf("Go validator rejected valid routing selectors: %v", err)
+	}
+	if err := validatePython(evidence); err != nil {
+		t.Fatalf("Python validator rejected valid routing selectors: %v", err)
+	}
+
+	evidence.Routing.ActiveMatcher = "attacker-route"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted retargeted routing selectors")
+	}
+	if err := validatePython(evidence); err == nil {
+		t.Fatal("Python validator accepted retargeted routing selectors")
+	}
+}
+
 func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHealth(t *testing.T) {
 	document := func() map[string]any {
 		evidence := validGoldenMigrationPreparationEvidence()
@@ -701,6 +734,15 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 			SourceRevision: goldenPinnedPredecessorRevision, TagOnMain: true, HardPinVerified: true,
 			SHA256SumsMatch: true, EmbeddedRevisionVerified: true, LiveWorkerChecksumMatch: true,
 		},
+		Routing: goldenMigrationRouting{
+			URLMap: "url-map", ActiveMatcher: "staging-subrouter",
+			LegacyBackend: "legacy-backend", FrontBackend: "front-backend",
+			LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
+			Canary: goldenMigrationCanary{
+				Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
+				BackendURL: "https://example.test/front",
+			},
+		},
 		Legacy: goldenMigrationLegacy{
 			Service: "subrouter.service", Generation: "legacy-generation",
 			Checksum: goldenPinnedPredecessorLinuxSHA256, AcceptingNewPublic: true,
@@ -745,6 +787,12 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 	evidence.PriorEvidenceSHA256 = priorSHA
 	evidence.PreparationEvidenceSHA256 = preparationSHA
 	evidence.Routing.Before, evidence.Routing.After = source, destination
+	evidence.Routing.SourceBackendURL = map[string]string{
+		"legacy": evidence.Routing.LegacyBackendURL, "front": evidence.Routing.FrontBackendURL,
+	}[source]
+	evidence.Routing.DestinationBackendURL = map[string]string{
+		"legacy": evidence.Routing.LegacyBackendURL, "front": evidence.Routing.FrontBackendURL,
+	}[destination]
 	sourceGeneration, destinationGeneration := "legacy-generation", "front-generation"
 	if source == "front" {
 		sourceGeneration, destinationGeneration = destinationGeneration, sourceGeneration

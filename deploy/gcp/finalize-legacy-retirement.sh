@@ -45,6 +45,19 @@ source "${SCRIPT_DIR}/deploy-lock.sh"
 
 log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
+case "${INSTANCE}" in
+  subrouter-team)
+    expected_active_matcher="__root__"
+    expected_canary_matcher="subrouter-front-canary"
+    expected_canary_host="front-canary.sr.cmux.internal"
+    ;;
+  subrouter-staging)
+    expected_active_matcher="staging-subrouter"
+    expected_canary_matcher="staging-subrouter-front-canary"
+    expected_canary_host="front-canary.staging.sr.cmux.internal"
+    ;;
+  *) die "unsupported instance: ${INSTANCE}" ;;
+esac
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
 REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
@@ -70,9 +83,13 @@ predecessor_json="$(jq -c '.predecessor' "${CUTOVER_EVIDENCE}")"
 URL_MAP="$(jq -r '.routing.url_map' "${CUTOVER_EVIDENCE}")"
 legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${CUTOVER_EVIDENCE}")"
 front_backend_url="$(jq -r '.routing.front_backend_url' "${CUTOVER_EVIDENCE}")"
-active_matcher="$(jq -r '.routing.active_matcher' "${CUTOVER_EVIDENCE}")"
-canary_matcher="$(jq -r '.routing.canary.matcher' "${CUTOVER_EVIDENCE}")"
-canary_host="$(jq -r '.routing.canary.host' "${CUTOVER_EVIDENCE}")"
+[[ "$(jq -r '.routing.active_matcher' "${CUTOVER_EVIDENCE}")" == "${expected_active_matcher}" &&
+   "$(jq -r '.routing.canary.matcher' "${CUTOVER_EVIDENCE}")" == "${expected_canary_matcher}" &&
+   "$(jq -r '.routing.canary.host' "${CUTOVER_EVIDENCE}")" == "${expected_canary_host}" ]] \
+  || die "cutover evidence routing selectors do not match the target instance"
+active_matcher="${expected_active_matcher}"
+canary_matcher="${expected_canary_matcher}"
+canary_host="${expected_canary_host}"
 legacy_generation="$(jq -r '.legacy.generation' "${CUTOVER_EVIDENCE}")"
 legacy_checksum="$(jq -r '.legacy.checksum' "${CUTOVER_EVIDENCE}")"
 accepting_new_public_false_at="$(jq -r '.timestamps.activated_at' "${CUTOVER_EVIDENCE}")"

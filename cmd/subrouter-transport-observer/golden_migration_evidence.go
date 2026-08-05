@@ -257,22 +257,11 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 	}
 	switch expected {
 	case "front-migration-preparation":
-		expectedMatcher, expectedCanaryMatcher, expectedCanaryHost := "", "", ""
-		switch evidence.Run.Instance {
-		case "subrouter-staging":
-			expectedMatcher = "staging-subrouter"
-			expectedCanaryMatcher = "staging-subrouter-front-canary"
-			expectedCanaryHost = "front-canary.staging.sr.cmux.internal"
-		case "subrouter-team":
-			expectedMatcher = "__root__"
-			expectedCanaryMatcher = "subrouter-front-canary"
-			expectedCanaryHost = "front-canary.sr.cmux.internal"
-		default:
-			return failGolden("migration_preparation_target_invalid")
+		if err := validateGoldenMigrationRoutingSelectors(evidence); err != nil {
+			return err
 		}
 		if evidence.Mode != "prepare" || evidence.Routing.Current != "legacy" ||
 			evidence.Routing.URLMap == "" || evidence.Routing.LegacyBackend == "" || evidence.Routing.FrontBackend == "" ||
-			evidence.Routing.ActiveMatcher != expectedMatcher ||
 			evidence.Routing.LegacyBackendURL == evidence.Routing.FrontBackendURL ||
 			!strings.HasPrefix(evidence.Routing.LegacyBackendURL, "https://") ||
 			!strings.HasPrefix(evidence.Routing.FrontBackendURL, "https://") ||
@@ -284,9 +273,7 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			return failGolden("migration_preparation_invalid")
 		}
 		canary := evidence.Routing.Canary
-		if canary.Host != expectedCanaryHost || canary.Matcher != expectedCanaryMatcher ||
-			canary.BackendURL != evidence.Routing.FrontBackendURL ||
-			canary.FirstProofAttempts < 1 || canary.FirstProofAttempts > 600 ||
+		if canary.FirstProofAttempts < 1 || canary.FirstProofAttempts > 600 ||
 			canary.VerifiedProofAttempts < 1 || canary.VerifiedProofAttempts > 600 ||
 			!validGoldenSHA256(canary.FirstSessionSHA256) || !validGoldenSHA256(canary.VerifiedSessionSHA256) {
 			return failGolden("migration_canary_invalid")
@@ -372,7 +359,33 @@ func validateGoldenMigrationIdentity(evidence *goldenMigrationEvidence) error {
 	return nil
 }
 
+func validateGoldenMigrationRoutingSelectors(evidence *goldenMigrationEvidence) error {
+	expectedMatcher, expectedCanaryMatcher, expectedCanaryHost := "", "", ""
+	switch evidence.Run.Instance {
+	case "subrouter-staging":
+		expectedMatcher = "staging-subrouter"
+		expectedCanaryMatcher = "staging-subrouter-front-canary"
+		expectedCanaryHost = "front-canary.staging.sr.cmux.internal"
+	case "subrouter-team":
+		expectedMatcher = "__root__"
+		expectedCanaryMatcher = "subrouter-front-canary"
+		expectedCanaryHost = "front-canary.sr.cmux.internal"
+	default:
+		return failGolden("migration_routing_target_invalid")
+	}
+	if evidence.Routing.ActiveMatcher != expectedMatcher ||
+		evidence.Routing.Canary.Matcher != expectedCanaryMatcher ||
+		evidence.Routing.Canary.Host != expectedCanaryHost ||
+		evidence.Routing.Canary.BackendURL != evidence.Routing.FrontBackendURL {
+		return failGolden("migration_routing_selectors_invalid")
+	}
+	return nil
+}
+
 func validateGoldenMigrationTransition(evidence *goldenMigrationEvidence, expected string) error {
+	if err := validateGoldenMigrationRoutingSelectors(evidence); err != nil {
+		return err
+	}
 	wantMode, source, destination, prior := "rollback", "front", "legacy", "front-migration-cutover"
 	expectedConnections := int64(1)
 	if expected == "front-migration-cutover" {

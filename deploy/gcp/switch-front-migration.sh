@@ -55,6 +55,19 @@ LEGACY_RSS_LIMIT_BYTES="${SUBROUTER_LEGACY_RSS_LIMIT_BYTES:-201326592}"
 
 log() { printf 'gcp-front-transition: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
+case "${INSTANCE}" in
+  subrouter-team)
+    EXPECTED_ACTIVE_MATCHER="__root__"
+    EXPECTED_CANARY_MATCHER="subrouter-front-canary"
+    EXPECTED_CANARY_HOST="front-canary.sr.cmux.internal"
+    ;;
+  subrouter-staging)
+    EXPECTED_ACTIVE_MATCHER="staging-subrouter"
+    EXPECTED_CANARY_MATCHER="staging-subrouter-front-canary"
+    EXPECTED_CANARY_HOST="front-canary.staging.sr.cmux.internal"
+    ;;
+  *) die "unsupported instance: ${INSTANCE}" ;;
+esac
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
 REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
@@ -112,9 +125,13 @@ front_json="$(jq -c '.front | {slot,generation,checksum,control_checksum,worker_
 URL_MAP="$(jq -r '.routing.url_map' "${PRIOR_EVIDENCE}")"
 legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${PRIOR_EVIDENCE}")"
 front_backend_url="$(jq -r '.routing.front_backend_url' "${PRIOR_EVIDENCE}")"
-ACTIVE_MATCHER="$(jq -r '.routing.active_matcher' "${PRIOR_EVIDENCE}")"
-CANARY_MATCHER="$(jq -r '.routing.canary.matcher' "${PRIOR_EVIDENCE}")"
-CANARY_HOST="$(jq -r '.routing.canary.host' "${PRIOR_EVIDENCE}")"
+[[ "$(jq -r '.routing.active_matcher' "${PRIOR_EVIDENCE}")" == "${EXPECTED_ACTIVE_MATCHER}" &&
+   "$(jq -r '.routing.canary.matcher' "${PRIOR_EVIDENCE}")" == "${EXPECTED_CANARY_MATCHER}" &&
+   "$(jq -r '.routing.canary.host' "${PRIOR_EVIDENCE}")" == "${EXPECTED_CANARY_HOST}" ]] \
+  || die "prior migration evidence routing selectors do not match the target instance"
+ACTIVE_MATCHER="${EXPECTED_ACTIVE_MATCHER}"
+CANARY_MATCHER="${EXPECTED_CANARY_MATCHER}"
+CANARY_HOST="${EXPECTED_CANARY_HOST}"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
