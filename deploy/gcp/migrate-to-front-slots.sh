@@ -63,7 +63,8 @@ REMOTE_WORKER_CANDIDATE="/tmp/subrouter-front-worker-${RUN_LABEL}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BACKEND_HEALTH_WAITER="${SCRIPT_DIR}/wait-for-backend-health.py"
+FRONT_READINESS_WAITER="${SCRIPT_DIR}/wait-for-front-readiness.py"
+FRONT_READINESS_PROBE="${SCRIPT_DIR}/probe-front-readiness.sh"
 URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
@@ -102,7 +103,8 @@ REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYM
 for command in "${GCLOUD_BINARY}" curl go jq python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
-[[ -f "${BACKEND_HEALTH_WAITER}" ]] || die "backend health waiter is missing"
+[[ -f "${FRONT_READINESS_WAITER}" ]] || die "front readiness waiter is missing"
+[[ -f "${FRONT_READINESS_PROBE}" ]] || die "front readiness probe is missing"
 [[ -f "${URL_MAP_ROUTING}" ]] || die "URL-map routing helper is missing"
 [[ -f "${CLOUD_CONFIG}" && ! -L "${CLOUD_CONFIG}" ]] || die "cloud config is missing or unsafe"
 tenant_key="$(jq -r '.tenantKey // empty' "${CLOUD_CONFIG}")"
@@ -186,45 +188,32 @@ gcloud_scp() {
 
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 epoch_seconds() { date +%s; }
-canary_session_observed() {
-  local session_id="$1" service="subrouter-slot@${front_slot}.service"
-  printf '%s\n' "${session_id}" | \
-    "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
-      --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
-      --command "set -eu; IFS= read -r session_id; sudo journalctl --unit='${service}' --since='@${map_updated_epoch}' --no-pager --output=cat | grep -F 'INFO proxy request agent=codex' | grep -F 'method=POST path=/v1/responses' | grep -F -e \"session=\${session_id} \" -e \"session=\${session_id}:\" -e \"session=\\\"\${session_id}\\\" \" -e \"session=\\\"\${session_id}:\" >/dev/null" \
-    >/dev/null 2>>"${ARTIFACT_DIR}/canary-journal-ssh.log"
+canary_sessions_observed() {
+  local sessions_file="$1" expected_count="$2" service="subrouter-slot@${front_slot}.service"
+  [[ "${expected_count}" =~ ^[0-9]+$ ]] || return 1
+  (( expected_count >= 21 )) || return 1
+  [[ "$(wc -l <"${sessions_file}" | tr -d '[:space:]')" == "${expected_count}" ]] || return 1
+  awk 'NF == 0 || $0 !~ /^[A-Za-z0-9._-]+$/ {exit 1}' "${sessions_file}" || return 1
+  "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
+    --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
+    --command "set -eu
+sessions_file=\$(mktemp)
+journal_file=\$(mktemp)
+trap 'rm -f \"\${sessions_file}\" \"\${journal_file}\"' EXIT INT TERM
+cat >\"\${sessions_file}\"
+sudo journalctl --sync
+sudo journalctl --unit='${service}' --since='@${map_updated_epoch}' --no-pager --output=cat >\"\${journal_file}\"
+count=0
+while IFS= read -r session_id; do
+  case \"\${session_id}\" in ''|*[!A-Za-z0-9._-]*) exit 1 ;; esac
+  grep -F 'INFO proxy request agent=codex' \"\${journal_file}\" | grep -F 'method=POST path=/v1/responses' | grep -F -e \"session=\${session_id} \" -e \"session=\${session_id}:\" -e \"session=\\\"\${session_id}\\\" \" -e \"session=\\\"\${session_id}:\" >/dev/null
+  count=\$((count + 1))
+done <\"\${sessions_file}\"
+test \"\${count}\" -eq '${expected_count}'
+session_set_sha256=\$(sha256sum \"\${sessions_file}\" | cut -d ' ' -f 1)
+printf '{\"journal_correlated_samples\":%s,\"session_set_sha256\":\"%s\"}\\n' \"\${count}\" \"\${session_set_sha256}\"" \
+    <"${sessions_file}" 2>>"${ARTIFACT_DIR}/canary-journal-ssh.log"
 }
-probe_front_canary() {
-  local label="$1" attempts_name="$2" observed_name="$3" hash_name="$4"
-  local session_id="canary-${RUN_LABEL}-${label}" attempts=0 deadline http_code observed_at session_hash
-  deadline=$(( $(epoch_seconds) + 600 ))
-  while (( $(epoch_seconds) < deadline && attempts < 600 )); do
-    attempts=$((attempts + 1))
-    http_code="$(
-      printf 'url = "%s/v1/responses"\nheader = "Authorization: Bearer %s"\nheader = "Host: %s"\nheader = "Content-Type: application/json"\nheader = "X-Subrouter-Agent: codex"\nheader = "X-Subrouter-Session: %s"\ndata = "{}"\n' \
-        "${PUBLIC_BASE_URL}" "${tenant_key}" "${CANARY_HOST}" "${session_id}" | \
-        curl --config - --http1.1 --silent --show-error --output /dev/null \
-          --write-out '%{http_code}' --connect-timeout 5 --max-time 10
-    )" || http_code=""
-    if [[ "${http_code}" == 400 ]] && canary_session_observed "${session_id}"; then
-      observed_at="$(utc_now)"
-      session_hash="$(printf '%s' "${session_id}" | sha256sum | awk '{print $1}')"
-      printf -v "${attempts_name}" '%s' "${attempts}"
-      printf -v "${observed_name}" '%s' "${observed_at}"
-      printf -v "${hash_name}" '%s' "${session_hash}"
-      return
-    fi
-    sleep 1
-  done
-  die "front canary ${label} did not correlate through the public load balancer within ten minutes"
-}
-
-first_canary_attempts=""
-first_canary_observed_at=""
-first_canary_session_sha256=""
-verified_canary_attempts=""
-verified_canary_observed_at=""
-verified_canary_session_sha256=""
 
 lock_holder_pid=""
 acquire_deploy_lock() {
@@ -405,26 +394,53 @@ url_map_switched=1
 python3 "${URL_MAP_ROUTING}" assert-state \
   "${canary_applied}" "${ACTIVE_MATCHER}" "${legacy_backend_url}" \
   "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
-log "waiting for the public front canary route to reach the front slot"
-probe_front_canary first first_canary_attempts first_canary_observed_at first_canary_session_sha256
-
-log "requiring every front backend health status to remain healthy for five minutes"
-backend_health_json="$(python3 "${BACKEND_HEALTH_WAITER}" \
-  --minimum-stable-seconds 300 --timeout-seconds 900 --poll-seconds 5 \
-  --maximum-sample-gap-seconds 15 -- \
-  "${GCLOUD_BINARY}" compute backend-services get-health "${FRONT_BACKEND_SERVICE}" \
-  --project "${PROJECT_ID}" --global --format=json)" \
-  || die "front did not remain continuously healthy in the load balancer"
-jq -e '.all_healthy == true and .duration_ms >= 300000 and .healthy_samples >= 21 and
-  .max_sample_gap_ms <= 15000 and (.backend_membership_sha256 | test("^[0-9a-f]{64}$"))' \
-  < <(stream_shell_value "${backend_health_json}") >/dev/null \
-  || die "front backend health evidence is invalid"
-
-probe_front_canary verified verified_canary_attempts verified_canary_observed_at verified_canary_session_sha256
-canary_stable_duration_ms="$(python3 -c 'from datetime import datetime, timedelta; import sys; first=datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); verified=datetime.fromisoformat(sys.argv[2].replace("Z", "+00:00")); print((verified-first)//timedelta(milliseconds=1))' \
-  "${first_canary_observed_at}" "${verified_canary_observed_at}")"
-(( canary_stable_duration_ms >= 300000 )) || die "front canary was not publicly routable for five continuous minutes"
-(( canary_stable_duration_ms <= 1200000 )) || die "front canary proof exceeded the twenty-minute acceptance window"
+log "requiring the public front canary and every backend health status in each sample for five minutes"
+canary_sessions_file="${ARTIFACT_DIR}/front-canary-sessions.txt"
+front_readiness_json="$(
+  SUBROUTER_GCP_PROJECT="${PROJECT_ID}" \
+  SUBROUTER_GCP_FRONT_BACKEND_SERVICE="${FRONT_BACKEND_SERVICE}" \
+  SUBROUTER_CANARY_PUBLIC_BASE_URL="${PUBLIC_BASE_URL}" \
+  SUBROUTER_CANARY_HOST="${CANARY_HOST}" \
+  SUBROUTER_CLOUD_CONFIG="${CLOUD_CONFIG}" \
+  GCLOUD_BIN="${GCLOUD_BINARY}" \
+  python3 "${FRONT_READINESS_WAITER}" \
+    --minimum-stable-seconds 300 --timeout-seconds 900 --poll-seconds 2 \
+    --maximum-sample-gap-seconds 15 --minimum-samples 21 \
+    --session-prefix "canary-${RUN_LABEL}" --sessions-file "${canary_sessions_file}" \
+    --probe-stderr-log "${ARTIFACT_DIR}/front-readiness-probe.log" -- \
+    bash "${FRONT_READINESS_PROBE}"
+)" || die "front backend and public canary did not remain continuously healthy together"
+jq -e '.backend_health.all_healthy == true and .backend_health.duration_ms >= 300000 and
+  .backend_health.healthy_samples >= 21 and .backend_health.max_sample_gap_ms <= 15000 and
+  (.backend_health.backend_membership_sha256 | test("^[0-9a-f]{64}$")) and
+  .canary.stable_duration_ms == .backend_health.duration_ms and
+  .canary.healthy_samples == .backend_health.healthy_samples and
+  .canary.max_sample_gap_ms == .backend_health.max_sample_gap_ms and
+  .canary.first_observed_at == .backend_health.stable_since and
+  .canary.verified_at == .backend_health.verified_at and
+  (.canary.first_session_sha256 | test("^[0-9a-f]{64}$")) and
+  (.canary.verified_session_sha256 | test("^[0-9a-f]{64}$")) and
+  (.canary.session_set_sha256 | test("^[0-9a-f]{64}$"))' \
+  < <(stream_shell_value "${front_readiness_json}") >/dev/null \
+  || die "combined front readiness evidence is invalid"
+backend_health_json="$(jq -c '.backend_health' < <(stream_shell_value "${front_readiness_json}"))"
+first_canary_attempts="$(jq -r '.canary.first_proof_attempts' < <(stream_shell_value "${front_readiness_json}"))"
+first_canary_observed_at="$(jq -r '.canary.first_observed_at' < <(stream_shell_value "${front_readiness_json}"))"
+first_canary_session_sha256="$(jq -r '.canary.first_session_sha256' < <(stream_shell_value "${front_readiness_json}"))"
+verified_canary_attempts="$(jq -r '.canary.verified_proof_attempts' < <(stream_shell_value "${front_readiness_json}"))"
+verified_canary_observed_at="$(jq -r '.canary.verified_at' < <(stream_shell_value "${front_readiness_json}"))"
+verified_canary_session_sha256="$(jq -r '.canary.verified_session_sha256' < <(stream_shell_value "${front_readiness_json}"))"
+canary_stable_duration_ms="$(jq -r '.canary.stable_duration_ms' < <(stream_shell_value "${front_readiness_json}"))"
+canary_healthy_samples="$(jq -r '.canary.healthy_samples' < <(stream_shell_value "${front_readiness_json}"))"
+canary_max_sample_gap_ms="$(jq -r '.canary.max_sample_gap_ms' < <(stream_shell_value "${front_readiness_json}"))"
+canary_session_set_sha256="$(jq -r '.canary.session_set_sha256' < <(stream_shell_value "${front_readiness_json}"))"
+canary_correlation_json="$(canary_sessions_observed "${canary_sessions_file}" "${canary_healthy_samples}")" \
+  || die "not every continuous public canary sample was correlated in the front slot journal"
+jq -e --argjson expected_count "${canary_healthy_samples}" --arg expected_sha "${canary_session_set_sha256}" \
+  '.journal_correlated_samples == $expected_count and .session_set_sha256 == $expected_sha' \
+  < <(stream_shell_value "${canary_correlation_json}") >/dev/null \
+  || die "front canary journal correlation evidence does not match the sampled sessions"
+canary_journal_correlated_samples="$(jq -r '.journal_correlated_samples' < <(stream_shell_value "${canary_correlation_json}"))"
 
 legacy_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
 jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \
@@ -466,6 +482,10 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
   --arg first_canary_session_sha "${first_canary_session_sha256}" \
   --arg verified_canary_session_sha "${verified_canary_session_sha256}" \
   --argjson canary_duration "${canary_stable_duration_ms}" \
+  --argjson canary_healthy_samples "${canary_healthy_samples}" \
+  --argjson canary_max_sample_gap "${canary_max_sample_gap_ms}" \
+  --argjson canary_journal_correlated_samples "${canary_journal_correlated_samples}" \
+  --arg canary_session_set_sha "${canary_session_set_sha256}" \
   --argjson first_canary_attempts "${first_canary_attempts}" \
   --argjson verified_canary_attempts "${verified_canary_attempts}" \
   --arg legacy_generation "${legacy_generation}" \
@@ -489,6 +509,9 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
       canary:{host:$canary_host,matcher:$canary_matcher,backend_url:$front_url,
         map_updated_at:$map_updated_at,first_observed_at:$first_canary_observed_at,
         verified_at:$verified_canary_observed_at,stable_duration_ms:$canary_duration,
+        healthy_samples:$canary_healthy_samples,max_sample_gap_ms:$canary_max_sample_gap,
+        journal_correlated_samples:$canary_journal_correlated_samples,
+        session_set_sha256:$canary_session_set_sha,
         first_proof_attempts:$first_canary_attempts,
         verified_proof_attempts:$verified_canary_attempts,
         first_session_sha256:$first_canary_session_sha,

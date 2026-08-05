@@ -660,10 +660,39 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         field(canary, "stable_duration_ms", "routing.canary"),
         "routing.canary.stable_duration_ms",
     )
-    for name in ("first_proof_attempts", "verified_proof_attempts"):
-        attempts = integer(field(canary, name, "routing.canary"), f"routing.canary.{name}", minimum=1)
-        if attempts > 600:
-            fail(f"routing.canary.{name} must be <= 600")
+    canary_healthy_samples = integer(
+        field(canary, "healthy_samples", "routing.canary"),
+        "routing.canary.healthy_samples",
+        minimum=21,
+    )
+    canary_max_sample_gap_ms = integer(
+        field(canary, "max_sample_gap_ms", "routing.canary"),
+        "routing.canary.max_sample_gap_ms",
+        minimum=0,
+    )
+    canary_journal_samples = integer(
+        field(canary, "journal_correlated_samples", "routing.canary"),
+        "routing.canary.journal_correlated_samples",
+        minimum=21,
+    )
+    sha(field(canary, "session_set_sha256", "routing.canary"), "routing.canary.session_set_sha256")
+    first_proof_attempts = integer(
+        field(canary, "first_proof_attempts", "routing.canary"),
+        "routing.canary.first_proof_attempts",
+        minimum=1,
+    )
+    verified_proof_attempts = integer(
+        field(canary, "verified_proof_attempts", "routing.canary"),
+        "routing.canary.verified_proof_attempts",
+        minimum=1,
+    )
+    if (
+        first_proof_attempts > 600
+        or verified_proof_attempts > 600
+        or verified_proof_attempts - first_proof_attempts + 1 != canary_healthy_samples
+        or canary_journal_samples != canary_healthy_samples
+    ):
+        fail("routing.canary proof attempt bounds do not match its samples")
     first_session_sha = sha(
         field(canary, "first_session_sha256", "routing.canary"),
         "routing.canary.first_session_sha256",
@@ -737,6 +766,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     stable_duration = verified_at - stable_since
     canary_stable_duration = canary_verified_at - first_observed_at
     sample_span_capacity_ms = (healthy_samples - 1) * (max_sample_gap_ms + 1)
+    canary_sample_span_capacity_ms = (canary_healthy_samples - 1) * (canary_max_sample_gap_ms + 1)
     if (
         stable_duration < FRONT_BACKEND_HEALTH_STABILITY
         or stable_duration > dt.timedelta(minutes=15)
@@ -746,11 +776,16 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         or max_sample_gap_ms > 15_000
         or duration_ms > sample_span_capacity_ms
         or first_observed_at < map_updated_at
-        or stable_since < first_observed_at
-        or canary_verified_at < verified_at
+        or stable_since != first_observed_at
+        or canary_verified_at != verified_at
         or canary_stable_duration < FRONT_BACKEND_HEALTH_STABILITY
         or canary_stable_duration > dt.timedelta(minutes=20)
         or canary_duration_ms != canary_stable_duration // dt.timedelta(milliseconds=1)
+        or canary_duration_ms != duration_ms
+        or canary_healthy_samples != healthy_samples
+        or canary_max_sample_gap_ms != max_sample_gap_ms
+        or canary_max_sample_gap_ms > 15_000
+        or canary_duration_ms > canary_sample_span_capacity_ms
     ):
         fail("front canary and backend health do not prove five continuous healthy minutes")
     emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")

@@ -82,6 +82,10 @@ type goldenMigrationCanary struct {
 	FirstObservedAt       string `json:"first_observed_at"`
 	VerifiedAt            string `json:"verified_at"`
 	StableDurationMillis  int64  `json:"stable_duration_ms"`
+	HealthySamples        int64  `json:"healthy_samples"`
+	MaxSampleGapMillis    int64  `json:"max_sample_gap_ms"`
+	JournalSamples        int64  `json:"journal_correlated_samples"`
+	SessionSetSHA256      string `json:"session_set_sha256"`
 	FirstProofAttempts    int64  `json:"first_proof_attempts"`
 	VerifiedProofAttempts int64  `json:"verified_proof_attempts"`
 	FirstSessionSHA256    string `json:"first_session_sha256"`
@@ -275,6 +279,9 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 		canary := evidence.Routing.Canary
 		if canary.FirstProofAttempts < 1 || canary.FirstProofAttempts > 600 ||
 			canary.VerifiedProofAttempts < 1 || canary.VerifiedProofAttempts > 600 ||
+			canary.HealthySamples < 21 || canary.MaxSampleGapMillis < 0 || canary.MaxSampleGapMillis > 15_000 ||
+			canary.JournalSamples != canary.HealthySamples || !validGoldenSHA256(canary.SessionSetSHA256) ||
+			canary.VerifiedProofAttempts-canary.FirstProofAttempts+1 != canary.HealthySamples ||
 			!validGoldenSHA256(canary.FirstSessionSHA256) || !validGoldenSHA256(canary.VerifiedSessionSHA256) {
 			return failGolden("migration_canary_invalid")
 		}
@@ -315,6 +322,15 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			samplesCoverDuration = evidence.Front.BackendHealth.HealthySamples-1 >= requiredIntervals
 		}
 		canaryStableDuration := canaryVerifiedAt.Sub(firstObservedAt)
+		canarySamplesCoverDuration := false
+		if canary.HealthySamples >= 1 && canary.MaxSampleGapMillis >= 0 && canary.MaxSampleGapMillis <= 15_000 {
+			intervalWidth := canary.MaxSampleGapMillis + 1
+			requiredIntervals := canary.StableDurationMillis / intervalWidth
+			if canary.StableDurationMillis%intervalWidth != 0 {
+				requiredIntervals++
+			}
+			canarySamplesCoverDuration = canary.HealthySamples-1 >= requiredIntervals
+		}
 		if err != nil || !evidence.Front.BackendHealth.AllHealthy || verifiedAt.Before(stableSince) ||
 			stableDuration < goldenBackendHealthStabilityLimit ||
 			stableDuration > 15*time.Minute ||
@@ -325,10 +341,14 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			evidence.Front.BackendHealth.MaxSampleGapMillis > 15_000 ||
 			!samplesCoverDuration ||
 			!validGoldenSHA256(evidence.Front.BackendHealth.BackendMembershipSHA256) ||
-			firstObservedAt.Before(mapUpdatedAt) || stableSince.Before(firstObservedAt) ||
-			canaryVerifiedAt.Before(verifiedAt) || emittedAt.Before(canaryVerifiedAt) ||
+			firstObservedAt.Before(mapUpdatedAt) || !stableSince.Equal(firstObservedAt) ||
+			!canaryVerifiedAt.Equal(verifiedAt) || emittedAt.Before(canaryVerifiedAt) ||
 			canaryStableDuration < goldenBackendHealthStabilityLimit || canaryStableDuration > 20*time.Minute ||
-			canary.StableDurationMillis != canaryStableDuration.Milliseconds() {
+			canary.StableDurationMillis != canaryStableDuration.Milliseconds() ||
+			canary.StableDurationMillis != evidence.Front.BackendHealth.DurationMillis ||
+			canary.HealthySamples != evidence.Front.BackendHealth.HealthySamples ||
+			canary.MaxSampleGapMillis != evidence.Front.BackendHealth.MaxSampleGapMillis ||
+			!canarySamplesCoverDuration {
 			return failGolden("migration_backend_health_invalid")
 		}
 		return nil

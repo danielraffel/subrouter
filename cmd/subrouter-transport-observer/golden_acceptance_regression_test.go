@@ -111,19 +111,21 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 		routing := result["routing"].(map[string]any)
 		routing["active_matcher"] = "staging-subrouter"
 		routing["canary"] = map[string]any{
-			"host":                    "front-canary.staging.sr.cmux.internal",
-			"matcher":                 "staging-subrouter-front-canary",
-			"backend_url":             routing["front_backend_url"],
-			"map_updated_at":          "2026-08-01T23:59:00Z",
-			"first_observed_at":       "2026-08-02T00:00:00Z",
-			"verified_at":             "2026-08-02T00:05:00Z",
-			"stable_duration_ms":      300_000,
-			"healthy_samples":         61,
-			"max_sample_gap_ms":       5_000,
-			"first_proof_attempts":    1,
-			"verified_proof_attempts": 61,
-			"first_session_sha256":    strings.Repeat("e", 64),
-			"verified_session_sha256": strings.Repeat("f", 64),
+			"host":                       "front-canary.staging.sr.cmux.internal",
+			"matcher":                    "staging-subrouter-front-canary",
+			"backend_url":                routing["front_backend_url"],
+			"map_updated_at":             "2026-08-01T23:59:00Z",
+			"first_observed_at":          "2026-08-02T00:00:00Z",
+			"verified_at":                "2026-08-02T00:05:00Z",
+			"stable_duration_ms":         300_000,
+			"healthy_samples":            61,
+			"max_sample_gap_ms":          5_000,
+			"journal_correlated_samples": 61,
+			"session_set_sha256":         strings.Repeat("a", 64),
+			"first_proof_attempts":       1,
+			"verified_proof_attempts":    61,
+			"first_session_sha256":       strings.Repeat("e", 64),
+			"verified_session_sha256":    strings.Repeat("f", 64),
 		}
 		return result
 	}
@@ -221,6 +223,16 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	}
 	if err := validatePython(gappedCanaryWindow); err == nil {
 		t.Fatal("Python validator accepted a gap in continuous front canary evidence")
+	}
+
+	uncorrelatedCanaryWindow := clone(valid)
+	uncorrelatedCanary := uncorrelatedCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	uncorrelatedCanary["journal_correlated_samples"] = 60
+	if err := validateGo(uncorrelatedCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a public canary sample absent from the front journal")
+	}
+	if err := validatePython(uncorrelatedCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a public canary sample absent from the front journal")
 	}
 
 	wrongCanaryHost := clone(valid)
@@ -813,7 +825,9 @@ func validGoldenMigrationPreparationEvidence() *goldenMigrationEvidence {
 			Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
 			BackendURL: "https://example.test/front", MapUpdatedAt: "2026-08-01T23:59:00Z",
 			FirstObservedAt: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
-			StableDurationMillis: 300_000, FirstProofAttempts: 1, VerifiedProofAttempts: 1,
+			StableDurationMillis: 300_000, HealthySamples: 61, MaxSampleGapMillis: 5_000,
+			JournalSamples: 61, SessionSetSHA256: strings.Repeat("a", 64),
+			FirstProofAttempts: 1, VerifiedProofAttempts: 61,
 			FirstSessionSHA256: strings.Repeat("e", 64), VerifiedSessionSHA256: strings.Repeat("f", 64),
 		},
 	}

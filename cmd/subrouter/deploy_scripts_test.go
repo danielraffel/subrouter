@@ -230,6 +230,90 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 	}
 }
 
+func TestGCPFrontReadinessSamplesPublicCanaryWithBackendHealthAcrossTheWindow(t *testing.T) {
+	requireDeployScriptTools(t, "python3", "sh")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	waiter := filepath.Join(repoRoot, "deploy", "gcp", "wait-for-front-readiness.py")
+	fake := filepath.Join(t.TempDir(), "front-readiness-command")
+	state := filepath.Join(t.TempDir(), "poll-count")
+	sessions := filepath.Join(t.TempDir(), "sessions")
+	writeExecutableTestFile(t, fake, `#!/bin/sh
+count=0
+if [ -f "$READINESS_STATE" ]; then count="$(cat "$READINESS_STATE")"; fi
+count=$((count + 1))
+printf '%s' "$count" >"$READINESS_STATE"
+test -n "$SUBROUTER_CANARY_SESSION"
+if [ "$count" -eq 3 ]; then exit 1; fi
+printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
+`)
+	command := exec.Command(
+		mustLookPath(t, "python3"), waiter,
+		"--minimum-stable-seconds", "0.08",
+		"--timeout-seconds", "1.5",
+		"--poll-seconds", "0.01",
+		"--maximum-sample-gap-seconds", "0.3",
+		"--minimum-samples", "5",
+		"--session-prefix", "test-canary",
+		"--sessions-file", sessions,
+		"--", fake,
+	)
+	command.Env = append(os.Environ(), "READINESS_STATE="+state)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("combined front readiness failed: %v\n%s", err, output)
+	}
+	var evidence struct {
+		BackendHealth struct {
+			StableSince      string `json:"stable_since"`
+			VerifiedAt       string `json:"verified_at"`
+			DurationMS       int64  `json:"duration_ms"`
+			HealthySamples   int64  `json:"healthy_samples"`
+			MaxSampleGapMS   int64  `json:"max_sample_gap_ms"`
+			MembershipSHA256 string `json:"backend_membership_sha256"`
+		} `json:"backend_health"`
+		Canary struct {
+			FirstObservedAt       string `json:"first_observed_at"`
+			VerifiedAt            string `json:"verified_at"`
+			StableDurationMS      int64  `json:"stable_duration_ms"`
+			HealthySamples        int64  `json:"healthy_samples"`
+			MaxSampleGapMS        int64  `json:"max_sample_gap_ms"`
+			FirstProofAttempts    int64  `json:"first_proof_attempts"`
+			VerifiedProofAttempts int64  `json:"verified_proof_attempts"`
+			FirstSessionSHA256    string `json:"first_session_sha256"`
+			VerifiedSessionSHA256 string `json:"verified_session_sha256"`
+			SessionSetSHA256      string `json:"session_set_sha256"`
+		} `json:"canary"`
+	}
+	if err := json.Unmarshal(output, &evidence); err != nil {
+		t.Fatalf("decode combined readiness evidence: %v\n%s", err, output)
+	}
+	sessionBody, err := os.ReadFile(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedSessions := strings.Fields(string(sessionBody))
+	if len(observedSessions) != int(evidence.Canary.HealthySamples) {
+		t.Fatalf("session count = %d, evidence samples = %d", len(observedSessions), evidence.Canary.HealthySamples)
+	}
+	firstHash := sha256.Sum256([]byte(observedSessions[0]))
+	lastHash := sha256.Sum256([]byte(observedSessions[len(observedSessions)-1]))
+	setHash := sha256.Sum256(sessionBody)
+	if evidence.Canary.FirstProofAttempts < 4 ||
+		evidence.Canary.VerifiedProofAttempts-evidence.Canary.FirstProofAttempts+1 != evidence.Canary.HealthySamples ||
+		evidence.Canary.HealthySamples < 5 || evidence.Canary.StableDurationMS < 80 ||
+		evidence.Canary.FirstObservedAt != evidence.BackendHealth.StableSince ||
+		evidence.Canary.VerifiedAt != evidence.BackendHealth.VerifiedAt ||
+		evidence.Canary.StableDurationMS != evidence.BackendHealth.DurationMS ||
+		evidence.Canary.HealthySamples != evidence.BackendHealth.HealthySamples ||
+		evidence.Canary.MaxSampleGapMS != evidence.BackendHealth.MaxSampleGapMS ||
+		evidence.Canary.FirstSessionSHA256 != fmt.Sprintf("%x", firstHash) ||
+		evidence.Canary.VerifiedSessionSHA256 != fmt.Sprintf("%x", lastHash) ||
+		evidence.Canary.SessionSetSHA256 != fmt.Sprintf("%x", setHash) ||
+		len(evidence.BackendHealth.MembershipSHA256) != 64 {
+		t.Fatalf("readiness evidence did not cover one continuous paired window: %+v", evidence)
+	}
+}
+
 func TestInstallScriptRecordsTheResolvedReleaseVersion(t *testing.T) {
 	requireDeployScriptTools(t, "sh", "curl")
 	requireChecksumTool(t)
