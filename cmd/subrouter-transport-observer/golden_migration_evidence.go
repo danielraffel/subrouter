@@ -278,6 +278,9 @@ func validateGoldenMigrationEvidence(evidence *goldenMigrationEvidence, expected
 			!validGoldenSHA256(canary.FirstSessionSHA256) || !validGoldenSHA256(canary.VerifiedSessionSHA256) {
 			return failGolden("migration_canary_invalid")
 		}
+		if canary.FirstSessionSHA256 == canary.VerifiedSessionSHA256 {
+			return failGolden("migration_canary_invalid")
+		}
 		mapUpdatedAt, err := parseGoldenEvidenceTime(canary.MapUpdatedAt)
 		if err != nil {
 			return err

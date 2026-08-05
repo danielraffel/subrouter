@@ -22,10 +22,10 @@ func TestGCPURLMapCanaryRemainsReferencedAcrossActiveRouteSwitches(t *testing.T)
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	helper := filepath.Join(repoRoot, "deploy", "gcp", "url-map-routing.py")
-	productionLegacy := "https://www.googleapis.com/production-legacy"
-	productionFront := "https://www.googleapis.com/production-front"
 	stagingLegacy := "https://www.googleapis.com/staging-legacy"
 	stagingFront := "https://www.googleapis.com/staging-front"
+	productionLegacy := stagingFront + "-v2"
+	productionFront := "https://www.googleapis.com/production-front"
 	base := `defaultService: ` + productionLegacy + `
 fingerprint: fingerprint
 hostRules:
@@ -93,7 +93,7 @@ pathMatchers:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(cutoverBody), stagingFront) != 2 || strings.Contains(string(cutoverBody), stagingLegacy) ||
+	if strings.Count(string(cutoverBody), "defaultService: "+stagingFront+"\n") != 2 || strings.Contains(string(cutoverBody), stagingLegacy) ||
 		!strings.Contains(string(cutoverBody), productionLegacy) {
 		t.Fatalf("staging cutover did not preserve exactly one warm canary reference:\n%s", cutoverBody)
 	}
@@ -141,6 +141,15 @@ pathMatchers:
 	hijacked := write(strings.Replace(string(first), "front-canary.staging.sr.cmux.internal", "attacker.invalid", 1))
 	if output, err := run(append([]string{"prepare-canary", hijacked, filepath.Join(t.TempDir(), "out.yaml")}, stagingArgs...)...); err == nil {
 		t.Fatalf("hijacked canary host was accepted:\n%s", output)
+	}
+	smuggledHost := write(strings.Replace(
+		string(first),
+		"  pathMatcher: staging-subrouter-front-canary\n",
+		"  pathMatcher: staging-subrouter-front-canary\n  - attacker.invalid\n",
+		1,
+	))
+	if output, err := run(append([]string{"prepare-canary", smuggledHost, filepath.Join(t.TempDir(), "out.yaml")}, stagingArgs...)...); err == nil {
+		t.Fatalf("host outside the canary hosts block was accepted:\n%s", output)
 	}
 }
 

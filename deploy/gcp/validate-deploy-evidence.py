@@ -664,8 +664,16 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         attempts = integer(field(canary, name, "routing.canary"), f"routing.canary.{name}", minimum=1)
         if attempts > 600:
             fail(f"routing.canary.{name} must be <= 600")
-    sha(field(canary, "first_session_sha256", "routing.canary"), "routing.canary.first_session_sha256")
-    sha(field(canary, "verified_session_sha256", "routing.canary"), "routing.canary.verified_session_sha256")
+    first_session_sha = sha(
+        field(canary, "first_session_sha256", "routing.canary"),
+        "routing.canary.first_session_sha256",
+    )
+    verified_session_sha = sha(
+        field(canary, "verified_session_sha256", "routing.canary"),
+        "routing.canary.verified_session_sha256",
+    )
+    if first_session_sha == verified_session_sha:
+        fail("front canary proofs must use distinct sessions")
     legacy = obj(field(document, "legacy", "root"), "legacy")
     exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
     text(field(legacy, "generation", "legacy"), "legacy.generation")

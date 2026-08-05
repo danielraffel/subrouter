@@ -192,7 +192,7 @@ canary_session_observed() {
     "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" \
       --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet \
       --command "set -eu; IFS= read -r session_id; sudo journalctl --unit='${service}' --since='@${map_updated_epoch}' --no-pager --output=cat | grep -F 'INFO proxy request agent=codex' | grep -F 'method=POST path=/v1/responses' | grep -F -e \"session=\${session_id} \" -e \"session=\${session_id}:\" -e \"session=\\\"\${session_id}\\\" \" -e \"session=\\\"\${session_id}:\" >/dev/null" \
-    >/dev/null 2>&1
+    >/dev/null 2>>"${ARTIFACT_DIR}/canary-journal-ssh.log"
 }
 probe_front_canary() {
   local label="$1" attempts_name="$2" observed_name="$3" hash_name="$4"
@@ -424,6 +424,7 @@ probe_front_canary verified verified_canary_attempts verified_canary_observed_at
 canary_stable_duration_ms="$(python3 -c 'from datetime import datetime, timedelta; import sys; first=datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00")); verified=datetime.fromisoformat(sys.argv[2].replace("Z", "+00:00")); print((verified-first)//timedelta(milliseconds=1))' \
   "${first_canary_observed_at}" "${verified_canary_observed_at}")"
 (( canary_stable_duration_ms >= 300000 )) || die "front canary was not publicly routable for five continuous minutes"
+(( canary_stable_duration_ms <= 1200000 )) || die "front canary proof exceeded the twenty-minute acceptance window"
 
 legacy_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
 jq -e '(.active.id|type)=="string" and (.backends|type)=="array" and ([.backends[].connections] | all(type=="number" and . >= 0))' \

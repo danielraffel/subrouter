@@ -60,7 +60,13 @@ func fakeAction(args []string) {
 		entries, err := os.ReadDir(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"))
 		// The harness process and this action are already registered. Require at
 		// least one separately held Codex session before migration preparation.
-		if err != nil || len(entries) <= 2 {
+		registered := 0
+		for _, entry := range entries {
+			if _, parseErr := strconv.Atoi(entry.Name()); parseErr == nil {
+				registered++
+			}
+		}
+		if err != nil || registered <= 2 {
 			os.Exit(9)
 		}
 	}

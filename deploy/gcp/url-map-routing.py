@@ -19,6 +19,7 @@ TOP_LEVEL_KEY = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
 FIRST_ITEM_FIELD = re.compile(r"^- ([A-Za-z][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
 ITEM_FIELD = re.compile(r"^  ([A-Za-z][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
 HOST_VALUE = re.compile(r"^  - ([^\s#][^\r\n]*)$")
+SCALAR_FIELD_VALUE = re.compile(r"^\s*(?:-\s*)?[A-Za-z][A-Za-z0-9_-]*:\s*([^\s#]+)\s*$")
 NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 HOST = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 
@@ -146,10 +147,14 @@ def host_rule(item: list[str], index: int) -> tuple[list[str], str, set[str]]:
     host_offset = fields["hosts"][1]
     matcher_offset = fields["pathMatcher"][1]
     hosts: list[str] = []
-    for raw in item[host_offset + 1 : matcher_offset]:
+    for offset, raw in enumerate(item):
+        if offset in {host_offset, matcher_offset} or ITEM_FIELD.fullmatch(raw.removesuffix("\n")):
+            continue
         match = HOST_VALUE.fullmatch(raw.removesuffix("\n"))
         if match is None:
-            fail(f"{label}.hosts contains unsupported YAML")
+            fail(f"{label} contains unsupported YAML")
+        if not host_offset < offset < matcher_offset:
+            fail(f"{label}.hosts contains an entry outside its hosts block")
         hosts.append(scalar(match.group(1), f"{label}.hosts"))
     if not hosts or len(hosts) != len(set(hosts)):
         fail(f"{label}.hosts must contain unique host names")
@@ -245,6 +250,15 @@ def expected_reference_count(active_url: str, canary_url: str, target_url: str) 
     return int(active_url == target_url) + int(canary_url == target_url)
 
 
+def reference_count(body: str, target_url: str) -> int:
+    count = 0
+    for raw in body.splitlines():
+        match = SCALAR_FIELD_VALUE.fullmatch(raw)
+        if match is not None and match.group(1) == target_url:
+            count += 1
+    return count
+
+
 def assert_state(
     body: str,
     active_matcher: str,
@@ -262,13 +276,13 @@ def assert_state(
         fail("canary route is missing")
     for url in {expected_active_url, canary_url}:
         expected = expected_reference_count(expected_active_url, canary_url, url)
-        actual = body.count(url)
+        actual = reference_count(body, url)
         if actual != expected:
             fail(f"URL-map reference count for {url} is {actual}, expected {expected}")
     for url in forbidden_urls or []:
         if not url or url in {expected_active_url, canary_url}:
             fail("forbidden URL must be distinct from active and canary backends")
-        if body.count(url) != 0:
+        if reference_count(body, url) != 0:
             fail(f"forbidden URL-map backend remains referenced: {url}")
 
 
@@ -291,7 +305,7 @@ def prepare_canary(body: str, active_matcher: str, expected_active_url: str, can
         fail("active route is not the distinct expected pre-cutover backend")
     state = canary_state(body, canary_matcher, canary_host, canary_url)
     if state == "absent":
-        if body.count(canary_url) != 0:
+        if reference_count(body, canary_url) != 0:
             fail("canary backend is already referenced outside the canary route")
         body = append_item(
             body,
@@ -331,7 +345,7 @@ def rewrite_active(body: str, active_matcher: str, expected_current_url: str, ne
     rewritten = "".join(lines)
     assert_state(rewritten, active_matcher, new_url, canary_matcher, canary_host, canary_url)
     expected_old_count = int(expected_current_url == canary_url)
-    if rewritten.count(expected_current_url) != expected_old_count:
+    if reference_count(rewritten, expected_current_url) != expected_old_count:
         fail("active route source backend remains referenced outside the canary route")
     return rewritten
 

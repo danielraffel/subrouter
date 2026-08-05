@@ -210,6 +210,28 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 		t.Fatal("Python validator accepted the wrong front canary host")
 	}
 
+	duplicateCanarySession := clone(valid)
+	duplicateCanary := duplicateCanarySession["routing"].(map[string]any)["canary"].(map[string]any)
+	duplicateCanary["verified_session_sha256"] = duplicateCanary["first_session_sha256"]
+	if err := validateGo(duplicateCanarySession); err == nil {
+		t.Fatal("Go validator accepted duplicate front canary sessions")
+	}
+	if err := validatePython(duplicateCanarySession); err == nil {
+		t.Fatal("Python validator accepted duplicate front canary sessions")
+	}
+
+	longCanaryWindow := clone(valid)
+	longCanary := longCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	longCanary["map_updated_at"] = "2026-08-01T23:39:00Z"
+	longCanary["first_observed_at"] = "2026-08-01T23:44:00Z"
+	longCanary["stable_duration_ms"] = 1_260_000
+	if err := validateGo(longCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a front canary window above twenty minutes")
+	}
+	if err := validatePython(longCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a front canary window above twenty minutes")
+	}
+
 	missing := clone(valid)
 	delete(missing["front"].(map[string]any), "backend_health")
 	if err := validateGo(missing); err == nil {
