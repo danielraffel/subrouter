@@ -250,6 +250,11 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 		if err != nil || writePrivateFile(attemptLivenessProofPath, livenessProofFileData) != nil {
 			return goldenActionSummary{}, nil, failGolden("migration_destination_liveness_proof_write_failed")
 		}
+		select {
+		case <-ctx.Done():
+			return goldenActionSummary{}, nil, ctx.Err()
+		case <-command.done:
+		}
 		destinationSession = candidateSession
 		break
 	}
