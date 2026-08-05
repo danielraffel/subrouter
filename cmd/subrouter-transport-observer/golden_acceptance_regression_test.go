@@ -74,6 +74,22 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			"max_sample_gap_ms":         5_000,
 			"backend_membership_sha256": strings.Repeat("d", 64),
 		}
+		result["run"].(map[string]any)["instance"] = "subrouter-staging"
+		routing := result["routing"].(map[string]any)
+		routing["active_matcher"] = "staging-subrouter"
+		routing["canary"] = map[string]any{
+			"host":                    "front-canary.staging.sr.cmux.internal",
+			"matcher":                 "staging-subrouter-front-canary",
+			"backend_url":             routing["front_backend_url"],
+			"map_updated_at":          "2026-08-01T23:59:00Z",
+			"first_observed_at":       "2026-08-02T00:00:00Z",
+			"verified_at":             "2026-08-02T00:05:00Z",
+			"stable_duration_ms":      300_000,
+			"first_proof_attempts":    1,
+			"verified_proof_attempts": 1,
+			"first_session_sha256":    strings.Repeat("e", 64),
+			"verified_session_sha256": strings.Repeat("f", 64),
+		}
 		return result
 	}
 	validateGo := func(value map[string]any) error {
@@ -127,6 +143,35 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	}
 	if err := validatePython(fractionalMillisecond); err != nil {
 		t.Fatalf("Python validator rejected exact millisecond readiness duration: %v", err)
+	}
+
+	missingCanary := clone(valid)
+	delete(missingCanary["routing"].(map[string]any), "canary")
+	if err := validateGo(missingCanary); err == nil {
+		t.Fatal("Go validator accepted preparation without a front canary proof")
+	}
+	if err := validatePython(missingCanary); err == nil {
+		t.Fatal("Python validator accepted preparation without a front canary proof")
+	}
+
+	shortCanary := clone(valid)
+	shortCanaryProof := shortCanary["routing"].(map[string]any)["canary"].(map[string]any)
+	shortCanaryProof["verified_at"] = "2026-08-02T00:04:59.999Z"
+	shortCanaryProof["stable_duration_ms"] = 299_999
+	if err := validateGo(shortCanary); err == nil {
+		t.Fatal("Go validator accepted a sub-five-minute front canary proof")
+	}
+	if err := validatePython(shortCanary); err == nil {
+		t.Fatal("Python validator accepted a sub-five-minute front canary proof")
+	}
+
+	wrongCanaryHost := clone(valid)
+	wrongCanaryHost["routing"].(map[string]any)["canary"].(map[string]any)["host"] = "attacker.invalid"
+	if err := validateGo(wrongCanaryHost); err == nil {
+		t.Fatal("Go validator accepted the wrong front canary host")
+	}
+	if err := validatePython(wrongCanaryHost); err == nil {
+		t.Fatal("Python validator accepted the wrong front canary host")
 	}
 
 	missing := clone(valid)

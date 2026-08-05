@@ -18,6 +18,131 @@ import (
 	"time"
 )
 
+func TestGCPURLMapCanaryRemainsReferencedAcrossActiveRouteSwitches(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "url-map-routing.py")
+	productionLegacy := "https://www.googleapis.com/production-legacy"
+	productionFront := "https://www.googleapis.com/production-front"
+	stagingLegacy := "https://www.googleapis.com/staging-legacy"
+	stagingFront := "https://www.googleapis.com/staging-front"
+	base := `defaultService: ` + productionLegacy + `
+fingerprint: fingerprint
+hostRules:
+- hosts:
+  - staging.example.com
+  pathMatcher: staging-subrouter
+name: subrouter-urlmap
+pathMatchers:
+- defaultService: ` + stagingLegacy + `
+  name: staging-subrouter
+`
+	run := func(args ...string) ([]byte, error) {
+		t.Helper()
+		return exec.Command(mustLookPath(t, "python3"), append([]string{helper}, args...)...).CombinedOutput()
+	}
+	write := func(body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "map.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	stagingBase := write(base)
+	stagingPrepared := filepath.Join(t.TempDir(), "prepared.yaml")
+	stagingArgs := []string{
+		"staging-subrouter", stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	}
+	if output, err := run(append([]string{"prepare-canary", stagingBase, stagingPrepared}, stagingArgs...)...); err != nil {
+		t.Fatalf("prepare staging canary: %v\n%s", err, output)
+	}
+	stagingPreparedAgain := filepath.Join(t.TempDir(), "prepared-again.yaml")
+	if output, err := run(append([]string{"prepare-canary", stagingPrepared, stagingPreparedAgain}, stagingArgs...)...); err != nil {
+		t.Fatalf("idempotent staging canary preparation: %v\n%s", err, output)
+	}
+	first, err := os.ReadFile(stagingPrepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(stagingPreparedAgain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("idempotent canary preparation changed the URL map")
+	}
+	stagingCutover := filepath.Join(t.TempDir(), "cutover.yaml")
+	if output, err := run(
+		"rewrite-active", stagingPrepared, stagingCutover,
+		"staging-subrouter", stagingLegacy, stagingFront,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("rewrite staging active route: %v\n%s", err, output)
+	}
+	if output, err := run(
+		"assert-state", stagingCutover, "staging-subrouter", stagingFront,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("assert staging cutover: %v\n%s", err, output)
+	}
+	cutoverBody, err := os.ReadFile(stagingCutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(cutoverBody), stagingFront) != 2 || strings.Contains(string(cutoverBody), stagingLegacy) ||
+		!strings.Contains(string(cutoverBody), productionLegacy) {
+		t.Fatalf("staging cutover did not preserve exactly one warm canary reference:\n%s", cutoverBody)
+	}
+	stagingRollback := filepath.Join(t.TempDir(), "rollback.yaml")
+	if output, err := run(
+		"rewrite-active", stagingCutover, stagingRollback,
+		"staging-subrouter", stagingFront, stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("rewrite staging rollback: %v\n%s", err, output)
+	}
+	if output, err := run(
+		"assert-state", stagingRollback, "staging-subrouter", stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("assert staging rollback: %v\n%s", err, output)
+	}
+
+	productionBase := write(base)
+	productionPrepared := filepath.Join(t.TempDir(), "prepared.yaml")
+	if output, err := run(
+		"prepare-canary", productionBase, productionPrepared,
+		"__root__", productionLegacy,
+		"subrouter-front-canary", "front-canary.sr.cmux.internal", productionFront,
+	); err != nil {
+		t.Fatalf("prepare production canary: %v\n%s", err, output)
+	}
+	productionCutover := filepath.Join(t.TempDir(), "cutover.yaml")
+	if output, err := run(
+		"rewrite-active", productionPrepared, productionCutover,
+		"__root__", productionLegacy, productionFront,
+		"subrouter-front-canary", "front-canary.sr.cmux.internal", productionFront,
+	); err != nil {
+		t.Fatalf("rewrite production active route: %v\n%s", err, output)
+	}
+	productionBody, err := os.ReadFile(productionCutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(productionBody), productionFront) != 2 ||
+		!strings.Contains(string(productionBody), stagingLegacy) {
+		t.Fatalf("production cutover changed the staging route:\n%s", productionBody)
+	}
+
+	hijacked := write(strings.Replace(string(first), "front-canary.staging.sr.cmux.internal", "attacker.invalid", 1))
+	if output, err := run(append([]string{"prepare-canary", hijacked, filepath.Join(t.TempDir(), "out.yaml")}, stagingArgs...)...); err == nil {
+		t.Fatalf("hijacked canary host was accepted:\n%s", output)
+	}
+}
+
 func TestGCPBackendHealthRequiresEveryStatusStableAcrossTheWindow(t *testing.T) {
 	requireDeployScriptTools(t, "python3", "sh")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))

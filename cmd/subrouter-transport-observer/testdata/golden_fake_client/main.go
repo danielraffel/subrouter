@@ -56,6 +56,12 @@ func fakeAction(args []string) {
 		os.Exit(9)
 	}
 	operation := args[0]
+	if operation == "migration-prepare" && os.Getenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_SESSIONS_DURING_PREPARE") == "1" {
+		entries, err := os.ReadDir(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"))
+		if err != nil || len(entries) <= 1 {
+			os.Exit(9)
+		}
+	}
 	if logPath := os.Getenv("ACTION_LOG"); logPath != "" {
 		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
