@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,52 @@ import (
 	"testing"
 	"time"
 )
+
+type accumulatingObserverDelay struct {
+	elapsed time.Duration
+}
+
+func (delay *accumulatingObserverDelay) wait(
+	_ context.Context,
+	_ <-chan struct{},
+	_ <-chan struct{},
+	duration time.Duration,
+) error {
+	delay.elapsed += duration
+	return nil
+}
+
+func TestGoldenObserverDefaultPacingOutlastsDeploymentGate(t *testing.T) {
+	gate := newGoldenResponseGate()
+	pacer := gate.newResponsePacer()
+	delay := &accumulatingObserverDelay{}
+	pacer.delay = delay
+
+	var payload bytes.Buffer
+	for line := 1; line <= 4000; line++ {
+		if _, err := fmt.Fprintf(&payload, "%d x\n", line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var delivered bytes.Buffer
+	if _, err := pacer.write(context.Background(), payload.Bytes(), delivered.Write); err != nil {
+		t.Fatal(err)
+	}
+	if delay.elapsed < 20*time.Minute {
+		t.Fatalf("finite golden response pacing runway = %s, want at least 20m", delay.elapsed)
+	}
+	if delivered.Len() >= payload.Len() {
+		t.Fatal("finite golden response completed before gate release")
+	}
+
+	gate.releasePacing()
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(delivered.Bytes(), payload.Bytes()) {
+		t.Fatal("released golden response did not preserve its payload")
+	}
+}
 
 func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 	previousHooks := goldenTestHooks

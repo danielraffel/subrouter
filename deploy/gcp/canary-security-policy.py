@@ -27,6 +27,7 @@ DENY_DESCRIPTION = "deny unauthenticated Subrouter front migration canary"
 TOKEN = re.compile(r"[0-9a-f]{64}")
 NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
 HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
+FINGERPRINT = re.compile(r"[A-Za-z0-9_-]{8,128}={0,2}")
 MAX_POLICY_BYTES = 2 * 1024 * 1024
 
 
@@ -170,6 +171,15 @@ def validate_identifiers(name: str, host: str, token: str | None = None) -> None
         fail("canary token must be 32 random bytes encoded as lowercase hex")
 
 
+def live_fingerprint(document: dict[str, Any], name: str) -> str:
+    if document.get("name") != name or document.get("type") != "CLOUD_ARMOR":
+        fail("existing security policy identity does not match the managed canary policy")
+    fingerprint = document.get("fingerprint")
+    if not isinstance(fingerprint, str) or FINGERPRINT.fullmatch(fingerprint) is None:
+        fail("existing security policy fingerprint is invalid")
+    return fingerprint
+
+
 def rule_expression(rule: dict[str, Any], label: str) -> str:
     match = rule.get("match")
     if not isinstance(match, dict) or set(match) != {"expr"}:
@@ -232,6 +242,12 @@ def main() -> None:
     render.add_argument("name")
     render.add_argument("host")
     render.add_argument("--token-file", type=Path, required=True)
+    render_update = commands.add_parser("render-update")
+    render_update.add_argument("destination", type=Path)
+    render_update.add_argument("current")
+    render_update.add_argument("name")
+    render_update.add_argument("host")
+    render_update.add_argument("--token-file", type=Path, required=True)
     verify = commands.add_parser("assert-ready")
     verify.add_argument("source")
     verify.add_argument("name")
@@ -240,10 +256,13 @@ def main() -> None:
     args = parser.parse_args()
     token = read_token(args.token_file) if args.token_file is not None else None
     validate_identifiers(args.name, args.host, token)
-    if args.command == "render":
+    if args.command in {"render", "render-update"}:
         if token is None:
-            fail("render requires a canary token")
-        write_document(args.destination, policy_document(args.name, args.host, token))
+            fail(f"{args.command} requires a canary token")
+        document = policy_document(args.name, args.host, token)
+        if args.command == "render-update":
+            document["fingerprint"] = live_fingerprint(read_document(args.current), args.name)
+        write_document(args.destination, document)
         return
     token = validate_ready(read_document(args.source), args.name, args.host, token)
     json.dump(

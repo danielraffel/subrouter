@@ -888,10 +888,11 @@ func numericAWSProfileSuffix(name string) (int, bool) {
 }
 
 // workerIdleTimeout caps how long a client connection may sit idle on this
-// worker. It has to be short enough that an upgraded-away generation actually
-// drains, and long enough that an ordinary pause between an agent's turns does
-// not churn connections.
-const workerIdleTimeout = 90 * time.Second
+// worker. Google Cloud's global Application Load Balancer keeps backend HTTP
+// connections idle for up to 600 seconds, so the worker must wait longer or a
+// GFE can reuse a connection just as the worker closes it and surface a 502.
+// Retired generations still drain once their load-balancer connections expire.
+const workerIdleTimeout = 620 * time.Second
 
 func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger) error {
 	errCh := make(chan error, 1)

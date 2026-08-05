@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the immutable v0.1.51/v0.1.60/v0.1.61 release inputs, then run the complete
+# Verify the immutable v0.1.51/v0.1.60/v0.1.63 release inputs, then run the complete
 # legacy-to-front migration and slot-upgrade continuity gate from a local Mac.
 set -euo pipefail
 umask 077
@@ -16,8 +16,8 @@ bootstrap_tag="v0.1.60"
 bootstrap_version="0.1.60"
 bootstrap_revision="e169e94f2bea9a0455a5831631fcbac220bd65f2"
 bootstrap_linux_sha="6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
-candidate_tag="v0.1.61"
-candidate_version="0.1.61"
+candidate_tag="v0.1.63"
+candidate_version="0.1.63"
 
 usage() {
   cat <<'EOF'
@@ -217,7 +217,7 @@ if ! gh release view "${candidate_tag}" --repo "${repository}" --json tagName,is
       '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not) and .isImmutable == true and
        (.publishedAt | type == "string" and length > 0)' \
       >/dev/null; then
-  echo "v0.1.61 is not a published immutable release" >&2
+  echo "v0.1.63 is not a published immutable release" >&2
   exit 1
 fi
 candidate_revision="$(require_release_revision_on_main "${candidate_tag}")"

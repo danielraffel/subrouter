@@ -30,8 +30,8 @@ import (
 const (
 	goldenRequestTokenHeader = "X-Subrouter-Golden-Request-Token"
 	goldenRequestStateEnv    = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
-	goldenPacedChunkBytes    = 256
-	goldenPacedChunkInterval = 100 * time.Millisecond
+	goldenPacedChunkBytes    = 8
+	goldenPacedChunkInterval = 500 * time.Millisecond
 	goldenPacedReadBuffer    = 64 << 10
 	goldenPacedHoldbackBytes = 256
 )
