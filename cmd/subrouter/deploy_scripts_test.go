@@ -295,10 +295,13 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 		t.Fatal(err)
 	}
 	body := string(captured)
+	authenticatedOffset := strings.Index(body, "X-Subrouter-Canary-Token:")
+	deniedOffset := strings.Index(body, "X-Subrouter-Session: canary-test-1-denied")
 	if strings.Count(body, "--request--") != 2 ||
 		strings.Count(body, "X-Subrouter-Canary-Token:") != 1 ||
 		!strings.Contains(body, "X-Subrouter-Session: canary-test-1-denied") ||
-		!strings.Contains(body, "X-Subrouter-Session: canary-test-1") {
+		!strings.Contains(body, "X-Subrouter-Session: canary-test-1") ||
+		authenticatedOffset < 0 || deniedOffset < 0 || authenticatedOffset > deniedOffset {
 		t.Fatalf("probe did not pair denied and authenticated canaries:\n%s", body)
 	}
 }
