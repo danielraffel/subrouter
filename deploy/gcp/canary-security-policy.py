@@ -51,8 +51,7 @@ def deny_expression(host: str) -> str:
 
 
 def host_expression(host: str) -> str:
-    pattern = "^" + host.replace(".", r"\.") + r"\.?(:[0-9]{1,5})?$"
-    return f"has(request.headers['host']) && request.headers['host'].lower().matches('{pattern}')"
+    return f"has(request.headers['host']) && request.headers['host'].lower() == '{host}'"
 
 
 def default_rule() -> dict[str, Any]:
