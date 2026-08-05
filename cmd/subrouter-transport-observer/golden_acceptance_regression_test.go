@@ -108,6 +108,45 @@ func TestGoldenMigrationAllowsConcurrentDestinationConnectionDrain(t *testing.T)
 	}
 }
 
+func TestGoldenMigrationRejectsMissingPostSnapshotConnectionLiveness(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	data, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	proof, ok := document["destination_proof"].(map[string]any)
+	if !ok {
+		t.Fatal("destination proof is not an object")
+	}
+	delete(proof, "post_snapshot_liveness")
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing goldenMigrationEvidence
+	if err := json.Unmarshal(data, &missing); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGoldenMigrationTransition(&missing, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted migration evidence without exact post-snapshot connection liveness")
+	}
+
+	path := filepath.Join(t.TempDir(), "transition.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
+		t.Fatalf("Python validator accepted migration evidence without exact post-snapshot connection liveness: %s", output)
+	}
+}
+
 func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
 	evidence := validGoldenMigrationTransitionEvidence(
 		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
