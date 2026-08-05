@@ -30,7 +30,10 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.000Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
-	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.750Z"
+	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:04:59.600Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ResponseChunkAt = "2026-08-02T00:04:59.700Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ReceivedAt = "2026-08-02T00:04:59.800Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.900Z"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
 		t.Fatalf("sub-five-minute route propagation was rejected: %v", err)
 	}
@@ -38,7 +41,10 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:05:00.000Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = evidence.Timestamps.ActivatedAt
-	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:05:00.001Z"
+	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:05:00.001Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ResponseChunkAt = "2026-08-02T00:05:00.002Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ReceivedAt = "2026-08-02T00:05:00.003Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:05:00.004Z"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
 		t.Fatal("five-minute route propagation boundary was accepted")
 	}
@@ -51,7 +57,10 @@ func TestGoldenMigrationSummaryPreservesRoutePropagationWindow(t *testing.T) {
 	evidence.Timestamps.ActivatedAt = "2026-08-02T00:04:59.123Z"
 	evidence.DestinationProof.ObservedAt = evidence.Timestamps.ActivatedAt
 	evidence.DestinationProof.ReceivedAt = "2026-08-02T00:04:59.500Z"
-	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.750Z"
+	evidence.DestinationProof.PostSnapshotLiveness.RequestedAt = "2026-08-02T00:04:59.600Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ResponseChunkAt = "2026-08-02T00:04:59.700Z"
+	evidence.DestinationProof.PostSnapshotLiveness.ReceivedAt = "2026-08-02T00:04:59.800Z"
+	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:04:59.900Z"
 
 	action := goldenActionSummary{}
 	populateGoldenMigrationActionSummary(&action, evidence)
@@ -75,6 +84,7 @@ func TestGoldenMigrationAllowsConcurrentDestinationConnectionDrain(t *testing.T)
 	evidence.Destination.After.PublicConnections = 10
 	evidence.Destination.After.GenerationConnections = 10
 	evidence.Destination.ConnectionCountDelta = -4
+	evidence.DestinationProof.PostSnapshotLiveness.DestinationSnapshotSHA256 = goldenMigrationSnapshotSHA256(evidence.Destination.After)
 
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
 		t.Fatalf("journal-correlated destination proof was rejected after concurrent drains: %v", err)
@@ -144,6 +154,43 @@ func TestGoldenMigrationRejectsMissingPostSnapshotConnectionLiveness(t *testing.
 	validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
 	if output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput(); err == nil {
 		t.Fatalf("Python validator accepted migration evidence without exact post-snapshot connection liveness: %s", output)
+	}
+}
+
+func TestGoldenMigrationPostSnapshotLivenessUsesExactTransportConnection(t *testing.T) {
+	connectionID := strings.Repeat("a", 64)
+	otherConnectionID := strings.Repeat("b", 64)
+	requestID := "request-1"
+	boundary := time.Now().UTC()
+	stats := newObserverStats()
+	session := &goldenSession{
+		observer: &runningGoldenObserver{stats: stats},
+		done:     make(chan struct{}),
+	}
+	stats.observe(transportEvent{
+		Kind: "request_started", Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID,
+	})
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: boundary.Add(time.Millisecond).Format(time.RFC3339Nano),
+		Path: "/v1/responses", RequestID: requestID, ConnectionID: otherConnectionID, Bytes: 1,
+	})
+	timedContext, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := waitGoldenConnectionResponseChunkAfter(timedContext, session, connectionID, boundary); err == nil {
+		t.Fatal("post-snapshot liveness accepted a response chunk from a different transport connection")
+	}
+
+	want := boundary.Add(2 * time.Millisecond)
+	stats.observe(transportEvent{
+		Kind: "response_chunk", Timestamp: want.Format(time.RFC3339Nano),
+		Path: "/v1/responses", RequestID: requestID, ConnectionID: connectionID, Bytes: 1,
+	})
+	got, err := waitGoldenConnectionResponseChunkAfter(context.Background(), session, connectionID, boundary)
+	if err != nil {
+		t.Fatalf("exact transport response chunk was rejected: %v", err)
+	}
+	if !got.Equal(want) {
+		t.Fatalf("response chunk timestamp = %s, want %s", got, want)
 	}
 }
 
@@ -1014,6 +1061,13 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 		SessionID:                  "golden-session",
 		OriginalContinuityVerified: true, FreshPublicConnection: true, JournalCorrelated: true,
 		ObservedAt: "2026-08-02T00:00:01Z", ReceivedAt: "2026-08-02T00:00:01.5Z",
+		PostSnapshotLiveness: goldenMigrationPostSnapshotLiveness{
+			SHA256: strings.Repeat("b", 64), Challenge: strings.Repeat("c", 32),
+			ConnectionID: strings.Repeat("a", 64), SessionID: "golden-session",
+			DestinationSnapshotSHA256: goldenMigrationSnapshotSHA256(evidence.Destination.After),
+			RequestedAt:               "2026-08-02T00:00:01.6Z", ResponseChunkAt: "2026-08-02T00:00:01.7Z",
+			ReceivedAt: "2026-08-02T00:00:01.8Z",
+		},
 	}
 	legacyMetrics := goldenMigrationLegacyMetrics{
 		NRestarts:             goldenDeployCounter{Before: goldenInt64(0), After: goldenInt64(0)},

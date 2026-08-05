@@ -35,6 +35,7 @@ const (
 	goldenActionEvidenceLimit                 = 256 << 10
 	goldenActivationLimit                     = 30 * time.Second
 	goldenMigrationPropagationLimit           = 5 * time.Minute
+	goldenDestinationLivenessLimit            = 10 * time.Second
 	goldenBackendHealthStabilityLimit         = 5 * time.Minute
 	goldenRetirementLimit                     = 30 * time.Second
 	goldenChunkGapFloor                       = 5 * time.Second

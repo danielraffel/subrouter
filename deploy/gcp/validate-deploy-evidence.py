@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 import sys
@@ -917,7 +918,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     challenge = text(field(proof, "challenge", "destination_proof"), "destination_proof.challenge")
     if not re.fullmatch(r"[0-9a-f]{32}", challenge):
         fail("destination_proof.challenge must be a 128-bit lowercase hex challenge")
-    text(field(proof, "connection_id", "destination_proof"), "destination_proof.connection_id")
+    connection_id = text(field(proof, "connection_id", "destination_proof"), "destination_proof.connection_id")
     session_id = text(field(proof, "session_id", "destination_proof"), "destination_proof.session_id")
     if re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", session_id) is None:
         fail("destination_proof.session_id is invalid")
@@ -952,6 +953,51 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         fail("destination proof receipt timestamps are out of order")
     if proof_received - requested >= dt.timedelta(minutes=5):
         fail("destination proof exceeded the five-minute route propagation boundary")
+
+    liveness = obj(
+        field(proof, "post_snapshot_liveness", "destination_proof"),
+        "destination_proof.post_snapshot_liveness",
+    )
+    sha(field(liveness, "sha256", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.sha256")
+    liveness_challenge = text(
+        field(liveness, "challenge", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.challenge",
+    )
+    if not re.fullmatch(r"[0-9a-f]{32}", liveness_challenge):
+        fail("destination_proof.post_snapshot_liveness.challenge must be a 128-bit lowercase hex challenge")
+    exact(
+        text(field(liveness, "connection_id", "destination_proof.post_snapshot_liveness"),
+             "destination_proof.post_snapshot_liveness.connection_id"),
+        connection_id,
+        "destination_proof.post_snapshot_liveness.connection_id",
+    )
+    exact(
+        text(field(liveness, "session_id", "destination_proof.post_snapshot_liveness"),
+             "destination_proof.post_snapshot_liveness.session_id"),
+        session_id,
+        "destination_proof.post_snapshot_liveness.session_id",
+    )
+    liveness_snapshot_sha = sha(
+        field(liveness, "destination_snapshot_sha256", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.destination_snapshot_sha256",
+    )
+    liveness_requested = timestamp(
+        field(liveness, "requested_at", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.requested_at",
+    )
+    liveness_chunk = timestamp(
+        field(liveness, "response_chunk_at", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.response_chunk_at",
+    )
+    liveness_received = timestamp(
+        field(liveness, "received_at", "destination_proof.post_snapshot_liveness"),
+        "destination_proof.post_snapshot_liveness.received_at",
+    )
+    if not proof_received <= liveness_requested <= liveness_chunk <= liveness_received <= emitted:
+        fail("destination post-snapshot liveness timestamps are out of order")
+    if liveness_received - liveness_requested >= dt.timedelta(seconds=10):
+        fail("destination post-snapshot liveness exceeded ten seconds")
 
     source = obj(field(document, "source", "root"), "source")
     before = validate_migration_snapshot(field(source, "before", "source"), "source.before", source_kind)
@@ -1004,6 +1050,16 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     )
     if destination_after["public_connections"] < 1 or destination_after["generation_connections"] < 1:
         fail("destination had no live connection after the journal-correlated golden proof")
+    canonical_destination = json.dumps(
+        destination_after,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    exact(
+        liveness_snapshot_sha,
+        hashlib.sha256(canonical_destination).hexdigest(),
+        "destination_proof.post_snapshot_liveness.destination_snapshot_sha256",
+    )
     metrics = obj(field(document, "metrics", "root"), "metrics")
     exact(
         field(metrics, "source_service", "metrics"),

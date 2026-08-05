@@ -43,6 +43,7 @@ ARTIFACT_DIR="${SUBROUTER_DEPLOY_ARTIFACT_DIR:-${PWD}/artifacts/gcp-front-transi
 RUN_LABEL="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-lb-${OPERATION}-$$"
 RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 MIGRATION_PROPAGATION_LIMIT_MS=300000
+DESTINATION_LIVENESS_LIMIT_MS=10000
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -381,7 +382,11 @@ destination_correlated=false
 while (( proof_attempt <= proof_max_attempts )); do
   proof_request_path="$(proof_attempt_path "${DESTINATION_PROOF_REQUEST}" "${proof_attempt}")"
   proof_path="$(proof_attempt_path "${DESTINATION_PROOF}" "${proof_attempt}")"
-  [[ ! -e "${proof_request_path}" && ! -L "${proof_request_path}" && ! -e "${proof_path}" && ! -L "${proof_path}" ]] \
+  liveness_request_path="${proof_path}.liveness-request"
+  liveness_proof_path="${proof_path}.liveness-proof"
+  [[ ! -e "${proof_request_path}" && ! -L "${proof_request_path}" && ! -e "${proof_path}" && ! -L "${proof_path}" &&
+     ! -e "${liveness_request_path}" && ! -L "${liveness_request_path}" &&
+     ! -e "${liveness_proof_path}" && ! -L "${liveness_proof_path}" ]] \
     || die "destination proof attempt path already exists"
   proof_challenge="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
   proof_request_tmp="$(mktemp "${proof_request_path}.tmp.XXXXXX")"
@@ -432,14 +437,44 @@ done
   || die "golden fresh public session did not reach the destination within ${proof_max_attempts} attempts"
 destination_after="$(supervisor_snapshot "${destination_kind}")"
 # Earlier proof attempts drain asynchronously, so their departures can hide the
-# accepted proof in an aggregate before/after delta. The journal match above
-# correlates the exact session; this snapshot proves it is still live on the
-# expected generation.
+# accepted proof in an aggregate before/after delta. Require a live connection
+# on the exact generation, then challenge the golden observer to produce a
+# response chunk on the accepted transport after this snapshot.
 jq -e --arg generation "${destination_generation}" \
   '.generation == $generation and .public_connections >= 1 and
    .generation_connections >= 1 and .inactive_connections == 0' \
   < <(stream_shell_value "${destination_after}") >/dev/null \
   || die "golden fresh public connection was not correlated to the destination generation"
+destination_snapshot_canonical="$(printf '%s' "${destination_after}" | jq -cS .)"
+destination_snapshot_sha256="$(printf '%s' "${destination_snapshot_canonical}" | sha256sum | awk '{print $1}')"
+liveness_challenge="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+liveness_requested_at="$(utc_now)"
+liveness_requested_ms="$(epoch_millis)"
+liveness_request_tmp="$(mktemp "${liveness_request_path}.tmp.XXXXXX")"
+jq -n --arg schema 'subrouter.gcp.destination-liveness-request/v1' \
+  --arg challenge "${liveness_challenge}" --arg operation "${OPERATION}" \
+  --arg destination "${destination_kind}" --arg generation "${destination_generation}" \
+  --arg connection_id "${destination_connection_id}" --arg session_id "${destination_session_id}" \
+  --arg snapshot_sha "${destination_snapshot_sha256}" --arg requested_at "${liveness_requested_at}" \
+  '{schema:$schema,challenge:$challenge,operation:$operation,destination:$destination,
+    destination_generation:$generation,connection_id:$connection_id,session_id:$session_id,
+    destination_snapshot_sha256:$snapshot_sha,requested_at:$requested_at}' \
+  >"${liveness_request_tmp}"
+chmod 0600 "${liveness_request_tmp}"
+mv -f -- "${liveness_request_tmp}" "${liveness_request_path}"
+while [[ ! -f "${liveness_proof_path}" || -L "${liveness_proof_path}" ]]; do
+  (( $(epoch_millis) - liveness_requested_ms < DESTINATION_LIVENESS_LIMIT_MS )) \
+    || die "golden destination connection produced no response chunk after the destination snapshot"
+  sleep 0.05
+done
+liveness_received_at="$(utc_now)"
+python3 "${DEPLOYMENT_CONTRACT}" validate-destination-liveness \
+  "${liveness_proof_path}" "${liveness_challenge}" "${OPERATION}" \
+  "${destination_kind}" "${destination_generation}" "${destination_connection_id}" \
+  "${destination_session_id}" "${destination_snapshot_sha256}" "${liveness_requested_at}" \
+  "${liveness_received_at}"
+liveness_proof_sha256="$(sha256sum "${liveness_proof_path}" | awk '{print $1}')"
+liveness_response_chunk_at="$(jq -r '.response_chunk_at' "${liveness_proof_path}")"
 destination_connection_delta="$(( $(jq -r '.generation_connections' < <(stream_shell_value "${destination_after}")) - $(jq -r '.generation_connections' < <(stream_shell_value "${destination_before}")) ))"
 legacy_restarts_after="$(service_restarts legacy)"
 legacy_oom_after="$(service_oom_kills legacy)"
@@ -480,6 +515,10 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
   --arg proof_received_at "${proof_received_at}" --arg emitted_at "${evidence_emitted_at}" \
   --arg proof_sha "${destination_proof_sha256}" --arg challenge "${proof_challenge}" \
   --arg connection_id "${destination_connection_id}" --arg session_id "${destination_session_id}" \
+  --arg liveness_sha "${liveness_proof_sha256}" --arg liveness_challenge "${liveness_challenge}" \
+  --arg snapshot_sha "${destination_snapshot_sha256}" --arg liveness_requested_at "${liveness_requested_at}" \
+  --arg liveness_response_chunk_at "${liveness_response_chunk_at}" \
+  --arg liveness_received_at "${liveness_received_at}" \
   --argjson before "${source_before}" \
   --argjson after "${source_after}" --argjson expected "${EXPECTED_CONNECTIONS}" \
   --argjson destination_before "${destination_before}" --argjson destination_after "${destination_after}" \
@@ -506,7 +545,11 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type "${evi
     destination_proof:{sha256:$proof_sha,challenge:$challenge,connection_id:$connection_id,
       session_id:$session_id,
       original_continuity_verified:true,fresh_public_connection:true,journal_correlated:true,
-      observed_at:$activated_at,received_at:$proof_received_at},
+      observed_at:$activated_at,received_at:$proof_received_at,
+      post_snapshot_liveness:{sha256:$liveness_sha,challenge:$liveness_challenge,
+        connection_id:$connection_id,session_id:$session_id,
+        destination_snapshot_sha256:$snapshot_sha,requested_at:$liveness_requested_at,
+        response_chunk_at:$liveness_response_chunk_at,received_at:$liveness_received_at}},
     destination:{before:$destination_before,after:$destination_after,
       connection_count_delta:$destination_delta},
     metrics:{source_service:(if $source=="legacy" then "legacy" else "slot" end),

@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	goldenDestinationProofRequestSchema = "subrouter.gcp.destination-proof-request/v1"
-	goldenDestinationProofSchema        = "subrouter.gcp.destination-proof/v1"
-	goldenDestinationProofMaxAttempts   = 64
+	goldenDestinationProofRequestSchema    = "subrouter.gcp.destination-proof-request/v1"
+	goldenDestinationProofSchema           = "subrouter.gcp.destination-proof/v1"
+	goldenDestinationLivenessRequestSchema = "subrouter.gcp.destination-liveness-request/v1"
+	goldenDestinationLivenessProofSchema   = "subrouter.gcp.destination-liveness/v1"
+	goldenDestinationProofMaxAttempts      = 64
 )
 
 type goldenDestinationProofRequest struct {
@@ -46,6 +48,31 @@ type goldenDestinationProof struct {
 	ConnectionID               string `json:"connection_id"`
 	SessionID                  string `json:"session_id"`
 	ObservedAt                 string `json:"observed_at"`
+}
+
+type goldenDestinationLivenessRequest struct {
+	Schema                    string `json:"schema"`
+	Challenge                 string `json:"challenge"`
+	Operation                 string `json:"operation"`
+	Destination               string `json:"destination"`
+	DestinationGeneration     string `json:"destination_generation"`
+	ConnectionID              string `json:"connection_id"`
+	SessionID                 string `json:"session_id"`
+	DestinationSnapshotSHA256 string `json:"destination_snapshot_sha256"`
+	RequestedAt               string `json:"requested_at"`
+}
+
+type goldenDestinationLivenessProof struct {
+	Schema                    string `json:"schema"`
+	Challenge                 string `json:"challenge"`
+	Operation                 string `json:"operation"`
+	Destination               string `json:"destination"`
+	DestinationGeneration     string `json:"destination_generation"`
+	ConnectionID              string `json:"connection_id"`
+	SessionID                 string `json:"session_id"`
+	DestinationSnapshotSHA256 string `json:"destination_snapshot_sha256"`
+	RequestedAt               string `json:"requested_at"`
+	ResponseChunkAt           string `json:"response_chunk_at"`
 }
 
 func (r *goldenRunner) runMigrationTransitionWithProof(
@@ -97,10 +124,15 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 	var request goldenDestinationProofRequest
 	var proof goldenDestinationProof
 	var proofDigest [sha256.Size]byte
+	var livenessRequest goldenDestinationLivenessRequest
+	var livenessProof goldenDestinationLivenessProof
+	var livenessProofDigest [sha256.Size]byte
 	var destinationSession *goldenSession
 	for attempt := 1; attempt <= goldenDestinationProofMaxAttempts; attempt++ {
 		attemptRequestPath := goldenMigrationAttemptPath(requestPath, attempt)
 		attemptProofPath := goldenMigrationAttemptPath(proofPath, attempt)
+		attemptLivenessRequestPath := attemptProofPath + ".liveness-request"
+		attemptLivenessProofPath := attemptProofPath + ".liveness-proof"
 		requestData, err := waitGoldenHandshakeFile(ctx, attemptRequestPath, command.done)
 		if err != nil {
 			return goldenActionSummary{}, nil, err
@@ -166,8 +198,8 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 		if err != nil || time.Since(requested) >= goldenMigrationPropagationLimit || writePrivateFile(attemptProofPath, proofFileData) != nil {
 			return goldenActionSummary{}, nil, failGolden("migration_destination_proof_write_failed")
 		}
-		retry, err := waitGoldenMigrationAttemptOutcome(
-			ctx, goldenMigrationAttemptPath(requestPath, attempt+1), command.done,
+		retry, livenessData, err := waitGoldenMigrationAttemptOutcome(
+			ctx, goldenMigrationAttemptPath(requestPath, attempt+1), attemptLivenessRequestPath, command.done,
 		)
 		if err != nil {
 			return goldenActionSummary{}, nil, err
@@ -181,6 +213,42 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 				return goldenActionSummary{}, nil, err
 			}
 			continue
+		}
+		livenessRequest = goldenDestinationLivenessRequest{}
+		if err := json.Unmarshal(livenessData, &livenessRequest); err != nil ||
+			livenessRequest.Schema != goldenDestinationLivenessRequestSchema ||
+			!validGoldenChallenge(livenessRequest.Challenge) || livenessRequest.Operation != operation ||
+			livenessRequest.Destination != destination ||
+			livenessRequest.DestinationGeneration != request.DestinationGeneration ||
+			livenessRequest.ConnectionID != proof.ConnectionID || livenessRequest.SessionID != proof.SessionID ||
+			!validGoldenSHA256(livenessRequest.DestinationSnapshotSHA256) {
+			return goldenActionSummary{}, nil, failGolden("migration_destination_liveness_request_invalid")
+		}
+		livenessRequested, err := parseGoldenEvidenceTime(livenessRequest.RequestedAt)
+		proofObserved, proofTimeErr := parseGoldenEvidenceTime(proof.ObservedAt)
+		if err != nil || proofTimeErr != nil || livenessRequested.Before(proofObserved) ||
+			time.Since(livenessRequested) >= goldenDestinationLivenessLimit {
+			return goldenActionSummary{}, nil, failGolden("migration_destination_liveness_request_invalid")
+		}
+		responseChunkAt, err := waitGoldenConnectionResponseChunkAfter(
+			ctx, candidateSession, proof.ConnectionID, livenessRequested,
+		)
+		if err != nil {
+			return goldenActionSummary{}, nil, err
+		}
+		livenessProof = goldenDestinationLivenessProof{
+			Schema: goldenDestinationLivenessProofSchema, Challenge: livenessRequest.Challenge,
+			Operation: operation, Destination: destination,
+			DestinationGeneration: request.DestinationGeneration,
+			ConnectionID:          proof.ConnectionID, SessionID: proof.SessionID,
+			DestinationSnapshotSHA256: livenessRequest.DestinationSnapshotSHA256,
+			RequestedAt:               livenessRequest.RequestedAt, ResponseChunkAt: responseChunkAt.Format(time.RFC3339Nano),
+		}
+		livenessProofData, err := json.Marshal(livenessProof)
+		livenessProofFileData := append(livenessProofData, '\n')
+		livenessProofDigest = sha256.Sum256(livenessProofFileData)
+		if err != nil || writePrivateFile(attemptLivenessProofPath, livenessProofFileData) != nil {
+			return goldenActionSummary{}, nil, failGolden("migration_destination_liveness_proof_write_failed")
 		}
 		destinationSession = candidateSession
 		break
@@ -207,7 +275,14 @@ func (r *goldenRunner) runMigrationTransitionWithProof(
 		evidence.Routing.After != destination || evidence.Timestamps.TransitionRequestedAt != request.TransitionRequestedAt ||
 		evidence.Timestamps.ActivatedAt != proof.ObservedAt || evidence.DestinationProof.SHA256 != fmt.Sprintf("%x", proofDigest[:]) ||
 		evidence.DestinationProof.Challenge != proof.Challenge || evidence.DestinationProof.ConnectionID != proof.ConnectionID ||
-		evidence.DestinationProof.SessionID != proof.SessionID {
+		evidence.DestinationProof.SessionID != proof.SessionID ||
+		evidence.DestinationProof.PostSnapshotLiveness.SHA256 != fmt.Sprintf("%x", livenessProofDigest[:]) ||
+		evidence.DestinationProof.PostSnapshotLiveness.Challenge != livenessProof.Challenge ||
+		evidence.DestinationProof.PostSnapshotLiveness.ConnectionID != livenessProof.ConnectionID ||
+		evidence.DestinationProof.PostSnapshotLiveness.SessionID != livenessProof.SessionID ||
+		evidence.DestinationProof.PostSnapshotLiveness.DestinationSnapshotSHA256 != livenessProof.DestinationSnapshotSHA256 ||
+		evidence.DestinationProof.PostSnapshotLiveness.RequestedAt != livenessProof.RequestedAt ||
+		evidence.DestinationProof.PostSnapshotLiveness.ResponseChunkAt != livenessProof.ResponseChunkAt {
 		return result, nil, failGolden("migration_destination_proof_evidence_mismatch")
 	}
 	if sessionDone(destinationSession) {
@@ -232,25 +307,94 @@ func goldenSessionThreadID(session *goldenSession) string {
 	return session.threadID
 }
 
-func waitGoldenMigrationAttemptOutcome(ctx context.Context, nextRequestPath string, commandDone <-chan struct{}) (bool, error) {
+func waitGoldenConnectionResponseChunkAfter(
+	ctx context.Context,
+	session *goldenSession,
+	connectionID string,
+	boundary time.Time,
+) (time.Time, error) {
+	if session == nil || session.observer == nil || session.observer.stats == nil ||
+		!validGoldenSHA256(connectionID) || boundary.IsZero() {
+		return time.Time{}, failGolden("migration_destination_connection_not_held")
+	}
+	waitContext, cancel := context.WithTimeout(ctx, goldenDestinationLivenessLimit)
+	defer cancel()
+	for {
+		requests, chunks, observerErrors := session.observer.stats.snapshot()
+		if observerErrors != 0 {
+			return time.Time{}, failGolden("migration_destination_connection_not_held")
+		}
+		requestIDs := make(map[string]bool)
+		for _, request := range requests {
+			if request.ConnectionID == connectionID &&
+				(request.Path == "/v1/responses" || request.Path == "/responses") {
+				requestIDs[request.RequestID] = true
+			}
+		}
+		for _, chunk := range chunks {
+			if chunk.Kind != "response_chunk" || chunk.ConnectionID != connectionID || chunk.Bytes <= 0 ||
+				!requestIDs[chunk.RequestID] || (chunk.Path != "/v1/responses" && chunk.Path != "/responses") {
+				continue
+			}
+			stamp, err := time.Parse(time.RFC3339Nano, chunk.Timestamp)
+			if err != nil || stamp.IsZero() {
+				return time.Time{}, failGolden("migration_destination_connection_not_held")
+			}
+			if !stamp.Before(boundary) {
+				return stamp, nil
+			}
+		}
+		if sessionDone(session) {
+			return time.Time{}, failGolden("migration_destination_connection_not_held")
+		}
+		select {
+		case <-waitContext.Done():
+			return time.Time{}, failGolden("migration_destination_connection_not_held")
+		case <-session.done:
+			return time.Time{}, failGolden("migration_destination_connection_not_held")
+		case <-session.observer.stats.notify:
+		}
+	}
+}
+
+func waitGoldenMigrationAttemptOutcome(
+	ctx context.Context,
+	nextRequestPath string,
+	livenessRequestPath string,
+	commandDone <-chan struct{},
+) (bool, []byte, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		info, err := os.Lstat(nextRequestPath)
 		if err == nil {
 			if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > goldenActionEvidenceLimit {
-				return false, failGolden("deployment_handshake_file_invalid")
+				return false, nil, failGolden("deployment_handshake_file_invalid")
 			}
-			return true, nil
+			return true, nil, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return false, failGolden("deployment_handshake_file_invalid")
+			return false, nil, failGolden("deployment_handshake_file_invalid")
+		}
+		info, err = os.Lstat(livenessRequestPath)
+		if err == nil {
+			if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > goldenActionEvidenceLimit {
+				return false, nil, failGolden("deployment_handshake_file_invalid")
+			}
+			data, readErr := os.ReadFile(livenessRequestPath)
+			if readErr != nil {
+				return false, nil, failGolden("deployment_handshake_file_invalid")
+			}
+			return false, data, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, nil, failGolden("deployment_handshake_file_invalid")
 		}
 		select {
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return false, nil, ctx.Err()
 		case <-commandDone:
-			return false, nil
+			return false, nil, failGolden("migration_destination_liveness_request_missing")
 		case <-ticker.C:
 		}
 	}
