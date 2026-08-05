@@ -37,6 +37,7 @@ RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
 # shellcheck source=deploy/gcp/deploy-lock.sh
@@ -50,6 +51,7 @@ REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYM
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+[[ -f "${URL_MAP_ROUTING}" ]] || die "URL-map routing helper is missing"
 INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
 DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 [[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be an integer"
@@ -68,6 +70,9 @@ predecessor_json="$(jq -c '.predecessor' "${CUTOVER_EVIDENCE}")"
 URL_MAP="$(jq -r '.routing.url_map' "${CUTOVER_EVIDENCE}")"
 legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${CUTOVER_EVIDENCE}")"
 front_backend_url="$(jq -r '.routing.front_backend_url' "${CUTOVER_EVIDENCE}")"
+active_matcher="$(jq -r '.routing.active_matcher' "${CUTOVER_EVIDENCE}")"
+canary_matcher="$(jq -r '.routing.canary.matcher' "${CUTOVER_EVIDENCE}")"
+canary_host="$(jq -r '.routing.canary.host' "${CUTOVER_EVIDENCE}")"
 legacy_generation="$(jq -r '.legacy.generation' "${CUTOVER_EVIDENCE}")"
 legacy_checksum="$(jq -r '.legacy.checksum' "${CUTOVER_EVIDENCE}")"
 accepting_new_public_false_at="$(jq -r '.timestamps.activated_at' "${CUTOVER_EVIDENCE}")"
@@ -163,8 +168,10 @@ gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_
 url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${url_map_applied}" --quiet
-python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
-  "${url_map_applied}" "${legacy_backend_url}" 0 "${front_backend_url}" 1
+python3 "${URL_MAP_ROUTING}" assert-state \
+  "${url_map_applied}" "${active_matcher}" "${front_backend_url}" \
+  "${canary_matcher}" "${canary_host}" "${front_backend_url}" \
+  --forbid-url "${legacy_backend_url}"
 installed_sum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${installed_sum}" == "${legacy_checksum}" ]] || die "legacy bytes changed after final cutover"
 restarts_before="$(legacy_restarts)"

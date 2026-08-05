@@ -85,6 +85,7 @@ pathMatchers:
 	if output, err := run(
 		"assert-state", stagingCutover, "staging-subrouter", stagingFront,
 		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+		"--forbid-url", stagingLegacy,
 	); err != nil {
 		t.Fatalf("assert staging cutover: %v\n%s", err, output)
 	}

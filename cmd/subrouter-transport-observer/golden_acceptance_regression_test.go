@@ -138,6 +138,9 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	fractionalHealth := fractionalMillisecond["front"].(map[string]any)["backend_health"].(map[string]any)
 	fractionalHealth["verified_at"] = "2026-08-02T00:05:00.001Z"
 	fractionalHealth["duration_ms"] = 300_001
+	fractionalCanary := fractionalMillisecond["routing"].(map[string]any)["canary"].(map[string]any)
+	fractionalCanary["verified_at"] = "2026-08-02T00:05:00.001Z"
+	fractionalCanary["stable_duration_ms"] = 300_001
 	if err := validateGo(fractionalMillisecond); err != nil {
 		t.Fatalf("Go validator rejected exact millisecond readiness duration: %v", err)
 	}
@@ -684,7 +687,7 @@ func validGoldenRetirementEvidence(mode string) *goldenDeployEvidence {
 func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigrationEvidence {
 	return &goldenMigrationEvidence{
 		Schema: goldenDeployEvidenceSchema, EvidenceType: evidenceType, Mode: mode, Success: true,
-		Run: goldenDeployRun{ID: "golden-run", Project: "project", Zone: "zone", Instance: "instance"},
+		Run: goldenDeployRun{ID: "golden-run", Project: "project", Zone: "zone", Instance: "subrouter-staging"},
 		Release: goldenDeployRelease{
 			Tag: goldenPinnedCandidateTag, SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
@@ -719,7 +722,14 @@ func validGoldenMigrationPreparationEvidence() *goldenMigrationEvidence {
 	evidence.Routing = goldenMigrationRouting{
 		URLMap: "url-map", LegacyBackend: "legacy-backend", FrontBackend: "front-backend",
 		LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
-		Current: "legacy",
+		ActiveMatcher: "staging-subrouter", Current: "legacy",
+		Canary: goldenMigrationCanary{
+			Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
+			BackendURL: "https://example.test/front", MapUpdatedAt: "2026-08-01T23:59:00Z",
+			FirstObservedAt: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
+			StableDurationMillis: 300_000, FirstProofAttempts: 1, VerifiedProofAttempts: 1,
+			FirstSessionSHA256: strings.Repeat("e", 64), VerifiedSessionSHA256: strings.Repeat("f", 64),
+		},
 	}
 	evidence.EvidenceEmittedAt = "2026-08-02T00:05:01Z"
 	return evidence

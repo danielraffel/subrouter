@@ -46,6 +46,7 @@ MIGRATION_PROPAGATION_LIMIT_MS=300000
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
 # shellcheck source=deploy/gcp/deploy-lock.sh
@@ -60,6 +61,7 @@ REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYM
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+[[ -f "${URL_MAP_ROUTING}" ]] || die "URL-map routing helper is missing"
 INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
 DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 if [[ "${OPERATION}" == rollback ]]; then EXPECTED_CONNECTIONS=1; else EXPECTED_CONNECTIONS=2; fi
@@ -110,6 +112,9 @@ front_json="$(jq -c '.front | {slot,generation,checksum,control_checksum,worker_
 URL_MAP="$(jq -r '.routing.url_map' "${PRIOR_EVIDENCE}")"
 legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${PRIOR_EVIDENCE}")"
 front_backend_url="$(jq -r '.routing.front_backend_url' "${PRIOR_EVIDENCE}")"
+ACTIVE_MATCHER="$(jq -r '.routing.active_matcher' "${PRIOR_EVIDENCE}")"
+CANARY_MATCHER="$(jq -r '.routing.canary.matcher' "${PRIOR_EVIDENCE}")"
+CANARY_HOST="$(jq -r '.routing.canary.host' "${PRIOR_EVIDENCE}")"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
@@ -192,7 +197,7 @@ start_rss_sampler() {
   die "${target} RSS sampler did not produce a sample"
 }
 stop_rss_sampler() {
-  local target="$1" pid result peak
+  local target="$1" output_name="$2" pid result peak
   pid="${rss_sampler_pids[${target}]}"
   result="${rss_sampler_results[${target}]}"
   gcloud_ssh "sudo rm -f '${rss_sampler_sentinels[${target}]}'"
@@ -200,7 +205,7 @@ stop_rss_sampler() {
   peak="$(gcloud_ssh "sudo cat '${result}'" | tail -n 1)"
   [[ "${peak}" =~ ^[0-9]+$ ]] || die "${target} RSS sampler returned invalid data"
   unset "rss_sampler_pids[${target}]"
-  printf '%s\n' "${peak}"
+  printf -v "${output_name}" '%s' "${peak}"
 }
 stop_all_rss_samplers() {
   local target
@@ -210,6 +215,10 @@ stop_all_rss_samplers() {
     unset "rss_sampler_pids[${target}]"
   done
 }
+
+legacy_peak_rss=""
+slot_peak_rss=""
+front_peak_rss=""
 
 supervisor_snapshot() {
   local kind="$1" status active_id generation_connections inactive_connections public_connections slot
@@ -262,8 +271,9 @@ cleanup() {
       --source "${before_yaml}" --quiet || \
       ! "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
         --destination "${restored_yaml}" --quiet || \
-      ! python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
-        "${restored_yaml}" "${source_url}" 1 "${destination_url}" 0
+      ! python3 "${URL_MAP_ROUTING}" assert-state \
+        "${restored_yaml}" "${ACTIVE_MATCHER}" "${source_url}" \
+        "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
     then
       log "failed to restore the pre-transition URL map" >&2
       status=1
@@ -295,8 +305,10 @@ after_yaml="${ARTIFACT_DIR}/url-map-after.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${before_yaml}" --quiet
 if [[ "${source_kind}" == legacy ]]; then source_url="${legacy_backend_url}"; destination_url="${front_backend_url}"; else source_url="${front_backend_url}"; destination_url="${legacy_backend_url}"; fi
-python3 "${DEPLOYMENT_CONTRACT}" rewrite-url-map \
-  "${before_yaml}" "${candidate_yaml}" "${source_url}" "${destination_url}"
+python3 "${URL_MAP_ROUTING}" rewrite-active \
+  "${before_yaml}" "${candidate_yaml}" "${ACTIVE_MATCHER}" \
+  "${source_url}" "${destination_url}" \
+  "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_before="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
@@ -311,8 +323,9 @@ transition_started=1
   --source "${candidate_yaml}" --quiet
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${after_yaml}" --quiet
-python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
-  "${after_yaml}" "${source_url}" 0 "${destination_url}" 1
+python3 "${URL_MAP_ROUTING}" assert-state \
+  "${after_yaml}" "${ACTIVE_MATCHER}" "${destination_url}" \
+  "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_after="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
@@ -397,9 +410,9 @@ front_oom_after="$(service_oom_kills front)"
   || die "slot service restarted or OOM-killed during migration transition"
 [[ "${front_restarts_after}" == "${front_restarts_before}" && "${front_oom_after}" == "${front_oom_before}" ]] \
   || die "front service restarted or OOM-killed during migration transition"
-legacy_peak_rss="$(stop_rss_sampler legacy)"
-slot_peak_rss="$(stop_rss_sampler "${active_migration_slot}")"
-front_peak_rss="$(stop_rss_sampler front)"
+stop_rss_sampler legacy legacy_peak_rss
+stop_rss_sampler "${active_migration_slot}" slot_peak_rss
+stop_rss_sampler front front_peak_rss
 slot_memory_max="$(service_memory_max "${active_migration_slot}")"
 front_memory_max="$(service_memory_max front)"
 [[ "${slot_memory_max}" == 201326592 && "${front_memory_max}" == 134217728 ]] \

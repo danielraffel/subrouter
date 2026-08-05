@@ -602,7 +602,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     exact(field(document, "evidence_type", "root"), "front-migration-preparation", "evidence_type")
     exact(field(document, "mode", "root"), "prepare", "mode")
     exact(boolean(field(document, "success", "root"), "success"), True, "success")
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
@@ -616,6 +616,49 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
         fail("migration backend URLs must be distinct HTTPS resources")
     exact(field(routing, "current", "routing"), "legacy", "routing.current")
+    expected_routing = {
+        "subrouter-staging": (
+            "staging-subrouter",
+            "staging-subrouter-front-canary",
+            "front-canary.staging.sr.cmux.internal",
+        ),
+        "subrouter-team": (
+            "__root__",
+            "subrouter-front-canary",
+            "front-canary.sr.cmux.internal",
+        ),
+    }
+    target = expected_routing.get(run["instance"])
+    if target is None:
+        fail("front migration preparation targets an unsupported instance")
+    active_matcher, canary_matcher, canary_host = target
+    exact(field(routing, "active_matcher", "routing"), active_matcher, "routing.active_matcher")
+    canary = obj(field(routing, "canary", "routing"), "routing.canary")
+    exact(field(canary, "host", "routing.canary"), canary_host, "routing.canary.host")
+    exact(field(canary, "matcher", "routing.canary"), canary_matcher, "routing.canary.matcher")
+    exact(field(canary, "backend_url", "routing.canary"), front_url, "routing.canary.backend_url")
+    map_updated_at = timestamp(
+        field(canary, "map_updated_at", "routing.canary"),
+        "routing.canary.map_updated_at",
+    )
+    first_observed_at = timestamp(
+        field(canary, "first_observed_at", "routing.canary"),
+        "routing.canary.first_observed_at",
+    )
+    canary_verified_at = timestamp(
+        field(canary, "verified_at", "routing.canary"),
+        "routing.canary.verified_at",
+    )
+    canary_duration_ms = integer(
+        field(canary, "stable_duration_ms", "routing.canary"),
+        "routing.canary.stable_duration_ms",
+    )
+    for name in ("first_proof_attempts", "verified_proof_attempts"):
+        attempts = integer(field(canary, name, "routing.canary"), f"routing.canary.{name}", minimum=1)
+        if attempts > 600:
+            fail(f"routing.canary.{name} must be <= 600")
+    sha(field(canary, "first_session_sha256", "routing.canary"), "routing.canary.first_session_sha256")
+    sha(field(canary, "verified_session_sha256", "routing.canary"), "routing.canary.verified_session_sha256")
     legacy = obj(field(document, "legacy", "root"), "legacy")
     exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
     text(field(legacy, "generation", "legacy"), "legacy.generation")
@@ -677,6 +720,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         "front.backend_health.backend_membership_sha256",
     )
     stable_duration = verified_at - stable_since
+    canary_stable_duration = canary_verified_at - first_observed_at
     sample_span_capacity_ms = (healthy_samples - 1) * (max_sample_gap_ms + 1)
     if (
         stable_duration < FRONT_BACKEND_HEALTH_STABILITY
@@ -686,11 +730,17 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         or healthy_samples < 21
         or max_sample_gap_ms > 15_000
         or duration_ms > sample_span_capacity_ms
+        or first_observed_at < map_updated_at
+        or stable_since < first_observed_at
+        or canary_verified_at < verified_at
+        or canary_stable_duration < FRONT_BACKEND_HEALTH_STABILITY
+        or canary_stable_duration > dt.timedelta(minutes=20)
+        or canary_duration_ms != canary_stable_duration // dt.timedelta(milliseconds=1)
     ):
-        fail("front.backend_health does not prove five continuous healthy minutes")
+        fail("front canary and backend health do not prove five continuous healthy minutes")
     emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
-    if emitted_at < verified_at:
-        fail("evidence_emitted_at predates front backend health verification")
+    if emitted_at < canary_verified_at:
+        fail("evidence_emitted_at predates front canary verification")
 
 
 def validate_migration_snapshot(value: Any, path: str, kind: str) -> dict[str, Any]:

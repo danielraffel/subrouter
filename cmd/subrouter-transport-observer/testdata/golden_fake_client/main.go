@@ -58,7 +58,9 @@ func fakeAction(args []string) {
 	operation := args[0]
 	if operation == "migration-prepare" && os.Getenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_SESSIONS_DURING_PREPARE") == "1" {
 		entries, err := os.ReadDir(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"))
-		if err != nil || len(entries) <= 1 {
+		// The harness process and this action are already registered. Require at
+		// least one separately held Codex session before migration preparation.
+		if err != nil || len(entries) <= 2 {
 			os.Exit(9)
 		}
 	}
@@ -498,11 +500,19 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 	stableSince := verifiedAt.Add(-5 * time.Minute)
 	return map[string]any{
 		"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "front-migration-preparation", "mode": "prepare", "success": true,
-		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "subrouter-staging"},
 		"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 		"routing": map[string]any{
 			"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
 			"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test", "current": "legacy",
+			"active_matcher": "staging-subrouter",
+			"canary": map[string]any{
+				"host": "front-canary.staging.sr.cmux.internal", "matcher": "staging-subrouter-front-canary",
+				"backend_url": "https://front.test", "map_updated_at": stableSince.Add(-time.Minute).Format(time.RFC3339Nano),
+				"first_observed_at": stableSince.Format(time.RFC3339Nano), "verified_at": verifiedAt.Format(time.RFC3339Nano),
+				"stable_duration_ms": 300_000, "first_proof_attempts": 1, "verified_proof_attempts": 1,
+				"first_session_sha256": strings.Repeat("e", 64), "verified_session_sha256": strings.Repeat("f", 64),
+			},
 		},
 		"legacy": map[string]any{
 			"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323", "accepting_new_public": true,
