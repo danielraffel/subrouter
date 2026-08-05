@@ -2417,6 +2417,21 @@ exit 0
 	if err := os.WriteFile(frontActiveMarker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	pinnedFrontStatus := `{"active":{"id":"slot-a"},"backends":[{"id":"slot-a","connections":13}]}`
+	output, runErr, contextErr = run("0", "0", pinnedFrontStatus)
+	if runErr == nil || contextErr != nil {
+		t.Fatalf("mismatched topology with pinned connections was not rejected safely: err=%v context=%v\n%s", runErr, contextErr, output)
+	}
+	if !strings.Contains(string(output), "refusing to replace stale front topology with 13 pinned connection(s)") {
+		t.Fatalf("mismatched pinned topology returned the wrong failure:\n%s", output)
+	}
+	logBody, err = os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBody), "disable --now") {
+		t.Fatalf("mismatched pinned topology allowed a service stop:\n%s", logBody)
+	}
 	for path, target := range map[string]string{
 		filepath.Join(frontRoot, "subrouter"):       controlRelease,
 		filepath.Join(controlRoot, "subrouter"):     controlRelease,
@@ -2428,6 +2443,23 @@ exit 0
 		if err := os.Symlink(target, path); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.WriteFile(systemctlLog, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, runErr, contextErr = run("0", "0", pinnedFrontStatus)
+	if runErr != nil || contextErr != nil {
+		t.Fatalf("exact active topology with load-balancer connections was not reused: err=%v context=%v\n%s", runErr, contextErr, output)
+	}
+	if !strings.Contains(string(output), "reusing active migration topology with 13 pinned connection(s)") {
+		t.Fatalf("exact pinned topology did not report reuse:\n%s", output)
+	}
+	logBody, err = os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBody), "disable --now") {
+		t.Fatalf("exact pinned topology stopped a serving unit:\n%s", logBody)
 	}
 	if err := os.WriteFile(systemctlLog, nil, 0o600); err != nil {
 		t.Fatal(err)
