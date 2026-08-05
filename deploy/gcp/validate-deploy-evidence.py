@@ -166,6 +166,66 @@ def validate_run(value: Any) -> dict[str, Any]:
     return result
 
 
+def validate_migration_routing_selectors(
+    run: dict[str, Any], routing: dict[str, Any], front_url: str
+) -> dict[str, Any]:
+    expected_routing = {
+        "subrouter-staging": (
+            "staging-subrouter",
+            "staging-subrouter-front-canary",
+            "front-canary.staging.sr.cmux.internal",
+            "subrouter-staging-front-canary-policy",
+        ),
+        "subrouter-team": (
+            "__root__",
+            "subrouter-front-canary",
+            "front-canary.sr.cmux.internal",
+            "subrouter-front-canary-policy",
+        ),
+    }
+    target = expected_routing.get(run["instance"])
+    if target is None:
+        fail("front migration targets an unsupported instance")
+    active_matcher, canary_matcher, canary_host, security_policy = target
+    exact(field(routing, "active_matcher", "routing"), active_matcher, "routing.active_matcher")
+    canary = obj(field(routing, "canary", "routing"), "routing.canary")
+    exact(field(canary, "host", "routing.canary"), canary_host, "routing.canary.host")
+    exact(field(canary, "matcher", "routing.canary"), canary_matcher, "routing.canary.matcher")
+    exact(field(canary, "backend_url", "routing.canary"), front_url, "routing.canary.backend_url")
+    access = obj(field(canary, "access_control", "routing.canary"), "routing.canary.access_control")
+    exact(field(access, "name", "routing.canary.access_control"), security_policy, "routing.canary.access_control.name")
+    exact(field(access, "type", "routing.canary.access_control"), "CLOUD_ARMOR", "routing.canary.access_control.type")
+    exact(
+        boolean(field(access, "attached", "routing.canary.access_control"), "routing.canary.access_control.attached"),
+        True,
+        "routing.canary.access_control.attached",
+    )
+    for name, expected in (
+        ("allow_priority", 900),
+        ("deny_priority", 1000),
+        ("unauthorized_status", 403),
+        ("authorized_status", 400),
+    ):
+        exact(
+            integer(field(access, name, "routing.canary.access_control"), f"routing.canary.access_control.{name}"),
+            expected,
+            f"routing.canary.access_control.{name}",
+        )
+    exact(
+        boolean(
+            field(access, "key_redacted_before_backend", "routing.canary.access_control"),
+            "routing.canary.access_control.key_redacted_before_backend",
+        ),
+        True,
+        "routing.canary.access_control.key_redacted_before_backend",
+    )
+    sha(
+        field(access, "key_fingerprint_sha256", "routing.canary.access_control"),
+        "routing.canary.access_control.key_fingerprint_sha256",
+    )
+    return canary
+
+
 def validate_release(value: Any) -> dict[str, Any]:
     result = obj(value, "release")
     tag = text(field(result, "tag", "release"), "release.tag")
@@ -602,7 +662,7 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     exact(field(document, "evidence_type", "root"), "front-migration-preparation", "evidence_type")
     exact(field(document, "mode", "root"), "prepare", "mode")
     exact(boolean(field(document, "success", "root"), "success"), True, "success")
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
@@ -616,6 +676,66 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
     if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
         fail("migration backend URLs must be distinct HTTPS resources")
     exact(field(routing, "current", "routing"), "legacy", "routing.current")
+    canary = validate_migration_routing_selectors(run, routing, front_url)
+    map_updated_at = timestamp(
+        field(canary, "map_updated_at", "routing.canary"),
+        "routing.canary.map_updated_at",
+    )
+    first_observed_at = timestamp(
+        field(canary, "first_observed_at", "routing.canary"),
+        "routing.canary.first_observed_at",
+    )
+    canary_verified_at = timestamp(
+        field(canary, "verified_at", "routing.canary"),
+        "routing.canary.verified_at",
+    )
+    canary_duration_ms = integer(
+        field(canary, "stable_duration_ms", "routing.canary"),
+        "routing.canary.stable_duration_ms",
+    )
+    canary_healthy_samples = integer(
+        field(canary, "healthy_samples", "routing.canary"),
+        "routing.canary.healthy_samples",
+        minimum=21,
+    )
+    canary_max_sample_gap_ms = integer(
+        field(canary, "max_sample_gap_ms", "routing.canary"),
+        "routing.canary.max_sample_gap_ms",
+        minimum=0,
+    )
+    canary_journal_samples = integer(
+        field(canary, "journal_correlated_samples", "routing.canary"),
+        "routing.canary.journal_correlated_samples",
+        minimum=21,
+    )
+    sha(field(canary, "session_set_sha256", "routing.canary"), "routing.canary.session_set_sha256")
+    first_proof_attempts = integer(
+        field(canary, "first_proof_attempts", "routing.canary"),
+        "routing.canary.first_proof_attempts",
+        minimum=1,
+    )
+    verified_proof_attempts = integer(
+        field(canary, "verified_proof_attempts", "routing.canary"),
+        "routing.canary.verified_proof_attempts",
+        minimum=1,
+    )
+    if (
+        first_proof_attempts > 600
+        or verified_proof_attempts > 600
+        or verified_proof_attempts - first_proof_attempts + 1 != canary_healthy_samples
+        or canary_journal_samples != canary_healthy_samples
+    ):
+        fail("routing.canary proof attempt bounds do not match its samples")
+    first_session_sha = sha(
+        field(canary, "first_session_sha256", "routing.canary"),
+        "routing.canary.first_session_sha256",
+    )
+    verified_session_sha = sha(
+        field(canary, "verified_session_sha256", "routing.canary"),
+        "routing.canary.verified_session_sha256",
+    )
+    if first_session_sha == verified_session_sha:
+        fail("front canary proofs must use distinct sessions")
     legacy = obj(field(document, "legacy", "root"), "legacy")
     exact(field(legacy, "service", "legacy"), "subrouter.service", "legacy.service")
     text(field(legacy, "generation", "legacy"), "legacy.generation")
@@ -677,7 +797,9 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         "front.backend_health.backend_membership_sha256",
     )
     stable_duration = verified_at - stable_since
+    canary_stable_duration = canary_verified_at - first_observed_at
     sample_span_capacity_ms = (healthy_samples - 1) * (max_sample_gap_ms + 1)
+    canary_sample_span_capacity_ms = (canary_healthy_samples - 1) * (canary_max_sample_gap_ms + 1)
     if (
         stable_duration < FRONT_BACKEND_HEALTH_STABILITY
         or stable_duration > dt.timedelta(minutes=15)
@@ -686,11 +808,22 @@ def validate_front_migration_preparation(document: dict[str, Any]) -> None:
         or healthy_samples < 21
         or max_sample_gap_ms > 15_000
         or duration_ms > sample_span_capacity_ms
+        or first_observed_at < map_updated_at
+        or stable_since != first_observed_at
+        or canary_verified_at != verified_at
+        or canary_stable_duration < FRONT_BACKEND_HEALTH_STABILITY
+        or canary_stable_duration > dt.timedelta(minutes=20)
+        or canary_duration_ms != canary_stable_duration // dt.timedelta(milliseconds=1)
+        or canary_duration_ms != duration_ms
+        or canary_healthy_samples != healthy_samples
+        or canary_max_sample_gap_ms != max_sample_gap_ms
+        or canary_max_sample_gap_ms > 15_000
+        or canary_duration_ms > canary_sample_span_capacity_ms
     ):
-        fail("front.backend_health does not prove five continuous healthy minutes")
+        fail("front canary and backend health do not prove five continuous healthy minutes")
     emitted_at = timestamp(field(document, "evidence_emitted_at", "root"), "evidence_emitted_at")
-    if emitted_at < verified_at:
-        fail("evidence_emitted_at predates front backend health verification")
+    if emitted_at < canary_verified_at:
+        fail("evidence_emitted_at predates front canary verification")
 
 
 def validate_migration_snapshot(value: Any, path: str, kind: str) -> dict[str, Any]:
@@ -723,7 +856,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
     exact(field(document, "prior_evidence_type", "root"), expected_prior, "prior_evidence_type")
     sha(field(document, "prior_evidence_sha256", "root"), "prior_evidence_sha256")
     sha(field(document, "preparation_evidence_sha256", "root"), "preparation_evidence_sha256")
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     bootstrap = validate_migration_bootstrap(field(document, "bootstrap", "root"))
     predecessor = validate_predecessor(field(document, "predecessor", "root"))
@@ -735,6 +868,7 @@ def validate_front_migration_transition(document: dict[str, Any], expected: str)
         text(field(routing, name, "routing"), f"routing.{name}")
     legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
     front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    validate_migration_routing_selectors(run, routing, front_url)
     exact(field(routing, "before", "routing"), source_kind, "routing.before")
     exact(field(routing, "after", "routing"), destination_kind, "routing.after")
     expected_source_url = legacy_url if source_kind == "legacy" else front_url

@@ -56,6 +56,20 @@ func fakeAction(args []string) {
 		os.Exit(9)
 	}
 	operation := args[0]
+	if operation == "migration-prepare" && os.Getenv("SUBROUTER_GOLDEN_FAKE_REQUIRE_SESSIONS_DURING_PREPARE") == "1" {
+		entries, err := os.ReadDir(os.Getenv("SUBROUTER_GOLDEN_FAKE_PROCESS_STATE"))
+		// The harness process and this action are already registered. Require at
+		// least one separately held Codex session before migration preparation.
+		registered := 0
+		for _, entry := range entries {
+			if _, parseErr := strconv.Atoi(entry.Name()); parseErr == nil {
+				registered++
+			}
+		}
+		if err != nil || registered <= 2 {
+			os.Exit(9)
+		}
+	}
 	if logPath := os.Getenv("ACTION_LOG"); logPath != "" {
 		file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
@@ -198,19 +212,25 @@ func fakeAction(args []string) {
 		legacyMetric := map[string]any{"nrestarts": map[string]any{"before": 0, "after": 0}, "oom_kill": map[string]any{"before": 0, "after": 0}, "run_scoped_peak_rss_bytes": 1 << 20, "rss_limit_bytes": 192 << 20}
 		slotMetric := metric(192 << 20)
 		slotMetric["id"] = "slot-a"
+		priorRouting, ok := prior["routing"].(map[string]any)
+		if !ok {
+			os.Exit(9)
+		}
+		routing := make(map[string]any, len(priorRouting)+4)
+		for key, value := range priorRouting {
+			routing[key] = value
+		}
+		routing["before"] = source
+		routing["after"] = destination
+		routing["source_backend_url"] = map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source]
+		routing["destination_backend_url"] = map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[destination]
 		evidence = map[string]any{
 			"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": evidenceType, "mode": mode, "success": true,
 			"prior_evidence_type": priorType, "prior_evidence_sha256": priorSHA, "preparation_evidence_sha256": preparationSHA,
-			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+			"run":     map[string]any{"id": "golden-migration", "project": "test-project", "zone": "test-zone", "instance": "subrouter-staging"},
 			"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
-			"routing": map[string]any{
-				"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
-				"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test",
-				"before": source, "after": destination,
-				"source_backend_url":      map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[source],
-				"destination_backend_url": map[string]string{"legacy": "https://legacy.test", "front": "https://front.test"}[destination],
-			},
-			"legacy": legacy, "front": front,
+			"routing": routing,
+			"legacy":  legacy, "front": front,
 			"timestamps": map[string]any{"transition_requested_at": requested.Format(time.RFC3339Nano), "activated_at": activated.Format(time.RFC3339Nano), "evidence_emitted_at": time.Now().UTC().Format(time.RFC3339Nano)},
 			"destination_proof": map[string]any{
 				"sha256": fmt.Sprintf("%x", proofDigest[:]), "challenge": challenge,
@@ -492,11 +512,27 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 	stableSince := verifiedAt.Add(-5 * time.Minute)
 	return map[string]any{
 		"schema": "subrouter.gcp.deploy-evidence/v1", "evidence_type": "front-migration-preparation", "mode": "prepare", "success": true,
-		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "test-instance"},
+		"run":     map[string]any{"id": "golden-migration-prepare", "project": "test-project", "zone": "test-zone", "instance": "subrouter-staging"},
 		"release": fakeMigrationRelease(candidate, revision), "bootstrap": fakeMigrationBootstrap(), "predecessor": fakeMigrationPredecessor(),
 		"routing": map[string]any{
 			"url_map": "test-map", "legacy_backend": "legacy-backend", "front_backend": "front-backend",
 			"legacy_backend_url": "https://legacy.test", "front_backend_url": "https://front.test", "current": "legacy",
+			"active_matcher": "staging-subrouter",
+			"canary": map[string]any{
+				"host": "front-canary.staging.sr.cmux.internal", "matcher": "staging-subrouter-front-canary",
+				"backend_url": "https://front.test", "map_updated_at": stableSince.Add(-time.Minute).Format(time.RFC3339Nano),
+				"access_control": map[string]any{
+					"name": "subrouter-staging-front-canary-policy", "type": "CLOUD_ARMOR", "attached": true,
+					"allow_priority": 900, "deny_priority": 1000, "unauthorized_status": 403, "authorized_status": 400,
+					"key_redacted_before_backend": true,
+					"key_fingerprint_sha256":      strings.Repeat("9", 64),
+				},
+				"first_observed_at": stableSince.Format(time.RFC3339Nano), "verified_at": verifiedAt.Format(time.RFC3339Nano),
+				"stable_duration_ms": 300_000, "healthy_samples": 61, "max_sample_gap_ms": 5_000,
+				"journal_correlated_samples": 61, "session_set_sha256": strings.Repeat("a", 64),
+				"first_proof_attempts": 1, "verified_proof_attempts": 61,
+				"first_session_sha256": strings.Repeat("e", 64), "verified_session_sha256": strings.Repeat("f", 64),
+			},
 		},
 		"legacy": map[string]any{
 			"service": "subrouter.service", "generation": "legacy-generation", "checksum": "99fcd10d912184c160370eb228b382795101f2b5b2467244f995aa2d10b0c323", "accepting_new_public": true,

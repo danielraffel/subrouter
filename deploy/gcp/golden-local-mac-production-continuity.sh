@@ -99,6 +99,8 @@ fi
   echo "cloud config is missing: ${cloud_config_path}" >&2
   exit 1
 }
+cloud_config_path="$(cd "$(dirname "${cloud_config_path}")" && pwd)/$(basename "${cloud_config_path}")"
+export SUBROUTER_CLOUD_CONFIG="${cloud_config_path}"
 normalized_public_base_url="$(python3 "${deployment_contract}" validate-target \
   "${cloud_config_path}" "${SUBROUTER_GCP_INSTANCE}" "${SUBROUTER_PUBLIC_BASE_URL}")"
 SUBROUTER_PUBLIC_BASE_URL="${normalized_public_base_url}"

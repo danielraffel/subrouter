@@ -18,6 +18,285 @@ import (
 	"time"
 )
 
+func TestGCPURLMapCanaryRemainsReferencedAcrossActiveRouteSwitches(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "url-map-routing.py")
+	stagingLegacy := "https://www.googleapis.com/staging-legacy"
+	stagingFront := "https://www.googleapis.com/staging-front"
+	productionLegacy := stagingFront + "-v2"
+	productionFront := "https://www.googleapis.com/production-front"
+	base := `defaultService: ` + productionLegacy + `
+fingerprint: fingerprint
+hostRules:
+- hosts:
+  - staging.example.com
+  pathMatcher: staging-subrouter
+name: subrouter-urlmap
+pathMatchers:
+- defaultService: ` + stagingLegacy + `
+  name: staging-subrouter
+`
+	run := func(args ...string) ([]byte, error) {
+		t.Helper()
+		return exec.Command(mustLookPath(t, "python3"), append([]string{helper}, args...)...).CombinedOutput()
+	}
+	write := func(body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "map.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	stagingBase := write(base)
+	stagingPrepared := filepath.Join(t.TempDir(), "prepared.yaml")
+	stagingArgs := []string{
+		"staging-subrouter", stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	}
+	if output, err := run(append([]string{"prepare-canary", stagingBase, stagingPrepared}, stagingArgs...)...); err != nil {
+		t.Fatalf("prepare staging canary: %v\n%s", err, output)
+	}
+	stagingPreparedAgain := filepath.Join(t.TempDir(), "prepared-again.yaml")
+	if output, err := run(append([]string{"prepare-canary", stagingPrepared, stagingPreparedAgain}, stagingArgs...)...); err != nil {
+		t.Fatalf("idempotent staging canary preparation: %v\n%s", err, output)
+	}
+	first, err := os.ReadFile(stagingPrepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(stagingPreparedAgain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatal("idempotent canary preparation changed the URL map")
+	}
+	stagingCutover := filepath.Join(t.TempDir(), "cutover.yaml")
+	if output, err := run(
+		"rewrite-active", stagingPrepared, stagingCutover,
+		"staging-subrouter", stagingLegacy, stagingFront,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("rewrite staging active route: %v\n%s", err, output)
+	}
+	if output, err := run(
+		"assert-state", stagingCutover, "staging-subrouter", stagingFront,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+		"--forbid-url", stagingLegacy,
+	); err != nil {
+		t.Fatalf("assert staging cutover: %v\n%s", err, output)
+	}
+	cutoverBody, err := os.ReadFile(stagingCutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(cutoverBody), "defaultService: "+stagingFront+"\n") != 2 || strings.Contains(string(cutoverBody), stagingLegacy) ||
+		!strings.Contains(string(cutoverBody), productionLegacy) {
+		t.Fatalf("staging cutover did not preserve exactly one warm canary reference:\n%s", cutoverBody)
+	}
+	stagingRollback := filepath.Join(t.TempDir(), "rollback.yaml")
+	if output, err := run(
+		"rewrite-active", stagingCutover, stagingRollback,
+		"staging-subrouter", stagingFront, stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("rewrite staging rollback: %v\n%s", err, output)
+	}
+	if output, err := run(
+		"assert-state", stagingRollback, "staging-subrouter", stagingLegacy,
+		"staging-subrouter-front-canary", "front-canary.staging.sr.cmux.internal", stagingFront,
+	); err != nil {
+		t.Fatalf("assert staging rollback: %v\n%s", err, output)
+	}
+
+	productionBase := write(base)
+	productionPrepared := filepath.Join(t.TempDir(), "prepared.yaml")
+	if output, err := run(
+		"prepare-canary", productionBase, productionPrepared,
+		"__root__", productionLegacy,
+		"subrouter-front-canary", "front-canary.sr.cmux.internal", productionFront,
+	); err != nil {
+		t.Fatalf("prepare production canary: %v\n%s", err, output)
+	}
+	productionCutover := filepath.Join(t.TempDir(), "cutover.yaml")
+	if output, err := run(
+		"rewrite-active", productionPrepared, productionCutover,
+		"__root__", productionLegacy, productionFront,
+		"subrouter-front-canary", "front-canary.sr.cmux.internal", productionFront,
+	); err != nil {
+		t.Fatalf("rewrite production active route: %v\n%s", err, output)
+	}
+	productionBody, err := os.ReadFile(productionCutover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(productionBody), productionFront) != 2 ||
+		!strings.Contains(string(productionBody), stagingLegacy) {
+		t.Fatalf("production cutover changed the staging route:\n%s", productionBody)
+	}
+
+	hijacked := write(strings.Replace(string(first), "front-canary.staging.sr.cmux.internal", "attacker.invalid", 1))
+	if output, err := run(append([]string{"prepare-canary", hijacked, filepath.Join(t.TempDir(), "out.yaml")}, stagingArgs...)...); err == nil {
+		t.Fatalf("hijacked canary host was accepted:\n%s", output)
+	}
+	smuggledHost := write(strings.Replace(
+		string(first),
+		"  pathMatcher: staging-subrouter-front-canary\n",
+		"  pathMatcher: staging-subrouter-front-canary\n  - attacker.invalid\n",
+		1,
+	))
+	if output, err := run(append([]string{"prepare-canary", smuggledHost, filepath.Join(t.TempDir(), "out.yaml")}, stagingArgs...)...); err == nil {
+		t.Fatalf("host outside the canary hosts block was accepted:\n%s", output)
+	}
+}
+
+func TestGCPCanarySecurityPolicyRequiresAnAuthenticatedHeader(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	helper := filepath.Join(repoRoot, "deploy", "gcp", "canary-security-policy.py")
+	policy := filepath.Join(t.TempDir(), "policy.json")
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	token := strings.Repeat("a", 64)
+	if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name := "subrouter-staging-front-canary-policy"
+	host := "front-canary.staging.sr.cmux.internal"
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "render", policy, name, host, "--token-file", tokenPath,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("render canary security policy: %v\n%s", err, output)
+	}
+	output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host, "--token-file", tokenPath,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("validate canary security policy: %v\n%s", err, output)
+	}
+	var access struct {
+		Attached             bool   `json:"attached"`
+		UnauthorizedStatus   int64  `json:"unauthorized_status"`
+		AuthorizedStatus     int64  `json:"authorized_status"`
+		KeyRedacted          bool   `json:"key_redacted_before_backend"`
+		KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
+	}
+	if err := json.Unmarshal(output, &access); err != nil {
+		t.Fatal(err)
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	if !access.Attached || access.UnauthorizedStatus != 403 || access.AuthorizedStatus != 400 || !access.KeyRedacted ||
+		access.KeyFingerprintSHA256 != fmt.Sprintf("%x", tokenHash) {
+		t.Fatalf("unexpected canary access evidence: %+v", access)
+	}
+	discovered, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("validate persisted canary policy without plaintext key: %v\n%s", err, discovered)
+	}
+	var discoveredAccess struct {
+		KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
+	}
+	if err := json.Unmarshal(discovered, &discoveredAccess); err != nil || discoveredAccess.KeyFingerprintSHA256 != access.KeyFingerprintSHA256 {
+		t.Fatalf("persisted policy fingerprint changed: %v %+v", err, discoveredAccess)
+	}
+
+	policyBody, err := os.ReadFile(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policyJSON map[string]any
+	if err := json.Unmarshal(policyBody, &policyJSON); err != nil {
+		t.Fatal(err)
+	}
+	rules := policyJSON["rules"].([]any)
+	rules[1].(map[string]any)["action"] = "allow"
+	unprotected := filepath.Join(t.TempDir(), "unprotected.json")
+	unprotectedBody, err := json.Marshal(policyJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unprotected, unprotectedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", unprotected, name, host,
+	).CombinedOutput(); err == nil {
+		t.Fatalf("policy with an allow fallback was accepted:\n%s", output)
+	}
+
+	wrongTokenPath := filepath.Join(t.TempDir(), "wrong-token")
+	if err := os.WriteFile(wrongTokenPath, []byte(strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "assert-ready", policy, name, host, "--token-file", wrongTokenPath,
+	).CombinedOutput(); err == nil {
+		t.Fatalf("policy accepted the wrong canary token:\n%s", output)
+	}
+}
+
+func TestGCPFrontReadinessProbeChecksDeniedAndAuthenticatedCanaries(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	probe := filepath.Join(repoRoot, "deploy", "gcp", "probe-front-readiness.sh")
+	fakeBin := t.TempDir()
+	capture := filepath.Join(t.TempDir(), "curl-configs")
+	fakeCurl := filepath.Join(fakeBin, "curl")
+	writeExecutableTestFile(t, fakeCurl, `#!/bin/sh
+body="$(cat)"
+printf '%s\n--request--\n' "$body" >>"$PROBE_CAPTURE"
+if printf '%s\n' "$body" | grep -q 'X-Subrouter-Canary-Token:'; then printf 400; else printf 403; fi
+`)
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/bin/sh
+printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
+`)
+	cloudConfig := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(cloudConfig, []byte(`{"tenantKey":"srt_1234567890abcdef"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte(strings.Repeat("c", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(mustLookPath(t, "bash"), probe)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PROBE_CAPTURE="+capture,
+		"GCLOUD_BIN="+fakeGcloud,
+		"SUBROUTER_GCP_PROJECT=test-project",
+		"SUBROUTER_GCP_FRONT_BACKEND_SERVICE=front-backend",
+		"SUBROUTER_CANARY_PUBLIC_BASE_URL=https://staging.example.test",
+		"SUBROUTER_CANARY_HOST=front-canary.staging.sr.cmux.internal",
+		"SUBROUTER_CLOUD_CONFIG="+cloudConfig,
+		"SUBROUTER_CANARY_SESSION=canary-test-1",
+		"SUBROUTER_CANARY_TOKEN_FILE="+tokenPath,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("paired front readiness probe failed: %v\n%s", err, output)
+	}
+	var health []map[string]any
+	if err := json.Unmarshal(output, &health); err != nil || len(health) != 1 {
+		t.Fatalf("probe did not emit backend health: %v\n%s", err, output)
+	}
+	captured, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(captured)
+	if strings.Count(body, "--request--") != 2 ||
+		strings.Count(body, "X-Subrouter-Canary-Token:") != 1 ||
+		!strings.Contains(body, "X-Subrouter-Session: canary-test-1-denied") ||
+		!strings.Contains(body, "X-Subrouter-Session: canary-test-1") {
+		t.Fatalf("probe did not pair denied and authenticated canaries:\n%s", body)
+	}
+}
+
 func TestGCPBackendHealthRequiresEveryStatusStableAcrossTheWindow(t *testing.T) {
 	requireDeployScriptTools(t, "python3", "sh")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -92,6 +371,90 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 	)
 	if output, err := command.CombinedOutput(); err == nil {
 		t.Fatalf("mixed backend health unexpectedly stabilized:\n%s", output)
+	}
+}
+
+func TestGCPFrontReadinessSamplesPublicCanaryWithBackendHealthAcrossTheWindow(t *testing.T) {
+	requireDeployScriptTools(t, "python3", "sh")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	waiter := filepath.Join(repoRoot, "deploy", "gcp", "wait-for-front-readiness.py")
+	fake := filepath.Join(t.TempDir(), "front-readiness-command")
+	state := filepath.Join(t.TempDir(), "poll-count")
+	sessions := filepath.Join(t.TempDir(), "sessions")
+	writeExecutableTestFile(t, fake, `#!/bin/sh
+count=0
+if [ -f "$READINESS_STATE" ]; then count="$(cat "$READINESS_STATE")"; fi
+count=$((count + 1))
+printf '%s' "$count" >"$READINESS_STATE"
+test -n "$SUBROUTER_CANARY_SESSION"
+if [ "$count" -eq 3 ]; then exit 1; fi
+printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
+`)
+	command := exec.Command(
+		mustLookPath(t, "python3"), waiter,
+		"--minimum-stable-seconds", "0.08",
+		"--timeout-seconds", "1.5",
+		"--poll-seconds", "0.01",
+		"--maximum-sample-gap-seconds", "0.3",
+		"--minimum-samples", "5",
+		"--session-prefix", "test-canary",
+		"--sessions-file", sessions,
+		"--", fake,
+	)
+	command.Env = append(os.Environ(), "READINESS_STATE="+state)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("combined front readiness failed: %v\n%s", err, output)
+	}
+	var evidence struct {
+		BackendHealth struct {
+			StableSince      string `json:"stable_since"`
+			VerifiedAt       string `json:"verified_at"`
+			DurationMS       int64  `json:"duration_ms"`
+			HealthySamples   int64  `json:"healthy_samples"`
+			MaxSampleGapMS   int64  `json:"max_sample_gap_ms"`
+			MembershipSHA256 string `json:"backend_membership_sha256"`
+		} `json:"backend_health"`
+		Canary struct {
+			FirstObservedAt       string `json:"first_observed_at"`
+			VerifiedAt            string `json:"verified_at"`
+			StableDurationMS      int64  `json:"stable_duration_ms"`
+			HealthySamples        int64  `json:"healthy_samples"`
+			MaxSampleGapMS        int64  `json:"max_sample_gap_ms"`
+			FirstProofAttempts    int64  `json:"first_proof_attempts"`
+			VerifiedProofAttempts int64  `json:"verified_proof_attempts"`
+			FirstSessionSHA256    string `json:"first_session_sha256"`
+			VerifiedSessionSHA256 string `json:"verified_session_sha256"`
+			SessionSetSHA256      string `json:"session_set_sha256"`
+		} `json:"canary"`
+	}
+	if err := json.Unmarshal(output, &evidence); err != nil {
+		t.Fatalf("decode combined readiness evidence: %v\n%s", err, output)
+	}
+	sessionBody, err := os.ReadFile(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedSessions := strings.Fields(string(sessionBody))
+	if len(observedSessions) != int(evidence.Canary.HealthySamples) {
+		t.Fatalf("session count = %d, evidence samples = %d", len(observedSessions), evidence.Canary.HealthySamples)
+	}
+	firstHash := sha256.Sum256([]byte(observedSessions[0]))
+	lastHash := sha256.Sum256([]byte(observedSessions[len(observedSessions)-1]))
+	setHash := sha256.Sum256(sessionBody)
+	if evidence.Canary.FirstProofAttempts < 4 ||
+		evidence.Canary.VerifiedProofAttempts-evidence.Canary.FirstProofAttempts+1 != evidence.Canary.HealthySamples ||
+		evidence.Canary.HealthySamples < 5 || evidence.Canary.StableDurationMS < 80 ||
+		evidence.Canary.FirstObservedAt != evidence.BackendHealth.StableSince ||
+		evidence.Canary.VerifiedAt != evidence.BackendHealth.VerifiedAt ||
+		evidence.Canary.StableDurationMS != evidence.BackendHealth.DurationMS ||
+		evidence.Canary.HealthySamples != evidence.BackendHealth.HealthySamples ||
+		evidence.Canary.MaxSampleGapMS != evidence.BackendHealth.MaxSampleGapMS ||
+		evidence.Canary.FirstSessionSHA256 != fmt.Sprintf("%x", firstHash) ||
+		evidence.Canary.VerifiedSessionSHA256 != fmt.Sprintf("%x", lastHash) ||
+		evidence.Canary.SessionSetSHA256 != fmt.Sprintf("%x", setHash) ||
+		len(evidence.BackendHealth.MembershipSHA256) != 64 {
+		t.Fatalf("readiness evidence did not cover one continuous paired window: %+v", evidence)
 	}
 }
 

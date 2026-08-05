@@ -46,6 +46,8 @@ MIGRATION_PROPAGATION_LIMIT_MS=300000
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
+CANARY_SECURITY_POLICY_HELPER="${SCRIPT_DIR}/canary-security-policy.py"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
 # shellcheck source=deploy/gcp/deploy-lock.sh
@@ -54,12 +56,29 @@ LEGACY_RSS_LIMIT_BYTES="${SUBROUTER_LEGACY_RSS_LIMIT_BYTES:-201326592}"
 
 log() { printf 'gcp-front-transition: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
+case "${INSTANCE}" in
+  subrouter-team)
+    EXPECTED_ACTIVE_MATCHER="__root__"
+    EXPECTED_CANARY_MATCHER="subrouter-front-canary"
+    EXPECTED_CANARY_HOST="front-canary.sr.cmux.internal"
+    EXPECTED_CANARY_SECURITY_POLICY="subrouter-front-canary-policy"
+    ;;
+  subrouter-staging)
+    EXPECTED_ACTIVE_MATCHER="staging-subrouter"
+    EXPECTED_CANARY_MATCHER="staging-subrouter-front-canary"
+    EXPECTED_CANARY_HOST="front-canary.staging.sr.cmux.internal"
+    EXPECTED_CANARY_SECURITY_POLICY="subrouter-staging-front-canary-policy"
+    ;;
+  *) die "unsupported instance: ${INSTANCE}" ;;
+esac
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
 REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+[[ -f "${URL_MAP_ROUTING}" ]] || die "URL-map routing helper is missing"
+[[ -f "${CANARY_SECURITY_POLICY_HELPER}" ]] || die "canary security policy helper is missing"
 INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
 DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 if [[ "${OPERATION}" == rollback ]]; then EXPECTED_CONNECTIONS=1; else EXPECTED_CONNECTIONS=2; fi
@@ -110,6 +129,15 @@ front_json="$(jq -c '.front | {slot,generation,checksum,control_checksum,worker_
 URL_MAP="$(jq -r '.routing.url_map' "${PRIOR_EVIDENCE}")"
 legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${PRIOR_EVIDENCE}")"
 front_backend_url="$(jq -r '.routing.front_backend_url' "${PRIOR_EVIDENCE}")"
+FRONT_BACKEND_SERVICE="$(jq -r '.routing.front_backend' "${PRIOR_EVIDENCE}")"
+[[ "$(jq -r '.routing.active_matcher' "${PRIOR_EVIDENCE}")" == "${EXPECTED_ACTIVE_MATCHER}" &&
+   "$(jq -r '.routing.canary.matcher' "${PRIOR_EVIDENCE}")" == "${EXPECTED_CANARY_MATCHER}" &&
+   "$(jq -r '.routing.canary.host' "${PRIOR_EVIDENCE}")" == "${EXPECTED_CANARY_HOST}" &&
+   "$(jq -r '.routing.canary.access_control.name' "${PRIOR_EVIDENCE}")" == "${EXPECTED_CANARY_SECURITY_POLICY}" ]] \
+  || die "prior migration evidence routing selectors do not match the target instance"
+ACTIVE_MATCHER="${EXPECTED_ACTIVE_MATCHER}"
+CANARY_MATCHER="${EXPECTED_CANARY_MATCHER}"
+CANARY_HOST="${EXPECTED_CANARY_HOST}"
 
 mkdir -p "${ARTIFACT_DIR}"
 ARTIFACT_DIR="$(cd "${ARTIFACT_DIR}" && pwd)"
@@ -131,6 +159,21 @@ gcloud_ssh() {
 gcloud_scp() {
   "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet
+}
+assert_canary_access_boundary() {
+  local expected_policy_url backend_json policy_json live_access expected_token_sha
+  expected_policy_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/securityPolicies/${EXPECTED_CANARY_SECURITY_POLICY}"
+  backend_json="$("${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  [[ "$(jq -r '.securityPolicy // empty' < <(stream_shell_value "${backend_json}"))" == "${expected_policy_url}" ]] \
+    || die "front backend lost its canary security policy before ${OPERATION}"
+  policy_json="$("${GCLOUD_BINARY}" compute security-policies describe "${EXPECTED_CANARY_SECURITY_POLICY}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  live_access="$(printf '%s\n' "${policy_json}" | python3 "${CANARY_SECURITY_POLICY_HELPER}" \
+    assert-ready - "${EXPECTED_CANARY_SECURITY_POLICY}" "${EXPECTED_CANARY_HOST}")"
+  expected_token_sha="$(jq -r '.routing.canary.access_control.key_fingerprint_sha256' "${PRIOR_EVIDENCE}")"
+  [[ "$(jq -r '.key_fingerprint_sha256' < <(stream_shell_value "${live_access}"))" == "${expected_token_sha}" ]] \
+    || die "live canary security policy no longer matches the preparation evidence"
 }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 epoch_millis() { python3 -c 'import time; print(time.time_ns() // 1_000_000)'; }
@@ -192,7 +235,7 @@ start_rss_sampler() {
   die "${target} RSS sampler did not produce a sample"
 }
 stop_rss_sampler() {
-  local target="$1" pid result peak
+  local target="$1" output_name="$2" pid result peak
   pid="${rss_sampler_pids[${target}]}"
   result="${rss_sampler_results[${target}]}"
   gcloud_ssh "sudo rm -f '${rss_sampler_sentinels[${target}]}'"
@@ -200,7 +243,7 @@ stop_rss_sampler() {
   peak="$(gcloud_ssh "sudo cat '${result}'" | tail -n 1)"
   [[ "${peak}" =~ ^[0-9]+$ ]] || die "${target} RSS sampler returned invalid data"
   unset "rss_sampler_pids[${target}]"
-  printf '%s\n' "${peak}"
+  printf -v "${output_name}" '%s' "${peak}"
 }
 stop_all_rss_samplers() {
   local target
@@ -210,6 +253,10 @@ stop_all_rss_samplers() {
     unset "rss_sampler_pids[${target}]"
   done
 }
+
+legacy_peak_rss=""
+slot_peak_rss=""
+front_peak_rss=""
 
 supervisor_snapshot() {
   local kind="$1" status active_id generation_connections inactive_connections public_connections slot
@@ -262,8 +309,9 @@ cleanup() {
       --source "${before_yaml}" --quiet || \
       ! "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
         --destination "${restored_yaml}" --quiet || \
-      ! python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
-        "${restored_yaml}" "${source_url}" 1 "${destination_url}" 0
+      ! python3 "${URL_MAP_ROUTING}" assert-state \
+        "${restored_yaml}" "${ACTIVE_MATCHER}" "${source_url}" \
+        "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
     then
       log "failed to restore the pre-transition URL map" >&2
       status=1
@@ -276,6 +324,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 acquire_lock
+assert_canary_access_boundary
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
@@ -295,8 +344,10 @@ after_yaml="${ARTIFACT_DIR}/url-map-after.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${before_yaml}" --quiet
 if [[ "${source_kind}" == legacy ]]; then source_url="${legacy_backend_url}"; destination_url="${front_backend_url}"; else source_url="${front_backend_url}"; destination_url="${legacy_backend_url}"; fi
-python3 "${DEPLOYMENT_CONTRACT}" rewrite-url-map \
-  "${before_yaml}" "${candidate_yaml}" "${source_url}" "${destination_url}"
+python3 "${URL_MAP_ROUTING}" rewrite-active \
+  "${before_yaml}" "${candidate_yaml}" "${ACTIVE_MATCHER}" \
+  "${source_url}" "${destination_url}" \
+  "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_before="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
@@ -311,8 +362,9 @@ transition_started=1
   --source "${candidate_yaml}" --quiet
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${after_yaml}" --quiet
-python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
-  "${after_yaml}" "${source_url}" 0 "${destination_url}" 1
+python3 "${URL_MAP_ROUTING}" assert-state \
+  "${after_yaml}" "${ACTIVE_MATCHER}" "${destination_url}" \
+  "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}"
 source_after="$(supervisor_snapshot "${source_kind}")"
 jq -e --argjson expected "${EXPECTED_CONNECTIONS}" \
   '.public_connections >= $expected and .generation_connections >= $expected and .inactive_connections == 0' \
@@ -397,9 +449,9 @@ front_oom_after="$(service_oom_kills front)"
   || die "slot service restarted or OOM-killed during migration transition"
 [[ "${front_restarts_after}" == "${front_restarts_before}" && "${front_oom_after}" == "${front_oom_before}" ]] \
   || die "front service restarted or OOM-killed during migration transition"
-legacy_peak_rss="$(stop_rss_sampler legacy)"
-slot_peak_rss="$(stop_rss_sampler "${active_migration_slot}")"
-front_peak_rss="$(stop_rss_sampler front)"
+stop_rss_sampler legacy legacy_peak_rss
+stop_rss_sampler "${active_migration_slot}" slot_peak_rss
+stop_rss_sampler front front_peak_rss
 slot_memory_max="$(service_memory_max "${active_migration_slot}")"
 front_memory_max="$(service_memory_max front)"
 [[ "${slot_memory_max}" == 201326592 && "${front_memory_max}" == 134217728 ]] \

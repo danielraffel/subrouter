@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -43,6 +44,43 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	}
 }
 
+func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T) {
+	evidence := validGoldenMigrationTransitionEvidence(
+		"final-cutover", "front-migration-rollback", strings.Repeat("1", 64), strings.Repeat("2", 64),
+	)
+	validatePython := func(value *goldenMigrationEvidence) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "transition.json")
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return err
+		}
+		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+		output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, output)
+		}
+		return nil
+	}
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
+		t.Fatalf("Go validator rejected valid routing selectors: %v", err)
+	}
+	if err := validatePython(evidence); err != nil {
+		t.Fatalf("Python validator rejected valid routing selectors: %v", err)
+	}
+
+	evidence.Routing.ActiveMatcher = "attacker-route"
+	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
+		t.Fatal("Go validator accepted retargeted routing selectors")
+	}
+	if err := validatePython(evidence); err == nil {
+		t.Fatal("Python validator accepted retargeted routing selectors")
+	}
+}
+
 func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHealth(t *testing.T) {
 	document := func() map[string]any {
 		evidence := validGoldenMigrationPreparationEvidence()
@@ -74,6 +112,32 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			"max_sample_gap_ms":         5_000,
 			"backend_membership_sha256": strings.Repeat("d", 64),
 		}
+		result["run"].(map[string]any)["instance"] = "subrouter-staging"
+		routing := result["routing"].(map[string]any)
+		routing["active_matcher"] = "staging-subrouter"
+		routing["canary"] = map[string]any{
+			"host":        "front-canary.staging.sr.cmux.internal",
+			"matcher":     "staging-subrouter-front-canary",
+			"backend_url": routing["front_backend_url"],
+			"access_control": map[string]any{
+				"name": "subrouter-staging-front-canary-policy", "type": "CLOUD_ARMOR", "attached": true,
+				"allow_priority": 900, "deny_priority": 1000, "unauthorized_status": 403, "authorized_status": 400,
+				"key_redacted_before_backend": true,
+				"key_fingerprint_sha256":      strings.Repeat("9", 64),
+			},
+			"map_updated_at":             "2026-08-01T23:59:00Z",
+			"first_observed_at":          "2026-08-02T00:00:00Z",
+			"verified_at":                "2026-08-02T00:05:00Z",
+			"stable_duration_ms":         300_000,
+			"healthy_samples":            61,
+			"max_sample_gap_ms":          5_000,
+			"journal_correlated_samples": 61,
+			"session_set_sha256":         strings.Repeat("a", 64),
+			"first_proof_attempts":       1,
+			"verified_proof_attempts":    61,
+			"first_session_sha256":       strings.Repeat("e", 64),
+			"verified_session_sha256":    strings.Repeat("f", 64),
+		}
 		return result
 	}
 	validateGo := func(value map[string]any) error {
@@ -97,7 +161,11 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			return err
 		}
 		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
-		return exec.Command("python3", validator, "--expect", "front-migration-preparation", path).Run()
+		output, err := exec.Command("python3", validator, "--expect", "front-migration-preparation", path).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, output)
+		}
+		return nil
 	}
 	clone := func(value map[string]any) map[string]any {
 		encoded, err := json.Marshal(value)
@@ -122,11 +190,105 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	fractionalHealth := fractionalMillisecond["front"].(map[string]any)["backend_health"].(map[string]any)
 	fractionalHealth["verified_at"] = "2026-08-02T00:05:00.001Z"
 	fractionalHealth["duration_ms"] = 300_001
+	fractionalCanary := fractionalMillisecond["routing"].(map[string]any)["canary"].(map[string]any)
+	fractionalCanary["verified_at"] = "2026-08-02T00:05:00.001Z"
+	fractionalCanary["stable_duration_ms"] = 300_001
 	if err := validateGo(fractionalMillisecond); err != nil {
 		t.Fatalf("Go validator rejected exact millisecond readiness duration: %v", err)
 	}
 	if err := validatePython(fractionalMillisecond); err != nil {
 		t.Fatalf("Python validator rejected exact millisecond readiness duration: %v", err)
+	}
+
+	missingCanary := clone(valid)
+	delete(missingCanary["routing"].(map[string]any), "canary")
+	if err := validateGo(missingCanary); err == nil {
+		t.Fatal("Go validator accepted preparation without a front canary proof")
+	}
+	if err := validatePython(missingCanary); err == nil {
+		t.Fatal("Python validator accepted preparation without a front canary proof")
+	}
+
+	unprotectedCanary := clone(valid)
+	unprotectedAccess := unprotectedCanary["routing"].(map[string]any)["canary"].(map[string]any)["access_control"].(map[string]any)
+	unprotectedAccess["attached"] = false
+	if err := validateGo(unprotectedCanary); err == nil {
+		t.Fatal("Go validator accepted a publicly forgeable front canary")
+	}
+	if err := validatePython(unprotectedCanary); err == nil {
+		t.Fatal("Python validator accepted a publicly forgeable front canary")
+	}
+
+	shortCanary := clone(valid)
+	shortCanaryProof := shortCanary["routing"].(map[string]any)["canary"].(map[string]any)
+	shortCanaryProof["first_observed_at"] = "2026-08-02T00:00:00.001Z"
+	shortCanaryProof["stable_duration_ms"] = 299_999
+	if err := validateGo(shortCanary); err == nil {
+		t.Fatal("Go validator accepted a sub-five-minute front canary proof")
+	}
+	if err := validatePython(shortCanary); err == nil {
+		t.Fatal("Python validator accepted a sub-five-minute front canary proof")
+	}
+
+	sparseCanaryWindow := clone(valid)
+	sparseCanary := sparseCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	sparseCanary["healthy_samples"] = 2
+	if err := validateGo(sparseCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted two endpoint probes as continuous front canary evidence")
+	}
+	if err := validatePython(sparseCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted two endpoint probes as continuous front canary evidence")
+	}
+
+	gappedCanaryWindow := clone(valid)
+	gappedCanary := gappedCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	gappedCanary["max_sample_gap_ms"] = 15_001
+	if err := validateGo(gappedCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a gap in continuous front canary evidence")
+	}
+	if err := validatePython(gappedCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a gap in continuous front canary evidence")
+	}
+
+	uncorrelatedCanaryWindow := clone(valid)
+	uncorrelatedCanary := uncorrelatedCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	uncorrelatedCanary["journal_correlated_samples"] = 60
+	if err := validateGo(uncorrelatedCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a public canary sample absent from the front journal")
+	}
+	if err := validatePython(uncorrelatedCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a public canary sample absent from the front journal")
+	}
+
+	wrongCanaryHost := clone(valid)
+	wrongCanaryHost["routing"].(map[string]any)["canary"].(map[string]any)["host"] = "attacker.invalid"
+	if err := validateGo(wrongCanaryHost); err == nil {
+		t.Fatal("Go validator accepted the wrong front canary host")
+	}
+	if err := validatePython(wrongCanaryHost); err == nil {
+		t.Fatal("Python validator accepted the wrong front canary host")
+	}
+
+	duplicateCanarySession := clone(valid)
+	duplicateCanary := duplicateCanarySession["routing"].(map[string]any)["canary"].(map[string]any)
+	duplicateCanary["verified_session_sha256"] = duplicateCanary["first_session_sha256"]
+	if err := validateGo(duplicateCanarySession); err == nil {
+		t.Fatal("Go validator accepted duplicate front canary sessions")
+	}
+	if err := validatePython(duplicateCanarySession); err == nil {
+		t.Fatal("Python validator accepted duplicate front canary sessions")
+	}
+
+	longCanaryWindow := clone(valid)
+	longCanary := longCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	longCanary["map_updated_at"] = "2026-08-01T23:39:00Z"
+	longCanary["first_observed_at"] = "2026-08-01T23:44:00Z"
+	longCanary["stable_duration_ms"] = 1_260_000
+	if err := validateGo(longCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a front canary window above twenty minutes")
+	}
+	if err := validatePython(longCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a front canary window above twenty minutes")
 	}
 
 	missing := clone(valid)
@@ -639,7 +801,7 @@ func validGoldenRetirementEvidence(mode string) *goldenDeployEvidence {
 func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigrationEvidence {
 	return &goldenMigrationEvidence{
 		Schema: goldenDeployEvidenceSchema, EvidenceType: evidenceType, Mode: mode, Success: true,
-		Run: goldenDeployRun{ID: "golden-run", Project: "project", Zone: "zone", Instance: "instance"},
+		Run: goldenDeployRun{ID: "golden-run", Project: "project", Zone: "zone", Instance: "subrouter-staging"},
 		Release: goldenDeployRelease{
 			Tag: goldenPinnedCandidateTag, SHA256: strings.Repeat("b", 64), SourceRevision: strings.Repeat("c", 40),
 			TagOnMain: true, AttestationVerified: true, Immutable: true,
@@ -652,6 +814,21 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 			Tag: "v0.1.51", SHA256: goldenPinnedPredecessorLinuxSHA256,
 			SourceRevision: goldenPinnedPredecessorRevision, TagOnMain: true, HardPinVerified: true,
 			SHA256SumsMatch: true, EmbeddedRevisionVerified: true, LiveWorkerChecksumMatch: true,
+		},
+		Routing: goldenMigrationRouting{
+			URLMap: "url-map", ActiveMatcher: "staging-subrouter",
+			LegacyBackend: "legacy-backend", FrontBackend: "front-backend",
+			LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
+			Canary: goldenMigrationCanary{
+				Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
+				BackendURL: "https://example.test/front",
+				AccessControl: goldenMigrationCanaryAccess{
+					Name: "subrouter-staging-front-canary-policy", Type: "CLOUD_ARMOR", Attached: true,
+					AllowPriority: 900, DenyPriority: 1000, UnauthorizedStatus: 403, AuthorizedStatus: 400,
+					KeyRedacted:          true,
+					KeyFingerprintSHA256: strings.Repeat("9", 64),
+				},
+			},
 		},
 		Legacy: goldenMigrationLegacy{
 			Service: "subrouter.service", Generation: "legacy-generation",
@@ -674,7 +851,22 @@ func validGoldenMigrationPreparationEvidence() *goldenMigrationEvidence {
 	evidence.Routing = goldenMigrationRouting{
 		URLMap: "url-map", LegacyBackend: "legacy-backend", FrontBackend: "front-backend",
 		LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
-		Current: "legacy",
+		ActiveMatcher: "staging-subrouter", Current: "legacy",
+		Canary: goldenMigrationCanary{
+			Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
+			BackendURL: "https://example.test/front", MapUpdatedAt: "2026-08-01T23:59:00Z",
+			AccessControl: goldenMigrationCanaryAccess{
+				Name: "subrouter-staging-front-canary-policy", Type: "CLOUD_ARMOR", Attached: true,
+				AllowPriority: 900, DenyPriority: 1000, UnauthorizedStatus: 403, AuthorizedStatus: 400,
+				KeyRedacted:          true,
+				KeyFingerprintSHA256: strings.Repeat("9", 64),
+			},
+			FirstObservedAt: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
+			StableDurationMillis: 300_000, HealthySamples: 61, MaxSampleGapMillis: 5_000,
+			JournalSamples: 61, SessionSetSHA256: strings.Repeat("a", 64),
+			FirstProofAttempts: 1, VerifiedProofAttempts: 61,
+			FirstSessionSHA256: strings.Repeat("e", 64), VerifiedSessionSHA256: strings.Repeat("f", 64),
+		},
 	}
 	evidence.EvidenceEmittedAt = "2026-08-02T00:05:01Z"
 	return evidence
@@ -690,6 +882,12 @@ func validGoldenMigrationTransitionEvidence(mode, priorType, priorSHA, preparati
 	evidence.PriorEvidenceSHA256 = priorSHA
 	evidence.PreparationEvidenceSHA256 = preparationSHA
 	evidence.Routing.Before, evidence.Routing.After = source, destination
+	evidence.Routing.SourceBackendURL = map[string]string{
+		"legacy": evidence.Routing.LegacyBackendURL, "front": evidence.Routing.FrontBackendURL,
+	}[source]
+	evidence.Routing.DestinationBackendURL = map[string]string{
+		"legacy": evidence.Routing.LegacyBackendURL, "front": evidence.Routing.FrontBackendURL,
+	}[destination]
 	sourceGeneration, destinationGeneration := "legacy-generation", "front-generation"
 	if source == "front" {
 		sourceGeneration, destinationGeneration = destinationGeneration, sourceGeneration

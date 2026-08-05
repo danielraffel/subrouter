@@ -37,6 +37,8 @@ RUN_LABEL="${RUN_LABEL//[^a-zA-Z0-9._-]/-}"
 REMOTE_INSTALLER="/tmp/install-front-slots-${RUN_LABEL}.sh"
 REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
+CANARY_SECURITY_POLICY_HELPER="${SCRIPT_DIR}/canary-security-policy.py"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
 # shellcheck source=deploy/gcp/deploy-lock.sh
@@ -44,12 +46,29 @@ source "${SCRIPT_DIR}/deploy-lock.sh"
 
 log() { printf 'gcp-legacy-retirement: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
+case "${INSTANCE}" in
+  subrouter-team)
+    expected_active_matcher="__root__"
+    expected_canary_matcher="subrouter-front-canary"
+    expected_canary_host="front-canary.sr.cmux.internal"
+    expected_canary_security_policy="subrouter-front-canary-policy"
+    ;;
+  subrouter-staging)
+    expected_active_matcher="staging-subrouter"
+    expected_canary_matcher="staging-subrouter-front-canary"
+    expected_canary_host="front-canary.staging.sr.cmux.internal"
+    expected_canary_security_policy="subrouter-staging-front-canary-policy"
+    ;;
+  *) die "unsupported instance: ${INSTANCE}" ;;
+esac
 INSTALL_FRONT_SLOTS="$(bash "${SCRIPT_DIR}/resolve-release-installer.sh" "${SCRIPT_DIR}/install-front-slots.sh")"
 DEPLOYMENT_CONTRACT="$(bash "${SCRIPT_DIR}/resolve-release-contract.sh" "${SCRIPT_DIR}/deployment-contract.py")"
 REMOTE_INSTALL_COMMAND="sudo env SUBROUTER_DEPLOYMENT_CONTRACT='${REMOTE_DEPLOYMENT_CONTRACT}' bash '${REMOTE_INSTALLER}'"
 for command in "${GCLOUD_BINARY}" jq curl python3 sha256sum; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+[[ -f "${URL_MAP_ROUTING}" ]] || die "URL-map routing helper is missing"
+[[ -f "${CANARY_SECURITY_POLICY_HELPER}" ]] || die "canary security policy helper is missing"
 INSTALL_FRONT_SLOTS_SHA256="$(sha256sum "${INSTALL_FRONT_SLOTS}" | awk '{print $1}')"
 DEPLOYMENT_CONTRACT_SHA256="$(sha256sum "${DEPLOYMENT_CONTRACT}" | awk '{print $1}')"
 [[ "${DRAIN_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] || die "SUBROUTER_RETIRE_DRAIN_TIMEOUT_SECONDS must be an integer"
@@ -68,6 +87,15 @@ predecessor_json="$(jq -c '.predecessor' "${CUTOVER_EVIDENCE}")"
 URL_MAP="$(jq -r '.routing.url_map' "${CUTOVER_EVIDENCE}")"
 legacy_backend_url="$(jq -r '.routing.legacy_backend_url' "${CUTOVER_EVIDENCE}")"
 front_backend_url="$(jq -r '.routing.front_backend_url' "${CUTOVER_EVIDENCE}")"
+front_backend_service="$(jq -r '.routing.front_backend' "${CUTOVER_EVIDENCE}")"
+[[ "$(jq -r '.routing.active_matcher' "${CUTOVER_EVIDENCE}")" == "${expected_active_matcher}" &&
+   "$(jq -r '.routing.canary.matcher' "${CUTOVER_EVIDENCE}")" == "${expected_canary_matcher}" &&
+   "$(jq -r '.routing.canary.host' "${CUTOVER_EVIDENCE}")" == "${expected_canary_host}" &&
+   "$(jq -r '.routing.canary.access_control.name' "${CUTOVER_EVIDENCE}")" == "${expected_canary_security_policy}" ]] \
+  || die "cutover evidence routing selectors do not match the target instance"
+active_matcher="${expected_active_matcher}"
+canary_matcher="${expected_canary_matcher}"
+canary_host="${expected_canary_host}"
 legacy_generation="$(jq -r '.legacy.generation' "${CUTOVER_EVIDENCE}")"
 legacy_checksum="$(jq -r '.legacy.checksum' "${CUTOVER_EVIDENCE}")"
 accepting_new_public_false_at="$(jq -r '.timestamps.activated_at' "${CUTOVER_EVIDENCE}")"
@@ -85,6 +113,21 @@ gcloud_ssh() {
 gcloud_scp() {
   "${GCLOUD_BINARY}" compute scp "$1" "${INSTANCE}:$2" \
     --project "${PROJECT_ID}" --zone "${ZONE}" --tunnel-through-iap --quiet
+}
+assert_canary_access_boundary() {
+  local expected_policy_url backend_json policy_json live_access expected_token_sha
+  expected_policy_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/securityPolicies/${expected_canary_security_policy}"
+  backend_json="$("${GCLOUD_BINARY}" compute backend-services describe "${front_backend_service}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  [[ "$(jq -r '.securityPolicy // empty' < <(stream_shell_value "${backend_json}"))" == "${expected_policy_url}" ]] \
+    || die "front backend lost its canary security policy before legacy retirement"
+  policy_json="$("${GCLOUD_BINARY}" compute security-policies describe "${expected_canary_security_policy}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  live_access="$(printf '%s\n' "${policy_json}" | python3 "${CANARY_SECURITY_POLICY_HELPER}" \
+    assert-ready - "${expected_canary_security_policy}" "${expected_canary_host}")"
+  expected_token_sha="$(jq -r '.routing.canary.access_control.key_fingerprint_sha256' "${CUTOVER_EVIDENCE}")"
+  [[ "$(jq -r '.key_fingerprint_sha256' < <(stream_shell_value "${live_access}"))" == "${expected_token_sha}" ]] \
+    || die "live canary security policy no longer matches the cutover evidence"
 }
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 epoch_millis() { python3 -c 'import time; print(time.time_ns() // 1_000_000)'; }
@@ -157,14 +200,17 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 acquire_lock
+assert_canary_access_boundary
 gcloud_scp "${INSTALL_FRONT_SLOTS}" "${REMOTE_INSTALLER}"
 gcloud_scp "${DEPLOYMENT_CONTRACT}" "${REMOTE_DEPLOYMENT_CONTRACT}"
 gcloud_ssh "printf '%s  %s\n%s  %s\n' '${INSTALL_FRONT_SLOTS_SHA256}' '${REMOTE_INSTALLER}' '${DEPLOYMENT_CONTRACT_SHA256}' '${REMOTE_DEPLOYMENT_CONTRACT}' | sha256sum -c - >/dev/null"
 url_map_applied="${ARTIFACT_DIR}/url-map-final.yaml"
 "${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
   --destination "${url_map_applied}" --quiet
-python3 "${DEPLOYMENT_CONTRACT}" assert-url-map \
-  "${url_map_applied}" "${legacy_backend_url}" 0 "${front_backend_url}" 1
+python3 "${URL_MAP_ROUTING}" assert-state \
+  "${url_map_applied}" "${active_matcher}" "${front_backend_url}" \
+  "${canary_matcher}" "${canary_host}" "${front_backend_url}" \
+  --forbid-url "${legacy_backend_url}"
 installed_sum="$(gcloud_ssh "sudo sha256sum /usr/local/bin/subrouter | awk '{print \$1}'" | tail -n 1)"
 [[ "${installed_sum}" == "${legacy_checksum}" ]] || die "legacy bytes changed after final cutover"
 restarts_before="$(legacy_restarts)"
