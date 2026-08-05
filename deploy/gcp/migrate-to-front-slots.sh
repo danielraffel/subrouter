@@ -244,13 +244,17 @@ install_canary_access_boundary() {
   python3 -c 'import secrets, sys; print(secrets.token_hex(32), file=sys.stdout)' >"${canary_token_file}"
   canary_policy_config_file="$(mktemp "${ARTIFACT_DIR}/.front-canary-policy.XXXXXX.json")"
   chmod 0600 "${canary_policy_config_file}"
-  python3 "${CANARY_SECURITY_POLICY_HELPER}" render \
-    "${canary_policy_config_file}" "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" \
-    --token-file "${canary_token_file}"
-  if "${GCLOUD_BINARY}" compute security-policies describe "${CANARY_SECURITY_POLICY}" \
-    --project "${PROJECT_ID}" --global --format=json >/dev/null 2>&1
+  if policy_json="$("${GCLOUD_BINARY}" compute security-policies describe "${CANARY_SECURITY_POLICY}" \
+    --project "${PROJECT_ID}" --global --format=json 2>/dev/null)"
   then
     policy_exists=1
+    printf '%s\n' "${policy_json}" | python3 "${CANARY_SECURITY_POLICY_HELPER}" render-update \
+      "${canary_policy_config_file}" - "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" \
+      --token-file "${canary_token_file}"
+  else
+    python3 "${CANARY_SECURITY_POLICY_HELPER}" render \
+      "${canary_policy_config_file}" "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" \
+      --token-file "${canary_token_file}"
   fi
   if [[ "${policy_exists}" == 1 ]]; then
     "${GCLOUD_BINARY}" compute security-policies import "${CANARY_SECURITY_POLICY}" \
