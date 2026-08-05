@@ -213,6 +213,12 @@ func TestGCPCanarySecurityPolicyRequiresAnAuthenticatedHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	rules := policyJSON["rules"].([]any)
+	hostExpression := `has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.staging.sr.cmux.internal'`
+	allowExpression := rules[0].(map[string]any)["match"].(map[string]any)["expr"].(map[string]any)["expression"].(string)
+	denyExpression := rules[1].(map[string]any)["match"].(map[string]any)["expr"].(map[string]any)["expression"].(string)
+	if denyExpression != hostExpression || allowExpression != hostExpression+" && has(request.headers['x-subrouter-canary-token']) && request.headers['x-subrouter-canary-token'] == '"+token+"'" {
+		t.Fatalf("policy did not render an exact Cloud Armor host expression:\nallow: %s\ndeny: %s", allowExpression, denyExpression)
+	}
 	rules[1].(map[string]any)["action"] = "allow"
 	unprotected := filepath.Join(t.TempDir(), "unprotected.json")
 	unprotectedBody, err := json.Marshal(policyJSON)
