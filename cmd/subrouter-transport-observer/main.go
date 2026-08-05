@@ -30,7 +30,221 @@ import (
 const (
 	goldenRequestTokenHeader = "X-Subrouter-Golden-Request-Token"
 	goldenRequestStateEnv    = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
+	goldenPacedChunkBytes    = 256
+	goldenPacedChunkInterval = 100 * time.Millisecond
+	goldenPacedReadBuffer    = 64 << 10
+	goldenPacedHoldbackBytes = 256
 )
+
+type observerDelay interface {
+	wait(context.Context, <-chan struct{}, <-chan struct{}, time.Duration) error
+}
+
+type timerObserverDelay struct{}
+
+func (timerObserverDelay) wait(
+	ctx context.Context,
+	gateReleased <-chan struct{},
+	requestReleased <-chan struct{},
+	duration time.Duration,
+) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gateReleased:
+		return nil
+	case <-requestReleased:
+		return nil
+	case <-timer.C:
+		return nil
+	}
+}
+
+type goldenResponseGate struct {
+	released chan struct{}
+	release  sync.Once
+}
+
+func newGoldenResponseGate() *goldenResponseGate {
+	return &goldenResponseGate{released: make(chan struct{})}
+}
+
+func (g *goldenResponseGate) releasePacing() {
+	if g == nil {
+		return
+	}
+	g.release.Do(func() { close(g.released) })
+}
+
+func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
+	if g == nil {
+		return nil
+	}
+	return &goldenResponsePacer{
+		chunkBytes:      goldenPacedChunkBytes,
+		holdbackBytes:   goldenPacedHoldbackBytes,
+		interval:        goldenPacedChunkInterval,
+		delay:           timerObserverDelay{},
+		gateReleased:    g.released,
+		requestReleased: make(chan struct{}),
+	}
+}
+
+// goldenResponsePacer applies backpressure from the local continuity observer
+// and retains a response tail so a finite real Codex response cannot complete
+// before the deployment gate explicitly releases it.
+type goldenResponsePacer struct {
+	chunkBytes         int
+	holdbackBytes      int
+	interval           time.Duration
+	delay              observerDelay
+	gateReleased       <-chan struct{}
+	requestReleased    chan struct{}
+	releaseRequestOnce sync.Once
+	mu                 sync.Mutex
+	started            bool
+	pending            []byte
+	sink               func([]byte) (int, error)
+}
+
+func (p *goldenResponsePacer) releaseRequest() {
+	if p == nil {
+		return
+	}
+	p.releaseRequestOnce.Do(func() { close(p.requestReleased) })
+}
+
+func (p *goldenResponsePacer) isReleased() bool {
+	if p == nil {
+		return true
+	}
+	select {
+	case <-p.gateReleased:
+		return true
+	case <-p.requestReleased:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write func([]byte) (int, error)) (int, error) {
+	if p == nil || len(payload) == 0 {
+		return write(payload)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sink = write
+	if p.isReleased() {
+		if err := p.flushPendingLocked(); err != nil {
+			return 0, err
+		}
+		return write(payload)
+	}
+	p.pending = append(p.pending, payload...)
+	flushBytes := len(p.pending) - p.holdbackBytes
+	if flushBytes <= 0 {
+		return len(payload), nil
+	}
+	written, err := p.writePacedLocked(ctx, p.pending[:flushBytes])
+	if written < 0 || written > len(p.pending) {
+		return 0, errors.New("golden response pacing writer returned an invalid byte count")
+	}
+	copy(p.pending, p.pending[written:])
+	p.pending = p.pending[:len(p.pending)-written]
+	if err != nil {
+		return 0, err
+	}
+	if written != flushBytes {
+		return 0, io.ErrShortWrite
+	}
+	return len(payload), nil
+}
+
+func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []byte) (int, error) {
+	total := 0
+	for total < len(payload) {
+		if p.isReleased() {
+			n, err := p.sink(payload[total:])
+			total += n
+			if err != nil {
+				return total, err
+			}
+			if total != len(payload) {
+				return total, io.ErrShortWrite
+			}
+			return total, nil
+		}
+		if p.started {
+			if err := p.delay.wait(ctx, p.gateReleased, p.requestReleased, p.interval); err != nil {
+				return total, err
+			}
+			if p.isReleased() {
+				continue
+			}
+		} else {
+			p.started = true
+		}
+		end := total + p.chunkBytes
+		if end > len(payload) {
+			end = len(payload)
+		}
+		n, err := p.sink(payload[total:end])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if total != end {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
+}
+
+func (p *goldenResponsePacer) flushPendingLocked() error {
+	if len(p.pending) == 0 {
+		return nil
+	}
+	if p.sink == nil {
+		return errors.New("golden response pacing sink is unavailable")
+	}
+	n, err := p.sink(p.pending)
+	if n < 0 || n > len(p.pending) {
+		return errors.New("golden response pacing writer returned an invalid byte count")
+	}
+	p.pending = p.pending[n:]
+	if err != nil {
+		return err
+	}
+	if len(p.pending) != 0 {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (p *goldenResponsePacer) hasPayload() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.started || len(p.pending) > 0
+}
+
+func (p *goldenResponsePacer) waitAndFlush() error {
+	if p == nil {
+		return nil
+	}
+	select {
+	case <-p.gateReleased:
+	case <-p.requestReleased:
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.flushPendingLocked()
+}
 
 type transportEvent struct {
 	Kind         string `json:"kind"`
@@ -333,9 +547,15 @@ type countingResponseWriter struct {
 	observer   *observer
 	meta       requestEvidence
 	statusCode int
+	context    context.Context
+	pacer      *goldenResponsePacer
 }
 
 func (w *countingResponseWriter) WriteHeader(statusCode int) {
+	if w.pacer != nil && statusCode != http.StatusSwitchingProtocols &&
+		(statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices) {
+		w.pacer.releaseRequest()
+	}
 	w.ResponseWriter.WriteHeader(statusCode)
 	if statusCode >= http.StatusOK || statusCode == http.StatusSwitchingProtocols {
 		w.recordFinalStatus(statusCode)
@@ -346,14 +566,16 @@ func (w *countingResponseWriter) Write(p []byte) (int, error) {
 	if w.statusCode == 0 {
 		w.recordFinalStatus(http.StatusOK)
 	}
-	n, err := w.ResponseWriter.Write(p)
-	if n > 0 {
-		event := w.meta.event("response_chunk")
-		event.Direction = "upstream_to_client"
-		event.Bytes = int64(n)
-		w.observer.emit(event)
-	}
-	return n, err
+	return w.pacer.write(w.context, p, func(chunk []byte) (int, error) {
+		n, err := w.ResponseWriter.Write(chunk)
+		if n > 0 {
+			event := w.meta.event("response_chunk")
+			event.Direction = "upstream_to_client"
+			event.Bytes = int64(n)
+			w.observer.emit(event)
+		}
+		return n, err
+	})
 }
 
 func (w *countingResponseWriter) recordFinalStatus(statusCode int) {
@@ -397,13 +619,15 @@ func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	w.recordFinalStatus(http.StatusSwitchingProtocols)
 	// ReverseProxy writes the HTTP 101 control response through buffered. The
 	// wrapped connection sees only post-handshake WebSocket frame bytes.
-	return &countingConn{Conn: connection, observer: w.observer, meta: w.meta}, buffered, nil
+	return &countingConn{Conn: connection, observer: w.observer, meta: w.meta, context: w.context, pacer: w.pacer}, buffered, nil
 }
 
 type countingConn struct {
 	net.Conn
 	observer *observer
 	meta     requestEvidence
+	context  context.Context
+	pacer    *goldenResponsePacer
 	closed   atomic.Bool
 }
 
@@ -456,17 +680,28 @@ func (c *countingConn) Read(p []byte) (int, error) {
 }
 
 func (c *countingConn) Write(p []byte) (int, error) {
-	n, err := c.Conn.Write(p)
-	if n > 0 {
-		event := c.meta.event("response_chunk")
-		event.Direction = "upstream_to_client"
-		event.Bytes = int64(n)
-		c.observer.emit(event)
-	}
-	return n, err
+	return c.pacer.write(c.context, p, func(chunk []byte) (int, error) {
+		n, err := c.Conn.Write(chunk)
+		if n > 0 {
+			event := c.meta.event("response_chunk")
+			event.Direction = "upstream_to_client"
+			event.Bytes = int64(n)
+			c.observer.emit(event)
+		}
+		return n, err
+	})
 }
 
 func (c *countingConn) Close() error {
+	if c.pacer != nil {
+		if !c.pacer.hasPayload() {
+			c.pacer.releaseRequest()
+		}
+		if err := c.pacer.waitAndFlush(); err != nil {
+			_ = c.Conn.Close()
+			return err
+		}
+	}
 	if c.closed.CompareAndSwap(false, true) {
 		c.observer.emit(transportEvent{Kind: "connection_closed", ConnectionID: c.meta.connectionID})
 	}
@@ -483,6 +718,10 @@ func newObserverHandlerWithStats(upstream *url.URL, events io.Writer, stats *obs
 }
 
 func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) http.Handler {
+	return newObserverHandlerWithObserverAndGate(upstream, observation, nil)
+}
+
+func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *observer, gate *goldenResponseGate) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	dialer := &net.Dialer{}
@@ -494,6 +733,14 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 		meta, ok := ctx.Value(requestEvidenceContextKey{}).(requestEvidence)
 		if !ok {
 			return connection, nil
+		}
+		if gate != nil && (meta.path == "/v1/responses" || meta.path == "/responses") {
+			if tcp, ok := connection.(*net.TCPConn); ok {
+				if err := tcp.SetReadBuffer(goldenPacedReadBuffer); err != nil {
+					_ = connection.Close()
+					return nil, err
+				}
+			}
 		}
 		id := goldenSocketEndpointID(connection.LocalAddr().String())
 		event := meta.event("upstream_connection_opened")
@@ -544,8 +791,23 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 			request.Body = &countingReadCloser{ReadCloser: request.Body, observer: observation, meta: meta}
 		}
 		request = request.WithContext(context.WithValue(request.Context(), requestEvidenceContextKey{}, meta))
-		responseWriter := &countingResponseWriter{ResponseWriter: w, observer: observation, meta: meta}
+		var responsePacer *goldenResponsePacer
+		if meta.path == "/v1/responses" || meta.path == "/responses" {
+			responsePacer = gate.newResponsePacer()
+		}
+		responseWriter := &countingResponseWriter{
+			ResponseWriter: w, observer: observation, meta: meta,
+			context: request.Context(), pacer: responsePacer,
+		}
 		proxy.ServeHTTP(responseWriter, request)
+		if responsePacer != nil {
+			if !responsePacer.hasPayload() {
+				responsePacer.releaseRequest()
+			}
+			if err := responsePacer.waitAndFlush(); err != nil {
+				observation.emit(meta.event("proxy_error"))
+			}
+		}
 		responseWriter.finish()
 		observation.emit(meta.event("request_completed"))
 	})
