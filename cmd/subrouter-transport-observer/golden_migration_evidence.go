@@ -75,21 +75,34 @@ type goldenMigrationRouting struct {
 }
 
 type goldenMigrationCanary struct {
-	Host                  string `json:"host"`
-	Matcher               string `json:"matcher"`
-	BackendURL            string `json:"backend_url"`
-	MapUpdatedAt          string `json:"map_updated_at"`
-	FirstObservedAt       string `json:"first_observed_at"`
-	VerifiedAt            string `json:"verified_at"`
-	StableDurationMillis  int64  `json:"stable_duration_ms"`
-	HealthySamples        int64  `json:"healthy_samples"`
-	MaxSampleGapMillis    int64  `json:"max_sample_gap_ms"`
-	JournalSamples        int64  `json:"journal_correlated_samples"`
-	SessionSetSHA256      string `json:"session_set_sha256"`
-	FirstProofAttempts    int64  `json:"first_proof_attempts"`
-	VerifiedProofAttempts int64  `json:"verified_proof_attempts"`
-	FirstSessionSHA256    string `json:"first_session_sha256"`
-	VerifiedSessionSHA256 string `json:"verified_session_sha256"`
+	Host                  string                      `json:"host"`
+	Matcher               string                      `json:"matcher"`
+	BackendURL            string                      `json:"backend_url"`
+	AccessControl         goldenMigrationCanaryAccess `json:"access_control"`
+	MapUpdatedAt          string                      `json:"map_updated_at"`
+	FirstObservedAt       string                      `json:"first_observed_at"`
+	VerifiedAt            string                      `json:"verified_at"`
+	StableDurationMillis  int64                       `json:"stable_duration_ms"`
+	HealthySamples        int64                       `json:"healthy_samples"`
+	MaxSampleGapMillis    int64                       `json:"max_sample_gap_ms"`
+	JournalSamples        int64                       `json:"journal_correlated_samples"`
+	SessionSetSHA256      string                      `json:"session_set_sha256"`
+	FirstProofAttempts    int64                       `json:"first_proof_attempts"`
+	VerifiedProofAttempts int64                       `json:"verified_proof_attempts"`
+	FirstSessionSHA256    string                      `json:"first_session_sha256"`
+	VerifiedSessionSHA256 string                      `json:"verified_session_sha256"`
+}
+
+type goldenMigrationCanaryAccess struct {
+	Name                 string `json:"name"`
+	Type                 string `json:"type"`
+	Attached             bool   `json:"attached"`
+	AllowPriority        int64  `json:"allow_priority"`
+	DenyPriority         int64  `json:"deny_priority"`
+	UnauthorizedStatus   int64  `json:"unauthorized_status"`
+	AuthorizedStatus     int64  `json:"authorized_status"`
+	KeyRedacted          bool   `json:"key_redacted_before_backend"`
+	KeyFingerprintSHA256 string `json:"key_fingerprint_sha256"`
 }
 
 type goldenMigrationLegacy struct {
@@ -383,23 +396,34 @@ func validateGoldenMigrationIdentity(evidence *goldenMigrationEvidence) error {
 }
 
 func validateGoldenMigrationRoutingSelectors(evidence *goldenMigrationEvidence) error {
-	expectedMatcher, expectedCanaryMatcher, expectedCanaryHost := "", "", ""
+	expectedMatcher, expectedCanaryMatcher, expectedCanaryHost, expectedPolicy := "", "", "", ""
 	switch evidence.Run.Instance {
 	case "subrouter-staging":
 		expectedMatcher = "staging-subrouter"
 		expectedCanaryMatcher = "staging-subrouter-front-canary"
 		expectedCanaryHost = "front-canary.staging.sr.cmux.internal"
+		expectedPolicy = "subrouter-staging-front-canary-policy"
 	case "subrouter-team":
 		expectedMatcher = "__root__"
 		expectedCanaryMatcher = "subrouter-front-canary"
 		expectedCanaryHost = "front-canary.sr.cmux.internal"
+		expectedPolicy = "subrouter-front-canary-policy"
 	default:
 		return failGolden("migration_routing_target_invalid")
 	}
 	if evidence.Routing.ActiveMatcher != expectedMatcher ||
 		evidence.Routing.Canary.Matcher != expectedCanaryMatcher ||
 		evidence.Routing.Canary.Host != expectedCanaryHost ||
-		evidence.Routing.Canary.BackendURL != evidence.Routing.FrontBackendURL {
+		evidence.Routing.Canary.BackendURL != evidence.Routing.FrontBackendURL ||
+		evidence.Routing.Canary.AccessControl.Name != expectedPolicy ||
+		evidence.Routing.Canary.AccessControl.Type != "CLOUD_ARMOR" ||
+		!evidence.Routing.Canary.AccessControl.Attached ||
+		evidence.Routing.Canary.AccessControl.AllowPriority != 900 ||
+		evidence.Routing.Canary.AccessControl.DenyPriority != 1000 ||
+		evidence.Routing.Canary.AccessControl.UnauthorizedStatus != 403 ||
+		evidence.Routing.Canary.AccessControl.AuthorizedStatus != 400 ||
+		!evidence.Routing.Canary.AccessControl.KeyRedacted ||
+		!validGoldenSHA256(evidence.Routing.Canary.AccessControl.KeyFingerprintSHA256) {
 		return failGolden("migration_routing_selectors_invalid")
 	}
 	return nil

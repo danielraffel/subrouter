@@ -521,6 +521,12 @@ func fakeMigrationPreparation(candidate, revision string) map[string]any {
 			"canary": map[string]any{
 				"host": "front-canary.staging.sr.cmux.internal", "matcher": "staging-subrouter-front-canary",
 				"backend_url": "https://front.test", "map_updated_at": stableSince.Add(-time.Minute).Format(time.RFC3339Nano),
+				"access_control": map[string]any{
+					"name": "subrouter-staging-front-canary-policy", "type": "CLOUD_ARMOR", "attached": true,
+					"allow_priority": 900, "deny_priority": 1000, "unauthorized_status": 403, "authorized_status": 400,
+					"key_redacted_before_backend": true,
+					"key_fingerprint_sha256":      strings.Repeat("9", 64),
+				},
 				"first_observed_at": stableSince.Format(time.RFC3339Nano), "verified_at": verifiedAt.Format(time.RFC3339Nano),
 				"stable_duration_ms": 300_000, "healthy_samples": 61, "max_sample_gap_ms": 5_000,
 				"journal_correlated_samples": 61, "session_set_sha256": strings.Repeat("a", 64),

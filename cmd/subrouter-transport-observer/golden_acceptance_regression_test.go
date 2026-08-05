@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -58,7 +59,11 @@ func TestGoldenMigrationTransitionRejectsRetargetedRoutingSelectors(t *testing.T
 			return err
 		}
 		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
-		return exec.Command("python3", validator, "--expect", "front-migration-cutover", path).Run()
+		output, err := exec.Command("python3", validator, "--expect", "front-migration-cutover", path).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, output)
+		}
+		return nil
 	}
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err != nil {
 		t.Fatalf("Go validator rejected valid routing selectors: %v", err)
@@ -111,9 +116,15 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 		routing := result["routing"].(map[string]any)
 		routing["active_matcher"] = "staging-subrouter"
 		routing["canary"] = map[string]any{
-			"host":                       "front-canary.staging.sr.cmux.internal",
-			"matcher":                    "staging-subrouter-front-canary",
-			"backend_url":                routing["front_backend_url"],
+			"host":        "front-canary.staging.sr.cmux.internal",
+			"matcher":     "staging-subrouter-front-canary",
+			"backend_url": routing["front_backend_url"],
+			"access_control": map[string]any{
+				"name": "subrouter-staging-front-canary-policy", "type": "CLOUD_ARMOR", "attached": true,
+				"allow_priority": 900, "deny_priority": 1000, "unauthorized_status": 403, "authorized_status": 400,
+				"key_redacted_before_backend": true,
+				"key_fingerprint_sha256":      strings.Repeat("9", 64),
+			},
 			"map_updated_at":             "2026-08-01T23:59:00Z",
 			"first_observed_at":          "2026-08-02T00:00:00Z",
 			"verified_at":                "2026-08-02T00:05:00Z",
@@ -150,7 +161,11 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			return err
 		}
 		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
-		return exec.Command("python3", validator, "--expect", "front-migration-preparation", path).Run()
+		output, err := exec.Command("python3", validator, "--expect", "front-migration-preparation", path).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%w: %s", err, output)
+		}
+		return nil
 	}
 	clone := func(value map[string]any) map[string]any {
 		encoded, err := json.Marshal(value)
@@ -192,6 +207,16 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	}
 	if err := validatePython(missingCanary); err == nil {
 		t.Fatal("Python validator accepted preparation without a front canary proof")
+	}
+
+	unprotectedCanary := clone(valid)
+	unprotectedAccess := unprotectedCanary["routing"].(map[string]any)["canary"].(map[string]any)["access_control"].(map[string]any)
+	unprotectedAccess["attached"] = false
+	if err := validateGo(unprotectedCanary); err == nil {
+		t.Fatal("Go validator accepted a publicly forgeable front canary")
+	}
+	if err := validatePython(unprotectedCanary); err == nil {
+		t.Fatal("Python validator accepted a publicly forgeable front canary")
 	}
 
 	shortCanary := clone(valid)
@@ -797,6 +822,12 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 			Canary: goldenMigrationCanary{
 				Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
 				BackendURL: "https://example.test/front",
+				AccessControl: goldenMigrationCanaryAccess{
+					Name: "subrouter-staging-front-canary-policy", Type: "CLOUD_ARMOR", Attached: true,
+					AllowPriority: 900, DenyPriority: 1000, UnauthorizedStatus: 403, AuthorizedStatus: 400,
+					KeyRedacted:          true,
+					KeyFingerprintSHA256: strings.Repeat("9", 64),
+				},
 			},
 		},
 		Legacy: goldenMigrationLegacy{
@@ -824,6 +855,12 @@ func validGoldenMigrationPreparationEvidence() *goldenMigrationEvidence {
 		Canary: goldenMigrationCanary{
 			Host: "front-canary.staging.sr.cmux.internal", Matcher: "staging-subrouter-front-canary",
 			BackendURL: "https://example.test/front", MapUpdatedAt: "2026-08-01T23:59:00Z",
+			AccessControl: goldenMigrationCanaryAccess{
+				Name: "subrouter-staging-front-canary-policy", Type: "CLOUD_ARMOR", Attached: true,
+				AllowPriority: 900, DenyPriority: 1000, UnauthorizedStatus: 403, AuthorizedStatus: 400,
+				KeyRedacted:          true,
+				KeyFingerprintSHA256: strings.Repeat("9", 64),
+			},
 			FirstObservedAt: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
 			StableDurationMillis: 300_000, HealthySamples: 61, MaxSampleGapMillis: 5_000,
 			JournalSamples: 61, SessionSetSHA256: strings.Repeat("a", 64),

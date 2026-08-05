@@ -174,22 +174,55 @@ def validate_migration_routing_selectors(
             "staging-subrouter",
             "staging-subrouter-front-canary",
             "front-canary.staging.sr.cmux.internal",
+            "subrouter-staging-front-canary-policy",
         ),
         "subrouter-team": (
             "__root__",
             "subrouter-front-canary",
             "front-canary.sr.cmux.internal",
+            "subrouter-front-canary-policy",
         ),
     }
     target = expected_routing.get(run["instance"])
     if target is None:
         fail("front migration targets an unsupported instance")
-    active_matcher, canary_matcher, canary_host = target
+    active_matcher, canary_matcher, canary_host, security_policy = target
     exact(field(routing, "active_matcher", "routing"), active_matcher, "routing.active_matcher")
     canary = obj(field(routing, "canary", "routing"), "routing.canary")
     exact(field(canary, "host", "routing.canary"), canary_host, "routing.canary.host")
     exact(field(canary, "matcher", "routing.canary"), canary_matcher, "routing.canary.matcher")
     exact(field(canary, "backend_url", "routing.canary"), front_url, "routing.canary.backend_url")
+    access = obj(field(canary, "access_control", "routing.canary"), "routing.canary.access_control")
+    exact(field(access, "name", "routing.canary.access_control"), security_policy, "routing.canary.access_control.name")
+    exact(field(access, "type", "routing.canary.access_control"), "CLOUD_ARMOR", "routing.canary.access_control.type")
+    exact(
+        boolean(field(access, "attached", "routing.canary.access_control"), "routing.canary.access_control.attached"),
+        True,
+        "routing.canary.access_control.attached",
+    )
+    for name, expected in (
+        ("allow_priority", 900),
+        ("deny_priority", 1000),
+        ("unauthorized_status", 403),
+        ("authorized_status", 400),
+    ):
+        exact(
+            integer(field(access, name, "routing.canary.access_control"), f"routing.canary.access_control.{name}"),
+            expected,
+            f"routing.canary.access_control.{name}",
+        )
+    exact(
+        boolean(
+            field(access, "key_redacted_before_backend", "routing.canary.access_control"),
+            "routing.canary.access_control.key_redacted_before_backend",
+        ),
+        True,
+        "routing.canary.access_control.key_redacted_before_backend",
+    )
+    sha(
+        field(access, "key_fingerprint_sha256", "routing.canary.access_control"),
+        "routing.canary.access_control.key_fingerprint_sha256",
+    )
     return canary
 
 

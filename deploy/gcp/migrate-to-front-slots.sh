@@ -65,6 +65,7 @@ REMOTE_DEPLOYMENT_CONTRACT="/tmp/deployment-contract-${RUN_LABEL}.py"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRONT_READINESS_WAITER="${SCRIPT_DIR}/wait-for-front-readiness.py"
 FRONT_READINESS_PROBE="${SCRIPT_DIR}/probe-front-readiness.sh"
+CANARY_SECURITY_POLICY_HELPER="${SCRIPT_DIR}/canary-security-policy.py"
 URL_MAP_ROUTING="${SCRIPT_DIR}/url-map-routing.py"
 # shellcheck source=deploy/gcp/stream-shell-value.sh
 source "${SCRIPT_DIR}/stream-shell-value.sh"
@@ -79,6 +80,7 @@ case "${INSTANCE}" in
     ACTIVE_MATCHER="__root__"
     CANARY_MATCHER="subrouter-front-canary"
     CANARY_HOST="front-canary.sr.cmux.internal"
+    CANARY_SECURITY_POLICY="subrouter-front-canary-policy"
     ;;
   subrouter-staging)
     LEGACY_BACKEND_SERVICE="${SUBROUTER_GCP_BACKEND_SERVICE:-subrouter-staging-backend}"
@@ -87,6 +89,7 @@ case "${INSTANCE}" in
     ACTIVE_MATCHER="staging-subrouter"
     CANARY_MATCHER="staging-subrouter-front-canary"
     CANARY_HOST="front-canary.staging.sr.cmux.internal"
+    CANARY_SECURITY_POLICY="subrouter-staging-front-canary-policy"
     ;;
   *)
     printf 'gcp-front-migration: unsupported instance: %s\n' "${INSTANCE}" >&2
@@ -105,6 +108,7 @@ for command in "${GCLOUD_BINARY}" curl go jq python3 sha256sum; do
 done
 [[ -f "${FRONT_READINESS_WAITER}" ]] || die "front readiness waiter is missing"
 [[ -f "${FRONT_READINESS_PROBE}" ]] || die "front readiness probe is missing"
+[[ -f "${CANARY_SECURITY_POLICY_HELPER}" ]] || die "canary security policy helper is missing"
 [[ -f "${URL_MAP_ROUTING}" ]] || die "URL-map routing helper is missing"
 [[ -f "${CLOUD_CONFIG}" && ! -L "${CLOUD_CONFIG}" ]] || die "cloud config is missing or unsafe"
 tenant_key="$(jq -r '.tenantKey // empty' "${CLOUD_CONFIG}")"
@@ -230,6 +234,56 @@ old_drain_timeout=""
 migration_started=0
 migration_committed=0
 url_map_switched=0
+canary_token_file=""
+canary_policy_config_file=""
+
+install_canary_access_boundary() {
+  local policy_exists=0 current_policy expected_policy_url policy_json backend_policy_json token_sha
+  canary_token_file="$(mktemp "${ARTIFACT_DIR}/.front-canary-token.XXXXXX")"
+  chmod 0600 "${canary_token_file}"
+  python3 -c 'import secrets, sys; print(secrets.token_hex(32), file=sys.stdout)' >"${canary_token_file}"
+  canary_policy_config_file="$(mktemp "${ARTIFACT_DIR}/.front-canary-policy.XXXXXX.json")"
+  chmod 0600 "${canary_policy_config_file}"
+  python3 "${CANARY_SECURITY_POLICY_HELPER}" render \
+    "${canary_policy_config_file}" "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" \
+    --token-file "${canary_token_file}"
+  if "${GCLOUD_BINARY}" compute security-policies describe "${CANARY_SECURITY_POLICY}" \
+    --project "${PROJECT_ID}" --global --format=json >/dev/null 2>&1
+  then
+    policy_exists=1
+  fi
+  if [[ "${policy_exists}" == 1 ]]; then
+    "${GCLOUD_BINARY}" compute security-policies import "${CANARY_SECURITY_POLICY}" \
+      --project "${PROJECT_ID}" --global --file-name "${canary_policy_config_file}" \
+      --file-format json --quiet
+  else
+    "${GCLOUD_BINARY}" compute security-policies create "${CANARY_SECURITY_POLICY}" \
+      --project "${PROJECT_ID}" --global --file-name "${canary_policy_config_file}" \
+      --file-format json --quiet
+  fi
+  rm -f -- "${canary_policy_config_file}"
+  canary_policy_config_file=""
+  policy_json="$("${GCLOUD_BINARY}" compute security-policies describe "${CANARY_SECURITY_POLICY}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  canary_policy_evidence="$(printf '%s\n' "${policy_json}" | python3 "${CANARY_SECURITY_POLICY_HELPER}" \
+    assert-ready - "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}" --token-file "${canary_token_file}")"
+  token_sha="$(python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read().strip()).hexdigest())' "${canary_token_file}")"
+  [[ "$(jq -r '.key_fingerprint_sha256' < <(stream_shell_value "${canary_policy_evidence}"))" == "${token_sha}" ]] \
+    || die "canary security policy token proof does not match its protected token file"
+
+  expected_policy_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/securityPolicies/${CANARY_SECURITY_POLICY}"
+  backend_policy_json="$("${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  current_policy="$(jq -r '.securityPolicy // empty' < <(stream_shell_value "${backend_policy_json}"))"
+  [[ -z "${current_policy}" || "${current_policy}" == "${expected_policy_url}" ]] \
+    || die "${FRONT_BACKEND_SERVICE} has an unrelated security policy"
+  "${GCLOUD_BINARY}" compute backend-services update "${FRONT_BACKEND_SERVICE}" \
+    --project "${PROJECT_ID}" --global --security-policy "${CANARY_SECURITY_POLICY}" --quiet
+  backend_policy_json="$("${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  [[ "$(jq -r '.securityPolicy // empty' < <(stream_shell_value "${backend_policy_json}"))" == "${expected_policy_url}" ]] \
+    || die "canary security policy was not attached to ${FRONT_BACKEND_SERVICE}"
+}
 
 rollback_lb() {
   log "restoring the URL map to the legacy backend"
@@ -249,6 +303,8 @@ cleanup() {
   if [[ "${migration_started}" == "1" && "${migration_committed}" == "0" ]]; then
     rollback_lb || status=1
   fi
+  [[ -z "${canary_token_file}" ]] || rm -f -- "${canary_token_file}"
+  [[ -z "${canary_policy_config_file}" ]] || rm -f -- "${canary_policy_config_file}"
   gcloud_ssh "rm -f '${REMOTE_CANDIDATE}' '${REMOTE_WORKER_CANDIDATE}' '${REMOTE_INSTALLER}' '${REMOTE_DEPLOYMENT_CONTRACT}'" >/dev/null 2>&1 || true
   release_deploy_lock
   exit "${status}"
@@ -374,10 +430,11 @@ jq -e --arg hc "${FRONT_HEALTH_CHECK}" --arg group "${INSTANCE_GROUP}" \
 front_status="$(gcloud_ssh "sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status")"
 front_slot="$(jq -r '.active.id // empty' < <(stream_shell_value "${front_status}"))"
 [[ "${front_slot}" == slot-a || "${front_slot}" == slot-b ]] || die "front active slot is invalid"
+install_canary_access_boundary
 
-# Keep the front backend referenced by a non-user canary host before changing
-# the active route. A successful public request, correlated in the front slot
-# journal, proves that the load balancer has made the backend routable.
+# Keep the front backend referenced by a Cloud Armor-protected canary host
+# before changing the active route. Paired denied and authenticated public
+# requests prove both isolation and routability before user traffic can move.
 canary_candidate="${ARTIFACT_DIR}/url-map-canary-candidate.yaml"
 canary_applied="${ARTIFACT_DIR}/url-map-canary-applied.yaml"
 python3 "${URL_MAP_ROUTING}" prepare-canary \
@@ -401,6 +458,7 @@ front_readiness_json="$(
   SUBROUTER_GCP_FRONT_BACKEND_SERVICE="${FRONT_BACKEND_SERVICE}" \
   SUBROUTER_CANARY_PUBLIC_BASE_URL="${PUBLIC_BASE_URL}" \
   SUBROUTER_CANARY_HOST="${CANARY_HOST}" \
+  SUBROUTER_CANARY_TOKEN_FILE="${canary_token_file}" \
   SUBROUTER_CLOUD_CONFIG="${CLOUD_CONFIG}" \
   GCLOUD_BIN="${GCLOUD_BINARY}" \
   python3 "${FRONT_READINESS_WAITER}" \
@@ -477,6 +535,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
   --arg front_backend "${FRONT_BACKEND_SERVICE}" --arg legacy_url "${legacy_backend_url}" \
   --arg front_url "${front_backend_url}" --arg active_matcher "${ACTIVE_MATCHER}" \
   --arg canary_matcher "${CANARY_MATCHER}" --arg canary_host "${CANARY_HOST}" \
+  --argjson canary_access_control "${canary_policy_evidence}" \
   --arg map_updated_at "${map_updated_at}" --arg first_canary_observed_at "${first_canary_observed_at}" \
   --arg verified_canary_observed_at "${verified_canary_observed_at}" \
   --arg first_canary_session_sha "${first_canary_session_sha256}" \
@@ -507,6 +566,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type front-
       legacy_backend:$legacy_backend,front_backend:$front_backend,
       legacy_backend_url:$legacy_url,front_backend_url:$front_url,current:"legacy",
       canary:{host:$canary_host,matcher:$canary_matcher,backend_url:$front_url,
+        access_control:$canary_access_control,
         map_updated_at:$map_updated_at,first_observed_at:$first_canary_observed_at,
         verified_at:$verified_canary_observed_at,stable_duration_ms:$canary_duration,
         healthy_samples:$canary_healthy_samples,max_sample_gap_ms:$canary_max_sample_gap,
