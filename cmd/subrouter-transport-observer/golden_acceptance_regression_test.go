@@ -118,8 +118,10 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 			"first_observed_at":       "2026-08-02T00:00:00Z",
 			"verified_at":             "2026-08-02T00:05:00Z",
 			"stable_duration_ms":      300_000,
+			"healthy_samples":         61,
+			"max_sample_gap_ms":       5_000,
 			"first_proof_attempts":    1,
-			"verified_proof_attempts": 1,
+			"verified_proof_attempts": 61,
 			"first_session_sha256":    strings.Repeat("e", 64),
 			"verified_session_sha256": strings.Repeat("f", 64),
 		}
@@ -199,6 +201,26 @@ func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHe
 	}
 	if err := validatePython(shortCanary); err == nil {
 		t.Fatal("Python validator accepted a sub-five-minute front canary proof")
+	}
+
+	sparseCanaryWindow := clone(valid)
+	sparseCanary := sparseCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	sparseCanary["healthy_samples"] = 2
+	if err := validateGo(sparseCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted two endpoint probes as continuous front canary evidence")
+	}
+	if err := validatePython(sparseCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted two endpoint probes as continuous front canary evidence")
+	}
+
+	gappedCanaryWindow := clone(valid)
+	gappedCanary := gappedCanaryWindow["routing"].(map[string]any)["canary"].(map[string]any)
+	gappedCanary["max_sample_gap_ms"] = 15_001
+	if err := validateGo(gappedCanaryWindow); err == nil {
+		t.Fatal("Go validator accepted a gap in continuous front canary evidence")
+	}
+	if err := validatePython(gappedCanaryWindow); err == nil {
+		t.Fatal("Python validator accepted a gap in continuous front canary evidence")
 	}
 
 	wrongCanaryHost := clone(valid)
