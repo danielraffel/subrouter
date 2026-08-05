@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -38,6 +40,150 @@ func TestGoldenMigrationUsesBoundedRoutePropagationWindow(t *testing.T) {
 	evidence.Timestamps.EvidenceEmittedAt = "2026-08-02T00:05:00.001Z"
 	if err := validateGoldenMigrationTransition(evidence, "front-migration-cutover"); err == nil {
 		t.Fatal("five-minute route propagation boundary was accepted")
+	}
+}
+
+func TestGoldenMigrationPreparationRequiresCompatibleBootstrapAndStableBackendHealth(t *testing.T) {
+	document := func() map[string]any {
+		evidence := validGoldenMigrationPreparationEvidence()
+		evidence.EvidenceEmittedAt = "2026-08-02T00:05:01Z"
+		encoded, err := json.Marshal(evidence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			t.Fatal(err)
+		}
+		result["bootstrap"] = map[string]any{
+			"tag":                  "v0.1.60",
+			"sha256":               "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303",
+			"source_revision":      "e169e94f2bea9a0455a5831631fcbac220bd65f2",
+			"tag_on_main":          true,
+			"attestation_verified": true,
+			"immutable":            true,
+		}
+		front := result["front"].(map[string]any)
+		front["worker_checksum"] = "6a8daa1361030311bdbe25a06cd4940e4dd07a45758c13c2dc8d687e70d87303"
+		front["backend_health"] = map[string]any{
+			"all_healthy":               true,
+			"stable_since":              "2026-08-02T00:00:00Z",
+			"verified_at":               "2026-08-02T00:05:00Z",
+			"duration_ms":               300_000,
+			"healthy_samples":           61,
+			"max_sample_gap_ms":         5_000,
+			"backend_membership_sha256": strings.Repeat("d", 64),
+		}
+		return result
+	}
+	validateGo := func(value map[string]any) error {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		var evidence goldenMigrationEvidence
+		if err := json.Unmarshal(encoded, &evidence); err != nil {
+			return err
+		}
+		return validateGoldenMigrationEvidence(&evidence, "front-migration-preparation")
+	}
+	validatePython := func(value map[string]any) error {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		path := filepath.Join(t.TempDir(), "preparation.json")
+		if err := os.WriteFile(path, encoded, 0o600); err != nil {
+			return err
+		}
+		validator := filepath.Join("..", "..", "deploy", "gcp", "validate-deploy-evidence.py")
+		return exec.Command("python3", validator, "--expect", "front-migration-preparation", path).Run()
+	}
+	clone := func(value map[string]any) map[string]any {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	valid := document()
+	if err := validateGo(valid); err != nil {
+		t.Fatalf("Go validator rejected five minutes of compatible front readiness: %v", err)
+	}
+	if err := validatePython(valid); err != nil {
+		t.Fatalf("Python validator rejected five minutes of compatible front readiness: %v", err)
+	}
+	fractionalMillisecond := clone(valid)
+	fractionalHealth := fractionalMillisecond["front"].(map[string]any)["backend_health"].(map[string]any)
+	fractionalHealth["verified_at"] = "2026-08-02T00:05:00.001Z"
+	fractionalHealth["duration_ms"] = 300_001
+	if err := validateGo(fractionalMillisecond); err != nil {
+		t.Fatalf("Go validator rejected exact millisecond readiness duration: %v", err)
+	}
+	if err := validatePython(fractionalMillisecond); err != nil {
+		t.Fatalf("Python validator rejected exact millisecond readiness duration: %v", err)
+	}
+
+	missing := clone(valid)
+	delete(missing["front"].(map[string]any), "backend_health")
+	if err := validateGo(missing); err == nil {
+		t.Fatal("Go validator accepted preparation without backend readiness evidence")
+	}
+	if err := validatePython(missing); err == nil {
+		t.Fatal("Python validator accepted preparation without backend readiness evidence")
+	}
+
+	short := clone(valid)
+	health := short["front"].(map[string]any)["backend_health"].(map[string]any)
+	health["verified_at"] = "2026-08-02T00:04:59.999Z"
+	health["duration_ms"] = 299_999
+	if err := validateGo(short); err == nil {
+		t.Fatal("Go validator accepted a sub-five-minute backend readiness window")
+	}
+	if err := validatePython(short); err == nil {
+		t.Fatal("Python validator accepted a sub-five-minute backend readiness window")
+	}
+
+	negativeGap := clone(valid)
+	negativeGap["front"].(map[string]any)["backend_health"].(map[string]any)["max_sample_gap_ms"] = -1
+	if err := validateGo(negativeGap); err == nil {
+		t.Fatal("Go validator accepted a negative backend health sample gap")
+	}
+	if err := validatePython(negativeGap); err == nil {
+		t.Fatal("Python validator accepted a negative backend health sample gap")
+	}
+
+	impossibleSpan := clone(valid)
+	impossibleHealth := impossibleSpan["front"].(map[string]any)["backend_health"].(map[string]any)
+	impossibleHealth["healthy_samples"] = 21
+	impossibleHealth["max_sample_gap_ms"] = 5_000
+	if err := validateGo(impossibleSpan); err == nil {
+		t.Fatal("Go validator accepted samples that cannot span the claimed readiness duration")
+	}
+	if err := validatePython(impossibleSpan); err == nil {
+		t.Fatal("Python validator accepted samples that cannot span the claimed readiness duration")
+	}
+
+	oldBootstrap := clone(valid)
+	oldBootstrap["bootstrap"] = map[string]any{
+		"tag":                  "v0.1.55",
+		"sha256":               "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c",
+		"source_revision":      "c4ea17e91ef6e9d0ab31cdd2774ca8d5387219bc",
+		"tag_on_main":          true,
+		"attestation_verified": true,
+		"immutable":            true,
+	}
+	oldBootstrap["front"].(map[string]any)["worker_checksum"] = "6261bda248a6afc84079ecd22ded35e71d3b4cfb5267a6db2871a35cdcf0bd0c"
+	if err := validateGo(oldBootstrap); err == nil {
+		t.Fatal("Go validator accepted the hosted-tenant-incompatible v0.1.55 bootstrap")
+	}
+	if err := validatePython(oldBootstrap); err == nil {
+		t.Fatal("Python validator accepted the hosted-tenant-incompatible v0.1.55 bootstrap")
 	}
 }
 
@@ -514,6 +660,11 @@ func validGoldenMigrationBaseEvidence(evidenceType, mode string) *goldenMigratio
 		Front: goldenMigrationFront{
 			Slot: "slot-a", Generation: "front-generation", Checksum: strings.Repeat("b", 64),
 			ControlChecksum: strings.Repeat("b", 64), WorkerChecksum: goldenPinnedBootstrapLinuxSHA256, Ready: true,
+			BackendHealth: goldenMigrationBackendHealth{
+				AllHealthy: true, StableSince: "2026-08-02T00:00:00Z", VerifiedAt: "2026-08-02T00:05:00Z",
+				DurationMillis: 300_000, HealthySamples: 61, MaxSampleGapMillis: 5_000,
+				BackendMembershipSHA256: strings.Repeat("d", 64),
+			},
 		},
 	}
 }
@@ -525,7 +676,7 @@ func validGoldenMigrationPreparationEvidence() *goldenMigrationEvidence {
 		LegacyBackendURL: "https://example.test/legacy", FrontBackendURL: "https://example.test/front",
 		Current: "legacy",
 	}
-	evidence.EvidenceEmittedAt = "2026-08-02T00:00:01Z"
+	evidence.EvidenceEmittedAt = "2026-08-02T00:05:01Z"
 	return evidence
 }
 
