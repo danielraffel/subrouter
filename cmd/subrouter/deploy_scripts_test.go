@@ -212,6 +212,24 @@ func TestGCPCanarySecurityPolicyRequiresAnAuthenticatedHeader(t *testing.T) {
 	if err := json.Unmarshal(policyBody, &policyJSON); err != nil {
 		t.Fatal(err)
 	}
+	updatedPolicy := filepath.Join(t.TempDir(), "updated-policy.json")
+	if output, err := exec.Command(
+		mustLookPath(t, "python3"), helper, "render", updatedPolicy, name, host,
+		"--token-file", tokenPath, "--fingerprint", "existing-fingerprint==",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("render existing canary security policy: %v\n%s", err, output)
+	}
+	updatedBody, err := os.ReadFile(updatedPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var updatedJSON map[string]any
+	if err := json.Unmarshal(updatedBody, &updatedJSON); err != nil {
+		t.Fatal(err)
+	}
+	if updatedJSON["fingerprint"] != "existing-fingerprint==" {
+		t.Fatalf("existing policy fingerprint was not preserved: %#v", updatedJSON["fingerprint"])
+	}
 	rules := policyJSON["rules"].([]any)
 	hostExpression := `has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.staging.sr.cmux.internal'`
 	allowExpression := rules[0].(map[string]any)["match"].(map[string]any)["expr"].(map[string]any)["expression"].(string)
