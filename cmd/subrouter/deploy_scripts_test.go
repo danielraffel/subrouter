@@ -259,6 +259,7 @@ if printf '%s\n' "$body" | grep -q 'X-Subrouter-Canary-Token:'; then printf 400;
 `)
 	fakeGcloud := filepath.Join(fakeBin, "gcloud")
 	writeExecutableTestFile(t, fakeGcloud, `#!/bin/sh
+printf '%s\n' '--health--' >>"$PROBE_CAPTURE"
 printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"instance-a","ipAddress":"10.0.0.1","port":31416,"healthState":"HEALTHY"}]}}]'
 `)
 	cloudConfig := filepath.Join(t.TempDir(), "cloud.json")
@@ -300,6 +301,13 @@ printf '%s\n' '[{"backend":"group-a","status":{"healthStatus":[{"instance":"inst
 		!strings.Contains(body, "X-Subrouter-Session: canary-test-1-denied") ||
 		!strings.Contains(body, "X-Subrouter-Session: canary-test-1") {
 		t.Fatalf("probe did not pair denied and authenticated canaries:\n%s", body)
+	}
+	deniedOffset := strings.Index(body, "X-Subrouter-Session: canary-test-1-denied")
+	healthOffset := strings.Index(body, "--health--")
+	authenticatedOffset := strings.Index(body, "X-Subrouter-Canary-Token:")
+	if deniedOffset < 0 || healthOffset < 0 || authenticatedOffset < 0 ||
+		deniedOffset > healthOffset || healthOffset > authenticatedOffset {
+		t.Fatalf("probe did not separate the denied control from the authenticated canary with backend health:\n%s", body)
 	}
 }
 
