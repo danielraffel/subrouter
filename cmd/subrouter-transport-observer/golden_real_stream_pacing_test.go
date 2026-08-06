@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -28,7 +29,7 @@ func (delay *accumulatingObserverDelay) wait(
 
 func TestGoldenObserverDefaultPacingOutlastsDeploymentGate(t *testing.T) {
 	gate := newGoldenResponseGate()
-	pacer := gate.newResponsePacer()
+	pacer := gate.newResponsePacer("")
 	delay := &accumulatingObserverDelay{}
 	pacer.delay = delay
 
@@ -125,15 +126,94 @@ func TestGoldenObserverHoldsRealResponseUntilGateRelease(t *testing.T) {
 	}
 }
 
-func TestGoldenObserverIsolatesConcurrentResponseHoldbacks(t *testing.T) {
+func TestGoldenObserverLeavesPostReleaseResponsesIndependent(t *testing.T) {
+	gate := newGoldenResponseGate()
+	gate.releasePacing()
+	first := gate.newResponsePacer("")
+	second := gate.newResponsePacer("")
+
+	var firstDelivered bytes.Buffer
+	if _, err := first.write(context.Background(), []byte("first"), firstDelivered.Write); err != nil {
+		t.Fatal(err)
+	}
+	var secondDelivered bytes.Buffer
+	if _, err := second.write(context.Background(), []byte("second"), secondDelivered.Write); err != nil {
+		t.Fatal(err)
+	}
+
+	if firstDelivered.String() != "first" {
+		t.Fatalf("first post-release response = %q, want first", firstDelivered.String())
+	}
+	if secondDelivered.String() != "second" {
+		t.Fatalf("second post-release response = %q, want second", secondDelivered.String())
+	}
+}
+
+func TestGoldenObserverSerializesSupersessionWithGateRelease(t *testing.T) {
+	gate := newGoldenResponseGate()
+	token := "0123456789abcdef0123456789abcdef"
+	previous := gate.newResponsePacer(token)
+
+	onceEntered := make(chan struct{})
+	onceRelease := make(chan struct{})
+	go previous.releaseRequestOnce.Do(func() {
+		close(onceEntered)
+		<-onceRelease
+	})
+	<-onceEntered
+
+	newPacerDone := make(chan struct{})
+	go func() {
+		gate.newResponsePacer(token)
+		close(newPacerDone)
+	}()
+	deadline := time.After(5 * time.Second)
+	for !previous.wasSuperseded() {
+		select {
+		case <-deadline:
+			t.Fatal("new response did not begin superseding the previous attempt")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	releaseDone := make(chan struct{})
+	go func() {
+		gate.releasePacing()
+		close(releaseDone)
+	}()
+	select {
+	case <-releaseDone:
+		t.Fatal("gate release overtook an in-progress supersession")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(onceRelease)
+	select {
+	case <-newPacerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supersession did not finish")
+	}
+	select {
+	case <-releaseDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate release did not finish after supersession")
+	}
+}
+
+func TestGoldenObserverSupersedesAbandonedResponseAttempt(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
 
 	upstreamWritten := make(chan string, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get(goldenResponseAttemptTokenHeader) != "" {
+			t.Error("golden response request token escaped the observer")
+		}
 		identifier := request.URL.Query().Get("id")
 		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.(http.Flusher).Flush()
 		_, _ = writer.Write([]byte(identifier))
 		upstreamWritten <- identifier
 	}))
@@ -161,12 +241,138 @@ func TestGoldenObserverIsolatesConcurrentResponseHoldbacks(t *testing.T) {
 		body       string
 		err        error
 	}
-	results := make(chan responseResult, 2)
-	for _, identifier := range []string{"first-response", "second-response"} {
+	results := map[string]chan responseResult{
+		"first-response":  make(chan responseResult, 1),
+		"second-response": make(chan responseResult, 1),
+	}
+	startRequest := func(identifier string) {
 		go func(identifier string) {
-			response, err := http.Post(observation.baseURL+"/v1/responses?id="+identifier, "application/json", bytes.NewReader([]byte("{}")))
+			request, err := http.NewRequest(
+				http.MethodPost,
+				observation.baseURL+"/v1/responses?id="+identifier,
+				bytes.NewReader([]byte("{}")),
+			)
 			if err != nil {
-				results <- responseResult{identifier: identifier, err: err}
+				results[identifier] <- responseResult{identifier: identifier, err: err}
+				return
+			}
+			request.Header.Set(goldenResponseAttemptTokenHeader, "0123456789abcdef0123456789abcdef")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				results[identifier] <- responseResult{identifier: identifier, err: err}
+				return
+			}
+			body, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if readErr == nil {
+				readErr = closeErr
+			}
+			results[identifier] <- responseResult{identifier: identifier, body: string(body), err: readErr}
+		}(identifier)
+	}
+	waitForUpstream := func(identifier string) {
+		t.Helper()
+		select {
+		case got := <-upstreamWritten:
+			if got != identifier {
+				t.Fatalf("upstream response = %q, want %q", got, identifier)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s upstream response was not written", identifier)
+		}
+	}
+
+	startRequest("first-response")
+	waitForUpstream("first-response")
+	startRequest("second-response")
+	waitForUpstream("second-response")
+
+	select {
+	case result := <-results["first-response"]:
+		if result.err != nil {
+			t.Fatalf("superseded response failed: %v", result.err)
+		}
+		if result.body != "" {
+			t.Fatalf("superseded response body = %q, want empty", result.body)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("superseded response remained held")
+	}
+	select {
+	case result := <-results["second-response"]:
+		t.Fatalf("current response completed before gate release: body=%q err=%v", result.body, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := releaseGoldenTestSessions([]*goldenSession{{observer: observation}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-results["second-response"]:
+		if result.err != nil {
+			t.Fatalf("current response failed: %v", result.err)
+		}
+		if result.body != result.identifier {
+			t.Fatalf("current response body = %q, want %q", result.body, result.identifier)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("current response did not drain")
+	}
+}
+
+func TestGoldenObserverKeepsDistinctConcurrentResponsesIndependent(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = false
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	upstreamWritten := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		identifier := request.URL.Query().Get("id")
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.(http.Flusher).Flush()
+		_, _ = writer.Write([]byte(identifier))
+		upstreamWritten <- identifier
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &goldenRunner{artifactDir: t.TempDir()}
+	observation, err := runner.startObserver("distinct-concurrent-real-stream-pacing", upstreamURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := observation.stop(ctx); err != nil {
+			t.Errorf("stop observer: %v", err)
+		}
+	})
+
+	type responseResult struct {
+		identifier string
+		body       string
+		err        error
+	}
+	results := make(chan responseResult, 2)
+	startRequest := func(identifier, token string) {
+		go func() {
+			request, requestErr := http.NewRequest(
+				http.MethodPost,
+				observation.baseURL+"/v1/responses?id="+identifier,
+				bytes.NewReader([]byte("{}")),
+			)
+			if requestErr != nil {
+				results <- responseResult{identifier: identifier, err: requestErr}
+				return
+			}
+			request.Header.Set(goldenResponseAttemptTokenHeader, token)
+			response, requestErr := http.DefaultClient.Do(request)
+			if requestErr != nil {
+				results <- responseResult{identifier: identifier, err: requestErr}
 				return
 			}
 			body, readErr := io.ReadAll(response.Body)
@@ -175,20 +381,34 @@ func TestGoldenObserverIsolatesConcurrentResponseHoldbacks(t *testing.T) {
 				readErr = closeErr
 			}
 			results <- responseResult{identifier: identifier, body: string(body), err: readErr}
-		}(identifier)
+		}()
 	}
-	for range 2 {
+	waitForUpstream := func(identifier string) {
+		t.Helper()
 		select {
-		case <-upstreamWritten:
+		case got := <-upstreamWritten:
+			if got != identifier {
+				t.Fatalf("upstream response = %q, want %q", got, identifier)
+			}
 		case <-time.After(5 * time.Second):
-			t.Fatal("concurrent upstream response was not written")
+			t.Fatalf("%s upstream response was not written", identifier)
 		}
 	}
-	time.Sleep(100 * time.Millisecond)
+
+	startRequest("first-response", "0123456789abcdef0123456789abcdef")
+	waitForUpstream("first-response")
+	startRequest("second-response", "fedcba9876543210fedcba9876543210")
+	waitForUpstream("second-response")
+
+	select {
+	case result := <-results:
+		t.Fatalf("distinct response completed before gate release: id=%s body=%q err=%v", result.identifier, result.body, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
 	if err := releaseGoldenTestSessions([]*goldenSession{{observer: observation}}); err != nil {
 		t.Fatal(err)
 	}
-
 	for range 2 {
 		select {
 		case result := <-results:
@@ -196,10 +416,10 @@ func TestGoldenObserverIsolatesConcurrentResponseHoldbacks(t *testing.T) {
 				t.Fatalf("%s failed: %v", result.identifier, result.err)
 			}
 			if result.body != result.identifier {
-				t.Fatalf("%s body = %q", result.identifier, result.body)
+				t.Fatalf("%s body = %q, want %q", result.identifier, result.body, result.identifier)
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatal("concurrent response did not drain")
+			t.Fatal("distinct concurrent response did not drain")
 		}
 	}
 }

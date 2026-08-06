@@ -28,12 +28,13 @@ import (
 )
 
 const (
-	goldenRequestTokenHeader = "X-Subrouter-Golden-Request-Token"
-	goldenRequestStateEnv    = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
-	goldenPacedChunkBytes    = 8
-	goldenPacedChunkInterval = 500 * time.Millisecond
-	goldenPacedReadBuffer    = 64 << 10
-	goldenPacedHoldbackBytes = 256
+	goldenRequestTokenHeader         = "X-Subrouter-Golden-Request-Token"
+	goldenResponseAttemptTokenHeader = "X-Subrouter-Golden-Response-Attempt"
+	goldenRequestStateEnv            = "SUBROUTER_GOLDEN_FAKE_REQUEST_STATE"
+	goldenPacedChunkBytes            = 8
+	goldenPacedChunkInterval         = 500 * time.Millisecond
+	goldenPacedReadBuffer            = 64 << 10
+	goldenPacedHoldbackBytes         = 256
 )
 
 type observerDelay interface {
@@ -63,26 +64,40 @@ func (timerObserverDelay) wait(
 }
 
 type goldenResponseGate struct {
-	released chan struct{}
-	release  sync.Once
+	released       chan struct{}
+	release        sync.Once
+	mu             sync.Mutex
+	pacingReleased bool
+	current        map[string]*goldenResponsePacer
 }
 
 func newGoldenResponseGate() *goldenResponseGate {
-	return &goldenResponseGate{released: make(chan struct{})}
+	return &goldenResponseGate{
+		released: make(chan struct{}),
+		current:  make(map[string]*goldenResponsePacer),
+	}
 }
 
 func (g *goldenResponseGate) releasePacing() {
 	if g == nil {
 		return
 	}
-	g.release.Do(func() { close(g.released) })
+	g.release.Do(func() {
+		g.mu.Lock()
+		g.pacingReleased = true
+		clear(g.current)
+		close(g.released)
+		g.mu.Unlock()
+	})
 }
 
-func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
+// newResponsePacer treats matching non-empty tokens as attempts for one golden
+// Codex turn. Untagged and differently tagged requests remain independent.
+func (g *goldenResponseGate) newResponsePacer(requestToken string) *goldenResponsePacer {
 	if g == nil {
 		return nil
 	}
-	return &goldenResponsePacer{
+	pacer := &goldenResponsePacer{
 		chunkBytes:      goldenPacedChunkBytes,
 		holdbackBytes:   goldenPacedHoldbackBytes,
 		interval:        goldenPacedChunkInterval,
@@ -90,6 +105,25 @@ func (g *goldenResponseGate) newResponsePacer() *goldenResponsePacer {
 		gateReleased:    g.released,
 		requestReleased: make(chan struct{}),
 	}
+	g.mu.Lock()
+	if !g.pacingReleased && requestToken != "" {
+		previous := g.current[requestToken]
+		g.current[requestToken] = pacer
+		previous.supersede()
+	}
+	g.mu.Unlock()
+	return pacer
+}
+
+func (g *goldenResponseGate) finishResponsePacer(requestToken string, pacer *goldenResponsePacer) {
+	if g == nil || requestToken == "" || pacer == nil {
+		return
+	}
+	g.mu.Lock()
+	if g.current[requestToken] == pacer {
+		delete(g.current, requestToken)
+	}
+	g.mu.Unlock()
 }
 
 // goldenResponsePacer applies backpressure from the local continuity observer
@@ -103,10 +137,23 @@ type goldenResponsePacer struct {
 	gateReleased       <-chan struct{}
 	requestReleased    chan struct{}
 	releaseRequestOnce sync.Once
+	superseded         atomic.Bool
 	mu                 sync.Mutex
 	started            bool
 	pending            []byte
 	sink               func([]byte) (int, error)
+}
+
+func (p *goldenResponsePacer) supersede() {
+	if p == nil {
+		return
+	}
+	p.superseded.Store(true)
+	p.releaseRequest()
+}
+
+func (p *goldenResponsePacer) wasSuperseded() bool {
+	return p != nil && p.superseded.Load()
 }
 
 func (p *goldenResponsePacer) releaseRequest() {
@@ -137,6 +184,10 @@ func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write f
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.sink = write
+	if p.wasSuperseded() {
+		p.pending = nil
+		return len(payload), nil
+	}
 	if p.isReleased() {
 		if err := p.flushPendingLocked(); err != nil {
 			return 0, err
@@ -166,6 +217,9 @@ func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write f
 func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []byte) (int, error) {
 	total := 0
 	for total < len(payload) {
+		if p.wasSuperseded() {
+			return len(payload), nil
+		}
 		if p.isReleased() {
 			n, err := p.sink(payload[total:])
 			total += n
@@ -204,6 +258,10 @@ func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []by
 }
 
 func (p *goldenResponsePacer) flushPendingLocked() error {
+	if p.wasSuperseded() {
+		p.pending = nil
+		return nil
+	}
 	if len(p.pending) == 0 {
 		return nil
 	}
@@ -752,10 +810,10 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		observation.emit(event)
 		return &countingUpstreamConn{Conn: connection, observer: observation, meta: meta, id: id}, nil
 	}
-	proxy.Transport = transport
+	proxy.Transport = &goldenResponseAttemptHeaderStripTransport{base: transport}
 	if goldenTestHooks.enabled {
 		proxy.Transport = &goldenRequestWriteTransport{
-			base:   transport,
+			base:   proxy.Transport,
 			signal: goldenTestHooks.outboundRequestWritten,
 		}
 	}
@@ -781,6 +839,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		requestToken := goldenResponseAttemptToken(request.Header)
 		finishRequest := observation.requests.begin()
 		defer finishRequest()
 		meta := requestEvidence{
@@ -797,7 +856,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		request = request.WithContext(context.WithValue(request.Context(), requestEvidenceContextKey{}, meta))
 		var responsePacer *goldenResponsePacer
 		if meta.path == "/v1/responses" || meta.path == "/responses" {
-			responsePacer = gate.newResponsePacer()
+			responsePacer = gate.newResponsePacer(requestToken)
 		}
 		responseWriter := &countingResponseWriter{
 			ResponseWriter: w, observer: observation, meta: meta,
@@ -805,16 +864,37 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		}
 		proxy.ServeHTTP(responseWriter, request)
 		if responsePacer != nil {
+			defer gate.finishResponsePacer(requestToken, responsePacer)
 			if !responsePacer.hasPayload() {
 				responsePacer.releaseRequest()
 			}
 			if err := responsePacer.waitAndFlush(); err != nil {
 				observation.emit(meta.event("proxy_error"))
 			}
+			if responsePacer.wasSuperseded() {
+				observation.emit(meta.event("response_superseded"))
+			}
 		}
 		responseWriter.finish()
 		observation.emit(meta.event("request_completed"))
 	})
+}
+
+type goldenResponseAttemptHeaderStripTransport struct {
+	base http.RoundTripper
+}
+
+func (transport *goldenResponseAttemptHeaderStripTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	request.Header.Del(goldenResponseAttemptTokenHeader)
+	return transport.base.RoundTrip(request)
+}
+
+func goldenResponseAttemptToken(header http.Header) string {
+	values := header.Values(goldenResponseAttemptTokenHeader)
+	if len(values) != 1 || !validGoldenRequestToken(values[0]) {
+		return ""
+	}
+	return values[0]
 }
 
 type goldenRequestWriteTransport struct {
