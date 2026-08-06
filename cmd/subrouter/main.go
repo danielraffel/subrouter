@@ -227,6 +227,7 @@ var directSRCommands = map[string]struct{}{
 	"account":          {},
 	"accounts":         {},
 	"attach-project":   {},
+	"az":               {},
 	"azure":            {},
 	"breadcrumbs":      {},
 	"claude":           {},

@@ -70,12 +70,7 @@ func TestAzureOpenAIResponsesRouteUsesCLITokenAndProfileEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := Server{
-		AzureOpenAI:  registry,
-		Accounts:     registry.Accounts("test"),
-		Sessions:     store,
-		MaxBodyBytes: 1 << 20,
-	}.Handler()
+	handler := Server{AzureOpenAI: registry, Accounts: registry.Accounts("test"), Sessions: store}.Handler()
 
 	request := httptest.NewRequest(http.MethodPost, "/azure/work/v1/responses", strings.NewReader(requestBody))
 	request.Header.Set("Authorization", "Bearer client-placeholder")
@@ -123,7 +118,12 @@ func TestAzureOpenAIProfileProbeAndUnknownProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := Server{AzureOpenAI: registry, Accounts: registry.Accounts("test"), Sessions: store}.Handler()
+	handler := Server{
+		AzureOpenAI:  registry,
+		Accounts:     registry.Accounts("test"),
+		Sessions:     store,
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
 
 	for _, test := range []struct {
 		path string
@@ -138,5 +138,45 @@ func TestAzureOpenAIProfileProbeAndUnknownProfile(t *testing.T) {
 		if response.Code != test.want {
 			t.Errorf("HEAD %s status = %d, want %d", test.path, response.Code, test.want)
 		}
+	}
+}
+
+func TestAzureOpenAIResponsesRouteRejectsUnconfiguredDeployment(t *testing.T) {
+	registry, err := azureopenai.NewRegistryWithTokenFactory([]azureopenai.Profile{{
+		Name:     "work",
+		Endpoint: "https://example.openai.azure.com",
+		Deployments: map[string]string{
+			azureopenai.GPT56Sol: "production-sol",
+		},
+		AzureCLI: "/opt/homebrew/bin/az",
+	}}, func(azureopenai.Profile) azureopenai.TokenSource {
+		return azureTokenSourceFunc(func(context.Context) (string, error) { return "token", nil })
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		AzureOpenAI:  registry,
+		Accounts:     registry.Accounts("test"),
+		Sessions:     store,
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+
+	request := httptest.NewRequest(http.MethodPost, "/azure/work/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	request.Header.Set("Authorization", "Bearer client-placeholder")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Subrouter-Agent", "codex")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "not a configured deployment") {
+		t.Fatalf("body = %q", response.Body.String())
 	}
 }

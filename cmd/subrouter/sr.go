@@ -51,7 +51,7 @@ Usage:
   sr add                Ask whether to add Codex, Claude, or Azure OpenAI
   sr add codex          Add Codex to the active local or hosted pool
   sr add claude         Add Claude to the active local or hosted pool
-  sr add azure          Add a local Azure OpenAI deployment using Azure CLI auth
+  sr add azure          Add Azure OpenAI GPT-5.6 deployments using Azure CLI auth
   sr add-key            Add an API key account
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
@@ -103,8 +103,8 @@ Running agents:
   sr codex [args]       Run codex through Subrouter
   sr claude [args]      Run claude through Subrouter
   sr gemini [args]      Run gemini through Subrouter
-  sr azure codex <profile> [args]
-                        Run Codex against one Azure OpenAI deployment
+  sr azure codex <profile> [--model sol|terra|luna] [args]
+                        Run Codex against Azure OpenAI (short alias: sr az)
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -210,7 +210,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
-		case "azure":
+		case "azure", "az":
 			return r.azure(ctx, args[1:])
 		case "add":
 			if len(args) > 1 && azureProviderAlias(args[1]) {
@@ -352,7 +352,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.spend(ctx)
 	case "gemini":
 		return r.gemini(args[1:])
-	case "azure":
+	case "azure", "az":
 		return r.azure(ctx, args[1:])
 	default:
 		if strings.Contains(args[0], "@") {
@@ -509,7 +509,7 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 		return r.add(ctx)
 	case "claude", "anthropic":
 		return r.claude(ctx, append([]string{"add"}, args[1:]...))
-	case "azure", "azure-openai", "foundry":
+	case "az", "azure", "azure-openai", "foundry":
 		return r.azure(ctx, append([]string{"add"}, args[1:]...))
 	default:
 		return fmt.Errorf("unknown provider %q; use '%s add codex', '%s add claude', or '%s add azure'",

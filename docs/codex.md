@@ -26,23 +26,35 @@ Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Codex shoul
 
 ## Azure OpenAI
 
-Subrouter can run Codex against an Azure OpenAI deployment while Azure CLI owns the Microsoft Entra login:
+Subrouter can run Codex against all three Azure OpenAI GPT-5.6 models while Azure CLI owns the Microsoft Entra login:
 
 ```bash
 brew install azure-cli
 az login
 sr azure add work \
-  --endpoint https://RESOURCE.openai.azure.com \
-  --deployment DEPLOYMENT_NAME
-sr azure codex work
-sr azure codex work exec "your prompt"
+  --endpoint https://RESOURCE.cognitiveservices.azure.com
+sr azure codex work --model sol
+sr az codex work --model terra
+sr az codex work --model luna exec "your prompt"
 ```
 
-Use the Azure deployment name, which can differ from the underlying model name. The launcher binds Codex to that deployment and rejects a conflicting `-m` or `--model` argument. `sr azure list` shows configured profiles, and `sr azure remove work` removes one.
+`sr azure` is the canonical command and `sr az` is its short alias. `sol` is the default when `--model` is omitted. The selectors `sol`, `terra`, and `luna` map to `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; `gpt-5.6` is an alias for Sol. Full model names also work.
+
+By default, each Azure deployment has the same name as its model. Override custom Azure deployment names by repeating the flag during setup:
+
+```bash
+sr azure add work \
+  --endpoint https://RESOURCE.cognitiveservices.azure.com \
+  --deployment sol=production-sol \
+  --deployment terra=production-terra \
+  --deployment luna=production-luna
+```
+
+The launcher resolves the selector to the configured Azure deployment before starting Codex. A legacy bare `--deployment DEPLOYMENT_NAME` remains supported as a single-deployment profile. `sr azure list` shows configured profiles, and `sr azure remove work` removes one.
 
 `sr azure add` validates the current Azure CLI session with `az account get-access-token`, stores the resolved CLI path plus non-secret profile metadata in `~/.subrouter/codex/azure-openai.json`, and restarts the local daemon. The daemon acquires tokens on demand, keeps them only in memory, and renews them before expiry. Run `az login` again when Azure CLI reports that the session or tenant access is invalid.
 
-Profiles default to the current Foundry token resource, `https://ai.azure.com`. Pass `--token-resource https://cognitiveservices.azure.com` for an Azure OpenAI resource that requires the Cognitive Services audience. `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_TOKEN_RESOURCE`, and `AZURE_CLI` provide defaults for `sr azure add`.
+Profiles default to the current Foundry token resource, `https://ai.azure.com`. Pass `--token-resource https://cognitiveservices.azure.com` for an Azure OpenAI resource that requires the Cognitive Services audience. `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_TOKEN_RESOURCE`, and `AZURE_CLI` provide defaults for `sr azure add`. `AZURE_OPENAI_DEPLOYMENT` accepts either a legacy deployment name or one `model=name` mapping; use flags for multiple mappings.
 
 The Codex child talks only to the local route `/azure/<profile>/v1`. Subrouter replaces its placeholder credential with the Azure CLI token, strips OpenAI API-key and organization headers, and forwards Responses requests to `<endpoint>/openai/v1`. Azure traffic does not enter the ChatGPT subscription pool, OAuth refresh, usage polling, or account failover paths. The custom provider uses HTTP streaming because Azure's Responses WebSocket mode is not enabled here.
 
@@ -134,7 +146,7 @@ OPENAI_API_KEY=dummy codex exec \
 - `SUBROUTER_CODEX_USER_EMAIL`: optional self-reported user email. When set, the wrapper sends `X-Subrouter-Agent: codex` and `X-Subrouter-User-Email` through a custom Subrouter provider.
 - `SUBROUTER_CODEX_ACCOUNT_ID`: optional Subrouter account id or API-key label. When set, the wrapper sends `X-Subrouter-Account-ID` and Subrouter forces that account for the session.
 - `AZURE_OPENAI_ENDPOINT`: default endpoint for `sr azure add`.
-- `AZURE_OPENAI_DEPLOYMENT`: default Azure deployment name for `sr azure add`.
+- `AZURE_OPENAI_DEPLOYMENT`: default legacy deployment name or one `model=name` mapping for `sr azure add`.
 - `AZURE_OPENAI_TOKEN_RESOURCE`: optional Azure token resource override for `sr azure add`.
 - `AZURE_CLI`: optional Azure CLI executable or absolute path for `sr azure add`.
 - `OPENAI_API_KEY`: only for real API-key mode or custom env-key providers. Avoid setting it when you want ChatGPT subscription model behavior.

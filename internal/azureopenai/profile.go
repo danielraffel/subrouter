@@ -19,17 +19,22 @@ import (
 const (
 	CognitiveServicesTokenResource = "https://cognitiveservices.azure.com"
 	FoundryTokenResource           = "https://ai.azure.com"
+	GPT56Sol                       = "gpt-5.6-sol"
+	GPT56Terra                     = "gpt-5.6-terra"
+	GPT56Luna                      = "gpt-5.6-luna"
+	DefaultGPT56Model              = GPT56Sol
 )
 
 var profileNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 type Profile struct {
-	Name          string `json:"name"`
-	Endpoint      string `json:"endpoint"`
-	Deployment    string `json:"deployment"`
-	TokenResource string `json:"tokenResource"`
-	AzureCLI      string `json:"azureCli"`
-	AddedAt       string `json:"addedAt"`
+	Name          string            `json:"name"`
+	Endpoint      string            `json:"endpoint"`
+	Deployment    string            `json:"deployment,omitempty"`
+	Deployments   map[string]string `json:"deployments,omitempty"`
+	TokenResource string            `json:"tokenResource"`
+	AzureCLI      string            `json:"azureCli"`
+	AddedAt       string            `json:"addedAt"`
 }
 
 type Store struct {
@@ -64,8 +69,47 @@ func NormalizeProfile(profile Profile) (Profile, error) {
 	}
 	profile.Endpoint = endpoint.String()
 	profile.Deployment = strings.TrimSpace(profile.Deployment)
-	if profile.Deployment == "" || len(profile.Deployment) > 256 || strings.ContainsAny(profile.Deployment, "\r\n\x00") {
-		return Profile{}, errors.New("Azure OpenAI deployment name is invalid")
+	if profile.Deployment != "" {
+		if err := validateDeploymentName(profile.Deployment); err != nil {
+			return Profile{}, err
+		}
+	}
+	deployments := make(map[string]string, len(profile.Deployments))
+	for rawModel, rawDeployment := range profile.Deployments {
+		if strings.TrimSpace(rawModel) == "" {
+			return Profile{}, errors.New("Azure OpenAI model mapping name is required")
+		}
+		model, ok := CanonicalGPT56Model(rawModel)
+		if !ok {
+			return Profile{}, fmt.Errorf("unsupported Azure OpenAI model mapping %q", rawModel)
+		}
+		deployment := strings.TrimSpace(rawDeployment)
+		if err := validateDeploymentName(deployment); err != nil {
+			return Profile{}, fmt.Errorf("Azure OpenAI %s mapping: %w", model, err)
+		}
+		if existing, exists := deployments[model]; exists && existing != deployment {
+			return Profile{}, fmt.Errorf("conflicting Azure OpenAI deployment mappings for %s", model)
+		}
+		deployments[model] = deployment
+	}
+	if len(deployments) == 0 {
+		if profile.Deployment == "" {
+			return Profile{}, errors.New("at least one Azure OpenAI deployment is required")
+		}
+		profile.Deployments = nil
+	} else {
+		defaultDeployment, ok := deployments[DefaultGPT56Model]
+		if !ok {
+			return Profile{}, fmt.Errorf("Azure OpenAI profile requires a %s deployment mapping", DefaultGPT56Model)
+		}
+		if profile.Deployment != "" && profile.Deployment != defaultDeployment {
+			return Profile{}, errors.New("Azure OpenAI compatibility deployment must match the Sol deployment mapping")
+		}
+		// Keep the default deployment in the legacy field so rolling back to a
+		// single-deployment Subrouter still launches Sol instead of rejecting the
+		// profile file. New binaries use Deployments for model selection.
+		profile.Deployment = defaultDeployment
+		profile.Deployments = deployments
 	}
 
 	profile.TokenResource = strings.TrimRight(strings.TrimSpace(profile.TokenResource), "/")
@@ -88,6 +132,70 @@ func NormalizeProfile(profile Profile) (Profile, error) {
 		}
 	}
 	return profile, nil
+}
+
+func validateDeploymentName(value string) error {
+	if value == "" || len(value) > 256 || strings.ContainsAny(value, "\r\n\x00") {
+		return errors.New("Azure OpenAI deployment name is invalid")
+	}
+	return nil
+}
+
+func GPT56Models() []string {
+	return []string{GPT56Sol, GPT56Terra, GPT56Luna}
+}
+
+func DefaultGPT56Deployments() map[string]string {
+	return map[string]string{
+		GPT56Sol:   GPT56Sol,
+		GPT56Terra: GPT56Terra,
+		GPT56Luna:  GPT56Luna,
+	}
+}
+
+func CanonicalGPT56Model(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "gpt-5.6", "sol", GPT56Sol:
+		return GPT56Sol, true
+	case "terra", GPT56Terra:
+		return GPT56Terra, true
+	case "luna", GPT56Luna:
+		return GPT56Luna, true
+	default:
+		return "", false
+	}
+}
+
+func GPT56ModelAlias(model string) string {
+	switch model {
+	case GPT56Sol:
+		return "sol"
+	case GPT56Terra:
+		return "terra"
+	case GPT56Luna:
+		return "luna"
+	default:
+		return model
+	}
+}
+
+func (p Profile) DeploymentForModel(value string) (string, bool) {
+	if len(p.Deployments) == 0 {
+		requested := strings.TrimSpace(value)
+		return p.Deployment, requested == "" || requested == p.Deployment
+	}
+	model, ok := CanonicalGPT56Model(value)
+	if ok {
+		deployment, exists := p.Deployments[model]
+		return deployment, exists
+	}
+	requested := strings.TrimSpace(value)
+	for _, deployment := range p.Deployments {
+		if requested == deployment {
+			return deployment, true
+		}
+	}
+	return "", false
 }
 
 func normalizeEndpoint(raw string) (*url.URL, error) {
@@ -248,7 +356,7 @@ func (s Store) Remove(name string) (bool, error) {
 }
 
 func (s Store) write(profiles []Profile) error {
-	body, err := json.MarshalIndent(profilesFile{Version: 1, Profiles: profiles}, "", "  ")
+	body, err := json.MarshalIndent(profilesFile{Version: 2, Profiles: profiles}, "", "  ")
 	if err != nil {
 		return err
 	}

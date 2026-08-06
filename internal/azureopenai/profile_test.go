@@ -67,6 +67,63 @@ func TestNormalizeProfileKeepsExplicitCognitiveServicesAudience(t *testing.T) {
 	}
 }
 
+func TestNormalizeProfileCanonicalizesGPT56DeploymentMappings(t *testing.T) {
+	profile, err := NormalizeProfile(Profile{
+		Name:     "work",
+		Endpoint: "https://example.openai.azure.com",
+		Deployments: map[string]string{
+			"sol":           "team-sol",
+			"gpt-5.6-terra": "team-terra",
+			"LUNA":          "team-luna",
+		},
+		AzureCLI: "/opt/homebrew/bin/az",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		GPT56Sol:   "team-sol",
+		GPT56Terra: "team-terra",
+		GPT56Luna:  "team-luna",
+	}
+	for model, deployment := range want {
+		if profile.Deployments[model] != deployment {
+			t.Fatalf("deployment %s = %q, want %q", model, profile.Deployments[model], deployment)
+		}
+	}
+	for selector, deployment := range map[string]string{
+		"":             "team-sol",
+		"gpt-5.6":      "team-sol",
+		"sol":          "team-sol",
+		"terra":        "team-terra",
+		"gpt-5.6-luna": "team-luna",
+		"team-luna":    "team-luna",
+	} {
+		got, ok := profile.DeploymentForModel(selector)
+		if !ok || got != deployment {
+			t.Errorf("DeploymentForModel(%q) = %q, %t; want %q, true", selector, got, ok, deployment)
+		}
+	}
+	if _, ok := profile.DeploymentForModel("gpt-5.5"); ok {
+		t.Fatal("unsupported model selector was accepted")
+	}
+}
+
+func TestNormalizeProfileRejectsInconsistentCompatibilityDeployment(t *testing.T) {
+	_, err := NormalizeProfile(Profile{
+		Name:       "work",
+		Endpoint:   "https://example.openai.azure.com",
+		Deployment: "legacy",
+		Deployments: map[string]string{
+			GPT56Sol: "team-sol",
+		},
+		AzureCLI: "/opt/homebrew/bin/az",
+	})
+	if err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestStorePersistsOnlyProfileMetadata(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "azure-openai.json")
 	store := Store{Path: path}

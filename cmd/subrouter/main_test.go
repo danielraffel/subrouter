@@ -313,6 +313,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"add-key",
 		"admin-keys",
 		"attach-project",
+		"az",
 		"azure",
 		"breadcrumbs",
 		"claude",

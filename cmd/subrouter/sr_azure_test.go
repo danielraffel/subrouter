@@ -100,6 +100,76 @@ func TestSRAzureAddValidatesCLIThenPersistsMetadata(t *testing.T) {
 	}
 }
 
+func TestSRAzAddDefaultsToAllGPT56Deployments(t *testing.T) {
+	dir := t.TempDir()
+	cliPath := filepath.Join(dir, "az")
+	if err := os.WriteFile(cliPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := azureopenai.Store{Path: filepath.Join(dir, "azure-openai.json")}
+	commands := &azureTestCommandRunner{output: []byte(`{"accessToken":"azure-cli-secret","expires_on":4070908800}`)}
+	runner := srRunner{
+		program:    "sr",
+		in:         strings.NewReader(""),
+		out:        io.Discard,
+		errOut:     io.Discard,
+		cmd:        commands,
+		azureStore: store,
+		restartDaemon: func() error {
+			return nil
+		},
+	}
+
+	if err := runner.run(context.Background(), []string{
+		"az", "add", "work",
+		"--endpoint", "https://example.openai.azure.com",
+		"--azure-cli", cliPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok, err := store.Find("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("Azure profile was not saved")
+	}
+	if profile.Deployment != azureopenai.GPT56Sol {
+		t.Fatalf("compatibility deployment = %q, want %q", profile.Deployment, azureopenai.GPT56Sol)
+	}
+	for _, model := range azureopenai.GPT56Models() {
+		if profile.Deployments[model] != model {
+			t.Errorf("deployment %s = %q, want canonical model name", model, profile.Deployments[model])
+		}
+	}
+}
+
+func TestParseAzureDeploymentFlagsSupportsAliasesAndRejectsConflicts(t *testing.T) {
+	deployments, legacy, err := parseAzureDeploymentFlags([]string{
+		"sol=production-sol",
+		"gpt-5.6-terra=production-terra",
+		"luna=production-luna",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy != "" {
+		t.Fatalf("legacy deployment = %q", legacy)
+	}
+	for model, want := range map[string]string{
+		azureopenai.GPT56Sol:   "production-sol",
+		azureopenai.GPT56Terra: "production-terra",
+		azureopenai.GPT56Luna:  "production-luna",
+	} {
+		if deployments[model] != want {
+			t.Errorf("deployment %s = %q, want %q", model, deployments[model], want)
+		}
+	}
+	if _, _, err := parseAzureDeploymentFlags([]string{"sol=one", "gpt-5.6-sol=two"}); err == nil {
+		t.Fatal("conflicting model aliases were accepted")
+	}
+}
+
 func TestSRAzureCodexBindsCustomProviderToDeployment(t *testing.T) {
 	local := healthServer(t, 200)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
@@ -172,6 +242,90 @@ func TestSRAzureCodexRejectsDeploymentOverride(t *testing.T) {
 	}
 	err := runner.run(context.Background(), []string{"azure", "codex", "work", "-m", "other-deployment"})
 	if err == nil || !strings.Contains(err.Error(), `bound to deployment "codex-deployment"`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSRAzureCodexResolvesGPT56FamilyAndRewritesModelFlag(t *testing.T) {
+	local := healthServer(t, 200)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "cloud.json"))
+	t.Setenv("SUBROUTER_CODEX_BIN", "codex-test")
+
+	store := azureopenai.Store{Path: filepath.Join(t.TempDir(), "azure-openai.json")}
+	if _, err := store.Save(azureopenai.Profile{
+		Name:     "work",
+		Endpoint: "https://example.openai.azure.com",
+		Deployments: map[string]string{
+			azureopenai.GPT56Sol:   "deployment-sol",
+			azureopenai.GPT56Terra: "deployment-terra",
+			azureopenai.GPT56Luna:  "deployment-luna",
+		},
+		AzureCLI: "/opt/homebrew/bin/az",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name       string
+		modelArgs  []string
+		deployment string
+	}{
+		{name: "default sol", deployment: "deployment-sol"},
+		{name: "OpenAI alias", modelArgs: []string{"--model", "gpt-5.6"}, deployment: "deployment-sol"},
+		{name: "terra short alias", modelArgs: []string{"--model=terra"}, deployment: "deployment-terra"},
+		{name: "luna full name", modelArgs: []string{"-m", "gpt-5.6-luna"}, deployment: "deployment-luna"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			commands := &azureTestCommandRunner{output: []byte(`{"accessToken":"azure-cli-secret","expires_on":4070908800}`)}
+			runner := srRunner{
+				program:    "sr",
+				in:         strings.NewReader(""),
+				out:        io.Discard,
+				errOut:     io.Discard,
+				client:     local.Client(),
+				cmd:        commands,
+				azureStore: store,
+			}
+			args := []string{"az", "codex", "work", "exec"}
+			args = append(args, test.modelArgs...)
+			args = append(args, "hello")
+			if err := runner.run(context.Background(), args); err != nil {
+				t.Fatal(err)
+			}
+			joined := strings.Join(commands.runArgs, "\n")
+			if !strings.Contains(joined, `model="`+test.deployment+`"`) {
+				t.Fatalf("Codex args do not select %q:\n%s", test.deployment, joined)
+			}
+			for _, arg := range commands.runArgs {
+				if arg == "gpt-5.6" || arg == "terra" || arg == "gpt-5.6-luna" || arg == "--model=terra" {
+					t.Fatalf("unresolved model selector reached Codex: %#v", commands.runArgs)
+				}
+			}
+		})
+	}
+}
+
+func TestSRAzureCodexRejectsUnknownGPT56Mapping(t *testing.T) {
+	store := azureopenai.Store{Path: filepath.Join(t.TempDir(), "azure-openai.json")}
+	if _, err := store.Save(azureopenai.Profile{
+		Name:        "work",
+		Endpoint:    "https://example.openai.azure.com",
+		Deployments: azureopenai.DefaultGPT56Deployments(),
+		AzureCLI:    "/opt/homebrew/bin/az",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := srRunner{
+		program:    "sr",
+		in:         strings.NewReader(""),
+		out:        io.Discard,
+		errOut:     io.Discard,
+		cmd:        &azureTestCommandRunner{},
+		azureStore: store,
+	}
+	err := runner.run(context.Background(), []string{"azure", "codex", "work", "--model", "gpt-5.5"})
+	if err == nil || !strings.Contains(err.Error(), "use sol, terra, or luna") {
 		t.Fatalf("error = %v", err)
 	}
 }

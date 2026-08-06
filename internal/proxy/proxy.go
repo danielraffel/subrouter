@@ -2260,9 +2260,17 @@ func (s Server) proxyHandler() http.Handler {
 				http.NotFound(w, r)
 				return
 			}
-			if _, ok := s.AzureOpenAI.Profile(azureProfileName); !ok {
+			profile, ok := s.AzureOpenAI.Profile(azureProfileName)
+			if !ok {
 				http.NotFound(w, r)
 				return
+			}
+			if requestedModel := session.ExtractModel(r, s.MaxBodyBytes); requestedModel != "" {
+				deployment, allowed := profile.DeploymentForModel(requestedModel)
+				if !allowed || deployment != requestedModel {
+					http.Error(w, "Azure OpenAI model is not a configured deployment for this profile", http.StatusBadRequest)
+					return
+				}
 			}
 			// The path is the authority for Azure profile selection. Binding the
 			// account internally prevents a client header from crossing profiles.
