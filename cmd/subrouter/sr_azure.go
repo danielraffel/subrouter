@@ -19,14 +19,17 @@ import (
 const srAzureHelp = `sr azure - Run Codex through Azure OpenAI with Azure CLI authentication
 
 Usage:
-  sr azure add <profile> --endpoint <url> [--deployment <model=name> ...]
+  sr azure add <profile> --endpoint <url> [--deployment <model=name> ...] [--default]
   sr azure list
+  sr azure default [profile]
   sr azure remove <profile>
-  sr azure codex <profile> [--model sol|terra|luna] [codex args...]
+  sr azure codex [--azure-profile <profile>] [--model sol|terra|luna] [codex args...]
 
 The short alias 'sr az' supports the same commands. With no --deployment flags,
 the profile maps Sol, Terra, and Luna to their canonical GPT-5.6 deployment names.
 Repeat --deployment to override a mapping, for example --deployment sol=my-sol.
+The first profile becomes the default. Use 'sr az default <profile>' to change it.
+Inside Codex, use /model to switch among the configured GPT-5.6 models.
 The profile stores endpoint and deployment metadata, never an access token.
 Run 'az login' first. Subrouter renews Entra access tokens through the same Azure CLI session.
 `
@@ -49,6 +52,8 @@ func (r srRunner) azure(ctx context.Context, args []string) error {
 		return r.azureAdd(ctx, args[1:])
 	case "list", "ls", "status":
 		return r.azureList()
+	case "default", "use":
+		return r.azureDefault(args[1:])
 	case "remove", "rm":
 		if len(args) != 2 {
 			return errors.New("usage: sr azure remove <profile>")
@@ -92,6 +97,7 @@ func (r srRunner) azureAdd(ctx context.Context, args []string) error {
 	flags.Var(&deploymentFlags, "deployment", "Azure deployment mapping model=name; repeat for multiple models")
 	tokenResource := flags.String("token-resource", strings.TrimSpace(os.Getenv("AZURE_OPENAI_TOKEN_RESOURCE")), "Azure token resource audience")
 	azureCLI := flags.String("azure-cli", strings.TrimSpace(os.Getenv("AZURE_CLI")), "Azure CLI path")
+	makeDefault := flags.Bool("default", false, "make this the default Azure OpenAI profile")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -150,6 +156,11 @@ func (r srRunner) azureAdd(ctx context.Context, args []string) error {
 	existed, err := r.azureProfileStore().Save(profile)
 	if err != nil {
 		return err
+	}
+	if *makeDefault {
+		if err := r.azureProfileStore().SetDefault(profile.Name); err != nil {
+			return err
+		}
 	}
 	if err := r.restartAzureDaemon(); err != nil {
 		return err
@@ -216,7 +227,8 @@ func resolveAzureCLI(explicit string) (string, error) {
 }
 
 func (r srRunner) azureList() error {
-	profiles, err := r.azureProfileStore().List()
+	store := r.azureProfileStore()
+	profiles, err := store.List()
 	if err != nil {
 		return err
 	}
@@ -224,10 +236,42 @@ func (r srRunner) azureList() error {
 		fmt.Fprintln(r.out, "No Azure OpenAI profiles. Run: sr azure add <profile> --endpoint <url>")
 		return nil
 	}
+	defaultProfile, _, err := store.Default()
+	if err != nil {
+		return err
+	}
 	for _, profile := range profiles {
-		fmt.Fprintf(r.out, "%s\t%s\t%s\n", profile.Name, azureDeploymentSummary(profile), profile.Endpoint)
+		marker := " "
+		if profile.Name == defaultProfile.Name {
+			marker = "*"
+		}
+		fmt.Fprintf(r.out, "%s %s\t%s\t%s\n", marker, profile.Name, azureDeploymentSummary(profile), profile.Endpoint)
 	}
 	return nil
+}
+
+func (r srRunner) azureDefault(args []string) error {
+	store := r.azureProfileStore()
+	switch len(args) {
+	case 0:
+		profile, ok, err := store.Default()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("no Azure OpenAI profiles; run 'sr az add <profile> --endpoint <url>'")
+		}
+		fmt.Fprintf(r.out, "%s\n", profile.Name)
+		return nil
+	case 1:
+		if err := store.SetDefault(args[0]); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "Default Azure OpenAI profile set to %s.\n", strings.ToLower(strings.TrimSpace(args[0])))
+		return nil
+	default:
+		return errors.New("usage: sr azure default [profile]")
+	}
 }
 
 func (r srRunner) azureRemove(name string) error {
@@ -246,26 +290,19 @@ func (r srRunner) azureRemove(name string) error {
 }
 
 func (r srRunner) azureCodex(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: sr azure codex <profile> [--model sol|terra|luna] [codex args...]")
-	}
-	profile, ok, err := r.azureProfileStore().Find(args[0])
+	profile, codexArgsRaw, err := r.azureCodexProfile(args)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return fmt.Errorf("Azure OpenAI profile %q not found; run 'sr azure list'", args[0])
-	}
-	codexArgsRaw := args[1:]
 	requested := codexModelArg(codexArgsRaw)
-	deployment, ok := profile.DeploymentForModel(requested)
+	codexModel, _, ok := profile.ResolveModel(requested)
 	if !ok {
 		if len(profile.Deployments) == 0 {
 			return fmt.Errorf("Azure profile %s is bound to deployment %q, not %q", profile.Name, profile.Deployment, requested)
 		}
 		return fmt.Errorf("Azure profile %s has no mapping for model %q; use sol, terra, or luna", profile.Name, requested)
 	}
-	codexArgsRaw = rewriteCodexModelArg(codexArgsRaw, deployment)
+	codexArgsRaw = rewriteCodexModelArg(codexArgsRaw, codexModel)
 	// Fail before starting Codex when the Azure CLI session is absent or stale.
 	if _, err := azureopenai.FetchCLIAccessToken(ctx, r.commandRunner(), profile); err != nil {
 		return err
@@ -287,7 +324,7 @@ func (r srRunner) azureCodex(ctx context.Context, args []string) error {
 		return err
 	}
 	localProxyToken := cloudClientProxyToken(cloudConfig, local)
-	childArgs := azureCodexArgs(codexArgsRaw, baseURL, deployment, localProxyToken != "")
+	childArgs := azureCodexArgs(codexArgsRaw, baseURL, codexModel, localProxyToken != "")
 	env := []string(nil)
 	if localProxyToken != "" {
 		env = []string{"SUBROUTER_CODEX_DUMMY_API_KEY=" + localProxyToken}
@@ -301,6 +338,56 @@ func (r srRunner) azureCodex(ctx context.Context, args []string) error {
 		r.out,
 		r.errOut,
 	)
+}
+
+func (r srRunner) azureCodexProfile(args []string) (azureopenai.Profile, []string, error) {
+	store := r.azureProfileStore()
+	profileName := ""
+	codexArgs := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--azure-profile":
+			if i+1 >= len(args) {
+				return azureopenai.Profile{}, nil, errors.New("--azure-profile requires a profile name")
+			}
+			profileName = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--azure-profile="):
+			profileName = strings.TrimPrefix(args[i], "--azure-profile=")
+		default:
+			codexArgs = append(codexArgs, args[i])
+		}
+	}
+	if strings.TrimSpace(profileName) != "" {
+		profile, ok, err := store.Find(profileName)
+		if err != nil {
+			return azureopenai.Profile{}, nil, err
+		}
+		if !ok {
+			return azureopenai.Profile{}, nil, fmt.Errorf("Azure OpenAI profile %q not found; run 'sr az list'", profileName)
+		}
+		return profile, codexArgs, nil
+	}
+
+	// Preserve the original positional profile syntax when the first argument
+	// names an existing profile. Otherwise every argument belongs to Codex.
+	if len(codexArgs) > 0 && !strings.HasPrefix(codexArgs[0], "-") {
+		profile, ok, err := store.Find(codexArgs[0])
+		if err != nil {
+			return azureopenai.Profile{}, nil, err
+		}
+		if ok {
+			return profile, codexArgs[1:], nil
+		}
+	}
+	profile, ok, err := store.Default()
+	if err != nil {
+		return azureopenai.Profile{}, nil, err
+	}
+	if !ok {
+		return azureopenai.Profile{}, nil, errors.New("no Azure OpenAI profiles; run 'sr az add <profile> --endpoint <url>'")
+	}
+	return profile, codexArgs, nil
 }
 
 func rewriteCodexModelArg(args []string, deployment string) []string {

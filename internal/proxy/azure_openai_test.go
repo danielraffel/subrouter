@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -166,7 +167,7 @@ func TestAzureOpenAIResponsesRouteRejectsUnconfiguredDeployment(t *testing.T) {
 		MaxBodyBytes: 1 << 20,
 	}.Handler()
 
-	request := httptest.NewRequest(http.MethodPost, "/azure/work/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	request := httptest.NewRequest(http.MethodPost, "/azure/work/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hello"}`))
 	request.Header.Set("Authorization", "Bearer client-placeholder")
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Subrouter-Agent", "codex")
@@ -178,5 +179,66 @@ func TestAzureOpenAIResponsesRouteRejectsUnconfiguredDeployment(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "not a configured deployment") {
 		t.Fatalf("body = %q", response.Body.String())
+	}
+}
+
+func TestAzureOpenAIResponsesRouteMapsPickerModelToCustomDeployment(t *testing.T) {
+	var upstreamBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		upstreamBody = string(body)
+		if request.ContentLength != int64(len(body)) {
+			t.Errorf("content length = %d, want %d", request.ContentLength, len(body))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	registry, err := azureopenai.NewRegistryWithTokenFactory([]azureopenai.Profile{{
+		Name:     "work",
+		Endpoint: upstream.URL,
+		Deployments: map[string]string{
+			azureopenai.GPT56Sol:   "production-sol",
+			azureopenai.GPT56Terra: "production-terra",
+			azureopenai.GPT56Luna:  "production-luna",
+		},
+		AzureCLI: "/opt/homebrew/bin/az",
+	}}, func(azureopenai.Profile) azureopenai.TokenSource {
+		return azureTokenSourceFunc(func(context.Context) (string, error) { return "token", nil })
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		AzureOpenAI:  registry,
+		Accounts:     registry.Accounts("test"),
+		Sessions:     store,
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+
+	request := httptest.NewRequest(http.MethodPost, "/azure/work/v1/responses", strings.NewReader(`{"model":"gpt-5.6-terra","input":"hello"}`))
+	request.Header.Set("Authorization", "Bearer client-placeholder")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Subrouter-Agent", "codex")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", response.Code, response.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(upstreamBody), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["model"] != "production-terra" || payload["input"] != "hello" {
+		t.Fatalf("upstream body = %s", upstreamBody)
 	}
 }

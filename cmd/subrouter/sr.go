@@ -103,7 +103,7 @@ Running agents:
   sr codex [args]       Run codex through Subrouter
   sr claude [args]      Run claude through Subrouter
   sr gemini [args]      Run gemini through Subrouter
-  sr azure codex <profile> [--model sol|terra|luna] [args]
+  sr azure codex [--azure-profile <profile>] [--model sol|terra|luna] [args]
                         Run Codex against Azure OpenAI (short alias: sr az)
 
   sr server             Legacy form of sr remote

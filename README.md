@@ -286,12 +286,10 @@ Run Codex against the Azure OpenAI GPT-5.6 family with Microsoft Entra credentia
 ```bash
 az login
 sr azure add work --endpoint https://RESOURCE.cognitiveservices.azure.com
-sr azure codex work --model sol
-sr az codex work --model terra
-sr az codex work --model luna
+sr az codex
 ```
 
-`sr azure` is canonical and `sr az` is its short alias. A profile defaults to deployments named `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; repeat `--deployment model=name` during `add` when Azure uses custom deployment names. Subrouter stores only profile metadata. It acquires renewable access tokens through `az account get-access-token`, keeps them in daemon memory, and routes this launcher through the explicit local `/azure/work/v1` path. See [Azure OpenAI setup and security details](docs/codex.md#azure-openai).
+The first Azure profile becomes the default, so `sr az codex` needs no profile argument. Use `/model` inside Codex to switch among Sol, Terra, and Luna, `sr az default <profile>` to change the saved default profile, or `--azure-profile <profile>` for one run. `sr azure` is canonical and `sr az` is its short alias. A profile defaults to deployments named `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; repeat `--deployment model=name` during `add` when Azure uses custom deployment names. Subrouter keeps Codex's canonical model names in the picker and translates them to Azure deployment names at the proxy boundary. It stores only profile metadata, acquires renewable access tokens through `az account get-access-token`, keeps them in daemon memory, and routes the launcher through the explicit local `/azure/work/v1` path. See [Azure OpenAI setup and security details](docs/codex.md#azure-openai).
 
 If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:31415/v1`. To make `sr codex`, Codex Desktop's app-server, and the default `sr` usage view use a remote Subrouter, register and select a named server:
 

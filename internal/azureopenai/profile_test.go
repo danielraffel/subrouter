@@ -104,8 +104,27 @@ func TestNormalizeProfileCanonicalizesGPT56DeploymentMappings(t *testing.T) {
 			t.Errorf("DeploymentForModel(%q) = %q, %t; want %q, true", selector, got, ok, deployment)
 		}
 	}
+	model, deployment, ok := profile.ResolveModel("team-luna")
+	if !ok || model != GPT56Luna || deployment != "team-luna" {
+		t.Fatalf("ResolveModel(team-luna) = %q, %q, %t", model, deployment, ok)
+	}
 	if _, ok := profile.DeploymentForModel("gpt-5.5"); ok {
 		t.Fatal("unsupported model selector was accepted")
+	}
+}
+
+func TestNormalizeProfileRejectsOneDeploymentForMultipleModels(t *testing.T) {
+	_, err := NormalizeProfile(Profile{
+		Name:     "work",
+		Endpoint: "https://example.openai.azure.com",
+		Deployments: map[string]string{
+			GPT56Sol:   "shared",
+			GPT56Terra: "shared",
+		},
+		AzureCLI: "/opt/homebrew/bin/az",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot map both") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -186,6 +205,69 @@ func TestStorePersistsOnlyProfileMetadata(t *testing.T) {
 	}
 	if len(profiles) != 0 {
 		t.Fatalf("profiles after remove = %#v", profiles)
+	}
+}
+
+func TestStoreDefaultsToFirstProfileAndAllowsChangingDefault(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "azure-openai.json")}
+	for _, name := range []string{"work", "backup"} {
+		if _, err := store.Save(Profile{
+			Name:        name,
+			Endpoint:    "https://" + name + ".openai.azure.com",
+			Deployments: DefaultGPT56Deployments(),
+			AzureCLI:    "/opt/homebrew/bin/az",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	profile, ok, err := store.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || profile.Name != "work" {
+		t.Fatalf("default profile = %#v, found = %t; want work", profile, ok)
+	}
+	if err := store.SetDefault("BACKUP"); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok, err = store.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || profile.Name != "backup" {
+		t.Fatalf("changed default profile = %#v, found = %t; want backup", profile, ok)
+	}
+	if removed, err := store.Remove("backup"); err != nil || !removed {
+		t.Fatalf("remove default = %t, %v", removed, err)
+	}
+	profile, ok, err = store.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || profile.Name != "work" {
+		t.Fatalf("fallback default profile = %#v, found = %t; want work", profile, ok)
+	}
+}
+
+func TestStoreReadsVersionTwoProfilesWithDeterministicDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "azure-openai.json")
+	body := `{
+  "version": 2,
+  "profiles": [
+    {"name":"zeta","endpoint":"https://zeta.openai.azure.com/openai/v1","deployment":"zeta","tokenResource":"https://ai.azure.com","azureCli":"az"},
+    {"name":"alpha","endpoint":"https://alpha.openai.azure.com/openai/v1","deployment":"alpha","tokenResource":"https://ai.azure.com","azureCli":"az"}
+  ]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok, err := (Store{Path: path}).Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || profile.Name != "alpha" {
+		t.Fatalf("version 2 default profile = %#v, found = %t; want alpha", profile, ok)
 	}
 }
 

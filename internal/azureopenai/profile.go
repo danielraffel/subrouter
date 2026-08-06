@@ -42,8 +42,9 @@ type Store struct {
 }
 
 type profilesFile struct {
-	Version  int       `json:"version"`
-	Profiles []Profile `json:"profiles"`
+	Version        int       `json:"version"`
+	DefaultProfile string    `json:"defaultProfile,omitempty"`
+	Profiles       []Profile `json:"profiles"`
 }
 
 func DefaultStore() Store {
@@ -75,6 +76,7 @@ func NormalizeProfile(profile Profile) (Profile, error) {
 		}
 	}
 	deployments := make(map[string]string, len(profile.Deployments))
+	deploymentModels := make(map[string]string, len(profile.Deployments))
 	for rawModel, rawDeployment := range profile.Deployments {
 		if strings.TrimSpace(rawModel) == "" {
 			return Profile{}, errors.New("Azure OpenAI model mapping name is required")
@@ -90,7 +92,11 @@ func NormalizeProfile(profile Profile) (Profile, error) {
 		if existing, exists := deployments[model]; exists && existing != deployment {
 			return Profile{}, fmt.Errorf("conflicting Azure OpenAI deployment mappings for %s", model)
 		}
+		if existingModel, exists := deploymentModels[deployment]; exists && existingModel != model {
+			return Profile{}, fmt.Errorf("Azure OpenAI deployment %q cannot map both %s and %s", deployment, existingModel, model)
+		}
 		deployments[model] = deployment
+		deploymentModels[deployment] = model
 	}
 	if len(deployments) == 0 {
 		if profile.Deployment == "" {
@@ -180,22 +186,33 @@ func GPT56ModelAlias(model string) string {
 }
 
 func (p Profile) DeploymentForModel(value string) (string, bool) {
+	_, deployment, ok := p.ResolveModel(value)
+	return deployment, ok
+}
+
+// ResolveModel returns the canonical Codex model slug and the Azure deployment
+// that serves it. Keeping those names separate lets Codex retain its native
+// model picker metadata while the proxy translates to custom deployment names.
+func (p Profile) ResolveModel(value string) (string, string, bool) {
 	if len(p.Deployments) == 0 {
 		requested := strings.TrimSpace(value)
-		return p.Deployment, requested == "" || requested == p.Deployment
+		if requested == "" || requested == p.Deployment {
+			return p.Deployment, p.Deployment, true
+		}
+		return "", "", false
 	}
 	model, ok := CanonicalGPT56Model(value)
 	if ok {
 		deployment, exists := p.Deployments[model]
-		return deployment, exists
+		return model, deployment, exists
 	}
 	requested := strings.TrimSpace(value)
-	for _, deployment := range p.Deployments {
+	for model, deployment := range p.Deployments {
 		if requested == deployment {
-			return deployment, true
+			return model, deployment, true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 func normalizeEndpoint(raw string) (*url.URL, error) {
@@ -261,32 +278,50 @@ func azureEndpointHost(host string) bool {
 }
 
 func (s Store) List() ([]Profile, error) {
-	body, err := os.ReadFile(s.ProfilesPath())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	file, err := s.load()
 	if err != nil {
 		return nil, err
 	}
+	return file.Profiles, nil
+}
+
+func (s Store) load() (profilesFile, error) {
+	body, err := os.ReadFile(s.ProfilesPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return profilesFile{Version: 3}, nil
+	}
+	if err != nil {
+		return profilesFile{}, err
+	}
 	var file profilesFile
 	if err := json.Unmarshal(body, &file); err != nil {
-		return nil, fmt.Errorf("parse Azure OpenAI profiles: %w", err)
+		return profilesFile{}, fmt.Errorf("parse Azure OpenAI profiles: %w", err)
 	}
 	profiles := make([]Profile, 0, len(file.Profiles))
 	seen := map[string]bool{}
 	for _, raw := range file.Profiles {
 		profile, err := NormalizeProfile(raw)
 		if err != nil {
-			return nil, fmt.Errorf("Azure OpenAI profile %q: %w", raw.Name, err)
+			return profilesFile{}, fmt.Errorf("Azure OpenAI profile %q: %w", raw.Name, err)
 		}
 		if seen[profile.Name] {
-			return nil, fmt.Errorf("duplicate Azure OpenAI profile %q", profile.Name)
+			return profilesFile{}, fmt.Errorf("duplicate Azure OpenAI profile %q", profile.Name)
 		}
 		seen[profile.Name] = true
 		profiles = append(profiles, profile)
 	}
 	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Name < profiles[j].Name })
-	return profiles, nil
+	file.Profiles = profiles
+	file.DefaultProfile = strings.ToLower(strings.TrimSpace(file.DefaultProfile))
+	if file.DefaultProfile == "" && len(profiles) > 0 {
+		// Version 2 stores predate an explicit default. Their first sorted
+		// profile becomes the deterministic default without requiring migration.
+		file.DefaultProfile = profiles[0].Name
+	}
+	if file.DefaultProfile != "" && !seen[file.DefaultProfile] {
+		return profilesFile{}, fmt.Errorf("default Azure OpenAI profile %q not found", file.DefaultProfile)
+	}
+	return file, nil
 }
 
 func (s Store) Find(name string) (Profile, bool, error) {
@@ -303,46 +338,85 @@ func (s Store) Find(name string) (Profile, bool, error) {
 	return Profile{}, false, nil
 }
 
+func (s Store) Default() (Profile, bool, error) {
+	file, err := s.load()
+	if err != nil {
+		return Profile{}, false, err
+	}
+	if file.DefaultProfile == "" {
+		return Profile{}, false, nil
+	}
+	for _, profile := range file.Profiles {
+		if profile.Name == file.DefaultProfile {
+			return profile, true, nil
+		}
+	}
+	return Profile{}, false, fmt.Errorf("default Azure OpenAI profile %q not found", file.DefaultProfile)
+}
+
+func (s Store) SetDefault(name string) error {
+	name = strings.ToLower(strings.TrimSpace(name))
+	file, err := s.load()
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, profile := range file.Profiles {
+		if profile.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("Azure OpenAI profile %q not found", name)
+	}
+	file.DefaultProfile = name
+	return s.write(file)
+}
+
 func (s Store) Save(profile Profile) (bool, error) {
 	profile, err := NormalizeProfile(profile)
 	if err != nil {
 		return false, err
 	}
-	profiles, err := s.List()
+	file, err := s.load()
 	if err != nil {
 		return false, err
 	}
 	existed := false
-	for i := range profiles {
-		if profiles[i].Name != profile.Name {
+	for i := range file.Profiles {
+		if file.Profiles[i].Name != profile.Name {
 			continue
 		}
 		existed = true
 		if profile.AddedAt == "" {
-			profile.AddedAt = profiles[i].AddedAt
+			profile.AddedAt = file.Profiles[i].AddedAt
 		}
-		profiles[i] = profile
+		file.Profiles[i] = profile
 		break
 	}
 	if profile.AddedAt == "" {
 		profile.AddedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	if !existed {
-		profiles = append(profiles, profile)
+		file.Profiles = append(file.Profiles, profile)
 	}
-	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Name < profiles[j].Name })
-	return existed, s.write(profiles)
+	if file.DefaultProfile == "" {
+		file.DefaultProfile = profile.Name
+	}
+	sort.Slice(file.Profiles, func(i, j int) bool { return file.Profiles[i].Name < file.Profiles[j].Name })
+	return existed, s.write(file)
 }
 
 func (s Store) Remove(name string) (bool, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
-	profiles, err := s.List()
+	file, err := s.load()
 	if err != nil {
 		return false, err
 	}
-	kept := profiles[:0]
+	kept := file.Profiles[:0]
 	removed := false
-	for _, profile := range profiles {
+	for _, profile := range file.Profiles {
 		if profile.Name == name {
 			removed = true
 			continue
@@ -352,11 +426,19 @@ func (s Store) Remove(name string) (bool, error) {
 	if !removed {
 		return false, nil
 	}
-	return true, s.write(kept)
+	file.Profiles = kept
+	if file.DefaultProfile == name {
+		file.DefaultProfile = ""
+		if len(kept) > 0 {
+			file.DefaultProfile = kept[0].Name
+		}
+	}
+	return true, s.write(file)
 }
 
-func (s Store) write(profiles []Profile) error {
-	body, err := json.MarshalIndent(profilesFile{Version: 2, Profiles: profiles}, "", "  ")
+func (s Store) write(file profilesFile) error {
+	file.Version = 3
+	body, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return err
 	}

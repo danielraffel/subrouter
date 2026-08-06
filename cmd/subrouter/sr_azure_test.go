@@ -222,6 +222,90 @@ func TestSRAzureCodexBindsCustomProviderToDeployment(t *testing.T) {
 	}
 }
 
+func TestSRAzureCodexUsesSavedDefaultWithoutProfileArgument(t *testing.T) {
+	local := healthServer(t, 200)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "cloud.json"))
+	t.Setenv("SUBROUTER_CODEX_BIN", "codex-test")
+
+	store := azureopenai.Store{Path: filepath.Join(t.TempDir(), "azure-openai.json")}
+	for _, profile := range []azureopenai.Profile{
+		{
+			Name:        "primary",
+			Endpoint:    "https://primary.openai.azure.com",
+			Deployments: azureopenai.DefaultGPT56Deployments(),
+			AzureCLI:    "/opt/homebrew/bin/az",
+		},
+		{
+			Name:        "secondary",
+			Endpoint:    "https://secondary.openai.azure.com",
+			Deployments: azureopenai.DefaultGPT56Deployments(),
+			AzureCLI:    "/opt/homebrew/bin/az",
+		},
+	} {
+		if _, err := store.Save(profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetDefault("secondary"); err != nil {
+		t.Fatal(err)
+	}
+
+	commands := &azureTestCommandRunner{output: []byte(`{"accessToken":"azure-cli-secret","expires_on":4070908800}`)}
+	runner := srRunner{
+		program:    "sr",
+		in:         strings.NewReader(""),
+		out:        io.Discard,
+		errOut:     io.Discard,
+		client:     local.Client(),
+		cmd:        commands,
+		azureStore: store,
+	}
+
+	if err := runner.run(context.Background(), []string{"az", "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(commands.runArgs, "\n")
+	for _, want := range []string{
+		`model="gpt-5.6-sol"`,
+		`model_providers.subrouter_azure.base_url="` + local.URL + `/azure/secondary/v1"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("Codex args missing %q:\n%s", want, joined)
+		}
+	}
+	for _, arg := range commands.runArgs {
+		if arg == "--model" || arg == "-m" || strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "-m=") {
+			t.Fatalf("launcher pinned Codex's model flag instead of leaving /model available: %#v", commands.runArgs)
+		}
+	}
+}
+
+func TestSRAzureCodexProfileOverrideDoesNotReachCodex(t *testing.T) {
+	store := azureopenai.Store{Path: filepath.Join(t.TempDir(), "azure-openai.json")}
+	for _, name := range []string{"primary", "secondary"} {
+		if _, err := store.Save(azureopenai.Profile{
+			Name:        name,
+			Endpoint:    "https://" + name + ".openai.azure.com",
+			Deployments: azureopenai.DefaultGPT56Deployments(),
+			AzureCLI:    "/opt/homebrew/bin/az",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := srRunner{azureStore: store}
+	profile, args, err := runner.azureCodexProfile([]string{"exec", "--azure-profile=secondary", "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Name != "secondary" {
+		t.Fatalf("profile = %q, want secondary", profile.Name)
+	}
+	if !reflect.DeepEqual(args, []string{"exec", "hello"}) {
+		t.Fatalf("Codex args = %#v, want exec hello", args)
+	}
+}
+
 func TestSRAzureCodexRejectsDeploymentOverride(t *testing.T) {
 	store := azureopenai.Store{Path: filepath.Join(t.TempDir(), "azure-openai.json")}
 	if _, err := store.Save(azureopenai.Profile{
@@ -294,11 +378,18 @@ func TestSRAzureCodexResolvesGPT56FamilyAndRewritesModelFlag(t *testing.T) {
 				t.Fatal(err)
 			}
 			joined := strings.Join(commands.runArgs, "\n")
-			if !strings.Contains(joined, `model="`+test.deployment+`"`) {
-				t.Fatalf("Codex args do not select %q:\n%s", test.deployment, joined)
+			canonicalModel, ok := azureopenai.CanonicalGPT56Model("")
+			if len(test.modelArgs) > 0 {
+				canonicalModel, ok = azureopenai.CanonicalGPT56Model(codexModelArg(test.modelArgs))
+			}
+			if !ok {
+				t.Fatalf("test model selector is not canonical: %#v", test.modelArgs)
+			}
+			if !strings.Contains(joined, `model="`+canonicalModel+`"`) {
+				t.Fatalf("Codex args do not retain canonical picker model %q:\n%s", canonicalModel, joined)
 			}
 			for _, arg := range commands.runArgs {
-				if arg == "gpt-5.6" || arg == "terra" || arg == "gpt-5.6-luna" || arg == "--model=terra" {
+				if arg == test.deployment || arg == "gpt-5.6" || arg == "terra" || arg == "--model=terra" {
 					t.Fatalf("unresolved model selector reached Codex: %#v", commands.runArgs)
 				}
 			}

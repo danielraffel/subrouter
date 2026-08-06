@@ -33,12 +33,12 @@ brew install azure-cli
 az login
 sr azure add work \
   --endpoint https://RESOURCE.cognitiveservices.azure.com
-sr azure codex work --model sol
-sr az codex work --model terra
-sr az codex work --model luna exec "your prompt"
+sr az codex
 ```
 
-`sr azure` is the canonical command and `sr az` is its short alias. `sol` is the default when `--model` is omitted. The selectors `sol`, `terra`, and `luna` map to `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; `gpt-5.6` is an alias for Sol. Full model names also work.
+`sr azure` is the canonical command and `sr az` is its short alias. The first saved Azure profile becomes the default, so `sr az codex` launches directly. Use `/model` inside Codex to switch among Sol, Terra, and Luna. Use `sr az default <profile>` to change the default, `sr az default` to print it, or `sr az codex --azure-profile <profile>` for one run. The original `sr az codex <profile>` form remains supported.
+
+Sol is the default model when `--model` is omitted. The selectors `sol`, `terra`, and `luna` map to `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; `gpt-5.6` is an alias for Sol. Full model names also work, including non-interactive runs such as `sr az codex --model luna exec "your prompt"`.
 
 By default, each Azure deployment has the same name as its model. Override custom Azure deployment names by repeating the flag during setup:
 
@@ -50,7 +50,7 @@ sr azure add work \
   --deployment luna=production-luna
 ```
 
-The launcher resolves the selector to the configured Azure deployment before starting Codex. A legacy bare `--deployment DEPLOYMENT_NAME` remains supported as a single-deployment profile. `sr azure list` shows configured profiles, and `sr azure remove work` removes one.
+Codex keeps canonical GPT-5.6 model names and native picker metadata. Subrouter translates each request to the configured Azure deployment at the proxy boundary, including after an in-session `/model` change. A legacy bare `--deployment DEPLOYMENT_NAME` remains supported as a single-deployment profile. `sr azure list` marks the default profile with `*`, and `sr azure remove work` removes one.
 
 `sr azure add` validates the current Azure CLI session with `az account get-access-token`, stores the resolved CLI path plus non-secret profile metadata in `~/.subrouter/codex/azure-openai.json`, and restarts the local daemon. The daemon acquires tokens on demand, keeps them only in memory, and renews them before expiry. Run `az login` again when Azure CLI reports that the session or tenant access is invalid.
 

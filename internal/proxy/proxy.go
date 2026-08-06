@@ -2266,9 +2266,13 @@ func (s Server) proxyHandler() http.Handler {
 				return
 			}
 			if requestedModel := session.ExtractModel(r, s.MaxBodyBytes); requestedModel != "" {
-				deployment, allowed := profile.DeploymentForModel(requestedModel)
-				if !allowed || deployment != requestedModel {
+				_, deployment, allowed := profile.ResolveModel(requestedModel)
+				if !allowed {
 					http.Error(w, "Azure OpenAI model is not a configured deployment for this profile", http.StatusBadRequest)
+					return
+				}
+				if err := rewriteAzureOpenAIRequestModel(r, requestedModel, deployment, s.MaxBodyBytes); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
 					return
 				}
 			}
