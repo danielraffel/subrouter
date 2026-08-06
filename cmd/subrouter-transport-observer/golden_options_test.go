@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func TestGoldenOptionsRequireV0168Candidate(t *testing.T) {
+func TestGoldenOptionsRequireV0169Candidate(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
@@ -20,10 +20,11 @@ func TestGoldenOptionsRequireV0168Candidate(t *testing.T) {
 	args := []string{
 		"--predecessor-version", "v0.1.51",
 		"--predecessor-sha256", goldenPinnedPredecessorSHA256,
-		"--candidate-tag", "v0.1.68",
+		"--candidate-tag", "v0.1.69",
 		"--candidate-sha256", strings.Repeat("b", 64),
 		"--candidate-revision", strings.Repeat("c", 40),
 		"--deploy-evidence-validator", "validator",
+		"--account-id", "test@example.invalid",
 		"--stream-lines", "100",
 		"--migration-prepare", "true",
 		"--migration-switch", "true",
@@ -33,10 +34,10 @@ func TestGoldenOptionsRequireV0168Candidate(t *testing.T) {
 		"--old-generation-check", "true",
 	}
 	if _, err := parseGoldenArgs(args); err != nil {
-		t.Fatalf("v0.1.68 candidate was rejected: %v", err)
+		t.Fatalf("v0.1.69 candidate was rejected: %v", err)
 	}
 	for index := range args {
-		if args[index] == "v0.1.68" {
+		if args[index] == "v0.1.69" {
 			args[index] = "v0.1.63"
 			break
 		}
@@ -44,6 +45,52 @@ func TestGoldenOptionsRequireV0168Candidate(t *testing.T) {
 	if _, err := parseGoldenArgs(args); err == nil {
 		t.Fatal("bootstrap v0.1.63 candidate was accepted")
 	}
+}
+
+func TestGoldenOptionsPinSparkAndSelectedOAuthAccount(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = true
+	goldenTestHooks.evidenceValidator = "validator"
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	args := []string{
+		"--account-id", "test@example.invalid",
+		"--migration-prepare", "true",
+		"--migration-switch", "true",
+		"--legacy-retirement", "true",
+		"--activate", "true",
+		"--rollback", "true",
+		"--old-generation-check", "true",
+	}
+	options, err := parseGoldenArgs(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.model != "gpt-5.3-codex-spark" {
+		t.Fatalf("default model = %q, want gpt-5.3-codex-spark", options.model)
+	}
+	if options.streamLines != 400 {
+		t.Fatalf("default stream lines = %d, want 400", options.streamLines)
+	}
+	if options.accountID != "test@example.invalid" {
+		t.Fatalf("account ID = %q", options.accountID)
+	}
+
+	environment := goldenChildEnv(t.TempDir(), map[string]string{
+		"SUBROUTER_CODEX_ACCOUNT_ID": options.accountID,
+	})
+	if !containsGoldenEnvironment(environment, "SUBROUTER_CODEX_ACCOUNT_ID=test@example.invalid") {
+		t.Fatalf("golden child environment omitted the selected OAuth account: %v", environment)
+	}
+}
+
+func containsGoldenEnvironment(environment []string, expected string) bool {
+	for _, item := range environment {
+		if item == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGoldenGitHubJSONUsesLocalGitHubAuthentication(t *testing.T) {
