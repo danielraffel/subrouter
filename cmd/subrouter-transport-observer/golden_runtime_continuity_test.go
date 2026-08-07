@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -530,6 +531,49 @@ func TestGoldenLocalDaemonStderrIgnoresShutdownTimeoutConfiguration(t *testing.T
 	runner.consumeGoldenLocalDaemonStderr(strings.NewReader("upstream_request timeout=true\n"))
 	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_timeout" {
 		t.Fatalf("structured timeout failure = %q, want local_daemon_transport_issue_timeout", got)
+	}
+}
+
+func TestGoldenLocalDaemonStderrIgnoresStructuredRequestMetadata(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		"2026/08/07 10:04:57 INFO proxy request agent=codex session=fallback:0123456789abcdef user=\"\" account=account-timeout method=POST path=/responses upstream=example.test remote_addr=127.0.0.1:1234 user_agent=\"client msg=retry-client\"\n",
+	))
+	if err := runner.requireGoldenLocalDaemonTransportClean(); err != nil {
+		t.Fatalf("ordinary structured request metadata was treated as a transport failure: %v", err)
+	}
+	if evidence.Len() != 0 {
+		t.Fatalf("ordinary structured request metadata emitted issue evidence: %s", evidence.String())
+	}
+}
+
+func TestGoldenLocalDaemonStderrClassifiesMessagesAcrossFragmentedReads(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(iotest.OneByteReader(strings.NewReader(
+		"time=2026-08-07T10:04:57Z level=INFO msg=\"proxy request\" session=fallback:0123456789abcdef\n" +
+			"time=2026-08-07T10:04:58Z level=WARN msg=\"retrying replayable upstream request after transport failure\" session=ordinary\n",
+	)))
+	if runner.localIssues["fallback"] != 0 {
+		t.Fatalf("structured fallback metadata was classified: %+v", runner.localIssues)
+	}
+	if runner.localIssues["retry"] != 1 || runner.localIssues["error"] != 1 {
+		t.Fatalf("transport message categories = %+v, want one retry and one error", runner.localIssues)
+	}
+}
+
+func TestGoldenLocalDaemonStderrRejectsOversizedRecord(t *testing.T) {
+	var evidence bytes.Buffer
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: &evidence}}
+	runner.consumeGoldenLocalDaemonStderr(strings.NewReader(
+		strings.Repeat("x", goldenLocalDaemonMaxLogRecordBytes+1),
+	))
+	if got := fixedGoldenFailure(runner.requireGoldenLocalDaemonTransportClean()); got != "local_daemon_transport_issue_error" {
+		t.Fatalf("oversized record failure = %q, want local_daemon_transport_issue_error", got)
+	}
+	if strings.Contains(evidence.String(), strings.Repeat("x", 32)) {
+		t.Fatal("oversized record contents leaked into evidence")
 	}
 }
 
