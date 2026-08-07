@@ -65,6 +65,41 @@ func TestSRAutoSwitchPicksBestOAuthAccount(t *testing.T) {
 	}
 }
 
+func TestSRAutoSwitchIgnoresClaudeAccountWithSameID(t *testing.T) {
+	var switchedTo string
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+		Accounts: []accounts.Account{
+			{ID: "shared@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+			{ID: "shared@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		},
+		FetchScores: func(_ context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+			if len(candidates) != 2 {
+				t.Fatalf("candidates = %#v, want only two Codex accounts", candidates)
+			}
+			for _, candidate := range candidates {
+				if candidate.Provider != accounts.ProviderCodex {
+					t.Fatalf("auto-switch scored non-Codex account: %#v", candidate)
+				}
+			}
+			return []selectacct.Score{
+				{AccountID: "shared@example.com", Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+				{AccountID: "healthy@example.com", Provider: accounts.ProviderCodex, Headroom: 0.30, ShortHeadroom: 0.30},
+			}, 2
+		},
+		SwitchActive: func(_ context.Context, accountID string) error {
+			switchedTo = accountID
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked != "healthy@example.com" || switchedTo != "healthy@example.com" {
+		t.Fatalf("picked=%q switchedTo=%q, want healthy@example.com", picked, switchedTo)
+	}
+}
+
 func TestSRAutoSwitchUsesLiveAccountsFunc(t *testing.T) {
 	var switchedTo string
 	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
