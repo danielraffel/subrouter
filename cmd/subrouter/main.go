@@ -627,8 +627,10 @@ func serve(args []string) error {
 	if transcriptGCSSyncer.Enabled() {
 		go transcriptGCSSyncer.Run(context.Background())
 	}
+	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
+	defer stopActiveGenerationTasks()
 	if srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil {
-		go runSRAutoSwitch(context.Background(), srAutoSwitchConfig{
+		go runSRAutoSwitch(activeGenerationCtx, srAutoSwitchConfig{
 			Interval:             srSwitchInterval,
 			AccountsSnapshotFunc: accountRef.Snapshot,
 			Sessions:             store,
@@ -709,7 +711,7 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default())
+	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
 }
 
 func validatePublicSubrouterURL(raw string) error {
@@ -943,7 +945,7 @@ func numericAWSProfileSuffix(name string) (int, bool) {
 // Retired generations still drain once their load-balancer connections expire.
 const workerIdleTimeout = 620 * time.Second
 
-func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger) error {
+func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, stopActiveGenerationTasks ...func()) error {
 	errCh := make(chan error, 1)
 	go func() {
 		err := listenAndServeHTTP(server, logger)
@@ -974,7 +976,7 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 				// response carry "Connection: close", so each client finishes
 				// its current request and reconnects onto the new generation.
 				// In-flight requests and streams are unaffected.
-				retireServer(server, logger)
+				retireServer(server, logger, stopActiveGenerationTasks...)
 				continue
 			}
 			return shutdownOnSignal(server, lifecycle, sig, shutdownTimeout, logger, errCh)
@@ -983,7 +985,12 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 }
 
 // retireServer stops connection reuse without interrupting anything in flight.
-func retireServer(server *http.Server, logger *slog.Logger) {
+func retireServer(server *http.Server, logger *slog.Logger, stopActiveGenerationTasks ...func()) {
+	for _, stop := range stopActiveGenerationTasks {
+		if stop != nil {
+			stop()
+		}
+	}
 	server.SetKeepAlivesEnabled(false)
 	if logger != nil {
 		logger.Info("subrouter worker retired; closing idle connections and asking clients to reconnect")
