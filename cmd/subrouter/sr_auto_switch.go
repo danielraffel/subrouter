@@ -102,7 +102,7 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	} else if cfg.AccountsFunc != nil {
 		allAccounts = cfg.AccountsFunc()
 	}
-	candidates := oauthAccounts(allAccounts)
+	candidates := codexOAuthAccounts(allAccounts)
 	if len(candidates) == 0 {
 		return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
 	}
@@ -138,10 +138,11 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	return picked.ID, nil
 }
 
-func oauthAccounts(all []accounts.Account) []accounts.Account {
+func codexOAuthAccounts(all []accounts.Account) []accounts.Account {
 	out := make([]accounts.Account, 0, len(all))
 	for _, account := range all {
-		if account.AuthMode == accounts.AuthModeOAuth {
+		if account.AuthMode == accounts.AuthModeOAuth &&
+			(account.Provider == "" || account.Provider == accounts.ProviderCodex) {
 			out = append(out, account)
 		}
 	}
