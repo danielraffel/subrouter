@@ -3187,6 +3187,12 @@ func (w *lazyWebSocketWriter) Write(p []byte) (int, error) {
 	if w.discarded {
 		return len(p), nil
 	}
+	if w.gateUnavailable {
+		if w.writer == nil {
+			return 0, io.ErrClosedPipe
+		}
+		return w.writer.Write(p)
+	}
 	if w.writer == nil {
 		if len(w.pending)+len(p) > w.limit {
 			w.pending = nil
@@ -3217,15 +3223,20 @@ func (w *lazyWebSocketWriter) commit() error {
 	}
 	writer, err := w.open()
 	if err != nil {
+		w.pending = nil
+		w.releasePending()
+		w.discarded = true
 		return err
 	}
 	w.writer = writer
 	if len(w.pending) == 0 {
+		w.releasePending()
 		return nil
 	}
-	_, err = w.writer.Write(w.pending)
+	pending := w.pending
 	w.pending = nil
 	w.releasePending()
+	_, err = w.writer.Write(pending)
 	return err
 }
 
@@ -5340,7 +5351,7 @@ func readUntilSSEEvent(body io.Reader, maxBytes int, deadline time.Time) ([]byte
 	if maxBytes <= 0 {
 		return nil, nil
 	}
-	prefix := make([]byte, 0, minInt(maxBytes, 32<<10))
+	prefix := make([]byte, 0, min(maxBytes, 32<<10))
 	buffer := make([]byte, 32<<10)
 	for len(prefix) < maxBytes {
 		remaining := maxBytes - len(prefix)
@@ -5355,7 +5366,7 @@ func readUntilSSEEvent(body io.Reader, maxBytes int, deadline time.Time) ([]byte
 			}
 		}
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return prefix, nil
 			}
 			return prefix, err
@@ -5545,13 +5556,6 @@ func sseMetadataEvent(event []byte) bool {
 		}
 	}
 	return true
-}
-
-func minInt(left, right int) int {
-	if left < right {
-		return left
-	}
-	return right
 }
 
 func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {

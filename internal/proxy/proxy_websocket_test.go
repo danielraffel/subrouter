@@ -2292,7 +2292,7 @@ func TestHandlerPreservesResponseBodyBytes(t *testing.T) {
 	}
 }
 
-func TestHandlerMarksCodexHTTP200StreamingUsageLimitForNextTurn(t *testing.T) {
+func TestHandlerFailsOverCodexHTTP200StreamingUsageLimitAcrossTurns(t *testing.T) {
 	var mu sync.Mutex
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3674,6 +3674,8 @@ func TestHandlerMarksWebSocketUsageLimitAccountExhausted(t *testing.T) {
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{
 			{ID: "empty@example.com", AuthMode: accounts.AuthModeOAuth, Token: "empty-token"},
+			// Keep this fallback as an API key so this test asserts that the
+			// quota frame remains visible when no OAuth retry is available.
 			{ID: "healthy@example.com", AuthMode: accounts.AuthModeAPIKey, Token: "healthy-token"},
 		},
 		Sessions:     store,
@@ -3800,12 +3802,13 @@ func TestHandlerRetriesCodexWebSocketUsageLimitOnAlternateOAuthAccount(t *testin
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
 	request := []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol","input":[]}}`)
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
 		"X-Subrouter-Session": []string{baseSession + ":0"},
 	})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
+	defer response.Body.Close()
 	if err := conn.WriteMessage(websocket.TextMessage, request); err != nil {
 		t.Fatalf("write create: %v", err)
 	}
@@ -3819,12 +3822,13 @@ func TestHandlerRetriesCodexWebSocketUsageLimitOnAlternateOAuthAccount(t *testin
 	}
 	_ = conn.Close()
 
-	retryConn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+	retryConn, retryResponse, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
 		"X-Subrouter-Session": []string{baseSession + ":1"},
 	})
 	if err != nil {
 		t.Fatalf("retry dial: %v", err)
 	}
+	defer retryResponse.Body.Close()
 	defer retryConn.Close()
 	if err := retryConn.WriteMessage(websocket.TextMessage, request); err != nil {
 		t.Fatalf("retry create: %v", err)
