@@ -3188,7 +3188,9 @@ func (w *lazyWebSocketWriter) Write(p []byte) (int, error) {
 	}
 	if w.writer == nil {
 		if len(w.pending)+len(p) > w.limit {
+			w.pending = nil
 			w.releasePending()
+			w.discarded = true
 			return 0, websocket.ErrReadLimit
 		}
 		if !webSocketInspectBudget.tryReserve(int64(len(p))) {
