@@ -3175,6 +3175,7 @@ type lazyWebSocketWriter struct {
 	limit           int
 	candidate       bool
 	discarded       bool
+	retrySuppressed bool
 	gateUnavailable bool
 }
 
@@ -3233,6 +3234,7 @@ func (w *lazyWebSocketWriter) suppress() {
 		w.pending = nil
 		w.releasePending()
 		w.discarded = true
+		w.retrySuppressed = true
 	}
 }
 
@@ -3241,7 +3243,7 @@ func (w *lazyWebSocketWriter) canSuppress() bool {
 }
 
 func (w *lazyWebSocketWriter) suppressed() bool {
-	return w.discarded
+	return w.retrySuppressed
 }
 
 func (w *lazyWebSocketWriter) usageCandidate() bool {
