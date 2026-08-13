@@ -2892,20 +2892,14 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	go func() {
 		defer wg.Done()
 		s.copyWebSocketMessages(wsCtx, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "client_to_upstream", clientConn, upstreamConn, nil, false, &failoverRequested)
-		if failoverRequested.Load() {
-			closeConnections()
-			return
-		}
-		_ = upstreamConn.Close()
+		// forwardWebSocketClose uses WriteControl synchronously, so the close
+		// frame is on the wire before this coordinated socket shutdown.
+		closeConnections()
 	}()
 	go func() {
 		defer wg.Done()
 		s.copyWebSocketMessages(wsCtx, agentType, sessionID, userEmail, account.ID, poolModel, modelState, "upstream_to_client", upstreamConn, clientConn, reportLeaseFailure, rerouteUsageLimit, &failoverRequested)
-		if failoverRequested.Load() {
-			closeConnections()
-			return
-		}
-		_ = clientConn.Close()
+		closeConnections()
 	}()
 	wg.Wait()
 	if credentialLease != nil &&
@@ -3078,7 +3072,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, agentType, sessionID,
 		}
 	}
 	for {
-		_, err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage, direction == "upstream_to_client" && rerouteUsageLimit)
+		suppressed, err := s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, dst, observeMessage, direction == "upstream_to_client" && rerouteUsageLimit)
+		if suppressed {
+			return
+		}
 		if err != nil {
 			if failoverRequested.Load() {
 				return
@@ -3171,12 +3168,14 @@ func (s Server) forwardWebSocketMessage(ctx context.Context, agentType, sessionI
 // frames are discrete JSON events, so classifying the complete bounded frame
 // avoids leaking a prefix when the quota marker is split across read chunks.
 type lazyWebSocketWriter struct {
-	open      func() (io.WriteCloser, error)
-	writer    io.WriteCloser
-	pending   []byte
-	limit     int
-	candidate bool
-	discarded bool
+	open            func() (io.WriteCloser, error)
+	writer          io.WriteCloser
+	pending         []byte
+	reserved        int64
+	limit           int
+	candidate       bool
+	discarded       bool
+	gateUnavailable bool
 }
 
 func newLazyWebSocketWriter(open func() (io.WriteCloser, error), limit int) *lazyWebSocketWriter {
@@ -3189,11 +3188,21 @@ func (w *lazyWebSocketWriter) Write(p []byte) (int, error) {
 	}
 	if w.writer == nil {
 		if len(w.pending)+len(p) > w.limit {
-			w.pending = nil
-			w.discarded = true
+			w.releasePending()
 			return 0, websocket.ErrReadLimit
 		}
+		if !webSocketInspectBudget.tryReserve(int64(len(p))) {
+			w.gateUnavailable = true
+			if err := w.commit(); err != nil {
+				return 0, err
+			}
+			if w.writer == nil {
+				return 0, io.ErrClosedPipe
+			}
+			return w.writer.Write(p)
+		}
 		w.pending = append(w.pending, p...)
+		w.reserved += int64(len(p))
 		return len(p), nil
 	}
 	return w.writer.Write(p)
@@ -3213,18 +3222,20 @@ func (w *lazyWebSocketWriter) commit() error {
 	}
 	_, err = w.writer.Write(w.pending)
 	w.pending = nil
+	w.releasePending()
 	return err
 }
 
 func (w *lazyWebSocketWriter) suppress() {
 	if w.writer == nil {
 		w.pending = nil
+		w.releasePending()
 		w.discarded = true
 	}
 }
 
 func (w *lazyWebSocketWriter) canSuppress() bool {
-	return w != nil && w.writer == nil && !w.discarded
+	return w != nil && w.writer == nil && !w.discarded && !w.gateUnavailable
 }
 
 func (w *lazyWebSocketWriter) suppressed() bool {
@@ -3240,6 +3251,7 @@ func (w *lazyWebSocketWriter) usageCandidate() bool {
 
 func (w *lazyWebSocketWriter) Close() error {
 	if w.discarded {
+		w.releasePending()
 		return nil
 	}
 	if err := w.commit(); err != nil {
@@ -3251,6 +3263,14 @@ func (w *lazyWebSocketWriter) Close() error {
 	err := w.writer.Close()
 	w.writer = nil
 	return err
+}
+
+func (w *lazyWebSocketWriter) releasePending() {
+	if w.reserved == 0 {
+		return
+	}
+	webSocketInspectBudget.release(w.reserved)
+	w.reserved = 0
 }
 
 func streamWebSocketMessage(
@@ -5264,7 +5284,12 @@ func claudeRateLimitHeaderFields(header http.Header) []any {
 	return fields
 }
 
-const codexInitialSSEInspectBytes = 256 << 10
+const (
+	codexInitialSSEInspectBytes   = 256 << 10
+	codexInitialSSEInspectTimeout = 500 * time.Millisecond
+)
+
+var errCodexInitialSSEInspectTimeout = errors.New("codex initial SSE inspection timed out")
 
 func (t usageLimitRetryTransport) shouldInspectInitialCodexSSE(response *http.Response, authMode accounts.AuthMode) bool {
 	if !t.codexOAuth || authMode != accounts.AuthModeOAuth ||
@@ -5288,11 +5313,17 @@ func responseInitialCodexUsageLimit(response *http.Response) (bool, error) {
 	if response == nil || response.Body == nil {
 		return false, nil
 	}
-	body := response.Body
-	prefix, readErr := readUntilSSEEvent(body, codexInitialSSEInspectBytes)
+	body := newTimedPrefetchBody(response.Body)
+	prefix, readErr := readUntilSSEEvent(body, codexInitialSSEInspectBytes, time.Now().Add(codexInitialSSEInspectTimeout))
 	response.Body = prefixReadCloser{
 		Reader: io.MultiReader(bytes.NewReader(prefix), body),
 		Closer: body,
+	}
+	if errors.Is(readErr, errCodexInitialSSEInspectTimeout) {
+		// The provider has not produced a classifiable initial event within
+		// the bounded gate. Return the live stream rather than delaying headers
+		// indefinitely; the passive observer still marks a later quota event.
+		return false, nil
 	}
 	if readErr != nil {
 		return false, readErr
@@ -5301,7 +5332,7 @@ func responseInitialCodexUsageLimit(response *http.Response) (bool, error) {
 	return limited, nil
 }
 
-func readUntilSSEEvent(body io.Reader, maxBytes int) ([]byte, error) {
+func readUntilSSEEvent(body io.Reader, maxBytes int, deadline time.Time) ([]byte, error) {
 	if maxBytes <= 0 {
 		return nil, nil
 	}
@@ -5312,7 +5343,7 @@ func readUntilSSEEvent(body io.Reader, maxBytes int) ([]byte, error) {
 		if remaining < len(buffer) {
 			buffer = buffer[:remaining]
 		}
-		n, err := body.Read(buffer)
+		n, err := readWithDeadline(body, buffer, deadline)
 		if n > 0 {
 			prefix = append(prefix, buffer[:n]...)
 			if _, decided := initialSSEUsageDecision(prefix); decided {
@@ -5327,6 +5358,127 @@ func readUntilSSEEvent(body io.Reader, maxBytes int) ([]byte, error) {
 		}
 	}
 	return prefix, nil
+}
+
+func readWithDeadline(body io.Reader, buffer []byte, deadline time.Time) (int, error) {
+	if timed, ok := body.(interface {
+		readUntil(time.Time, []byte) (int, error)
+	}); ok {
+		return timed.readUntil(deadline, buffer)
+	}
+	return body.Read(buffer)
+}
+
+type timedPrefetchResult struct {
+	data []byte
+	err  error
+}
+
+// timedPrefetchBody owns the only reader of the upstream response while the
+// initial SSE gate is deciding whether a request can be replayed. If the gate
+// times out, the same body continues from the queued bytes without a second
+// goroutine reading the provider stream concurrently.
+type timedPrefetchBody struct {
+	source    io.ReadCloser
+	results   chan timedPrefetchResult
+	done      chan struct{}
+	closeOnce sync.Once
+	pending   []byte
+	terminal  error
+}
+
+func newTimedPrefetchBody(source io.ReadCloser) *timedPrefetchBody {
+	body := &timedPrefetchBody{
+		source:  source,
+		results: make(chan timedPrefetchResult, 2),
+		done:    make(chan struct{}),
+	}
+	go body.produce()
+	return body
+}
+
+func (b *timedPrefetchBody) produce() {
+	buffer := make([]byte, 32<<10)
+	for {
+		n, err := b.source.Read(buffer)
+		if n > 0 {
+			data := append([]byte(nil), buffer[:n]...)
+			select {
+			case b.results <- timedPrefetchResult{data: data}:
+			case <-b.done:
+				return
+			}
+		}
+		if err != nil {
+			select {
+			case b.results <- timedPrefetchResult{err: err}:
+			case <-b.done:
+			}
+			return
+		}
+	}
+}
+
+func (b *timedPrefetchBody) Read(p []byte) (int, error) {
+	return b.readUntil(time.Time{}, p)
+}
+
+func (b *timedPrefetchBody) readUntil(deadline time.Time, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(b.pending) > 0 {
+		n := copy(p, b.pending)
+		b.pending = b.pending[n:]
+		return n, nil
+	}
+	if b.terminal != nil {
+		return 0, b.terminal
+	}
+	var timer *time.Timer
+	if !deadline.IsZero() {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return 0, errCodexInitialSSEInspectTimeout
+		}
+		timer = time.NewTimer(wait)
+		defer timer.Stop()
+	}
+	select {
+	case result := <-b.results:
+		if len(result.data) > 0 {
+			n := copy(p, result.data)
+			if n < len(result.data) {
+				b.pending = append(b.pending, result.data[n:]...)
+			}
+			if result.err != nil {
+				b.terminal = result.err
+			}
+			return n, nil
+		}
+		b.terminal = result.err
+		return 0, result.err
+	case <-b.done:
+		return 0, io.ErrClosedPipe
+	case <-timerChannel(timer):
+		return 0, errCodexInitialSSEInspectTimeout
+	}
+}
+
+func timerChannel(timer *time.Timer) <-chan time.Time {
+	if timer == nil {
+		return nil
+	}
+	return timer.C
+}
+
+func (b *timedPrefetchBody) Close() error {
+	var err error
+	b.closeOnce.Do(func() {
+		close(b.done)
+		err = b.source.Close()
+	})
+	return err
 }
 
 func initialSSEUsageDecision(body []byte) (bool, bool) {
