@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 var headerCandidates = []string{
@@ -28,6 +31,12 @@ var headerCandidates = []string{
 	"OpenAI-Conversation-ID",
 	"Anthropic-Conversation-ID",
 	"Google-Conversation-ID",
+	// Codex sends bare session-id/thread-id on every responses request and on
+	// the websocket upgrade. They come last so the existing window-scoped
+	// headers keep priority, but they keep session identity working if the
+	// x-codex-* compatibility headers ever go away.
+	"Session-Id",
+	"Thread-Id",
 	"Idempotency-Key",
 }
 
@@ -217,22 +226,11 @@ func extractJSONModel(r *http.Request, maxBodyBytes int64) string {
 }
 
 func extractJSONValue(r *http.Request, maxBodyBytes int64) any {
-	if r.Body == nil || maxBodyBytes <= 0 {
-		return nil
-	}
 	if r.ContentLength < 0 || r.ContentLength > maxBodyBytes {
 		return nil
 	}
-	if contentType := r.Header.Get("Content-Type"); !strings.Contains(contentType, "json") {
-		return nil
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
-	if err != nil {
-		return nil
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	if int64(len(body)) > maxBodyBytes {
+	body, truncated := readDecodedJSONBody(r, maxBodyBytes)
+	if body == nil || truncated {
 		return nil
 	}
 
@@ -242,6 +240,75 @@ func extractJSONValue(r *http.Request, maxBodyBytes int64) any {
 	}
 	return value
 }
+
+// readDecodedJSONBody reads at most maxWireBytes of the request body, restores
+// the body for the proxy, and returns it decoded per Content-Encoding. Codex
+// sends `content-encoding: zstd` on every responses request, so without this
+// step every body inspection here sees compressed bytes and silently finds
+// neither the session id nor the model. truncated reports that the decoded body
+// was cut short, so callers that need a complete JSON document give up while
+// prefix scanners can still use what came back.
+func readDecodedJSONBody(r *http.Request, maxWireBytes int64) (body []byte, truncated bool) {
+	if r == nil || r.Body == nil || maxWireBytes <= 0 {
+		return nil, false
+	}
+	if contentType := r.Header.Get("Content-Type"); !strings.Contains(contentType, "json") {
+		return nil, false
+	}
+	wire, err := io.ReadAll(io.LimitReader(r.Body, maxWireBytes+1))
+	if err != nil {
+		return nil, false
+	}
+	// Anything past the read limit stays on the original body so the proxied
+	// request is still byte-identical upstream.
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{Reader: io.MultiReader(bytes.NewReader(wire), r.Body), Closer: r.Body}
+	if int64(len(wire)) > maxWireBytes {
+		return wire[:maxWireBytes], true
+	}
+	return decodeRequestBody(wire, r.Header.Get("Content-Encoding"))
+}
+
+func decodeRequestBody(wire []byte, contentEncoding string) (body []byte, truncated bool) {
+	switch strings.ToLower(strings.TrimSpace(contentEncoding)) {
+	case "", "identity":
+		return wire, false
+	case "zstd":
+		decoder, err := zstd.NewReader(bytes.NewReader(wire), zstd.WithDecoderMaxMemory(uint64(decodedBodyMaxBytes)))
+		if err != nil {
+			return nil, false
+		}
+		defer decoder.Close()
+		return readDecodedLimit(decoder)
+	case "gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(wire))
+		if err != nil {
+			return nil, false
+		}
+		defer reader.Close()
+		return readDecodedLimit(reader)
+	default:
+		return nil, false
+	}
+}
+
+func readDecodedLimit(reader io.Reader) (body []byte, truncated bool) {
+	decoded, err := io.ReadAll(io.LimitReader(reader, decodedBodyMaxBytes+1))
+	if err != nil && int64(len(decoded)) <= decodedBodyMaxBytes {
+		return nil, false
+	}
+	if int64(len(decoded)) > decodedBodyMaxBytes {
+		return decoded[:decodedBodyMaxBytes], true
+	}
+	return decoded, false
+}
+
+// decodedBodyMaxBytes bounds how much decompressed request body is held in
+// memory per inspection. A compressed body well under the wire limit can expand
+// far past it, so the decoded size needs its own ceiling.
+const decodedBodyMaxBytes = int64(16 << 20)
 
 func findJSONID(value any) string {
 	switch typed := value.(type) {
@@ -304,11 +371,10 @@ func extractJSONModelScan(r *http.Request, maxBodyBytes int64) string {
 	if limit < modelScanMaxBodyBytes {
 		limit = modelScanMaxBodyBytes
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, limit))
-	if err != nil {
+	body, _ := readDecodedJSONBody(r, limit)
+	if body == nil {
 		return ""
 	}
-	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
 	match := jsonModelFieldPattern.FindSubmatch(body)
 	if len(match) != 2 {
 		return ""

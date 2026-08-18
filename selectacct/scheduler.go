@@ -35,6 +35,15 @@ type Scheduler struct {
 
 const MinNewSessionHeadroom = 0.40
 
+// MinStickyRetentionHeadroom is the headroom an account must still have for an
+// idle session to stay on it. It sits far below MinNewSessionHeadroom on
+// purpose. Placing a NEW session on an account needs room for a whole
+// conversation, but a session that is already running built the upstream
+// prompt cache on that account, and the cache is per account: moving the
+// session re-bills its entire conversation prefix as uncached input. Holding
+// the session until its account is nearly empty costs less than moving it.
+const MinStickyRetentionHeadroom = 0.05
+
 // ScoreKey is the scheduler's identity for an account. A Codex account's ID is
 // its bare email and a Claude account's ID is its profile name, which can also
 // be an email, so the same string routinely identifies one account per
@@ -160,6 +169,13 @@ func (s Scheduler) UsableForNewSession(provider account.Provider, accountID stri
 	return s.score(provider, accountID).usableForNewSession()
 }
 
+// UsableForStickySession reports whether an account still has enough headroom
+// to keep serving a session already assigned to it. Callers placing a fresh
+// session use UsableForNewSession instead.
+func (s Scheduler) UsableForStickySession(provider account.Provider, accountID string) bool {
+	return s.score(provider, accountID).usableForStickySession()
+}
+
 func (s Scheduler) Exhausted(provider account.Provider, accountID string) bool {
 	return s.score(provider, accountID).exhausted()
 }
@@ -227,6 +243,10 @@ func (s Scheduler) score(provider account.Provider, accountID string) Score {
 
 func (s Score) usableForNewSession() bool {
 	return s.Headroom >= MinNewSessionHeadroom && s.ShortHeadroom >= MinNewSessionHeadroom
+}
+
+func (s Score) usableForStickySession() bool {
+	return s.Headroom >= MinStickyRetentionHeadroom && s.ShortHeadroom >= MinStickyRetentionHeadroom
 }
 
 func (s Score) exhausted() bool {

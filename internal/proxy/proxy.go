@@ -4198,6 +4198,13 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if options.oauthOnly {
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
+	// The upstream prompt cache is per account, so moving a session to another
+	// account re-bills its whole conversation prefix as uncached input. Record
+	// where the session was before any branch can reassign it.
+	previousAccountID := ""
+	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
+		previousAccountID = assignment.AccountID
+	}
 	if forcedAccountID != "" {
 		account, ok := findAccount(availableAccounts, forcedAccountID)
 		if !ok {
@@ -4206,6 +4213,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if provider == accounts.ProviderCodex && chatGPTBackendPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q cannot be used for ChatGPT backend paths", forcedAccountID)
 		}
+		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, nil)
 		assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
@@ -4257,6 +4265,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					"account", account.ID,
 					"active", s.activeSession(agentType, sessionID),
 					"usable_for_new_session", scheduler.UsableForNewSession(account.Provider, account.ID),
+					"usable_for_sticky_session", scheduler.UsableForStickySession(account.Provider, account.ID),
 					"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 				)
 			}
@@ -4286,11 +4295,38 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 			"threshold", selectacct.MinNewSessionHeadroom)
 	}
+	s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, &scheduler)
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
 		return accounts.Account{}, sessionID, userEmail, err
 	}
 	return account, sessionID, assignment.UserEmail, nil
+}
+
+// logAccountMove records that a session left the account holding its upstream
+// prompt cache. scheduler is nil when the caller forced the account and no
+// routing scores were consulted.
+func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAccountID string, provider accounts.Provider, scheduler *selectacct.Scheduler) {
+	if s.Logger == nil || fromAccountID == "" || fromAccountID == toAccountID {
+		return
+	}
+	fields := []any{
+		"agent", agentType,
+		"session", sessionID,
+		"model", model,
+		"from_account", fromAccountID,
+		"to_account", toAccountID,
+	}
+	if scheduler == nil {
+		fields = append(fields, "forced", true)
+	} else {
+		fields = append(fields,
+			"from_exhausted", scheduler.Exhausted(provider, fromAccountID),
+			"from_usable_for_sticky_session", scheduler.UsableForStickySession(provider, fromAccountID),
+			"retention_threshold", selectacct.MinStickyRetentionHeadroom,
+		)
+	}
+	s.Logger.Warn("session moved to another account; upstream prompt cache is cold", fields...)
 }
 
 func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) {
@@ -4317,7 +4353,12 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 		return true
 	}
 	if accountProviderOrCodex(account) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
-		return scheduler.UsableForNewSession(account.Provider, account.ID)
+		// Retention, not placement: this session already built the upstream
+		// prompt cache on this account. Gating it on the new-session threshold
+		// moved every idle session off any account past 60% used, which in a
+		// busy pool is all of them, so stickiness stopped existing exactly
+		// when the pool could least afford re-billing whole prefixes.
+		return scheduler.UsableForStickySession(account.Provider, account.ID)
 	}
 	return true
 }
