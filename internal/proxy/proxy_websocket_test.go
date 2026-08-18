@@ -2932,7 +2932,7 @@ func TestHandlerReroutesStickySessionWhenAssignedAccountExhausted(t *testing.T) 
 	}
 }
 
-func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowHeadroom(t *testing.T) {
+func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowRetentionHeadroom(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))
@@ -2959,7 +2959,7 @@ func TestHandlerReroutesColdStickySessionWhenAssignedAccountBelowHeadroom(t *tes
 		},
 		Sessions: store,
 		Scheduler: selectacct.NewScheduler([]selectacct.Score{
-			{AccountID: "low@example.com", Headroom: 0.10, ShortHeadroom: 0.10},
+			{AccountID: "low@example.com", Headroom: 0.02, ShortHeadroom: 0.02},
 			{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
 		}),
 		MaxBodyBytes: 1024,
@@ -3060,7 +3060,7 @@ func TestHandlerRoutesSparkModelUsingSparkQuota(t *testing.T) {
 	}
 }
 
-func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowHeadroom(t *testing.T) {
+func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowRetentionHeadroom(t *testing.T) {
 	var mu sync.Mutex
 	var auths []string
 	firstStarted := make(chan struct{})
@@ -3146,7 +3146,7 @@ func TestHandlerKeepsActiveStickySessionWhenAssignedAccountBelowHeadroom(t *test
 	}
 
 	schedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "low@example.com", Headroom: 0.10, ShortHeadroom: 0.10},
+		{AccountID: "low@example.com", Headroom: 0.02, ShortHeadroom: 0.02},
 		{AccountID: "healthy@example.com", Headroom: 0.90, ShortHeadroom: 0.90},
 	}))
 

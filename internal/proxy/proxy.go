@@ -4258,6 +4258,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					"account", account.ID,
 					"active", s.activeSession(agentType, sessionID),
 					"usable_for_new_session", scheduler.UsableForNewSession(account.Provider, account.ID),
+					"usable_for_sticky_session", scheduler.UsableForStickySession(account.Provider, account.ID),
 					"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 				)
 			}
@@ -4330,7 +4331,12 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 		return true
 	}
 	if accountProviderOrCodex(account) == accounts.ProviderCodex && account.AuthMode == accounts.AuthModeOAuth {
-		return scheduler.UsableForNewSession(account.Provider, account.ID)
+		// Retention, not placement: this session already built the upstream
+		// prompt cache on this account. Gating it on the new-session threshold
+		// moved every idle session off any account past 60% used, which in a
+		// busy pool is all of them, so stickiness stopped existing exactly
+		// when the pool could least afford re-billing whole prefixes.
+		return scheduler.UsableForStickySession(account.Provider, account.ID)
 	}
 	return true
 }
