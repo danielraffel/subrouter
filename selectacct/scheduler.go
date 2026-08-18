@@ -172,8 +172,12 @@ func (s Scheduler) UsableForNewSession(provider account.Provider, accountID stri
 // UsableForStickySession reports whether an account still has enough headroom
 // to keep serving a session already assigned to it. Callers placing a fresh
 // session use UsableForNewSession instead.
+// Retention reads the measured score, not the live-debited one. The debit
+// floors headroom at 0.01, so on any busy account it sits below every
+// retention threshold and would evict the session the debit was only meant to
+// steer new picks away from.
 func (s Scheduler) UsableForStickySession(provider account.Provider, accountID string) bool {
-	return s.score(provider, accountID).usableForStickySession()
+	return s.measuredScore(provider, accountID).usableForStickySession()
 }
 
 func (s Scheduler) Exhausted(provider account.Provider, accountID string) bool {
@@ -217,13 +221,7 @@ func (s Scheduler) WithLiveDebits(debits map[string]int) Scheduler {
 }
 
 func (s Scheduler) score(provider account.Provider, accountID string) Score {
-	score, ok := s.scores[ScoreKey(provider, accountID)]
-	if !ok {
-		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
-	}
-	if s.sessionCounts != nil {
-		score.Sessions = s.sessionCounts[accountID]
-	}
+	score := s.measuredScore(provider, accountID)
 	if count := s.liveDebits[ScoreKey(provider, accountID)]; count > 0 {
 		// A soft, self-correcting signal: it reorders picks and can push an
 		// account below the new-session threshold, but never onto (or off of)
@@ -237,6 +235,21 @@ func (s Scheduler) score(provider account.Provider, accountID string) Score {
 		if score.ShortHeadroom > 0.01 {
 			score.ShortHeadroom = math.Max(0.01, score.ShortHeadroom-debit)
 		}
+	}
+	return score
+}
+
+// measuredScore is the score from the last usage refresh, with no live debit
+// applied. The debit is our own optimism about requests already in flight, not
+// evidence that an account is empty, so decisions that evict work rather than
+// merely reorder picks read this instead.
+func (s Scheduler) measuredScore(provider account.Provider, accountID string) Score {
+	score, ok := s.scores[ScoreKey(provider, accountID)]
+	if !ok {
+		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
+	}
+	if s.sessionCounts != nil {
+		score.Sessions = s.sessionCounts[accountID]
 	}
 	return score
 }
