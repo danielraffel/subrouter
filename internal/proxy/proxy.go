@@ -4229,7 +4229,13 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(s.Sessions.CountByAccount())
+	// The upstream prompt cache is per account, so moving a session to another
+	// account re-bills its whole conversation prefix as uncached input. Track
+	// where the session was so every move is visible, not just the reroute the
+	// scheduler makes deliberately.
+	previousAccountID := ""
 	if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
+		previousAccountID = assignment.AccountID
 		if userEmail != "" && userEmail != assignment.UserEmail {
 			updated, err := s.Sessions.Put(agentType, sessionID, assignment.AccountID, userEmail)
 			if err != nil {
@@ -4280,6 +4286,18 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			"account", account.ID,
 			"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 			"threshold", selectacct.MinNewSessionHeadroom)
+	}
+	if previousAccountID != "" && previousAccountID != account.ID && s.Logger != nil {
+		s.Logger.Warn("session moved to another account; upstream prompt cache is cold",
+			"agent", agentType,
+			"session", sessionID,
+			"model", model,
+			"from_account", previousAccountID,
+			"to_account", account.ID,
+			"from_exhausted", scheduler.Exhausted(provider, previousAccountID),
+			"from_usable_for_new_session", scheduler.UsableForNewSession(provider, previousAccountID),
+			"threshold", selectacct.MinNewSessionHeadroom,
+		)
 	}
 	assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
 	if err != nil {
