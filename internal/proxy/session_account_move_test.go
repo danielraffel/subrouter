@@ -185,3 +185,43 @@ func TestStickyCodexSessionLeavesNearlyEmptyAccount(t *testing.T) {
 		t.Fatalf("account move was not logged: %s", logs.String())
 	}
 }
+
+// A forced account header also moves the session off its cached account, so
+// the move must still be logged.
+func TestForcedAccountMoveIsLogged(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "cached@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "cached@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-cached"},
+			{ID: "forced@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-forced"},
+		},
+		Sessions:     store,
+		MaxBodyBytes: 1024,
+		Logger:       slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "codex")
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	req.Header.Set("X-Subrouter-Account-ID", "forced@example.com")
+	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.ID != "forced@example.com" {
+		t.Fatalf("account = %q, want the forced account", account.ID)
+	}
+	if !strings.Contains(logs.String(), "session moved to another account") ||
+		!strings.Contains(logs.String(), "forced=true") {
+		t.Fatalf("forced account move was not logged: %s", logs.String())
+	}
+}
