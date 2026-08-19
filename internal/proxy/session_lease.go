@@ -541,11 +541,10 @@ func (lease sessionLease) allowsRequest(r *http.Request) bool {
 		return codexResponsePath(r.URL.Path)
 	case accounts.ProviderClaude:
 		return r.URL.Path == "/v1/messages"
-	case accounts.ProviderKimi:
-		return r.URL.Path == "/kimi/v1/messages"
-	case accounts.ProviderZAI:
-		return r.URL.Path == "/zai/chat/completions"
 	default:
+		if entry, ok := keyedProviderFor(lease.Provider); ok {
+			return r.URL.Path == entry.LeasePath
+		}
 		return false
 	}
 }
@@ -854,18 +853,22 @@ func sessionLeaseProvider(providerValue, modelValue string) (accounts.Provider, 
 			switch {
 			case strings.HasPrefix(lowerModel, "claude-"):
 				providerName = "claude"
-			case strings.HasPrefix(lowerModel, "kimi-"):
-				providerName = "kimi"
-			case strings.HasPrefix(lowerModel, "glm-"):
-				providerName = "zai"
 			default:
 				providerName = "codex"
+				if entry, ok := keyedProviderForModelPrefix(lowerModel); ok {
+					providerName = string(entry.Provider)
+				}
 			}
 		}
 	}
 	provider, err := parseSessionLeaseProvider(providerName)
 	if err != nil {
 		return "", "", err
+	}
+	// A provider that addresses models as vendor/model owns the whole id: the
+	// segment before the slash belongs to the model, not to a provider name.
+	if entry, ok := keyedProviderFor(provider); ok && entry.VendorPrefixedModels {
+		return provider, model, nil
 	}
 	if modelProvider, modelID, hasProvider := strings.Cut(model, "/"); hasProvider {
 		if modelProviderValue, modelProviderErr := parseSessionLeaseProvider(strings.ToLower(strings.TrimSpace(modelProvider))); modelProviderErr == nil {
@@ -884,11 +887,10 @@ func parseSessionLeaseProvider(providerName string) (accounts.Provider, error) {
 		return accounts.ProviderCodex, nil
 	case "claude", "anthropic":
 		return accounts.ProviderClaude, nil
-	case "kimi", "kimi-for-coding":
-		return accounts.ProviderKimi, nil
-	case "zai", "glm":
-		return accounts.ProviderZAI, nil
 	default:
+		if entry, ok := keyedProviderForName(providerName); ok {
+			return entry.Provider, nil
+		}
 		return "", fmt.Errorf("unsupported provider %q", providerName)
 	}
 }
@@ -948,19 +950,18 @@ func sessionLeaseResponseFor(lease sessionLease) sessionLeaseResponse {
 		piBaseURL += "/backend-api"
 	case accounts.ProviderClaude:
 		api = "anthropic-messages"
-	case accounts.ProviderKimi:
-		api = "anthropic-messages"
-		baseURL += "/kimi"
-		piBaseURL += "/kimi"
-	case accounts.ProviderZAI:
-		api = "openai-completions"
-		baseURL += "/zai"
-		piBaseURL += "/zai"
+	default:
+		if entry, ok := keyedProviderFor(lease.Provider); ok {
+			api = entry.LeaseAPI
+			baseURL += "/" + entry.PathPrefix
+			piBaseURL += "/" + entry.PathPrefix
+		}
 	}
 	environment := map[string]string{
 		"CLOUDMUX_SUBROUTER_LEASE_TOKEN": lease.Token,
 	}
-	if lease.Provider == accounts.ProviderCodex || lease.Provider == accounts.ProviderZAI {
+	entry, isKeyed := keyedProviderFor(lease.Provider)
+	if lease.Provider == accounts.ProviderCodex || (isKeyed && entry.LeaseEnv == leaseEnvOpenAI) {
 		environment["OPENAI_API_KEY"] = lease.Token
 		environment["OPENAI_BASE_URL"] = baseURL
 	} else {

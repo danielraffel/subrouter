@@ -733,14 +733,10 @@ func authLikeUsageError(message string) bool {
 }
 
 func apiKeyPlanType(provider accounts.Provider) string {
-	switch provider {
-	case accounts.ProviderKimi:
-		return "kimi api key"
-	case accounts.ProviderZAI:
-		return "zai api key"
-	default:
-		return "api key"
+	if entry, ok := keyedProviderFor(provider); ok {
+		return entry.PlanLabel
 	}
+	return "api key"
 }
 
 func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus {
@@ -1428,7 +1424,7 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, map[string]any{
 			"ok":        true,
-			"providers": []string{"codex", "claude", "kimi", "zai"},
+			"providers": append([]string{"codex", "claude"}, keyedProviderNames()...),
 		})
 		return
 	case http.MethodPost:
@@ -1540,8 +1536,8 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			}
 		}
 	}()
-	switch input.Provider {
-	case accounts.ProviderCodex, accounts.ProviderKimi, accounts.ProviderZAI:
+	switch {
+	case input.Provider == accounts.ProviderCodex || isKeyedProvider(input.Provider):
 		if input.Codex == nil || input.Claude != nil {
 			return "", invalidAccountImport("exactly one matching account payload is required")
 		}
@@ -1558,7 +1554,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			return "", err
 		}
 		accountID = account.Email
-	case accounts.ProviderClaude:
+	case input.Provider == accounts.ProviderClaude:
 		if input.Claude != nil && input.Codex == nil {
 			name, credential, err := validateClaudeAccountImport(*input.Claude)
 			if err != nil {
@@ -4325,6 +4321,10 @@ const claudeOAuthBetaHeader = "oauth-2025-04-20"
 func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 	headers.Set("Authorization", account.AuthorizationHeader())
 	headers.Del("ChatGPT-Account-ID")
+	if entry, ok := keyedProviderFor(account.Provider); ok {
+		applyKeyedProviderAuth(headers, account, entry)
+		return
+	}
 	switch account.Provider {
 	case accounts.ProviderClaude:
 		if account.AuthMode == accounts.AuthModeAPIKey {
@@ -4335,14 +4335,6 @@ func setAccountAuthHeaders(headers http.Header, account accounts.Account) {
 		}
 		headers.Del("X-Api-Key")
 		ensureCommaHeaderValue(headers, "Anthropic-Beta", claudeOAuthBetaHeader)
-	case accounts.ProviderKimi:
-		headers.Set("Authorization", account.AuthorizationHeader())
-		headers.Set("X-Api-Key", account.Token)
-		if headers.Get("Anthropic-Version") == "" {
-			headers.Set("Anthropic-Version", "2023-06-01")
-		}
-	case accounts.ProviderZAI:
-		headers.Del("X-Api-Key")
 	case accounts.ProviderCodex, "":
 		if account.AccountID != "" {
 			headers.Set("ChatGPT-Account-ID", account.AccountID)
@@ -4392,11 +4384,8 @@ func (s Server) upstreamForRequest(path string, account accounts.Account) *url.U
 	if account.Provider == accounts.ProviderClaude {
 		return s.ClaudeUpstream
 	}
-	if account.Provider == accounts.ProviderKimi {
-		return s.KimiUpstream
-	}
-	if account.Provider == accounts.ProviderZAI {
-		return s.ZAIUpstream
+	if entry, ok := keyedProviderFor(account.Provider); ok {
+		return entry.Upstream(s)
 	}
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return s.APIUpstream
@@ -4417,24 +4406,12 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 	if account.Provider == accounts.ProviderClaude {
 		return path
 	}
-	if account.Provider == accounts.ProviderKimi {
-		path = stripProviderPathPrefix(path, "kimi")
-		upstreamPath := ""
-		if s.KimiUpstream != nil {
-			upstreamPath = strings.TrimRight(s.KimiUpstream.Path, "/")
-		}
-		if strings.HasSuffix(upstreamPath, "/v1") {
-			if path == "/v1" {
-				return "/"
-			}
-			if strings.HasPrefix(path, "/v1/") {
-				return strings.TrimPrefix(path, "/v1")
-			}
+	if entry, ok := keyedProviderFor(account.Provider); ok {
+		path = stripProviderPathPrefix(path, entry.PathPrefix)
+		if entry.CollapseVersionSegment {
+			return collapseDuplicateVersionSegment(path, entry.Upstream(s))
 		}
 		return path
-	}
-	if account.Provider == accounts.ProviderZAI {
-		return stripProviderPathPrefix(path, "zai")
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
 		if stripped, ok := stripChatGPTBackendPath(path); ok {
@@ -4963,23 +4940,18 @@ func providerForRequest(agentType, path string) accounts.Provider {
 }
 
 func agentTypeForProviderSession(agentType string, provider accounts.Provider) string {
-	switch provider {
-	case accounts.ProviderKimi, accounts.ProviderZAI:
+	if isKeyedProvider(provider) {
 		return string(provider)
-	default:
-		return agentType
 	}
+	return agentType
 }
 
 func providerForPath(path string) (accounts.Provider, bool) {
-	switch firstPathSegment(path) {
-	case "kimi":
-		return accounts.ProviderKimi, true
-	case "zai":
-		return accounts.ProviderZAI, true
-	default:
+	entry, ok := keyedProviderForPathPrefix(firstPathSegment(path))
+	if !ok {
 		return "", false
 	}
+	return entry.Provider, true
 }
 
 func firstPathSegment(path string) string {
@@ -5020,7 +4992,9 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	if len(filtered) > 0 {
 		return filtered
 	}
-	if provider == accounts.ProviderKimi || provider == accounts.ProviderZAI {
+	// A keyed provider never inherits provider-less legacy accounts: those
+	// predate multi-provider support and are Codex credentials.
+	if isKeyedProvider(provider) {
 		return nil
 	}
 	return legacy

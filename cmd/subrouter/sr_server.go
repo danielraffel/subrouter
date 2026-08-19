@@ -20,6 +20,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"golang.org/x/term"
@@ -937,7 +938,7 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, arg
 	command := r.programOrSubrouter() + " add-key"
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
-	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: codex, claude, kimi, or zai")
+	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: "+proxy.APIKeyProviderList())
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -1003,12 +1004,11 @@ func parseAPIKeyProvider(value string) (accounts.Provider, error) {
 		return accounts.ProviderCodex, nil
 	case string(accounts.ProviderClaude), "anthropic":
 		return accounts.ProviderClaude, nil
-	case string(accounts.ProviderKimi), "kimi-for-coding":
-		return accounts.ProviderKimi, nil
-	case string(accounts.ProviderZAI), "glm", "glm-5.2":
-		return accounts.ProviderZAI, nil
 	default:
-		return "", fmt.Errorf("unsupported API-key provider %q, expected codex, claude, kimi, or zai", value)
+		if provider, ok := proxy.APIKeyProviderForName(strings.ToLower(strings.TrimSpace(value))); ok {
+			return provider, nil
+		}
+		return "", fmt.Errorf("unsupported API-key provider %q, expected %s", value, proxy.APIKeyProviderList())
 	}
 }
 
