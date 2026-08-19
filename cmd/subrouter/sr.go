@@ -51,7 +51,11 @@ Usage:
   sr add                Ask whether to add Codex or Claude
   sr add codex          Add Codex to the active local or hosted pool
   sr add claude         Add Claude to the active local or hosted pool
-  sr add-key            Add an API key account
+  sr add-key            Add an API key account for Codex
+  sr add-key --provider <name>
+                        Add an API key account for another provider
+                        (kimi, zai, openrouter, grok, qwen, qwen-token,
+                        qwen-anthropic, claude)
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
   sr switch [email]     Switch active Codex account and sync OpenCode/pi

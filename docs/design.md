@@ -46,7 +46,10 @@ Codex Pi leases select only OAuth subscription accounts because Pi's
 If no Codex OAuth account is available, lease creation returns `503` without
 creating a lease or sticky session assignment. Claude, Kimi, ZAI,
 OpenRouter, Grok, and Qwen leases may use API-key accounts supported by their
-returned Pi adapter configuration.
+returned Pi adapter configuration. A provider is leased with the adapter its
+protocol needs rather than its vendor: the Qwen Token Plan is reachable both as
+`openai-completions` and, on its Anthropic endpoint, as `anthropic-messages`,
+and each hands the sandbox the environment variables its own client reads.
 
 A model-bound lease requires a top-level `model` string in the forwarded JSON
 body. Every body occurrence and any forwarded `model` query value must match

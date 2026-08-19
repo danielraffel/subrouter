@@ -264,7 +264,7 @@ X-Subrouter-Session: <conversation-or-thread-id>
 
 If that header is missing, Subrouter checks Codex headers such as `x-codex-window-id` and `x-codex-turn-state`, common session headers, query params, and small JSON bodies for `session_id`, `conversation_id`, or `thread_id`.
 
-Subrouter scopes sticky assignments and transcript files by agent type. It infers `codex`, `claude`, or `gemini` from provider session headers, and clients can set an explicit namespace:
+Subrouter scopes sticky assignments and transcript files by agent type. It infers `codex`, `claude`, or `gemini` from provider session headers, uses the provider name for the API-key providers below (a request to `/qwen-token/...` is scoped to `qwen-token`), and clients can set an explicit namespace:
 
 ```text
 X-Subrouter-Agent: codex
@@ -276,7 +276,7 @@ For teammate-level graphs, clients can also send a self-reported user header:
 X-Subrouter-User-Email: alice@example.com
 ```
 
-Subrouter stores the normalized email on the session assignment, includes it in proxy logs as `user`, and exposes it in `GET /_subrouter/sessions`. This is observability metadata, not authentication. To force a selected account, send `X-Subrouter-Account-ID`; API-key labels can omit the `apikey:` prefix. Subrouter strips `X-Subrouter-Session`, `X-Subrouter-Agent`, `X-Subrouter-User-Email`, `X-Subrouter-User`, `X-User-Email`, `X-Subrouter-Account-ID`, and `X-Subrouter-Account` before forwarding upstream.
+Subrouter stores the normalized email on the session assignment, includes it in proxy logs as `user`, and exposes it in `GET /_subrouter/sessions`. This is observability metadata, not authentication. To force a selected account, send `X-Subrouter-Account-ID`; Codex API-key labels can omit the `apikey:` prefix, and an API-key account for another provider is identified as `<provider>:<label>`, such as `qwen-token:work`. Subrouter strips `X-Subrouter-Session`, `X-Subrouter-Agent`, `X-Subrouter-User-Email`, `X-Subrouter-User`, `X-User-Email`, `X-Subrouter-Account-ID`, and `X-Subrouter-Account` before forwarding upstream.
 
 ## Codex CLI
 
@@ -408,6 +408,71 @@ Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Gene
 For a shared server, replace `127.0.0.1` with the server URL. Subrouter recognizes Claude Code traffic, selects a Claude OAuth account from its own store, strips API-key auth, and forwards to Anthropic with the OAuth beta header. Claude Code prompt caching does not require Subrouter-specific cache settings: Subrouter keeps the same Claude conversation pinned to the same Claude account when that account is still available, and forwards the client `Anthropic-Beta` values and request body `cache_control` blocks unchanged.
 
 Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
+
+## API-key providers
+
+Beyond Codex and Claude, Subrouter routes a set of providers that authenticate
+with an API key. Each one owns a path prefix, so a client picks a provider by
+the URL it calls and Subrouter replaces the outbound credential with whichever
+account it selects:
+
+| Prefix | Provider | Default upstream |
+|---|---|---|
+| `/kimi` | Kimi For Coding | `https://api.kimi.com/coding/v1` |
+| `/zai` | Z.AI coding | `https://api.z.ai/api/coding/paas/v4` |
+| `/openrouter` | OpenRouter | `https://openrouter.ai/api/v1` |
+| `/grok` | xAI Grok | `https://api.x.ai/v1` |
+| `/qwen` | Model Studio Coding Plan | `https://coding-intl.dashscope.aliyuncs.com/v1` |
+| `/qwen-token` | Model Studio Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
+| `/qwen-anthropic` | Token Plan, Anthropic protocol | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
+
+Each has a `--<name>-upstream` flag for a different region or a gateway. Add a
+key with the provider named, or it is stored as a Codex account and forwarded to
+OpenAI:
+
+```bash
+sr add-key --provider qwen-token
+```
+
+Aliases are accepted where a provider is named: `glm` for Z.AI, `xai` for Grok,
+`dashscope` for the Coding Plan, `tokenplan` for the Token Plan.
+
+### Two protocols against one subscription
+
+Some vendors serve the same subscription over both the OpenAI and the Anthropic
+wire protocol. Alibaba's Token Plan is the current example, which is why it has
+two entries: `/qwen-token` speaks OpenAI-compatible JSON, and
+`/qwen-anthropic` speaks Anthropic Messages. Subrouter forwards bodies
+unchanged, so an Anthropic-shaped client can run on that subscription without
+any translation in the proxy — the vendor does the adaptation:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:31415/qwen-anthropic claude
+```
+
+The two entries differ in one detail worth knowing if you add a provider like
+this. The OpenAI base already ends in `/v1`, so a client's own `/v1` is
+collapsed to avoid `/v1/v1`. The Anthropic base stops at `/apps/anthropic` and
+the client appends `/v1/messages` itself, so there the version segment is
+preserved — collapsing it produces the duplicated path the vendor documents as a
+404.
+
+### Declaring a provider without a release
+
+A provider whose only distinguishing feature is its base URL — a subscription
+plan on its own host, a self-hosted gateway, a relay — does not need code:
+
+```bash
+sr serve --openai-compatible acme=https://gateway.acme.test/v1
+sr serve --openai-compatible acme|acme-relay=https://gateway.acme.test/v1
+```
+
+A declared provider gets the same routing, auth, lease, import, and CLI handling
+as a built-in one. Declarations are rejected if they claim a name or path
+segment that Codex, Claude, or a built-in provider already routes on, since that
+would silently redirect traffic which already had a home. Providers are read on
+every request and declared once at startup, so they cannot change while the
+server is serving.
 
 ## Multi-tenant mode
 
