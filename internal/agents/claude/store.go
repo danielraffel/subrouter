@@ -1110,72 +1110,63 @@ func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, 
 	return s.refreshProfileCredential(ctx, client, profile, true)
 }
 
+// refreshProfileCredential serializes concurrent refreshes of the same
+// profile using lockProfileRefresh, a lock distinct from
+// lockProfileCredential. Claude refresh tokens are single-use, so two
+// concurrent callers racing to refresh the same profile must still be
+// serialized across the network call itself — a caller that blocks here will
+// observe the winner's already-refreshed, still-fresh credential on its own
+// subsequent read and skip the network call entirely (see the shouldRefresh
+// check below). Unlike lockProfileCredential, lockProfileRefresh is only ever
+// held here, so holding it across the OAuth round-trip never blocks an
+// unrelated ImportProfileCredential call for the same profile; each
+// individual disk read/write still takes the short-lived
+// lockProfileCredential via ReadCredential / writeRefreshedCredentialIfUnchanged.
 func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, didRefresh bool, err error) {
 	configDir := s.ClaudeConfigDir(profile.Name)
-	lock, err := lockProfileCredential(ctx, configDir)
+	refreshLock, err := lockProfileRefresh(ctx, configDir)
 	if err != nil {
 		return accounts.Account{}, false, err
 	}
+	defer func() {
+		if closeErr := refreshLock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
 	current, ok := s.FindProfile(profile.Name)
 	if !ok || profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
-		return accounts.Account{}, false, errors.Join(
-			fmt.Errorf("Claude profile %q is no longer current", profile.Name),
-			lock.Close(),
-		)
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err := s.readCredential(ctx, configDir)
+	credential, err := s.ReadCredential(ctx, configDir)
 	if err != nil {
-		return accounts.Account{}, false, errors.Join(err, lock.Close())
+		return accounts.Account{}, false, err
 	}
 	if credential == nil || credential.AccessToken == "" {
-		return accounts.Account{}, false, errors.Join(
-			fmt.Errorf("Claude profile %q has no access token", profile.Name),
-			lock.Close(),
-		)
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
 	if force && credential.RefreshToken == "" {
-		return accounts.Account{}, false, errors.Join(
-			fmt.Errorf("Claude profile %q has no refresh token", profile.Name),
-			lock.Close(),
-		)
+		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
 	}
 	shouldRefresh := credential.RefreshToken != "" &&
 		(force || credentialExpired(credential, 60*time.Second))
 	if !shouldRefresh {
 		account, ok = profileAccount(profile, configDir, credential)
 		if !ok {
-			return accounts.Account{}, false, errors.Join(
-				fmt.Errorf("Claude profile %q has no usable credential", profile.Name),
-				lock.Close(),
-			)
-		}
-		if err := lock.Close(); err != nil {
-			return accounts.Account{}, false, err
+			return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 		}
 		return account, false, nil
 	}
 
 	credentialBeforeRefresh := *credential
 	profileBeforeRefresh := profile
-	if err := lock.Close(); err != nil {
-		return accounts.Account{}, false, err
-	}
 	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
 	if err != nil {
 		return accounts.Account{}, false, err
 	}
 	didRefresh = true
 
-	lock, err = lockProfileCredential(ctx, configDir)
-	if err != nil {
-		return accounts.Account{}, false, err
-	}
-	defer func() {
-		if closeErr := lock.Close(); err == nil {
-			err = closeErr
-		}
-	}()
 	current, ok = s.FindProfile(profile.Name)
 	if !ok ||
 		current.CreatedAt != profileBeforeRefresh.CreatedAt ||
@@ -1183,24 +1174,51 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err = s.readCredential(ctx, configDir)
+	credential, err = s.writeRefreshedCredentialIfUnchanged(ctx, configDir, credentialBeforeRefresh, refreshed)
 	if err != nil {
 		return accounts.Account{}, false, err
 	}
 	if credential == nil || credential.AccessToken == "" {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
-	if *credential == credentialBeforeRefresh {
-		credential = &refreshed
-		if err := s.writeCredential(ctx, configDir, *credential); err != nil {
-			return accounts.Account{}, false, err
-		}
-	}
 	account, ok = profileAccount(profile, configDir, credential)
 	if !ok {
 		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 	}
 	return account, didRefresh, nil
+}
+
+// writeRefreshedCredentialIfUnchanged briefly holds lockProfileCredential to
+// re-read the on-disk credential and compare it against the value read before
+// the network refresh. If nothing else wrote to the profile in the meantime,
+// the refreshed credential is persisted and returned. Otherwise the newer
+// on-disk credential wins and the refreshed value is discarded, so a
+// concurrent ImportProfileCredential is never clobbered by a stale refresh.
+func (s Store) writeRefreshedCredentialIfUnchanged(ctx context.Context, instancePath string, before, refreshed CredentialInfo) (credential *CredentialInfo, err error) {
+	lock, err := lockProfileCredential(ctx, instancePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	current, err := s.readCredential(ctx, instancePath)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.AccessToken == "" {
+		return current, nil
+	}
+	if *current != before {
+		return current, nil
+	}
+	if err := s.writeCredential(ctx, instancePath, refreshed); err != nil {
+		return nil, err
+	}
+	return &refreshed, nil
 }
 
 func (s Store) RefreshAccountIfExpired(ctx context.Context, client *http.Client, account accounts.Account) (accounts.Account, bool, error) {

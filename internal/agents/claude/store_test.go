@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -792,6 +793,108 @@ func TestRefreshCredentialPostsClaudeOAuthRefresh(t *testing.T) {
 	}
 	if got.ExpiresAt <= time.Now().UnixMilli() {
 		t.Fatalf("ExpiresAt = %d, want future", got.ExpiresAt)
+	}
+}
+
+// Claude refresh tokens are single-use. Concurrent callers that each read the
+// same stored refresh token and race to redeem it get one winner and one
+// invalidated credential, which logs the profile out. Concurrent refreshes of
+// one profile must therefore serialize across the network round-trip, so that
+// every caller after the first observes the winner's fresh credential and
+// skips the network call entirely.
+func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
+	originalURL := oauthTokenURL
+	defer func() { oauthTokenURL = originalURL }()
+
+	var mu sync.Mutex
+	redeemed := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		token := payload["refresh_token"]
+
+		mu.Lock()
+		redeemed[token]++
+		reuse := redeemed[token] > 1
+		mu.Unlock()
+
+		// Model the upstream's single-use semantics: a token that has already
+		// been redeemed is dead, and redeeming it again is an error.
+		if reuse {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+			return
+		}
+		// Slow enough that unserialized callers would overlap inside the
+		// network call rather than lining up behind each other by accident.
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+	oauthTokenURL = server.URL
+
+	store := Store{Dir: t.TempDir()}
+	if err := store.ImportProfileCredential("race@example.com", CredentialInfo{
+		AccessToken:  "stale-access",
+		RefreshToken: "stale-refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile("race@example.com")
+	if !ok {
+		t.Fatal("profile not found")
+	}
+
+	const callers = 8
+	type result struct {
+		account    accounts.Account
+		didRefresh bool
+		err        error
+	}
+	results := make([]result, callers)
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+	start.Add(1)
+	for i := range results {
+		done.Add(1)
+		go func(i int) {
+			defer done.Done()
+			start.Wait()
+			account, didRefresh, err := store.RefreshCredentialIfExpired(context.Background(), server.Client(), profile)
+			results[i] = result{account: account, didRefresh: didRefresh, err: err}
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+
+	refreshes := 0
+	for i, got := range results {
+		if got.err != nil {
+			t.Fatalf("caller %d failed: %v", i, got.err)
+		}
+		if got.account.Token != "fresh-access" {
+			t.Fatalf("caller %d token = %q, want fresh-access", i, got.account.Token)
+		}
+		if got.didRefresh {
+			refreshes++
+		}
+	}
+	if refreshes != 1 {
+		t.Fatalf("network refreshes reported = %d, want exactly 1", refreshes)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(redeemed) != 1 {
+		t.Fatalf("distinct refresh tokens redeemed = %d (%v), want 1", len(redeemed), redeemed)
+	}
+	if got := redeemed["stale-refresh"]; got != 1 {
+		t.Fatalf("stale-refresh redeemed %d times, want exactly 1", got)
 	}
 }
 
