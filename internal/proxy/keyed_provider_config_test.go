@@ -205,6 +205,19 @@ func TestOneSubscriptionServesBothProtocolEntries(t *testing.T) {
 			t.Fatalf("account id changed to %q; stickiness and forced selection key on it", got[0].ID)
 		}
 	}
+	// A credential stored against the protocol endpoint rather than the owning
+	// provider must still be found, or a key added that way is silently
+	// orphaned.
+	underEndpoint := []accounts.Account{{
+		ID: "qwen-anthropic:main", Provider: accounts.ProviderQwenAnthropic,
+		AuthMode: accounts.AuthModeAPIKey, Token: "sk-sp-endpoint",
+	}}
+	for _, provider := range []accounts.Provider{accounts.ProviderQwenAnthropic, accounts.ProviderQwenToken} {
+		if got := filterAccountsForProvider(underEndpoint, provider); len(got) != 1 {
+			t.Fatalf("provider %q found %d accounts stored under the endpoint name, want 1", provider, len(got))
+		}
+	}
+
 	// Stamping must not mutate the caller's slice.
 	if stored[0].Provider != accounts.ProviderQwenToken {
 		t.Fatalf("the stored account was mutated to %q", stored[0].Provider)

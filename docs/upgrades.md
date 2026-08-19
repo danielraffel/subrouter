@@ -2,6 +2,60 @@
 
 Use this runbook for local macOS daemon upgrades when Codex is already pointed at `127.0.0.1:31415`.
 
+## Replacing the binary in place on macOS
+
+A LaunchAgent that runs `subrouter serve` directly, rather than behind
+`subrouter supervise`, is upgraded by replacing its executable. **Do not
+overwrite the live executable with `cp`.** Writing through the existing inode
+invalidates the binary's code-signing state, and macOS then kills every respawn
+with `OS_REASON_CODESIGNING` (SIGKILL, exit 137). The daemon appears to
+flap: launchd restarts it, the kernel kills it, and the log shows nothing
+useful.
+
+Restoring the previous binary to the same path does **not** recover it. The
+pathname stays poisoned even when `codesign --verify --strict` passes and the
+restored file is byte-identical to the original. Recovery requires deleting the
+file first, so the copy lands on a fresh inode:
+
+```bash
+launchctl bootout gui/$(id -u)/<label>
+rm -f ~/bin/subrouter          # the delete is the part that matters
+cp ~/bin/subrouter.backup ~/bin/subrouter
+chmod 755 ~/bin/subrouter
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+```
+
+The upgrade procedure that avoids this staged the new binary under its own name,
+signs and proves it runs *before* the old one is taken out of service, and puts
+it in place with an atomic rename:
+
+```bash
+cp subrouter.new ~/bin/subrouter.new
+codesign --force --sign - ~/bin/subrouter.new    # ad-hoc is enough for a local build
+codesign --verify --strict --verbose=4 ~/bin/subrouter.new
+~/bin/subrouter.new --help >/dev/null            # prove it executes first
+launchctl bootout gui/$(id -u)/<label>
+mv ~/bin/subrouter.new ~/bin/subrouter           # rename, never cp
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+```
+
+A locally built Go binary is unsigned and will not run as a launchd daemon until
+it is signed, which is why the ad-hoc `codesign` is part of the procedure rather
+than an optional step.
+
+### What a restart costs
+
+`serve` drains on SIGTERM: it stops accepting, finishes in-flight requests, and
+exits, bounded by `--shutdown-timeout` (default 10 minutes). launchd is the
+shorter fuse. Without an `ExitTimeOut` in the plist it escalates to SIGKILL at
+its own default of 20 seconds, so a stream still running after that is cut, and
+`ThrottleInterval` delays the restart by its value. Sticky session assignments
+survive, because the session store is read back from its file at startup; the
+scheduler's exhaustion marks do not, since they are in-memory only.
+
+Behind `subrouter supervise` none of this applies — the supervisor owns the
+listener and hands connections over without dropping them.
+
 ## Supervised handoff
 
 On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on an inherited private socket, and pins accepted TCP connections to that worker generation. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.

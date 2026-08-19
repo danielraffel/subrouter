@@ -4990,11 +4990,15 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	// endpoint the client asked for, not the one that owns the credential.
 	// Leaving the owner's provider on it routes an Anthropic-protocol request
 	// through the OpenAI upstream and its path rules, which 404s.
+	// Providers that share a subscription form one credential group, named by
+	// the provider that owns it. Matching on the group rather than the exact
+	// name means one stored key serves every protocol endpoint, and a key added
+	// against the endpoint a user actually calls is not silently orphaned.
 	credentialProvider := accountProviderFor(provider)
 	filtered := make([]accounts.Account, 0, len(all))
 	legacy := make([]accounts.Account, 0)
 	for _, account := range all {
-		if account.Provider == credentialProvider {
+		if account.Provider != "" && accountProviderFor(account.Provider) == credentialProvider {
 			account.Provider = provider
 			filtered = append(filtered, account)
 			continue

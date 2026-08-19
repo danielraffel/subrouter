@@ -437,6 +437,17 @@ sr add-key --provider qwen-token
 Aliases are accepted where a provider is named: `glm` for Z.AI, `xai` for Grok,
 `dashscope` for the Coding Plan, `tokenplan` for the Token Plan.
 
+`sr status` groups these under their own provider rather than under Codex, and
+reports what each vendor actually exposes: how the plan is metered, whether the
+key still works, how many models it may use, and which endpoints its credential
+serves. None of these vendors publish a quota or reset API, so the quota column
+says so instead of showing a number that does not exist.
+
+To put a new provider on an already-running macOS daemon, follow
+[docs/upgrades.md](docs/upgrades.md#replacing-the-binary-in-place-on-macos).
+Replacing a live executable with `cp` invalidates its code signature and macOS
+kills every respawn.
+
 ### Two protocols against one subscription
 
 Some vendors serve the same subscription over both the OpenAI and the Anthropic
