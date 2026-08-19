@@ -4695,7 +4695,13 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 	if session.ExtractAccountID(r) != "" || (provider != accounts.ProviderClaude && provider != accounts.ProviderCodex) {
 		return account, err
 	}
-	if provider == accounts.ProviderCodex && !isTerminalCredentialError(err) {
+	// A refresh that failed for a transient reason (cancelled context, timeout,
+	// upstream 5xx) says nothing about the credential, so failing over would mark
+	// a healthy account exhausted and hold it out for the credential TTL. Only a
+	// terminal credential error justifies that. isTerminalCredentialError is
+	// provider-agnostic, so a genuine Claude logout (invalid_grant) still fails
+	// over here.
+	if !isTerminalCredentialError(err) {
 		return account, err
 	}
 	if s.Logger != nil {
@@ -4716,7 +4722,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		if err == nil {
 			return refreshed, nil
 		}
-		if provider == accounts.ProviderCodex && !isTerminalCredentialError(err) {
+		if !isTerminalCredentialError(err) {
 			return next, err
 		}
 		lastErr = err
