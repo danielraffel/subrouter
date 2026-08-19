@@ -17,7 +17,7 @@ func TestKeyedProviderRegistryEntriesAreComplete(t *testing.T) {
 	seenPrefix := map[string]bool{}
 	seenName := map[string]bool{}
 
-	for _, entry := range keyedProviders {
+	for _, entry := range keyedProviders() {
 		name := string(entry.Provider)
 		if name == "" || entry.PathPrefix == "" || entry.PlanLabel == "" ||
 			entry.LeaseAPI == "" || entry.LeasePath == "" || entry.Upstream == nil {
@@ -45,7 +45,7 @@ func TestKeyedProviderRegistryEntriesAreComplete(t *testing.T) {
 
 // Each lookup is a routing decision, so each must round-trip for every entry.
 func TestKeyedProviderLookupsRoundTrip(t *testing.T) {
-	for _, entry := range keyedProviders {
+	for _, entry := range keyedProviders() {
 		name := string(entry.Provider)
 
 		if got, ok := keyedProviderFor(entry.Provider); !ok || got.PathPrefix != entry.PathPrefix {
@@ -198,9 +198,9 @@ func TestSessionLeaseProviderHonoursVendorPrefixedModels(t *testing.T) {
 		t.Fatal("a mismatched model provider must still be rejected")
 	}
 
-	original := keyedProviders
-	t.Cleanup(func() { keyedProviders = original })
-	keyedProviders = append(append([]keyedProvider{}, original...), keyedProvider{
+	original := builtinKeyedProviders
+	t.Cleanup(func() { builtinKeyedProviders = original })
+	builtinKeyedProviders = append(append([]keyedProvider{}, original...), keyedProvider{
 		Provider:             accounts.Provider("vendorcase"),
 		PathPrefix:           "vendorcase",
 		PlanLabel:            "vendorcase api key",

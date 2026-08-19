@@ -68,7 +68,7 @@ func TestRegistryDoesNotCaptureCodexOrClaudeRouting(t *testing.T) {
 			t.Fatalf("filterAccountsForProvider(%q) dropped the legacy account", provider)
 		}
 	}
-	for _, entry := range keyedProviders {
+	for _, entry := range keyedProviders() {
 		if got := filterAccountsForProvider(legacy, entry.Provider); len(got) != 0 {
 			t.Fatalf("registry provider %q must not inherit provider-less legacy accounts", entry.Provider)
 		}

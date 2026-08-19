@@ -133,6 +133,8 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		server.GrokUpstream = upstream
 	case accounts.ProviderQwen:
 		server.QwenUpstream = upstream
+	case accounts.ProviderQwenToken:
+		server.QwenTokenUpstream = upstream
 	default:
 		t.Fatalf("no upstream field wired for provider %s", provider)
 	}
@@ -365,6 +367,67 @@ func TestSessionLeaseInfersQwenFromModelPrefix(t *testing.T) {
 		got, _, err := sessionLeaseProvider(alias, "qwen3-coder-plus")
 		if err != nil || got != accounts.ProviderQwen {
 			t.Fatalf("alias %q resolved to (%q, %v), want qwen", alias, got, err)
+		}
+	}
+}
+
+// The Token Plan is a different subscription from the Coding Plan, with its own
+// key and its own host, so both must be able to serve at once rather than the
+// operator choosing one. The Token Plan base ends in /compatible-mode/v1, so a
+// client's own /v1 still has to collapse.
+func TestHandlerRoutesQwenTokenPlanAlongsideCodingPlan(t *testing.T) {
+	var codingHits, tokenHits int
+	coding := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		codingHits++
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("coding-plan path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-sp-coding" {
+			t.Fatalf("coding-plan Authorization = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer coding.Close()
+	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenHits++
+		if r.URL.Path != "/compatible-mode/v1/chat/completions" {
+			t.Fatalf("token-plan path = %q, want /compatible-mode/v1/chat/completions", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-token-plan" {
+			t.Fatalf("token-plan Authorization = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer token.Close()
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "qwen:coding", Provider: accounts.ProviderQwen, AuthMode: accounts.AuthModeAPIKey, Token: "sk-sp-coding"},
+			{ID: "qwen-token:main", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "sk-token-plan"},
+		},
+		Sessions:          store,
+		QwenUpstream:      mustParseURL(t, coding.URL+"/v1"),
+		QwenTokenUpstream: mustParseURL(t, token.URL+"/compatible-mode/v1"),
+		MaxBodyBytes:      1024,
+	}
+	handler := server.Handler()
+
+	for path, wantHits := range map[string]*int{
+		"/qwen/v1/chat/completions":       &codingHits,
+		"/qwen-token/v1/chat/completions": &tokenHits,
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"qwen3.8-max"}`))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("%s status = %d body = %s", path, rec.Code, rec.Body.String())
+		}
+		if *wantHits != 1 {
+			t.Fatalf("%s did not reach its own upstream exactly once", path)
 		}
 	}
 }

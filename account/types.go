@@ -22,6 +22,11 @@ const (
 	// subscription is addressed with a plan-specific API key on a dedicated
 	// OpenAI-compatible endpoint.
 	ProviderQwen Provider = "qwen"
+
+	// ProviderQwenToken routes to Model Studio's Token Plan, which is a
+	// separate subscription from the Coding Plan with its own key and its own
+	// endpoint.
+	ProviderQwenToken Provider = "qwen-token"
 )
 
 type AuthMode string

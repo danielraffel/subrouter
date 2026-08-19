@@ -1,0 +1,142 @@
+package proxy
+
+import (
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+)
+
+// OpenAICompatibleProvider declares an OpenAI-compatible endpoint that this
+// build did not ship an entry for. A provider whose only distinguishing feature
+// is its base URL — a subscription plan on its own host, a self-hosted gateway,
+// a relay — does not need code, so operators can declare one instead of waiting
+// for a release.
+type OpenAICompatibleProvider struct {
+	// Name is the provider id and the path prefix: /<Name>/... routes here.
+	Name string
+	// BaseURL is the endpoint requests are forwarded to.
+	BaseURL string
+	// Aliases are additional names accepted wherever a provider is named.
+	Aliases []string
+}
+
+// configuredProviders holds the entries declared for this process. The registry
+// is read on every request and written once during startup, before the server
+// begins serving, so a mutex is enough and no request-time coordination is
+// needed. It is deliberately not reconfigurable while serving: a provider
+// disappearing under an in-flight request would route it nowhere.
+var (
+	configuredMu        sync.RWMutex
+	configuredProviders []keyedProvider
+)
+
+// reservedProviderNames are the names and path segments the non-registry
+// providers already route on. A configured provider claiming one would shadow
+// Codex or Claude, so it is rejected rather than silently accepted.
+var reservedProviderNames = map[string]bool{
+	"codex": true, "openai": true, "openai-codex": true,
+	"claude": true, "anthropic": true,
+	"v1": true, "backend-api": true, "messages": true, "responses": true,
+}
+
+// ConfigureOpenAICompatibleProviders registers operator-declared providers.
+// It must be called during startup, before the server serves any request, and
+// replaces any previous declaration so a caller cannot accumulate duplicates by
+// being invoked twice.
+func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) error {
+	entries := make([]keyedProvider, 0, len(declared))
+	seen := map[string]bool{}
+	for _, item := range declared {
+		name := strings.ToLower(strings.TrimSpace(item.Name))
+		if name == "" {
+			return fmt.Errorf("openai-compatible provider needs a name")
+		}
+		if strings.ContainsAny(name, "/ \t") {
+			return fmt.Errorf("openai-compatible provider name %q cannot contain a slash or whitespace", item.Name)
+		}
+		base, err := parseProviderBaseURL(item.BaseURL, name)
+		if err != nil {
+			return err
+		}
+		names := append([]string{name}, normalizeAliases(item.Aliases)...)
+		for _, candidate := range names {
+			if reservedProviderNames[candidate] {
+				return fmt.Errorf("openai-compatible provider %q claims the reserved name %q", item.Name, candidate)
+			}
+			if _, taken := keyedProviderForName(candidate); taken {
+				return fmt.Errorf("openai-compatible provider %q claims %q, which a built-in provider already uses", item.Name, candidate)
+			}
+			if seen[candidate] {
+				return fmt.Errorf("openai-compatible provider name %q is declared twice", candidate)
+			}
+			seen[candidate] = true
+		}
+		entries = append(entries, keyedProvider{
+			Provider:   accounts.Provider(name),
+			PathPrefix: name,
+			Aliases:    names[1:],
+			PlanLabel:  name + " api key",
+			Auth:       authBearer,
+			// The declared base may or may not end in /v1, and an
+			// OpenAI-compatible client sends /v1/... either way.
+			CollapseVersionSegment: true,
+			LeaseAPI:               "openai-completions",
+			LeasePath:              "/" + name + "/chat/completions",
+			LeaseEnv:               leaseEnvOpenAI,
+			Upstream:               func(Server) *url.URL { return base },
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].PathPrefix < entries[j].PathPrefix })
+	configuredMu.Lock()
+	configuredProviders = entries
+	configuredMu.Unlock()
+	return nil
+}
+
+func parseProviderBaseURL(raw, name string) (*url.URL, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("openai-compatible provider %q needs a base URL", name)
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("openai-compatible provider %q has an unparseable base URL: %w", name, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("openai-compatible provider %q base URL must be http or https, got %q", name, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("openai-compatible provider %q base URL has no host", name)
+	}
+	return parsed, nil
+}
+
+func normalizeAliases(aliases []string) []string {
+	out := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		trimmed := strings.ToLower(strings.TrimSpace(alias))
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// ParseOpenAICompatibleFlag reads one `name=https://host/v1` declaration, with
+// optional comma-separated aliases after the name: `name|alias=https://...`.
+func ParseOpenAICompatibleFlag(value string) (OpenAICompatibleProvider, error) {
+	name, base, found := strings.Cut(value, "=")
+	if !found {
+		return OpenAICompatibleProvider{}, fmt.Errorf("openai-compatible provider %q must be name=BASE_URL", value)
+	}
+	parts := strings.Split(name, "|")
+	return OpenAICompatibleProvider{
+		Name:    parts[0],
+		Aliases: parts[1:],
+		BaseURL: base,
+	}, nil
+}

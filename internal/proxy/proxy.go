@@ -57,6 +57,7 @@ type Server struct {
 	OpenRouterUpstream *url.URL
 	GrokUpstream       *url.URL
 	QwenUpstream       *url.URL
+	QwenTokenUpstream  *url.URL
 	Accounts           []accounts.Account
 	AccountRef         *AccountRef
 	Sessions           *session.Store

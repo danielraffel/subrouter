@@ -107,10 +107,12 @@ type keyedProvider struct {
 	Upstream func(Server) *url.URL
 }
 
-// keyedProviders is the registry. Adding an API-key provider means adding an
-// entry here and a base-URL field on Server; the routing, auth, lease, import,
-// and CLI paths all read from this table.
-var keyedProviders = []keyedProvider{
+// builtinKeyedProviders are the providers this build ships. Adding one means
+// adding an entry here and a base-URL field on Server; the routing, auth,
+// lease, import, and CLI paths all read from the registry. Operators can
+// declare further OpenAI-compatible providers at startup — see
+// ConfigureOpenAICompatibleProviders.
+var builtinKeyedProviders = []keyedProvider{
 	{
 		Provider:               accounts.ProviderKimi,
 		PathPrefix:             "kimi",
@@ -180,11 +182,40 @@ var keyedProviders = []keyedProvider{
 		LeaseEnv:               leaseEnvOpenAI,
 		Upstream:               func(s Server) *url.URL { return s.QwenUpstream },
 	},
+	{
+		Provider:   accounts.ProviderQwenToken,
+		PathPrefix: "qwen-token",
+		Aliases:    []string{"tokenplan", "qwen-tokenplan"},
+		PlanLabel:  "qwen token plan key",
+		Auth:       authBearer,
+		// The Token Plan endpoint ends in /compatible-mode/v1.
+		CollapseVersionSegment: true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/qwen-token/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server) *url.URL { return s.QwenTokenUpstream },
+	},
+}
+
+// keyedProviders returns the effective registry: the providers this build ships
+// followed by any the operator declared. Declared providers cannot shadow a
+// built-in one, which is enforced when they are configured.
+func keyedProviders() []keyedProvider {
+	configuredMu.RLock()
+	declared := configuredProviders
+	configuredMu.RUnlock()
+	if len(declared) == 0 {
+		return builtinKeyedProviders
+	}
+	all := make([]keyedProvider, 0, len(builtinKeyedProviders)+len(declared))
+	all = append(all, builtinKeyedProviders...)
+	all = append(all, declared...)
+	return all
 }
 
 // keyedProviderFor returns the registry entry for a provider.
 func keyedProviderFor(provider accounts.Provider) (keyedProvider, bool) {
-	for _, entry := range keyedProviders {
+	for _, entry := range keyedProviders() {
 		if entry.Provider == provider {
 			return entry, true
 		}
@@ -194,7 +225,7 @@ func keyedProviderFor(provider accounts.Provider) (keyedProvider, bool) {
 
 // keyedProviderForPathPrefix resolves the first path segment to a provider.
 func keyedProviderForPathPrefix(segment string) (keyedProvider, bool) {
-	for _, entry := range keyedProviders {
+	for _, entry := range keyedProviders() {
 		if entry.PathPrefix == segment {
 			return entry, true
 		}
@@ -205,7 +236,7 @@ func keyedProviderForPathPrefix(segment string) (keyedProvider, bool) {
 // keyedProviderForName resolves a provider named by a human or an API caller,
 // accepting the canonical provider string and any registered alias.
 func keyedProviderForName(name string) (keyedProvider, bool) {
-	for _, entry := range keyedProviders {
+	for _, entry := range keyedProviders() {
 		if name == string(entry.Provider) {
 			return entry, true
 		}
@@ -220,7 +251,7 @@ func keyedProviderForName(name string) (keyedProvider, bool) {
 
 // keyedProviderForModelPrefix infers a provider from a bare model id.
 func keyedProviderForModelPrefix(lowerModel string) (keyedProvider, bool) {
-	for _, entry := range keyedProviders {
+	for _, entry := range keyedProviders() {
 		if entry.ModelPrefix != "" && len(lowerModel) >= len(entry.ModelPrefix) &&
 			lowerModel[:len(entry.ModelPrefix)] == entry.ModelPrefix {
 			return entry, true
@@ -238,8 +269,9 @@ func isKeyedProvider(provider accounts.Provider) bool {
 // keyedProviderNames lists every canonical provider name in the registry, in
 // registry order, for advertising and for error messages.
 func keyedProviderNames() []string {
-	names := make([]string, 0, len(keyedProviders))
-	for _, entry := range keyedProviders {
+	all := keyedProviders()
+	names := make([]string, 0, len(all))
+	for _, entry := range all {
 		names = append(names, string(entry.Provider))
 	}
 	return names
