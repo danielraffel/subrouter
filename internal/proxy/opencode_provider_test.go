@@ -135,6 +135,8 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		server.QwenUpstream = upstream
 	case accounts.ProviderQwenToken:
 		server.QwenTokenUpstream = upstream
+	case accounts.ProviderQwenAnthropic:
+		server.QwenAnthropicUpstream = upstream
 	default:
 		t.Fatalf("no upstream field wired for provider %s", provider)
 	}
@@ -429,5 +431,67 @@ func TestHandlerRoutesQwenTokenPlanAlongsideCodingPlan(t *testing.T) {
 		if *wantHits != 1 {
 			t.Fatalf("%s did not reach its own upstream exactly once", path)
 		}
+	}
+}
+
+// The Token Plan also serves the Anthropic protocol, which is what lets an
+// Anthropic-shaped client run on a Qwen subscription with no translation. Its
+// base stops at /apps/anthropic and the client appends /v1/messages itself, so
+// the version segment must survive: collapsing it is exactly the /v1/v1 404 the
+// vendor documents.
+func TestHandlerPreservesTheVersionSegmentForQwenAnthropic(t *testing.T) {
+	var seen []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.Path)
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-token-plan" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "qwen-anthropic:main",
+		Provider: accounts.ProviderQwenAnthropic,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "sk-token-plan",
+	}, accounts.ProviderQwenAnthropic, upstream.URL+"/apps/anthropic").Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/qwen-anthropic/v1/messages", strings.NewReader(`{"model":"qwen3.7-plus","max_tokens":16,"messages":[]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(seen) != 1 || seen[0] != "/apps/anthropic/v1/messages" {
+		t.Fatalf("upstream saw %v, want [/apps/anthropic/v1/messages]", seen)
+	}
+	for _, path := range seen {
+		if strings.Contains(path, "/v1/v1") {
+			t.Fatalf("path %q duplicates the version segment, which the vendor documents as a 404", path)
+		}
+	}
+}
+
+// A lease for the Anthropic-protocol provider must hand the sandbox the
+// Anthropic environment variables, or an Anthropic client has nothing to read.
+func TestQwenAnthropicLeaseUsesAnthropicEnvironment(t *testing.T) {
+	entry, ok := keyedProviderFor(accounts.ProviderQwenAnthropic)
+	if !ok {
+		t.Fatal("qwen-anthropic should be a registered provider")
+	}
+	if entry.LeaseEnv != leaseEnvAnthropic {
+		t.Fatal("an Anthropic-protocol provider must lease the Anthropic environment")
+	}
+	if entry.LeaseAPI != "anthropic-messages" {
+		t.Fatalf("LeaseAPI = %q, want anthropic-messages", entry.LeaseAPI)
+	}
+	if entry.CollapseVersionSegment {
+		t.Fatal("collapsing the version segment would produce the documented /v1/v1 404")
+	}
+	// The OpenAI-protocol sibling must keep its own shape.
+	openaiSibling, ok := keyedProviderFor(accounts.ProviderQwenToken)
+	if !ok || openaiSibling.LeaseEnv != leaseEnvOpenAI || !openaiSibling.CollapseVersionSegment {
+		t.Fatal("the OpenAI-protocol Token Plan entry must be unaffected")
 	}
 }

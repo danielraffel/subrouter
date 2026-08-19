@@ -195,6 +195,21 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseEnv:               leaseEnvOpenAI,
 		Upstream:               func(s Server) *url.URL { return s.QwenTokenUpstream },
 	},
+	{
+		Provider:   accounts.ProviderQwenAnthropic,
+		PathPrefix: "qwen-anthropic",
+		Aliases:    []string{"qwen-token-anthropic", "tokenplan-anthropic"},
+		PlanLabel:  "qwen token plan key",
+		Auth:       authBearer,
+		// The Anthropic base stops at /apps/anthropic and the client appends
+		// /v1/messages itself, so the version segment must survive: collapsing
+		// it here is what produces the /v1/v1 404 the vendor documents.
+		CollapseVersionSegment: false,
+		LeaseAPI:               "anthropic-messages",
+		LeasePath:              "/qwen-anthropic/v1/messages",
+		LeaseEnv:               leaseEnvAnthropic,
+		Upstream:               func(s Server) *url.URL { return s.QwenAnthropicUpstream },
+	},
 }
 
 // keyedProviders returns the effective registry: the providers this build ships

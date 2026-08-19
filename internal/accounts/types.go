@@ -32,6 +32,8 @@ const (
 
 	ProviderQwenToken = account.ProviderQwenToken
 
+	ProviderQwenAnthropic = account.ProviderQwenAnthropic
+
 	AuthModeOAuth  = account.AuthModeOAuth
 	AuthModeAPIKey = account.AuthModeAPIKey
 )

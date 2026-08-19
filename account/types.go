@@ -27,6 +27,10 @@ const (
 	// separate subscription from the Coding Plan with its own key and its own
 	// endpoint.
 	ProviderQwenToken Provider = "qwen-token"
+
+	// ProviderQwenAnthropic routes to the Token Plan's Anthropic-protocol
+	// endpoint, which serves the same subscription to Anthropic-shaped clients.
+	ProviderQwenAnthropic Provider = "qwen-anthropic"
 )
 
 type AuthMode string

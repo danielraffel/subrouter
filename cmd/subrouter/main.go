@@ -290,7 +290,8 @@ func serve(args []string) error {
 	grokUpstreamRaw := flags.String("grok-upstream", "https://api.x.ai/v1", "xAI Grok upstream base URL")
 	var openAICompatibleRaw stringList
 	flags.Var(&openAICompatibleRaw, "openai-compatible", "declare an OpenAI-compatible provider as name=BASE_URL (repeatable); aliases may follow the name as name|alias=BASE_URL")
-	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "Alibaba Model Studio Token Plan upstream base URL")
+	qwenAnthropicUpstreamRaw := flags.String("qwen-anthropic-upstream", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic", "Alibaba Model Studio Token Plan Anthropic-protocol upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic)")
+	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "Alibaba Model Studio Token Plan upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)")
 	qwenUpstreamRaw := flags.String("qwen-upstream", "https://coding-intl.dashscope.aliyuncs.com/v1", "Alibaba Model Studio Coding Plan upstream base URL (Beijing: https://coding.dashscope.aliyuncs.com/v1)")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
@@ -454,6 +455,10 @@ func serve(args []string) error {
 		return err
 	}
 	qwenTokenUpstream, err := url.Parse(*qwenTokenUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	qwenAnthropicUpstream, err := url.Parse(*qwenAnthropicUpstreamRaw)
 	if err != nil {
 		return err
 	}
@@ -658,6 +663,7 @@ func serve(args []string) error {
 		GrokUpstream:          grokUpstream,
 		QwenUpstream:          qwenUpstream,
 		QwenTokenUpstream:     qwenTokenUpstream,
+		QwenAnthropicUpstream: qwenAnthropicUpstream,
 		Accounts:              nil,
 		AccountRef:            accountRef,
 		CredentialBroker:      credentialBroker,
@@ -1474,7 +1480,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--grok-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--grok-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
   %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]
