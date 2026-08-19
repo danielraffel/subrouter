@@ -444,13 +444,14 @@ func TestRequiredSessionLeaseAlsoClosesBedrockGateway(t *testing.T) {
 	}
 }
 
-func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
+func TestAPIKeyProviderLeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 	tests := []struct {
 		name          string
 		provider      string
 		model         string
 		account       accounts.Account
 		configure     func(*Server, *url.URL)
+		upstreamPath  string
 		wantAPI       string
 		adapterSuffix string
 		wantPath      string
@@ -467,6 +468,7 @@ func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 			configure: func(server *Server, upstream *url.URL) {
 				server.KimiUpstream = upstream
 			},
+			upstreamPath:  "/coding/v1",
 			wantAPI:       "anthropic-messages",
 			adapterSuffix: "/v1/messages",
 			wantPath:      "/coding/v1/messages",
@@ -483,9 +485,26 @@ func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 			configure: func(server *Server, upstream *url.URL) {
 				server.ZAIUpstream = upstream
 			},
+			upstreamPath:  "/api/coding/paas/v4",
 			wantAPI:       "openai-completions",
 			adapterSuffix: "/chat/completions",
 			wantPath:      "/api/coding/paas/v4/chat/completions",
+		},
+		{
+			name:     "openrouter OpenAI completions",
+			provider: "openrouter",
+			model:    "anthropic/claude-opus-5",
+			account: accounts.Account{
+				ID: "openrouter:main", Provider: accounts.ProviderOpenRouter,
+				AuthMode: accounts.AuthModeAPIKey, Token: "sk-or-v1-secret",
+			},
+			configure: func(server *Server, upstream *url.URL) {
+				server.OpenRouterUpstream = upstream
+			},
+			upstreamPath:  "/api/v1",
+			wantAPI:       "openai-completions",
+			adapterSuffix: "/chat/completions",
+			wantPath:      "/api/v1/chat/completions",
 		},
 	}
 
@@ -499,11 +518,7 @@ func TestKimiAndZAILeasePiRoutesMatchProviderUpstreams(t *testing.T) {
 			}))
 			defer upstream.Close()
 			upstreamURL := mustParseURL(t, upstream.URL)
-			if test.provider == "kimi" {
-				upstreamURL.Path = "/coding/v1"
-			} else {
-				upstreamURL.Path = "/api/coding/paas/v4"
-			}
+			upstreamURL.Path = test.upstreamPath
 			server := Server{
 				Accounts:      []accounts.Account{test.account},
 				Sessions:      newSessionStore(t),
@@ -1441,4 +1456,40 @@ func decodeSessionLeaseToken(t *testing.T, token string) (sessionLeaseTokenHeade
 		t.Fatal(err)
 	}
 	return header, payload, parts
+}
+
+// OpenRouter addresses every model as vendor/model, so a lease must forward the
+// whole id. Every other provider keeps treating the segment before the slash as
+// a provider selector.
+func TestSessionLeaseProviderKeepsVendorPrefixedModelForOpenRouter(t *testing.T) {
+	provider, model, err := sessionLeaseProvider("openrouter", "anthropic/claude-opus-5")
+	if err != nil {
+		t.Fatalf("an OpenRouter vendor-prefixed model must be accepted: %v", err)
+	}
+	if provider != accounts.ProviderOpenRouter {
+		t.Fatalf("provider = %q, want openrouter", provider)
+	}
+	if model != "anthropic/claude-opus-5" {
+		t.Fatalf("model = %q, want the vendor prefix preserved", model)
+	}
+
+	provider, model, err = sessionLeaseProvider("openrouter", "x-ai/grok-4")
+	if err != nil {
+		t.Fatalf("an unknown vendor prefix must still be accepted: %v", err)
+	}
+	if provider != accounts.ProviderOpenRouter || model != "x-ai/grok-4" {
+		t.Fatalf("got (%q, %q), want (openrouter, x-ai/grok-4)", provider, model)
+	}
+
+	// Unchanged for the providers that do use the prefix as a selector.
+	provider, model, err = sessionLeaseProvider("claude", "anthropic/claude-opus-5")
+	if err != nil {
+		t.Fatalf("claude vendor prefix should still resolve: %v", err)
+	}
+	if provider != accounts.ProviderClaude || model != "claude-opus-5" {
+		t.Fatalf("got (%q, %q), want (claude, claude-opus-5)", provider, model)
+	}
+	if _, _, err = sessionLeaseProvider("claude", "openai/gpt-5"); err == nil {
+		t.Fatal("a mismatched model provider must still be rejected")
+	}
 }

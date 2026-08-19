@@ -1894,3 +1894,34 @@ func TestParseAPIKeyProviderClaude(t *testing.T) {
 func jsonMarshalIndent(value any) ([]byte, error) {
 	return json.MarshalIndent(value, "", "  ")
 }
+
+func TestParseAPIKeyProviderCoversEveryProvider(t *testing.T) {
+	cases := map[string]accounts.Provider{
+		"":                accounts.ProviderCodex,
+		"codex":           accounts.ProviderCodex,
+		"openai":          accounts.ProviderCodex,
+		"claude":          accounts.ProviderClaude,
+		"anthropic":       accounts.ProviderClaude,
+		"kimi":            accounts.ProviderKimi,
+		"kimi-for-coding": accounts.ProviderKimi,
+		"zai":             accounts.ProviderZAI,
+		"glm":             accounts.ProviderZAI,
+		"openrouter":      accounts.ProviderOpenRouter,
+		"open-router":     accounts.ProviderOpenRouter,
+		"  OpenRouter  ":  accounts.ProviderOpenRouter,
+	}
+	for value, want := range cases {
+		got, err := parseAPIKeyProvider(value)
+		if err != nil {
+			t.Fatalf("parseAPIKeyProvider(%q) failed: %v", value, err)
+		}
+		if got != want {
+			t.Fatalf("parseAPIKeyProvider(%q) = %q, want %q", value, got, want)
+		}
+	}
+	if _, err := parseAPIKeyProvider("gemini"); err == nil {
+		t.Fatal("an unsupported provider must be rejected")
+	} else if !strings.Contains(err.Error(), "openrouter") {
+		t.Fatalf("the error should list openrouter as supported, got %v", err)
+	}
+}

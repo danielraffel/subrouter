@@ -120,8 +120,108 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		server.KimiUpstream = upstream
 	case accounts.ProviderZAI:
 		server.ZAIUpstream = upstream
+	case accounts.ProviderOpenRouter:
+		server.OpenRouterUpstream = upstream
 	default:
 		t.Fatalf("unsupported provider %s", provider)
 	}
 	return server
+}
+
+func TestHandlerRoutesOpenRouterProviderPrefixToOpenRouterUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /api/v1/chat/completions", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-or-v1-token" {
+			t.Fatalf("Authorization = %q, want openrouter bearer", got)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "" {
+			t.Fatalf("X-Api-Key = %q, want stripped", got)
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "openrouter:main",
+		Provider: accounts.ProviderOpenRouter,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "sk-or-v1-token",
+	}, accounts.ProviderOpenRouter, upstream.URL+"/api/v1").Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/openrouter/chat/completions", strings.NewReader(`{"model":"anthropic/claude-opus-5"}`))
+	req.Header.Set("X-Api-Key", "client-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// OpenRouter's base URL already ends in /v1 and OpenAI-compatible clients send
+// /v1/chat/completions, so the version segment must collapse rather than reach
+// upstream as /api/v1/v1/chat/completions.
+func TestHandlerCollapsesDuplicateV1ForOpenRouterUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /api/v1/chat/completions", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "openrouter:main",
+		Provider: accounts.ProviderOpenRouter,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "sk-or-v1-token",
+	}, accounts.ProviderOpenRouter, upstream.URL+"/api/v1").Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/openrouter/v1/chat/completions", strings.NewReader(`{"model":"anthropic/claude-opus-5"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// An unversioned override base must keep the client's /v1, the same way the
+// Kimi lane does — the collapse is conditional on the upstream base, not on the
+// provider.
+func TestHandlerPreservesV1ForOpenRouterUpstreamWithoutVersionedBase(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "openrouter:custom",
+		Provider: accounts.ProviderOpenRouter,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "sk-or-v1-token",
+	}, accounts.ProviderOpenRouter, upstream.URL).Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/openrouter/v1/chat/completions", strings.NewReader(`{"model":"anthropic/claude-opus-5"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProviderForPathOpenRouter(t *testing.T) {
+	provider, ok := providerForPath("/openrouter/chat/completions")
+	if !ok || provider != accounts.ProviderOpenRouter {
+		t.Fatalf("providerForPath = (%q, %v), want openrouter", provider, ok)
+	}
+	if agent := agentTypeForProviderSession("codex", accounts.ProviderOpenRouter); agent != "openrouter" {
+		t.Fatalf("agentTypeForProviderSession = %q, want openrouter", agent)
+	}
+	if plan := apiKeyPlanType(accounts.ProviderOpenRouter); plan != "openrouter api key" {
+		t.Fatalf("apiKeyPlanType = %q, want openrouter api key", plan)
+	}
 }

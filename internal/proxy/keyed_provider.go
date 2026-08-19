@@ -93,6 +93,21 @@ var keyedProviders = []keyedProvider{
 		LeaseEnv:    leaseEnvOpenAI,
 		Upstream:    func(s Server) *url.URL { return s.ZAIUpstream },
 	},
+	{
+		Provider:   accounts.ProviderOpenRouter,
+		PathPrefix: "openrouter",
+		Aliases:    []string{"open-router"},
+		PlanLabel:  "openrouter api key",
+		Auth:       authBearer,
+		// OpenRouter's base already ends in /v1 and it addresses every model as
+		// vendor/model, e.g. anthropic/claude-opus-5.
+		CollapseVersionSegment: true,
+		VendorPrefixedModels:   true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/openrouter/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server) *url.URL { return s.OpenRouterUpstream },
+	},
 }
 
 // keyedProviderFor returns the registry entry for a provider.

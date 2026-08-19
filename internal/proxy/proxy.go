@@ -48,19 +48,20 @@ type CredentialBroker interface {
 }
 
 type Server struct {
-	Upstream       *url.URL
-	CodexUpstream  *url.URL
-	APIUpstream    *url.URL
-	ClaudeUpstream *url.URL
-	KimiUpstream   *url.URL
-	ZAIUpstream    *url.URL
-	Accounts       []accounts.Account
-	AccountRef     *AccountRef
-	Sessions       *session.Store
-	Scheduler      selectacct.Scheduler
-	SchedulerRef   *selectacct.SchedulerRef
-	UsageScoreTTL  time.Duration
-	ScoreAccounts  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
+	Upstream           *url.URL
+	CodexUpstream      *url.URL
+	APIUpstream        *url.URL
+	ClaudeUpstream     *url.URL
+	KimiUpstream       *url.URL
+	ZAIUpstream        *url.URL
+	OpenRouterUpstream *url.URL
+	Accounts           []accounts.Account
+	AccountRef         *AccountRef
+	Sessions           *session.Store
+	Scheduler          selectacct.Scheduler
+	SchedulerRef       *selectacct.SchedulerRef
+	UsageScoreTTL      time.Duration
+	ScoreAccounts      func(context.Context, []accounts.Account) ([]selectacct.Score, int)
 	// RefreshAccountFn, when set, replaces the default OAuth refresh path. Test
 	// seam for simulating dead/expired refresh tokens; nil in production.
 	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)

@@ -446,7 +446,7 @@ func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
 	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
 	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
 
-	for _, tc := range []struct {
+	providers := []struct {
 		provider accounts.Provider
 		email    string
 		key      string
@@ -455,7 +455,10 @@ func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
 		{provider: accounts.ProviderClaude, email: "claude:anthropic", key: "anthropic-test"},
 		{provider: accounts.ProviderKimi, email: "kimi:kimi", key: "kimi-test"},
 		{provider: accounts.ProviderZAI, email: "zai:zai", key: "zai-test"},
-	} {
+		{provider: accounts.ProviderOpenRouter, email: "openrouter:openrouter", key: "sk-or-v1-test"},
+	}
+
+	for _, tc := range providers {
 		account := accounts.StoredCodexAccount{
 			Email:    tc.email,
 			Provider: tc.provider,
@@ -478,8 +481,8 @@ func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
 	}
 
 	loaded := ref.All()
-	if len(loaded) != 4 {
-		t.Fatalf("loaded accounts = %d, want 4: %+v", len(loaded), loaded)
+	if len(loaded) != len(providers) {
+		t.Fatalf("loaded accounts = %d, want %d: %+v", len(loaded), len(providers), loaded)
 	}
 	for _, account := range loaded {
 		if account.AuthMode != accounts.AuthModeAPIKey || account.Token == "" {

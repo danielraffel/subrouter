@@ -9,6 +9,10 @@ const (
 	ProviderClaude Provider = "claude"
 	ProviderKimi   Provider = "kimi"
 	ProviderZAI    Provider = "zai"
+
+	// ProviderOpenRouter routes to OpenRouter's OpenAI-compatible API with a
+	// per-account API key.
+	ProviderOpenRouter Provider = "openrouter"
 )
 
 type AuthMode string

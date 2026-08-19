@@ -24,6 +24,8 @@ const (
 	ProviderKimi   = account.ProviderKimi
 	ProviderZAI    = account.ProviderZAI
 
+	ProviderOpenRouter = account.ProviderOpenRouter
+
 	AuthModeOAuth  = account.AuthModeOAuth
 	AuthModeAPIKey = account.AuthModeAPIKey
 )
