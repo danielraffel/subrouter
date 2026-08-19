@@ -166,6 +166,20 @@ var keyedProviders = []keyedProvider{
 		LeaseEnv:               leaseEnvOpenAI,
 		Upstream:               func(s Server) *url.URL { return s.GrokUpstream },
 	},
+	{
+		Provider:    accounts.ProviderQwen,
+		PathPrefix:  "qwen",
+		Aliases:     []string{"dashscope", "modelstudio"},
+		ModelPrefix: "qwen",
+		PlanLabel:   "qwen coding plan key",
+		Auth:        authBearer,
+		// The Coding Plan endpoint already ends in /v1.
+		CollapseVersionSegment: true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/qwen/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server) *url.URL { return s.QwenUpstream },
+	},
 }
 
 // keyedProviderFor returns the registry entry for a provider.

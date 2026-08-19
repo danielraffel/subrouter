@@ -131,6 +131,8 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		server.OpenRouterUpstream = upstream
 	case accounts.ProviderGrok:
 		server.GrokUpstream = upstream
+	case accounts.ProviderQwen:
+		server.QwenUpstream = upstream
 	default:
 		t.Fatalf("no upstream field wired for provider %s", provider)
 	}
@@ -314,5 +316,55 @@ func TestSessionLeaseInfersGrokFromModelPrefix(t *testing.T) {
 	}
 	if _, _, err := sessionLeaseProvider("grok", "openai/gpt-5"); err == nil {
 		t.Fatal("grok must keep the vendor/model selector rule and reject a mismatch")
+	}
+}
+
+func TestHandlerRoutesQwenProviderPrefixToCodingPlanUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-sp-token" {
+			t.Fatalf("Authorization = %q, want the coding-plan bearer", got)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "" {
+			t.Fatalf("X-Api-Key = %q, want stripped", got)
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "qwen:main",
+		Provider: accounts.ProviderQwen,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "sk-sp-token",
+	}, accounts.ProviderQwen, upstream.URL+"/v1").Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/qwen/v1/chat/completions", strings.NewReader(`{"model":"qwen3-coder-plus"}`))
+	req.Header.Set("X-Api-Key", "client-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The Coding Plan is a subscription addressed by a plan-specific key, and its
+// endpoint differs from standard DashScope. A bare qwen model id resolves
+// without the caller naming a provider.
+func TestSessionLeaseInfersQwenFromModelPrefix(t *testing.T) {
+	provider, model, err := sessionLeaseProvider("", "qwen3-coder-plus")
+	if err != nil {
+		t.Fatalf("a bare qwen model should resolve: %v", err)
+	}
+	if provider != accounts.ProviderQwen || model != "qwen3-coder-plus" {
+		t.Fatalf("got (%q, %q), want (qwen, qwen3-coder-plus)", provider, model)
+	}
+	for _, alias := range []string{"qwen", "dashscope", "modelstudio"} {
+		got, _, err := sessionLeaseProvider(alias, "qwen3-coder-plus")
+		if err != nil || got != accounts.ProviderQwen {
+			t.Fatalf("alias %q resolved to (%q, %v), want qwen", alias, got, err)
+		}
 	}
 }

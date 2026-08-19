@@ -28,6 +28,8 @@ const (
 
 	ProviderGrok = account.ProviderGrok
 
+	ProviderQwen = account.ProviderQwen
+
 	AuthModeOAuth  = account.AuthModeOAuth
 	AuthModeAPIKey = account.AuthModeAPIKey
 )

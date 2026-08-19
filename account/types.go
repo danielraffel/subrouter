@@ -17,6 +17,11 @@ const (
 	// ProviderGrok routes to xAI's OpenAI-compatible API with a per-account
 	// API key.
 	ProviderGrok Provider = "grok"
+
+	// ProviderQwen routes to Alibaba Cloud Model Studio's Coding Plan, whose
+	// subscription is addressed with a plan-specific API key on a dedicated
+	// OpenAI-compatible endpoint.
+	ProviderQwen Provider = "qwen"
 )
 
 type AuthMode string

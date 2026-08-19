@@ -56,6 +56,7 @@ type Server struct {
 	ZAIUpstream        *url.URL
 	OpenRouterUpstream *url.URL
 	GrokUpstream       *url.URL
+	QwenUpstream       *url.URL
 	Accounts           []accounts.Account
 	AccountRef         *AccountRef
 	Sessions           *session.Store
