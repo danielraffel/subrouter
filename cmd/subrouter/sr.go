@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
@@ -155,6 +157,12 @@ type srSwitchOptions struct {
 }
 
 type srUsageRow struct {
+	// providerHealth is the result of probing the vendor with this key; empty
+	// when the provider offers no endpoint to probe.
+	providerHealth string
+	// providerModels counts the models the key is entitled to, from that same
+	// probe. Negative means unknown.
+	providerModels     int
 	email              string
 	active             bool
 	planType           string
@@ -1000,7 +1008,24 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		if account.IsAPIKey() {
 			rows[i].authMode = accounts.AuthModeAPIKey
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
-			rows[i].planType = "api key"
+			rows[i].planType = apiKeyPlanLabel(rowProvider)
+			rows[i].providerModels = -1
+			// These vendors publish no quota API, so the only live signals are
+			// whether the key still works and what it may reach. Probe
+			// concurrently with the rest of the row work so status stays fast,
+			// and treat a failure as information rather than an error.
+			if metering := proxy.ProviderMetering(rowProvider); metering != "" {
+				rows[i].planType = metering
+				wg.Add(1)
+				go func(idx int, provider accounts.Provider, token string) {
+					defer wg.Done()
+					probeCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+					defer cancel()
+					state, models := probeProviderKey(probeCtx, nil, provider, token)
+					rows[idx].providerHealth = state
+					rows[idx].providerModels = models
+				}(i, rowProvider, account.Auth.OpenAIAPIKey)
+			}
 			rows[i].apiKeyHint = r.apiKeyHint(account, admins)
 			if admin, ok, err := r.store.PickAdminKeyFor(account); err == nil && ok {
 				if fresh, ok, err := r.store.ReadUsageCache(admin.Label, account.ProjectID, srUsageCacheTTL); err == nil && ok {
@@ -1808,8 +1833,22 @@ func usageProviderLabel(row srUsageRow) string {
 	case accounts.ProviderClaude:
 		return "Claude profiles"
 	default:
-		return strings.Title(string(usageProvider(row))) + " accounts"
+		return providerDisplayName(usageProvider(row)) + " accounts"
 	}
+}
+
+// providerDisplayName renders a provider id as a section heading. Only the
+// first letter is capitalized: a provider id is a single token that may carry
+// its own hyphens ("qwen-token"), and title-casing every segment reads as two
+// words that do not exist.
+func providerDisplayName(provider accounts.Provider) string {
+	name := string(provider)
+	if name == "" {
+		return ""
+	}
+	runes := []rune(name)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
 }
 
 func usageRowTier(row srUsageRow) int {
@@ -2056,6 +2095,20 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
+	} else if isKeyedProviderSection(provider) {
+		// These vendors publish no quota or reset API, so the Codex windows and
+		// the scheduler's "Use" advice would always be empty or misleading.
+		// Show what is actually knowable instead: how the plan is metered,
+		// whether the key still works, what it can reach, and an explicit note
+		// that quota is not exposed. Plan is widened because a metering
+		// description is a phrase, not a tier name.
+		columns = dropUsageGridColumn(columns, "Pick")
+		setUsageGridColumnWidth(columns, "Plan", 24)
+		columns = append(columns,
+			usageGridColumn{Key: "Models", Title: "Models", Width: 6},
+			usageGridColumn{Key: "Endpoints", Title: "Endpoints", Width: 28},
+			usageGridColumn{Key: "Quota", Title: "Quota", Width: 11},
+		)
 	} else {
 		columns = append(columns,
 			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
@@ -2088,6 +2141,9 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Account":   {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
 		"Plan":      {Text: row.planType, Style: ansiDim},
 		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Models":    {Text: usageGridModels(row), Style: ansiDim},
+		"Endpoints": {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
+		"Quota":     {Text: "not exposed", Style: ansiDim},
 		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
 		"5h":        usageGridShortWindowCell(row),
 		"7d":        usageGridWindowCell(row.windows, isLongQuotaWindow),
@@ -2224,6 +2280,12 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	// For a keyed provider the useful state is whether the key still works,
+	// not the Codex scheduler's view of it: none of the Codex states apply to a
+	// vendor that publishes no quota.
+	if row.providerHealth != "" {
+		return row.providerHealth
+	}
 	var states []string
 	if row.active && row.gtoRecommended {
 		states = append(states, "active rec")
@@ -2809,4 +2871,87 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// apiKeyPlanLabel names an API-key account's provider in the usage table, so a
+// Qwen or Grok key is not described with the same bare label as a Codex one.
+func apiKeyPlanLabel(provider accounts.Provider) string {
+	if provider == "" || provider == accounts.ProviderCodex {
+		return "api key"
+	}
+	return string(provider) + " key"
+}
+
+// isKeyedProviderSection reports whether a status section belongs to an
+// API-key provider that the registry routes.
+func isKeyedProviderSection(provider accounts.Provider) bool {
+	return proxy.ProviderMetering(provider) != ""
+}
+
+// usageGridModels renders the entitled model count from the health probe.
+func usageGridModels(row srUsageRow) string {
+	if row.providerModels < 0 {
+		return "?"
+	}
+	return strconv.Itoa(row.providerModels)
+}
+
+// probeProviderKey asks the vendor whether this key still works and how many
+// models it may use. These vendors expose no quota API, so key validity and
+// entitlement are the only live signals available. A provider with no health
+// endpoint, or an unreachable one, reports what happened rather than guessing.
+func probeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, token string) (state string, models int) {
+	url := proxy.ProviderHealthURL(provider)
+	if url == "" {
+		return "", -1
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 6 * time.Second}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "unreachable", -1
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := client.Do(req)
+	if err != nil {
+		return "unreachable", -1
+	}
+	defer func() { _ = res.Body.Close() }()
+	switch {
+	case res.StatusCode == http.StatusUnauthorized:
+		return "bad key", -1
+	case res.StatusCode == http.StatusForbidden:
+		return "denied", -1
+	case res.StatusCode < 200 || res.StatusCode >= 300:
+		return fmt.Sprintf("http %d", res.StatusCode), -1
+	}
+	var payload struct {
+		Data []struct{} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&payload); err != nil {
+		return "ok", -1
+	}
+	return "ok", len(payload.Data)
+}
+
+// dropUsageGridColumn removes a column that does not apply to a section.
+func dropUsageGridColumn(columns []usageGridColumn, key string) []usageGridColumn {
+	out := columns[:0]
+	for _, column := range columns {
+		if column.Key != key {
+			out = append(out, column)
+		}
+	}
+	return out
+}
+
+// setUsageGridColumnWidth widens a column that carries a phrase rather than a
+// short token, so it is not truncated to an ellipsis.
+func setUsageGridColumnWidth(columns []usageGridColumn, key string, width int) {
+	for i := range columns {
+		if columns[i].Key == key && columns[i].Width < width {
+			columns[i].Width = width
+		}
+	}
 }

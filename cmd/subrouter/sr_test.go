@@ -18,6 +18,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
@@ -1545,5 +1546,135 @@ func TestUsageErrorFootnoteShowsProviderAndReaddCommand(t *testing.T) {
 	}
 	if !strings.Contains(text, "codex-flaky@example.com [codex]: usage fetch failed: connection refused") {
 		t.Fatalf("transient error footnote should still show provider:\n%s", text)
+	}
+}
+
+// A usage row must be filed under the provider its key actually reaches.
+// Hardcoding Codex listed every Qwen, Grok, and OpenRouter key under
+// "Codex accounts", which misreports what the account is for.
+func TestUsageRowsGroupByTheirOwnProvider(t *testing.T) {
+	cases := []struct {
+		provider  accounts.Provider
+		wantLabel string
+		wantPlan  string
+	}{
+		{provider: accounts.ProviderCodex, wantLabel: "Codex accounts", wantPlan: "api key"},
+		{provider: "", wantLabel: "Codex accounts", wantPlan: "api key"},
+		{provider: accounts.ProviderClaude, wantLabel: "Claude profiles", wantPlan: "claude key"},
+		{provider: accounts.ProviderQwenToken, wantLabel: "Qwen-token accounts", wantPlan: "qwen-token key"},
+		{provider: accounts.ProviderQwenAnthropic, wantLabel: "Qwen-anthropic accounts", wantPlan: "qwen-anthropic key"},
+		{provider: accounts.ProviderGrok, wantLabel: "Grok accounts", wantPlan: "grok key"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.provider), func(t *testing.T) {
+			row := srUsageRow{email: "acct", provider: tc.provider}
+			if got := usageProviderLabel(row); got != tc.wantLabel {
+				t.Fatalf("usageProviderLabel = %q, want %q", got, tc.wantLabel)
+			}
+			if got := apiKeyPlanLabel(tc.provider); got != tc.wantPlan {
+				t.Fatalf("apiKeyPlanLabel = %q, want %q", got, tc.wantPlan)
+			}
+		})
+	}
+
+	// Codex and Claude keep their positions; everything else sorts after them
+	// rather than interleaving.
+	codex := usageProviderOrder(srUsageRow{provider: accounts.ProviderCodex})
+	claude := usageProviderOrder(srUsageRow{provider: accounts.ProviderClaude})
+	other := usageProviderOrder(srUsageRow{provider: accounts.ProviderQwenToken})
+	if !(codex < claude && claude < other) {
+		t.Fatalf("ordering = codex %d, claude %d, other %d; want codex first", codex, claude, other)
+	}
+}
+
+// The Codex windows and the scheduler's "Use" advice mean nothing for a vendor
+// that publishes no quota, so a keyed-provider section gets its own columns.
+func TestKeyedProviderSectionUsesItsOwnColumns(t *testing.T) {
+	var out bytes.Buffer
+	keyed := usageGridColumns(&out, false, accounts.ProviderQwenToken)
+	keys := map[string]int{}
+	for _, column := range keyed {
+		keys[column.Key] = column.Width
+	}
+	for _, want := range []string{"Account", "Plan", "State", "Models", "Endpoints", "Quota"} {
+		if _, ok := keys[want]; !ok {
+			t.Fatalf("keyed section is missing the %q column: %v", want, keys)
+		}
+	}
+	for _, unwanted := range []string{"Pick", "5h", "7d", "Reset", "Credits"} {
+		if _, ok := keys[unwanted]; ok {
+			t.Fatalf("keyed section should not carry the %q column", unwanted)
+		}
+	}
+	// "token plan, per credit" must not be truncated to an ellipsis.
+	if keys["Plan"] < len("token plan, per credit") {
+		t.Fatalf("Plan width %d truncates the metering description", keys["Plan"])
+	}
+
+	// Codex keeps its own columns untouched.
+	codex := usageGridColumns(&out, false, accounts.ProviderCodex)
+	codexKeys := map[string]bool{}
+	for _, column := range codex {
+		codexKeys[column.Key] = true
+	}
+	for _, want := range []string{"Pick", "5h", "7d"} {
+		if !codexKeys[want] {
+			t.Fatalf("codex section lost its %q column", want)
+		}
+	}
+	if codexKeys["Endpoints"] || codexKeys["Quota"] {
+		t.Fatal("codex section must not gain the keyed-provider columns")
+	}
+}
+
+// One subscription reachable over two protocols must read as one account
+// listing both endpoints, not as two accounts.
+func TestProviderEndpointsCollapseASharedSubscription(t *testing.T) {
+	for _, provider := range []accounts.Provider{accounts.ProviderQwenToken, accounts.ProviderQwenAnthropic} {
+		got := proxy.ProviderEndpoints(provider)
+		if len(got) != 2 {
+			t.Fatalf("provider %q lists %v, want both protocol endpoints", provider, got)
+		}
+	}
+	if got := proxy.ProviderEndpoints(accounts.ProviderGrok); len(got) != 1 || got[0] != "/grok" {
+		t.Fatalf("a provider that owns its credential lists %v, want just its own", got)
+	}
+}
+
+// The health probe must classify what the vendor actually returns, since these
+// providers offer no quota API and key validity is the only live signal.
+func TestProbeProviderKeyClassifiesTheResponse(t *testing.T) {
+	if state, models := probeProviderKey(context.Background(), nil, accounts.ProviderQwenAnthropic, "k"); state != "" || models != -1 {
+		t.Fatalf("a provider with no health endpoint should report nothing, got %q %d", state, models)
+	}
+	if state := usageGridState(srUsageRow{providerHealth: "bad key"}); state != "bad key" {
+		t.Fatalf("a keyed provider's state should come from its probe, got %q", state)
+	}
+	// A row with no probe result falls back to the scheduler's state.
+	if state := usageGridState(srUsageRow{active: true}); state != "active" {
+		t.Fatalf("a non-keyed row should keep the scheduler state, got %q", state)
+	}
+	if got := usageGridModels(srUsageRow{providerModels: -1}); got != "?" {
+		t.Fatalf("an unknown model count should render %q, got %q", "?", got)
+	}
+	if got := usageGridModels(srUsageRow{providerModels: 11}); got != "11" {
+		t.Fatalf("model count = %q, want 11", got)
+	}
+}
+
+// The flag defaults and the health probe must read the same base URL, or a
+// probe silently checks an address the proxy does not use.
+func TestProviderDefaultUpstreamsAreDeclared(t *testing.T) {
+	for _, provider := range []accounts.Provider{
+		accounts.ProviderKimi, accounts.ProviderZAI, accounts.ProviderOpenRouter,
+		accounts.ProviderGrok, accounts.ProviderQwen, accounts.ProviderQwenToken,
+		accounts.ProviderQwenAnthropic,
+	} {
+		if proxy.ProviderDefaultUpstream(provider) == "" {
+			t.Fatalf("provider %q declares no default upstream", provider)
+		}
+		if proxy.ProviderMetering(provider) == "" {
+			t.Fatalf("provider %q declares no metering description", provider)
+		}
 	}
 }

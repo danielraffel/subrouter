@@ -168,3 +168,53 @@ func TestParseOpenAICompatibleFlag(t *testing.T) {
 		t.Fatal("a declaration without = must be rejected")
 	}
 }
+
+// A vendor that exposes one subscription on two protocol endpoints must not
+// require the key to be stored twice. Registering it once against the owning
+// provider has to serve both entries, or rotating the key means editing every
+// copy and account listings double-count one subscription.
+func TestOneSubscriptionServesBothProtocolEntries(t *testing.T) {
+	if got := accountProviderFor(accounts.ProviderQwenAnthropic); got != accounts.ProviderQwenToken {
+		t.Fatalf("accountProviderFor(qwen-anthropic) = %q, want qwen-token", got)
+	}
+	if got := accountProviderFor(accounts.ProviderQwenToken); got != accounts.ProviderQwenToken {
+		t.Fatalf("a provider that owns its accounts must resolve to itself, got %q", got)
+	}
+	if got := accountProviderFor(accounts.ProviderCodex); got != accounts.ProviderCodex {
+		t.Fatalf("a non-registry provider must resolve to itself, got %q", got)
+	}
+
+	// One stored account, under the owning provider only.
+	stored := []accounts.Account{{
+		ID: "qwen-token:main", Provider: accounts.ProviderQwenToken,
+		AuthMode: accounts.AuthModeAPIKey, Token: "sk-sp-one",
+	}}
+	for _, provider := range []accounts.Provider{accounts.ProviderQwenToken, accounts.ProviderQwenAnthropic} {
+		got := filterAccountsForProvider(stored, provider)
+		if len(got) != 1 || got[0].Token != "sk-sp-one" {
+			t.Fatalf("provider %q selected %d accounts, want the single shared credential", provider, len(got))
+		}
+		// The selected account must carry the REQUESTED provider, since
+		// upstream selection and path rewriting key on it. Carrying the
+		// credential owner's provider routes the Anthropic endpoint through the
+		// OpenAI upstream and 404s.
+		if got[0].Provider != provider {
+			t.Fatalf("selected account carries provider %q, want the requested %q", got[0].Provider, provider)
+		}
+		if got[0].ID != "qwen-token:main" {
+			t.Fatalf("account id changed to %q; stickiness and forced selection key on it", got[0].ID)
+		}
+	}
+	// Stamping must not mutate the caller's slice.
+	if stored[0].Provider != accounts.ProviderQwenToken {
+		t.Fatalf("the stored account was mutated to %q", stored[0].Provider)
+	}
+
+	// Sharing must not leak across unrelated providers.
+	if got := filterAccountsForProvider(stored, accounts.ProviderGrok); len(got) != 0 {
+		t.Fatalf("grok selected %d qwen accounts, want none", len(got))
+	}
+	if got := filterAccountsForProvider(stored, accounts.ProviderCodex); len(got) != 0 {
+		t.Fatalf("codex selected %d qwen accounts, want none", len(got))
+	}
+}

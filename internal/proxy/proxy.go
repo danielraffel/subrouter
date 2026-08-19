@@ -4983,10 +4983,19 @@ func stripProviderPathPrefix(path, provider string) string {
 }
 
 func filterAccountsForProvider(all []accounts.Account, provider accounts.Provider) []accounts.Account {
+	// A provider that shares a subscription with another selects that
+	// provider's accounts, so one stored credential serves both. The selected
+	// account is stamped with the requested provider, because everything
+	// downstream — upstream selection, path rewriting, auth — must follow the
+	// endpoint the client asked for, not the one that owns the credential.
+	// Leaving the owner's provider on it routes an Anthropic-protocol request
+	// through the OpenAI upstream and its path rules, which 404s.
+	credentialProvider := accountProviderFor(provider)
 	filtered := make([]accounts.Account, 0, len(all))
 	legacy := make([]accounts.Account, 0)
 	for _, account := range all {
-		if account.Provider == provider {
+		if account.Provider == credentialProvider {
+			account.Provider = provider
 			filtered = append(filtered, account)
 			continue
 		}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -103,6 +104,26 @@ type keyedProvider struct {
 	// LeasePath is the single path a lease for this provider may call.
 	LeasePath string
 	LeaseEnv  leaseEnvStyle
+	// Metering describes how the vendor charges this provider, so an operator
+	// can tell an invocation-metered plan from a credit-metered one without
+	// leaving the terminal. Vendors in this table expose no quota API, so this
+	// is the only plan information available.
+	Metering string
+	// HealthPath is a GET that proves a key still works, relative to the
+	// upstream base. Empty means the provider offers no such endpoint and its
+	// state cannot be probed.
+	HealthPath string
+	// DefaultUpstream is the vendor's documented base URL for this provider. It
+	// is the flag default and the address a health probe uses, so the two
+	// cannot drift apart.
+	DefaultUpstream string
+	// AccountProvider names the provider whose accounts serve this one. A
+	// vendor that exposes one subscription on two protocol endpoints gets an
+	// entry per endpoint, but the subscription is still a single credential:
+	// without this, the same key has to be stored once per entry, rotating it
+	// means editing every copy, and account listings double-count one
+	// subscription. Empty means the provider owns its own accounts.
+	AccountProvider accounts.Provider
 	// Upstream reads this provider's configured base URL off the server.
 	Upstream func(Server) *url.URL
 }
@@ -115,6 +136,9 @@ type keyedProvider struct {
 var builtinKeyedProviders = []keyedProvider{
 	{
 		Provider:               accounts.ProviderKimi,
+		DefaultUpstream:        "https://api.kimi.com/coding/v1",
+		Metering:               "subscription, per request",
+		HealthPath:             "/models",
 		PathPrefix:             "kimi",
 		Aliases:                []string{"kimi-for-coding"},
 		ModelPrefix:            "kimi-",
@@ -127,23 +151,29 @@ var builtinKeyedProviders = []keyedProvider{
 		Upstream:               func(s Server) *url.URL { return s.KimiUpstream },
 	},
 	{
-		Provider:    accounts.ProviderZAI,
-		PathPrefix:  "zai",
-		Aliases:     []string{"glm", "glm-5.2"},
-		ModelPrefix: "glm-",
-		PlanLabel:   "zai api key",
-		Auth:        authBearer,
-		LeaseAPI:    "openai-completions",
-		LeasePath:   "/zai/chat/completions",
-		LeaseEnv:    leaseEnvOpenAI,
-		Upstream:    func(s Server) *url.URL { return s.ZAIUpstream },
+		Provider:        accounts.ProviderZAI,
+		DefaultUpstream: "https://api.z.ai/api/coding/paas/v4",
+		Metering:        "subscription, per request",
+		HealthPath:      "/models",
+		PathPrefix:      "zai",
+		Aliases:         []string{"glm", "glm-5.2"},
+		ModelPrefix:     "glm-",
+		PlanLabel:       "zai api key",
+		Auth:            authBearer,
+		LeaseAPI:        "openai-completions",
+		LeasePath:       "/zai/chat/completions",
+		LeaseEnv:        leaseEnvOpenAI,
+		Upstream:        func(s Server) *url.URL { return s.ZAIUpstream },
 	},
 	{
-		Provider:   accounts.ProviderOpenRouter,
-		PathPrefix: "openrouter",
-		Aliases:    []string{"open-router"},
-		PlanLabel:  "openrouter api key",
-		Auth:       authBearer,
+		Provider:        accounts.ProviderOpenRouter,
+		DefaultUpstream: "https://openrouter.ai/api/v1",
+		Metering:        "credits, per token",
+		HealthPath:      "/models",
+		PathPrefix:      "openrouter",
+		Aliases:         []string{"open-router"},
+		PlanLabel:       "openrouter api key",
+		Auth:            authBearer,
 		// OpenRouter's base already ends in /v1 and it addresses every model as
 		// vendor/model, e.g. anthropic/claude-opus-5.
 		CollapseVersionSegment: true,
@@ -154,12 +184,15 @@ var builtinKeyedProviders = []keyedProvider{
 		Upstream:               func(s Server) *url.URL { return s.OpenRouterUpstream },
 	},
 	{
-		Provider:    accounts.ProviderGrok,
-		PathPrefix:  "grok",
-		Aliases:     []string{"xai", "x-ai"},
-		ModelPrefix: "grok-",
-		PlanLabel:   "grok api key",
-		Auth:        authBearer,
+		Provider:        accounts.ProviderGrok,
+		DefaultUpstream: "https://api.x.ai/v1",
+		Metering:        "api key, per token",
+		HealthPath:      "/models",
+		PathPrefix:      "grok",
+		Aliases:         []string{"xai", "x-ai"},
+		ModelPrefix:     "grok-",
+		PlanLabel:       "grok api key",
+		Auth:            authBearer,
 		// api.x.ai/v1 already ends in /v1. xAI model ids are bare (grok-4), so
 		// the vendor/model provider-selector rule still applies.
 		CollapseVersionSegment: true,
@@ -169,12 +202,15 @@ var builtinKeyedProviders = []keyedProvider{
 		Upstream:               func(s Server) *url.URL { return s.GrokUpstream },
 	},
 	{
-		Provider:    accounts.ProviderQwen,
-		PathPrefix:  "qwen",
-		Aliases:     []string{"dashscope", "modelstudio"},
-		ModelPrefix: "qwen",
-		PlanLabel:   "qwen coding plan key",
-		Auth:        authBearer,
+		Provider:        accounts.ProviderQwen,
+		DefaultUpstream: "https://coding-intl.dashscope.aliyuncs.com/v1",
+		Metering:        "coding plan, per invocation",
+		HealthPath:      "/models",
+		PathPrefix:      "qwen",
+		Aliases:         []string{"dashscope", "modelstudio"},
+		ModelPrefix:     "qwen",
+		PlanLabel:       "qwen coding plan key",
+		Auth:            authBearer,
 		// The Coding Plan endpoint already ends in /v1.
 		CollapseVersionSegment: true,
 		LeaseAPI:               "openai-completions",
@@ -183,11 +219,14 @@ var builtinKeyedProviders = []keyedProvider{
 		Upstream:               func(s Server) *url.URL { return s.QwenUpstream },
 	},
 	{
-		Provider:   accounts.ProviderQwenToken,
-		PathPrefix: "qwen-token",
-		Aliases:    []string{"tokenplan", "qwen-tokenplan"},
-		PlanLabel:  "qwen token plan key",
-		Auth:       authBearer,
+		Provider:        accounts.ProviderQwenToken,
+		DefaultUpstream: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		Metering:        "token plan, per credit",
+		HealthPath:      "/models",
+		PathPrefix:      "qwen-token",
+		Aliases:         []string{"tokenplan", "qwen-tokenplan"},
+		PlanLabel:       "qwen token plan key",
+		Auth:            authBearer,
 		// The Token Plan endpoint ends in /compatible-mode/v1.
 		CollapseVersionSegment: true,
 		LeaseAPI:               "openai-completions",
@@ -196,11 +235,16 @@ var builtinKeyedProviders = []keyedProvider{
 		Upstream:               func(s Server) *url.URL { return s.QwenTokenUpstream },
 	},
 	{
-		Provider:   accounts.ProviderQwenAnthropic,
-		PathPrefix: "qwen-anthropic",
-		Aliases:    []string{"qwen-token-anthropic", "tokenplan-anthropic"},
-		PlanLabel:  "qwen token plan key",
-		Auth:       authBearer,
+		Provider:        accounts.ProviderQwenAnthropic,
+		DefaultUpstream: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+		Metering:        "token plan, per credit",
+		HealthPath:      "",
+		// One Token Plan subscription, reachable over two protocols.
+		AccountProvider: accounts.ProviderQwenToken,
+		PathPrefix:      "qwen-anthropic",
+		Aliases:         []string{"qwen-token-anthropic", "tokenplan-anthropic"},
+		PlanLabel:       "qwen token plan key",
+		Auth:            authBearer,
 		// The Anthropic base stops at /apps/anthropic and the client appends
 		// /v1/messages itself, so the version segment must survive: collapsing
 		// it here is what produces the /v1/v1 404 the vendor documents.
@@ -348,4 +392,59 @@ func APIKeyProviderList() string {
 		return names[0]
 	}
 	return strings.Join(names[:len(names)-1], ", ") + ", or " + names[len(names)-1]
+}
+
+// accountProviderFor resolves which provider's accounts serve a request for
+// this provider. Providers that share a subscription across protocol endpoints
+// resolve to the one that owns the credential.
+func accountProviderFor(provider accounts.Provider) accounts.Provider {
+	if entry, ok := keyedProviderFor(provider); ok && entry.AccountProvider != "" {
+		return entry.AccountProvider
+	}
+	return provider
+}
+
+// ProviderDefaultUpstream returns a provider's documented base URL, so a flag
+// default and a health probe read the same value.
+func ProviderDefaultUpstream(provider accounts.Provider) string {
+	entry, ok := keyedProviderFor(provider)
+	if !ok {
+		return ""
+	}
+	return entry.DefaultUpstream
+}
+
+// ProviderMetering describes how a vendor charges this provider. These vendors
+// expose no quota API, so this is the only plan information available.
+func ProviderMetering(provider accounts.Provider) string {
+	entry, ok := keyedProviderFor(provider)
+	if !ok {
+		return ""
+	}
+	return entry.Metering
+}
+
+// ProviderHealthURL returns the URL that proves a key still works, or "" when
+// the provider offers no such endpoint.
+func ProviderHealthURL(provider accounts.Provider) string {
+	entry, ok := keyedProviderFor(provider)
+	if !ok || entry.HealthPath == "" || entry.DefaultUpstream == "" {
+		return ""
+	}
+	return strings.TrimRight(entry.DefaultUpstream, "/") + entry.HealthPath
+}
+
+// ProviderEndpoints lists every path prefix served by one provider's
+// credential, so a subscription reachable over two protocols reads as one
+// account rather than two.
+func ProviderEndpoints(provider accounts.Provider) []string {
+	owner := accountProviderFor(provider)
+	paths := make([]string, 0, 2)
+	for _, entry := range keyedProviders() {
+		if accountProviderFor(entry.Provider) == owner {
+			paths = append(paths, "/"+entry.PathPrefix)
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
