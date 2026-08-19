@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -460,5 +461,22 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn403OrgDisabled(t *testing.T) {
 	assignment, ok := store.Get("claude", "session-403")
 	if !ok || assignment.AccountID != "fresh@example.com" {
 		t.Fatalf("sticky assignment = %+v, want moved off the org-disabled account", assignment)
+	}
+}
+
+// A stored credential that will not decode cannot be refreshed, so it needs
+// re-auth exactly like a rejected refresh token does. Classifying it as
+// transient would retry the same unparseable blob forever instead of failing
+// over to an account that still works.
+func TestIsTerminalCredentialErrorClassifiesUnreadableCredential(t *testing.T) {
+	unreadable := errors.New(`unreadable credential from keychain (bytes=132 offset=125 trailing_bytes=8 trailing_kind=binary-plist): invalid character 'b' after top-level value`)
+	if !isTerminalCredentialError(unreadable) {
+		t.Fatal("an unreadable stored credential must be terminal so selection fails over")
+	}
+	if isTerminalCredentialError(errors.New("Claude OAuth refresh failed: 503 Service Unavailable")) {
+		t.Fatal("an upstream 5xx must stay transient")
+	}
+	if isTerminalCredentialError(context.Canceled) {
+		t.Fatal("a cancelled context must stay transient")
 	}
 }
