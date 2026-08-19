@@ -26,6 +26,8 @@ const (
 
 	ProviderOpenRouter = account.ProviderOpenRouter
 
+	ProviderGrok = account.ProviderGrok
+
 	AuthModeOAuth  = account.AuthModeOAuth
 	AuthModeAPIKey = account.AuthModeAPIKey
 )

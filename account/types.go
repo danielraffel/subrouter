@@ -13,6 +13,10 @@ const (
 	// ProviderOpenRouter routes to OpenRouter's OpenAI-compatible API with a
 	// per-account API key.
 	ProviderOpenRouter Provider = "openrouter"
+
+	// ProviderGrok routes to xAI's OpenAI-compatible API with a per-account
+	// API key.
+	ProviderGrok Provider = "grok"
 )
 
 type AuthMode string

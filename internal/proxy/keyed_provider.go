@@ -151,6 +151,21 @@ var keyedProviders = []keyedProvider{
 		LeaseEnv:               leaseEnvOpenAI,
 		Upstream:               func(s Server) *url.URL { return s.OpenRouterUpstream },
 	},
+	{
+		Provider:    accounts.ProviderGrok,
+		PathPrefix:  "grok",
+		Aliases:     []string{"xai", "x-ai"},
+		ModelPrefix: "grok-",
+		PlanLabel:   "grok api key",
+		Auth:        authBearer,
+		// api.x.ai/v1 already ends in /v1. xAI model ids are bare (grok-4), so
+		// the vendor/model provider-selector rule still applies.
+		CollapseVersionSegment: true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/grok/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server) *url.URL { return s.GrokUpstream },
+	},
 }
 
 // keyedProviderFor returns the registry entry for a provider.

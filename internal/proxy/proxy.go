@@ -55,6 +55,7 @@ type Server struct {
 	KimiUpstream       *url.URL
 	ZAIUpstream        *url.URL
 	OpenRouterUpstream *url.URL
+	GrokUpstream       *url.URL
 	Accounts           []accounts.Account
 	AccountRef         *AccountRef
 	Sessions           *session.Store

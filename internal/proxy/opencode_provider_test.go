@@ -115,15 +115,27 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		Sessions:     store,
 		MaxBodyBytes: 1024,
 	}
-	switch provider {
+	// Resolve through the registry so a newly registered provider is testable
+	// without editing this helper, and so an entry whose Upstream accessor reads
+	// the wrong field fails loudly instead of silently routing nowhere.
+	entry, ok := keyedProviderFor(provider)
+	if !ok {
+		t.Fatalf("unsupported provider %s", provider)
+	}
+	switch entry.Provider {
 	case accounts.ProviderKimi:
 		server.KimiUpstream = upstream
 	case accounts.ProviderZAI:
 		server.ZAIUpstream = upstream
 	case accounts.ProviderOpenRouter:
 		server.OpenRouterUpstream = upstream
+	case accounts.ProviderGrok:
+		server.GrokUpstream = upstream
 	default:
-		t.Fatalf("unsupported provider %s", provider)
+		t.Fatalf("no upstream field wired for provider %s", provider)
+	}
+	if entry.Upstream(server) != upstream {
+		t.Fatalf("provider %s upstream accessor does not read the field this helper set", provider)
 	}
 	return server
 }
@@ -223,5 +235,84 @@ func TestProviderForPathOpenRouter(t *testing.T) {
 	}
 	if plan := apiKeyPlanType(accounts.ProviderOpenRouter); plan != "openrouter api key" {
 		t.Fatalf("apiKeyPlanType = %q, want openrouter api key", plan)
+	}
+}
+
+func TestHandlerRoutesGrokProviderPrefixToGrokUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer xai-token" {
+			t.Fatalf("Authorization = %q, want the xai bearer", got)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "" {
+			t.Fatalf("X-Api-Key = %q, want stripped", got)
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "grok:main",
+		Provider: accounts.ProviderGrok,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "xai-token",
+	}, accounts.ProviderGrok, upstream.URL+"/v1").Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/grok/chat/completions", strings.NewReader(`{"model":"grok-4"}`))
+	req.Header.Set("X-Api-Key", "client-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// api.x.ai/v1 already ends in /v1 and OpenAI-compatible clients send
+// /v1/chat/completions, so the version segment must collapse.
+func TestHandlerCollapsesDuplicateV1ForGrokUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "grok:main",
+		Provider: accounts.ProviderGrok,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "xai-token",
+	}, accounts.ProviderGrok, upstream.URL+"/v1").Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/grok/v1/chat/completions", strings.NewReader(`{"model":"grok-4"}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A bare grok- model id resolves to Grok without the caller naming a provider,
+// the same way glm- resolves to ZAI. Unlike OpenRouter, xAI model ids carry no
+// vendor prefix, so the provider-selector rule still applies to Grok.
+func TestSessionLeaseInfersGrokFromModelPrefix(t *testing.T) {
+	provider, model, err := sessionLeaseProvider("", "grok-4")
+	if err != nil {
+		t.Fatalf("a bare grok model should resolve: %v", err)
+	}
+	if provider != accounts.ProviderGrok || model != "grok-4" {
+		t.Fatalf("got (%q, %q), want (grok, grok-4)", provider, model)
+	}
+	for _, alias := range []string{"grok", "xai", "x-ai"} {
+		got, _, err := sessionLeaseProvider(alias, "grok-4")
+		if err != nil || got != accounts.ProviderGrok {
+			t.Fatalf("alias %q resolved to (%q, %v), want grok", alias, got, err)
+		}
+	}
+	if _, _, err := sessionLeaseProvider("grok", "openai/gpt-5"); err == nil {
+		t.Fatal("grok must keep the vendor/model selector rule and reject a mismatch")
 	}
 }
