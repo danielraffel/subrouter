@@ -607,6 +607,30 @@ func TestSRDefaultShowsTemporarilyCookedAccountWhenShortWindowConsumed(t *testin
 	}
 }
 
+func TestModelScopedShortWindowDoesNotTemporarilyCookWholeAccount(t *testing.T) {
+	windows := []accounts.UsageWindow{
+		{Name: "primary", UsedPercent: 28, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{
+			Name:               "GPT-5.3-Codex-Spark/primary",
+			Feature:            "GPT-5.3-Codex-Spark",
+			UsedPercent:        100,
+			LimitWindowSeconds: int64((5 * time.Hour) / time.Second),
+			ResetAfterSeconds:  int64((4 * time.Hour) / time.Second),
+		},
+		{
+			Name:               "GPT-5.3-Codex-Spark/secondary",
+			Feature:            "GPT-5.3-Codex-Spark",
+			UsedPercent:        48,
+			LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second),
+		},
+	}
+
+	tempCooked, reason := tempCookedFromWindows(windows)
+	if tempCooked {
+		t.Fatalf("account should remain switchable when only a model-scoped short window is exhausted (reason=%q)", reason)
+	}
+}
+
 func TestSRInteractiveRefusesTemporarilyCookedSelection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

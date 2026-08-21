@@ -1405,7 +1405,7 @@ func tempCookedFromWindows(windows []accounts.UsageWindow) (bool, string) {
 		return false, ""
 	}
 	for _, window := range windows {
-		if !isShortQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
+		if isModelScopedWindow(window) || !isShortQuotaWindow(window) || clampUsagePercent(window.UsedPercent) < 100 {
 			continue
 		}
 		if window.ResetAfterSeconds > 0 {
