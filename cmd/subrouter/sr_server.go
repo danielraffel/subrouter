@@ -407,7 +407,14 @@ func (r srRunner) defaultRemoteServer() (srServerConfig, bool, error) {
 
 func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	store := defaultSRServerStore(r.store)
-	if serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); serverName != "" {
+	// SUBROUTER_SERVER is provider-neutral and is used by Claude profile
+	// maintenance commands. Keep SUBROUTER_CODEX_SERVER as the Codex-specific
+	// compatibility override used by existing shell integrations.
+	serverName := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
+	if serverName == "" {
+		serverName = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
+	}
+	if serverName != "" {
 		if isLocalServerName(serverName) {
 			return srServerConfig{}, false, nil
 		}

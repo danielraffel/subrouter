@@ -526,6 +526,32 @@ func TestSRServerEnvLocalKeepsCommandsLocal(t *testing.T) {
 	}
 }
 
+func TestSRServerGenericEnvSelectsNamedServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_SERVER", "team")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "local")
+	store := accounts.DefaultCodexStore()
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "other",
+		Servers: []srServerConfig{
+			{Name: "team", URL: "http://team.example:31415"},
+			{Name: "other", URL: "http://other.example:31415"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store}
+	server, ok, err := runner.selectedRemoteServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || server.Name != "team" {
+		t.Fatalf("selected server = %#v, ok=%v; want team", server, ok)
+	}
+}
+
 func TestSRSwitchDoesNotMutateLocalWhenDefaultRemoteServerSelected(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
