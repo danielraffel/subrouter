@@ -5,10 +5,16 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// MaxRetainedAssignments bounds the on-disk and HTTP-visible routing history.
+// The client may further cap its snapshot, but the daemon must never
+// materialize an unbounded session map first.
+const MaxRetainedAssignments = 512
 
 type Assignment struct {
 	AgentType string    `json:"agent_type"`
@@ -80,6 +86,7 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 		}
 	}
 	s.data[key] = assignment
+	s.pruneLocked()
 	return assignment, s.saveLocked()
 }
 
@@ -88,10 +95,17 @@ func (s *Store) All() []Assignment {
 	defer s.mu.Unlock()
 	s.reloadBestEffortLocked()
 
+	s.pruneLocked()
 	assignments := make([]Assignment, 0, len(s.data))
 	for _, assignment := range s.data {
 		assignments = append(assignments, assignment)
 	}
+	sort.Slice(assignments, func(i, j int) bool {
+		if assignments[i].UpdatedAt.Equal(assignments[j].UpdatedAt) {
+			return assignments[i].SessionID < assignments[j].SessionID
+		}
+		return assignments[i].UpdatedAt.After(assignments[j].UpdatedAt)
+	})
 	return assignments
 }
 
@@ -131,7 +145,31 @@ func (s *Store) loadLocked() error {
 	}
 	s.data = data
 	s.migrateLoadedAssignments()
+	s.pruneLocked()
 	return nil
+}
+
+func (s *Store) pruneLocked() {
+	if len(s.data) <= MaxRetainedAssignments {
+		return
+	}
+	type entry struct {
+		key       string
+		updatedAt time.Time
+	}
+	entries := make([]entry, 0, len(s.data))
+	for key, assignment := range s.data {
+		entries = append(entries, entry{key: key, updatedAt: assignment.UpdatedAt})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].updatedAt.Equal(entries[j].updatedAt) {
+			return entries[i].key < entries[j].key
+		}
+		return entries[i].updatedAt.After(entries[j].updatedAt)
+	})
+	for _, stale := range entries[MaxRetainedAssignments:] {
+		delete(s.data, stale.key)
+	}
 }
 
 func (s *Store) saveLocked() error {

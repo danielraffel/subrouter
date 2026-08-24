@@ -1,10 +1,49 @@
 package session
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
+
+func TestAllBoundsPersistedHistoryToMostRecentAssignments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	base := time.Unix(1_700_000_000, 0).UTC()
+	data := make(map[string]Assignment, MaxRetainedAssignments+100)
+	for index := 0; index < MaxRetainedAssignments+100; index++ {
+		assignment := Assignment{
+			AgentType: "codex",
+			SessionID: "session-" + strconv.Itoa(index),
+			AccountID: "account",
+			CreatedAt: base,
+			UpdatedAt: base.Add(time.Duration(index) * time.Second),
+		}
+		data[ScopedSessionKey(assignment.AgentType, assignment.SessionID)] = assignment
+	}
+	body, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignments := store.All()
+	if len(assignments) != MaxRetainedAssignments {
+		t.Fatalf("retained assignments = %d, want %d", len(assignments), MaxRetainedAssignments)
+	}
+	wantNewest := "session-" + strconv.Itoa(MaxRetainedAssignments+99)
+	if assignments[0].SessionID != wantNewest {
+		t.Fatalf("newest assignment = %q, want %q", assignments[0].SessionID, wantNewest)
+	}
+}
 
 func TestCountByAccount(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
