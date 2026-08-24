@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -11,8 +12,8 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func TestRetryableUpstreamPostRequestClaudeMessages(t *testing.T) {
@@ -307,7 +308,7 @@ func TestCaptureResponseBodyClaude401MarksExhausted(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"authentication_error"}}`)),
 		Header:     http.Header{},
 	}
-	server.captureResponseBody(response, "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
+	server.captureResponseBody(response, context.Background(), "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("claude 401 should mark the account exhausted via passive inspection")
 	}
@@ -341,7 +342,7 @@ func TestCaptureResponseBodyClaude429MarksExhausted(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error"}}`)),
 		Header:     h,
 	}
-	server.captureResponseBody(response, "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
+	server.captureResponseBody(response, context.Background(), "claude", "session-1", "cooked@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
 	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "cooked@example.com") {
 		t.Fatal("claude rejected-header 429 should mark the account exhausted via passive inspection")
 	}
@@ -357,7 +358,7 @@ func TestCaptureResponseBodyClaudeBare429DoesNotPoison(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`)),
 		Header:     http.Header{},
 	}
-	server.captureResponseBody(response, "claude", "session-1", "healthy@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
+	server.captureResponseBody(response, context.Background(), "claude", "session-1", "healthy@example.com", accounts.ProviderClaude, "", "", "/v1/messages")
 	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "healthy@example.com") {
 		t.Fatal("a bare (headerless) 429 must NOT mark a healthy account exhausted")
 	}
@@ -460,5 +461,108 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn403OrgDisabled(t *testing.T) {
 	assignment, ok := store.Get("claude", "session-403")
 	if !ok || assignment.AccountID != "fresh@example.com" {
 		t.Fatalf("sticky assignment = %+v, want moved off the org-disabled account", assignment)
+	}
+}
+
+// refreshSelectedAccount must only fail over when the refresh error says the
+// credential is dead. A transient failure (cancelled context, timeout, upstream
+// 5xx) previously fell straight through to markAccountExhaustedRefreshFailure
+// for Claude, because the non-terminal carve-out was gated on Codex, so a blip
+// held a healthy Claude account out of selection.
+func TestRefreshSelectedAccountClaudeKeepsAccountOnTransientRefreshError(t *testing.T) {
+	transient := []struct {
+		name string
+		err  error
+	}{
+		{name: "context canceled", err: context.Canceled},
+		{name: "deadline exceeded", err: context.DeadlineExceeded},
+		{name: "upstream 5xx", err: errors.New("Claude OAuth refresh failed: 503 Service Unavailable")},
+	}
+	for _, tc := range transient {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := claudeFailoverServer(t)
+			cooked := server.Accounts[0]
+			refreshed := make([]string, 0, 2)
+			server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+				refreshed = append(refreshed, account.ID)
+				return account, tc.err
+			}
+
+			got, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
+			if err == nil {
+				t.Fatal("a transient refresh failure must still be reported to the caller")
+			}
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("expected the transient error back, got %v", err)
+			}
+			if got.ID != cooked.ID {
+				t.Fatalf("expected the originally selected account back, got %q", got.ID)
+			}
+			if len(refreshed) != 1 || refreshed[0] != cooked.ID {
+				t.Fatalf("expected exactly one refresh of the selected account, got %v", refreshed)
+			}
+			if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, cooked.ID) {
+				t.Fatal("a transient refresh failure must not mark a healthy Claude account exhausted")
+			}
+		})
+	}
+}
+
+// The carve-out must not swallow a real logout: Claude's refresh error text
+// carries invalid_grant, which isTerminalCredentialError classifies as terminal,
+// so the account is still marked and failover still runs.
+func TestRefreshSelectedAccountClaudeFailsOverOnTerminalRefreshError(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	cooked := server.Accounts[0]
+	fresh := server.Accounts[1]
+	refreshed := make([]string, 0, 2)
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		refreshed = append(refreshed, account.ID)
+		if account.ID == cooked.ID {
+			return account, errors.New(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}`)
+		}
+		return account, nil
+	}
+
+	got, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
+	if err != nil {
+		t.Fatalf("failover to the healthy account should succeed: %v", err)
+	}
+	if got.ID != fresh.ID {
+		t.Fatalf("expected failover to %q, got %q", fresh.ID, got.ID)
+	}
+	if len(refreshed) != 2 || refreshed[0] != cooked.ID || refreshed[1] != fresh.ID {
+		t.Fatalf("expected a refresh of the dead account then the healthy one, got %v", refreshed)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, cooked.ID) {
+		t.Fatal("a terminal Claude credential error must still mark the account exhausted")
+	}
+}
+
+func claudeRefreshRequest(t *testing.T) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-1")
+	return req
+}
+
+// A stored credential that will not decode cannot be refreshed, so it needs
+// re-auth exactly like a rejected refresh token does. Classifying it as
+// transient would retry the same unparseable blob forever instead of failing
+// over to an account that still works.
+func TestIsTerminalCredentialErrorClassifiesUnreadableCredential(t *testing.T) {
+	unreadable := errors.New(`unreadable credential from keychain (bytes=132 offset=125 trailing_bytes=8 trailing_kind=binary-plist): invalid character 'b' after top-level value`)
+	if !isTerminalCredentialError(unreadable) {
+		t.Fatal("an unreadable stored credential must be terminal so selection fails over")
+	}
+	if isTerminalCredentialError(errors.New("Claude OAuth refresh failed: 503 Service Unavailable")) {
+		t.Fatal("an upstream 5xx must stay transient")
+	}
+	if isTerminalCredentialError(context.Canceled) {
+		t.Fatal("a cancelled context must stay transient")
 	}
 }

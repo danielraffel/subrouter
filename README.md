@@ -13,49 +13,54 @@ Subrouter is a local AI coding-agent proxy. It routes traffic across Codex accou
 
 ## Install
 
-### Agent setup prompt
+### Keeping the CLI current on macOS
 
-Paste this into Claude, Codex, or another coding agent that has SSH access to your server and a local browser for OAuth:
+A shared server autoupdates its worker. A laptop does not, so clients drift behind the servers they talk to and hit failures nobody can reproduce. Install the per-user updater once:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manaflow-ai/subrouter/main/deploy/macos/install-cli-autoupdate.sh | bash
+```
+
+It installs a LaunchAgent that checks daily, compares the release tag against `~/.subrouter/cli-version`, and exits without downloading when they match. Updates go through `install.sh`, so the release checksum is verified, and a missing binary forces a reinstall even when the marker looks current. Logs land in `~/Library/Logs/subrouter-cli-autoupdate.log`. Remove it with `launchctl bootout gui/$(id -u)/ai.manaflow.subrouter-cli-autoupdate`.
+
+### GCP setup prompt
+
+Paste this into Claude, Codex, or another coding agent with GCP operator access and a local browser for OAuth:
 
 ```text
 Set up Subrouter as a shared production service.
 
 Inputs:
-- Server SSH target: <user@host>
-- Server URL reachable from my machine: http://<tailnet-ip-or-dns>:31415
+- GCP project, zone, and instance: <project> <zone> <instance>
+- Public server URL: https://sr.cmux.com
 - Local server nickname: team
 
 Rules:
 - Do not copy ~/.codex/auth.json or local ~/.subrouter/codex/accounts/*.json to the server.
 - Server OAuth accounts must be created with fresh server-owned login flows.
 - Do not print access tokens, refresh tokens, API keys, id tokens, or admin tokens.
-- Keep the listener private to Tailscale/VPC. Do not expose it to the public internet.
+- Never use SSH, SCP, or gcloud to transfer account credentials.
+- Accept port 31415 only from Google load-balancer ranges and SSH only through IAP.
+- End-user authentication and proxy traffic must use the public HTTPS hostname.
 - Use the released Subrouter binary unless I explicitly ask you to build from source.
 
 Steps:
-1. On this local machine, create an admin token variable without printing it:
-   TOKEN="$(openssl rand -hex 32)"
-2. Install the release on the server:
-   ssh <user@host> 'curl -fsSL https://github.com/manaflow-ai/subrouter/releases/latest/download/install.sh | sudo sh'
-3. Install the systemd service with the local admin token and verify it over loopback:
-   ssh <user@host> "sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token '$TOKEN'"
-   ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/health'
-   ssh <user@host> 'curl -fsS http://127.0.0.1:31415/_subrouter/ready'
-4. Save the same admin token locally in Subrouter server config without printing it. This also writes Codex routing defaults to `CODEX_HOME/config.toml` or `~/.codex/config.toml`:
-   sr server add team --url http://<tailnet-ip-or-dns>:31415 --admin-token "$TOKEN" --default
-5. Create server-owned Codex OAuth chains:
-   sr server sync team --device-auth
-   Follow each OAuth flow. Do not upload local refresh tokens.
-6. Verify:
+1. Configure the GCP project and publish the released service with deploy/gcp/publish-subrouter.sh. The installer must generate and provision its protected account-import token without printing it.
+2. Verify from this client machine:
    sr server status team
-   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/health
-   curl -fsS http://<tailnet-ip-or-dns>:31415/_subrouter/ready
-   ssh <user@host> 'journalctl -u subrouter --since "30 min ago" --no-pager | grep -Ei "WARN|ERROR|failed|401|502|503|no usable|refresh_token" | tail -n 200 || true'
-7. Report:
+   curl -fsS https://sr.cmux.com/_subrouter/health
+   curl -fsS https://sr.cmux.com/_subrouter/ready
+3. Create server-owned Codex OAuth chains:
+   sr server sync team
+   Follow each OAuth flow. Do not upload local refresh tokens.
+4. Verify:
+   sr server status team
+   curl -fsS https://sr.cmux.com/_subrouter/health
+   curl -fsS https://sr.cmux.com/_subrouter/ready
+5. Report:
    - systemd active/running status
    - health and readiness result
    - number of registered Codex OAuth accounts
-   - any warning/error log lines, without secrets
    - the exact command I should use for Codex through Subrouter
 ```
 
@@ -160,6 +165,8 @@ GET /_subrouter/drain-status
 GET /_subrouter/accounts
 GET /_subrouter/account-status
 POST /_subrouter/account-status
+GET /_subrouter/account-import
+POST /_subrouter/account-import
 GET /_subrouter/usage-status
 GET /_subrouter/sessions
 GET /_subrouter/dashboard
@@ -176,12 +183,38 @@ sudo sr install-systemd --addr 0.0.0.0:31415 --admin-token "$TOKEN"
 sr server add team --url http://100.64.0.1:31415 --admin-token "$TOKEN" --default
 ```
 
-When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted so server-local hot reloads continue to work.
+When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to sensitive `/_subrouter/*` endpoints must send `Authorization: Bearer <token>` or `X-Subrouter-Admin-Token: <token>`. Loopback stays trusted for ordinary admin endpoints. Account onboarding uses a distinct `SUBROUTER_ACCOUNT_IMPORT_TOKEN`; that token authorizes only `GET` and `POST /_subrouter/account-import` and cannot access admin APIs or proxy traffic.
+
+A server with neither credential configured rejects every account import, including `sr add`. That state is reported as `"account_import": "disabled"` by `/_subrouter/health` and logged as a warning at startup, and `sr doctor` runs the same preflight `sr add` runs against the selected server.
+
+### Tailnet authentication for self-hosted servers
+
+A server whose port is already restricted to a tailnet by ACL does not need a second credential system on top of it. Start it with `--tailscale-auth` (or `SUBROUTER_TAILSCALE_AUTH=1`) and non-loopback callers are authenticated by their tailnet identity instead:
+
+```bash
+subrouter serve --addr 0.0.0.0:31415 --tailscale-auth
+sr server add mac-mini --url http://mac-mini.tailnet.ts.net:31415   # no tokens
+sr add                                                              # just works
+```
+
+Identity comes from this machine's own tailscaled through `tailscale whois`, so it is an assertion about a WireGuard-authenticated peer rather than a claim carried in the request, and account imports are logged with the tailnet user or tags that made them. Narrow it further with `--tailscale-auth-users lawrence@example.com` or `--tailscale-auth-tags tag:dev-workstation`; with neither, every tailnet peer is accepted, which is the point of the mode.
+
+Enabling it closes the unsecured legacy default: a caller the tailnet does not recognize gets only the token path, never open access. Configured tokens keep working alongside it. It is refused together with `--multi-tenant`, because a shared cloud deployment authenticates tenants rather than network peers, and `/_subrouter/health` reports the active mode as `"auth": "tailnet" | "token" | "tenant" | "open"`.
+
+`sr server install <name>` provisions those credentials for you and keeps both sides in step. It reaches a GCP instance through gcloud, and any other machine through SSH:
+
+```bash
+sr server add mac-mini --url http://100.64.0.9:31415 --ssh-host worker@mac-mini
+sr server install mac-mini
+```
+
+On the host that resolves to `sudo sr install-systemd` on Linux and `sudo sr install-launchd` on macOS. `install-launchd` provisions credentials into an existing LaunchDaemon rather than creating the service: it writes the tokens to 0600 files owned by the service user, points `SUBROUTER_ADMIN_TOKEN_FILE` and `SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE` at them, and reloads the job. Every other key in the plist is left alone, so a host keeps its supervisor layout, service user, and per-host flags across a credential rotation. Build the service itself with [deploy/macos/migrate-launchdaemon-to-supervisor.sh](deploy/macos/migrate-launchdaemon-to-supervisor.sh) first.
 
 ## GCP deployment
 
 See [deploy/gcp/README.md](deploy/gcp/README.md) for the small GCP + Tailscale Subrouter deployment flow.
 See [docs/production.md](docs/production.md) for the production checklist before running a shared server.
+See [deploy/docker/README.md](deploy/docker/README.md) for hardened local-account and cmux.com team containers.
 
 Transcript recording is off by default. To persist raw Subrouter transcripts, pass a transcript directory:
 
@@ -190,6 +223,8 @@ subrouter serve --transcripts ~/.subrouter/transcripts
 ```
 
 Transcripts are JSONL files keyed by agent type and session id under `by-agent/<agent-type>/by-session/<agent-session-id>.jsonl`. They include Subrouter metadata, redacted headers, HTTP/SSE body chunks, HTTP/SSE body summaries, and WebSocket message payloads as base64 with byte counts and SHA-256 hashes. Each event includes `agent_type` and `agent_session_id`; Codex events also include `codex_session_id` for matching `~/.codex/sessions` JSONL files. This is intentionally storage-heavy and can contain sensitive request/response payloads. Authorization-style headers are redacted, but bodies are stored in full.
+
+The synthetic model-catalog session is never recorded. Every Codex client polls `/models` continuously, all of it lands under one session id, and each poll would write the request metadata plus the whole catalog body: on the team server that single file reached 30 GB in two days, dwarfed every real transcript, saturated the upload, and filled the disk. Its responses are still inspected for quota signals; they are just not written down.
 
 When transcript recording is enabled, `/_subrouter/dashboard` serves an internal HTML dashboard over the same Subrouter listener. It shows token usage over time, usage by user email, usage by selected account, session assignments, transcript summaries, and links to sanitized transcript event JSON under `/_subrouter/transcripts/<agent-type>/<session-id>`. Raw internal trajectory JSON with decoded body text is available under `/_subrouter/transcripts/<agent-type>/<session-id>/raw`.
 
@@ -203,6 +238,21 @@ subrouter serve \
   --transcript-local-retention 24h \
   --transcript-max-local-bytes 2GiB
 ```
+
+Azure blob storage is the other destination, and the only one that works off GCP: the GCS syncer authenticates through the GCE metadata server, so a Mac or a laptop can reach a bucket only by shelling out to `gsutil`.
+
+```bash
+export SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE=/var/lib/subrouter/transcript-azure-key   # or SUBROUTER_TRANSCRIPT_AZURE_SAS
+subrouter serve \
+  --transcripts /var/lib/subrouter/transcripts \
+  --transcript-azure-url https://<account>.blob.core.windows.net/<container>/<prefix> \
+  --transcript-local-retention 24h \
+  --transcript-max-local-bytes 2GiB
+```
+
+The Azure syncer writes append blobs, so each byte uploads once. Transcripts are append-only and large (a busy session reaches gigabytes within hours), and re-sending the whole file every interval is how the first version earned "503 The server is busy" from Azure. Before a local file is deleted, the blob is snapshotted server side, which preserves exactly the retired bytes with no upload at all; only a file that was never uploaded is copied the slow way, under `_archive/<path>/<time>-<size>-<hash>.jsonl`. A throttled or failed request is retried with backoff, and one failing file no longer stops the rest of the pass. Uploads are paced at 2 MiB/s by default (`--transcript-azure-max-bytes-per-second`, `0` for no cap). The first backlog upload saturated the host's uplink for hours, and the proxy shares that link: health probes from the tailnet timed out and SSH stalled while gigabytes of transcript went out. Transcripts are background data and the proxy is the product, so the upload yields; the cap still clears more per hour than a busy day of sessions produces. Retention runs before and after the upload pass, because a backlog can occupy the whole interval and a spool that only prunes afterwards keeps growing past its cap the entire time. A file whose blob has not caught up is never retired: the append pass finishes it first.
+
+Both destinations follow the same rules: upload on the background interval, never on the request path, and delete a local file only after the exact bytes exist remotely. The Azure syncer signs its own requests with the storage account key (Shared Key), so the host needs no Azure CLI. A configured destination with no usable credential logs a warning at startup rather than starting quietly and copying nothing.
 
 The daemon uploads with the GCS JSON API on a background interval. Local transcript writes stay on the request path; GCS upload failures are logged and retried later. Local cleanup only runs after a successful GCS sync. Files selected for cleanup are copied to an immutable `_archive/` object before local deletion so future resumed sessions cannot overwrite the only cloud copy.
 
@@ -299,7 +349,7 @@ On first run, Subrouter migrates legacy `~/.codex-accounts` state into `~/.subro
 Server-owned OAuth accounts must be created with fresh logins because Codex refresh tokens rotate. Do not copy local OAuth account files to a server. To compare local OAuth emails with a configured server, validate server refresh-token chains, and reauth missing or invalid accounts on the server, run:
 
 ```bash
-sr server sync team --device-auth
+sr server sync team
 ```
 
 To only show the diff:
@@ -310,7 +360,7 @@ sr server diff team
 
 `sr server sync` prints the plan and asks before opening login. Use `--yes` for unattended sync, `--email you@example.com` to reauth one email, or `--all` to replace every local OAuth email on the server with a new server-owned refresh-token chain. The server status check may refresh valid server-owned OAuth chains in place because Codex refresh tokens rotate.
 
-Account uploads hot-reload the live server process after writing the new server-owned account file. Existing proxy and WebSocket connections keep running.
+Account login first checks the protected endpoint with `GET`, then sends the new credential with authenticated `POST`. It never transfers credentials with SSH, SCP, or gcloud. The server validates and atomically stores the credential, hot-reloads the account pool, and leaves existing HTTP and WebSocket proxy connections running. Use `--device-auth` only when the browser and CLI cannot share a localhost callback, such as a headless or remote shell.
 
 Account-management commands are built into the `subrouter` binary:
 
@@ -359,6 +409,14 @@ For a shared server, replace `127.0.0.1` with the server URL. Subrouter recogniz
 
 Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
 
+## Multi-tenant mode
+
+One hosted Subrouter can serve many isolated users, each with their own account pool under `<state-dir>/tenants/<id>/` (same layout as the single-tenant state dir). `sr tenant create <name>` registers a tenant against a named server's admin API (or the local state dir on the server host) and prints an `srt_<32 hex>` key once; only its SHA-256 hash is stored in `tenants.json`.
+
+Clients authenticate by base URL prefix, because agent CLIs can only override base URLs: point Codex at `https://host/t/<key>/v1` and Claude Code at `ANTHROPIC_BASE_URL=https://host/t/<key>`. The key is also accepted as a Bearer token or `x-api-key` header (Claude Code's `ANTHROPIC_AUTH_TOKEN` lands there). Account selection, sticky sessions, usage scoring, and transcripts are all scoped to the tenant's pool; an unknown or revoked key gets a 401. Requests without a tenant key keep the legacy single-tenant behavior.
+
+`sr server add <name> --url <url> --tenant-key srt_...` stores the key on a server entry, after which `sr codex`, `sr claude push`, `sr server login/sync`, and the status commands operate on that tenant's pool automatically. Tenant CRUD lives on the admin-gated `/_subrouter/tenants` endpoints; tenant-scoped reads and account import (`/t/<key>/_subrouter/{accounts,account-status,usage-status,sessions,account-import}`) are authorized by the tenant key itself.
+
 ## Selection policy
 
 On startup, Subrouter fetches current Codex usage for OAuth accounts and scores each account by its most constrained usage window. The scheduler keeps existing sessions sticky. For a new session it protects low-headroom accounts, spends healthy quota that resets soonest, then breaks ties by live assigned-session counts.
@@ -371,6 +429,58 @@ By default, OAuth accounts are forwarded to `https://chatgpt.com/backend-api/cod
 Live headroom comes from Codex subscription usage. API-key spend comes from the OpenAI organization usage endpoints through stored `sk-admin-*` keys. Claude profile usage comes from the Anthropic OAuth usage endpoint when profile credentials are readable.
 
 See [docs/saturation.md](docs/saturation.md) for the 5h/7d placement strategy and simulation tests.
+
+## Azure fallback for Codex
+
+When the Codex pool cannot serve a Responses request, Subrouter can finish it on Azure OpenAI instead of returning the error. The pool stays primary: Azure runs only after the request has spent five pool retries (account failover and transport retries draw on one shared budget), or when account selection fails outright. Quota (429), broken credentials (401/403), upstream faults (408/5xx), and transport failures qualify; a 400 does not, because Azure would reject it the same way for money.
+
+After Azure answers, the session is pinned to that endpoint for 30 minutes of activity, and the following turns skip the pool entirely. The pin is written to `azure-codex-pins.json` beside the session store, so a restart does not strand a thread whose history only Azure can read. Session identity is the Codex thread id, not its window index: `X-Codex-Window-ID` arrives as `<thread>:<window>`, the window number changes while the conversation does not, and treating each window as a new session reset both the pin and the account stickiness. Prompt caching is per-deployment and keyed on an identical prefix, so alternating between ChatGPT and Azure turn by turn would re-upload the whole conversation as a cache miss on both sides. Subrouter forwards the `prompt_cache_key` Codex sends, and derives a stable one from the session when it is absent. With several endpoints configured, a session hashes to one of them and stays there.
+
+One Azure resource:
+
+```bash
+export SUBROUTER_AZURE_CODEX_ENDPOINT="https://YOUR_RESOURCE.openai.azure.com/openai/v1"
+export SUBROUTER_AZURE_CODEX_API_KEY="<azure-key>"          # or SUBROUTER_AZURE_CODEX_API_KEY_FILE
+export SUBROUTER_AZURE_CODEX_DEPLOYMENTS="gpt-5.6-codex=my-codex-deployment"   # only if the deployment name differs from the model
+export SUBROUTER_AZURE_CODEX_MODELS="gpt-5.6*"   # optional allow list; empty serves every model
+```
+
+Several resources go in a file named by `SUBROUTER_AZURE_CODEX_CONFIG_FILE`:
+
+```json
+{"models":["gpt-5.6*"],
+ "endpoints":[
+  {"name":"eastus2","base_url":"https://east.openai.azure.com/openai/v1","api_key":"..."},
+  {"name":"openai","base_url":"https://api.openai.com/v1","api_key_file":"/var/lib/subrouter/openai-api-key"}
+]}
+```
+
+An endpoint may be `https://api.openai.com/v1` with an OpenAI API key: it speaks the same Responses surface with real model names, so it backs the pool when Azure itself is out. `api_key_file` reads the key from a file instead of carrying it inline. `models` limits which requested models the fallback serves; an entry matches exactly or as a prefix when it ends with `*`. A model outside the list keeps the pool's own failure, because paying a metered provider to answer with a different model than the one requested is worse.
+
+`SUBROUTER_AZURE_CODEX_DISABLED=1` switches the whole route off while leaving the endpoint and its key in place, so turning it back on is one environment variable rather than a credential to find again. The switch wins over every other Azure setting, and the daemon says so at startup, because a route that is off looks identical to one that was never set up right up until the pool runs out of quota. Sessions already pinned to Azure fall back to the pool, which drops the reasoning Azure sealed and retries, so they keep working rather than stranding.
+
+Set `SUBROUTER_AZURE_CODEX_DEFAULT_DEPLOYMENT` to catch models Azure has not shipped yet. Azure trails the ChatGPT model list, and the request that needs the fallback is the one the pool refused, so an unmapped model lands on that deployment instead of 404ing. Prefer the `models` allow list plus same-named deployments when Azure does host the requested models, so the fallback never answers with a silently different model.
+
+The fallback also catches turn failures that arrive inside an otherwise-200 stream rather than as a status code, on both transports. Failures classify by who can fix them. Client-caused ones (context length, invalid prompt, policy, unsupported parameters) pass through untouched, because every provider refuses them the same way. Quota failures (`usage_limit_reached`, `insufficient_quota`, `usage_not_included`) mark the account exhausted like a 429 would; on SSE the turn is then served from Azure, and on WebSocket the connection closes with 1012 so the reconnect lands on another pool account, falling to Azure only when nothing in the pool can start it. Everything else, including any failure code this proxy has never seen, is provider-side by default and is absorbed: Codex treats an unrecognized `response.failed` as the end of the turn (`server_is_overloaded` renders as "Selected model is at capacity. Please try a different model."), so an unknown code forwarded is a turn lost, while an unknown code absorbed costs one Azure attempt and falls back to the original error if Azure refuses it. On SSE the stream is sniffed before any byte reaches the client; on WebSocket the event pins the session to Azure, closes with 1012, and the reconnect is refused with 426, the one status Codex answers by switching to the HTTP transport, where the pin serves the turn.
+
+Prove the route without waiting for an outage:
+
+```bash
+sr az status          # which endpoints the daemon armed
+sr az test            # one forced request; run twice, the second reports cached tokens
+sr az cost            # what the fallback has spent
+sr az codex exec "…"  # run Codex with every request forced onto Azure
+```
+
+`sr az test` sends a fixed prompt long enough to be cacheable, so the second run's `cached=` count is real evidence that the prompt cache is being reused. Forced requests skip the pool and never pin the session; a broken endpoint surfaces as an error instead of a silent ChatGPT answer.
+
+Codex bodies carry fields the Responses API does not take (`session_id` on every turn), and a Codex release can send a value an older Azure model version refuses (`reasoning.context="all_turns"`). Known ChatGPT-only fields are stripped, and a 400 that names one field is retried once without it, up to three times. That includes a settings key inside a single input item (`input[39].namespace`), but never a whole turn or the keys that carry one (`content`, `role`, `arguments`, and the like): dropping those would quietly send a different conversation. Reasoning moves freely inside OpenAI and not at all across providers. Measured on gpt-5.6-sol: a reasoning blob produced by a ChatGPT subscription account is accepted by any other subscription account and by an OpenAI API key, and the reverse holds; Azure refuses every OpenAI blob and OpenAI refuses every Azure blob. So subscription-to-subscription and subscription-to-API-key moves are lossless, and only the Azure boundary costs the model's private reasoning. Both directions of that boundary are repaired the same way: the sealed items are dropped and the turn is retried, on the Azure route going in and on the pool route coming back.
+
+A conversation that starts on the ChatGPT pool and then falls back carries reasoning blobs sealed by the provider that made them, and Azure answers `invalid_encrypted_content` with no field named. Those blobs are stripped and the turn is retried, keeping the user's messages, tool results, and any readable reasoning summary. The turn loses the model's earlier private reasoning trace, which is the cost of crossing providers mid-conversation, and it is the difference between a served answer and a hard failure. Each rejection is remembered per endpoint and deployment for six hours, so a long session does not re-upload its whole conversation every turn to rediscover the same refusal, and an Azure model upgrade that starts accepting the field is picked up on its own.
+
+Azure is metered, unlike the subscription pool, so every served request is priced into `azure-codex-cost.jsonl` next to the session store and summarized at `/_subrouter/azure-codex-cost`. `sr az cost` prints it, and `sr` status grows a spend line once the fallback has run. Cached input is billed at the cached rate rather than the full one, and a model with no price entry contributes zero rather than a guess.
+
+`curl -s http://127.0.0.1:31415/_subrouter/health` lists the armed endpoints by name under `azure_codex`. Only `/responses` falls back; `/responses/compact`, the model catalog, and `/alpha/search` are ChatGPT-backend endpoints with no Azure equivalent. Team credential storage (`sr storage team`) refuses this fallback, like the other personal-credential routes.
 
 ## Security defaults
 

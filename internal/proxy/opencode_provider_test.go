@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func TestHandlerRoutesKimiProviderPrefixToKimiUpstream(t *testing.T) {
@@ -43,6 +43,29 @@ func TestHandlerRoutesKimiProviderPrefixToKimiUpstream(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlerPreservesV1ForKimiUpstreamWithoutVersionedBase(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("upstream path = %q, want /v1/messages", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "kimi:custom",
+		Provider: accounts.ProviderKimi,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "kimi-token",
+	}, accounts.ProviderKimi, upstream.URL).Handler()
+	req := httptest.NewRequest(http.MethodPost, "/kimi/v1/messages", strings.NewReader(`{"model":"kimi-for-coding"}`))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 

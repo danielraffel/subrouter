@@ -18,7 +18,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 func TestSRListReadsNativeCodexStore(t *testing.T) {
@@ -269,7 +269,9 @@ func TestSRAddRestoresPreviouslyActiveAccount(t *testing.T) {
 
 	var out bytes.Buffer
 	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
-	if err := runner.run(context.Background(), []string{"add"}); err != nil {
+	// "add" now asks which provider; this test exercises the Codex path, so it
+	// names it rather than relying on a default that no longer exists.
+	if err := runner.run(context.Background(), []string{"add", "codex"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1164,12 +1166,12 @@ func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
 		{
-			email:          "lawrencechen2002@gmail.com",
+			email:          "test@example.invalid",
 			planType:       "pro",
 			gtoRecommended: true,
 			authMode:       accounts.AuthModeOAuth,
 			provider:       accounts.ProviderCodex,
-			score:          selectacct.Score{AccountID: "lawrencechen2002@gmail.com", Headroom: 0.67, ShortHeadroom: 0.96, ShortResetAfterSeconds: int64(time.Minute / time.Second)},
+			score:          selectacct.Score{AccountID: "test@example.invalid", Headroom: 0.67, ShortHeadroom: 0.96, ShortResetAfterSeconds: int64(time.Minute / time.Second)},
 			windows: []accounts.UsageWindow{
 				{Name: "primary", UsedPercent: 4, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Minute / time.Second)},
 				{Name: "secondary", UsedPercent: 33, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},

@@ -199,7 +199,7 @@ func TestServeClaudeFableBedrockPrimaryFallsThroughOnExceptionFirstStream(t *tes
 	if string(restored) != bodyStr {
 		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
 	}
-	if logs := logBuf.String(); !strings.Contains(logs, "claude-fable bedrock stream failed before first event") || !strings.Contains(logs, "exception_type=modelStreamErrorException") {
+	if logs := logBuf.String(); !strings.Contains(logs, "claude-fable bedrock stream failed before content") || !strings.Contains(logs, "exception_type=modelStreamErrorException") {
 		t.Fatalf("missing first-event failure log:\n%s", logs)
 	}
 }
@@ -232,5 +232,20 @@ func TestServeClaudeFableBedrockPrimaryFallsThroughOnEmptyStream(t *testing.T) {
 	}
 	if string(restored) != bodyStr {
 		t.Fatalf("restored body = %q, want %q", string(restored), bodyStr)
+	}
+}
+
+// The stream path must carry the cache_creation TTL split into the cost
+// record; dropping it prices 1h writes at the 5m rate.
+func TestTranscodeCarriesCacheCreationDetail(t *testing.T) {
+	start := `{"type":"message_start","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":7,"cache_creation":{"ephemeral_5m_input_tokens":25,"ephemeral_1h_input_tokens":75}}}}`
+	stream := append(buildEventStreamFrame(t, start), buildEventStreamFrame(t, `{"type":"message_stop"}`)...)
+	var out bytes.Buffer
+	result := transcodeBedrockToSSE(&out, bytes.NewReader(stream), nil, "src", "region")
+	if result.Usage.CacheCreation.Ephemeral5m != 25 || result.Usage.CacheCreation.Ephemeral1h != 75 {
+		t.Fatalf("cache_creation detail lost: %+v", result.Usage.CacheCreation)
+	}
+	if result.Usage.CacheWriteTokens != 100 {
+		t.Fatalf("cache write total = %d, want 100", result.Usage.CacheWriteTokens)
 	}
 }

@@ -3,14 +3,35 @@ package main
 import (
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
+
+func TestSecretValueUsesFileEnvironmentWithoutOverridingFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tenant-secret")
+	if err := os.WriteFile(path, []byte("file-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_SECRET", "")
+	t.Setenv("TEST_SECRET_FILE", path)
+	got, err := secretValue("", "TEST_SECRET", "TEST_SECRET_FILE")
+	if err != nil || got != "file-secret" {
+		t.Fatalf("secret = %q, %v", got, err)
+	}
+	got, err = secretValue("flag-secret", "TEST_SECRET", "TEST_SECRET_FILE")
+	if err != nil || got != "flag-secret" {
+		t.Fatalf("flag secret = %q, %v", got, err)
+	}
+}
 
 func TestConfigureDefaultLoggerWritesCLIToStateLog(t *testing.T) {
 	previous := slog.Default()
@@ -58,6 +79,54 @@ func TestConfigureDefaultLoggerLeavesSupervisorLoggerAlone(t *testing.T) {
 	}
 }
 
+func TestValidatePublicSubrouterURLRequiresAnHTTPSOrigin(t *testing.T) {
+	for _, valid := range []string{
+		"",
+		"https://sr.example.com",
+		"https://sr.example.com/",
+		"http://127.0.0.1:31415",
+	} {
+		if err := validatePublicSubrouterURL(valid); err != nil {
+			t.Fatalf("%q: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{
+		"https://sr.example.com/path",
+		"https://user@sr.example.com",
+		"https://sr.example.com?query=1",
+		"http://sr.example.com",
+	} {
+		if err := validatePublicSubrouterURL(invalid); err == nil {
+			t.Fatalf("%q was accepted", invalid)
+		}
+	}
+}
+
+func TestNormalizePublicSubrouterURLTrimsFlagValues(t *testing.T) {
+	got, err := normalizePublicSubrouterURL("  https://sr.example.com/  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://sr.example.com" {
+		t.Fatalf("normalized public URL = %q, want https://sr.example.com", got)
+	}
+}
+
+func TestServeKeepsHostedLoginCompatibleWithoutTenantDeleteToken(t *testing.T) {
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	t.Setenv("SUBROUTER_STACK_PROJECT_ID", "project")
+	t.Setenv("SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY", "publishable")
+	t.Setenv("SUBROUTER_STACK_TENANT_KEY_SECRET", "0123456789abcdef0123456789abcdef")
+	t.Setenv("SUBROUTER_STACK_TENANT_KEY_SECRET_FILE", "")
+	t.Setenv("SUBROUTER_STACK_TENANT_DELETE_TOKEN", "")
+	t.Setenv("SUBROUTER_STACK_TENANT_DELETE_TOKEN_FILE", "")
+
+	err := serve([]string{"--public-url", "http://sr.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("serve error = %v, want public URL validation after legacy hosted-login config", err)
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",
@@ -99,6 +168,75 @@ func TestSystemdListenFDsRejectsInvalidEnv(t *testing.T) {
 		return env[key]
 	}); err == nil {
 		t.Fatal("expected invalid LISTEN_FDS error")
+	}
+}
+
+func TestTeamModeRejectsBedrockCredentialFallback(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "https://cmux.com",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--addr", "invalid:::",
+		"--bedrock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatal("team mode did not reject Bedrock credential fallback")
+	}
+}
+
+func TestTeamModeRejectsPersonalFableKeyFallback(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "https://cmux.com",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CLAUDE_FABLE_API_KEY", "sk-ant-private")
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--addr", "invalid:::",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatal("team mode did not reject personal Fable credential fallback")
+	}
+}
+
+// Docker team mode accepts a copied workstation config. In production that
+// config can still describe legacy storage and a loopback development API, so
+// the container must explicitly select team storage and the hosted API without
+// rewriting the read-only credential secret.
+func TestServeCloudOverridesUpgradeCopiedLegacyConfigForTeamContainer(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          "http://127.0.0.1:3928",
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		CredentialSource: broker.CredentialSourceLegacy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := serve([]string{
+		"--cloud-config", configPath,
+		"--cloud-base-url", "https://cmux.com",
+		"--cloud-credential-source", "team",
+		"--addr", "invalid:::",
+		"--bedrock",
+	})
+	if err == nil || !strings.Contains(err.Error(), "team credential storage") {
+		t.Fatalf("serve error = %v, want team-mode validation after Docker overrides", err)
 	}
 }
 
@@ -167,17 +305,24 @@ func TestSRDefaultRunsAccountPicker(t *testing.T) {
 
 func TestDirectSRCommandNames(t *testing.T) {
 	expected := []string{
+		"account",
+		"accounts",
 		"add",
 		"add-admin-key",
 		"add-api-key",
 		"add-key",
 		"admin-keys",
 		"attach-project",
+		"az",
+		"azure",
 		"breadcrumbs",
 		"claude",
 		"claude-aws",
 		"claude-direct",
+		"cleanup",
 		"cost",
+		"daemon",
+		"doctor",
 		"g",
 		"gemini",
 		"gui",
@@ -187,17 +332,25 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"list",
 		"list-admin-keys",
 		"login",
+		"logout",
 		"ls",
 		"pick",
+		"remote",
+		"remotes",
 		"remove",
 		"remove-admin-key",
 		"reset",
 		"rm",
 		"server",
 		"servers",
+		"setup",
 		"spend",
 		"status",
+		"storage",
 		"switch",
+		"tenant",
+		"tenants",
+		"team",
 		"trace",
 		"usage",
 		"use",
@@ -224,9 +377,49 @@ func TestDirectSRCommandNames(t *testing.T) {
 	}
 }
 
+func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/subrouter/accounts" {
+				http.NotFound(w, r)
+				return
+			}
+			requests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"teamId":"team-a","accounts":[]}`))
+		},
+	))
+	defer server.Close()
+
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := broker.SaveConfig(configPath, broker.Config{
+		BaseURL:          server.URL,
+		AccessToken:      "stack-access",
+		RefreshToken:     "stack-refresh",
+		TeamID:           "team-a",
+		TeamName:         "Team A",
+		CredentialSource: broker.CredentialSourceTeam,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runForProgram("sr", []string{"accounts"}); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("team account requests = %d, want 1", requests.Load())
+	}
+}
+
 func TestUsageShowsAccountCommandsAtTopLevel(t *testing.T) {
 	got := usageText("sr")
 	for _, want := range []string{
+		"sr login",
+		"sr team",
+		"sr account",
 		"sr add",
 		"sr add-key",
 		"sr switch [email]",

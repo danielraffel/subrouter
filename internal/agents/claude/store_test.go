@@ -3,16 +3,22 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"io"
 )
 
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
@@ -62,6 +68,229 @@ func TestRegisterProfileAllowsEmailName(t *testing.T) {
 	}
 }
 
+func TestImportProfileCredentialKeepsSanitizedNameCollisionsIsolated(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	firstName := "first.last@example.com"
+	secondName := "first+last@example.com"
+	if sanitizeName(firstName) != sanitizeName(secondName) {
+		t.Fatal("test inputs no longer reproduce the legacy directory collision")
+	}
+	if err := store.ImportProfileCredential(firstName, CredentialInfo{
+		AccessToken: "first-access", RefreshToken: "first-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential(secondName, CredentialInfo{
+		AccessToken: "second-access", RefreshToken: "second-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, ok := store.FindProfile(firstName)
+	if !ok {
+		t.Fatalf("profile %q not found", firstName)
+	}
+	second, ok := store.FindProfile(secondName)
+	if !ok {
+		t.Fatalf("profile %q not found", secondName)
+	}
+	if first.Dir == second.Dir {
+		t.Fatalf("distinct profiles share credential directory %q", first.Dir)
+	}
+	firstCredential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir(firstName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCredential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir(secondName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCredential.AccessToken != "first-access" || secondCredential.AccessToken != "second-access" {
+		t.Fatalf("credential collision: first=%q second=%q", firstCredential.AccessToken, secondCredential.AccessToken)
+	}
+}
+
+func TestImportProfileCredentialSerializesRegistryAcrossProcesses(t *testing.T) {
+	if os.Getenv("SUBROUTER_CLAUDE_IMPORT_HELPER") == "1" {
+		dir := os.Getenv("SUBROUTER_CLAUDE_IMPORT_DIR")
+		name := os.Getenv("SUBROUTER_CLAUDE_IMPORT_NAME")
+		ready := os.Getenv("SUBROUTER_CLAUDE_IMPORT_READY")
+		gate := os.Getenv("SUBROUTER_CLAUDE_IMPORT_GATE")
+		if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(gate); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for concurrent import gate")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := (Store{Dir: dir}).ImportProfileCredential(name, CredentialInfo{
+			AccessToken:  "access-" + name,
+			RefreshToken: "refresh-" + name,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	gate := filepath.Join(dir, "start-imports")
+	const processCount = 24
+	commands := make([]*exec.Cmd, 0, processCount)
+	for index := 0; index < processCount; index++ {
+		name := fmt.Sprintf("profile-%02d@example.com", index)
+		ready := filepath.Join(dir, fmt.Sprintf("ready-%02d", index))
+		command := exec.Command(os.Args[0], "-test.run=^TestImportProfileCredentialSerializesRegistryAcrossProcesses$")
+		command.Env = append(os.Environ(),
+			"SUBROUTER_CLAUDE_IMPORT_HELPER=1",
+			"SUBROUTER_CLAUDE_IMPORT_DIR="+dir,
+			"SUBROUTER_CLAUDE_IMPORT_NAME="+name,
+			"SUBROUTER_CLAUDE_IMPORT_READY="+ready,
+			"SUBROUTER_CLAUDE_IMPORT_GATE="+gate,
+		)
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		readyCount := 0
+		for index := 0; index < processCount; index++ {
+			if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("ready-%02d", index))); err == nil {
+				readyCount++
+			}
+		}
+		if readyCount == processCount {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d import helpers became ready", readyCount, processCount)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := os.WriteFile(gate, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Errorf("import helper failed: %v", err)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	profiles := (Store{Dir: dir}).ListProfiles()
+	if len(profiles) != processCount {
+		t.Fatalf("profiles = %d, want %d", len(profiles), processCount)
+	}
+}
+
+func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.T) {
+	if os.Getenv("SUBROUTER_CLAUDE_REFRESH_HELPER") == "1" {
+		oauthTokenURL = os.Getenv("SUBROUTER_CLAUDE_REFRESH_URL")
+		store := Store{Dir: os.Getenv("SUBROUTER_CLAUDE_REFRESH_DIR")}
+		profile, ok := store.FindProfile("founders@example.com")
+		if !ok {
+			t.Fatal("refresh helper could not find profile")
+		}
+		_, didRefresh, err := store.RefreshCredentialIfExpired(context.Background(), http.DefaultClient, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !didRefresh {
+			t.Fatal("refresh helper did not refresh expired credential")
+		}
+		return
+	}
+
+	store := Store{Dir: t.TempDir()}
+	if err := store.ImportProfileCredential("founders@example.com", CredentialInfo{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	requestSeen := make(chan struct{}, 1)
+	releaseRefresh := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestSeen <- struct{}{}:
+		default:
+		}
+		select {
+		case <-releaseRefresh:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"stale-refreshed-access","refresh_token":"stale-refreshed-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses$")
+	command.Env = append(os.Environ(),
+		"SUBROUTER_CLAUDE_REFRESH_HELPER=1",
+		"SUBROUTER_CLAUDE_REFRESH_DIR="+store.Dir,
+		"SUBROUTER_CLAUDE_REFRESH_URL="+server.URL,
+	)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requestSeen:
+	case <-ctx.Done():
+		close(releaseRefresh)
+		_ = command.Wait()
+		t.Fatal("refresh helper did not reach OAuth endpoint")
+	}
+
+	importDone := make(chan error, 1)
+	go func() {
+		importDone <- store.ImportProfileCredential("founders@example.com", CredentialInfo{
+			AccessToken:  "new-import-access",
+			RefreshToken: "new-import-refresh",
+			ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
+		})
+	}()
+	select {
+	case err := <-importDone:
+		if err != nil {
+			close(releaseRefresh)
+			_ = command.Wait()
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseRefresh)
+		_ = command.Wait()
+		t.Fatal("credential import remained blocked by the OAuth round trip")
+	}
+	close(releaseRefresh)
+	if err := command.Wait(); err != nil {
+		t.Fatalf("refresh helper failed: %v", err)
+	}
+
+	credential, err := store.ReadCredential(context.Background(), store.ClaudeConfigDir("founders@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil {
+		t.Fatal("final credential is missing")
+	}
+	if credential.AccessToken != "new-import-access" || credential.RefreshToken != "new-import-refresh" {
+		t.Fatalf("refresh overwrote newer import: access=%q refresh=%q", credential.AccessToken, credential.RefreshToken)
+	}
+}
+
 func TestClaudeConfigDirPrefersCodexAccountsAlias(t *testing.T) {
 	home := t.TempDir()
 	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
@@ -88,6 +317,408 @@ func TestClaudeConfigDirFallsBackWhenAliasMissing(t *testing.T) {
 
 	if got := store.ClaudeConfigDir("work"); got != filepath.Clean(instancePath) {
 		t.Fatalf("ClaudeConfigDir = %q, want %q", got, filepath.Clean(instancePath))
+	}
+}
+
+func TestImportProfileCredentialUsesPreferredRealLegacyPath(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	legacyInstance := filepath.Join(home, ".codex-accounts", "claude", "work")
+	if err := os.MkdirAll(legacyInstance, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyInstance, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"legacy-access","refreshToken":"legacy-refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "imported-access",
+		RefreshToken: "imported-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "imported-access" || credential.RefreshToken != "imported-refresh" {
+		t.Fatalf("preferred credential was not updated: %+v", credential)
+	}
+}
+
+func TestRemoveProfileRemovesPreferredRealLegacyPath(t *testing.T) {
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	canonicalInstance := store.InstancePath("work")
+	if err := os.WriteFile(filepath.Join(canonicalInstance, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"copied-access","refreshToken":"copied-refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyInstance := filepath.Join(home, ".codex-accounts", "claude", "work")
+	if err := os.MkdirAll(legacyInstance, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyInstance, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"legacy-access","refreshToken":"legacy-refresh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.RemoveProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("profile was not removed")
+	}
+	if _, err := os.Stat(legacyInstance); !os.IsNotExist(err) {
+		t.Fatalf("preferred credential directory still exists: %v", err)
+	}
+	if _, err := os.Stat(canonicalInstance); !os.IsNotExist(err) {
+		t.Fatalf("copied canonical credential directory still exists: %v", err)
+	}
+	recreatedInstance, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.ReadCredential(t.Context(), recreatedInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential != nil {
+		t.Fatalf("removed credential was resurrected after same-name recreation: %+v", credential)
+	}
+}
+
+func TestRemoveProfileDeletesMacOSKeychainCredential(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	fakeBin := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "security-arguments")
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
+
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(recordPath, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.RemoveProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("profile was not removed")
+	}
+	record, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantServices := []string{
+		"Claude Code-credentials-" + keychainHash(instancePath),
+		"Claude Code-credentials-" + keychainHash(filepath.Join(home, ".codex-accounts", "claude", "work")),
+	}
+	for _, wantService := range wantServices {
+		if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
+			t.Fatalf("Keychain removal = %q, want delete for %q", got, wantService)
+		}
+	}
+}
+
+func TestRemoveProfileRollsBackWhenKeychainDeletionFails(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := t.TempDir()
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(
+		securityPath,
+		[]byte("#!/bin/sh\necho 'forced keychain deletion failure' >&2\nexit 1\n"),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	removed, removeErr := store.RemoveProfile("work")
+	if removeErr == nil {
+		t.Fatal("profile removal ignored the keychain deletion failure")
+	}
+	if removed {
+		t.Fatal("failed profile removal was reported as committed")
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("keychain failure left the profile absent from the registry")
+	}
+	credential, err := store.ReadCredential(t.Context(), instancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "access" || credential.RefreshToken != "refresh" {
+		t.Fatalf("keychain failure did not restore the staged credential: %+v", credential)
+	}
+	stagingRoots, err := filepath.Glob(filepath.Join(filepath.Dir(instancePath), ".work.remove-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stagingRoots) != 0 {
+		t.Fatalf("profile rollback left staging roots: %v", stagingRoots)
+	}
+}
+
+func TestCleanupInstanceDeletesMacOSKeychainCredentialAliases(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	fakeBin := t.TempDir()
+	recordPath := filepath.Join(t.TempDir(), "security-arguments")
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(securityPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBROUTER_KEYCHAIN_TEST_RECORD\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SUBROUTER_KEYCHAIN_TEST_RECORD", recordPath)
+
+	instancePath, dir, err := store.CreateTempInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CleanupInstance(dir); err != nil {
+		t.Fatal(err)
+	}
+	record, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantServices := []string{
+		"Claude Code-credentials-" + keychainHash(instancePath),
+		"Claude Code-credentials-" + keychainHash(filepath.Join(home, ".codex-accounts", "claude", dir)),
+	}
+	for _, wantService := range wantServices {
+		if got := string(record); !strings.Contains(got, "delete-generic-password") || !strings.Contains(got, wantService) {
+			t.Fatalf("Keychain cleanup = %q, want delete for %q", got, wantService)
+		}
+	}
+}
+
+func TestCredentialLocksDoNotCoupleDistinctProfiles(t *testing.T) {
+	root := t.TempDir()
+	seen := map[uint32]string{}
+	var firstPath, secondPath string
+	for index := 0; index < 10_000 && secondPath == ""; index++ {
+		path := filepath.Join(root, fmt.Sprintf("tenant-%d", index), "profile")
+		hasher := fnv.New32a()
+		_, _ = hasher.Write([]byte(filepath.Clean(path) + ".credentials.lock"))
+		bucket := hasher.Sum32() % 64
+		if prior := seen[bucket]; prior != "" {
+			firstPath, secondPath = prior, path
+		} else {
+			seen[bucket] = path
+		}
+	}
+	if secondPath == "" {
+		t.Fatal("could not find two profile paths in the same legacy lock shard")
+	}
+	firstLock, err := lockProfileCredential(context.Background(), firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAcquired := make(chan *profileCredentialLock, 1)
+	secondError := make(chan error, 1)
+	go func() {
+		lock, err := lockProfileCredential(context.Background(), secondPath)
+		if err != nil {
+			secondError <- err
+			return
+		}
+		secondAcquired <- lock
+	}()
+	select {
+	case secondLock := <-secondAcquired:
+		if err := secondLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := firstLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+	case err := <-secondError:
+		_ = firstLock.Close()
+		t.Fatal(err)
+	case <-time.After(500 * time.Millisecond):
+		if err := firstLock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		secondLock := <-secondAcquired
+		_ = secondLock.Close()
+		t.Fatal("distinct profile locks were serialized by a shared process shard")
+	}
+}
+
+func TestReadCredentialWaitsForProfileWriter(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writerLock, err := lockProfileCredential(context.Background(), instancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := store.ReadCredential(t.Context(), instancePath)
+		readDone <- err
+	}()
+	select {
+	case err := <-readDone:
+		_ = writerLock.Close()
+		t.Fatalf("credential read bypassed the active writer lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := writerLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("credential read remained blocked after writer released its lock")
+	}
+}
+
+func TestReadCredentialLockWaitHonorsContextCancellation(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken:  "access",
+		RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writerLock, err := lockProfileCredential(context.Background(), instancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := store.ReadCredential(ctx, instancePath)
+		readDone <- err
+	}()
+	lockKey := filepath.Clean(profileInstancePathKey(instancePath) + ".credentials.lock")
+	deadline := time.Now().Add(time.Second)
+	for {
+		profileCredentialProcessLocks.Lock()
+		entry := profileCredentialProcessLocks.entries[lockKey]
+		waiterRegistered := entry != nil && entry.refs >= 2
+		profileCredentialProcessLocks.Unlock()
+		if waiterRegistered {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = writerLock.Close()
+			<-readDone
+			t.Fatal("credential read did not begin waiting for the writer lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-readDone:
+		_ = writerLock.Close()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("credential read error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		_ = writerLock.Close()
+		<-readDone
+		t.Fatal("credential read ignored context cancellation while waiting for its lock")
+	}
+}
+
+func TestRemoveProfileRejectsRegistryPathsOutsideInstanceRoots(t *testing.T) {
+	for _, dir := range []string{"../../outside", filepath.Join(t.TempDir(), "absolute-outside")} {
+		t.Run(strings.ReplaceAll(dir, string(os.PathSeparator), "_"), func(t *testing.T) {
+			root := t.TempDir()
+			store := Store{Dir: filepath.Join(root, "store")}
+			outside := filepath.Join(root, "outside")
+			if filepath.IsAbs(dir) {
+				outside = dir
+			}
+			if err := os.MkdirAll(outside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(outside, "sentinel")
+			if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.writeProfiles(profilesFile{
+				Active: "work",
+				Profiles: map[string]Profile{
+					"work": {Name: "work", Dir: dir},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			removed, err := store.RemoveProfile("work")
+			if err == nil {
+				t.Fatal("unsafe profile directory was accepted")
+			}
+			if removed {
+				t.Fatal("profile with an unsafe directory was reported removed")
+			}
+			if _, err := os.Stat(sentinel); err != nil {
+				t.Fatalf("outside sentinel was changed: %v", err)
+			}
+			if _, ok := store.FindProfile("work"); !ok {
+				t.Fatal("unsafe profile was removed from the registry")
+			}
+		})
 	}
 }
 
@@ -162,6 +793,147 @@ func TestRefreshCredentialPostsClaudeOAuthRefresh(t *testing.T) {
 	}
 	if got.ExpiresAt <= time.Now().UnixMilli() {
 		t.Fatalf("ExpiresAt = %d, want future", got.ExpiresAt)
+	}
+}
+
+// Claude refresh tokens are single-use. Concurrent callers that each read the
+// same stored refresh token and race to redeem it get one winner and one
+// invalidated credential, which logs the profile out. Concurrent refreshes of
+// one profile must therefore serialize across the network round-trip, so that
+// every caller after the first observes the winner's fresh credential and
+// skips the network call entirely.
+func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
+	originalURL := oauthTokenURL
+	defer func() { oauthTokenURL = originalURL }()
+
+	var mu sync.Mutex
+	redeemed := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		token := payload["refresh_token"]
+
+		mu.Lock()
+		redeemed[token]++
+		reuse := redeemed[token] > 1
+		mu.Unlock()
+
+		// Model the upstream's single-use semantics: a token that has already
+		// been redeemed is dead, and redeeming it again is an error.
+		if reuse {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+			return
+		}
+		// Slow enough that unserialized callers would overlap inside the
+		// network call rather than lining up behind each other by accident.
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+	oauthTokenURL = server.URL
+
+	store := Store{Dir: t.TempDir()}
+	if err := store.ImportProfileCredential("race@example.com", CredentialInfo{
+		AccessToken:  "stale-access",
+		RefreshToken: "stale-refresh",
+		ExpiresAt:    time.Now().Add(-time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile("race@example.com")
+	if !ok {
+		t.Fatal("profile not found")
+	}
+
+	const callers = 8
+	type result struct {
+		account    accounts.Account
+		didRefresh bool
+		err        error
+	}
+	results := make([]result, callers)
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+	start.Add(1)
+	for i := range results {
+		done.Add(1)
+		go func(i int) {
+			defer done.Done()
+			start.Wait()
+			account, didRefresh, err := store.RefreshCredentialIfExpired(context.Background(), server.Client(), profile)
+			results[i] = result{account: account, didRefresh: didRefresh, err: err}
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+
+	refreshes := 0
+	for i, got := range results {
+		if got.err != nil {
+			t.Fatalf("caller %d failed: %v", i, got.err)
+		}
+		if got.account.Token != "fresh-access" {
+			t.Fatalf("caller %d token = %q, want fresh-access", i, got.account.Token)
+		}
+		if got.didRefresh {
+			refreshes++
+		}
+	}
+	if refreshes != 1 {
+		t.Fatalf("network refreshes reported = %d, want exactly 1", refreshes)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(redeemed) != 1 {
+		t.Fatalf("distinct refresh tokens redeemed = %d (%v), want 1", len(redeemed), redeemed)
+	}
+	if got := redeemed["stale-refresh"]; got != 1 {
+		t.Fatalf("stale-refresh redeemed %d times, want exactly 1", got)
+	}
+}
+
+func TestForceRefreshCredentialRefreshesFreshProfile(t *testing.T) {
+	originalURL := oauthTokenURL
+	defer func() { oauthTokenURL = originalURL }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"forced-access","refresh_token":"forced-refresh","expires_in":3600}`)
+	}))
+	defer server.Close()
+	oauthTokenURL = server.URL
+
+	store := Store{Dir: t.TempDir()}
+	if err := store.ImportProfileCredential("force@example.com", CredentialInfo{
+		AccessToken:  "still-fresh-access",
+		RefreshToken: "still-fresh-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile("force@example.com")
+	if !ok {
+		t.Fatal("profile not found")
+	}
+	account, didRefresh, err := store.ForceRefreshCredential(context.Background(), server.Client(), profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !didRefresh || account.Token != "forced-access" {
+		t.Fatalf("forced refresh result = didRefresh:%v token:%q", didRefresh, account.Token)
+	}
+	credential, err := store.ReadCredential(context.Background(), store.ClaudeConfigDir(profile.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "forced-access" || credential.RefreshToken != "forced-refresh" {
+		t.Fatalf("forced credential was not persisted: %+v", credential)
 	}
 }
 

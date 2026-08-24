@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
-	"github.com/manaflow-ai/subrouter/internal/session"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 const defaultSRSwitchInterval = 10 * time.Minute
@@ -17,11 +17,16 @@ type srAutoSwitchConfig struct {
 	Interval     time.Duration
 	Accounts     []accounts.Account
 	AccountsFunc func() []accounts.Account
-	Sessions     *session.Store
-	SchedulerRef *selectacct.SchedulerRef
-	Logger       *slog.Logger
-	FetchScores  func(context.Context, []accounts.Account) ([]selectacct.Score, int)
-	SwitchActive func(context.Context, string) error
+	// AccountsSnapshotFunc couples dynamic accounts to the generation used for
+	// scheduler publication. It supersedes AccountsFunc when configured.
+	AccountsSnapshotFunc func() ([]accounts.Account, uint64)
+	Sessions             *session.Store
+	SchedulerRef         *selectacct.SchedulerRef
+	Logger               *slog.Logger
+	FetchScores          func(context.Context, []accounts.Account) ([]selectacct.Score, int)
+	SwitchActive         func(context.Context, string) error
+	// Lease keeps the sweep singleton across concurrently live workers.
+	Lease srAutoSwitchLease
 }
 
 func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
@@ -35,6 +40,15 @@ func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			claimed, leaseErr := cfg.Lease.acquire(cfg.Interval)
+			if leaseErr != nil {
+				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch lease unavailable, sweeping anyway", "error", leaseErr)
+			}
+			if !claimed {
+				// Another live worker already swept within this interval.
+				timer.Reset(cfg.Interval)
+				continue
+			}
 			picked, err := srAutoSwitchOnce(ctx, cfg)
 			if err != nil {
 				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch failed", "error", err)
@@ -82,10 +96,13 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	}
 
 	allAccounts := cfg.Accounts
-	if cfg.AccountsFunc != nil {
+	accountGeneration := uint64(0)
+	if cfg.AccountsSnapshotFunc != nil {
+		allAccounts, accountGeneration = cfg.AccountsSnapshotFunc()
+	} else if cfg.AccountsFunc != nil {
 		allAccounts = cfg.AccountsFunc()
 	}
-	candidates := oauthAccounts(allAccounts)
+	candidates := codexOAuthAccounts(allAccounts)
 	if len(candidates) == 0 {
 		return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
 	}
@@ -97,13 +114,18 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 
 	scheduler := selectacct.NewScheduler(scores)
 	if cfg.SchedulerRef != nil {
-		cfg.SchedulerRef.Set(scheduler)
+		if !cfg.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
+			return "", fmt.Errorf("account pool changed during sr auto-switch")
+		}
 	}
 	if cfg.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(cfg.Sessions.CountByAccount())
 	}
 
-	picked, err := scheduler.Pick(candidates)
+	// PickBest, not Pick: auto-switch maintains one active CLI account over
+	// time, and the placement spread would rotate it across equally-usable
+	// accounts on every interval.
+	picked, err := scheduler.PickBest(candidates)
 	if err != nil {
 		return "", err
 	}
@@ -119,10 +141,11 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	return picked.ID, nil
 }
 
-func oauthAccounts(all []accounts.Account) []accounts.Account {
+func codexOAuthAccounts(all []accounts.Account) []accounts.Account {
 	out := make([]accounts.Account, 0, len(all))
 	for _, account := range all {
-		if account.AuthMode == accounts.AuthModeOAuth {
+		if account.AuthMode == accounts.AuthModeOAuth &&
+			(account.Provider == "" || account.Provider == accounts.ProviderCodex) {
 			out = append(out, account)
 		}
 	}

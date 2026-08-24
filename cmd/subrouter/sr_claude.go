@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -49,9 +50,50 @@ type claudeRunner struct {
 	pushToServer func(ctx context.Context, name string) error
 	pushAfterAdd func(ctx context.Context, name string) error
 	pick         func(ctx context.Context) error
+	// ephemeral is used by hosted account onboarding. OAuth runs in a
+	// temporary store, the credential is uploaded, and no local profile or
+	// trajectory directory survives the command.
+	ephemeral bool
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
+	// Launching Claude needs a live daemon; account management does not. Start
+	// the daemon only for the launching forms so `sr claude list` stays quiet.
+	if claudeLaunchesAgent(args) {
+		config, err := cloudModeConfig()
+		if err != nil {
+			return fmt.Errorf("load cmux.com login: %w", err)
+		}
+		source := config.EffectiveCredentialSource()
+		if source == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if source == broker.CredentialSourceHosted {
+			server, ok, err := r.selectedRemoteServer()
+			if err != nil {
+				return err
+			}
+			if !ok || server.Name != "cmux" || server.TenantKey == "" {
+				return fmt.Errorf("hosted cmux remote is unavailable; run '%s login'", programBase())
+			}
+			return r.proxyClaudeTo(ctx, args, serverProxyRootURL(server), server.TenantKey)
+		}
+		if source == broker.CredentialSourceTeam ||
+			source == broker.CredentialSourceLocal {
+			if !ensureLocalHealthy(
+				ctx,
+				fallbackHTTPClient(),
+				localBaseURL(),
+				defaultDaemonStarter(),
+				r.errOut,
+			) {
+				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
+			}
+			localProxyToken := cloudClientProxyToken(config, localBaseURL())
+			return r.proxyClaude(ctx, args, localProxyToken)
+		}
+		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
+	}
 	cr := claudeRunner{
 		store:        claude.DefaultStore(),
 		in:           r.in,
@@ -63,6 +105,123 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		pick:         r.pickClaudeProfile,
 	}
 	return cr.run(ctx, args)
+}
+
+// cloudClaude launches Claude against the local proxy. The proxy leases an
+// access-only team credential from cmux.com and sends the provider request from
+// this machine, so Claude never sees a shared refresh token.
+func (r srRunner) cloudClaude(ctx context.Context, args []string) error {
+	config, err := cloudModeConfig()
+	if err != nil {
+		return fmt.Errorf("load cmux.com login: %w", err)
+	}
+	if !config.TeamModeReady() {
+		return fmt.Errorf("cmux.com team vault is not configured; run '%s login'", programBase())
+	}
+	return r.proxyClaude(
+		ctx,
+		args,
+		cloudClientProxyToken(config, localBaseURL()),
+	)
+}
+
+func (r srRunner) proxyClaude(
+	ctx context.Context,
+	args []string,
+	localProxyToken string,
+) error {
+	return r.proxyClaudeTo(ctx, args, localBaseURL(), localProxyToken)
+}
+
+func (r srRunner) proxyClaudeTo(
+	ctx context.Context,
+	args []string,
+	baseURL string,
+	proxyToken string,
+) error {
+	configDir, launchArgs, err := proxyClaudeInvocation(
+		claude.DefaultStore(),
+		args,
+	)
+	if err != nil {
+		return err
+	}
+	claudePath, ok := claude.DetectCLI()
+	if !ok {
+		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd.Stdin = r.in
+	cmd.Stdout = r.out
+	cmd.Stderr = r.errOut
+
+	env := cloudClaudeEnvironment(
+		os.Environ(),
+		baseURL,
+		proxyToken,
+	)
+	if configDir != "" {
+		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
+	}
+	cmd.Env = env
+	return cmd.Run()
+}
+
+func proxyClaudeInvocation(
+	store claude.Store,
+	args []string,
+) (string, []string, error) {
+	name := ""
+	launchArgs := args
+	explicitProfile := false
+	switch {
+	case len(args) == 0:
+		name = store.ActiveProfile()
+	case args[0] == "run":
+		launchArgs = args[1:]
+		if len(launchArgs) > 0 && !strings.HasPrefix(launchArgs[0], "-") {
+			name = launchArgs[0]
+			explicitProfile = true
+			launchArgs = launchArgs[1:]
+		} else {
+			name = store.ActiveProfile()
+		}
+	case strings.HasPrefix(args[0], "-"):
+		name = store.ActiveProfile()
+	default:
+		explicitProfile = true
+		name = args[0]
+		launchArgs = args[1:]
+	}
+	if name == "" {
+		if explicitProfile {
+			return "", nil, fmt.Errorf("profile %q not found", name)
+		}
+		return "", launchArgs, nil
+	}
+	profile, ok, err := store.MatchProfile(name)
+	if err != nil {
+		return "", nil, err
+	}
+	if !ok {
+		return "", nil, fmt.Errorf("profile %q not found", name)
+	}
+	if err := store.SetActiveProfile(profile.Name); err != nil {
+		return "", nil, err
+	}
+	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
+}
+
+func cloudClaudeEnvironment(
+	environ []string,
+	baseURL string,
+	proxyToken string,
+) []string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+	env := envWithout(environ, claudeRoutingEnvKeys)
+	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
+	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", proxyToken)
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -212,6 +371,18 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	if status.Email != "" {
 		email = " (" + status.Email + ")"
 	}
+	if r.ephemeral {
+		if r.pushAfterAdd == nil {
+			return fmt.Errorf("hosted Claude upload is unavailable")
+		}
+		if err := r.pushAfterAdd(ctx, profileName); err != nil {
+			return fmt.Errorf("upload Claude credential: %w", err)
+		}
+		fmt.Fprintf(r.out, "\nAdded Claude account %q to hosted cmux.%s%s\n", profileName, email, plan)
+		fmt.Fprintln(r.out, "Local Claude auth was left unchanged.")
+		return nil
+	}
+
 	fmt.Fprintf(r.out, "\nAdded Claude profile %q.%s%s\n", profileName, email, plan)
 	if r.pushAfterAdd != nil {
 		if err := r.pushAfterAdd(ctx, profileName); err != nil {

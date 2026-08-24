@@ -19,7 +19,9 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/selectacct"
+	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"golang.org/x/term"
 )
 
 const srUsageCacheTTL = time.Hour
@@ -45,7 +47,9 @@ const srHelp = `sr - Manage Subrouter accounts
 
 Usage:
   sr                    Show Codex and Claude usage, grouped by provider
-  sr add                Add a new Codex account (opens OAuth login)
+  sr add                Ask whether to add Codex or Claude
+  sr add codex          Add Codex to the active local or hosted pool
+  sr add claude         Add Claude to the active local or hosted pool
   sr add-key            Add an API key account
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts
@@ -59,14 +63,60 @@ Usage:
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
+  sr az status          Show whether the Azure Codex fallback is armed
+  sr az test [model]    Prove the Azure route with one forced request
+  sr az codex [args]    Run Codex forced onto Azure
 
-  sr server             Manage Subrouter servers
+Getting started:
+  sr login              Authenticate with cmux.com through Stack Auth
+                        Use --hosted-url for a staging public origin
+  sr add codex          Add a Codex account to hosted cmux
+  sr add claude         Add a Claude account to hosted cmux
+  sr logout             Revoke this machine's cmux.com session
+  sr remote -v          List local, cmux hosted, and self-hosted remotes
+  sr remote use local   Route agents through this computer
+  sr remote use cmux    Route agents through hosted cmux
+  sr remote add <name> <url>
+                        Add a self-hosted Subrouter
+  sr remote use <name>  Route agents through a self-hosted Subrouter
+
+Advanced setup:
+  sr setup              Install the local daemon and verify it
+  sr setup --storage local
+                        Install the daemon with credentials kept on this machine
+  sr storage            Show the active credential source
+  sr storage hosted     Use credentials hosted for the selected Stack team
+  sr storage local      Keep and use credentials only on this machine
+  sr storage legacy     Use the selected legacy remote Subrouter server
+  sr team list          List available Stack teams
+  sr team use <team>    Select the team whose accounts this machine uses
+  sr account list       List credentials shared with the selected team
+  sr account import --only <label>
+                        Copy one local credential for a canary
+  sr account import --all
+                        Copy every local Codex, Claude, and API-key account
+  sr account repair <id>
+                        Replace a broken shared credential in place
+  sr doctor             Diagnose login, team, daemon, and credential access
+  sr cleanup            Remove the local daemon (--yes to apply, --purge for credentials)
+
+Running agents:
+  sr codex [args]       Run codex through Subrouter
+  sr claude [args]      Run claude through Subrouter
+  sr gemini [args]      Run gemini through Subrouter
+
+  sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
   sr server use <name|local> [--no-codex-config]
   sr server rename <old> <new>
   sr server install <name>
   sr server login <name> [--device-auth]
   sr server sync <name> [--device-auth] [--yes]
+
+  sr tenant create <name> [--server <name>]
+  sr tenant list [--server <name>]
+  sr tenant key create <tenant> [--server <name>]
+  sr tenant key revoke <tenant> <key-prefix> [--server <name>]
 
   sr admin-keys         List stored OpenAI admin keys
   sr add-admin-key      Add an sk-admin-* key
@@ -137,19 +187,71 @@ func srForProgram(program string, args []string) error {
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
+	// Keep recovery commands available when cloud.json is malformed. Login can
+	// replace it after a successful device flow, while help, doctor, and cleanup
+	// need no valid cloud state to explain or remove the broken installation.
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "-h", "--help":
+			fmt.Fprint(r.out, srHelp)
+			return nil
+		case "login":
+			return r.cloudLogin(ctx, args[1:])
+		case "logout":
+			return r.cloudLogout(ctx)
+		case "storage":
+			return r.cloudStorage(args[1:])
+		case "setup":
+			return r.cloudSetup(ctx, args[1:])
+		case "cleanup":
+			return runCleanup(r.store, args[1:], r.out)
+		case "doctor":
+			return runDoctor(ctx, r.store, r.out)
+		}
+	}
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
 	}
-	if shouldRouteSRCommand(args[0]) {
-		if server, ok, err := r.selectedRemoteServer(); err != nil {
+	var source broker.CredentialSource
+	// A named server in the environment is an explicit, one-command target.
+	// Honor it before the persisted credential source so wrappers such as
+	// `SUBROUTER_CODEX_SERVER=gcp-staging sr add` upload directly to that
+	// server even when this machine normally uses the team vault.
+	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" && shouldRouteSRCommand(args[0]) {
+		if strings.EqualFold(target, "local") {
+			source = broker.CredentialSourceLocal
+		} else if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
 			return err
-		} else if ok {
-			return r.runRemoteAccountCommand(ctx, server, args)
+		}
+	}
+	if source == "" {
+		config, err := cloudModeConfig()
+		if err != nil {
+			return fmt.Errorf("load credential storage: %w", err)
+		}
+		source = config.EffectiveCredentialSource()
+	}
+	if source == broker.CredentialSourceTeam || source == broker.CredentialSourceHosted {
+		if handled, err := r.runTeamCredentialCommand(ctx, args); handled {
+			return err
+		}
+	}
+	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) {
+		if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
+			return err
 		}
 	}
 	switch args[0] {
-	case "add", "login":
-		return r.add(ctx)
+	case "add":
+		return r.addProvider(ctx, args[1:])
+	case "logout":
+		return r.cloudLogout(ctx)
+	case "team":
+		return r.cloudTeam(ctx, args[1:])
+	case "account", "accounts":
+		return r.cloudAccount(ctx, args[1:])
+	case "storage":
+		return r.cloudStorage(args[1:])
 	case "add-key", "add-api-key":
 		return r.addKey()
 	case "import":
@@ -220,9 +322,17 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.attachProject(ctx, args[1], projectID)
 	case "server", "servers":
 		return r.server(ctx, args[1:])
+	case "remote", "remotes":
+		return r.remote(ctx, args[1:])
+	case "tenant", "tenants":
+		return r.tenant(ctx, args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprint(r.out, srHelp)
 		return nil
+	case "daemon":
+		return runDaemonCommand(ctx, args[1:], r.out, r.errOut)
+	case "setup":
+		return r.cloudSetup(ctx, args[1:])
 	case "claude":
 		return r.claude(ctx, args[1:])
 	case "claude-aws":
@@ -233,6 +343,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.spend(ctx)
 	case "gemini":
 		return r.gemini(args[1:])
+	case "az", "azure":
+		return r.az(ctx, args[1:])
 	default:
 		if strings.Contains(args[0], "@") {
 			return r.statusOne(ctx, args[0])
@@ -241,12 +353,67 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	}
 }
 
+func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []string) (bool, error) {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil || !ok {
+		return ok, err
+	}
+	return true, r.runRemoteAccountCommand(ctx, server, args)
+}
+
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "help", "-h", "--help":
+		return false
+	// Setup, cleanup and doctor act on this machine, never the remote server.
+	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
 		return false
 	default:
 		return true
+	}
+}
+
+func (r srRunner) runTeamCredentialCommand(
+	ctx context.Context,
+	args []string,
+) (bool, error) {
+	switch args[0] {
+	case "list", "ls", "status", "usage":
+		return true, r.cloudStatus(ctx)
+	case "add":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		providerArgs := args[1:]
+		if len(providerArgs) == 0 {
+			chosen, chooseErr := r.promptProvider()
+			if chooseErr != nil {
+				return true, chooseErr
+			}
+			providerArgs = []string{chosen}
+		}
+		return true, r.cloudAccountAdd(ctx, client, providerArgs)
+	case "add-key", "add-api-key":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountAdd(ctx, client, []string{"openai-key"})
+	case "import":
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return true, err
+		}
+		return true, r.cloudAccountImport(ctx, client, args[1:])
+	case "remove", "rm":
+		return true, r.cloudAccount(ctx, args)
+	case "switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "reset":
+		return true, fmt.Errorf(
+			"hosted cmux selects an account per request; use 'sr account list' or switch with 'sr remote use local'",
+		)
+	default:
+		return false, nil
 	}
 }
 
@@ -312,6 +479,56 @@ func (r srRunner) unsupportedRemoteCommand(command string, server srServerConfig
 	return fmt.Errorf("%s is configured to use server %s (%s), so %s will not edit local Codex state; %s", r.programOrSubrouter(), server.Name, server.URL, r.programOrSubrouter()+" "+command, detail)
 }
 
+// addProvider is the one command a new user runs to attach a credential.
+// "sr add codex" and "sr add claude" are explicit; bare "sr add" asks, because
+// a user who has just installed this does not yet know which provider names the
+// tool expects, and guessing Codex silently was a trap for Claude users.
+func (r srRunner) addProvider(ctx context.Context, args []string) error {
+	provider := ""
+	if len(args) > 0 {
+		provider = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+	if provider == "" {
+		chosen, err := r.promptProvider()
+		if err != nil {
+			return err
+		}
+		provider = chosen
+	}
+	switch provider {
+	case "codex", "openai", "chatgpt":
+		return r.add(ctx)
+	case "claude", "anthropic":
+		return r.claude(ctx, append([]string{"add"}, args[1:]...))
+	default:
+		return fmt.Errorf("unknown provider %q; use '%s add codex' or '%s add claude'",
+			provider, r.program, r.program)
+	}
+}
+
+// promptProvider asks which provider to attach. A non-interactive caller gets
+// an error naming both commands rather than a hang on a read that never returns.
+func (r srRunner) promptProvider() (string, error) {
+	if !readerIsTerminal(r.in) {
+		return "", fmt.Errorf("no provider given; run '%s add codex' or '%s add claude'",
+			r.program, r.program)
+	}
+	fmt.Fprintf(r.out, "Which account do you want to add?\n\n  1) Codex   (ChatGPT subscription or API key)\n  2) Claude  (Anthropic subscription or API key)\n\nChoice [1]: ")
+	line, err := bufio.NewReader(r.in).ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		return "", fmt.Errorf("no provider selected")
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "", "1", "codex":
+		return "codex", nil
+	case "2", "claude":
+		return "claude", nil
+	default:
+		return "", fmt.Errorf("unrecognised choice %q; run '%s add codex' or '%s add claude'",
+			strings.TrimSpace(line), r.program, r.program)
+	}
+}
+
 func (r srRunner) add(ctx context.Context) error {
 	previousActive, err := r.store.DetectActiveAccount()
 	if err != nil {
@@ -364,7 +581,12 @@ func (r srRunner) addKey() error {
 	if err != nil {
 		return err
 	}
-	key, err := promptLine(r.out, reader, "API key (sk-...): ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		"API key (sk-...): ",
+	)
 	if err != nil {
 		return err
 	}
@@ -525,10 +747,19 @@ func appendKV(parts *[]string, key, value string) {
 }
 
 func (r srRunner) status(ctx context.Context) error {
-	if server, ok, err := r.defaultRemoteServer(); err != nil {
+	config, err := cloudModeConfig()
+	if err != nil {
 		return err
-	} else if ok {
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		return r.cloudStatus(ctx)
+	case broker.CredentialSourceLegacy:
+		if server, ok, err := r.defaultRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
@@ -596,10 +827,19 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 }
 
 func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) error {
-	if server, ok, err := r.defaultRemoteServer(); err != nil {
+	config, err := cloudModeConfig()
+	if err != nil {
 		return err
-	} else if ok {
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+	}
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		return r.cloudStatus(ctx)
+	case broker.CredentialSourceLegacy:
+		if server, ok, err := r.defaultRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
 		return err
@@ -891,7 +1131,12 @@ func (r srRunner) addAdminKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	key, err := promptLine(r.out, reader, "Admin key (sk-admin-...): ")
+	key, err := promptSecret(
+		r.out,
+		reader,
+		r.in,
+		"Admin key (sk-admin-...): ",
+	)
 	if err != nil {
 		return err
 	}
@@ -2217,6 +2462,27 @@ func promptLine(out io.Writer, reader *bufio.Reader, prompt string) (string, err
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+func promptSecret(
+	out io.Writer,
+	reader *bufio.Reader,
+	input io.Reader,
+	prompt string,
+) (string, error) {
+	file, interactive := input.(*os.File)
+	if !interactive ||
+		reader.Buffered() != 0 ||
+		!term.IsTerminal(int(file.Fd())) {
+		return promptLine(out, reader, prompt)
+	}
+	fmt.Fprint(out, prompt)
+	value, err := term.ReadPassword(int(file.Fd()))
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(value)), nil
 }
 
 func restartCodexGUI(ctx context.Context) (string, error) {

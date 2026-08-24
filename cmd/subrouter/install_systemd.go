@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,24 +20,29 @@ import (
 const defaultSystemdServiceName = "subrouter"
 
 type systemdConfig struct {
-	ServiceName      string
-	User             string
-	Group            string
-	Home             string
-	Addr             string
-	InstallPath      string
-	SessionsPath     string
-	TranscriptsDir   string
-	SRSwitchInterval string
-	AdminToken       string
-	ExtraArgs        string
-	Start            bool
-	DryRun           bool
-	InstallAliases   bool
-	ReplaceLegacy    bool
+	ServiceName        string
+	User               string
+	Group              string
+	Home               string
+	Addr               string
+	InstallPath        string
+	SessionsPath       string
+	TranscriptsDir     string
+	SRSwitchInterval   string
+	AdminToken         string
+	AccountImportToken string
+	ExtraArgs          string
+	Start              bool
+	DryRun             bool
+	InstallAliases     bool
+	ReplaceLegacy      bool
 }
 
 func installSystemd(args []string) error {
+	return installSystemdWithInput(args, os.Stdin)
+}
+
+func installSystemdWithInput(args []string, input io.Reader) error {
 	config := systemdConfig{}
 	flags := flag.NewFlagSet("install-systemd", flag.ContinueOnError)
 	flags.StringVar(&config.ServiceName, "service", defaultSystemdServiceName, "systemd service name")
@@ -50,6 +56,9 @@ func installSystemd(args []string) error {
 	flags.StringVar(&config.SRSwitchInterval, "sr-switch-interval", "10m", "sr auto-switch interval; 0 disables")
 	flags.StringVar(&config.SRSwitchInterval, "cx-switch-interval", "10m", "compatibility alias for --sr-switch-interval")
 	flags.StringVar(&config.AdminToken, "admin-token", "", "admin token required for non-loopback _subrouter endpoints; preserves existing SUBROUTER_ADMIN_TOKEN by default")
+	adminTokenStdin := flags.Bool("admin-token-stdin", false, "read the admin token from standard input without exposing it in process arguments")
+	flags.StringVar(&config.AccountImportToken, "account-import-token", "", "token limited to protected account import; preserves existing SUBROUTER_ACCOUNT_IMPORT_TOKEN by default")
+	accountImportTokenStdin := flags.Bool("account-import-token-stdin", false, "read the account import token from standard input without exposing it in process arguments")
 	flags.StringVar(&config.ExtraArgs, "extra-args", "", "extra arguments appended to subrouter serve")
 	flags.BoolVar(&config.Start, "start", true, "enable and restart the systemd service")
 	flags.BoolVar(&config.DryRun, "dry-run", false, "print the systemd unit without writing files")
@@ -58,11 +67,81 @@ func installSystemd(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if *adminTokenStdin && strings.TrimSpace(config.AdminToken) != "" {
+		return errors.New("--admin-token and --admin-token-stdin cannot be used together")
+	}
+	if *accountImportTokenStdin && strings.TrimSpace(config.AccountImportToken) != "" {
+		return errors.New("--account-import-token and --account-import-token-stdin cannot be used together")
+	}
+	requestedTokens := 0
+	if *adminTokenStdin {
+		requestedTokens++
+	}
+	if *accountImportTokenStdin {
+		requestedTokens++
+	}
+	if requestedTokens > 0 {
+		tokens, err := readSystemdTokens(input, requestedTokens)
+		if err != nil {
+			return err
+		}
+		index := 0
+		if *adminTokenStdin {
+			config.AdminToken = tokens[index]
+			index++
+		}
+		if *accountImportTokenStdin {
+			config.AccountImportToken = tokens[index]
+		}
+	}
 	if runtime.GOOS != "linux" && !config.DryRun {
 		return errors.New("install-systemd is Linux-only")
 	}
 	applyExistingSystemdDefaults(&config, systemdDefaultPath(config))
 	return installSystemdWithConfig(config, commandRunner{})
+}
+
+func readSystemdAdminToken(input io.Reader) (string, error) {
+	tokens, err := readSystemdTokens(input, 1)
+	if err != nil {
+		return "", err
+	}
+	return tokens[0], nil
+}
+
+func readSystemdTokens(input io.Reader, count int) ([]string, error) {
+	if input == nil {
+		return nil, errors.New("token input is unavailable")
+	}
+	limit := int64(count*4097 + 1)
+	body, err := io.ReadAll(io.LimitReader(input, limit))
+	if err != nil {
+		return nil, fmt.Errorf("read service token: %w", err)
+	}
+	if int64(len(body)) >= limit {
+		return nil, errors.New("service token input is too large")
+	}
+	text := strings.ReplaceAll(string(body), "\r\n", "\n")
+	text = strings.TrimSuffix(text, "\n")
+	lines := strings.Split(text, "\n")
+	if len(lines) != count {
+		return nil, fmt.Errorf("expected %d service token line(s)", count)
+	}
+	tokens := make([]string, count)
+	for index, line := range lines {
+		token := strings.TrimSpace(line)
+		if token == "" {
+			return nil, errors.New("service token is required on standard input")
+		}
+		if len(token) > 4096 {
+			return nil, errors.New("service token is too large")
+		}
+		if strings.ContainsAny(token, "\r\n\x00") {
+			return nil, errors.New("service token contains invalid characters")
+		}
+		tokens[index] = token
+	}
+	return tokens, nil
 }
 
 func installSystemdWithConfig(config systemdConfig, runner commandRunner) error {
@@ -125,17 +204,14 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 			}
 		}
 	}
-	defaultMode := os.FileMode(0o644)
-	if config.AdminToken != "" {
-		defaultMode = 0o600
-	}
-	if err := os.WriteFile(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
+	defaultMode := systemdDefaultsMode(config)
+	if err := writeFileAtomic(systemdDefaultPath(config), []byte(defaults), defaultMode); err != nil {
 		return err
 	}
-	if err := os.WriteFile(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
+	if err := writeFileAtomic(systemdUnitPath(config), []byte(unit), 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
+	if err := writeFileAtomic(systemdSocketPath(config), []byte(socketUnit), 0o644); err != nil {
 		return err
 	}
 	chownPaths := []string{
@@ -176,6 +252,46 @@ func installSystemdWithConfig(config systemdConfig, runner commandRunner) error 
 	return nil
 }
 
+func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	file, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
+}
+
+func systemdDefaultsMode(config systemdConfig) os.FileMode {
+	if config.AdminToken != "" || config.AccountImportToken != "" {
+		return 0o600
+	}
+	return 0o644
+}
+
 func validateSystemdConfig(config systemdConfig) error {
 	if strings.TrimSpace(config.ServiceName) == "" {
 		return errors.New("service is required")
@@ -206,6 +322,20 @@ func validateSystemdConfig(config systemdConfig) error {
 	}
 	if _, err := time.ParseDuration(config.SRSwitchInterval); err != nil {
 		return fmt.Errorf("sr-switch-interval must be a Go duration such as 10m: %w", err)
+	}
+	for name, value := range map[string]string{
+		"addr":                 config.Addr,
+		"home":                 config.Home,
+		"sessions":             config.SessionsPath,
+		"transcripts":          config.TranscriptsDir,
+		"sr-switch-interval":   config.SRSwitchInterval,
+		"admin-token":          config.AdminToken,
+		"account-import-token": config.AccountImportToken,
+		"extra-args":           config.ExtraArgs,
+	} {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("%s contains a newline or NUL byte", name)
+		}
 	}
 	return nil
 }
@@ -241,6 +371,9 @@ func applyExistingSystemdDefaults(config *systemdConfig, defaultPath string) {
 	if config.AdminToken == "" {
 		config.AdminToken = readDefaultValue(defaultPath, "SUBROUTER_ADMIN_TOKEN")
 	}
+	if config.AccountImportToken == "" {
+		config.AccountImportToken = readDefaultValue(defaultPath, "SUBROUTER_ACCOUNT_IMPORT_TOKEN")
+	}
 }
 
 func readLegacySystemdExtraArgs() string {
@@ -268,11 +401,47 @@ func readDefaultValue(path, keyName string) string {
 		if !ok || strings.TrimSpace(key) != keyName {
 			continue
 		}
-		value = strings.TrimSpace(value)
-		value = strings.Trim(value, `"`)
-		return value
+		return parseSystemdEnvironmentValue(strings.TrimSpace(value))
 	}
 	return ""
+}
+
+// EnvironmentFile double-quoted values use shell-like escaping only for a
+// small set of characters. Keep the writer and reader paired so a reinstall
+// preserves credentials containing quotes or backslashes byte for byte.
+func quoteSystemdEnvironmentValue(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for _, char := range value {
+		if char == '\\' || char == '"' {
+			quoted.WriteByte('\\')
+		}
+		quoted.WriteRune(char)
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
+}
+
+func parseSystemdEnvironmentValue(value string) string {
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return value
+	}
+	value = value[1 : len(value)-1]
+	var unquoted strings.Builder
+	unquoted.Grow(len(value))
+	for index := 0; index < len(value); index++ {
+		if value[index] == '\\' && index+1 < len(value) {
+			next := value[index+1]
+			if next == '\\' || next == '"' {
+				unquoted.WriteByte(next)
+				index++
+				continue
+			}
+		}
+		unquoted.WriteByte(value[index])
+	}
+	return unquoted.String()
 }
 
 func stopLegacySystemdServices(runner commandRunner) {
@@ -315,11 +484,16 @@ func systemdDefaults(config systemdConfig) string {
 SUBROUTER_STATE_DIR=%s
 SUBROUTER_SESSIONS=%s
 SUBROUTER_TRANSCRIPTS=%s
-SUBROUTER_TRANSCRIPT_ARGS=%q
+SUBROUTER_TRANSCRIPT_ARGS=%s
 SUBROUTER_SR_SWITCH_INTERVAL=%s
-SUBROUTER_ADMIN_TOKEN=%q
-SUBROUTER_EXTRA_ARGS=%q
-`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir, transcriptArgs, config.SRSwitchInterval, config.AdminToken, config.ExtraArgs)
+SUBROUTER_ADMIN_TOKEN=%s
+SUBROUTER_ACCOUNT_IMPORT_TOKEN=%s
+SUBROUTER_EXTRA_ARGS=%s
+`, config.Addr, config.Home, config.SessionsPath, config.TranscriptsDir,
+		quoteSystemdEnvironmentValue(transcriptArgs), config.SRSwitchInterval,
+		quoteSystemdEnvironmentValue(config.AdminToken),
+		quoteSystemdEnvironmentValue(config.AccountImportToken),
+		quoteSystemdEnvironmentValue(config.ExtraArgs))
 }
 
 func systemdUnit(config systemdConfig) (string, error) {

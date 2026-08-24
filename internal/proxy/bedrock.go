@@ -146,6 +146,14 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 	// ("context_management: Extra inputs are not permitted"), which used to
 	// push every context-editing Claude Code request straight to the API key.
 	body = stripClaudeUnsupportedFields(body)
+	var strippedTools int
+	body, strippedTools = stripBedrockUnsupportedTools(body)
+	if strippedTools > 0 && s.Logger != nil {
+		s.Logger.Warn("stripped bedrock-unsupported server tools from claude-fable request", "count", strippedTools)
+	}
+	if !s.ClaudeFableCacheTTLUpgradeOff {
+		body = upgradeEphemeralCacheTTL(body)
+	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
@@ -169,64 +177,88 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		endpoint = "invoke-with-response-stream"
 	}
 	path := "/model/" + bedrockFableModelID + "/" + endpoint
+	var resp *http.Response
+	var sourceName, region string
 	started := time.Now()
-	resp, sourceName, region, err := s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		if s.Logger != nil {
-			s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName, "region", region)
+	for attempt := 1; ; attempt++ {
+		started = time.Now()
+		resp, sourceName, region, err = s.signAndForwardBedrock(ctx, http.MethodPost, path, newBody)
+		if err != nil {
+			return nil, err
 		}
-		cfg.onThrottle(sourceName, region, bedrockFableModelID)
-	}
-
-	if stream && resp.StatusCode == http.StatusOK {
-		first, peeked, err := peekBedrockStream(resp.Body)
-		if err != nil || strings.EqualFold(first.messageType, "exception") {
+		if resp.StatusCode == http.StatusTooManyRequests {
 			if s.Logger != nil {
-				attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false}
-				if first.exceptionType != "" {
-					attrs = append(attrs, "exception_type", first.exceptionType, "message", bedrockLogPreview(first.payload))
-				}
-				if err != nil {
-					attrs = append(attrs, "read_err", err)
-				}
-				s.Logger.Warn("claude-fable bedrock stream failed before first event", attrs...)
+				s.Logger.Warn("bedrock throttled", "model", bedrockFableModelID, "path", path, "bedrock_source", sourceName, "region", region)
 			}
-			_ = resp.Body.Close()
-			body := first.payload
-			if len(body) == 0 {
-				body = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before first event"}}`)
-			}
-			s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+			cfg.onThrottle(sourceName, region, bedrockFableModelID)
+		}
+		if !stream || resp.StatusCode != http.StatusOK {
+			break
+		}
+		peek := peekBedrockStreamUntilCommit(resp.Body)
+		if peek.outcome == bedrockPeekCommit {
+			pr, pw := io.Pipe()
+			streamStarted := started
+			streamRegion := region
+			streamSource := sourceName
+			body := resp.Body
+			peeked := peek.peeked
+			commitReason := peek.commitReason
+			commitAt := peek.commitAt
+			go func() {
+				result := transcodeBedrockToSSESince(pw, io.MultiReader(bytes.NewReader(peeked), body), s.Logger, streamSource, streamRegion, streamStarted, commitReason, commitAt)
+				_ = body.Close()
+				_ = pw.Close()
+				s.recordClaudeFableBedrockCost(streamStarted, streamRegion, http.StatusOK, result.Usage, result.HaveUsage)
+			}()
 			return &http.Response{
-				Status:        "503 Service Unavailable",
-				StatusCode:    http.StatusServiceUnavailable,
+				Status:        "200 OK",
+				StatusCode:    http.StatusOK,
 				Proto:         "HTTP/1.1",
 				ProtoMajor:    1,
 				ProtoMinor:    1,
-				Header:        http.Header{"Content-Type": {"application/json"}},
-				Body:          io.NopCloser(bytes.NewReader(body)),
-				ContentLength: int64(len(body)),
+				Header:        http.Header{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}},
+				Body:          pr,
+				ContentLength: -1,
 			}, nil
 		}
-		pr, pw := io.Pipe()
-		go func() {
-			result := transcodeBedrockToSSE(pw, io.MultiReader(bytes.NewReader(peeked), resp.Body), s.Logger, sourceName, region)
-			_ = resp.Body.Close()
-			_ = pw.Close()
-			s.recordClaudeFableBedrockCost(started, region, http.StatusOK, result.Usage, result.HaveUsage)
-		}()
+		retryable := bedrockPeekFailureRetryable(peek)
+		// Error bodies only (never message content): the failing frame is an
+		// exception or an Anthropic error event, so logging it is safe.
+		if s.Logger != nil {
+			attrs := []any{"bedrock_source", sourceName, "region", region, "saw_message_stop", false, "attempt", attempt, "retryable", retryable}
+			if peek.errorFrame.exceptionType != "" {
+				attrs = append(attrs, "exception_type", peek.errorFrame.exceptionType)
+			}
+			if len(peek.errorFrame.payload) > 0 {
+				attrs = append(attrs, "message", bedrockLogPreview(peek.errorFrame.payload))
+			}
+			if peek.readErr != nil {
+				attrs = append(attrs, "read_err", peek.readErr)
+			}
+			s.Logger.Warn("claude-fable bedrock stream failed before content", attrs...)
+		}
+		_ = resp.Body.Close()
+		s.recordClaudeFableBedrockCost(started, region, http.StatusServiceUnavailable, bedrockUsage{}, false)
+		if retryable && attempt < claudeFableBedrockStreamAttempts && bedrockRetryBackoff(ctx, attempt) {
+			// A fresh signAndForwardBedrock call starts from the next
+			// credential source/region rotation, so the retry prefers a
+			// different endpoint when more than one is configured.
+			continue
+		}
+		errBody := peek.errorFrame.payload
+		if len(errBody) == 0 {
+			errBody = []byte(`{"type":"error","error":{"type":"api_error","message":"Bedrock stream failed before content"}}`)
+		}
 		return &http.Response{
-			Status:        "200 OK",
-			StatusCode:    http.StatusOK,
+			Status:        "503 Service Unavailable",
+			StatusCode:    http.StatusServiceUnavailable,
 			Proto:         "HTTP/1.1",
 			ProtoMajor:    1,
 			ProtoMinor:    1,
-			Header:        http.Header{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}},
-			Body:          pr,
-			ContentLength: -1,
+			Header:        http.Header{"Content-Type": {"application/json"}},
+			Body:          io.NopCloser(bytes.NewReader(errBody)),
+			ContentLength: int64(len(errBody)),
 		}, nil
 	}
 	// Non-stream success or any error status: Bedrock answers Anthropic-format JSON.
@@ -254,6 +286,83 @@ func (s Server) claudeFableBedrockResponse(ctx context.Context, body []byte) (*h
 		Body:          io.NopCloser(bytes.NewReader(respBody)),
 		ContentLength: int64(len(respBody)),
 	}, nil
+}
+
+// upgradeEphemeralCacheTTL rewrites every bare cache_control
+// {"type":"ephemeral"} to the 1-hour TTL on the Bedrock path. Cost-log data
+// (2026-08-20): 88% of daily cache-write spend came from 819 requests that
+// re-wrote their whole context after the 5-minute cache expired during a long
+// tool run, and 89% of rewrite-causing gaps were under an hour. 1h writes cost
+// 1.6x the 5m rate, so the upgrade pays whenever more than 43% of rewrites
+// fall inside the hour. An explicit client-set ttl is respected untouched.
+// The byte-literal match is safe: inside a JSON string value the quotes would
+// be escaped, so the pattern can only match real cache_control objects.
+func upgradeEphemeralCacheTTL(body []byte) []byte {
+	return bytes.ReplaceAll(body,
+		[]byte(`"cache_control":{"type":"ephemeral"}`),
+		[]byte(`"cache_control":{"type":"ephemeral","ttl":"1h"}`))
+}
+
+// bedrockUnsupportedToolPrefixes lists Anthropic server-side tool types that
+// Bedrock rejects with a 400 ("tool type 'web_search_20250305' is not
+// supported for this model"). The direct Anthropic API supports them, so this
+// filter runs only on the Bedrock path; stripping the definition just means
+// the model never calls the tool, which is a strict improvement over failing
+// the whole request. Client tools (input_schema, custom types) and the
+// Bedrock-supported computer/text_editor/bash types pass through untouched.
+var bedrockUnsupportedToolPrefixes = []string{"web_search", "web_fetch", "code_execution"}
+
+// stripBedrockUnsupportedTools removes server tools Bedrock rejects from the
+// request's tools array, returning the possibly rebuilt body and how many
+// entries were dropped.
+func stripBedrockUnsupportedTools(body []byte) ([]byte, int) {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return body, 0
+	}
+	rawTools, ok := payload["tools"]
+	if !ok {
+		return body, 0
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(rawTools, &tools) != nil {
+		return body, 0
+	}
+	kept := make([]json.RawMessage, 0, len(tools))
+	dropped := 0
+	for _, tool := range tools {
+		var meta struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(tool, &meta)
+		unsupported := false
+		for _, prefix := range bedrockUnsupportedToolPrefixes {
+			if strings.HasPrefix(meta.Type, prefix) {
+				unsupported = true
+				break
+			}
+		}
+		if unsupported {
+			dropped++
+			continue
+		}
+		kept = append(kept, tool)
+	}
+	if dropped == 0 {
+		return body, 0
+	}
+	if len(kept) == 0 {
+		delete(payload, "tools")
+	} else if rebuilt, err := json.Marshal(kept); err == nil {
+		payload["tools"] = rebuilt
+	} else {
+		return body, 0
+	}
+	rebuilt, err := json.Marshal(payload)
+	if err != nil {
+		return body, 0
+	}
+	return rebuilt, dropped
 }
 
 func (s Server) recordClaudeFableBedrockCost(started time.Time, region string, status int, usage bedrockUsage, haveUsage bool) {
@@ -449,6 +558,237 @@ type bedrockFrame struct {
 
 var errBedrockStreamEmpty = errors.New("bedrock stream ended before first event")
 
+// claudeFableBedrockStreamAttempts bounds how many times a streaming Fable
+// request is re-sent to Bedrock when the stream fails before any content has
+// been forwarded to the client. Nothing was committed yet, so the request is
+// safely replayable.
+const claudeFableBedrockStreamAttempts = 3
+
+type bedrockPeekOutcome int
+
+const (
+	// bedrockPeekCommit: the stream produced its first content block (or
+	// finished), so it is viable and must be forwarded as-is from here on.
+	bedrockPeekCommit bedrockPeekOutcome = iota
+	// bedrockPeekError: an exception frame or in-band Anthropic error event
+	// arrived before any content. The response is still fully replayable.
+	bedrockPeekError
+	// bedrockPeekReadErr: the connection died before the stream proved viable.
+	bedrockPeekReadErr
+)
+
+type bedrockStreamPeek struct {
+	outcome      bedrockPeekOutcome
+	errorFrame   bedrockFrame
+	readErr      error
+	peeked       []byte
+	commitReason string
+	commitAt     time.Duration
+}
+
+// bedrockFrameDecision reports whether a frame decides the stream's fate.
+// Errors and exceptions are failures. The first content delta, a usage delta,
+// or message_stop proves the stream viable. message_start, content_block_start,
+// and pings prove nothing: Bedrock regularly opens a message (and even a
+// content block) and then delivers an overloaded_error, so the peek window has
+// to extend past them.
+// claudeFableBedrockCommitWindow bounds how long the peek keeps buffering
+// early thinking deltas before committing anyway. Production depth telemetry
+// (2026-08-18) put most overload sheds within the first seconds of the stream,
+// all during thinking with zero visible tokens. Fable adaptive thinking often
+// delivers its FIRST thinking_delta only after seconds of server-side thought,
+// so a short window expires before that delta arrives and commits on it (seen
+// live: committed on a late first delta, shed 743ms later). Surfaced sheds on
+// 2026-08-19/20 clustered at 5-20s, mostly during thinking; twenty seconds
+// buys absorption of that whole cluster. The cost is visible thinking starting
+// up to this much later on thinking-heavy responses; visible text and tool
+// input still commit instantly, and agent sessions never watch live thinking. Any visible delta (text or tool input) commits immediately, so
+// answers without long thinking pay nothing. A var, not a const, so tests can
+// shrink it.
+var claudeFableBedrockCommitWindow = 20 * time.Second
+
+// bedrockFrameDecision reports whether a frame decides the stream's fate at
+// the given elapsed time since the stream opened. Errors and exceptions are
+// failures. A visible delta (text_delta, input_json_delta), a usage delta, or
+// message_stop proves the stream viable immediately. Thinking deltas prove it
+// only once the commit window has elapsed: Bedrock regularly sheds a stream
+// within the first seconds of thinking, and holding those frames back keeps
+// the request replayable. message_start, content_block_start/stop, and pings
+// prove nothing.
+// sinceFirstThinking is how long thinking deltas have been flowing (zero
+// until the first one arrives): the commit window is anchored there, not at
+// stream start, because display delay only begins to cost once there is
+// something to display. Fable regularly thinks silently for 30s+ before its
+// first delta (seen live: first delta at 38.6s, shed 3s later), and a
+// stream-start anchor expires the window during that silence for no benefit.
+func bedrockFrameDecision(frame bedrockFrame, sinceFirstThinking time.Duration) (decisive, failure bool, reason string) {
+	if strings.EqualFold(frame.messageType, "exception") {
+		return true, true, "exception"
+	}
+	var ev struct {
+		Type  string `json:"type"`
+		Delta struct {
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			PartialJSON string `json:"partial_json"`
+			Thinking    string `json:"thinking"`
+		} `json:"delta"`
+	}
+	_ = json.Unmarshal(frame.payload, &ev)
+	switch ev.Type {
+	case "error":
+		return true, true, "error"
+	case "message_delta", "message_stop":
+		return true, false, ev.Type
+	case "content_block_delta":
+		switch ev.Delta.Type {
+		case "thinking_delta", "signature_delta":
+			if sinceFirstThinking >= claudeFableBedrockCommitWindow {
+				return true, false, "window_expired_" + ev.Delta.Type
+			}
+			return false, false, ""
+		case "text_delta":
+			// Bedrock primes every block with an EMPTY first delta (seen in
+			// transcripts: text_delta{text:""}, input_json_delta
+			// {partial_json:""}). An empty delta carries nothing the client
+			// needs, so it proves nothing; committing on it made a shed one
+			// frame later non-replayable. Only a delta with payload commits.
+			if ev.Delta.Text != "" {
+				return true, false, "text_delta"
+			}
+			return false, false, ""
+		case "input_json_delta":
+			if ev.Delta.PartialJSON != "" {
+				return true, false, "input_json_delta"
+			}
+			return false, false, ""
+		}
+		return true, false, "delta_" + ev.Delta.Type
+	}
+	return false, false, ""
+}
+
+// peekBedrockStreamUntilCommit buffers a Bedrock response stream until it
+// either proves viable (first content block) or fails (error, exception, or
+// read error). Nothing is forwarded to the client while peeking, so a failed
+// stream can be retried without duplicating output. peeked carries every raw
+// byte read, for replay into the transcoder on commit.
+// bedrockFrameIsThinkingDelta reports whether a frame is a thinking or
+// signature delta, the frame class the commit window buffers.
+func bedrockFrameIsThinkingDelta(frame bedrockFrame) bool {
+	var ev struct {
+		Type  string `json:"type"`
+		Delta struct {
+			Type string `json:"type"`
+		} `json:"delta"`
+	}
+	if json.Unmarshal(frame.payload, &ev) != nil || ev.Type != "content_block_delta" {
+		return false
+	}
+	return ev.Delta.Type == "thinking_delta" || ev.Delta.Type == "signature_delta"
+}
+
+func peekBedrockStreamUntilCommit(src io.Reader) bedrockStreamPeek {
+	var scanner bedrockFrameScanner
+	var peeked bytes.Buffer
+	started := time.Now()
+	decided := false
+	failed := false
+	commitReason := ""
+	var commitAt time.Duration
+	var firstThinkingAt time.Time
+	var errorFrame bedrockFrame
+	emit := func(frame bedrockFrame) {
+		if decided {
+			return
+		}
+		if firstThinkingAt.IsZero() && bedrockFrameIsThinkingDelta(frame) {
+			firstThinkingAt = time.Now()
+		}
+		var sinceFirstThinking time.Duration
+		if !firstThinkingAt.IsZero() {
+			sinceFirstThinking = time.Since(firstThinkingAt)
+		}
+		decisive, failure, reason := bedrockFrameDecision(frame, sinceFirstThinking)
+		if !decisive {
+			return
+		}
+		decided = true
+		failed = failure
+		commitReason = reason
+		commitAt = time.Since(started)
+		if failure {
+			errorFrame = frame
+		}
+	}
+	buf := make([]byte, 32*1024)
+	for !decided {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			peeked.Write(buf[:n])
+			scanner.feed(buf[:n], emit)
+		}
+		if decided {
+			break
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				readErr = errBedrockStreamEmpty
+			}
+			return bedrockStreamPeek{outcome: bedrockPeekReadErr, readErr: readErr, peeked: peeked.Bytes()}
+		}
+	}
+	if failed {
+		return bedrockStreamPeek{outcome: bedrockPeekError, errorFrame: errorFrame, peeked: peeked.Bytes()}
+	}
+	return bedrockStreamPeek{outcome: bedrockPeekCommit, peeked: peeked.Bytes(), commitReason: commitReason, commitAt: commitAt}
+}
+
+// bedrockPeekFailureRetryable reports whether a fresh attempt may succeed:
+// transport errors, throttles, and capacity errors qualify; validation and
+// auth errors fail identically everywhere and do not.
+func bedrockPeekFailureRetryable(peek bedrockStreamPeek) bool {
+	if peek.outcome == bedrockPeekReadErr {
+		return true
+	}
+	frame := peek.errorFrame
+	if strings.EqualFold(frame.messageType, "exception") {
+		t := strings.ToLower(frame.exceptionType)
+		return strings.Contains(t, "throttl") ||
+			strings.Contains(t, "serviceunavailable") ||
+			strings.Contains(t, "internalserver") ||
+			strings.Contains(t, "modelnotready") ||
+			strings.Contains(t, "timeout")
+	}
+	var ev struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(frame.payload, &ev) == nil && ev.Type == "error" {
+		switch ev.Error.Type {
+		case "overloaded_error", "api_error", "rate_limit_error", "internal_server_error":
+			return true
+		}
+	}
+	return false
+}
+
+// bedrockRetryBackoff spaces retries (200ms, then 400ms) so a momentary
+// capacity burst is not hit three times within the same millisecond. Returns
+// false when the caller's context is done, in which case retrying is moot.
+func bedrockRetryBackoff(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(time.Duration(attempt) * 200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // transcodeBedrockToSSE converts a Bedrock invoke-with-response-stream body (AWS
 // event-stream framing wrapping Anthropic event JSON) into Anthropic Messages
 // SSE, which is what a Claude client on the OAuth path expects. It also extracts
@@ -456,9 +796,18 @@ var errBedrockStreamEmpty = errors.New("bedrock stream ended before first event"
 // http.ResponseWriter (flushed per event) or a plain writer like an io.Pipe
 // (each Write hands the event to the reader directly).
 func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string) bedrockStreamResult {
+	return transcodeBedrockToSSESince(w, src, logger, bedrockSource, region, time.Now(), "", 0)
+}
+
+// transcodeBedrockToSSESince is transcodeBedrockToSSE with an explicit stream
+// start time, so elapsed_ms in the death logs is stream-relative (including
+// time spent in the pre-commit peek) rather than transcode-relative.
+func transcodeBedrockToSSESince(w io.Writer, src io.Reader, logger *slog.Logger, bedrockSource, region string, started time.Time, commitReason string, commitAt time.Duration) bedrockStreamResult {
 	flusher, _ := w.(http.Flusher)
 	var scanner bedrockFrameScanner
 	var result bedrockStreamResult
+	eventsForwarded := 0
+	sawTextBlock := false
 	exceptionHandled := false
 	finalize := func() bedrockStreamResult {
 		result.HaveUsage = result.HaveUsage && !result.Usage.empty()
@@ -514,6 +863,9 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 			result.Usage.InputTokens = ev.Message.Usage.InputTokens
 			result.Usage.CacheReadTokens = ev.Message.Usage.CacheReadTokens
 			result.Usage.CacheWriteTokens = ev.Message.Usage.CacheWriteTokens
+			// Without the per-TTL split the cost log prices every write at
+			// the 5m rate, understating 1h writes by 1.6x.
+			result.Usage.CacheCreation = ev.Message.Usage.CacheCreation
 			result.HaveUsage = true
 		case "message_delta":
 			if ev.Usage.OutputTokens > 0 {
@@ -522,9 +874,22 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 			}
 		case "message_stop":
 			result.SawMessageStop = true
+		case "content_block_start":
+			var block struct {
+				ContentBlock struct {
+					Type string `json:"type"`
+				} `json:"content_block"`
+			}
+			if json.Unmarshal(inner, &block) == nil && block.ContentBlock.Type == "text" {
+				sawTextBlock = true
+			}
 		case "error":
 			if logger != nil {
-				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop)
+				// Depth telemetry: how far into the committed stream the
+				// upstream died. events_forwarded and saw_text_block separate
+				// admission-time sheds (retryable pre-commit, handled by the
+				// peek) from mid-generation sheds (not replayable).
+				logger.Warn("claude-fable bedrock in-band error", "exception_type", "", "message", bedrockLogPreview(inner), "bedrock_source", bedrockSource, "region", region, "saw_message_stop", result.SawMessageStop, "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
 			}
 		}
 		eventType := ev.Type
@@ -534,6 +899,7 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 		_, _ = w.Write([]byte("event: " + eventType + "\ndata: "))
 		_, _ = w.Write(inner)
 		_, _ = w.Write([]byte("\n\n"))
+		eventsForwarded++
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -551,7 +917,7 @@ func transcodeBedrockToSSE(w io.Writer, src io.Reader, logger *slog.Logger, bedr
 			if !result.SawMessageStop && !exceptionHandled {
 				result.ReadErr = readErr
 				if logger != nil {
-					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "")
+					logger.Error("claude-fable bedrock stream truncated", "bedrock_source", bedrockSource, "region", region, "read_err", readErr, "saw_message_stop", result.SawMessageStop, "exception_type", "", "message", "", "events_forwarded", eventsForwarded, "saw_text_block", sawTextBlock, "output_tokens_so_far", result.Usage.OutputTokens, "elapsed_ms", time.Since(started).Milliseconds(), "commit_reason", commitReason, "commit_at_ms", commitAt.Milliseconds())
 				}
 				writeErrorEvent("api_error", "Bedrock stream interrupted")
 			} else if readErr != io.EOF {
@@ -679,37 +1045,6 @@ func parseBedrockEventHeaders(headers []byte) (map[string]string, bool) {
 		}
 	}
 	return out, true
-}
-
-func peekBedrockStream(src io.Reader) (bedrockFrame, []byte, error) {
-	var scanner bedrockFrameScanner
-	var first bedrockFrame
-	var got bool
-	var peeked bytes.Buffer
-	emit := func(frame bedrockFrame) {
-		if !got {
-			first = frame
-			got = true
-		}
-	}
-	buf := make([]byte, 32*1024)
-	for !got {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			peeked.Write(buf[:n])
-			scanner.feed(buf[:n], emit)
-		}
-		if got {
-			break
-		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				return bedrockFrame{}, peeked.Bytes(), errBedrockStreamEmpty
-			}
-			return bedrockFrame{}, peeked.Bytes(), readErr
-		}
-	}
-	return first, peeked.Bytes(), nil
 }
 
 func bedrockLogPreview(payload []byte) string {
