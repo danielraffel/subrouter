@@ -43,6 +43,17 @@ func TestAllBoundsPersistedHistoryToMostRecentAssignments(t *testing.T) {
 	if assignments[0].SessionID != wantNewest {
 		t.Fatalf("newest assignment = %q, want %q", assignments[0].SessionID, wantNewest)
 	}
+	body, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]Assignment
+	if err := json.Unmarshal(body, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != MaxRetainedAssignments {
+		t.Fatalf("persisted assignments = %d, want %d", len(persisted), MaxRetainedAssignments)
+	}
 }
 
 func TestCountByAccount(t *testing.T) {

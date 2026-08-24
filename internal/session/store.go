@@ -145,13 +145,17 @@ func (s *Store) loadLocked() error {
 	}
 	s.data = data
 	s.migrateLoadedAssignments()
-	s.pruneLocked()
+	if s.pruneLocked() {
+		// Rewrite legacy/unbounded files while the session lock is held so
+		// every subsequent reader starts from the bounded representation.
+		return s.saveLocked()
+	}
 	return nil
 }
 
-func (s *Store) pruneLocked() {
+func (s *Store) pruneLocked() bool {
 	if len(s.data) <= MaxRetainedAssignments {
-		return
+		return false
 	}
 	type entry struct {
 		key       string
@@ -170,6 +174,7 @@ func (s *Store) pruneLocked() {
 	for _, stale := range entries[MaxRetainedAssignments:] {
 		delete(s.data, stale.key)
 	}
+	return true
 }
 
 func (s *Store) saveLocked() error {
