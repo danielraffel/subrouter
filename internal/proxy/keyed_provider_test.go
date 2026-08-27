@@ -181,4 +181,8 @@ func TestSessionLeaseProviderHonoursVendorPrefixedModels(t *testing.T) {
 	if provider != accounts.Provider("vendorcase") || model != "anthropic/claude-opus-5" {
 		t.Fatalf("got (%q, %q), want the vendor prefix preserved", provider, model)
 	}
+	provider, model, err = sessionLeaseProvider("", "vendorcase/vendor-model")
+	if err != nil || provider != accounts.Provider("vendorcase") || model != "vendorcase/vendor-model" {
+		t.Fatalf("inferred provider got (%q, %q, %v), want the full vendor-prefixed model", provider, model, err)
+	}
 }

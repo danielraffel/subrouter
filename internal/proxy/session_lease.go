@@ -843,6 +843,7 @@ func (request *sessionLeaseRequest) normalize() {
 func sessionLeaseProvider(providerValue, modelValue string) (accounts.Provider, string, error) {
 	providerName := strings.ToLower(strings.TrimSpace(providerValue))
 	model := strings.TrimSpace(modelValue)
+	originalModel := model
 	if providerName == "" {
 		modelProvider, modelID, hasProvider := strings.Cut(model, "/")
 		if hasProvider {
@@ -868,7 +869,7 @@ func sessionLeaseProvider(providerValue, modelValue string) (accounts.Provider, 
 	// A provider that addresses models as vendor/model owns the whole id: the
 	// segment before the slash belongs to the model, not to a provider name.
 	if entry, ok := keyedProviderFor(provider); ok && entry.VendorPrefixedModels {
-		return provider, model, nil
+		return provider, originalModel, nil
 	}
 	if modelProvider, modelID, hasProvider := strings.Cut(model, "/"); hasProvider {
 		if modelProviderValue, modelProviderErr := parseSessionLeaseProvider(strings.ToLower(strings.TrimSpace(modelProvider))); modelProviderErr == nil {
