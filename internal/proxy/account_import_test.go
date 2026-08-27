@@ -192,6 +192,31 @@ func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 	}
 }
 
+func TestAccountImportRejectsCodexOAuthWithoutIsolatedLoginOrigin(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	account := proxyStoredOAuthAccount("owner@example.com", "fresh", time.Now().Add(time.Hour))
+	account.OAuthCredentialOrigin = ""
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": account})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := serveProtectedAccountImport(handler, payload)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", resp.Code, resp.Body.String())
+	}
+	stored, err := codexStore.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("unproven OAuth import wrote %d accounts", len(stored))
+	}
+}
+
 func TestRejectedAccountImportDoesNotPublishGeneration(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	ref := NewAccountRef(codexStore, nil, nil)

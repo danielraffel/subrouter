@@ -313,7 +313,13 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	if err := os.MkdirAll(filepath.Join(dir, "codex", "accounts"), 0o700); err != nil {
 		return nil, err
 	}
-	codexStore := accounts.CodexStore{Dir: filepath.Join(dir, "codex", "accounts")}
+	// Tenant handlers are serving paths, not interactive account managers. A
+	// token refresh may update the tenant's stored credential, but it must not
+	// replace the daemon user's ~/.codex/auth.json even when the emails match.
+	codexStore := accounts.CodexStore{
+		Dir:                   filepath.Join(dir, "codex", "accounts"),
+		DisableActiveAuthSync: true,
+	}
 	claudeStore := agentclaude.Store{Dir: filepath.Join(dir, "codex")}
 	sessions, err := session.NewStore(filepath.Join(dir, "sessions.json"))
 	if err != nil {
@@ -819,12 +825,13 @@ func validStackTeamName(name string) bool {
 }
 
 type tenantAccountUpload struct {
-	Provider        string `json:"provider"`
-	AccountID       string `json:"accountId,omitempty"`
-	Label           string `json:"label"`
-	APIKey          string `json:"apiKey"`
-	TargetAccountID string `json:"targetAccountID,omitempty"`
-	Tokens          *struct {
+	Provider              string                              `json:"provider"`
+	AccountID             string                              `json:"accountId,omitempty"`
+	Label                 string                              `json:"label"`
+	APIKey                string                              `json:"apiKey"`
+	TargetAccountID       string                              `json:"targetAccountID,omitempty"`
+	OAuthCredentialOrigin accounts.CodexOAuthCredentialOrigin `json:"oauthCredentialOrigin,omitempty"`
+	Tokens                *struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		IDToken      string `json:"idToken"`
@@ -950,8 +957,12 @@ func storedTenantMigrationAccount(input tenantAccountUpload) (accounts.StoredCod
 		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
 			return accounts.StoredCodexAccount{}, errors.New("complete Codex OAuth tokens are required")
 		}
+		if input.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+			return accounts.StoredCodexAccount{}, errors.New("Codex OAuth credential must come from an isolated server login")
+		}
 		return accounts.StoredCodexAccount{
 			Email: input.AccountID, Label: input.Label, Provider: accounts.ProviderCodex,
+			OAuthCredentialOrigin: input.OAuthCredentialOrigin,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
 				Tokens: &accounts.CodexTokens{
@@ -1023,6 +1034,10 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "complete Codex OAuth tokens are required", http.StatusBadRequest)
 			return
 		}
+		if input.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+			http.Error(w, "Codex OAuth credential must come from an isolated server login", http.StatusBadRequest)
+			return
+		}
 		id, kind = input.AccountID, "codex"
 		if id == "" {
 			id = input.Label
@@ -1033,6 +1048,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 		}
 		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
+			OAuthCredentialOrigin: input.OAuthCredentialOrigin,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
 				Tokens: &accounts.CodexTokens{

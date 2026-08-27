@@ -1671,6 +1671,9 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 	if provider != accounts.ProviderCodex || account.Auth.Tokens == nil || account.Auth.OpenAIAPIKey != "" {
 		return account, invalidAccountImport("OAuth account payload is invalid")
 	}
+	if account.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		return account, invalidAccountImport("OAuth account payload must come from an isolated server login")
+	}
 	tokens := account.Auth.Tokens
 	if strings.TrimSpace(tokens.AccessToken) == "" || strings.TrimSpace(tokens.RefreshToken) == "" || strings.TrimSpace(tokens.IDToken) == "" {
 		return account, invalidAccountImport("OAuth account payload is incomplete")
@@ -5870,6 +5873,10 @@ func isTerminalCredentialError(err error) bool {
 	}
 	var storedCodexFailure *accounts.CodexStoredRefreshFailureError
 	if errors.As(err, &storedCodexFailure) {
+		return true
+	}
+	var unisolatedCredential *accounts.CodexUnisolatedCredentialError
+	if errors.As(err, &unisolatedCredential) {
 		return true
 	}
 	var codexRefreshFailure *accounts.CodexAuthRefreshError

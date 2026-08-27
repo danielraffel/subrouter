@@ -1961,8 +1961,9 @@ func writeClaudeCredential(t *testing.T, dir string, credential agentclaude.Cred
 
 func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.StoredCodexAccount {
 	return accounts.StoredCodexAccount{
-		Email:   email,
-		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Email:                 email,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
 		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
 			AccessToken:  proxyTestCodexJWT(email, tokenPrefix+"-access", exp),
 			RefreshToken: tokenPrefix + "-refresh",

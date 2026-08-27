@@ -296,7 +296,7 @@ func serve(args []string) error {
 	transcriptAzureRate := flags.String("transcript-azure-max-bytes-per-second", "2MiB", "cap on Azure transcript upload throughput; supports KiB/MiB/GiB suffixes; 0 disables the cap")
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
-	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for switching and syncing the active sr account to the best OAuth account; 0 disables active-auth writes")
+	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
@@ -513,12 +513,10 @@ func serve(args []string) error {
 	}
 
 	codexStore := accounts.DefaultCodexStore()
-	// A shared server does not need to mutate the daemon user's interactive
-	// Codex login. In particular, refreshing a stored account can otherwise
-	// rotate auth.json underneath a running Codex process and make it fail with
-	// "logged out or signed in to another account". An enabled auto-switch
-	// interval retains the legacy local-account-manager behavior explicitly.
-	codexStore.DisableActiveAuthSync = srSwitchInterval <= 0
+	// Serving traffic is credential-read-only with respect to the daemon user's
+	// interactive Codex login. Stored credentials may refresh for proxy routing,
+	// but only explicit account-manager commands may replace auth.json.
+	codexStore.DisableActiveAuthSync = true
 	claudeStore := agentclaude.DefaultStore()
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
@@ -710,7 +708,10 @@ func serve(args []string) error {
 			Sessions:             store,
 			SchedulerRef:         schedulerRef,
 			Logger:               slog.Default(),
-			Lease:                newSRAutoSwitchLease(storepath.StateDir()),
+			FetchScores: func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+				return fetchCodexScoresWithStore(ctx, codexStore, candidates)
+			},
+			Lease: newSRAutoSwitchLease(storepath.StateDir()),
 		})
 	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
@@ -1455,7 +1456,7 @@ Session stickiness:
   Send X-Subrouter-Agent when the client is not Codex.
   Send X-Subrouter-User-Email for teammate-level observability.
   Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
-  Subrouter switches the active sr account every 10m by default; set --sr-switch-interval=0 to disable.
+  Subrouter refreshes routing scores every 10m by default; set --sr-switch-interval=0 to disable.
   For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
   The proxy also checks common session headers, query params, and small JSON bodies.
 `, program)

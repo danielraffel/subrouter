@@ -1127,6 +1127,9 @@ func TestSRServerLoginUploadsFreshAuthAndRestoresLocalChain(t *testing.T) {
 	if gotImported.Email != "bob@example.com" || gotImported.Auth.Tokens == nil || gotImported.Auth.Tokens.RefreshToken != freshServer.Tokens.RefreshToken {
 		t.Fatalf("server did not receive fresh OAuth account for bob@example.com")
 	}
+	if gotImported.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("server OAuth origin = %q, want isolated server login", gotImported.OAuthCredentialOrigin)
+	}
 	for _, forbidden := range []string{"ssh", "scp", "gcloud"} {
 		if fake.hasCommandPrefix(forbidden) {
 			t.Fatalf("server login must never execute %s: %#v", forbidden, fake.commands)

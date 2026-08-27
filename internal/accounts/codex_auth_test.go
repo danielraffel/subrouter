@@ -271,10 +271,12 @@ func TestRefreshStoredIfExpiredLeavesActiveAuthAloneWhenSyncDisabled(t *testing.
 	t.Setenv("HOME", home)
 	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true}
 	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
+	stale.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
 	if err := store.SaveStored(stale); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteActiveCodexAuth(stale.Auth); err != nil {
+	interactive := storedOAuthAccount("founders@example.com", "interactive", time.Now().Add(-time.Hour))
+	if err := WriteActiveCodexAuth(interactive.Auth); err != nil {
 		t.Fatal(err)
 	}
 
@@ -296,8 +298,91 @@ func TestRefreshStoredIfExpiredLeavesActiveAuthAloneWhenSyncDisabled(t *testing.
 	if !ok {
 		t.Fatal("missing active auth")
 	}
-	if active.Tokens.RefreshToken != "old-refresh" {
-		t.Fatalf("active refresh token = %q, want old-refresh", active.Tokens.RefreshToken)
+	if active.Tokens.RefreshToken != "interactive-refresh" {
+		t.Fatalf("active refresh token = %q, want interactive-refresh", active.Tokens.RefreshToken)
+	}
+}
+
+func TestRefreshStoredDoesNotRotateSharedInteractiveCredentialWhenSyncDisabled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true}
+	stale := storedOAuthAccount("founders@example.com", "shared", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteActiveCodexAuth(stale.Auth); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return refreshResponse("new", "founders@example.com", time.Now().Add(time.Hour)), nil
+	})}
+
+	_, refreshed, err := store.RefreshStored(context.Background(), client, stale)
+	var unisolated *CodexUnisolatedCredentialError
+	if !errors.As(err, &unisolated) {
+		t.Fatalf("refresh error = %v, want CodexUnisolatedCredentialError", err)
+	}
+	if refreshed {
+		t.Fatal("shared credential was refreshed")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("refresh calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestRefreshStoredDoesNotTrustDifferentTokenGenerationWithoutIsolatedProvenance(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true}
+	stored := storedOAuthAccount("founders@example.com", "older-generation", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	interactive := storedOAuthAccount("founders@example.com", "newer-generation", time.Now().Add(time.Hour))
+	if err := WriteActiveCodexAuth(interactive.Auth); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return refreshResponse("new", "founders@example.com", time.Now().Add(time.Hour)), nil
+	})}
+
+	_, _, err := store.RefreshStored(context.Background(), client, stored)
+	var unisolated *CodexUnisolatedCredentialError
+	if !errors.As(err, &unisolated) {
+		t.Fatalf("refresh error = %v, want CodexUnisolatedCredentialError", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("refresh calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestImportActiveClearsIsolatedServerLoginOrigin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	isolated := storedOAuthAccount("founders@example.com", "isolated", time.Now().Add(time.Hour))
+	isolated.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	if err := store.SaveStored(isolated); err != nil {
+		t.Fatal(err)
+	}
+	interactive := storedOAuthAccount("founders@example.com", "interactive", time.Now().Add(time.Hour))
+	if err := WriteActiveCodexAuth(interactive.Auth); err != nil {
+		t.Fatal(err)
+	}
+
+	imported, existed, err := store.ImportActive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !existed {
+		t.Fatal("existing account was not replaced")
+	}
+	if imported.OAuthCredentialOrigin != CodexOAuthOriginInteractiveImport {
+		t.Fatalf("OAuth origin = %q, want interactive import", imported.OAuthCredentialOrigin)
 	}
 }
 

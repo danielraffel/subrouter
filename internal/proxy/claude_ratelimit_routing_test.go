@@ -1091,6 +1091,7 @@ func TestIsTerminalCredentialError(t *testing.T) {
 	}{
 		{fmt.Errorf(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`), true},
 		{fmt.Errorf("profile has no refresh token"), true},
+		{&accounts.CodexUnisolatedCredentialError{}, true},
 		{fmt.Errorf("dial tcp: connection refused"), false},
 		{context.Canceled, false},
 		{context.DeadlineExceeded, false},

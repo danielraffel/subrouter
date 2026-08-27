@@ -122,6 +122,7 @@ func (s CodexStore) SyncActiveToStore() error {
 	}
 	previous := account
 	account.Auth = auth
+	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_synced", "active_auth", false, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		return err
@@ -154,6 +155,7 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	}
 	previous := account
 	account.Auth = auth
+	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_imported", "active_auth", false, &previous, &account, nil, nil)
 	err = s.SaveStored(account)
 	if err == nil {
@@ -238,6 +240,25 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure_after_lock")
 		return account, false, err
 	}
+	if s.DisableActiveAuthSync {
+		if account.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+			err := &CodexUnisolatedCredentialError{}
+			logCodexRefreshSkipped(ctx, s, account, force, "oauth_origin_not_isolated")
+			return account, false, err
+		}
+		active, ok, activeErr := ReadActiveCodexAuth()
+		if activeErr != nil {
+			logCodexRefreshSkipped(ctx, s, account, force, "active_auth_unreadable")
+			return account, false, activeErr
+		}
+		if ok && active.Tokens != nil &&
+			active.Tokens.RefreshToken != "" &&
+			active.Tokens.RefreshToken == account.Auth.Tokens.RefreshToken {
+			err := &CodexUnisolatedCredentialError{}
+			logCodexRefreshSkipped(ctx, s, account, force, "shared_active_refresh_token")
+			return account, false, err
+		}
+	}
 
 	previous := account
 	logCodexRefreshStart(ctx, s, previous, force)
@@ -296,6 +317,14 @@ func (s CodexStore) recoverRefreshedAccount(previous StoredCodexAccount) (Stored
 
 type CodexStoredRefreshFailureError struct {
 	Failure CodexRefreshFailure
+}
+
+// CodexUnisolatedCredentialError prevents a serving process from rotating a
+// refresh-token chain that is not proven independent of interactive Codex.
+type CodexUnisolatedCredentialError struct{}
+
+func (*CodexUnisolatedCredentialError) Error() string {
+	return "stored Codex credential is not proven isolated from interactive auth; reauthenticate it with an isolated server login"
 }
 
 func (e *CodexStoredRefreshFailureError) Error() string {

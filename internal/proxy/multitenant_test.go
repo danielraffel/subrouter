@@ -131,6 +131,22 @@ func TestMultiTenantUsageStatusNeedsOnlyTheTenantKey(t *testing.T) {
 	}
 }
 
+func TestMultiTenantServingStoreDoesNotSyncInteractiveCodexAuth(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, _, err := registry.Create("read-only-serving-store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi := &MultiTenant{Base: Server{}, Registry: registry}
+	server, err := multi.newTenantServer(context.Background(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !server.AccountRef.store.DisableActiveAuthSync {
+		t.Fatal("tenant serving store can rewrite interactive Codex auth")
+	}
+}
+
 func writeTenantAPIKeyAccount(t *testing.T, registry *tenant.Registry, tenantID, email, apiKey string) {
 	t.Helper()
 	dir := filepath.Join(registry.Dir(tenantID), "codex", "accounts")
@@ -1446,6 +1462,7 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 			"provider":"codex",
 			"accountId":%q,
 			"label":"Shared account",
+			"oauthCredentialOrigin":"isolated-server-login",
 			"tokens":{
 				"accessToken":"access-%s",
 				"refreshToken":"refresh-%s",
@@ -1483,6 +1500,33 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 		if accounts[i].ID != id || accounts[i].Label != "Shared account" {
 			t.Fatalf("account %d = %#v", i, accounts[i])
 		}
+	}
+}
+
+func TestTenantCodexOAuthUploadRequiresIsolatedLoginOrigin(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(`{
+			"provider":"codex",
+			"accountId":"unproven-account",
+			"label":"Unproven",
+			"tokens":{
+				"accessToken":"access",
+				"refreshToken":"refresh",
+				"idToken":"id",
+				"accountID":"provider"
+			}
+		}`),
+	))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
 
@@ -1573,6 +1617,7 @@ func TestTenantMigrationBatchStaysInactiveUntilAtomicActivation(t *testing.T) {
 			"provider":"codex",
 			"accountId":"legacy-account",
 			"label":"Shared account",
+			"oauthCredentialOrigin":"isolated-server-login",
 			"tokens":{
 				"accessToken":"access",
 				"refreshToken":"refresh",

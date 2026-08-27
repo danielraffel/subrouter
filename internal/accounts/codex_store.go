@@ -31,17 +31,25 @@ func (e *StorageKeyCollisionError) Error() string {
 }
 
 type StoredCodexAccount struct {
-	Email            string                `json:"email"`
-	Label            string                `json:"label,omitempty"`
-	Provider         Provider              `json:"provider,omitempty"`
-	MigrationBatchID string                `json:"migrationBatchId,omitempty"`
-	AddedAt          string                `json:"addedAt"`
-	Auth             CodexAuthFile         `json:"auth"`
-	ProjectID        string                `json:"projectId,omitempty"`
-	ProjectName      string                `json:"projectName,omitempty"`
-	AdminKeyLabel    string                `json:"adminKeyLabel,omitempty"`
-	Breadcrumbs      []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
+	Email                 string                     `json:"email"`
+	Label                 string                     `json:"label,omitempty"`
+	Provider              Provider                   `json:"provider,omitempty"`
+	OAuthCredentialOrigin CodexOAuthCredentialOrigin `json:"oauthCredentialOrigin,omitempty"`
+	MigrationBatchID      string                     `json:"migrationBatchId,omitempty"`
+	AddedAt               string                     `json:"addedAt"`
+	Auth                  CodexAuthFile              `json:"auth"`
+	ProjectID             string                     `json:"projectId,omitempty"`
+	ProjectName           string                     `json:"projectName,omitempty"`
+	AdminKeyLabel         string                     `json:"adminKeyLabel,omitempty"`
+	Breadcrumbs           []CodexAuthBreadcrumb      `json:"breadcrumbs,omitempty"`
 }
+
+type CodexOAuthCredentialOrigin string
+
+const (
+	CodexOAuthOriginInteractiveImport   CodexOAuthCredentialOrigin = "interactive-import"
+	CodexOAuthOriginIsolatedServerLogin CodexOAuthCredentialOrigin = "isolated-server-login"
+)
 
 type CodexAuthFile struct {
 	Tokens         *CodexTokens         `json:"tokens,omitempty"`
