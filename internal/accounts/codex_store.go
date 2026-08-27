@@ -15,7 +15,8 @@ import (
 )
 
 type CodexStore struct {
-	Dir string
+	Dir                   string
+	DisableActiveAuthSync bool
 }
 
 const migrationBatchControlLockID = ".subrouter-migration-batch-control"

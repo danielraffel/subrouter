@@ -268,9 +268,11 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, true, err
 	}
-	if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
-		logCodexRefreshFailed(ctx, s, account, force, err)
-		return account, true, err
+	if !s.DisableActiveAuthSync {
+		if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
+			logCodexRefreshFailed(ctx, s, account, force, err)
+			return account, true, err
+		}
 	}
 	logCodexRefreshSucceeded(ctx, s, previous, account, force)
 	return account, true, nil

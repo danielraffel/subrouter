@@ -266,6 +266,41 @@ func TestRefreshStoredIfExpiredSyncsActiveAuthWhenActiveAccountRefreshes(t *test
 	}
 }
 
+func TestRefreshStoredIfExpiredLeavesActiveAuthAloneWhenSyncDisabled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true}
+	stale := storedOAuthAccount("founders@example.com", "old", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteActiveCodexAuth(stale.Auth); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return refreshResponse("new", "founders@example.com", time.Now().Add(time.Hour)), nil
+	})}
+
+	refreshed, _, err := store.RefreshStoredIfExpired(context.Background(), client, stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Auth.Tokens.RefreshToken != "new-refresh" {
+		t.Fatalf("stored refresh token = %q, want new-refresh", refreshed.Auth.Tokens.RefreshToken)
+	}
+	active, ok, err := ReadActiveCodexAuth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing active auth")
+	}
+	if active.Tokens.RefreshToken != "old-refresh" {
+		t.Fatalf("active refresh token = %q, want old-refresh", active.Tokens.RefreshToken)
+	}
+}
+
 func TestRefreshStoredIfExpiredLogsRefreshFingerprints(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := CodexStore{Dir: t.TempDir()}
