@@ -999,14 +999,18 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, arg
 }
 
 func parseAPIKeyProvider(value string) (accounts.Provider, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
 	case "", string(accounts.ProviderCodex), "openai":
 		return accounts.ProviderCodex, nil
 	case string(accounts.ProviderClaude), "anthropic":
 		return accounts.ProviderClaude, nil
 	default:
-		if provider, ok := proxy.APIKeyProviderForName(strings.ToLower(strings.TrimSpace(value))); ok {
+		if provider, ok := proxy.APIKeyProviderForName(normalized); ok {
 			return provider, nil
+		}
+		if proxy.ValidDeclaredProviderName(normalized) {
+			return accounts.Provider(normalized), nil
 		}
 		return "", fmt.Errorf("unsupported API-key provider %q, expected %s", value, proxy.APIKeyProviderList())
 	}

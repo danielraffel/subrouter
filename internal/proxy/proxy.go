@@ -1076,6 +1076,7 @@ func (r *AccountRef) replace(account accounts.Account) {
 }
 
 func (s Server) Handler() http.Handler {
+	FreezeOpenAICompatibleProviders()
 	s.CredentialBroker = normalizedCredentialBroker(s.CredentialBroker)
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()

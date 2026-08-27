@@ -32,6 +32,7 @@ type OpenAICompatibleProvider struct {
 var (
 	configuredMu        sync.RWMutex
 	configuredProviders []keyedProvider
+	configuredFrozen    bool
 )
 
 // reservedProviderNames are the names and path segments the non-registry
@@ -40,7 +41,8 @@ var (
 var reservedProviderNames = map[string]bool{
 	"codex": true, "openai": true, "openai-codex": true,
 	"claude": true, "anthropic": true,
-	"v1": true, "backend-api": true, "messages": true, "responses": true,
+	"gemini": true,
+	"v1":     true, "backend-api": true, "messages": true, "responses": true,
 }
 
 // ConfigureOpenAICompatibleProviders registers operator-declared providers.
@@ -48,6 +50,11 @@ var reservedProviderNames = map[string]bool{
 // replaces any previous declaration so a caller cannot accumulate duplicates by
 // being invoked twice.
 func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) error {
+	configuredMu.Lock()
+	defer configuredMu.Unlock()
+	if configuredFrozen {
+		return fmt.Errorf("openai-compatible providers cannot change after serving starts")
+	}
 	entries := make([]keyedProvider, 0, len(declared))
 	seen := map[string]bool{}
 	for _, item := range declared {
@@ -67,7 +74,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 			if reservedProviderNames[candidate] {
 				return fmt.Errorf("openai-compatible provider %q claims the reserved name %q", item.Name, candidate)
 			}
-			if _, taken := keyedProviderForName(candidate); taken {
+			if builtinClaimsName(candidate) {
 				return fmt.Errorf("openai-compatible provider %q claims %q, which a built-in provider already uses", item.Name, candidate)
 			}
 			if seen[candidate] {
@@ -91,10 +98,39 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].PathPrefix < entries[j].PathPrefix })
-	configuredMu.Lock()
 	configuredProviders = entries
-	configuredMu.Unlock()
 	return nil
+}
+
+// FreezeOpenAICompatibleProviders prevents routing declarations from changing
+// once a handler can observe them.
+func FreezeOpenAICompatibleProviders() {
+	configuredMu.Lock()
+	configuredFrozen = true
+	configuredMu.Unlock()
+}
+
+func builtinClaimsName(candidate string) bool {
+	for _, entry := range builtinKeyedProviders {
+		if candidate == string(entry.Provider) {
+			return true
+		}
+		for _, alias := range entry.Aliases {
+			if candidate == alias {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ValidDeclaredProviderName reports whether a standalone CLI may safely carry
+// a provider name to a serving process that owns the actual declaration. The
+// server still rejects imports for names it did not declare.
+func ValidDeclaredProviderName(raw string) bool {
+	name := strings.ToLower(strings.TrimSpace(raw))
+	return name != "" && !strings.ContainsAny(name, "/ \t") &&
+		!reservedProviderNames[name] && !builtinClaimsName(name)
 }
 
 func parseProviderBaseURL(raw, name string) (*url.URL, error) {

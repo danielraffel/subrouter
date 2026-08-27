@@ -18,10 +18,13 @@ restored file is byte-identical to the original. Recovery requires deleting the
 file first, so the copy lands on a fresh inode:
 
 ```bash
+set -euo pipefail
+cp ~/bin/subrouter.backup ~/bin/subrouter.restore
+chmod 755 ~/bin/subrouter.restore
+codesign --verify --strict --verbose=4 ~/bin/subrouter.restore
+~/bin/subrouter.restore --help >/dev/null
 launchctl bootout gui/$(id -u)/<label>
-rm -f ~/bin/subrouter          # the delete is the part that matters
-cp ~/bin/subrouter.backup ~/bin/subrouter
-chmod 755 ~/bin/subrouter
+mv -f ~/bin/subrouter.restore ~/bin/subrouter
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
 ```
 
@@ -30,25 +33,35 @@ signs and proves it runs *before* the old one is taken out of service, and puts
 it in place with an atomic rename:
 
 ```bash
+set -euo pipefail
 cp subrouter.new ~/bin/subrouter.new
-codesign --force --sign - ~/bin/subrouter.new    # ad-hoc is enough for a local build
+# Preserve release signatures; ad-hoc sign only an unsigned local build when
+# the supported macOS launchd policy requires a signature.
+codesign --verify --strict ~/bin/subrouter.new 2>/dev/null || codesign --force --sign - ~/bin/subrouter.new
 codesign --verify --strict --verbose=4 ~/bin/subrouter.new
 ~/bin/subrouter.new --help >/dev/null            # prove it executes first
+cp -p ~/bin/subrouter ~/bin/subrouter.rollback
 launchctl bootout gui/$(id -u)/<label>
 mv ~/bin/subrouter.new ~/bin/subrouter           # rename, never cp
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+if ! launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist; then
+  mv -f ~/bin/subrouter.rollback ~/bin/subrouter
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+  exit 1
+fi
+rm -f ~/bin/subrouter.rollback
 ```
 
-A locally built Go binary is unsigned and will not run as a launchd daemon until
-it is signed, which is why the ad-hoc `codesign` is part of the procedure rather
-than an optional step.
+On macOS versions and launchd policies that reject an unsigned local build, the
+fallback ad-hoc signature makes that build runnable without replacing a valid
+release signature.
 
 ### What a restart costs
 
 `serve` drains on SIGTERM: it stops accepting, finishes in-flight requests, and
 exits, bounded by `--shutdown-timeout` (default 10 minutes). launchd is the
-shorter fuse. Without an `ExitTimeOut` in the plist it escalates to SIGKILL at
-its own default of 20 seconds, so a stream still running after that is cut, and
+shorter fuse. Without an explicit `ExitTimeOut` in the direct `install-daemon`
+plist, the escalation timeout is system-defined and may be shorter than
+`--shutdown-timeout`; a stream still running when launchd escalates is cut, and
 `ThrottleInterval` delays the restart by its value. Sticky session assignments
 survive, because the session store is read back from its file at startup; the
 scheduler's exhaustion marks do not, since they are in-memory only.

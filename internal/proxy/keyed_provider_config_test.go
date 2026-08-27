@@ -12,9 +12,14 @@ import (
 
 func resetConfiguredProviders(t *testing.T) {
 	t.Helper()
+	configuredMu.Lock()
+	configuredProviders = nil
+	configuredFrozen = false
+	configuredMu.Unlock()
 	t.Cleanup(func() {
 		configuredMu.Lock()
 		configuredProviders = nil
+		configuredFrozen = false
 		configuredMu.Unlock()
 	})
 }
@@ -136,12 +141,26 @@ func TestConfigureReplacesPreviousDeclarations(t *testing.T) {
 	if _, ok := keyedProviderForName("second"); !ok {
 		t.Fatal("the current declaration should resolve")
 	}
+	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{Name: "second", BaseURL: "https://b.test/v1"}}); err != nil {
+		t.Fatalf("re-applying the same declaration must be accepted: %v", err)
+	}
 	// A failed declaration must not disturb what is already configured.
 	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{Name: "claude", BaseURL: "https://c.test/v1"}}); err == nil {
 		t.Fatal("expected rejection")
 	}
 	if _, ok := keyedProviderForName("second"); !ok {
 		t.Fatal("a rejected declaration must leave the previous configuration intact")
+	}
+}
+
+func TestConfigureRejectsChangesAfterHandlerStarts(t *testing.T) {
+	resetConfiguredProviders(t)
+	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{Name: "first", BaseURL: "https://a.test/v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	_ = (Server{}).Handler()
+	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{Name: "second", BaseURL: "https://b.test/v1"}}); err == nil {
+		t.Fatal("configuration after Handler starts must be rejected")
 	}
 }
 

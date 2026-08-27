@@ -59,6 +59,9 @@ const (
 	// authBearer sends Authorization: Bearer <key> and removes any client
 	// X-Api-Key, which is the OpenAI-compatible convention.
 	authBearer authStyle = iota
+	// authBearerWithAnthropicVersion keeps bearer-only authentication while
+	// supplying the protocol version required by Anthropic-shaped endpoints.
+	authBearerWithAnthropicVersion
 	// authBearerAndAnthropicKey sends both Authorization and X-Api-Key, and
 	// defaults Anthropic-Version, for providers exposing an Anthropic-shaped API.
 	authBearerAndAnthropicKey
@@ -244,7 +247,7 @@ var builtinKeyedProviders = []keyedProvider{
 		PathPrefix:      "qwen-anthropic",
 		Aliases:         []string{"qwen-token-anthropic", "tokenplan-anthropic"},
 		PlanLabel:       "qwen token plan key",
-		Auth:            authBearer,
+		Auth:            authBearerWithAnthropicVersion,
 		// The Anthropic base stops at /apps/anthropic and the client appends
 		// /v1/messages itself, so the version segment must survive: collapsing
 		// it here is what produces the /v1/v1 404 the vendor documents.
@@ -340,6 +343,11 @@ func keyedProviderNames() []string {
 // expects it. Authorization is already set to the bearer form by the caller.
 func applyKeyedProviderAuth(headers http.Header, account accounts.Account, entry keyedProvider) {
 	switch entry.Auth {
+	case authBearerWithAnthropicVersion:
+		headers.Del("X-Api-Key")
+		if headers.Get("Anthropic-Version") == "" {
+			headers.Set("Anthropic-Version", "2023-06-01")
+		}
 	case authBearerAndAnthropicKey:
 		headers.Set("Authorization", account.AuthorizationHeader())
 		headers.Set("X-Api-Key", account.Token)
@@ -426,12 +434,15 @@ func ProviderMetering(provider accounts.Provider) string {
 
 // ProviderHealthURL returns the URL that proves a key still works, or "" when
 // the provider offers no such endpoint.
-func ProviderHealthURL(provider accounts.Provider) string {
+func ProviderHealthURL(provider accounts.Provider, upstream string) string {
 	entry, ok := keyedProviderFor(provider)
-	if !ok || entry.HealthPath == "" || entry.DefaultUpstream == "" {
+	if !ok || entry.HealthPath == "" {
 		return ""
 	}
-	return strings.TrimRight(entry.DefaultUpstream, "/") + entry.HealthPath
+	if upstream == "" {
+		upstream = entry.DefaultUpstream
+	}
+	return strings.TrimRight(upstream, "/") + entry.HealthPath
 }
 
 // ProviderEndpoints lists every path prefix served by one provider's

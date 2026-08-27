@@ -187,8 +187,8 @@ func TestCollapseDuplicateVersionSegment(t *testing.T) {
 
 // A provider that addresses models as vendor/model must keep the whole id,
 // while every other provider keeps reading the leading segment as a provider
-// selector. No registered provider sets this today; the behaviour is asserted
-// against a synthetic entry so the flag cannot rot before it is used.
+// selector. OpenRouter uses this flag; the synthetic entry below also proves
+// the behavior independently of that registry row.
 func TestSessionLeaseProviderHonoursVendorPrefixedModels(t *testing.T) {
 	provider, model, err := sessionLeaseProvider("claude", "anthropic/claude-opus-5")
 	if err != nil || provider != accounts.ProviderClaude || model != "claude-opus-5" {

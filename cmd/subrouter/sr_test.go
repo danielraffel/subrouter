@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1632,7 +1633,8 @@ func TestKeyedProviderSectionUsesItsOwnColumns(t *testing.T) {
 func TestProviderEndpointsCollapseASharedSubscription(t *testing.T) {
 	for _, provider := range []accounts.Provider{accounts.ProviderQwenToken, accounts.ProviderQwenAnthropic} {
 		got := proxy.ProviderEndpoints(provider)
-		if len(got) != 2 {
+		want := []string{"/qwen-anthropic", "/qwen-token"}
+		if !slices.Equal(got, want) {
 			t.Fatalf("provider %q lists %v, want both protocol endpoints", provider, got)
 		}
 	}
@@ -1644,8 +1646,31 @@ func TestProviderEndpointsCollapseASharedSubscription(t *testing.T) {
 // The health probe must classify what the vendor actually returns, since these
 // providers offer no quota API and key validity is the only live signal.
 func TestProbeProviderKeyClassifiesTheResponse(t *testing.T) {
-	if state, models := probeProviderKey(context.Background(), nil, accounts.ProviderQwenAnthropic, "k"); state != "" || models != -1 {
+	if state, models := probeProviderKey(context.Background(), nil, accounts.ProviderQwenAnthropic, "", "k"); state != "" || models != -1 {
 		t.Fatalf("a provider with no health endpoint should report nothing, got %q %d", state, models)
+	}
+	cases := []struct {
+		status int
+		body   string
+		state  string
+		models int
+	}{
+		{http.StatusUnauthorized, `{}`, "bad key", -1},
+		{http.StatusForbidden, `{}`, "denied", -1},
+		{http.StatusBadGateway, `{}`, "http 502", -1},
+		{http.StatusOK, `{"data":[{},{}]}`, "ok", 2},
+		{http.StatusOK, `{`, "ok", -1},
+	}
+	for _, tc := range cases {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(tc.status)
+			_, _ = io.WriteString(w, tc.body)
+		}))
+		state, models := probeProviderKey(context.Background(), nil, accounts.ProviderQwenToken, server.URL, "k")
+		server.Close()
+		if state != tc.state || models != tc.models {
+			t.Fatalf("status %d body %q => (%q, %d), want (%q, %d)", tc.status, tc.body, state, models, tc.state, tc.models)
+		}
 	}
 	if state := usageGridState(srUsageRow{providerHealth: "bad key"}); state != "bad key" {
 		t.Fatalf("a keyed provider's state should come from its probe, got %q", state)

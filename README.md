@@ -278,6 +278,8 @@ X-Subrouter-User-Email: alice@example.com
 
 Subrouter stores the normalized email on the session assignment, includes it in proxy logs as `user`, and exposes it in `GET /_subrouter/sessions`. This is observability metadata, not authentication. To force a selected account, send `X-Subrouter-Account-ID`; Codex API-key labels can omit the `apikey:` prefix, and an API-key account for another provider is identified as `<provider>:<label>`, such as `qwen-token:work`. Subrouter strips `X-Subrouter-Session`, `X-Subrouter-Agent`, `X-Subrouter-User-Email`, `X-Subrouter-User`, `X-User-Email`, `X-Subrouter-Account-ID`, and `X-Subrouter-Account` before forwarding upstream.
 
+Only send this header when storing that email in the Subrouter state and logs is acceptable under your privacy policy. Protect the admin-gated sessions endpoint and log access accordingly; the value is self-reported and must not be treated as verified identity.
+
 ## Codex CLI
 
 `subrouter codex` is a direct Codex wrapper. Use it anywhere you would use `codex`:
@@ -426,7 +428,8 @@ account it selects:
 | `/qwen-token` | Model Studio Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
 | `/qwen-anthropic` | Token Plan, Anthropic protocol | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
 
-Each has a `--<name>-upstream` flag for a different region or a gateway. Add a
+Each has a `--<name>-upstream` flag for a different region or a gateway; the
+Anthropic-protocol Token Plan route uses `--qwen-anthropic-upstream`. Add a
 key with the provider named, or it is stored as a Codex account and forwarded to
 OpenAI:
 
@@ -442,6 +445,8 @@ reports what each vendor actually exposes: how the plan is metered, whether the
 key still works, how many models it may use, and which endpoints its credential
 serves. None of these vendors publish a quota or reset API, so the quota column
 says so instead of showing a number that does not exist.
+Standalone local status probes use the documented vendor default upstream;
+custom serving upstreams are not persisted into the CLI configuration.
 
 To put a new provider on an already-running macOS daemon, follow
 [docs/upgrades.md](docs/upgrades.md#replacing-the-binary-in-place-on-macos).
@@ -475,11 +480,13 @@ plan on its own host, a self-hosted gateway, a relay — does not need code:
 
 ```bash
 sr serve --openai-compatible acme=https://gateway.acme.test/v1
-sr serve --openai-compatible acme|acme-relay=https://gateway.acme.test/v1
+sr serve --openai-compatible 'acme|acme-relay=https://gateway.acme.test/v1'
 ```
 
 A declared provider gets the same routing, auth, lease, import, and CLI handling
-as a built-in one. Declarations are rejected if they claim a name or path
+as a built-in one. A standalone local or remote `sr add-key --provider <name>`
+carries the validated custom name to the serving process, which accepts the
+account only when that process declared the provider. Declarations are rejected if they claim a name or path
 segment that Codex, Claude, or a built-in provider already routes on, since that
 would silently redirect traffic which already had a home. Providers are read on
 every request and declared once at startup, so they cannot change while the

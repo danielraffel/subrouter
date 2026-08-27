@@ -1019,9 +1019,9 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				wg.Add(1)
 				go func(idx int, provider accounts.Provider, token string) {
 					defer wg.Done()
-					probeCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+					probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 					defer cancel()
-					state, models := probeProviderKey(probeCtx, nil, provider, token)
+					state, models := probeProviderKey(probeCtx, nil, provider, "", token)
 					rows[idx].providerHealth = state
 					rows[idx].providerModels = models
 				}(i, rowProvider, account.Auth.OpenAIAPIKey)
@@ -2104,11 +2104,9 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 		// description is a phrase, not a tier name.
 		columns = dropUsageGridColumn(columns, "Pick")
 		setUsageGridColumnWidth(columns, "Plan", 24)
-		columns = append(columns,
-			usageGridColumn{Key: "Models", Title: "Models", Width: 6},
-			usageGridColumn{Key: "Endpoints", Title: "Endpoints", Width: 28},
-			usageGridColumn{Key: "Quota", Title: "Quota", Width: 11},
-		)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Models", Title: "Models", Width: 6}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Endpoints", Title: "Endpoints", Width: 28}, termWidth)
+		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Quota", Title: "Quota", Width: 11}, termWidth)
 	} else {
 		columns = append(columns,
 			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
@@ -2223,7 +2221,7 @@ func usageGridWidth(columns []usageGridColumn) int {
 
 func appendUsageGridColumnIfFits(columns []usageGridColumn, column usageGridColumn, termWidth int) []usageGridColumn {
 	next := append(append([]usageGridColumn{}, columns...), column)
-	if usageGridWidth(next) <= termWidth {
+	if termWidth <= 0 || usageGridWidth(next) <= termWidth {
 		return next
 	}
 	return columns
@@ -2310,6 +2308,8 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
+	case row.providerHealth != "" && row.providerHealth != "ok":
+		return ansiRed
 	case row.err != nil || row.cooked:
 		return ansiRed
 	case row.tempCooked:
@@ -2900,8 +2900,8 @@ func usageGridModels(row srUsageRow) string {
 // models it may use. These vendors expose no quota API, so key validity and
 // entitlement are the only live signals available. A provider with no health
 // endpoint, or an unreachable one, reports what happened rather than guessing.
-func probeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, token string) (state string, models int) {
-	url := proxy.ProviderHealthURL(provider)
+func probeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, upstream, token string) (state string, models int) {
+	url := proxy.ProviderHealthURL(provider, upstream)
 	if url == "" {
 		return "", -1
 	}

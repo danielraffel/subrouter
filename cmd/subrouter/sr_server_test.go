@@ -1924,4 +1924,12 @@ func TestParseAPIKeyProviderCoversEveryProvider(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "openrouter") {
 		t.Fatalf("the error should list openrouter as supported, got %v", err)
 	}
+	if got, err := parseAPIKeyProvider("acme-relay"); err != nil || got != accounts.Provider("acme-relay") {
+		t.Fatalf("declared provider name = %q, %v", got, err)
+	}
+	for _, invalid := range []string{"a/b", "two words", "v1"} {
+		if _, err := parseAPIKeyProvider(invalid); err == nil {
+			t.Fatalf("invalid declared provider name %q should be rejected", invalid)
+		}
+	}
 }
