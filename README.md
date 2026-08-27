@@ -278,7 +278,7 @@ X-Subrouter-User-Email: alice@example.com
 
 Subrouter stores the normalized email on the session assignment for up to 30 days after the session's last activity. Proxy logs contain only a truncated SHA-256 `user_hash`, not the email. The full value is available through admin-authorized `GET /_subrouter/sessions`; hosted tenant keys additionally need `manage_accounts`. An administrator can delete the complete assignment and its email with `DELETE /_subrouter/sessions?agent_type=TYPE&session_id=ID`. This is observability metadata, not authentication. To force a selected account, send `X-Subrouter-Account-ID`; Codex API-key labels can omit the `apikey:` prefix, and an API-key account for another provider is identified as `<provider>:<label>`, such as `qwen-token:work`. Subrouter strips `X-Subrouter-Session`, `X-Subrouter-Agent`, `X-Subrouter-User-Email`, `X-Subrouter-User`, `X-User-Email`, `X-Subrouter-Account-ID`, and `X-Subrouter-Account` before forwarding upstream.
 
-Only send this header when storing that email in the Subrouter state and logs is acceptable under your privacy policy. Protect the admin-gated sessions endpoint and log access accordingly; the value is self-reported and must not be treated as verified identity.
+Only send this header when storing the normalized email in Subrouter session state and a truncated hash in proxy logs is acceptable under your privacy policy. Protect the admin-gated sessions endpoint and log access accordingly; the value is self-reported and must not be treated as verified identity.
 
 ## Codex CLI
 
