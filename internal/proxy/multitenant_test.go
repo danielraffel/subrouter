@@ -396,6 +396,29 @@ func TestMultiTenantScopedControlEndpoints(t *testing.T) {
 	}
 }
 
+func TestTenantSessionsRequireManageAccountsCapability(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	const tenantID = "privacy-test"
+	const useKey = "srt_11111111111111111111111111111111"
+	const manageKey = "srt_22222222222222222222222222222222"
+	if _, err := registry.EnsureExternalRestricted(tenantID, "privacy", useKey, []tenant.Capability{tenant.CapabilityUse}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternalRestricted(tenantID, "privacy", manageKey, []tenant.Capability{tenant.CapabilityManageAccounts}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		key  string
+		want int
+	}{{useKey, http.StatusForbidden}, {manageKey, http.StatusOK}} {
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/t/"+test.key+"/_subrouter/sessions", nil))
+		if resp.Code != test.want {
+			t.Fatalf("sessions with scoped key status = %d, want %d", resp.Code, test.want)
+		}
+	}
+}
+
 func TestMultiTenantAccountImportUsesTenantKeyAndStaysInTenantPool(t *testing.T) {
 	registry, handler, _ := newMultiTenantFixture(t)
 	created, key, err := registry.Create("alpha")

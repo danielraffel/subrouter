@@ -2262,6 +2262,15 @@ func clientRemoteIP(r *http.Request) string {
 	return host
 }
 
+func userEmailHash(value string) string {
+	value = session.NormalizeUserEmail(value)
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:8])
+}
+
 func stripOutboundForwardingHeaders(headers http.Header) {
 	headers.Del("Forwarded")
 	headers.Del("X-Forwarded-For")
@@ -2349,8 +2358,31 @@ func (s Server) authorizeAdmin(r *http.Request) bool {
 	return s.matchesConfiguredAdminToken(r)
 }
 
-func (s Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.Sessions.All())
+func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, s.Sessions.All())
+	case http.MethodDelete:
+		agentType := strings.TrimSpace(r.URL.Query().Get("agent_type"))
+		sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+		if agentType == "" || sessionID == "" {
+			http.Error(w, "agent_type and session_id are required", http.StatusBadRequest)
+			return
+		}
+		deleted, err := s.Sessions.Delete(agentType, sessionID)
+		if err != nil {
+			http.Error(w, "delete session assignment", http.StatusInternalServerError)
+			return
+		}
+		if !deleted {
+			http.Error(w, "session assignment not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, DELETE")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s Server) proxyHandler() http.Handler {
@@ -2779,7 +2811,7 @@ func (s Server) proxyHandler() http.Handler {
 			// device / client type). Without them a concurrency spike is an
 			// anonymous wall of user="" sessions that cannot be traced to whatever
 			// fired it (a load-test loader, an agent fleet, etc.).
-			s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user", userEmail, "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent())
+			s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user_hash", userEmailHash(userEmail), "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent())
 		}
 
 		// Read-heavy polling endpoints: identical concurrent requests share

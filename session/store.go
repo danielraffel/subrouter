@@ -16,6 +16,11 @@ import (
 // materialize an unbounded session map first.
 const MaxRetainedAssignments = 512
 
+// UserEmailRetention limits how long inactive self-reported identity metadata
+// remains attached to a sticky routing assignment. The assignment itself is
+// retained so a resumed session still reaches the same account.
+const UserEmailRetention = 30 * 24 * time.Hour
+
 type Assignment struct {
 	AgentType string    `json:"agent_type"`
 	SessionID string    `json:"session_id"`
@@ -90,6 +95,27 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 	return assignment, s.saveLocked()
 }
 
+// Delete removes one scoped sticky assignment and its self-reported identity
+// metadata. It is used by the admin-only sessions endpoint.
+func (s *Store) Delete(agentType, sessionID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return false, err
+	}
+	key := ScopedSessionKey(agentType, sessionID)
+	if _, ok := s.data[key]; !ok {
+		return false, nil
+	}
+	delete(s.data, key)
+	return true, s.saveLocked()
+}
+
 func (s *Store) All() []Assignment {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,9 +171,13 @@ func (s *Store) loadLocked() error {
 	}
 	s.data = data
 	s.migrateLoadedAssignments()
+	changed := s.expireUserEmailsLocked(time.Now().UTC())
 	if s.pruneLocked() {
 		// Rewrite legacy/unbounded files while the session lock is held so
 		// every subsequent reader starts from the bounded representation.
+		changed = true
+	}
+	if changed {
 		return s.saveLocked()
 	}
 	return nil
@@ -175,6 +205,19 @@ func (s *Store) pruneLocked() bool {
 		delete(s.data, stale.key)
 	}
 	return true
+}
+
+func (s *Store) expireUserEmailsLocked(now time.Time) bool {
+	changed := false
+	for key, assignment := range s.data {
+		if assignment.UserEmail == "" || now.Sub(assignment.UpdatedAt) < UserEmailRetention {
+			continue
+		}
+		assignment.UserEmail = ""
+		s.data[key] = assignment
+		changed = true
+	}
+	return changed
 }
 
 func (s *Store) saveLocked() error {

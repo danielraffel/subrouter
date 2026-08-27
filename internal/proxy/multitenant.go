@@ -252,9 +252,11 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 		return key.Allows(tenant.CapabilityUse) ||
 			key.Allows(tenant.CapabilityManageAccounts)
 	}
+	if path == "/_subrouter/sessions" {
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
 	if path == "/_subrouter/leases" ||
-		strings.HasPrefix(path, "/_subrouter/leases/") ||
-		path == "/_subrouter/sessions" {
+		strings.HasPrefix(path, "/_subrouter/leases/") {
 		return key.Allows(tenant.CapabilityUse)
 	}
 	if strings.HasPrefix(path, "/_subrouter/") {

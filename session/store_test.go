@@ -98,6 +98,54 @@ func TestPutPreservesExistingUserEmailWhenMissing(t *testing.T) {
 	}
 }
 
+func TestNewStoreExpiresStaleUserEmailWithoutDroppingAssignment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	stale := time.Now().UTC().Add(-UserEmailRetention - time.Hour)
+	assignment := Assignment{
+		AgentType: "codex", SessionID: "session-1", AccountID: "account-a",
+		UserEmail: "alice@example.com", CreatedAt: stale, UpdatedAt: stale,
+	}
+	body, err := json.Marshal(map[string]Assignment{ScopedSessionKey("codex", "session-1"): assignment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := store.Get("codex", "session-1")
+	if !ok {
+		t.Fatal("stale assignment was removed")
+	}
+	if got.UserEmail != "" {
+		t.Fatalf("stale user email = %q, want empty", got.UserEmail)
+	}
+}
+
+func TestDeleteRemovesScopedAssignment(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "account-a", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := store.Delete("codex", "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deleted {
+		t.Fatal("existing assignment was not deleted")
+	}
+	if _, ok := store.Get("codex", "session-1"); ok {
+		t.Fatal("deleted assignment is still present")
+	}
+}
+
 func TestCodexTurnScopedIDsUseOneStickyAssignment(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
