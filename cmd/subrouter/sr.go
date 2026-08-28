@@ -1064,11 +1064,12 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err := r.ensureSwitchableForFreshUsage(ctx, account); err != nil {
 		return err
 	}
-	if err := r.store.SwitchActive(account.Email); err != nil {
+	activated, err := r.store.SwitchActiveStored(account.Email)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Switched to %s\n", account.Email)
-	for _, result := range syncCodexCompatibleAuth(account) {
+	fmt.Fprintf(r.out, "Switched to %s\n", activated.Email)
+	for _, result := range syncCodexCompatibleAuth(activated) {
 		if result.Err != nil {
 			fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
 			continue

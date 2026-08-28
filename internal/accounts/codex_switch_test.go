@@ -41,8 +41,15 @@ func TestSwitchActiveDowngradesIsolatedOAuthOriginBeforeExport(t *testing.T) {
 	if err := store.SaveStored(account); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SwitchActive(account.Email); err != nil {
+	activated, err := store.SwitchActiveStored(account.Email)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if activated.OAuthCredentialOrigin != CodexOAuthOriginInteractiveImport {
+		t.Fatalf("activated OAuth origin = %q, want interactive import", activated.OAuthCredentialOrigin)
+	}
+	if activated.Auth.Tokens == nil || activated.Auth.Tokens.RefreshToken != "refresh" {
+		t.Fatalf("activated account = %#v, want exact stored OAuth chain", activated)
 	}
 	stored, ok, err := store.FindStored(account.Email)
 	if err != nil {
