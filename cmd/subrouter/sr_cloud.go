@@ -951,7 +951,7 @@ func (r srRunner) cloudAccountAdd(
 			return err
 		}
 	case "openai-key":
-		if err := r.addKey(nil); err != nil {
+		if err := r.addKey(ctx, nil); err != nil {
 			return err
 		}
 	default:

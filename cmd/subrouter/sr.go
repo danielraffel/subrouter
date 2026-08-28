@@ -316,9 +316,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "storage":
 		return r.cloudStorage(args[1:])
 	case "add-key", "add-api-key":
-		return r.addKey(args[1:])
+		return r.addKey(ctx, args[1:])
 	case "import":
-		return r.importActive()
+		return r.importActive(ctx)
 	case "list", "ls":
 		return r.list()
 	case "switch", "use":
@@ -661,14 +661,20 @@ func (r srRunner) add(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
+	if err := r.publishActiveSync(ctx); err != nil {
 		return err
 	}
 	fmt.Fprintln(r.out, "Opening Codex OAuth login...")
 	if err := r.commandRunner().Run(ctx, "codex", []string{"login"}, r.in, r.out, r.errOut); err != nil {
 		return fmt.Errorf("codex login failed: %w", err)
 	}
-	account, existed, err := r.store.ImportActive()
+	var account accounts.StoredCodexAccount
+	var existed bool
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var importErr error
+		account, existed, importErr = r.store.ImportActive()
+		return importErr == nil, importErr
+	})
 	if err != nil {
 		return err
 	}
@@ -699,12 +705,12 @@ func (r srRunner) add(ctx context.Context) error {
 	return nil
 }
 
-func (r srRunner) addKey(args []string) error {
+func (r srRunner) addKey(ctx context.Context, args []string) error {
 	provider, err := parseAddKeyProviderArgs(r.programOrSubrouter()+" add-key", r.errOut, args)
 	if err != nil {
 		return err
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
+	if err := r.publishActiveSync(ctx); err != nil {
 		return err
 	}
 	reader := bufio.NewReader(r.in)
@@ -725,7 +731,13 @@ func (r srRunner) addKey(args []string) error {
 	if err != nil {
 		return err
 	}
-	account, existed, err := r.store.AddProviderAPIKey(provider, label, key)
+	var account accounts.StoredCodexAccount
+	var existed bool
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var addErr error
+		account, existed, addErr = r.store.AddProviderAPIKey(provider, label, key)
+		return addErr == nil, addErr
+	})
 	if err != nil {
 		return err
 	}
@@ -754,8 +766,14 @@ func parseAddKeyProviderArgs(command string, errOut io.Writer, args []string) (a
 	return provider, nil
 }
 
-func (r srRunner) importActive() error {
-	account, existed, err := r.store.ImportActive()
+func (r srRunner) importActive(ctx context.Context) error {
+	var account accounts.StoredCodexAccount
+	var existed bool
+	err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var importErr error
+		account, existed, importErr = r.store.ImportActive()
+		return importErr == nil, importErr
+	})
 	if err != nil {
 		return err
 	}
@@ -767,16 +785,33 @@ func (r srRunner) importActive() error {
 	return nil
 }
 
-func (r srRunner) autoImportIfEmpty() error {
+func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 	all, err := r.store.ListStored()
 	if err != nil || len(all) > 0 {
 		return err
 	}
-	account, _, err := r.store.ImportActive()
+	var account accounts.StoredCodexAccount
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var importErr error
+		account, _, importErr = r.store.ImportActive()
+		return importErr == nil, importErr
+	})
 	if err == nil {
 		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.Email)
 	}
 	return nil
+}
+
+func (r srRunner) publishActiveSync(ctx context.Context) error {
+	return proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		if err := r.store.SyncActiveToStore(); err != nil {
+			return false, err
+		}
+		// SyncActiveToStore intentionally has no changed return. Publishing an
+		// unchanged generation is harmless and prevents a rotated active token
+		// from remaining stale in a running worker.
+		return true, nil
+	})
 }
 
 func (r srRunner) list() error {
@@ -913,7 +948,7 @@ func (r srRunner) status(ctx context.Context) error {
 			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 		}
 	}
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	rows, err := r.fetchUsageRows(ctx)
@@ -925,7 +960,7 @@ func (r srRunner) status(ctx context.Context) error {
 }
 
 func (r srRunner) statusOne(ctx context.Context, selector string) error {
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	all, err := r.fetchUsageRows(ctx)
@@ -947,7 +982,7 @@ func (r srRunner) statusOne(ctx context.Context, selector string) error {
 }
 
 func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	rows, err := r.fetchUsageRows(ctx)
@@ -993,7 +1028,7 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 		}
 	}
-	if err := r.autoImportIfEmpty(); err != nil {
+	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
 	}
 	rows, err := r.fetchUsageRows(ctx)
@@ -1512,14 +1547,26 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
-	if account.ProviderOrDefault() == accounts.ProviderQwenToken {
-		root := agentqwen.ConsoleRootForStore(r.store)
-		if err := agentqwen.RemoveConsoleCredentialIn(root, account.Email); err != nil {
-			return fmt.Errorf("could not remove Qwen console credential: %w", err)
-		}
-	}
 	accountID := account.Email
-	account, ok, err = r.store.RemoveStored(accountID)
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var removeErr error
+		account, ok, removeErr = r.store.RemoveStored(accountID)
+		if removeErr != nil || !ok {
+			return false, removeErr
+		}
+		if account.ProviderOrDefault() != accounts.ProviderQwenToken {
+			return true, nil
+		}
+		root := agentqwen.ConsoleRootForStore(r.store)
+		if cleanupErr := agentqwen.RemoveConsoleCredentialIn(root, account.Email); cleanupErr != nil {
+			restoreErr := r.store.SaveStored(account)
+			return false, errors.Join(
+				fmt.Errorf("could not remove Qwen console credential: %w", cleanupErr),
+				restoreErr,
+			)
+		}
+		return true, nil
+	})
 	if err != nil {
 		return err
 	}

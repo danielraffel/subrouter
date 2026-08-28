@@ -1126,15 +1126,19 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		return
 	}
 	if ok {
-		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
-			if err := agentqwen.RemoveConsoleCredentialIn(server.AccountRef.qwenRoot(), stored.Email); err != nil {
-				http.Error(w, "remove Qwen console credential", http.StatusInternalServerError)
-				return
-			}
-		}
 		if _, removed, err = server.AccountRef.store.RemoveStored(stored.Email); err != nil {
 			http.Error(w, "remove account", http.StatusInternalServerError)
 			return
+		}
+		if removed && stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			if cleanupErr := agentqwen.RemoveConsoleCredentialIn(server.AccountRef.qwenRoot(), stored.Email); cleanupErr != nil {
+				if restoreErr := server.AccountRef.store.SaveStored(stored); restoreErr != nil {
+					http.Error(w, "remove Qwen console credential and restore account", http.StatusInternalServerError)
+					return
+				}
+				http.Error(w, "remove Qwen console credential", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 	if ok, err := server.AccountRef.claudeStore.RemoveProfile(id); err != nil {

@@ -21,6 +21,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -1832,6 +1833,41 @@ func TestTenantAccountDeleteReturnsUnavailableWithoutAccountStore(t *testing.T) 
 	)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTenantQwenDeleteRestoresAccountWhenCredentialCleanupFails(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email:    "qwen-token:work",
+		Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "model-secret",
+		},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := os.MkdirAll(ref.qwenRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), agentqwen.ConsoleConfigDirIn(ref.qwenRoot(), stored.Email)); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	handleTenantAccountDelete(
+		&Server{AccountRef: ref},
+		response,
+		httptest.NewRequest(http.MethodDelete, "/_subrouter/accounts/"+stored.Email, nil),
+	)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	if _, ok, err := store.FindStored(stored.Email); err != nil || !ok {
+		t.Fatalf("Qwen account was not restored after cleanup failure: ok=%v err=%v", ok, err)
 	}
 }
 

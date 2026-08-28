@@ -625,6 +625,9 @@ func TestSRQwenKeyAccountsCanBeAddedListedAndRemoved(t *testing.T) {
 	if err := runner.run(context.Background(), []string{"remove", "qwen-token:small-plan"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("Qwen removal did not publish account generation: %v", err)
+	}
 	if _, ok, err := store.FindStored("qwen-token:small-plan"); err != nil || ok {
 		t.Fatalf("removed Qwen account remains: ok=%v err=%v", ok, err)
 	}
@@ -666,6 +669,11 @@ func TestAdditionalKeyedProvidersCanBeAddedListedAndRemoved(t *testing.T) {
 			if err != nil || !ok || stored.Provider != provider {
 				t.Fatalf("stored account = %+v ok=%v err=%v", stored, ok, err)
 			}
+			generationPath := filepath.Join(store.StoreDir(), ".account-generation")
+			generationAfterAdd, err := os.ReadFile(generationPath)
+			if err != nil || len(generationAfterAdd) == 0 {
+				t.Fatalf("add did not publish account generation: %q err=%v", generationAfterAdd, err)
+			}
 			out.Reset()
 			runner.in = strings.NewReader("")
 			if err := runner.run(t.Context(), []string{"list"}); err != nil {
@@ -683,6 +691,13 @@ func TestAdditionalKeyedProvidersCanBeAddedListedAndRemoved(t *testing.T) {
 			}
 			if _, ok, err := store.FindStored(accountID); err != nil || ok {
 				t.Fatalf("removed account remains: ok=%v err=%v", ok, err)
+			}
+			generationAfterRemove, err := os.ReadFile(generationPath)
+			if err != nil {
+				t.Fatalf("read removal generation: %v", err)
+			}
+			if bytes.Equal(generationAfterAdd, generationAfterRemove) {
+				t.Fatal("remove did not publish a new account generation")
 			}
 			if strings.Contains(out.String(), "provider-test-key") {
 				t.Fatal("account lifecycle output leaked the API key")
@@ -734,6 +749,9 @@ func TestSRQwenRemovalRetainsAccountWhenCredentialCleanupFails(t *testing.T) {
 	}
 	if _, ok, err := store.FindStored(accountID); err != nil || !ok {
 		t.Fatalf("Qwen account should remain retryable: ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed Qwen removal published account generation: %v", err)
 	}
 }
 
