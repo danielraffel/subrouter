@@ -277,7 +277,7 @@ func pickTenantCredentialLeaseAccount(
 	if server.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
 	}
-	return scheduler.Pick(candidates)
+	return pickRoutingAccount(scheduler, candidates)
 }
 
 func applyTenantCredentialLeaseReport(

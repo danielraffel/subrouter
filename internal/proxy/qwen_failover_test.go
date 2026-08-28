@@ -60,6 +60,111 @@ func TestRetryableUpstreamPostRequestAdditionalKeyedProviders(t *testing.T) {
 	}
 }
 
+func TestKeyedProviderQuotaExhaustionIsAccountWideWithRequestModel(t *testing.T) {
+	const accountID = "qwen-token:limited"
+	scheduler := selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: accountID, Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1,
+	}})
+	server := &Server{SchedulerRef: selectacct.NewSchedulerRef(scheduler)}
+	transport := usageLimitRetryTransport{
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusTooManyRequests,
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body:   io.NopCloser(strings.NewReader(`{"error":{"message":"quota exhausted"}}`)), Request: request}, nil
+		}),
+		server: server, provider: accounts.ProviderQwenToken, account: accountID,
+		poolModel: "qwen3.7-plus", maxAttempts: 1,
+	}
+	request := httptest.NewRequest(http.MethodPost, "https://qwen.test/v1/chat/completions", strings.NewReader(`{"model":"qwen3.7-plus"}`))
+	request.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(`{"model":"qwen3.7-plus"}`)), nil
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderQwenToken, accountID) {
+		t.Fatal("plan-wide keyed-provider quota exhaustion remained scoped to the request model")
+	}
+}
+
+func TestCodexFailoverRebuildsPathForReplacementAuthMode(t *testing.T) {
+	const oauthID = "codex:oauth"
+	const apiID = "codex:api"
+	var paths []string
+	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.URL.Path)
+		if len(paths) == 1 {
+			return &http.Response{StatusCode: http.StatusTooManyRequests,
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body:   io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached"}}`)), Request: request}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Request: request}, nil
+	})
+	server := &Server{
+		Accounts: []accounts.Account{
+			{ID: oauthID, Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token"},
+			{ID: apiID, Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeAPIKey, Token: "api-key"},
+		},
+		SchedulerRef:  selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		APIUpstream:   mustParseURL(t, "https://api.openai.test"),
+		CodexUpstream: mustParseURL(t, "https://chatgpt.test/backend-api/codex"),
+	}
+	transport := usageLimitRetryTransport{base: base, server: server, provider: accounts.ProviderCodex,
+		account: oauthID, path: "/responses", poolModel: "gpt-5", maxAttempts: 2}
+	request := httptest.NewRequest(http.MethodPost, "https://chatgpt.test/responses", strings.NewReader(`{"model":"gpt-5"}`))
+	request.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(`{"model":"gpt-5"}`)), nil
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if len(paths) != 2 || paths[1] != "/v1/responses" {
+		t.Fatalf("attempt paths = %v, want replacement API-key attempt at /v1/responses", paths)
+	}
+}
+
+func TestCodexFailoverRemovesAPIPathPrefixForOAuthReplacement(t *testing.T) {
+	const apiID = "codex:api"
+	const oauthID = "codex:oauth"
+	var paths []string
+	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.URL.Path)
+		if len(paths) == 1 {
+			return &http.Response{StatusCode: http.StatusTooManyRequests,
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body:   io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached"}}`)), Request: request}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Request: request}, nil
+	})
+	server := &Server{
+		Accounts: []accounts.Account{
+			{ID: apiID, Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeAPIKey, Token: "api-key"},
+			{ID: oauthID, Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token"},
+		},
+		SchedulerRef:  selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		APIUpstream:   mustParseURL(t, "https://api.openai.test"),
+		CodexUpstream: mustParseURL(t, "https://chatgpt.test/backend-api/codex"),
+	}
+	transport := usageLimitRetryTransport{base: base, server: server, provider: accounts.ProviderCodex,
+		account: apiID, path: "/v1/responses", poolModel: "gpt-5", maxAttempts: 2}
+	request := httptest.NewRequest(http.MethodPost, "https://api.openai.test/v1/responses", strings.NewReader(`{"model":"gpt-5"}`))
+	request.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(`{"model":"gpt-5"}`)), nil
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if len(paths) != 2 || paths[1] != "/backend-api/codex/responses" {
+		t.Fatalf("attempt paths = %v, want replacement OAuth attempt at /backend-api/codex/responses", paths)
+	}
+}
+
 func TestGrokFailoverRetargetsBetweenAPIAndSubscriptionUpstreams(t *testing.T) {
 	apiCalls := 0
 	apiUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

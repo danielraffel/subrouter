@@ -3386,16 +3386,18 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = usageLimitRetryTransport{
-				base:               transport,
-				server:             &s,
-				logger:             s.Logger,
-				provider:           requestProvider,
-				agent:              sessionAgentType,
-				session:            sessionID,
-				userEmail:          userEmail,
-				account:            account.ID,
-				method:             r.Method,
-				path:               proxyRequest.URL.Path,
+				base:      transport,
+				server:    &s,
+				logger:    s.Logger,
+				provider:  requestProvider,
+				agent:     sessionAgentType,
+				session:   sessionID,
+				userEmail: userEmail,
+				account:   account.ID,
+				method:    r.Method,
+				// Keep the client path, before the initially selected account's
+				// auth-mode rewrite, so a mixed-auth retry can derive its own path.
+				path:               r.URL.Path,
 				upstream:           upstream.Host,
 				maxAttempts:        s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
 				poolModel:          retryPoolModel,
@@ -6554,6 +6556,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// below remain scoped to the rejected model.
 			exhaustionPool = ""
 		}
+		if _, keyedProvider := keyedProviderFor(t.provider); keyedProvider && exhausted {
+			// Provider-plan and API-key quota errors apply to the credential,
+			// regardless of which request model happened to observe them.
+			exhaustionPool = ""
+		}
 		if t.provider == accounts.ProviderClaude {
 			// Surface the genuine upstream rate-limit signal. The active retry
 			// path consumes this 429 before the passive ModifyResponse capture
@@ -6635,7 +6642,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.URL.Scheme = nextUpstream.Scheme
 			attemptReq.URL.Host = nextUpstream.Host
 			attemptReq.URL.User = nextUpstream.User
-			attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.path)
+			attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.server.pathForUpstream(t.path, nextAccount))
 			attemptReq.URL.RawPath = ""
 		}
 		setAccountAuthHeaders(attemptReq.Header, nextAccount, t.poolModel)
