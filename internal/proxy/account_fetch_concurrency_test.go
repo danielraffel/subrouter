@@ -161,3 +161,37 @@ func TestAccountFetchSweepsUseOneDeadlineAcrossAllBatches(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedScoreDeadlinePreservesSeedsForQueuedAccounts(t *testing.T) {
+	ref, available, _ := accountFetchConcurrencyFixture(t)
+	transport := &contextBlockingTransport{}
+	ref.client = &http.Client{Transport: transport}
+	seeded := make([]selectacct.Score, 0, len(available))
+	for _, account := range available {
+		seeded = append(seeded, selectacct.Score{
+			AccountID: account.ID,
+			Provider:  account.Provider,
+			Headroom:  0.75,
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	scores, scored := (Server{
+		AccountRef: ref,
+		Scheduler:  selectacct.NewScheduler(seeded),
+	}).scoreAccounts(ctx, available)
+	if scored != 0 {
+		t.Fatalf("freshly scored accounts = %d, want 0 from blocked upstream", scored)
+	}
+	if len(scores) != len(available) {
+		t.Fatalf("scores = %d, want %d", len(scores), len(available))
+	}
+	for _, score := range scores {
+		if score.Headroom != 0.75 {
+			t.Fatalf("account %s lost seeded headroom: %v", score.AccountID, score.Headroom)
+		}
+	}
+	if calls, maximum := transport.counts(); calls != accountFetchConcurrency || maximum != accountFetchConcurrency {
+		t.Fatalf("blocked sweep calls/max = %d/%d, want %d/%d", calls, maximum, accountFetchConcurrency, accountFetchConcurrency)
+	}
+}

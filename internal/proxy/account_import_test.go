@@ -130,7 +130,23 @@ func TestAccountImportPreflightRequiresAdminTokenFromLoopback(t *testing.T) {
 func TestAccountImportCodexPersistsAndHotLoadsWithoutReturningSecrets(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	claudeStore := agentclaude.Store{Dir: t.TempDir()}
-	ref := NewAccountRef(codexStore, nil, nil)
+	rotated := proxyStoredOAuthAccount("founders@manaflow.ai", "server", time.Now().Add(time.Hour))
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		body, err := json.Marshal(map[string]string{
+			"access_token":  rotated.Auth.Tokens.AccessToken,
+			"refresh_token": rotated.Auth.Tokens.RefreshToken,
+			"id_token":      rotated.Auth.Tokens.IDToken,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+	ref := NewAccountRef(codexStore, nil, client)
 	ref.claudeStore = claudeStore
 	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
 	account := proxyStoredOAuthAccount("founders@manaflow.ai", "fresh", time.Now().Add(time.Hour))
@@ -153,8 +169,9 @@ func TestAccountImportCodexPersistsAndHotLoadsWithoutReturningSecrets(t *testing
 	if err != nil || !ok {
 		t.Fatalf("stored account = found:%v err:%v", ok, err)
 	}
-	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != "fresh-refresh" {
-		t.Fatal("stored account does not contain the imported refresh-token chain")
+	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != "server-refresh" ||
+		stored.OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested {
+		t.Fatal("stored account does not contain the server-attested refresh-token chain")
 	}
 	info, err := os.Stat(stored.SourcePath(codexStore))
 	if err != nil {
@@ -194,9 +211,25 @@ func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 	}
 }
 
-func TestAccountImportRejectsCodexOAuthWithoutIsolatedLoginOrigin(t *testing.T) {
+func TestAccountImportServerAttestsCodexOAuthRegardlessOfCallerOrigin(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
-	ref := NewAccountRef(codexStore, nil, nil)
+	rotated := proxyStoredOAuthAccount("owner@example.com", "server", time.Now().Add(time.Hour))
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		body, err := json.Marshal(map[string]string{
+			"access_token":  rotated.Auth.Tokens.AccessToken,
+			"refresh_token": rotated.Auth.Tokens.RefreshToken,
+			"id_token":      rotated.Auth.Tokens.IDToken,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+	ref := NewAccountRef(codexStore, nil, client)
 	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
 	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
 	account := proxyStoredOAuthAccount("owner@example.com", "fresh", time.Now().Add(time.Hour))
@@ -207,15 +240,16 @@ func TestAccountImportRejectsCodexOAuthWithoutIsolatedLoginOrigin(t *testing.T) 
 	}
 
 	resp := serveProtectedAccountImport(handler, payload)
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400, body = %s", resp.Code, resp.Body.String())
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", resp.Code, resp.Body.String())
 	}
 	stored, err := codexStore.ListStored()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(stored) != 0 {
-		t.Fatalf("unproven OAuth import wrote %d accounts", len(stored))
+	if len(stored) != 1 || stored[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested ||
+		stored[0].Auth.Tokens == nil || stored[0].Auth.Tokens.RefreshToken != "server-refresh" {
+		t.Fatalf("caller origin was not replaced by server attestation: %#v", stored)
 	}
 }
 

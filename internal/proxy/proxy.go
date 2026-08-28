@@ -798,6 +798,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	claudeProfiles := r.claudeStore.ListProfiles()
 	claudeOffset := len(storedAccounts)
 	out := make([]AccountUsageStatus, claudeOffset+len(claudeProfiles))
+	// The deadline intentionally covers the whole pool rather than each queued
+	// account. Status latency must stay bounded as pools grow; entries that do
+	// not acquire a slot retain the identity/status seeded below and are retried
+	// by the next sweep instead of extending this request by another batch.
 	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
 	defer cancelSweep()
 	var wg sync.WaitGroup
@@ -1628,9 +1632,12 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		if input.Codex == nil || input.Claude != nil {
 			return "", invalidAccountImport("exactly one matching account payload is required")
 		}
-		untrustedTenantOAuth := s.tenantAccountImportAuthorized &&
-			input.Provider == accounts.ProviderCodex && !input.Codex.IsAPIKey()
-		account, err := validateStoredAccountImportOrigin(input.Provider, *input.Codex, !untrustedTenantOAuth)
+		remoteCodexOAuth := input.Provider == accounts.ProviderCodex && !input.Codex.IsAPIKey()
+		// An HTTP caller can assert an origin enum but cannot prove that its
+		// refresh chain is isolated from another process. Rotating every remotely
+		// imported Codex OAuth chain transfers ownership to this server before it
+		// is persisted, regardless of which import credential authorized the call.
+		account, err := validateStoredAccountImportOrigin(input.Provider, *input.Codex, !remoteCodexOAuth)
 		if err != nil {
 			return "", err
 		}
@@ -1639,7 +1646,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			return "", err
 		}
 		account.Email = canonicalID
-		if untrustedTenantOAuth {
+		if remoteCodexOAuth {
 			account, err = attestTenantCodexOAuth(ctx, s.AccountRef.client, account)
 			if err != nil {
 				return "", err
@@ -2216,10 +2223,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	if client == nil {
 		client = &http.Client{Timeout: defaultUsageFetchTimeout}
 	}
+	// Keep one wall-clock budget for the entire pool. A per-account deadline
+	// after semaphore acquisition would make a sweep grow by five seconds per
+	// batch. Accounts that do not acquire a slot preserve their scheduler seed,
+	// so a saturated upstream cannot erase prior routing evidence.
 	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
 	defer cancelSweep()
-	// Score each account in parallel and bound each refresh/usage pair. A dead
-	// account must not make every other account wait for its network timeout.
+	// Score accounts in parallel without allowing an unbounded number of
+	// refresh/usage pairs to occupy transports and provider endpoints.
 	scored := 0
 	var scoreMu sync.Mutex
 	var wg sync.WaitGroup

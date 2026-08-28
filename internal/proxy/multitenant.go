@@ -1030,6 +1030,43 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
+		if err := lockMutexContext(r.Context(), &server.AccountRef.installMu); err != nil {
+			http.Error(w, "Codex account update canceled", http.StatusRequestTimeout)
+			return
+		}
+		accountUpdateLocked := true
+		defer func() {
+			if accountUpdateLocked {
+				server.AccountRef.installMu.Unlock()
+			}
+		}()
+		submittedIdentity, err := accounts.ExtractEmailFromJWT(input.Tokens.IDToken)
+		if err != nil || strings.TrimSpace(submittedIdentity) == "" {
+			http.Error(w, "Codex OAuth credential identity is invalid", http.StatusBadRequest)
+			return
+		}
+		expectedIdentity := ""
+		existing, found, findErr := server.AccountRef.store.FindStored(id)
+		if findErr != nil {
+			http.Error(w, "read Codex account target", http.StatusInternalServerError)
+			return
+		}
+		if input.TargetAccountID != "" {
+			if !found || existing.Auth.Tokens == nil {
+				http.Error(w, "Codex repair target is unavailable", http.StatusConflict)
+				return
+			}
+			expectedIdentity, err = accounts.ExtractEmailFromJWT(existing.Auth.Tokens.IDToken)
+			if err != nil || !strings.EqualFold(
+				strings.TrimSpace(expectedIdentity), strings.TrimSpace(submittedIdentity),
+			) {
+				http.Error(w, "Codex repair identity does not match existing account", http.StatusConflict)
+				return
+			}
+		} else if found {
+			http.Error(w, "Codex account already exists; use repair", http.StatusConflict)
+			return
+		}
 		account, err := attestTenantCodexOAuth(r.Context(), server.AccountRef.client, accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
@@ -1049,19 +1086,9 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "Codex OAuth credential identity is invalid", http.StatusBadRequest)
 			return
 		}
-		if input.TargetAccountID != "" {
-			existing, found, findErr := server.AccountRef.store.FindStored(input.TargetAccountID)
-			if findErr != nil {
-				http.Error(w, "read Codex repair target", http.StatusInternalServerError)
-				return
-			}
-			if !found || existing.Auth.Tokens == nil {
-				http.Error(w, "Codex repair target is unavailable", http.StatusConflict)
-				return
-			}
-			existingIdentity, identityErr := accounts.ExtractEmailFromJWT(existing.Auth.Tokens.IDToken)
-			if identityErr != nil || !strings.EqualFold(
-				strings.TrimSpace(existingIdentity), strings.TrimSpace(refreshedIdentity),
+		if expectedIdentity != "" {
+			if !strings.EqualFold(
+				strings.TrimSpace(expectedIdentity), strings.TrimSpace(refreshedIdentity),
 			) {
 				http.Error(w, "Codex repair identity does not match existing account", http.StatusConflict)
 				return
@@ -1072,6 +1099,8 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "save Codex account", http.StatusInternalServerError)
 			return
 		}
+		server.AccountRef.installMu.Unlock()
+		accountUpdateLocked = false
 	case "openai-apikey", "anthropic-apikey":
 		if strings.TrimSpace(input.APIKey) == "" {
 			http.Error(w, "API key is required", http.StatusBadRequest)

@@ -1687,7 +1687,11 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 
 func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
 	var refreshedIdentity = "owner@example.com"
-	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+	var refreshCalls atomic.Int32
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost {
+			refreshCalls.Add(1)
+		}
 		idToken := proxyTestCodexJWT(refreshedIdentity, "id-token", time.Now().Add(time.Hour))
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -1725,10 +1729,22 @@ func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
 	if response := upload("owner@example.com", "owner-refresh", ""); response.Code != http.StatusOK {
 		t.Fatalf("initial upload status = %d, body = %s", response.Code, response.Body.String())
 	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("initial refresh calls = %d, want 1", refreshCalls.Load())
+	}
+	if response := upload("owner@example.com", "duplicate-refresh", ""); response.Code != http.StatusConflict {
+		t.Fatalf("duplicate add status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("duplicate add consumed refresh token: calls = %d, want 1", refreshCalls.Load())
+	}
 	refreshedIdentity = "other@example.com"
 	response := upload("other@example.com", "other-refresh", "stable-routing-id")
 	if response.Code != http.StatusConflict {
 		t.Fatalf("cross-identity repair status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("cross-identity repair consumed refresh token: calls = %d, want 1", refreshCalls.Load())
 	}
 	store := accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}
 	stored, found, err := store.FindStored("stable-routing-id")
@@ -1742,7 +1758,9 @@ func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
 }
 
 func TestTenantCodexUploadRejectsMalformedRefreshedIdentity(t *testing.T) {
+	var refreshCalls atomic.Int32
 	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		refreshCalls.Add(1)
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -1760,13 +1778,16 @@ func TestTenantCodexUploadRejectsMalformedRefreshedIdentity(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(
 		http.MethodPost,
 		"/t/"+key+"/_subrouter/accounts",
-		strings.NewReader(`{
+		strings.NewReader(fmt.Sprintf(`{
 			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
-			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":"id"}
-		}`),
+			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":%q}
+		}`, proxyTestCodexJWT("owner@example.com", "submitted-id", time.Now().Add(time.Hour)))),
 	))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("malformed identity status = %d, want 400, body = %s", response.Code, response.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("refresh calls = %d, want provider response validation", refreshCalls.Load())
 	}
 	stored, err := (accounts.CodexStore{
 		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),
