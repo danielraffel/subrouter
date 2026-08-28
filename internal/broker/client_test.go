@@ -368,6 +368,22 @@ func TestInvalidatingOneLeaseEvictsEveryCacheEntryForItsGeneration(
 	}
 }
 
+func TestParseLeasePreservesQwenAnthropicTransportProvider(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	lease, err := parseLease(leaseWire{
+		LeaseID: "lease-qwen", AccountID: "qwen-token:work",
+		Provider: string(account.ProviderQwenAnthropic), AuthMode: string(account.AuthModeAPIKey),
+		Token: "token-plan-key", CredentialGeneration: 1,
+		IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(5 * time.Minute).Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Account.Provider != account.ProviderQwenAnthropic || lease.Account.ID != "qwen-token:work" {
+		t.Fatalf("lease account = %+v", lease.Account)
+	}
+}
+
 func TestLeaseRejectsRefreshTokensAtTheClientBoundary(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

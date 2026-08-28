@@ -81,9 +81,10 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	input.normalize()
 	provider := accounts.Provider(input.Provider)
 	if keyedProvider, ok := APIKeyProviderForName(input.Provider); ok {
-		provider = APIKeyAccountProvider(keyedProvider)
+		provider = keyedProvider
 	}
-	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude && provider != accounts.ProviderQwenToken {
+	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude &&
+		provider != accounts.ProviderQwenToken && provider != accounts.ProviderQwenAnthropic {
 		http.Error(w, "unsupported credential lease provider", http.StatusBadRequest)
 		return
 	}

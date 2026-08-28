@@ -648,7 +648,8 @@ func parseLease(raw leaseWire) (Lease, error) {
 		return Lease{}, errors.New("cmux.com returned an incomplete credential lease")
 	}
 	provider := account.Provider(raw.Provider)
-	if provider != account.ProviderCodex && provider != account.ProviderClaude && provider != account.ProviderQwenToken {
+	if provider != account.ProviderCodex && provider != account.ProviderClaude &&
+		provider != account.ProviderQwenToken && provider != account.ProviderQwenAnthropic {
 		return Lease{}, errors.New("cmux.com returned an invalid lease provider")
 	}
 	authMode := account.AuthMode(raw.AuthMode)

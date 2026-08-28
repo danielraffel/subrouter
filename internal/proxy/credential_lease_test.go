@@ -149,7 +149,7 @@ func TestTenantCredentialLeaseReturnsAccessOnlyRefreshedCredential(t *testing.T)
 	}
 }
 
-func TestTenantCredentialLeaseCanonicalizesQwenAnthropicToTokenPlanAccount(t *testing.T) {
+func TestTenantCredentialLeaseUsesTokenPlanAccountWithoutLosingQwenAnthropicTransport(t *testing.T) {
 	server := Server{
 		Accounts: []accounts.Account{{
 			ID: "qwen-token:work", Provider: accounts.ProviderQwenToken,
@@ -190,7 +190,7 @@ func TestTenantCredentialLeaseCanonicalizesQwenAnthropicToTokenPlanAccount(t *te
 		t.Fatal(err)
 	}
 	if envelope.Lease.AccountID != "qwen-token:work" ||
-		envelope.Lease.Provider != string(accounts.ProviderQwenToken) ||
+		envelope.Lease.Provider != string(accounts.ProviderQwenAnthropic) ||
 		envelope.Lease.AuthMode != string(accounts.AuthModeAPIKey) ||
 		envelope.Lease.Token != "leased-token-plan-key" {
 		t.Fatalf("Qwen lease = %+v", envelope.Lease)
