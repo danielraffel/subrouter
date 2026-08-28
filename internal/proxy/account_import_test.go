@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -641,6 +643,45 @@ func TestAccountImportBoundsAndStrictlyParsesCredentialBodies(t *testing.T) {
 			t.Fatalf("status = %d, want %d, body = %s", resp.Code, http.StatusRequestEntityTooLarge, resp.Body.String())
 		}
 	})
+}
+
+func TestTenantOAuthImportChecksCapacityBeforeRotatingCredential(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	for i := 0; i < maxAccountImportAccounts; i++ {
+		account := accounts.StoredCodexAccount{
+			Email: fmt.Sprintf("apikey:existing-%03d", i), Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-existing"},
+		}
+		if err := store.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var refreshCalls atomic.Int32
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		refreshCalls.Add(1)
+		return nil, errors.New("refresh must not be called")
+	})}
+	ref := NewAccountRef(store, nil, client)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	server := Server{AccountRef: ref, tenantAccountImportAuthorized: true}
+	token := proxyTestCodexJWT("new@example.com", "new", time.Now().Add(time.Hour))
+	_, err := server.installImportedAccount(context.Background(), accountImportRequest{
+		Provider: accounts.ProviderCodex,
+		Codex: &accounts.StoredCodexAccount{
+			Email: "new@example.com", Provider: accounts.ProviderCodex,
+			OAuthCredentialOrigin: accounts.CodexOAuthOriginInteractiveImport,
+			Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+				AccessToken: token, RefreshToken: "caller-refresh", IDToken: token,
+			}},
+		},
+	})
+	var capacityErr *accountImportCapacityError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("import error = %v, want capacity error", err)
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("refresh calls = %d, want 0 before capacity rejection", refreshCalls.Load())
+	}
 }
 
 func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing.T) {

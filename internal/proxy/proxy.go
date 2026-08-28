@@ -798,6 +798,8 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	claudeProfiles := r.claudeStore.ListProfiles()
 	claudeOffset := len(storedAccounts)
 	out := make([]AccountUsageStatus, claudeOffset+len(claudeProfiles))
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
+	defer cancelSweep()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, accountFetchConcurrency)
 	for i, stored := range storedAccounts {
@@ -835,13 +837,18 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}
 		out[i] = status
 		wg.Add(1)
-		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }()
-			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
-			defer cancel()
-			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "usage-status.if-expired")
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-sweepCtx.Done():
+				next := out[i]
+				next.Error = sweepCtx.Err().Error()
+				out[i] = next
+				return
+			}
+			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "usage-status.if-expired")
 			refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
 			r.noteCredResult(credential, refreshErr)
 			next := out[i]
@@ -860,7 +867,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			r.replace(account)
-			details, err := accounts.FetchCodexUsageDetails(fetchCtx, r.client, account)
+			details, err := accounts.FetchCodexUsageDetails(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -903,13 +910,18 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}
 		out[i] = status
 		wg.Add(1)
-		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }()
-			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
-			defer cancel()
-			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(fetchCtx, r.client, profile)
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-sweepCtx.Done():
+				next := out[i]
+				next.Error = sweepCtx.Err().Error()
+				out[i] = next
+				return
+			}
+			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(sweepCtx, r.client, profile)
 			r.noteCredResult(credential, err)
 			next := out[i]
 			next.Refreshed = didRefresh
@@ -921,7 +933,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			}
 			next.AuthValid = true
 			r.replace(account)
-			windows, fresh, err := r.FetchUsageWindowsCached(fetchCtx, r.client, account)
+			windows, fresh, err := r.FetchUsageWindowsCached(sweepCtx, r.client, account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -1596,18 +1608,6 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 }
 
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
-	if s.tenantAccountImportAuthorized && input.Provider == accounts.ProviderCodex &&
-		input.Codex != nil && !input.Codex.IsAPIKey() {
-		account, validationErr := validateStoredAccountImportOrigin(input.Provider, *input.Codex, false)
-		if validationErr != nil {
-			return "", validationErr
-		}
-		account, validationErr = attestTenantCodexOAuth(ctx, s.AccountRef.client, account)
-		if validationErr != nil {
-			return "", validationErr
-		}
-		input.Codex = &account
-	}
 	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
 		return "", err
 	}
@@ -1628,7 +1628,9 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		if input.Codex == nil || input.Claude != nil {
 			return "", invalidAccountImport("exactly one matching account payload is required")
 		}
-		account, err := validateStoredAccountImport(input.Provider, *input.Codex)
+		untrustedTenantOAuth := s.tenantAccountImportAuthorized &&
+			input.Provider == accounts.ProviderCodex && !input.Codex.IsAPIKey()
+		account, err := validateStoredAccountImportOrigin(input.Provider, *input.Codex, !untrustedTenantOAuth)
 		if err != nil {
 			return "", err
 		}
@@ -1637,6 +1639,16 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			return "", err
 		}
 		account.Email = canonicalID
+		if untrustedTenantOAuth {
+			account, err = attestTenantCodexOAuth(ctx, s.AccountRef.client, account)
+			if err != nil {
+				return "", err
+			}
+			account, err = validateStoredAccountImport(input.Provider, account)
+			if err != nil {
+				return "", err
+			}
+		}
 		if err := s.AccountRef.store.SaveStored(account); err != nil {
 			return "", err
 		}
@@ -2204,6 +2216,8 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	if client == nil {
 		client = &http.Client{Timeout: defaultUsageFetchTimeout}
 	}
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, usageStatusFetchTimeout)
+	defer cancelSweep()
 	// Score each account in parallel and bound each refresh/usage pair. A dead
 	// account must not make every other account wait for its network timeout.
 	scored := 0
@@ -2224,13 +2238,15 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			continue
 		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(account accounts.Account) {
 			defer wg.Done()
-			defer func() { <-sem }()
-			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
-			defer cancel()
-			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "proxy.score-accounts")
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-sweepCtx.Done():
+				return
+			}
+			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "proxy.score-accounts")
 			refreshed, err := s.refreshAccount(refreshCtx, account)
 			s.AccountRef.noteCredResult(account, err)
 			if err != nil {
@@ -2246,7 +2262,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				}
 				return
 			}
-			windows, fresh, err := s.fetchAccountUsageWindows(fetchCtx, client, refreshed)
+			windows, fresh, err := s.fetchAccountUsageWindows(sweepCtx, client, refreshed)
 			if err != nil {
 				if s.Logger != nil {
 					s.Logger.Warn("account reload usage fetch failed", "account", account.ID, "error", err)
