@@ -84,10 +84,12 @@ func TestConfigureRejectsShadowingAnExistingProvider(t *testing.T) {
 		declared OpenAICompatibleProvider
 	}{
 		{name: "reserved provider name", declared: OpenAICompatibleProvider{Name: "claude", BaseURL: "https://x.test/v1"}},
+		{name: "legacy API-key namespace", declared: OpenAICompatibleProvider{Name: "apikey", BaseURL: "https://x.test/v1"}},
 		{name: "reserved path segment", declared: OpenAICompatibleProvider{Name: "v1", BaseURL: "https://x.test/v1"}},
 		{name: "built-in name", declared: OpenAICompatibleProvider{Name: "kimi", BaseURL: "https://x.test/v1"}},
 		{name: "built-in alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"glm"}, BaseURL: "https://x.test/v1"}},
 		{name: "reserved alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"anthropic"}, BaseURL: "https://x.test/v1"}},
+		{name: "legacy API-key alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"apikey"}, BaseURL: "https://x.test/v1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -107,6 +109,8 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 		{name: "no name", declared: OpenAICompatibleProvider{BaseURL: "https://x.test/v1"}},
 		{name: "no base url", declared: OpenAICompatibleProvider{Name: "thing"}},
 		{name: "name with a slash", declared: OpenAICompatibleProvider{Name: "a/b", BaseURL: "https://x.test/v1"}},
+		{name: "alias with a slash", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a/b"}, BaseURL: "https://x.test/v1"}},
+		{name: "alias with whitespace", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a b"}, BaseURL: "https://x.test/v1"}},
 		{name: "non-http scheme", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "ftp://x.test/v1"}},
 		{name: "no host", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "https:///v1"}},
 	}
@@ -122,6 +126,17 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 		{Name: "dupe", BaseURL: "https://b.test/v1"},
 	}); err == nil {
 		t.Fatal("two declarations of the same name should have been rejected")
+	}
+}
+
+func TestValidDeclaredProviderNameRejectsStorageAndRoutingNamespaces(t *testing.T) {
+	for _, value := range []string{"apikey", "codex", "anthropic", "qwen", "a/b", "a b"} {
+		if ValidDeclaredProviderName(value) {
+			t.Fatalf("ValidDeclaredProviderName(%q) = true, want false", value)
+		}
+	}
+	if !ValidDeclaredProviderName("acme-relay") {
+		t.Fatal("a non-reserved provider identifier should be valid")
 	}
 }
 

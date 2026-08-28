@@ -432,15 +432,13 @@ func ProviderMetering(provider accounts.Provider) string {
 	return entry.Metering
 }
 
-// ProviderHealthURL returns the URL that proves a key still works, or "" when
-// the provider offers no such endpoint.
+// ProviderHealthURL returns the URL that proves a key still works. The caller
+// must supply the actual configured upstream: silently falling back to a vendor
+// default can disclose a gateway-specific credential to an unrelated host.
 func ProviderHealthURL(provider accounts.Provider, upstream string) string {
 	entry, ok := keyedProviderFor(provider)
-	if !ok || entry.HealthPath == "" {
+	if !ok || entry.HealthPath == "" || strings.TrimSpace(upstream) == "" {
 		return ""
-	}
-	if upstream == "" {
-		upstream = entry.DefaultUpstream
 	}
 	return strings.TrimRight(upstream, "/") + entry.HealthPath
 }

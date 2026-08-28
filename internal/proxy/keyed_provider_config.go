@@ -39,7 +39,8 @@ var (
 // providers already route on. A configured provider claiming one would shadow
 // Codex or Claude, so it is rejected rather than silently accepted.
 var reservedProviderNames = map[string]bool{
-	"codex": true, "openai": true, "openai-codex": true,
+	"apikey": true,
+	"codex":  true, "openai": true, "openai-codex": true,
 	"claude": true, "anthropic": true,
 	"gemini": true,
 	"v1":     true, "backend-api": true, "messages": true, "responses": true,
@@ -62,7 +63,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 		if name == "" {
 			return fmt.Errorf("openai-compatible provider needs a name")
 		}
-		if strings.ContainsAny(name, "/ \t") {
+		if !validDeclaredProviderIdentifier(name) {
 			return fmt.Errorf("openai-compatible provider name %q cannot contain a slash or whitespace", item.Name)
 		}
 		base, err := parseProviderBaseURL(item.BaseURL, name)
@@ -71,6 +72,9 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 		}
 		names := append([]string{name}, normalizeAliases(item.Aliases)...)
 		for _, candidate := range names {
+			if !validDeclaredProviderIdentifier(candidate) {
+				return fmt.Errorf("openai-compatible provider %q has invalid alias %q: aliases cannot contain a slash or whitespace", item.Name, candidate)
+			}
 			if reservedProviderNames[candidate] {
 				return fmt.Errorf("openai-compatible provider %q claims the reserved name %q", item.Name, candidate)
 			}
@@ -129,8 +133,12 @@ func builtinClaimsName(candidate string) bool {
 // server still rejects imports for names it did not declare.
 func ValidDeclaredProviderName(raw string) bool {
 	name := strings.ToLower(strings.TrimSpace(raw))
-	return name != "" && !strings.ContainsAny(name, "/ \t") &&
+	return validDeclaredProviderIdentifier(name) &&
 		!reservedProviderNames[name] && !builtinClaimsName(name)
+}
+
+func validDeclaredProviderIdentifier(name string) bool {
+	return name != "" && !strings.ContainsAny(name, "/ \t")
 }
 
 func parseProviderBaseURL(raw, name string) (*url.URL, error) {

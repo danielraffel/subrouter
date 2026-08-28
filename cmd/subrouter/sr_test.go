@@ -1626,6 +1626,19 @@ func TestKeyedProviderSectionUsesItsOwnColumns(t *testing.T) {
 	if codexKeys["Endpoints"] || codexKeys["Quota"] {
 		t.Fatal("codex section must not gain the keyed-provider columns")
 	}
+
+	// A standalone sr process does not have serve's declared registry, but the
+	// stored provider still identifies this as an API-key section. It must not
+	// fall back to Codex quota and switch columns merely because metering is
+	// unknown locally.
+	custom := usageGridColumns(&out, false, accounts.Provider("acme-relay"))
+	customKeys := map[string]bool{}
+	for _, column := range custom {
+		customKeys[column.Key] = true
+	}
+	if !customKeys["Endpoints"] || !customKeys["Quota"] || customKeys["5h"] || customKeys["7d"] {
+		t.Fatalf("declared-provider columns = %v, want keyed-provider layout", customKeys)
+	}
 }
 
 // One subscription reachable over two protocols must read as one account
@@ -1674,6 +1687,12 @@ func TestProbeProviderKeyClassifiesTheResponse(t *testing.T) {
 	}
 	if state := usageGridState(srUsageRow{providerHealth: "bad key"}); state != "bad key" {
 		t.Fatalf("a keyed provider's state should come from its probe, got %q", state)
+	}
+	if state := usageGridState(srUsageRow{providerHealth: "not checked"}); state != "not checked" {
+		t.Fatalf("an unprobed provider should be explicit, got %q", state)
+	}
+	if color := usageGridStateColor(srUsageRow{providerHealth: "not checked"}); color != "" {
+		t.Fatalf("an unprobed key is not known-bad and should not be red, got %q", color)
 	}
 	// A row with no probe result falls back to the scheduler's state.
 	if state := usageGridState(srUsageRow{active: true}); state != "active" {

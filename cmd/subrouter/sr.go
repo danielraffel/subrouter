@@ -157,8 +157,10 @@ type srSwitchOptions struct {
 }
 
 type srUsageRow struct {
-	// providerHealth is the result of probing the vendor with this key; empty
-	// when the provider offers no endpoint to probe.
+	// providerHealth is the key's validation state. Local status deliberately
+	// reports "not checked" when it does not know the daemon's configured
+	// upstream; it must not send a possibly gateway-specific key to a vendor
+	// default merely to populate this field.
 	providerHealth string
 	// providerModels counts the models the key is entitled to, from that same
 	// probe. Negative means unknown.
@@ -1011,21 +1013,15 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
 			rows[i].planType = apiKeyPlanLabel(rowProvider)
 			rows[i].providerModels = -1
-			// These vendors publish no quota API, so the only live signals are
-			// whether the key still works and what it may reach. Probe
-			// concurrently with the rest of the row work so status stays fast,
-			// and treat a failure as information rather than an error.
+			// The standalone status process does not know whether serve overrides
+			// this provider to a gateway. Sending a gateway key to the built-in
+			// vendor default would disclose it, so validation must remain explicit
+			// until it can run through the configured daemon upstream.
+			if isKeyedProviderSection(rowProvider) {
+				rows[i].providerHealth = "not checked"
+			}
 			if metering := proxy.ProviderMetering(rowProvider); metering != "" {
 				rows[i].planType = metering
-				wg.Add(1)
-				go func(idx int, provider accounts.Provider, token string) {
-					defer wg.Done()
-					probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-					defer cancel()
-					state, models := probeProviderKey(probeCtx, nil, provider, "", token)
-					rows[idx].providerHealth = state
-					rows[idx].providerModels = models
-				}(i, rowProvider, account.Auth.OpenAIAPIKey)
 			}
 			rows[i].apiKeyHint = r.apiKeyHint(account, admins)
 			if admin, ok, err := r.store.PickAdminKeyFor(account); err == nil && ok {
@@ -2099,9 +2095,9 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 	} else if isKeyedProviderSection(provider) {
 		// These vendors publish no quota or reset API, so the Codex windows and
 		// the scheduler's "Use" advice would always be empty or misleading.
-		// Show what is actually knowable instead: how the plan is metered,
-		// whether the key still works, what it can reach, and an explicit note
-		// that quota is not exposed. Plan is widened because a metering
+		// Show what is actually knowable instead: how the plan is metered, the
+		// validation state, what it can reach, and an explicit note that quota is
+		// not exposed. Plan is widened because a metering
 		// description is a phrase, not a tier name.
 		columns = dropUsageGridColumn(columns, "Pick")
 		setUsageGridColumnWidth(columns, "Plan", 24)
@@ -2309,7 +2305,7 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
-	case row.providerHealth != "" && row.providerHealth != "ok":
+	case row.providerHealth != "" && row.providerHealth != "ok" && row.providerHealth != "not checked":
 		return ansiRed
 	case row.err != nil || row.cooked:
 		return ansiRed
@@ -2883,10 +2879,12 @@ func apiKeyPlanLabel(provider accounts.Provider) string {
 	return string(provider) + " key"
 }
 
-// isKeyedProviderSection reports whether a status section belongs to an
-// API-key provider that the registry routes.
+// isKeyedProviderSection reports whether a status section belongs to a
+// non-Codex/Claude API-key provider. Operator-declared providers are not in the
+// standalone status process's registry, so their stored provider identity is
+// the authoritative signal here.
 func isKeyedProviderSection(provider accounts.Provider) bool {
-	return proxy.ProviderMetering(provider) != ""
+	return provider != "" && provider != accounts.ProviderCodex && provider != accounts.ProviderClaude
 }
 
 // usageGridModels renders the entitled model count from the health probe.
@@ -2897,10 +2895,10 @@ func usageGridModels(row srUsageRow) string {
 	return strconv.Itoa(row.providerModels)
 }
 
-// probeProviderKey asks the vendor whether this key still works and how many
-// models it may use. These vendors expose no quota API, so key validity and
-// entitlement are the only live signals available. A provider with no health
-// endpoint, or an unreachable one, reports what happened rather than guessing.
+// probeProviderKey asks the explicitly configured upstream whether this key
+// works and how many models it may use. An unknown upstream deliberately
+// reports no result rather than sending a possibly gateway-specific secret to
+// a vendor default.
 func probeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, upstream, token string) (state string, models int) {
 	url := proxy.ProviderHealthURL(provider, upstream)
 	if url == "" {

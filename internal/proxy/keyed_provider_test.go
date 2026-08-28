@@ -130,6 +130,15 @@ func TestAPIKeyProviderListNamesEveryProvider(t *testing.T) {
 	}
 }
 
+func TestProviderHealthURLRequiresTheConfiguredUpstream(t *testing.T) {
+	if got := ProviderHealthURL(accounts.ProviderQwenToken, ""); got != "" {
+		t.Fatalf("unknown configured upstream produced health URL %q; this could disclose a gateway key", got)
+	}
+	if got := ProviderHealthURL(accounts.ProviderQwenToken, "https://gateway.example/v1"); got != "https://gateway.example/v1/models" {
+		t.Fatalf("configured gateway health URL = %q", got)
+	}
+}
+
 func TestApplyKeyedProviderAuthPresentsTheKeyPerStyle(t *testing.T) {
 	account := accounts.Account{Provider: accounts.ProviderZAI, AuthMode: accounts.AuthModeAPIKey, Token: "key"}
 

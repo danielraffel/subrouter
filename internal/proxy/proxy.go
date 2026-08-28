@@ -4593,6 +4593,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
 			if s.reuseStickyAssignment(agentType, sessionID, account, scheduler) {
 				s.logStickyReuse(agentType, sessionID, account, scheduler)
+				if _, _, err := s.Sessions.Touch(agentType, sessionID); err != nil {
+					return accounts.Account{}, sessionID, userEmail, err
+				}
 				return account, sessionID, userEmail, nil
 			}
 			candidate, pickErr := scheduler.Pick(availableAccounts)
@@ -4606,6 +4609,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 						"active", s.activeSession(agentType, sessionID),
 						"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 					)
+				}
+				if _, _, err := s.Sessions.Touch(agentType, sessionID); err != nil {
+					return accounts.Account{}, sessionID, userEmail, err
 				}
 				return account, sessionID, userEmail, nil
 			}

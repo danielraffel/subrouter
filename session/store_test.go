@@ -126,6 +126,59 @@ func TestNewStoreExpiresStaleUserEmailWithoutDroppingAssignment(t *testing.T) {
 	}
 }
 
+func TestTouchRefreshesActiveAssignmentRetentionTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	stale := time.Now().UTC().Add(-2 * sessionActivityWriteInterval)
+	assignment := Assignment{
+		AgentType: "codex", SessionID: "session-1", AccountID: "account-a",
+		UserEmail: "alice@example.com", CreatedAt: stale, UpdatedAt: stale,
+	}
+	body, err := json.Marshal(map[string]Assignment{ScopedSessionKey("codex", "session-1"): assignment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	touched, ok, err := store.Touch("codex", "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("existing assignment was not touched")
+	}
+	if !touched.UpdatedAt.After(stale) {
+		t.Fatalf("updated_at = %s, want after %s", touched.UpdatedAt, stale)
+	}
+	if touched.UserEmail != "alice@example.com" {
+		t.Fatalf("touch changed user email to %q", touched.UserEmail)
+	}
+
+	reloaded, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, ok := reloaded.Get("codex", "session-1")
+	if !ok || !persisted.UpdatedAt.Equal(touched.UpdatedAt) {
+		t.Fatalf("persisted touch = %+v, ok=%t; want updated_at %s", persisted, ok, touched.UpdatedAt)
+	}
+}
+
+func TestTouchMissingAssignmentIsANoop(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.Touch("codex", "missing"); err != nil || ok {
+		t.Fatalf("Touch missing assignment ok=%t err=%v, want false, nil", ok, err)
+	}
+}
+
 func TestDeleteRemovesScopedAssignment(t *testing.T) {
 	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {

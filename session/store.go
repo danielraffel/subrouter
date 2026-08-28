@@ -21,6 +21,10 @@ const MaxRetainedAssignments = 512
 // retained so a resumed session still reaches the same account.
 const UserEmailRetention = 30 * 24 * time.Hour
 
+// sessionActivityWriteInterval keeps active-session retention accurate without
+// rewriting the shared store for every proxied request.
+const sessionActivityWriteInterval = 24 * time.Hour
+
 type Assignment struct {
 	AgentType string    `json:"agent_type"`
 	SessionID string    `json:"session_id"`
@@ -93,6 +97,38 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 	s.data[key] = assignment
 	s.pruneLocked()
 	return assignment, s.saveLocked()
+}
+
+// Touch records recent use of an existing sticky assignment. Updates are
+// coalesced because this path runs for ordinary requests and the store may be
+// shared by several processes.
+func (s *Store) Touch(agentType, sessionID string) (Assignment, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return Assignment{}, false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return Assignment{}, false, err
+	}
+
+	key := ScopedSessionKey(agentType, sessionID)
+	assignment, ok := s.data[key]
+	if !ok {
+		return Assignment{}, false, nil
+	}
+	now := time.Now().UTC()
+	if now.Sub(assignment.UpdatedAt) < sessionActivityWriteInterval {
+		return assignment, true, nil
+	}
+	assignment.UpdatedAt = now
+	s.data[key] = assignment
+	if err := s.saveLocked(); err != nil {
+		return Assignment{}, false, err
+	}
+	return assignment, true, nil
 }
 
 // Delete removes one scoped sticky assignment and its self-reported identity
