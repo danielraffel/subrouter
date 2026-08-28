@@ -64,7 +64,7 @@ func TestScoreAccountsSkipsKnownDeadCredentialWithoutNetwork(t *testing.T) {
 	ref := cacheTestAccountRef(t, transport)
 	account := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
 
-	ref.noteCredResult(account.Provider, account.ID, errors.New(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`))
+	ref.noteCredResult(account, errors.New(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`))
 
 	server := Server{
 		AccountRef: ref,
@@ -92,21 +92,21 @@ func TestScoreAccountsSkipsKnownDeadCredentialWithoutNetwork(t *testing.T) {
 // the fast-fail TTL, so any non-terminal result clears the remembered failure.
 func TestNoteCredResultClearsRememberedFailure(t *testing.T) {
 	ref := &AccountRef{}
-	provider, id := accounts.ProviderClaude, "claude@example.com"
+	account := accounts.Account{Provider: accounts.ProviderClaude, ID: "claude@example.com", Token: "credential"}
 
-	ref.noteCredResult(provider, id, errors.New("invalid_grant"))
-	if _, dead := ref.terminalCredFailure(provider, id); !dead {
+	ref.noteCredResult(account, errors.New("invalid_grant"))
+	if _, dead := ref.terminalCredFailure(account); !dead {
 		t.Fatal("terminal credential error was not remembered")
 	}
 
-	ref.noteCredResult(provider, id, nil)
-	if _, dead := ref.terminalCredFailure(provider, id); dead {
+	ref.noteCredResult(account, nil)
+	if _, dead := ref.terminalCredFailure(account); dead {
 		t.Fatal("a successful refresh must clear the remembered failure")
 	}
 
 	// A transient error is not a credential verdict and must not re-arm it.
-	ref.noteCredResult(provider, id, context.DeadlineExceeded)
-	if _, dead := ref.terminalCredFailure(provider, id); dead {
+	ref.noteCredResult(account, context.DeadlineExceeded)
+	if _, dead := ref.terminalCredFailure(account); dead {
 		t.Fatal("a timeout must not be treated as a dead credential")
 	}
 }

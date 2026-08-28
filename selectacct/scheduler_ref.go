@@ -1,6 +1,8 @@
 package selectacct
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,13 @@ type SchedulerRef struct {
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
+	// credentialExhaustedUntil is separate from quota/model evidence and is
+	// scoped to the account snapshot generation that observed the bad token.
+	// Replacing credentials advances the generation, immediately discarding the
+	// old token's exclusion while rejecting late reports from in-flight work.
+	credentialExhaustedUntil map[string]time.Time
+	credentialFingerprints   map[string]string
+	credentialRevision       uint64
 	// incompatibleUntil records account/model exclusions learned from upstream
 	// entitlement errors. Usage refreshes cannot supersede these marks because
 	// quota headroom says nothing about whether an account supports a model.
@@ -49,6 +58,7 @@ func (r *SchedulerRef) Get() Scheduler {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
 }
 
@@ -76,6 +86,14 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		}
 	}
 	if !anyExpired {
+		for _, until := range r.credentialExhaustedUntil {
+			if !until.After(now) {
+				anyExpired = true
+				break
+			}
+		}
+	}
+	if !anyExpired {
 		for _, until := range r.incompatibleUntil {
 			if !until.After(now) {
 				anyExpired = true
@@ -94,6 +112,11 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 			continue
 		}
 		delete(r.exhaustedUntil, key)
+	}
+	for key, until := range r.credentialExhaustedUntil {
+		if !until.After(now) {
+			delete(r.credentialExhaustedUntil, key)
+		}
 	}
 	for key, until := range r.incompatibleUntil {
 		if until.After(now) {
@@ -130,6 +153,55 @@ func (r *SchedulerRef) AdvanceAccountGeneration(generation uint64) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.advanceAccountGenerationLocked(generation)
+}
+
+// AdvanceAccountGenerationWithAccounts advances the snapshot and publishes
+// the credential identity currently attached to each routing account. Existing
+// exclusions remain effective for unchanged tokens; repaired tokens do not
+// inherit them.
+func (r *SchedulerRef) AdvanceAccountGenerationWithAccounts(generation, credentialRevision uint64, accounts []account.Account) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation == r.accountGeneration && credentialRevision <= r.credentialRevision && r.credentialFingerprints != nil {
+		return
+	}
+	r.advanceAccountGenerationLocked(generation)
+	r.credentialRevision = credentialRevision
+	r.credentialFingerprints = make(map[string]string, len(accounts))
+	for _, candidate := range accounts {
+		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+	}
+}
+
+// SyncAccountCredentials publishes token rotations that occur within an
+// account generation (for example, a successful OAuth refresh). It does not
+// invalidate score work; it only changes which credential-scoped exclusions
+// apply to the current snapshot.
+func (r *SchedulerRef) SyncAccountCredentials(generation, credentialRevision uint64, accounts []account.Account) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration || credentialRevision < r.credentialRevision {
+		return false
+	}
+	if credentialRevision == r.credentialRevision && r.credentialFingerprints != nil {
+		return true
+	}
+	r.credentialRevision = credentialRevision
+	r.credentialFingerprints = make(map[string]string, len(accounts))
+	for _, candidate := range accounts {
+		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+	}
+	return true
+}
+
+func (r *SchedulerRef) advanceAccountGenerationLocked(generation uint64) {
 	if generation == r.accountGeneration {
 		return
 	}
@@ -238,6 +310,62 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, 
 	r.updatedAt = time.Now()
 }
 
+// MarkCredentialExhaustedUntil records a terminal credential failure only if
+// it was observed against the current account snapshot. Unlike quota marks,
+// credential exclusions are discarded when credentials are reloaded.
+func (r *SchedulerRef) MarkCredentialExhaustedUntil(
+	provider account.Provider,
+	accountID string,
+	credentialIdentity string,
+	until time.Time,
+	accountGeneration uint64,
+) bool {
+	if r == nil || accountID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fingerprint := credentialFingerprint(credentialIdentity)
+	scoreKey := ScoreKey(provider, accountID)
+	if accountGeneration != r.accountGeneration {
+		return false
+	}
+	if r.credentialFingerprints == nil {
+		r.credentialFingerprints = make(map[string]string)
+	}
+	if current, tracked := r.credentialFingerprints[scoreKey]; tracked && current != fingerprint {
+		return false
+	}
+	r.credentialFingerprints[scoreKey] = fingerprint
+	if r.credentialExhaustedUntil == nil {
+		r.credentialExhaustedUntil = make(map[string]time.Time)
+	}
+	r.credentialExhaustedUntil[scoreKey+"\x00"+fingerprint] = until
+	r.updatedAt = time.Now()
+	return true
+}
+
+func credentialFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func (r *SchedulerRef) activeCredentialExhaustionLocked() map[string]time.Time {
+	active := make(map[string]time.Time)
+	for key, until := range r.credentialExhaustedUntil {
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		scoreKey := ScoreKey(account.Provider(parts[0]), parts[1])
+		if current, tracked := r.credentialFingerprints[scoreKey]; tracked && current != parts[2] {
+			continue
+		}
+		active[poolScopedExhaustionKey(account.Provider(parts[0]), parts[1], "")] = until
+	}
+	return active
+}
+
 // MarkModelIncompatibleUntil excludes one account from one model until the
 // supplied expiry. Unlike quota exhaustion, usage-score refreshes cannot clear
 // this mark because they do not carry entitlement evidence.
@@ -263,7 +391,11 @@ func (r *SchedulerRef) MarkModelIncompatible(provider account.Provider, accountI
 func (r *SchedulerRef) ExhaustedUntilFor(provider account.Provider, accountID, poolKey string) (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	until, ok := r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)]
+	key := poolScopedExhaustionKey(provider, accountID, poolKey)
+	until, ok := r.exhaustedUntil[key]
+	if credentialUntil, credentialOK := r.activeCredentialExhaustionLocked()[key]; credentialOK && (!ok || credentialUntil.After(until)) {
+		until, ok = credentialUntil, true
+	}
 	return until, ok
 }
 
@@ -280,6 +412,11 @@ func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
 		marks[key] = until
 	}
 	for key, until := range r.incompatibleUntil {
+		if until.After(marks[key]) {
+			marks[key] = until
+		}
+	}
+	for key, until := range r.activeCredentialExhaustionLocked() {
 		if until.After(marks[key]) {
 			marks[key] = until
 		}

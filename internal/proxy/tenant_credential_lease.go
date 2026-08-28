@@ -35,6 +35,7 @@ type tenantCredentialLease struct {
 	provider             accounts.Provider
 	authMode             accounts.AuthMode
 	credentialGeneration int
+	credentialIdentity   string
 	model                string
 	expiresAt            time.Time
 }
@@ -120,7 +121,8 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	}
 	lease := tenantCredentialLease{
 		accountID: account.ID, provider: provider, authMode: account.AuthMode,
-		credentialGeneration: generation, model: input.Model, expiresAt: expiresAt,
+		credentialGeneration: generation,
+		credentialIdentity:   account.CredentialIdentity(), model: input.Model, expiresAt: expiresAt,
 	}
 	s.put(leaseID, lease, issuedAt)
 	writeJSON(w, map[string]any{
@@ -213,11 +215,11 @@ func selectTenantCredentialLeaseAccount(
 		tried[account.ID] = struct{}{}
 		refreshed, err := server.refreshAccount(ctx, account)
 		if err != nil {
-			server.markAccountExhaustedRefreshFailure(provider, account.ID, "", err)
+			server.markAccountExhaustedRefreshFailure(account, err)
 			continue
 		}
 		if strings.TrimSpace(refreshed.Token) == "" {
-			server.markAccountExhaustedCredential(provider, account.ID, "")
+			server.markAccountExhaustedCredentialForAccount(account)
 			continue
 		}
 		if server.Sessions != nil {
@@ -285,8 +287,16 @@ func applyTenantCredentialLeaseReport(
 		return
 	}
 	switch report.Outcome {
-	case broker.LeaseUnauthorized, broker.LeaseForbidden:
-		server.markAccountExhaustedCredential(lease.provider, lease.accountID, "")
+	case broker.LeaseUnauthorized:
+		account := accounts.Account{
+			ID: lease.accountID, Provider: lease.provider,
+			CredentialVersion: lease.credentialIdentity,
+		}
+		server.markAccountExhaustedCredentialForAccount(account)
+	case broker.LeaseForbidden:
+		server.SchedulerRef.MarkExhaustedUntil(
+			lease.provider, lease.accountID, "", time.Now().Add(credentialExhaustionTTL),
+		)
 	case broker.LeaseRateLimited:
 		poolKey := ""
 		if report.Scope == broker.LeaseCooldownQuota {

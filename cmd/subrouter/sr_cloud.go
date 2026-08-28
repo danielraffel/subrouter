@@ -899,7 +899,10 @@ func (r srRunner) cloudAccountAdd(
 			}
 			deviceAuth = true
 		}
-		return r.hostedCodexAdd(ctx, client, deviceAuth)
+		if err := r.hostedCodexAdd(ctx, client, deviceAuth); err != nil {
+			return err
+		}
+		return restartInstalledDaemon()
 	}
 	if args[0] == "anthropic-key" {
 		reader := bufio.NewReader(r.in)

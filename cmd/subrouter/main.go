@@ -525,6 +525,7 @@ func serve(args []string) error {
 	claudeStore := agentclaude.DefaultStore()
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
+	var credentialRevision uint64
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
 		accountRef, err = proxy.OpenAccountRef(codexStore, claudeStore, &http.Client{
@@ -534,8 +535,9 @@ func serve(args []string) error {
 		if err != nil {
 			return err
 		}
-		initialAccounts, generation := accountRef.Snapshot()
+		initialAccounts, generation, revision := accountRef.CredentialSnapshot()
 		accountGeneration = generation
+		credentialRevision = revision
 		for _, account := range initialAccounts {
 			if account.Provider == accounts.ProviderClaude {
 				claudeAccounts = append(claudeAccounts, account)
@@ -551,7 +553,8 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
-	schedulerRef.AdvanceAccountGeneration(accountGeneration)
+	allInitialAccounts := append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...)
+	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, allInitialAccounts)
 	if *fetchUsage && credentialBroker == nil {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)

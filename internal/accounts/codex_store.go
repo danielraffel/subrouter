@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	accountpkg "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
@@ -250,6 +251,9 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 
 	out.AuthMode = AuthModeOAuth
 	out.Token = a.Auth.Tokens.AccessToken
+	out.CredentialVersion = accountpkg.OAuthCredentialVersion(
+		a.Auth.Tokens.AccessToken, a.Auth.Tokens.RefreshToken,
+	)
 	out.AccountID = a.Auth.Tokens.AccountID
 	if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
 		out.Email = strings.TrimSpace(email)

@@ -28,6 +28,7 @@ import (
 	"unicode"
 
 	"github.com/gorilla/websocket"
+	accountpkg "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
@@ -225,14 +226,15 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu                sync.RWMutex
-	installMu         sync.Mutex
-	accounts          []accounts.Account
-	accountGeneration uint64
-	diskGeneration    string
-	store             accounts.CodexStore
-	claudeStore       agentclaude.Store
-	client            *http.Client
+	mu                 sync.RWMutex
+	installMu          sync.Mutex
+	accounts           []accounts.Account
+	accountGeneration  uint64
+	credentialRevision uint64
+	diskGeneration     string
+	store              accounts.CodexStore
+	claudeStore        agentclaude.Store
+	client             *http.Client
 
 	usageStatusMu    sync.Mutex
 	usageStatusCache []AccountUsageStatus
@@ -275,20 +277,20 @@ const usageStatusFetchTimeout = 5 * time.Second
 
 const credFailureTTL = credentialExhaustionTTL
 
-func (r *AccountRef) terminalCredFailure(provider accounts.Provider, id string) (string, bool) {
+func (r *AccountRef) terminalCredFailure(account accounts.Account) (string, bool) {
 	if r == nil {
 		return "", false
 	}
 	r.credFailMu.Lock()
 	defer r.credFailMu.Unlock()
-	failure, ok := r.credFail[credFailureKey(provider, id)]
+	failure, ok := r.credFail[credFailureKey(account)]
 	if !ok || time.Since(failure.at) > credFailureTTL {
 		return "", false
 	}
 	return failure.err, true
 }
 
-func (r *AccountRef) noteCredResult(provider accounts.Provider, id string, err error) {
+func (r *AccountRef) noteCredResult(account accounts.Account, err error) {
 	if r == nil {
 		return
 	}
@@ -297,16 +299,36 @@ func (r *AccountRef) noteCredResult(provider accounts.Provider, id string, err e
 	if r.credFail == nil {
 		r.credFail = make(map[string]credFailure)
 	}
-	key := credFailureKey(provider, id)
+	now := time.Now()
+	for candidate, failure := range r.credFail {
+		if now.Sub(failure.at) > credFailureTTL {
+			delete(r.credFail, candidate)
+		}
+	}
+	key := credFailureKey(account)
 	if isTerminalCredentialError(err) {
-		r.credFail[key] = credFailure{err: err.Error(), at: time.Now()}
+		r.credFail[key] = credFailure{err: err.Error(), at: now}
 		return
 	}
 	delete(r.credFail, key)
 }
 
-func credFailureKey(provider accounts.Provider, id string) string {
-	return string(provider) + "\x00" + id
+func credFailureKey(account accounts.Account) string {
+	fingerprint := sha256.Sum256([]byte(account.CredentialIdentity()))
+	return string(account.Provider) + "\x00" + account.ID + "\x00" + string(fingerprint[:])
+}
+
+func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) accounts.Account {
+	if r != nil {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		for _, candidate := range r.accounts {
+			if sameProvider(candidate.Provider, provider) && candidate.ID == id {
+				return candidate
+			}
+		}
+	}
+	return accounts.Account{ID: id, Provider: provider, AuthMode: accounts.AuthModeOAuth}
 }
 
 // FetchUsageWindowsCached is the single path for reading an account's usage
@@ -501,6 +523,15 @@ func (r *AccountRef) Snapshot() ([]accounts.Account, uint64) {
 	return append([]accounts.Account(nil), r.accounts...), r.accountGeneration
 }
 
+func (r *AccountRef) CredentialSnapshot() ([]accounts.Account, uint64, uint64) {
+	if r == nil {
+		return nil, 0, 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]accounts.Account(nil), r.accounts...), r.accountGeneration, r.credentialRevision
+}
+
 func (r *AccountRef) Generation() uint64 {
 	if r == nil {
 		return 0
@@ -531,6 +562,7 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	defer r.mu.Unlock()
 	r.accounts = append([]accounts.Account(nil), loaded...)
 	r.accountGeneration++
+	r.credentialRevision++
 	r.diskGeneration = diskGeneration
 	return append([]accounts.Account(nil), loaded...), r.accountGeneration, nil
 }
@@ -570,6 +602,9 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	replaced := false
 	for i := range r.accounts {
 		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
+			if r.accounts[i].CredentialIdentity() != next.CredentialIdentity() {
+				r.credentialRevision++
+			}
 			r.accounts[i] = next
 			replaced = true
 			break
@@ -577,6 +612,7 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	}
 	if !replaced {
 		r.accounts = append(r.accounts, next)
+		r.credentialRevision++
 	}
 	return next, nil
 }
@@ -780,7 +816,14 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}
 		status.AuthMode = accounts.AuthModeOAuth
 		status.AuthChecked = true
-		if failure, dead := r.terminalCredFailure(provider, stored.Email); dead {
+		credential := accounts.Account{ID: stored.Email, Provider: provider, AuthMode: accounts.AuthModeOAuth}
+		if stored.Auth.Tokens != nil {
+			credential.Token = stored.Auth.Tokens.AccessToken
+			credential.CredentialVersion = accountpkg.OAuthCredentialVersion(
+				stored.Auth.Tokens.AccessToken, stored.Auth.Tokens.RefreshToken,
+			)
+		}
+		if failure, dead := r.terminalCredFailure(credential); dead {
 			status.AuthValid = false
 			status.Error = failure
 			out[i] = status
@@ -794,7 +837,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			defer cancel()
 			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "usage-status.if-expired")
 			refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
-			r.noteCredResult(provider, stored.Email, refreshErr)
+			r.noteCredResult(credential, refreshErr)
 			next := out[i]
 			next.Refreshed = didRefresh
 			if refreshErr != nil {
@@ -839,7 +882,14 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			},
 			Active: profile.Name == activeClaude,
 		}
-		if failure, dead := r.terminalCredFailure(accounts.ProviderClaude, profile.Name); dead {
+		credential := accounts.Account{ID: profile.Name, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}
+		if current, err := r.claudeStore.ReadCredential(ctx, r.claudeStore.ClaudeConfigDir(profile.Name)); err == nil && current != nil {
+			credential.Token = current.AccessToken
+			credential.CredentialVersion = accountpkg.OAuthCredentialVersion(
+				current.AccessToken, current.RefreshToken,
+			)
+		}
+		if failure, dead := r.terminalCredFailure(credential); dead {
 			status.AuthValid = false
 			status.Error = failure
 			out[i] = status
@@ -852,7 +902,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
 			defer cancel()
 			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(fetchCtx, r.client, profile)
-			r.noteCredResult(accounts.ProviderClaude, profile.Name, err)
+			r.noteCredResult(credential, err)
 			next := out[i]
 			next.Refreshed = didRefresh
 			if err != nil {
@@ -1067,11 +1117,15 @@ func (r *AccountRef) replace(account accounts.Account) {
 	defer r.mu.Unlock()
 	for i := range r.accounts {
 		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
+			if r.accounts[i].CredentialIdentity() != account.CredentialIdentity() {
+				r.credentialRevision++
+			}
 			r.accounts[i] = account
 			return
 		}
 	}
 	r.accounts = append(r.accounts, account)
+	r.credentialRevision++
 }
 
 func (s Server) Handler() http.Handler {
@@ -1242,7 +1296,12 @@ func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	forceRefresh := r.Method == http.MethodPost
 	if s.AccountRef != nil {
-		writeJSON(w, s.AccountRef.Statuses(r.Context(), forceRefresh))
+		statuses := s.AccountRef.Statuses(r.Context(), forceRefresh)
+		if s.SchedulerRef != nil {
+			loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+		}
+		writeJSON(w, statuses)
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -1266,6 +1325,10 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.AccountRef != nil {
 		statuses := s.AccountRef.UsageStatuses(r.Context())
+		if s.SchedulerRef != nil {
+			loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+		}
 		s.updateSchedulerFromUsageStatusesContext(r.Context(), statuses)
 		writeJSON(w, s.withRequestTimeExhaustionWindows(statuses))
 		return
@@ -1603,8 +1666,9 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 	if err != nil {
 		return "", err
 	}
+	loaded, accountGeneration, credentialRevision := s.AccountRef.CredentialSnapshot()
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+		s.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, loaded)
 	}
 	if closeErr := transactionLock.Close(); closeErr != nil {
 		return "", closeErr
@@ -1729,8 +1793,9 @@ func (s Server) reloadAccounts(ctx context.Context) (accountCount int, scoredCou
 		_ = transactionLock.Close()
 		return 0, 0, err
 	}
+	loaded, accountGeneration, credentialRevision := s.AccountRef.CredentialSnapshot()
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+		s.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, loaded)
 	}
 	if err := transactionLock.Close(); err != nil {
 		return 0, 0, err
@@ -2097,7 +2162,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
-		if failure, dead := s.AccountRef.terminalCredFailure(account.Provider, account.ID); dead {
+		if failure, dead := s.AccountRef.terminalCredFailure(account); dead {
 			if s.Logger != nil {
 				s.Logger.Debug("skipping account with known-dead credential", "account", account.ID, "error", failure)
 			}
@@ -2113,7 +2178,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			defer cancel()
 			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "proxy.score-accounts")
 			refreshed, err := s.refreshAccount(refreshCtx, account)
-			s.AccountRef.noteCredResult(account.Provider, account.ID, err)
+			s.AccountRef.noteCredResult(account, err)
 			if err != nil {
 				if s.Logger != nil {
 					s.Logger.Warn("account reload refresh failed", "account", account.ID, "error", err)
@@ -2673,21 +2738,22 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = usageLimitRetryTransport{
-				base:          transport,
-				server:        &s,
-				logger:        s.Logger,
-				provider:      requestProvider,
-				agent:         sessionAgentType,
-				session:       sessionID,
-				userEmail:     userEmail,
-				account:       account.ID,
-				method:        r.Method,
-				path:          proxyRequest.URL.Path,
-				upstream:      upstream.Host,
-				maxAttempts:   s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
-				poolModel:     retryPoolModel,
-				fableFallback: fableFallback,
-				budget:        azureCodexBudget,
+				base:              transport,
+				server:            &s,
+				logger:            s.Logger,
+				provider:          requestProvider,
+				agent:             sessionAgentType,
+				session:           sessionID,
+				userEmail:         userEmail,
+				account:           account.ID,
+				accountCredential: account.CredentialIdentity(),
+				method:            r.Method,
+				path:              proxyRequest.URL.Path,
+				upstream:          upstream.Host,
+				maxAttempts:       s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
+				poolModel:         retryPoolModel,
+				fableFallback:     fableFallback,
+				budget:            azureCodexBudget,
 			}
 		}
 		if retryPost && postReplayable {
@@ -2730,7 +2796,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBody(response, r.Context(), sessionAgentType, sessionID, account.ID, account.Provider, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, account, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			if credentialLease != nil {
 				s.reportCredentialLease(
 					credentialLease.ID,
@@ -3660,19 +3726,32 @@ func (s Server) markAccountExhausted(provider accounts.Provider, accountID, pool
 // failing; failover then burned its attempts on genuinely-cooked accounts and
 // never reached the recovered one.
 func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, accountID, poolKey string, status int, header http.Header) {
+	s.markAccountExhaustedFromResponseForAccount(
+		s.AccountRef.credentialSnapshot(provider, accountID), poolKey, status, header,
+	)
+}
+
+func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Account, poolKey string, status int, header http.Header) {
 	if s.SchedulerRef == nil {
 		return
 	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		// Dead/expired credential (401) or org-level OAuth disablement (403):
-		// not a rate-limit window, no reset header exists, and neither
-		// self-heals on a schedule. A longer TTL avoids probing every few
-		// minutes while still picking the account back up within the hour
-		// after a re-auth or an org re-enable.
-		s.markAccountExhaustedCredential(provider, accountID, "")
+	if status == http.StatusUnauthorized {
+		// A dead/expired credential is repaired by replacing its OAuth chain.
+		s.markAccountExhaustedCredentialForAccount(account)
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+	if status == http.StatusForbidden {
+		// Org-level OAuth disablement is account state, not credential state:
+		// not a rate-limit window, no reset header exists, and neither
+		// self-heals on a schedule. A longer TTL avoids probing every few
+		// minutes while still picking the account back up within the hour after
+		// an org re-enable. Token rotation must not clear this exclusion.
+		s.SchedulerRef.MarkExhaustedUntil(
+			account.Provider, account.ID, "", time.Now().Add(credentialExhaustionTTL),
+		)
+		return
+	}
+	s.SchedulerRef.MarkExhaustedUntil(account.Provider, account.ID, poolKey, claudeExhaustionExpiry(header, time.Now()))
 }
 
 // credentialExhaustionTTL is how long an account with a dead credential
@@ -3683,21 +3762,48 @@ func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, acc
 const credentialExhaustionTTL = time.Hour
 
 func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accountID, poolKey string) {
+	s.markAccountExhaustedCredentialForAccount(s.AccountRef.credentialSnapshot(provider, accountID))
+}
+
+func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Account) {
 	if s.SchedulerRef == nil {
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, "", time.Now().Add(credentialExhaustionTTL))
+	// Legacy/test servers without a reloadable AccountRef have no credential
+	// generation to advance, so retain the historical TTL-backed behavior.
+	if s.AccountRef == nil {
+		s.SchedulerRef.MarkExhaustedUntil(
+			account.Provider, account.ID, "", time.Now().Add(credentialExhaustionTTL),
+		)
+		return
+	}
+	loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+	current := false
+	for _, candidate := range loaded {
+		if sameProvider(candidate.Provider, account.Provider) && candidate.ID == account.ID &&
+			candidate.CredentialIdentity() == account.CredentialIdentity() {
+			current = true
+			break
+		}
+	}
+	if !current {
+		return
+	}
+	s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+	s.SchedulerRef.MarkCredentialExhaustedUntil(
+		account.Provider, account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL), generation,
+	)
 }
 
 // markAccountExhaustedRefreshFailure picks the mark TTL by failure class: a
 // terminal credential error gets the long credential TTL, anything transient
 // gets the short default so the account rejoins quickly.
-func (s Server) markAccountExhaustedRefreshFailure(provider accounts.Provider, accountID, poolKey string, err error) {
+func (s Server) markAccountExhaustedRefreshFailure(account accounts.Account, err error) {
 	if isTerminalCredentialError(err) {
-		s.markAccountExhaustedCredential(provider, accountID, "")
+		s.markAccountExhaustedCredentialForAccount(account)
 		return
 	}
-	s.markAccountExhausted(provider, accountID, "")
+	s.markAccountExhausted(account.Provider, account.ID, "")
 }
 
 // claudeExhaustionExpiry picks when an exhaustion mark should lapse:
@@ -4052,6 +4158,16 @@ func streamCancelAttribution(clientCtx context.Context, err error) (string, erro
 }
 
 func (s Server) captureResponseBody(response *http.Response, clientCtx context.Context, agentType, sessionID, accountID string, provider accounts.Provider, poolModel, compatibilityModel, path string) {
+	s.captureResponseBodyForAccount(
+		response, clientCtx, agentType, sessionID,
+		s.AccountRef.credentialSnapshot(provider, accountID),
+		poolModel, compatibilityModel, path,
+	)
+}
+
+func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx context.Context, agentType, sessionID string, account accounts.Account, poolModel, compatibilityModel, path string) {
+	accountID := account.ID
+	provider := account.Provider
 	if provider == "" {
 		provider = accounts.ProviderCodex
 	}
@@ -4071,7 +4187,7 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 		// the rejected header). A transient "allowed"/"allowed_warning" 429 still
 		// fails over for this request but must not mark a healthy account exhausted.
 		if claudeAccountExhaustedByResponse(response.StatusCode, response.Header) {
-			s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
+			s.markAccountExhaustedFromResponseForAccount(account, poolModel, response.StatusCode, response.Header)
 		}
 		// Surface the genuine upstream rate-limit signal (headers now, body
 		// prefix below). Anthropic conveys subscription exhaustion only via the
@@ -4123,7 +4239,7 @@ func (s Server) captureResponseBody(response *http.Response, clientCtx context.C
 				// Use the response's headers so a header-derived reset expiry set
 				// above is recomputed identically, not overwritten with the short
 				// default TTL.
-				s.markAccountExhaustedFromResponse(provider, accountID, poolModel, response.StatusCode, response.Header)
+				s.markAccountExhaustedFromResponseForAccount(account, poolModel, response.StatusCode, response.Header)
 			}
 			if inspectModelCompatibility && codexChatGPTModelUnsupportedJSON(body) {
 				_, _ = s.rerouteModelIncompatibility(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel, nil)
@@ -5052,14 +5168,16 @@ func (s Server) accountListSnapshot() ([]accounts.Account, uint64) {
 func (s Server) accountListSnapshotContext(ctx context.Context) ([]accounts.Account, uint64) {
 	out := append([]accounts.Account(nil), s.Accounts...)
 	if s.AccountRef != nil {
-		reloaded, accountGeneration, err := s.AccountRef.reloadIfDiskGenerationChanged(ctx)
+		reloaded, _, err := s.AccountRef.reloadIfDiskGenerationChanged(ctx)
 		if err != nil && s.Logger != nil {
 			s.Logger.Error("account state generation reload failed", "error", err)
 		}
+		loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
 		if reloaded && s.SchedulerRef != nil {
-			s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+			s.SchedulerRef.AdvanceAccountGenerationWithAccounts(generation, credentialRevision, loaded)
+		} else if s.SchedulerRef != nil {
+			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
 		}
-		loaded, generation := s.AccountRef.Snapshot()
 		out = append(out, loaded...)
 		return out, generation
 	}
@@ -5073,7 +5191,12 @@ func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (a
 	if s.AccountRef == nil {
 		return account, nil
 	}
-	return s.AccountRef.Refresh(ctx, account)
+	refreshed, err := s.AccountRef.Refresh(ctx, account)
+	if err == nil && s.SchedulerRef != nil {
+		loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
+		s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+	}
+	return refreshed, err
 }
 
 func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, r *http.Request, account accounts.Account) (accounts.Account, error) {
@@ -5097,7 +5220,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 		s.Logger.Warn("selected OAuth account refresh failed, trying another account", "provider", provider, "account", account.ID, "error", err)
 	}
 	tried := map[string]struct{}{account.ID: {}}
-	s.markAccountExhaustedRefreshFailure(provider, account.ID, "", err)
+	s.markAccountExhaustedRefreshFailure(account, err)
 	lastErr := err
 	oauthOnly := provider == accounts.ProviderCodex &&
 		(chatGPTBackendPath(r.URL.Path) || codexModelCatalogRequest(r))
@@ -5115,7 +5238,7 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 			return next, err
 		}
 		lastErr = err
-		s.markAccountExhaustedRefreshFailure(provider, next.ID, "", err)
+		s.markAccountExhaustedRefreshFailure(next, err)
 		if s.Logger != nil {
 			s.Logger.Warn("retry OAuth account refresh failed", "provider", provider, "account", next.ID, "error", err)
 		}
@@ -5269,18 +5392,19 @@ type replayablePostRetryTransport struct {
 }
 
 type usageLimitRetryTransport struct {
-	base        http.RoundTripper
-	server      *Server
-	logger      *slog.Logger
-	provider    accounts.Provider
-	agent       string
-	session     string
-	userEmail   string
-	account     string
-	method      string
-	path        string
-	upstream    string
-	maxAttempts int
+	base              http.RoundTripper
+	server            *Server
+	logger            *slog.Logger
+	provider          accounts.Provider
+	agent             string
+	session           string
+	userEmail         string
+	account           string
+	accountCredential string
+	method            string
+	path              string
+	upstream          string
+	maxAttempts       int
 	// sleep waits for the backoff duration or until the context is cancelled.
 	// Injectable for tests; nil means a real timer wait.
 	sleep func(context.Context, time.Duration) error
@@ -5537,6 +5661,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	attemptReq := req
 	accountID := t.account
+	accountCredential := t.accountCredential
 	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
@@ -5658,7 +5783,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers (codex responses lack these headers and fall back
 			// to the default TTL inside claudeExhaustionExpiry).
-			t.server.markAccountExhaustedFromResponse(t.provider, accountID, exhaustionPool, response.StatusCode, response.Header)
+			t.server.markAccountExhaustedFromResponseForAccount(accounts.Account{
+				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+			}, exhaustionPool, response.StatusCode, response.Header)
 		}
 		budgetExhausted := false
 		if attempt < maxAttempts && t.server != nil {
@@ -5705,6 +5832,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		previousAccount := accountID
 		accountID = nextAccount.ID
+		accountCredential = nextAccount.CredentialIdentity()
 		tried[accountID] = struct{}{}
 		if t.server != nil && t.server.SchedulerRef != nil {
 			t.server.SchedulerRef.NoteRouted(t.provider, accountID)
@@ -6013,7 +6141,7 @@ func (s Server) oauthRetryAccount(ctx context.Context, provider accounts.Provide
 			if terminal {
 				// Credential TTL, not the short default: a dead token only heals
 				// via human re-auth, so frequent probes are pure overhead.
-				s.markAccountExhaustedCredential(provider, account.ID, "")
+				s.markAccountExhaustedCredentialForAccount(account)
 			}
 			if s.Logger != nil {
 				s.Logger.Warn("usage-limit retry skipping OAuth account with failed refresh",
