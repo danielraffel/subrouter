@@ -638,6 +638,8 @@ func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
 }
 
 func TestLocalAccountUploadsExcludeInteractiveCodexOAuthChains(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
 	store := accounts.CodexStore{Dir: t.TempDir()}
 	interactive := accounts.StoredCodexAccount{
 		Email:                 "interactive@example.com",
