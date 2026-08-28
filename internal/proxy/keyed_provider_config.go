@@ -182,6 +182,9 @@ func parseProviderBaseURL(raw, name string) (*url.URL, error) {
 	if parsed.User != nil {
 		return nil, fmt.Errorf("openai-compatible provider %q base URL must not contain userinfo", name)
 	}
+	if err := validateCredentialUpstream(name, parsed); err != nil {
+		return nil, fmt.Errorf("openai-compatible provider %q: %w", name, err)
+	}
 	return parsed, nil
 }
 

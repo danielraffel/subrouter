@@ -289,6 +289,22 @@ func TestParseOpenAICompatibleFlag(t *testing.T) {
 	}
 }
 
+func TestConfigureOpenAICompatibleProvidersRejectsRemoteCleartext(t *testing.T) {
+	resetConfiguredProviders(t)
+
+	err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{
+		Name: "cleartext", BaseURL: "http://provider.example/v1",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "HTTPS") {
+		t.Fatalf("remote cleartext base URL error = %v, want HTTPS rejection", err)
+	}
+	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{
+		Name: "local", BaseURL: "http://127.0.0.1:8080/v1",
+	}}); err != nil {
+		t.Fatalf("loopback development base URL rejected: %v", err)
+	}
+}
+
 // A vendor that exposes one subscription on two protocol endpoints must not
 // require the key to be stored twice. Registering it once against the owning
 // provider has to serve both entries, or rotating the key means editing every
