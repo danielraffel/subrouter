@@ -1064,7 +1064,7 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err := r.ensureSwitchableForFreshUsage(ctx, account); err != nil {
 		return err
 	}
-	if err := accounts.WriteActiveCodexAuth(account.Auth); err != nil {
+	if err := r.store.SwitchActive(account.Email); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Switched to %s\n", account.Email)

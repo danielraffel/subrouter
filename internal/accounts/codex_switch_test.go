@@ -28,6 +28,37 @@ func TestCodexStoreRawAuthForFindsStoredAccount(t *testing.T) {
 	}
 }
 
+func TestSwitchActiveDowngradesIsolatedOAuthOriginBeforeExport(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{
+		Email:                 "isolated@example.com",
+		OAuthCredentialOrigin: CodexOAuthOriginIsolatedServerLogin,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "access", RefreshToken: "refresh", IDToken: "id",
+		}},
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SwitchActive(account.Email); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("stored account disappeared")
+	}
+	if stored.OAuthCredentialOrigin != CodexOAuthOriginInteractiveImport {
+		t.Fatalf("OAuth origin = %q, want interactive import", stored.OAuthCredentialOrigin)
+	}
+	if len(stored.Breadcrumbs) == 0 || stored.Breadcrumbs[len(stored.Breadcrumbs)-1].Event != "credential_exported_to_active" {
+		t.Fatalf("breadcrumbs = %#v", stored.Breadcrumbs)
+	}
+}
+
 func TestCodexStoreListIgnoresHiddenAccountArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	writeStoredAccount(t, dir, "b@example.com", `{"auth_mode":"chatgpt","tokens":{"access_token":"token"},"last_refresh":"now"}`)

@@ -2,6 +2,7 @@ package accounts
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,9 @@ func DefaultCodexAuthPath() string {
 }
 
 func (s CodexStore) SwitchActive(accountID string) error {
+	if err := s.markStoredCredentialInteractive(accountID); err != nil {
+		return err
+	}
 	_, rawAuth, err := s.rawAuthFor(accountID)
 	if err != nil {
 		return err
@@ -34,6 +38,36 @@ func (s CodexStore) SwitchActive(accountID string) error {
 		return err
 	}
 	return nil
+}
+
+func (s CodexStore) markStoredCredentialInteractive(accountID string) error {
+	stored, ok, err := s.FindStored(accountID)
+	if err != nil || !ok {
+		return err
+	}
+	if stored.IsAPIKey() || stored.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+		return nil
+	}
+	lock, err := s.lockStoredAccount(stored.Email)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	stored, ok, err = s.findStoredExact(stored.Email)
+	if err != nil || !ok {
+		return err
+	}
+	if stored.IsAPIKey() || stored.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+		return nil
+	}
+	previous := stored
+	stored.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
+	appendCodexAuthBreadcrumb(
+		context.Background(), s, &stored,
+		"credential_exported_to_active", "account_manager", false,
+		&previous, &stored, nil, nil,
+	)
+	return s.saveStoredUnlocked(stored)
 }
 
 func (s CodexStore) rawAuthFor(accountID string) (Account, json.RawMessage, error) {
