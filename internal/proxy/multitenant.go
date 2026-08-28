@@ -1086,6 +1086,12 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "Codex OAuth credential identity is invalid", http.StatusBadRequest)
 			return
 		}
+		if !strings.EqualFold(
+			strings.TrimSpace(submittedIdentity), strings.TrimSpace(refreshedIdentity),
+		) {
+			http.Error(w, "Codex OAuth credential identity changed during transfer", http.StatusConflict)
+			return
+		}
 		if expectedIdentity != "" {
 			if !strings.EqualFold(
 				strings.TrimSpace(expectedIdentity), strings.TrimSpace(refreshedIdentity),

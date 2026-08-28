@@ -1800,6 +1800,47 @@ func TestTenantCodexUploadRejectsMalformedRefreshedIdentity(t *testing.T) {
 	}
 }
 
+func TestTenantCodexUploadRejectsIdentityChangedByRefresh(t *testing.T) {
+	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT("other@example.com", "access-token", time.Now().Add(time.Hour)),
+				proxyTestCodexJWT("other@example.com", "id-token", time.Now().Add(time.Hour)),
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	submittedID := proxyTestCodexJWT("owner@example.com", "submitted-id", time.Now().Add(time.Hour))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
+			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":%q}
+		}`, submittedID)),
+	))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("changed identity status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := (accounts.CodexStore{
+		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),
+	}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("identity-changing refresh stored an account: %#v", stored)
+	}
+}
+
 func TestTenantAccountTextRejectsControlsAndUsesUTF8ByteLimits(t *testing.T) {
 	base := tenantAccountUpload{
 		Provider:  "openai-apikey",
