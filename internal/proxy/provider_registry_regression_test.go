@@ -93,7 +93,7 @@ func TestRegistryDoesNotCaptureCodexOrClaudeRouting(t *testing.T) {
 func TestRegistryDoesNotChangeCodexOrClaudeAuthHeaders(t *testing.T) {
 	claudeOAuth := http.Header{}
 	claudeOAuth.Set("X-Api-Key", "client-supplied")
-	setAccountAuthHeaders(claudeOAuth, accounts.Account{Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token"})
+	setAccountAuthHeaders(claudeOAuth, accounts.Account{Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token"}, "")
 	if claudeOAuth.Get("Authorization") != "Bearer oauth-token" {
 		t.Fatalf("claude oauth Authorization = %q", claudeOAuth.Get("Authorization"))
 	}
@@ -106,7 +106,7 @@ func TestRegistryDoesNotChangeCodexOrClaudeAuthHeaders(t *testing.T) {
 
 	claudeKey := http.Header{}
 	claudeKey.Set("Anthropic-Beta", claudeOAuthBetaHeader)
-	setAccountAuthHeaders(claudeKey, accounts.Account{Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "sk-ant"})
+	setAccountAuthHeaders(claudeKey, accounts.Account{Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "sk-ant"}, "")
 	if claudeKey.Get("Authorization") != "" {
 		t.Fatal("claude api-key auth must not send Authorization")
 	}
@@ -118,7 +118,7 @@ func TestRegistryDoesNotChangeCodexOrClaudeAuthHeaders(t *testing.T) {
 	}
 
 	codex := http.Header{}
-	setAccountAuthHeaders(codex, accounts.Account{Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "codex-token", AccountID: "acct-1"})
+	setAccountAuthHeaders(codex, accounts.Account{Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "codex-token", AccountID: "acct-1"}, "")
 	if codex.Get("Authorization") != "Bearer codex-token" {
 		t.Fatalf("codex Authorization = %q", codex.Get("Authorization"))
 	}
@@ -128,7 +128,7 @@ func TestRegistryDoesNotChangeCodexOrClaudeAuthHeaders(t *testing.T) {
 
 	// A provider-less account is still treated as Codex.
 	legacy := http.Header{}
-	setAccountAuthHeaders(legacy, accounts.Account{AuthMode: accounts.AuthModeOAuth, Token: "legacy-token", AccountID: "acct-2"})
+	setAccountAuthHeaders(legacy, accounts.Account{AuthMode: accounts.AuthModeOAuth, Token: "legacy-token", AccountID: "acct-2"}, "")
 	if legacy.Get("ChatGPT-Account-ID") != "acct-2" {
 		t.Fatalf("provider-less ChatGPT-Account-ID = %q, want the account id", legacy.Get("ChatGPT-Account-ID"))
 	}

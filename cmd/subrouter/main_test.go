@@ -114,6 +114,9 @@ func TestNormalizePublicSubrouterURLTrimsFlagValues(t *testing.T) {
 
 func TestServeKeepsHostedLoginCompatibleWithoutTenantDeleteToken(t *testing.T) {
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	// DefaultCodexStore performs one-time legacy migration. Isolate HOME so a
+	// unit test never walks or copies the developer's real account archive.
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SUBROUTER_STACK_PROJECT_ID", "project")
 	t.Setenv("SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY", "publishable")
 	t.Setenv("SUBROUTER_STACK_TENANT_KEY_SECRET", "0123456789abcdef0123456789abcdef")
@@ -335,6 +338,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"logout",
 		"ls",
 		"pick",
+		"qwen",
 		"remote",
 		"remotes",
 		"remove",
@@ -393,6 +397,9 @@ func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	// sr initializes the local Codex store before dispatching the hosted alias.
+	// Keep its legacy migration away from the developer's real HOME.
+	t.Setenv("HOME", t.TempDir())
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
 	if err := broker.SaveConfig(configPath, broker.Config{

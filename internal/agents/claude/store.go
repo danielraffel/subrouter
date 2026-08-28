@@ -1365,11 +1365,34 @@ func readCredentialFile(instancePath string) (*CredentialInfo, bool) {
 // summary of the payload's shape: a decode failure is otherwise indistinguishable
 // between a keychain wrapper, a partial write, and a corrupt file.
 func parseCredentialPayload(body []byte, source string) (*CredentialInfo, error) {
+	credential, err := decodeCredentialPayload(body)
+	if err == nil {
+		return credential, nil
+	}
+	// Claude Code may store the credential as generic-password data instead of
+	// a string. On macOS, `security ... -w` renders that data as hexadecimal
+	// text. Accept that representation only for keychain reads and only when
+	// the complete decoded value is itself a valid credential payload.
+	if source == "keychain" {
+		trimmed := bytes.TrimSpace(body)
+		if len(trimmed) > 0 && len(trimmed)%2 == 0 {
+			decoded := make([]byte, hex.DecodedLen(len(trimmed)))
+			if _, decodeErr := hex.Decode(decoded, trimmed); decodeErr == nil {
+				if credential, decodeErr := decodeCredentialPayload(decoded); decodeErr == nil {
+					return credential, nil
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("%s from %s (%s): %w", unreadableCredentialPhrase, source, describeCredentialPayload(body, err), err)
+}
+
+func decodeCredentialPayload(body []byte) (*CredentialInfo, error) {
 	var raw struct {
 		ClaudeAIOAuth *CredentialInfo `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("%s from %s (%s): %w", unreadableCredentialPhrase, source, describeCredentialPayload(body, err), err)
+		return nil, err
 	}
 	return raw.ClaudeAIOAuth, nil
 }

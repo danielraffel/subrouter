@@ -158,13 +158,13 @@ func TestApplyKeyedProviderAuthPresentsTheKeyPerStyle(t *testing.T) {
 
 	bearer := http.Header{}
 	bearer.Set("X-Api-Key", "client-supplied")
-	applyKeyedProviderAuth(bearer, account, keyedProvider{Auth: authBearer})
+	applyKeyedProviderAuth(bearer, account, keyedProvider{Auth: authBearer}, "")
 	if bearer.Get("X-Api-Key") != "" {
 		t.Fatal("a bearer provider must not forward a client X-Api-Key")
 	}
 
 	anthropic := http.Header{}
-	applyKeyedProviderAuth(anthropic, account, keyedProvider{Auth: authBearerAndAnthropicKey})
+	applyKeyedProviderAuth(anthropic, account, keyedProvider{Auth: authBearerAndAnthropicKey}, "")
 	if anthropic.Get("X-Api-Key") != "key" {
 		t.Fatalf("X-Api-Key = %q, want the account key", anthropic.Get("X-Api-Key"))
 	}
@@ -177,7 +177,7 @@ func TestApplyKeyedProviderAuthPresentsTheKeyPerStyle(t *testing.T) {
 
 	explicit := http.Header{}
 	explicit.Set("Anthropic-Version", "2024-01-01")
-	applyKeyedProviderAuth(explicit, account, keyedProvider{Auth: authBearerAndAnthropicKey})
+	applyKeyedProviderAuth(explicit, account, keyedProvider{Auth: authBearerAndAnthropicKey}, "")
 	if explicit.Get("Anthropic-Version") != "2024-01-01" {
 		t.Fatal("a client's Anthropic-Version must not be overwritten")
 	}
@@ -232,7 +232,7 @@ func TestSessionLeaseProviderHonoursVendorPrefixedModels(t *testing.T) {
 		LeaseAPI:             "openai-completions",
 		LeasePath:            "/vendorcase/chat/completions",
 		LeaseEnv:             leaseEnvOpenAI,
-		Upstream:             func(Server) *url.URL { return nil },
+		Upstream:             func(Server, accounts.AuthMode) *url.URL { return nil },
 	})
 
 	provider, model, err = sessionLeaseProvider("vendorcase", "anthropic/claude-opus-5")

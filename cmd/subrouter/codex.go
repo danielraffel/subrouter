@@ -230,12 +230,6 @@ func codexConfigArgs(
 	model string,
 	forceAuthenticatedProvider bool,
 ) []string {
-	if !forceAuthenticatedProvider &&
-		userEmail == "" &&
-		accountID == "" &&
-		model == "" {
-		return []string{"-c", "openai_base_url=" + strconv.Quote(baseURL)}
-	}
 	authConfig := `model_providers.subrouter.experimental_bearer_token="subrouter"`
 	if forceAuthenticatedProvider {
 		authConfig = `model_providers.subrouter.env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`

@@ -302,6 +302,41 @@ func TestRefreshAdoptsARotatedRefreshToken(t *testing.T) {
 	}
 }
 
+func TestProviderHeadersAreSentOnAuthorizationPollingAndRefresh(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("X-Provider-Platform") != "supported-client" || r.Header.Get("X-Device-ID") != "device-123" {
+			http.Error(w, "missing provider identity", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/device":
+			_, _ = w.Write([]byte(`{"device_code":"dc","user_code":"CODE","verification_uri":"https://example.test","interval":1,"expires_in":60}`))
+		case "/token":
+			_, _ = w.Write([]byte(`{"access_token":"fresh","refresh_token":"refresh","expires_in":3600}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cfg := testConfig(server)
+	cfg.Headers = map[string]string{"X-Provider-Platform": "supported-client", "X-Device-ID": "device-123"}
+	code, err := RequestCode(context.Background(), server.Client(), cfg, reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Poll(context.Background(), server.Client(), cfg, code, noSleep, func() time.Time { return reference }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Refresh(context.Background(), server.Client(), cfg, "refresh", reference); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 3 {
+		t.Fatalf("provider identity was exercised on %d requests, want all three flow stages", requests)
+	}
+}
+
 func TestRefreshSurfacesInvalidGrant(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)

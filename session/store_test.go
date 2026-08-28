@@ -265,6 +265,45 @@ func TestStoreScopesAssignmentsByAgentType(t *testing.T) {
 	}
 }
 
+func TestStoreCompareAndPutPreservesNewerAssignment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "original", "user@example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	assignment, swapped, err := store.CompareAndPut("codex", "session-1", "original", "alternate", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !swapped || assignment.AccountID != "alternate" || assignment.UserEmail != "user@example.com" {
+		t.Fatalf("matching compare-and-put = (%+v, %v), want alternate with retained identity", assignment, swapped)
+	}
+
+	if _, err := store.Put("codex", "session-1", "forced", ""); err != nil {
+		t.Fatal(err)
+	}
+	assignment, swapped, err = store.CompareAndPut("codex", "session-1", "alternate", "stale", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if swapped || assignment.AccountID != "forced" {
+		t.Fatalf("stale compare-and-put = (%+v, %v), want forced unchanged", assignment, swapped)
+	}
+
+	reloaded, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, ok := reloaded.Get("codex", "session-1")
+	if !ok || persisted.AccountID != "forced" {
+		t.Fatalf("persisted assignment = (%+v, %v), want forced", persisted, ok)
+	}
+}
+
 func TestStoresReloadAndMergeConcurrentGenerationWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.json")
 	oldGeneration, err := NewStore(path)

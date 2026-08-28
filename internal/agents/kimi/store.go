@@ -2,31 +2,46 @@ package kimi
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/oauthdevice"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 // OAuth endpoints for the Kimi Code CLI's installed-app client, matching what
 // the CLI itself uses. There is no client secret: the device-grant client is a
 // public client.
 const (
-	oauthClientID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-	oauthTokenURL = "https://auth.kimi.com/api/oauth/token"
+	oauthClientID  = "17e5f671-d194-4dfb-9706-5516cb48c098"
+	oauthDeviceURL = "https://auth.kimi.com/api/oauth/device_authorization"
+	oauthTokenURL  = "https://auth.kimi.com/api/oauth/token"
+	// Keep managed OAuth identities disjoint from API-key account IDs, which
+	// already use the provider-derived "kimi:<label>" namespace.
+	managedIDPrefix      = "kimi-subscription:"
+	maxManagedLabelBytes = 160
 )
 
 // oauthConfig is a variable so tests can point the refresh at a stub server.
 var oauthConfig = oauthdevice.Config{
-	ClientID: oauthClientID,
-	TokenURL: oauthTokenURL,
+	ClientID:      oauthClientID,
+	DeviceAuthURL: oauthDeviceURL,
+	TokenURL:      oauthTokenURL,
 }
 
 // accountID is the stable identifier of the one account the CLI credential
@@ -37,21 +52,239 @@ const accountID = "kimi-code"
 type Store struct {
 	// Path is the credential file. Empty means the CLI's default location.
 	Path string
+	// KimiHome overrides the Kimi Code home used to resolve the CLI's sibling
+	// device_id file. It is primarily useful for isolated imports and tests.
+	KimiHome string
+	// ManagedDir holds Subrouter-owned OAuth profiles. Empty uses the portable
+	// Subrouter state directory unless Path points at an isolated test fixture.
+	ManagedDir string
+	// RefreshTransaction serializes a refresh write with account add/remove
+	// transactions. The proxy supplies its cross-process account-state lock.
+	RefreshTransaction func(context.Context, func() error) error
+}
+
+var deviceIDMu sync.Mutex
+
+func (s Store) oauthConfig() (oauthdevice.Config, error) {
+	deviceID, err := s.deviceID()
+	if err != nil {
+		return oauthdevice.Config{}, fmt.Errorf("load Kimi OAuth device identity: %w", err)
+	}
+	return oauthConfigForDevice(deviceID), nil
+}
+
+func oauthConfigForDevice(deviceID string) oauthdevice.Config {
+	return oauthConfigForDevicePlatform(deviceID, "kimi_cli")
+}
+
+func oauthConfigForDevicePlatform(deviceID, platform string) oauthdevice.Config {
+	hostname, _ := os.Hostname()
+	cfg := oauthConfig
+	cfg.Headers = map[string]string{
+		// This public client ID is registered for the Kimi CLI platform. Keep
+		// the platform identifier aligned with that public-client contract while
+		// identifying this implementation in the version field.
+		"X-Msh-Platform":     platform,
+		"X-Msh-Version":      "subrouter",
+		"X-Msh-Device-Name":  asciiHeaderValue(hostname, "subrouter-host"),
+		"X-Msh-Device-Model": runtime.GOOS + " " + runtime.GOARCH,
+		"X-Msh-Os-Version":   runtime.GOOS,
+		"X-Msh-Device-Id":    deviceID,
+	}
+	return cfg
+}
+
+func asciiHeaderValue(value, fallback string) string {
+	var out strings.Builder
+	for _, r := range value {
+		if r >= 0x20 && r <= 0x7e {
+			out.WriteRune(r)
+		}
+	}
+	if value := strings.TrimSpace(out.String()); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func (s Store) deviceID() (string, error) {
+	deviceIDMu.Lock()
+	defer deviceIDMu.Unlock()
+	dir := s.managedDir()
+	if dir == "" {
+		if s.Path != "" {
+			dir = filepath.Dir(s.Path)
+		} else {
+			dir = filepath.Join(storepath.StateDir(), "kimi")
+		}
+	}
+	path := filepath.Join(dir, "device-id")
+	if body, err := os.ReadFile(path); err == nil {
+		if raw := strings.TrimSpace(string(body)); raw != "" && len(raw) <= 128 {
+			if value := asciiHeaderValue(raw, ""); value != "" {
+				return value, nil
+			}
+		}
+		return "", fmt.Errorf("%s is empty or invalid", path)
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+	value := hex.EncodeToString(random)
+	tmp, err := os.CreateTemp(dir, ".device-id-*")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if _, err := tmp.WriteString(value); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func DefaultStore() Store {
 	return Store{}
 }
 
+func (s Store) cliHome() (string, error) {
+	if home := strings.TrimSpace(s.KimiHome); home != "" {
+		return filepath.Clean(home), nil
+	}
+	if s.Path != "" {
+		credentialDir := filepath.Dir(s.Path)
+		if filepath.Base(s.Path) == "kimi-code.json" && filepath.Base(credentialDir) == "credentials" {
+			return filepath.Dir(credentialDir), nil
+		}
+		return "", fmt.Errorf("cannot derive Kimi Code home from custom credential path; set KimiHome")
+	}
+	if home := strings.TrimSpace(os.Getenv("KIMI_CODE_HOME")); home != "" {
+		return filepath.Clean(home), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".kimi-code"), nil
+}
+
 func (s Store) credentialPath() string {
 	if s.Path != "" {
 		return s.Path
 	}
-	home, err := os.UserHomeDir()
+	home, err := s.cliHome()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".kimi-code", "credentials", "kimi-code.json")
+	return filepath.Join(home, "credentials", "kimi-code.json")
+}
+
+// localCLIDeviceID reads the identity the official Kimi Code client stores
+// beside its credentials. It never creates a replacement: an OAuth refresh
+// must use the same identity as the original authorization.
+func (s Store) localCLIDeviceID() (string, error) {
+	home, err := s.cliHome()
+	if err != nil {
+		return "", fmt.Errorf("resolve Kimi Code device identity: %w; run kimi login again", err)
+	}
+	path := filepath.Join(home, "device_id")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("read Kimi Code device identity: %w; run kimi login again", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("Kimi Code device identity is not a regular file; run kimi login again")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("read Kimi Code device identity: %w; run kimi login again", err)
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, 130))
+	if err != nil {
+		return "", fmt.Errorf("read Kimi Code device identity: %w; run kimi login again", err)
+	}
+	value := strings.TrimSpace(string(body))
+	if len(body) > 129 || ValidateOAuthDeviceID(value) != nil {
+		return "", fmt.Errorf("Kimi Code device identity is empty or invalid; run kimi login again")
+	}
+	return value, nil
+}
+
+func (s Store) managedDir() string {
+	if s.ManagedDir != "" {
+		return s.ManagedDir
+	}
+	if s.Path != "" {
+		return ""
+	}
+	return filepath.Join(storepath.StateDir(), "kimi")
+}
+
+// ManagedAccountID validates a user-facing profile label and returns the
+// stable account identifier used by routing and the persistent session store.
+func ManagedAccountID(label string) (string, error) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "", fmt.Errorf("Kimi account label is required")
+	}
+	if len(label) > maxManagedLabelBytes {
+		return "", fmt.Errorf("Kimi account label must be at most %d bytes", maxManagedLabelBytes)
+	}
+	if strings.HasPrefix(strings.ToLower(label), managedIDPrefix) {
+		return "", fmt.Errorf("Kimi account label must not start with reserved prefix %q", managedIDPrefix)
+	}
+	for _, r := range label {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return "", fmt.Errorf("Kimi account label contains a control character")
+		}
+	}
+	return managedIDPrefix + strings.ToLower(label), nil
+}
+
+func managedFilename(accountID string) (string, error) {
+	if !strings.HasPrefix(accountID, managedIDPrefix) {
+		return "", fmt.Errorf("%q is not a managed Kimi account", accountID)
+	}
+	label := strings.TrimSpace(strings.TrimPrefix(accountID, managedIDPrefix))
+	if _, err := ManagedAccountID(label); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString([]byte(label)) + ".json", nil
+}
+
+func managedAccountID(filename string) (string, bool) {
+	if filepath.Ext(filename) != ".json" {
+		return "", false
+	}
+	encoded := strings.TrimSuffix(filename, ".json")
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", false
+	}
+	id, err := ManagedAccountID(string(decoded))
+	return id, err == nil
 }
 
 // ReadLocalCredential returns the credential the Kimi Code CLI currently holds
@@ -63,6 +296,10 @@ func (s Store) ReadLocalCredential(now time.Time) (credential CredentialInfo, ok
 	if path == "" {
 		return CredentialInfo{}, false, nil
 	}
+	return readCredential(path, now)
+}
+
+func readCredential(path string, now time.Time) (credential CredentialInfo, ok bool, err error) {
 	body, readErr := os.ReadFile(path)
 	if readErr != nil {
 		if os.IsNotExist(readErr) {
@@ -91,13 +328,47 @@ func (s Store) Provider() account.Provider {
 // dropping it would look identical to being signed out.
 func (s Store) ListAccounts(_ context.Context) ([]account.Account, error) {
 	credential, ok, err := s.ReadLocalCredential(time.Now())
+	result := make([]account.Account, 0, 1)
+	var listErrors []error
 	if err != nil {
-		return nil, err
+		listErrors = append(listErrors, fmt.Errorf("read Kimi CLI credential: %w", err))
+	} else if ok {
+		result = append(result, credentialAccount(accountID, "Kimi Code", "kimi-code credentials file", credential))
 	}
-	if !ok {
-		return nil, nil
+	dir := s.managedDir()
+	if dir == "" {
+		return result, errors.Join(listErrors...)
 	}
-	return []account.Account{credentialAccount(credential)}, nil
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			return result, errors.Join(listErrors...)
+		}
+		listErrors = append(listErrors, readErr)
+		return result, errors.Join(listErrors...)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		managedID, valid := managedAccountID(entry.Name())
+		if entry.IsDir() || !valid {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		managedCredential, present, readErr := readCredential(path, time.Now())
+		if readErr != nil {
+			listErrors = append(listErrors, fmt.Errorf("read managed Kimi account %s: %w", managedID, readErr))
+			continue
+		}
+		if !present {
+			continue
+		}
+		label := strings.TrimSpace(managedCredential.AccountLabel)
+		if label == "" {
+			label = strings.TrimPrefix(managedID, managedIDPrefix)
+		}
+		result = append(result, credentialAccount(managedID, label, "subrouter managed Kimi credential", managedCredential))
+	}
+	return result, errors.Join(listErrors...)
 }
 
 // refreshMu serializes refreshes process-wide. Whether Kimi's refresh token is
@@ -111,44 +382,153 @@ var refreshMu sync.Mutex
 // what keeps the CLI itself signed in: if Kimi rotates the refresh token on
 // use, a proxy that keeps the new token to itself would log the CLI out.
 func (s Store) RefreshAccount(ctx context.Context, client *http.Client, acct account.Account) (account.Account, error) {
-	refreshMu.Lock()
-	defer refreshMu.Unlock()
-	credential, ok, err := s.ReadLocalCredential(time.Now())
-	if err != nil || !ok {
-		return acct, err
-	}
-	if !credential.NeedsRefresh(time.Now()) {
-		return credentialAccount(credential), nil
-	}
-	token, err := oauthdevice.Refresh(ctx, client, oauthConfig, credential.RefreshToken, time.Now())
-	if err != nil {
-		return acct, err
-	}
-	credential.AccessToken = token.AccessToken
-	if strings.TrimSpace(token.RefreshToken) != "" {
-		credential.RefreshToken = token.RefreshToken
-	}
-	if strings.TrimSpace(token.TokenType) != "" {
-		credential.TokenType = token.TokenType
-	}
-	if strings.TrimSpace(token.Scope) != "" {
-		credential.Scope = token.Scope
-	}
-	credential.ExpiresAt = token.ExpiresAt
-	if err := s.writeCredential(credential); err != nil {
-		return acct, fmt.Errorf("refreshed the Kimi credential but could not write it back: %w", err)
-	}
-	return credentialAccount(credential), nil
+	refreshed, _, err := s.RefreshAccountIfNeeded(ctx, client, acct)
+	return refreshed, err
 }
 
-func credentialAccount(credential CredentialInfo) account.Account {
+// RefreshAccountIfNeeded is RefreshAccount plus whether it committed a new
+// credential, allowing local CLI callers to publish the account generation
+// only when disk state actually changed.
+func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, acct account.Account) (refreshed account.Account, didRefresh bool, err error) {
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
+	refresh := func() (refreshErr error) {
+		path, label, source, pathErr := s.accountCredentialPath(acct.ID)
+		if pathErr != nil {
+			return pathErr
+		}
+		credential, ok, readErr := readCredential(path, time.Now())
+		if readErr != nil {
+			return readErr
+		}
+		if !ok {
+			return fmt.Errorf("Kimi credential for %s was not found", acct.ID)
+		}
+		if storedLabel := strings.TrimSpace(credential.AccountLabel); storedLabel != "" {
+			label = storedLabel
+		}
+		if !credential.NeedsRefresh(time.Now()) {
+			refreshed = credentialAccount(acct.ID, label, source, credential)
+			return nil
+		}
+		var cliLock *cliRefreshLock
+		if acct.ID == accountID {
+			var lockErr error
+			cliLock, lockErr = s.lockLocalCLIRefresh(ctx)
+			if lockErr != nil {
+				return lockErr
+			}
+			defer func() {
+				if releaseErr := cliLock.Release(); releaseErr != nil && refreshErr == nil {
+					refreshErr = releaseErr
+				}
+			}()
+			// A peer CLI may have rotated and stored the token while this
+			// process waited. Re-read under the shared lock and avoid spending
+			// the replacement refresh token when it is already fresh.
+			credential, ok, readErr = readCredential(path, time.Now())
+			if readErr != nil {
+				return readErr
+			}
+			if !ok {
+				return fmt.Errorf("Kimi credential for %s was removed while waiting for its OAuth refresh lock", acct.ID)
+			}
+			if !credential.NeedsRefresh(time.Now()) {
+				refreshed = credentialAccount(acct.ID, label, source, credential)
+				return nil
+			}
+			if lockErr = cliLock.Check(); lockErr != nil {
+				return lockErr
+			}
+		}
+		var cfg oauthdevice.Config
+		if deviceID := strings.TrimSpace(credential.OAuthDeviceID); deviceID != "" {
+			if validateErr := ValidateOAuthDeviceID(deviceID); validateErr != nil {
+				return fmt.Errorf("Kimi credential for %s has an invalid OAuth device identity", acct.ID)
+			}
+			cfg = oauthConfigForDevice(deviceID)
+		} else if acct.ID == accountID {
+			// The official Kimi Code credential schema stores its stable device
+			// identity in <KIMI_CODE_HOME>/device_id, not in the token JSON.
+			// Reuse it exactly and never generate or borrow a managed identity.
+			deviceID, deviceErr := s.localCLIDeviceID()
+			if deviceErr != nil {
+				return deviceErr
+			}
+			cfg = oauthConfigForDevicePlatform(deviceID, "kimi_code_cli")
+		} else {
+			return fmt.Errorf("Kimi managed credential for %s is missing its OAuth device identity; sign in again", acct.ID)
+		}
+		refreshCtx := ctx
+		if cliLock != nil {
+			refreshCtx = cliLock.Context()
+		}
+		token, tokenErr := oauthdevice.Refresh(refreshCtx, client, cfg, credential.RefreshToken, time.Now())
+		if tokenErr != nil {
+			if cliLock != nil {
+				if lockErr := cliLock.Check(); lockErr != nil {
+					return lockErr
+				}
+			}
+			return tokenErr
+		}
+		credential.AccessToken = token.AccessToken
+		if strings.TrimSpace(token.RefreshToken) != "" {
+			credential.RefreshToken = token.RefreshToken
+		}
+		if strings.TrimSpace(token.TokenType) != "" {
+			credential.TokenType = token.TokenType
+		}
+		if strings.TrimSpace(token.Scope) != "" {
+			credential.Scope = token.Scope
+		}
+		credential.ExpiresAt = token.ExpiresAt
+		if cliLock != nil {
+			if lockErr := cliLock.Check(); lockErr != nil {
+				return lockErr
+			}
+		}
+		if writeErr := writeCredential(path, credential); writeErr != nil {
+			return fmt.Errorf("refreshed the Kimi credential but could not write it back: %w", writeErr)
+		}
+		refreshed = credentialAccount(acct.ID, label, source, credential)
+		didRefresh = true
+		return nil
+	}
+	if s.RefreshTransaction != nil {
+		err = s.RefreshTransaction(ctx, refresh)
+	} else {
+		err = refresh()
+	}
+	if err != nil {
+		return acct, false, err
+	}
+	return refreshed, didRefresh, nil
+}
+
+func (s Store) accountCredentialPath(id string) (path, label, source string, err error) {
+	id = strings.TrimSpace(id)
+	if id == "" || id == accountID {
+		return s.credentialPath(), "Kimi Code", "kimi-code credentials file", nil
+	}
+	filename, err := managedFilename(id)
+	if err != nil {
+		return "", "", "", err
+	}
+	if s.managedDir() == "" {
+		return "", "", "", fmt.Errorf("managed Kimi account storage is disabled")
+	}
+	return filepath.Join(s.managedDir(), filename), strings.TrimPrefix(id, managedIDPrefix), "subrouter managed Kimi credential", nil
+}
+
+func credentialAccount(id, label, source string, credential CredentialInfo) account.Account {
 	return account.Account{
-		ID:       accountID,
+		ID:       id,
 		Provider: account.ProviderKimi,
 		AuthMode: account.AuthModeOAuth,
-		Label:    "Kimi Code",
+		Label:    label,
 		Token:    credential.AccessToken,
-		Source:   "kimi-code credentials file",
+		Source:   source,
 	}
 }
 
@@ -160,11 +540,21 @@ func (s Store) writeCredential(credential CredentialInfo) error {
 	if path == "" {
 		return fmt.Errorf("no Kimi credential path")
 	}
+	return writeCredential(path, credential)
+}
+
+func writeCredential(path string, credential CredentialInfo) error {
 	payload := map[string]any{
 		"access_token":  credential.AccessToken,
 		"refresh_token": credential.RefreshToken,
 		"token_type":    credential.TokenType,
 		"scope":         credential.Scope,
+	}
+	if strings.TrimSpace(credential.AccountLabel) != "" {
+		payload["account_label"] = strings.TrimSpace(credential.AccountLabel)
+	}
+	if strings.TrimSpace(credential.OAuthDeviceID) != "" {
+		payload["oauth_device_id"] = strings.TrimSpace(credential.OAuthDeviceID)
 	}
 	if !credential.ExpiresAt.IsZero() {
 		payload["expires_at"] = credential.ExpiresAt.Unix()
@@ -172,6 +562,9 @@ func (s Store) writeCredential(credential CredentialInfo) error {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".kimi-code.json.*")
@@ -187,8 +580,99 @@ func (s Store) writeCredential(credential CredentialInfo) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// SaveManagedCredential persists one Subrouter-owned OAuth profile without
+// touching the Kimi CLI's single global credential.
+func (s Store) SaveManagedCredential(label string, credential CredentialInfo) (account.Account, error) {
+	displayLabel := strings.TrimSpace(label)
+	id, err := ManagedAccountID(label)
+	if err != nil {
+		return account.Account{}, err
+	}
+	path, _, source, err := s.accountCredentialPath(id)
+	if err != nil {
+		return account.Account{}, err
+	}
+	credential.AccountLabel = displayLabel
+	if err := writeCredential(path, credential); err != nil {
+		return account.Account{}, err
+	}
+	return credentialAccount(id, displayLabel, source, credential), nil
+}
+
+// ReadManagedCredential exports one isolated profile for an authenticated
+// server upload. Callers must keep the returned value out of logs and remove
+// any staging directory after the upload completes.
+func (s Store) ReadManagedCredential(label string, now time.Time) (CredentialInfo, bool, error) {
+	id, err := ManagedAccountID(label)
+	if err != nil {
+		return CredentialInfo{}, false, err
+	}
+	path, _, _, err := s.accountCredentialPath(id)
+	if err != nil {
+		return CredentialInfo{}, false, err
+	}
+	return readCredential(path, now)
+}
+
+// RemoveManagedAccount removes one Subrouter-owned profile by its user-facing
+// label. The Kimi CLI credential is deliberately outside this command's
+// ownership.
+func (s Store) RemoveManagedAccount(label string) (account.Account, bool, error) {
+	id, err := ManagedAccountID(label)
+	if err != nil {
+		return account.Account{}, false, err
+	}
+	return s.removeManagedAccountID(id)
+}
+
+// RemoveManagedAccountID removes one Subrouter-owned profile by the canonical
+// routing identifier returned by ListAccounts.
+func (s Store) RemoveManagedAccountID(id string) (account.Account, bool, error) {
+	id = strings.TrimSpace(id)
+	if !strings.HasPrefix(id, managedIDPrefix) {
+		return account.Account{}, false, fmt.Errorf("%q is not a managed Kimi account", id)
+	}
+	canonicalID, err := ManagedAccountID(strings.TrimPrefix(id, managedIDPrefix))
+	if err != nil {
+		return account.Account{}, false, err
+	}
+	return s.removeManagedAccountID(canonicalID)
+}
+
+func (s Store) removeManagedAccountID(id string) (account.Account, bool, error) {
+	path, label, source, err := s.accountCredentialPath(id)
+	if err != nil {
+		return account.Account{}, false, err
+	}
+	credential, ok, err := readCredential(path, time.Now())
+	if err == nil && !ok {
+		return account.Account{}, false, nil
+	}
+	if removeErr := os.Remove(path); removeErr != nil {
+		if os.IsNotExist(removeErr) {
+			return account.Account{}, false, nil
+		}
+		return account.Account{}, false, removeErr
+	}
+	// A malformed credential must remain removable through the supported CLI;
+	// parsing only enriches the confirmation row and is not authority to keep a
+	// broken profile installed forever.
+	if err == nil {
+		if storedLabel := strings.TrimSpace(credential.AccountLabel); storedLabel != "" {
+			label = storedLabel
+		}
+	} else {
+		credential = CredentialInfo{}
+	}
+	return credentialAccount(id, label, source, credential), true, nil
 }

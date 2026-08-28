@@ -504,9 +504,14 @@ func TestAccountImportSupportsEveryAPIKeyProvider(t *testing.T) {
 	}{
 		{provider: accounts.ProviderCodex, email: "apikey:openai", key: "sk-openai-test"},
 		{provider: accounts.ProviderClaude, email: "claude:anthropic", key: "anthropic-test"},
-		{provider: accounts.ProviderKimi, email: "kimi:kimi", key: "kimi-test"},
-		{provider: accounts.ProviderZAI, email: "zai:zai", key: "zai-test"},
-		{provider: accounts.ProviderOpenRouter, email: "openrouter:openrouter", key: "sk-or-v1-test"},
+	}
+	for _, entry := range builtinKeyedProviders {
+		name := string(entry.Provider)
+		providers = append(providers, struct {
+			provider accounts.Provider
+			email    string
+			key      string
+		}{provider: entry.Provider, email: name + ":" + name, key: name + "-test"})
 	}
 
 	for _, tc := range providers {

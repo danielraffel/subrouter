@@ -13,16 +13,28 @@ subrouter codex resume --last
 subrouter codex --version
 ```
 
-The wrapper injects this global config override into the child Codex process:
+The wrapper launches the child with an authenticated custom provider pointed at
+Subrouter:
 
 ```toml
-openai_base_url = "http://127.0.0.1:31415/v1"
+model_provider = "subrouter"
+[model_providers.subrouter]
+base_url = "http://127.0.0.1:31415/v1"
+experimental_bearer_token = "subrouter"
+wire_api = "responses"
+supports_websockets = true
 ```
 
-Subrouter supports Codex WebSocket requests, so the built-in provider can keep its normal transport behavior.
+Subrouter supports Codex WebSocket requests, so the custom provider keeps the
+normal transport behavior.
 This includes Responses WebSockets at `/v1/responses` and realtime WebSockets at `/v1/realtime`.
 
-Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Codex should stay logged in normally, ideally with ChatGPT auth. Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers with the selected `sr` account.
+Do not set a dummy `OPENAI_API_KEY`. The wrapper's non-secret local-hop token
+decouples the client from `~/.codex/auth.json`, so a local ChatGPT logout or
+refresh failure cannot stop the request before proxy-side failover runs.
+Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers
+with the selected `sr` account. Resume with `sr codex resume ...`; a bare
+`codex resume ...` does not recreate wrapper-only overrides.
 
 ## Server Switching
 
@@ -74,7 +86,10 @@ SUBROUTER_CODEX_ACCOUNT_ID=team-codex-1 subrouter codex exec "your prompt"
 SUBROUTER_CODEX_ACCOUNT_ID=apikey:team-codex-1 subrouter codex exec "your prompt"
 ```
 
-Codex does not allow overriding arbitrary headers on the built-in `openai` provider. When either variable is set, `subrouter codex` switches the child process to a custom `subrouter` provider with WebSockets enabled and sends `X-Subrouter-Agent: codex`, plus `X-Subrouter-User-Email` and/or `X-Subrouter-Account-ID`. Subrouter still replaces outbound credentials before forwarding upstream. `SUBROUTER_CODEX_USER_EMAIL` is only teammate observability metadata; account selection belongs in `SUBROUTER_CODEX_ACCOUNT_ID`.
+`subrouter codex` always uses the custom `subrouter` provider with WebSockets
+enabled and sends `X-Subrouter-Agent: codex`. These variables add
+`X-Subrouter-User-Email` and/or `X-Subrouter-Account-ID`. Subrouter still
+replaces outbound credentials before forwarding upstream.
 
 ## Models
 
@@ -83,20 +98,22 @@ There are two separate Codex concepts:
 - `model`: the model slug selected by `/model`.
 - `model_provider`: the backend/provider config.
 
-Subrouter keeps `model_provider = "openai"` and does not rewrite the `model` field. `/model` continues to use Codex's own model catalog and auth-mode filtering. If Codex is logged in with ChatGPT auth, subscription-only models stay visible. If Codex is forced into API-key auth by `OPENAI_API_KEY`, Codex filters the picker to API-supported models.
+Subrouter does not rewrite the `model` field. The wrapper sets
+`model_provider = "subrouter"` so local ChatGPT authentication cannot fail
+before the proxy sees the request.
 
 Subrouter accepts `/v1/responses` and `/responses`. For OAuth subscription accounts it forwards to `https://chatgpt.com/backend-api/codex` and strips the `/v1` prefix when present. For API-key accounts it forwards to `https://api.openai.com` and adds `/v1` when needed.
 
-## Custom Provider Fallback
+## Manual Provider Configuration
 
 If WebSocket support needs to be disabled for debugging, use a custom provider:
 
 ```bash
-OPENAI_API_KEY=dummy codex exec \
+codex exec \
   -c 'model_provider="subrouter"' \
   -c 'model_providers.subrouter.name="Subrouter"' \
   -c 'model_providers.subrouter.base_url="http://127.0.0.1:31415/v1"' \
-  -c 'model_providers.subrouter.env_key="OPENAI_API_KEY"' \
+  -c 'model_providers.subrouter.experimental_bearer_token="subrouter"' \
   -c 'model_providers.subrouter.wire_api="responses"' \
   -c 'model_providers.subrouter.supports_websockets=false' \
   "your prompt"

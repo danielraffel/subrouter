@@ -70,7 +70,7 @@ func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
 	scheduler := NewScheduler([]Score{
 		{AccountID: "a", Headroom: 0.75, Sessions: 0},
 		{AccountID: "b", Headroom: 0.75, Sessions: 0},
-	}).WithSessionCounts(map[string]int{"a": 2})
+	}).WithSessionCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 2})
 
 	got, err := scheduler.Pick([]account.Account{{ID: "a"}, {ID: "b"}})
 	if err != nil {
@@ -78,6 +78,22 @@ func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
 	}
 	if got.ID != "b" {
 		t.Fatalf("got %q, want b", got.ID)
+	}
+}
+
+func TestWithSessionCountsSeparatesProvidersSharingAnAccountID(t *testing.T) {
+	scheduler := NewScheduler([]Score{
+		{AccountID: "same@example.com", Provider: account.ProviderCodex, Headroom: 0.75},
+		{AccountID: "same@example.com", Provider: account.ProviderClaude, Headroom: 0.75},
+	}).WithSessionCounts(map[string]int{
+		ScoreKey(account.ProviderCodex, "same@example.com"):  2,
+		ScoreKey(account.ProviderClaude, "same@example.com"): 9,
+	})
+	if got := scheduler.measuredScore(account.ProviderCodex, "same@example.com").Sessions; got != 2 {
+		t.Fatalf("Codex sessions = %d, want 2", got)
+	}
+	if got := scheduler.measuredScore(account.ProviderClaude, "same@example.com").Sessions; got != 9 {
+		t.Fatalf("Claude sessions = %d, want 9", got)
 	}
 }
 

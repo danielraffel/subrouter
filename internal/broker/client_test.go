@@ -54,6 +54,9 @@ func TestCredentialSourceMigratesTeamConfigAndAllowsExplicitLocal(t *testing.T) 
 	if !config.TeamModeReady() {
 		t.Fatal("pre-source team config should remain team-ready")
 	}
+	if config.HostedTenantReady() {
+		t.Fatal("pre-source team config unexpectedly has a hosted tenant endpoint")
+	}
 
 	config.CredentialSource = CredentialSourceLocal
 	if got := config.EffectiveCredentialSource(); got != CredentialSourceLocal {

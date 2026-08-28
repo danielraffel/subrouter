@@ -43,7 +43,8 @@ var reservedProviderNames = map[string]bool{
 	"codex":  true, "openai": true, "openai-codex": true,
 	"claude": true, "anthropic": true,
 	"gemini": true, "bedrock": true,
-	"internal": true, "_subrouter": true, "t": true,
+	"antigravity": true,
+	"internal":    true, "_subrouter": true, "t": true,
 	"v1": true, "backend-api": true, "messages": true, "responses": true,
 	"models": true, "alpha": true, "ps": true, "plugins": true,
 }
@@ -100,7 +101,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 			LeaseAPI:               "openai-completions",
 			LeasePath:              "/" + name + "/chat/completions",
 			LeaseEnv:               leaseEnvOpenAI,
-			Upstream:               func(Server) *url.URL { return base },
+			Upstream:               func(Server, accounts.AuthMode) *url.URL { return base },
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].PathPrefix < entries[j].PathPrefix })

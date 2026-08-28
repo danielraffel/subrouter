@@ -271,7 +271,7 @@ func pickTenantCredentialLeaseAccount(
 	}
 	scheduler := server.scheduler().ForModel(model)
 	if server.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(server.Sessions.CountByAccount())
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
 	}
 	return scheduler.Pick(candidates)
 }

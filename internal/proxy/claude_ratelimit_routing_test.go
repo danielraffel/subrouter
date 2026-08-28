@@ -1253,8 +1253,8 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
 	}
-	if calls != 1+claudeOverloadMaxRetries {
-		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeOverloadMaxRetries)
+	if calls != 1+providerOverloadMaxRetries {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+providerOverloadMaxRetries)
 	}
 }
 
@@ -1309,19 +1309,19 @@ func TestClaudeOverloadRetryPreservesFailoverAccount(t *testing.T) {
 
 func TestClaudeOverloadBackoff(t *testing.T) {
 	h := http.Header{}
-	if d := claudeOverloadBackoff(h, 0); d != time.Second {
+	if d := providerOverloadBackoff(h, 0); d != time.Second {
 		t.Fatalf("retry0 = %v, want 1s", d)
 	}
-	if d := claudeOverloadBackoff(h, 1); d != 2*time.Second {
+	if d := providerOverloadBackoff(h, 1); d != 2*time.Second {
 		t.Fatalf("retry1 = %v, want 2s", d)
 	}
 	h.Set("Retry-After", "3")
-	if d := claudeOverloadBackoff(h, 0); d != 3*time.Second {
+	if d := providerOverloadBackoff(h, 0); d != 3*time.Second {
 		t.Fatalf("retry-after 3 = %v, want 3s", d)
 	}
 	h.Set("Retry-After", "9999")
-	if d := claudeOverloadBackoff(h, 0); d != claudeOverloadMaxWait {
-		t.Fatalf("retry-after 9999 = %v, want cap %v", d, claudeOverloadMaxWait)
+	if d := providerOverloadBackoff(h, 0); d != providerOverloadMaxWait {
+		t.Fatalf("retry-after 9999 = %v, want cap %v", d, providerOverloadMaxWait)
 	}
 	if !claudeOverloadStatus(529) || !claudeOverloadStatus(500) || claudeOverloadStatus(429) || claudeOverloadStatus(200) {
 		t.Fatal("claudeOverloadStatus classification wrong")

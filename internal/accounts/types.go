@@ -25,7 +25,11 @@ const (
 	ProviderZAI         = account.ProviderZAI
 	ProviderAntigravity = account.ProviderAntigravity
 
-	ProviderOpenRouter = account.ProviderOpenRouter
+	ProviderOpenRouter  = account.ProviderOpenRouter
+	ProviderDeepSeek    = account.ProviderDeepSeek
+	ProviderTogether    = account.ProviderTogether
+	ProviderFireworks   = account.ProviderFireworks
+	ProviderOpenCodeZen = account.ProviderOpenCodeZen
 
 	ProviderGrok = account.ProviderGrok
 

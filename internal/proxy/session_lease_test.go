@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -267,6 +268,218 @@ func TestCodexSessionLeaseSkipsTerminalRefreshFailure(t *testing.T) {
 	assignment, ok := sessionStore.Get("pi", routingKey)
 	if !ok || assignment.AccountID != "healthy@example.com" {
 		t.Fatalf("sticky assignment = %+v, want healthy account", assignment)
+	}
+}
+
+func TestIdempotentSessionLeaseReplacesLeaseAfterTerminalAccountFailure(t *testing.T) {
+	request := sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}
+	const model = "gpt-5.4"
+	routingKey := sessionLeaseRoutingKey(request, accounts.ProviderCodex, model)
+	sessionStore := newSessionStore(t)
+	if _, err := sessionStore.Put("pi", routingKey, "stale@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := newSessionLeaseStore()
+	existing, err := leaseStore.put(sessionLease{
+		ScopeKey:       sessionLeaseScopeKey(request, accounts.ProviderCodex, model),
+		OrganizationID: request.OrganizationID,
+		WorkspaceID:    request.WorkspaceID,
+		ConversationID: request.ConversationID,
+		InvocationID:   request.InvocationID,
+		SessionKey:     routingKey,
+		Agent:          request.Agent,
+		Provider:       accounts.ProviderCodex,
+		AccountID:      "stale@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          model,
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "stale@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: leaseStore,
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			if account.ID == "stale@example.com" {
+				return account, &accounts.CodexStoredRefreshFailureError{Failure: accounts.CodexRefreshFailure{
+					StatusCode: http.StatusUnauthorized, ProviderCode: "refresh_token_reused",
+				}}
+			}
+			return account, nil
+		},
+	}.Handler()
+
+	got, _ := issueSessionLease(t, handler, "codex", "openai/"+model)
+	if got.LeaseID == existing.ID || got.Assignment.AccountID != "healthy@example.com" {
+		t.Fatalf("replacement lease = %+v id=%q, want a new lease on healthy account", got.Assignment, got.LeaseID)
+	}
+	assignment, ok := sessionStore.Get("pi", routingKey)
+	if !ok || assignment.AccountID != got.Assignment.AccountID {
+		t.Fatalf("sticky assignment %+v disagrees with returned lease %+v", assignment, got.Assignment)
+	}
+	if _, err := leaseStore.resolve(existing.Token); !errors.Is(err, errInvalidSessionLease) {
+		t.Fatalf("superseded account lease remained usable: %v", err)
+	}
+}
+
+func TestSessionLeaseRollsBackWhenStickyAssignmentCannotPersist(t *testing.T) {
+	requestPayload := sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}
+	const model = "gpt-5.4"
+	routingKey := sessionLeaseRoutingKey(requestPayload, accounts.ProviderCodex, model)
+	storePath := filepath.Join(t.TempDir(), "sessions.json")
+	sessionStore, err := session.NewStore(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionStore.Put("pi", routingKey, "stale@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(storePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(storePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := newSessionLeaseStore()
+	existing, err := leaseStore.put(sessionLease{
+		ScopeKey:       sessionLeaseScopeKey(requestPayload, accounts.ProviderCodex, model),
+		OrganizationID: requestPayload.OrganizationID,
+		WorkspaceID:    requestPayload.WorkspaceID,
+		ConversationID: requestPayload.ConversationID,
+		InvocationID:   requestPayload.InvocationID,
+		SessionKey:     routingKey,
+		Agent:          requestPayload.Agent,
+		Provider:       accounts.ProviderCodex,
+		AccountID:      "stale@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          model,
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "stale@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: leaseStore,
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			if account.ID == "stale@example.com" {
+				return account, &accounts.CodexStoredRefreshFailureError{Failure: accounts.CodexRefreshFailure{
+					StatusCode: http.StatusUnauthorized, ProviderCode: "refresh_token_reused",
+				}}
+			}
+			return account, nil
+		},
+	}.Handler()
+	req := newSessionLeaseRequest(t, "codex", "openai/"+model)
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", recorder.Code, recorder.Body.String())
+	}
+	leaseStore.mu.Lock()
+	leaseCount := len(leaseStore.byID)
+	leaseStore.mu.Unlock()
+	if leaseCount != 1 {
+		t.Fatalf("failed assignment changed scoped lease count to %d", leaseCount)
+	}
+	if resolved, err := leaseStore.resolve(existing.Token); err != nil || resolved.ID != existing.ID {
+		t.Fatalf("failed replacement did not preserve prior lease: lease=%+v err=%v", resolved, err)
+	}
+	assignment, ok := sessionStore.Get("pi", routingKey)
+	if !ok || assignment.AccountID != "stale@example.com" {
+		t.Fatalf("failed persistence changed sticky assignment: %+v", assignment)
+	}
+}
+
+func TestSessionLeaseDoesNotOverwriteConcurrentAssignmentMove(t *testing.T) {
+	requestPayload := sessionLeaseRequest{
+		OrganizationID: "organization-1", WorkspaceID: "workspace-1", ConversationID: "conversation-1",
+		InvocationID: "invocation-1", AgentSessionID: "agent-session-1", Agent: "pi",
+	}
+	const model = "gpt-5.4"
+	routingKey := sessionLeaseRoutingKey(requestPayload, accounts.ProviderCodex, model)
+	sessionStore := newSessionStore(t)
+	if _, err := sessionStore.Put("pi", routingKey, "stale@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := newSessionLeaseStore()
+	existing, err := leaseStore.put(sessionLease{
+		ScopeKey:       sessionLeaseScopeKey(requestPayload, accounts.ProviderCodex, model),
+		OrganizationID: requestPayload.OrganizationID,
+		WorkspaceID:    requestPayload.WorkspaceID,
+		ConversationID: requestPayload.ConversationID,
+		InvocationID:   requestPayload.InvocationID,
+		SessionKey:     routingKey,
+		Agent:          requestPayload.Agent,
+		Provider:       accounts.ProviderCodex,
+		AccountID:      "stale@example.com",
+		AuthMode:       accounts.AuthModeOAuth,
+		Model:          model,
+		ProxyBaseURL:   "http://subrouter:31415",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{
+			{ID: "stale@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale-token"},
+			{ID: "healthy@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "healthy-token"},
+			{ID: "forced@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "forced-token"},
+		},
+		Sessions:      sessionStore,
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: leaseStore,
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+		RefreshAccountFn: func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+			if account.ID == "stale@example.com" {
+				if _, err := sessionStore.Put("pi", routingKey, "forced@example.com", ""); err != nil {
+					t.Fatal(err)
+				}
+				return account, &accounts.CodexStoredRefreshFailureError{Failure: accounts.CodexRefreshFailure{
+					StatusCode: http.StatusUnauthorized, ProviderCode: "refresh_token_reused",
+				}}
+			}
+			return account, nil
+		},
+	}.Handler()
+	req := newSessionLeaseRequest(t, "codex", "openai/"+model)
+	req.RemoteAddr = "100.64.0.2:12345"
+	req.Header.Set("Authorization", "Bearer service-admin-token")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", recorder.Code, recorder.Body.String())
+	}
+	assignment, ok := sessionStore.Get("pi", routingKey)
+	if !ok || assignment.AccountID != "forced@example.com" {
+		t.Fatalf("concurrent assignment = %+v, want forced account unchanged", assignment)
+	}
+	if resolved, err := leaseStore.resolve(existing.Token); err != nil || resolved.ID != existing.ID {
+		t.Fatalf("concurrent move invalidated prior lease: lease=%+v err=%v", resolved, err)
 	}
 }
 

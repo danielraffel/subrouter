@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -16,6 +17,35 @@ func TestParseCredentialPayloadDecodesValidBlob(t *testing.T) {
 	}
 	if credential == nil || credential.AccessToken != "sk-ant-oat-secret" {
 		t.Fatalf("decoded credential did not round-trip: %+v", credential)
+	}
+}
+
+func TestParseCredentialPayloadDecodesMacOSKeychainHexData(t *testing.T) {
+	body := make([]byte, hex.EncodedLen(len(validCredentialPayload)))
+	hex.Encode(body, []byte(validCredentialPayload))
+	body = append(body, '\n')
+	credential, err := parseCredentialPayload(body, "keychain")
+	if err != nil {
+		t.Fatalf("hex keychain payload must decode: %v", err)
+	}
+	if credential == nil || credential.AccessToken != "sk-ant-oat-secret" {
+		t.Fatalf("decoded credential did not round-trip: %+v", credential)
+	}
+}
+
+func TestParseCredentialPayloadRejectsHexOutsideKeychain(t *testing.T) {
+	body := make([]byte, hex.EncodedLen(len(validCredentialPayload)))
+	hex.Encode(body, []byte(validCredentialPayload))
+	if _, err := parseCredentialPayload(body, "credentials file"); err == nil {
+		t.Fatal("hex text in a credential file must not be treated as keychain data")
+	}
+}
+
+func TestParseCredentialPayloadRejectsHexThatIsNotCredentialJSON(t *testing.T) {
+	body := make([]byte, hex.EncodedLen(len("not json")))
+	hex.Encode(body, []byte("not json"))
+	if _, err := parseCredentialPayload(body, "keychain"); err == nil {
+		t.Fatal("hex keychain data must decode to a complete credential payload")
 	}
 }
 

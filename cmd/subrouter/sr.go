@@ -18,11 +18,16 @@ import (
 	"time"
 	"unicode"
 
+	baseaccount "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 	"golang.org/x/term"
 )
 
@@ -52,6 +57,7 @@ Usage:
   sr add                Ask whether to add Codex or Claude
   sr add codex          Add Codex to the active local or hosted pool
   sr add claude         Add Claude to the active local or hosted pool
+  sr add grok           Add a Grok subscription to the local pool
   sr add-key            Add an API key account for Codex
   sr add-key --provider <name>
                         Add an API key account for another provider
@@ -63,8 +69,14 @@ Usage:
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  sr remove <email>     Remove a Codex account
+  sr remove <account>   Remove an account (for example qwen-token:large-plan)
   sr status             Show Codex and Claude usage (non-interactive)
+  sr qwen login [--console-account <email-or-label>] <account>
+                        Authorize live Lite/Pro and quota status for one Token Plan
+  sr kimi login <label> Add an isolated Kimi subscription account
+  sr kimi list          List Kimi CLI and managed subscription accounts
+  sr kimi remove <label>
+                        Remove one managed Kimi subscription account
   sr pick               Switch to the recommended account, failing if none has quota
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
@@ -149,6 +161,31 @@ type srRunner struct {
 	errOut  io.Writer
 	client  *http.Client
 	cmd     srCommandRunner
+	kimi    srKimiUsageStore
+	grok    srGrokStore
+}
+
+type srGrokStore interface {
+	Authorize(context.Context, *http.Client, io.Writer) (agentgrok.CredentialInfo, error)
+	SaveCredential(agentgrok.CredentialInfo) (baseaccount.Account, error)
+	RemoveCredential() (baseaccount.Account, bool, error)
+	ListAccounts(context.Context) ([]baseaccount.Account, error)
+	RefreshAccount(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, error)
+}
+
+type srGrokRefreshStore interface {
+	srGrokStore
+	RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error)
+}
+
+type srKimiUsageStore interface {
+	ListAccounts(context.Context) ([]baseaccount.Account, error)
+	FetchUsage(context.Context, *http.Client, baseaccount.Account) (string, []accounts.UsageWindow, error)
+}
+
+type srKimiRefreshStore interface {
+	srKimiUsageStore
+	RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error)
 }
 
 type srSwitchOptions struct {
@@ -165,9 +202,18 @@ type srUsageRow struct {
 	// probe. Negative means unknown.
 	providerModels     int
 	providerEndpoints  []string
+	keyFingerprint     string
+	assignedSessions   int
+	sessionsKnown      bool
 	email              string
 	active             bool
 	planType           string
+	quotaStatus        string
+	accountIdentity    string
+	displayAccount     string
+	showShortWindow    bool
+	showLongWindow     bool
+	quotaUsageKnown    bool
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
@@ -293,11 +339,15 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.switchAccount(ctx, selector, opts)
 	case "remove", "rm":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: subrouter remove <email>")
+			return fmt.Errorf("usage: subrouter remove <account>")
 		}
-		return r.remove(args[1])
+		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
+	case "qwen":
+		return r.qwen(ctx, args[1:])
+	case "kimi":
+		return r.kimiCommand(ctx, args[1:])
 	case "pick":
 		return r.pick(ctx, srSwitchOptions{})
 	case "reset":
@@ -428,6 +478,10 @@ func (r srRunner) runTeamCredentialCommand(
 			return true, err
 		}
 		return true, r.cloudAccountImport(ctx, client, args[1:])
+	case "qwen":
+		return true, r.cloudQwen(ctx, args[1:])
+	case "kimi":
+		return true, fmt.Errorf("hosted Kimi profile management is not available yet; use 'sr remote use local' or a self-hosted server")
 	case "remove", "rm":
 		return true, r.cloudAccount(ctx, args)
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "reset":
@@ -443,6 +497,12 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	command := args[0]
 	switch command {
 	case "add", "login":
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "kimi") || strings.EqualFold(args[1], "moonshot")) {
+			return r.kimiRemote(ctx, server, append([]string{"login"}, args[2:]...))
+		}
+		if command == "add" && len(args) > 1 && (strings.EqualFold(args[1], "grok") || strings.EqualFold(args[1], "xai")) {
+			return r.unsupportedRemoteCommand(command, server, "self-hosted Grok subscription import is not available yet; use 'sr remote use local' and then 'sr add grok'")
+		}
 		deviceAuth, err := parseRemoteAddArgs(command, args[1:])
 		if err != nil {
 			return err
@@ -463,6 +523,10 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		return r.pickRemoteAccount(ctx, server)
 	case "reset":
 		return r.reset(ctx, args[1:])
+	case "qwen":
+		return r.qwenRemote(ctx, server, args[1:])
+	case "kimi":
+		return r.kimiRemote(ctx, server, args[1:])
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use":
 		selector, _, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {
@@ -522,10 +586,49 @@ func (r srRunner) addProvider(ctx context.Context, args []string) error {
 		return r.add(ctx)
 	case "claude", "anthropic":
 		return r.claude(ctx, append([]string{"add"}, args[1:]...))
+	case "grok", "xai":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: %s add grok", r.programOrSubrouter())
+		}
+		return r.grokSignIn(ctx)
+	case "kimi", "moonshot":
+		label := ""
+		if len(args) > 1 {
+			label = args[1]
+		}
+		return r.kimiLogin(ctx, label)
 	default:
-		return fmt.Errorf("unknown provider %q; use '%s add codex' or '%s add claude'",
-			provider, r.program, r.program)
+		return fmt.Errorf("unknown provider %q; use '%s add codex', '%s add claude', '%s add kimi', or '%s add grok'",
+			provider, r.program, r.program, r.program, r.program)
 	}
+}
+
+func (r srRunner) grokStore() srGrokStore {
+	if r.grok != nil {
+		return r.grok
+	}
+	return agentgrok.DefaultStore()
+}
+
+// grokSignIn keeps Subrouter's routed subscription credential independent from
+// the Grok CLI's single global auth file. Human authorization happens before
+// the short account-disk transaction that makes the new credential visible to
+// running workers.
+func (r srRunner) grokSignIn(ctx context.Context) error {
+	store := r.grokStore()
+	credential, err := store.Authorize(ctx, r.client, r.out)
+	if err != nil {
+		return fmt.Errorf("Grok login failed: %w", err)
+	}
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		_, saveErr := store.SaveCredential(credential)
+		return saveErr == nil, saveErr
+	})
+	if err != nil {
+		return fmt.Errorf("signed in but could not publish the Grok credential: %w", err)
+	}
+	fmt.Fprintln(r.out, "Added Grok subscription account. Run: sr status")
+	return nil
 }
 
 // promptProvider asks which provider to attach. A non-interactive caller gets
@@ -989,6 +1092,10 @@ func recommendedUsableUsageRow(rows []srUsageRow) *srUsageRow {
 }
 
 func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
+	kimiStore := r.kimi
+	if kimiStore == nil {
+		kimiStore = agentkimi.DefaultStore()
+	}
 	all, err := r.store.ListStored()
 	if err != nil {
 		return nil, err
@@ -1010,6 +1117,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		if account.IsAPIKey() {
 			rowProvider := rows[i].provider
 			rows[i].authMode = accounts.AuthModeAPIKey
+			rows[i].keyFingerprint = accounts.APIKeyFingerprint(account.Auth.OpenAIAPIKey)
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
 			rows[i].planType = apiKeyPlanLabel(rowProvider)
 			rows[i].providerModels = -1
@@ -1022,6 +1130,69 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			}
 			if metering := proxy.ProviderMetering(rowProvider); metering != "" {
 				rows[i].planType = metering
+			}
+			if rowProvider == accounts.ProviderQwenToken {
+				wg.Add(1)
+				go func(idx int, accountID string) {
+					defer wg.Done()
+					hasCredential, credentialErr := agentqwen.HasConsoleCredential(accountID)
+					if credentialErr != nil {
+						rows[idx].quotaStatus = "error"
+						return
+					}
+					if !hasCredential {
+						rows[idx].quotaStatus = "login needed"
+						return
+					}
+					usage, usageErr := agentqwen.FetchUsage(ctx, r.client, accountID)
+					subscription, subscriptionErr := agentqwen.FetchSubscription(ctx, r.client, accountID)
+					if subscriptionErr == nil {
+						rows[idx].planType = subscription.Plan
+						rows[idx].accountIdentity = agentqwen.ConsoleAccount(accountID)
+						if rows[idx].accountIdentity == "" {
+							rows[idx].accountIdentity = subscription.InstanceCode
+						}
+						if subscription.Status != "" && subscription.Status != "valid" {
+							rows[idx].quotaStatus = subscription.Status
+						} else {
+							rows[idx].quotaStatus = "live"
+						}
+					}
+					if usageErr == nil {
+						rows[idx].quotaUsageKnown = true
+						if usage.FiveHour != nil {
+							rows[idx].windows = append(rows[idx].windows, *usage.FiveHour)
+						}
+						if usage.Weekly != nil {
+							rows[idx].windows = append(rows[idx].windows, *usage.Weekly)
+						}
+					}
+					if usageErr != nil || subscriptionErr != nil {
+						rows[idx].err = errors.Join(usageErr, subscriptionErr)
+						if usageErr != nil && subscriptionErr != nil {
+							rows[idx].quotaStatus = "error"
+						} else if subscriptionErr != nil || subscription.Status == "" || subscription.Status == "valid" {
+							rows[idx].quotaStatus = "partial"
+						}
+					}
+				}(i, account.Email)
+			}
+			if rowProvider == accounts.ProviderKimi {
+				wg.Add(1)
+				go func(idx int, token string) {
+					defer wg.Done()
+					plan, windows, usageErr := kimiStore.FetchUsage(ctx, r.client, baseaccount.Account{Token: token})
+					if usageErr != nil {
+						// Some Kimi keys authorize generation without exposing
+						// membership quota. A missing quota view must not turn an
+						// otherwise usable key into an authentication error.
+						return
+					}
+					rows[idx].planType = plan + " key"
+					rows[idx].windows = windows
+					rows[idx].quotaStatus = "live"
+					rows[idx].quotaUsageKnown = true
+				}(i, account.Auth.OpenAIAPIKey)
 			}
 			rows[i].apiKeyHint = r.apiKeyHint(account, admins)
 			if admin, ok, err := r.store.PickAdminKeyFor(account); err == nil && ok {
@@ -1064,6 +1235,131 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		}()
 	}
 	wg.Wait()
+	kimiAccounts, kimiErr := kimiStore.ListAccounts(ctx)
+	if kimiErr != nil {
+		rows = append(rows, srUsageRow{
+			email: "kimi", displayAccount: "credential source", provider: accounts.ProviderKimi,
+			authMode: accounts.AuthModeOAuth, planType: "subscription", err: kimiErr,
+			score: selectacct.Score{AccountID: "kimi"},
+		})
+	}
+	kimiOffset := len(rows)
+	for _, account := range kimiAccounts {
+		accountID := strings.TrimSpace(account.ID)
+		if accountID == "" {
+			accountID = "kimi-code"
+		}
+		rows = append(rows, srUsageRow{
+			email: accountID, displayAccount: strings.TrimSpace(account.Label), provider: accounts.ProviderKimi,
+			authMode: accounts.AuthModeOAuth, planType: "subscription",
+			score: selectacct.Score{AccountID: accountID, Headroom: 1, ShortHeadroom: 1},
+		})
+	}
+	// Finalize the slice before workers receive row indices. Appending another
+	// Kimi row while a worker writes rows[idx] could reallocate the backing
+	// array and race the slice header or strand an update in the old allocation.
+	for i, account := range kimiAccounts {
+		rowIndex := kimiOffset + i
+		wg.Add(1)
+		go func(idx int, acct baseaccount.Account) {
+			defer wg.Done()
+			if refresher, ok := kimiStore.(srKimiRefreshStore); ok {
+				var refreshed baseaccount.Account
+				refreshErr := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+					var didRefresh bool
+					var err error
+					refreshed, didRefresh, err = refresher.RefreshAccountIfNeeded(ctx, r.client, acct)
+					return didRefresh, err
+				})
+				if refreshErr != nil {
+					rows[idx].err = refreshErr
+					rows[idx].score = selectacct.Score{AccountID: rows[idx].email}
+					return
+				}
+				acct = refreshed
+			}
+			plan, windows, usageErr := kimiStore.FetchUsage(ctx, r.client, acct)
+			if plan != "" {
+				rows[idx].planType = plan
+			}
+			if usageErr != nil {
+				rows[idx].err = usageErr
+				rows[idx].score = selectacct.Score{AccountID: rows[idx].email}
+				return
+			}
+			rows[idx].windows = windows
+			rows[idx].score = scoreFromWindows(rows[idx].email, windows)
+			rows[idx].cooked, rows[idx].cookedReason = cookedFromWindows(windows)
+			rows[idx].tempCooked, rows[idx].tempCookedReason = tempCookedFromWindows(windows)
+		}(rowIndex, account)
+	}
+	wg.Wait()
+	grokStore := r.grokStore()
+	grokAccounts, grokErr := grokStore.ListAccounts(ctx)
+	if grokErr != nil {
+		rows = append(rows, srUsageRow{
+			email: "grok", displayAccount: "credential source", provider: accounts.ProviderGrok,
+			authMode: accounts.AuthModeOAuth, planType: "subscription", err: grokErr,
+			score: selectacct.Score{AccountID: "grok"},
+		})
+	}
+	for _, account := range grokAccounts {
+		accountID := strings.TrimSpace(account.ID)
+		if accountID == "" {
+			accountID = "grok-subscription"
+		}
+		display := strings.TrimSpace(account.Email)
+		if display == "" {
+			display = strings.TrimSpace(account.Label)
+		}
+		row := srUsageRow{
+			email: accountID, displayAccount: display, provider: accounts.ProviderGrok,
+			authMode: accounts.AuthModeOAuth, planType: "subscription",
+			score: selectacct.Score{AccountID: accountID, Headroom: 1, ShortHeadroom: 1},
+		}
+		var refreshed baseaccount.Account
+		var refreshErr error
+		if refresher, ok := grokStore.(srGrokRefreshStore); ok {
+			refreshErr = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+				var didRefresh bool
+				refreshed, didRefresh, refreshErr = refresher.RefreshAccountIfNeeded(ctx, r.client, account)
+				return didRefresh, refreshErr
+			})
+		} else {
+			refreshed, refreshErr = grokStore.RefreshAccount(ctx, r.client, account)
+		}
+		if refreshErr != nil {
+			row.err = refreshErr
+			row.score = selectacct.Score{AccountID: accountID}
+		} else {
+			row.providerHealth = "auth ok"
+			if identity := strings.TrimSpace(refreshed.Email); identity != "" {
+				row.displayAccount = identity
+			}
+		}
+		rows = append(rows, row)
+	}
+	for i := range rows {
+		if (rows[i].provider != accounts.ProviderQwenToken && rows[i].provider != accounts.ProviderKimi) || !rows[i].quotaUsageKnown {
+			continue
+		}
+		rows[i].score = scoreFromWindows(rows[i].email, rows[i].windows)
+		rows[i].cooked, rows[i].cookedReason = cookedFromWindows(rows[i].windows)
+		rows[i].tempCooked, rows[i].tempCookedReason = tempCookedFromWindows(rows[i].windows)
+	}
+	if sessionStore, sessionErr := session.NewStore(session.DefaultStorePath()); sessionErr == nil {
+		counts := proxy.SchedulerSessionCounts(sessionStore)
+		for i := range rows {
+			if rows[i].authMode == accounts.AuthModeAPIKey ||
+				((rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok) && rows[i].authMode == accounts.AuthModeOAuth) {
+				rows[i].assignedSessions = counts[selectacct.ScoreKey(rows[i].provider, rows[i].email)]
+				rows[i].sessionsKnown = true
+				if rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok {
+					rows[i].active = rows[i].assignedSessions > 0
+				}
+			}
+		}
+	}
 	claudeStore := agentclaude.DefaultStore()
 	claudeProfiles := claudeStore.ListProfiles()
 	claudeOffset := len(rows)
@@ -1172,13 +1468,61 @@ func (r srRunner) reportCodexGUIRestart(ctx context.Context) error {
 	return nil
 }
 
-func (r srRunner) remove(selector string) error {
-	account, ok, err := r.store.RemoveStored(selector)
+func (r srRunner) remove(ctx context.Context, selector string) error {
+	if strings.TrimSpace(selector) == "grok-subscription" {
+		var removed baseaccount.Account
+		var ok bool
+		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+			var removeErr error
+			removed, ok, removeErr = r.grokStore().RemoveCredential()
+			return ok, removeErr
+		})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no Grok subscription account found")
+		}
+		fmt.Fprintf(r.out, "Removed account: %s\n", removed.ID)
+		return nil
+	}
+	if strings.HasPrefix(strings.TrimSpace(selector), "kimi-subscription:") {
+		var removed baseaccount.Account
+		var ok bool
+		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+			var removeErr error
+			removed, ok, removeErr = agentkimi.DefaultStore().RemoveManagedAccountID(selector)
+			return ok, removeErr
+		})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no managed Kimi account found matching %q", selector)
+		}
+		fmt.Fprintf(r.out, "Removed account: %s\n", removed.ID)
+		return nil
+	}
+	account, ok, err := r.store.FindStored(selector)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
+	}
+	if account.ProviderOrDefault() == accounts.ProviderQwenToken {
+		root := agentqwen.ConsoleRootForStore(r.store)
+		if err := agentqwen.RemoveConsoleCredentialIn(root, account.Email); err != nil {
+			return fmt.Errorf("could not remove Qwen console credential: %w", err)
+		}
+	}
+	accountID := account.Email
+	account, ok, err = r.store.RemoveStored(accountID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("account %q changed while it was being removed", accountID)
 	}
 	fmt.Fprintf(r.out, "Removed account: %s\n", account.Email)
 	return nil
@@ -1733,20 +2077,49 @@ func rankUsageRows(rows []srUsageRow) {
 		if ao != bo {
 			return ao < bo
 		}
+		// Every printed heading must occupy one contiguous run. Providers beyond
+		// Codex and Claude share the broad ordering tier above, while Kimi further
+		// splits OAuth subscriptions from API keys; comparing the actual heading
+		// keeps those groups from interleaving by account label.
+		if al, bl := usageProviderLabel(a), usageProviderLabel(b); al != bl {
+			return al < bl
+		}
 		if usageProvider(a) == accounts.ProviderClaude {
 			return claudeUsageRowLess(a, b)
 		}
 		return codexUsageRowLess(a, b)
 	})
-	recommended := false
+	recommended := map[string]bool{}
 	for i := range rows {
 		rows[i].gtoRecommended = false
-		if !recommended && recommendedForNewSession(rows[i]) {
+		group := usageProviderLabel(rows[i])
+		if !recommended[group] && displayRecommendedForNewSession(rows[i]) {
 			rows[i].gtoRecommended = true
-			recommended = true
+			recommended[group] = true
 		}
 		rows[i].gtoReason = gtoReason(rows[i])
 	}
+}
+
+func displayRecommendedForNewSession(row srUsageRow) bool {
+	if usageProvider(row) == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+		return row.err == nil && !row.cooked && !row.tempCooked && usableForNewSession(row.score)
+	}
+	if usageProvider(row) == accounts.ProviderQwenToken {
+		healthUsable := row.providerHealth == "auth ok" ||
+			(row.providerHealth == "" && (row.quotaStatus == "live" || row.quotaStatus == "partial"))
+		return row.err == nil && row.authMode == accounts.AuthModeAPIKey &&
+			healthUsable && row.quotaUsageKnown &&
+			!row.cooked && !row.tempCooked && usableForNewSession(row.score)
+	}
+	if usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth {
+		return row.err == nil && row.providerHealth == "auth ok"
+	}
+	if isKeyedProviderSection(usageProvider(row)) {
+		return row.err == nil && row.authMode == accounts.AuthModeAPIKey &&
+			row.providerHealth == "auth ok" && !row.cooked && !row.tempCooked
+	}
+	return recommendedForNewSession(row)
 }
 
 func codexUsageRowLess(a, b srUsageRow) bool {
@@ -1824,11 +2197,19 @@ func usageProviderOrder(row srUsageRow) int {
 }
 
 func usageProviderLabel(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderKimi {
+		if row.authMode == accounts.AuthModeOAuth {
+			return "Kimi subscription accounts"
+		}
+		return "Kimi API-key accounts"
+	}
 	switch usageProvider(row) {
 	case accounts.ProviderCodex:
 		return "Codex accounts"
 	case accounts.ProviderClaude:
 		return "Claude profiles"
+	case accounts.ProviderQwenToken:
+		return "Qwen accounts"
 	default:
 		return providerDisplayName(usageProvider(row)) + " accounts"
 	}
@@ -1937,12 +2318,40 @@ func displayUsageRowsPerGroup(out io.Writer, rows []srUsageRow) {
 
 func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNumbers bool, colored bool) {
 	fmt.Fprintln(out)
+	identityCounts := map[string]int{}
+	qwenShortWindow := map[string]bool{}
+	qwenLongWindow := map[string]bool{}
+	for _, row := range rows {
+		if usageProvider(row) != accounts.ProviderQwenToken {
+			continue
+		}
+		group := usageProviderLabel(row)
+		if row.accountIdentity != "" {
+			identityCounts[group+"\x00"+row.accountIdentity]++
+		}
+		if usageGridShortWindowCell(row).Text != "" {
+			qwenShortWindow[group] = true
+		}
+		if usageGridWindowCell(row.windows, isLongQuotaWindow).Text != "" {
+			qwenLongWindow[group] = true
+		}
+	}
 	currentGroup := ""
 	accountRowIndex := 0
 	groupRowIndex := 0
 	for i, row := range rows {
 		group := usageProviderLabel(row)
-		columns := usageGridColumns(out, numbered, usageProvider(row))
+		if usageProvider(row) == accounts.ProviderQwenToken {
+			row.showShortWindow = qwenShortWindow[group]
+			row.showLongWindow = qwenLongWindow[group]
+			if row.accountIdentity != "" {
+				row.displayAccount = row.accountIdentity
+				if identityCounts[group+"\x00"+row.accountIdentity] > 1 {
+					row.displayAccount += " (" + displayUsageSavedAccountName(row) + ")"
+				}
+			}
+		}
+		columns := usageGridColumns(out, numbered, row)
 		if group != currentGroup {
 			if currentGroup != "" {
 				fmt.Fprintln(out)
@@ -2056,10 +2465,11 @@ func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string,
 	fmt.Fprintln(out, style(colored, ansiBold+ansiDim, fitCell(label, usageGridWidth(columns))))
 }
 
-func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) []usageGridColumn {
+func usageGridColumns(out io.Writer, numbered bool, row srUsageRow) []usageGridColumn {
+	provider := usageProvider(row)
 	termWidth := terminalColumns(out)
 	accountWidth := 22
-	planWidth := 6
+	planWidth := 8
 	stateWidth := 10
 	pickWidth := 22
 	windowWidth := 9
@@ -2067,7 +2477,7 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 	sparkWidth := 8
 	if termWidth < 100 {
 		accountWidth = 20
-		planWidth = 4
+		planWidth = 6
 		stateWidth = 14
 		pickWidth = 16
 		windowWidth = 7
@@ -2092,18 +2502,40 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
-	} else if isKeyedProviderSection(provider) {
-		// These vendors publish no quota or reset API, so the Codex windows and
-		// the scheduler's "Use" advice would always be empty or misleading.
-		// Show what is actually knowable instead: how the plan is metered, the
-		// validation state, what it can reach, and an explicit note that quota is
-		// not exposed. Plan is widened because a metering
-		// description is a phrase, not a tier name.
+	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
 		columns = dropUsageGridColumn(columns, "Pick")
-		setUsageGridColumnWidth(columns, "Plan", 24)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Models", Title: "Models", Width: 6}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Endpoints", Title: "Endpoints", Width: 28}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Quota", Title: "Quota", Width: 11}, termWidth)
+		columns = dropUsageGridColumn(columns, "Plan")
+		columns = append(columns,
+			usageGridColumn{Key: "5h", Title: "5h", Width: 12},
+			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12},
+		)
+	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeAPIKey && row.quotaUsageKnown {
+		columns = append(columns,
+			usageGridColumn{Key: "5h", Title: "5h", Width: 12},
+			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12},
+		)
+	} else if provider == accounts.ProviderQwenToken && row.authMode == accounts.AuthModeAPIKey {
+		// Token Plan names are longer than the generic API-key plan labels, while
+		// their Use text is compact. Reserve enough space to show Lite, Standard,
+		// and Pro without truncating the vendor-owned plan identity.
+		for i := range columns {
+			switch columns[i].Key {
+			case "Plan":
+				columns[i].Width = 19
+			case "Pick":
+				columns[i].Width = 18
+			}
+		}
+		if row.showShortWindow {
+			columns = append(columns, usageGridColumn{Key: "5h", Title: "5h", Width: 12})
+		}
+		if row.showLongWindow {
+			columns = append(columns, usageGridColumn{Key: "7d", Title: "7d", Width: 12})
+		}
+	} else if isKeyedProviderSection(provider) {
+		// API-key providers without a quota API use the same compact account,
+		// plan, routing-state, and use vocabulary as the subscription tables.
+		// Do not substitute model/endpoint inventory for unavailable quota data.
 	} else {
 		columns = append(columns,
 			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
@@ -2133,15 +2565,18 @@ func usageGridColumns(out io.Writer, numbered bool, provider accounts.Provider) 
 func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	return map[string]usageGridCell{
 		"#":         {Text: rowIndex, Style: ansiDim},
-		"Account":   {Text: displayAccountName(row.email), Style: ansiBold + ansiWhite},
-		"Plan":      {Text: row.planType, Style: ansiDim},
+		"Account":   {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
+		"Plan":      {Text: usageGridPlan(row), Style: ansiDim},
+		"Login":     {Text: row.accountIdentity, Style: ansiDim},
 		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Key ID":    {Text: row.keyFingerprint, Style: ansiDim},
+		"Sessions":  {Text: usageGridSessions(row), Style: ansiDim},
 		"Models":    {Text: usageGridModels(row), Style: ansiDim},
-		"Endpoints": {Text: usageGridEndpoints(row), Style: ansiDim},
-		"Quota":     {Text: "not exposed", Style: ansiDim},
+		"Endpoints": {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
+		"Quota":     {Text: usageGridProviderQuota(row), Style: ansiDim},
 		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-		"5h":        usageGridShortWindowCell(row),
-		"7d":        usageGridWindowCell(row.windows, isLongQuotaWindow),
+		"5h":        usageGridProviderShortWindowCell(row),
+		"7d":        usageGridProviderLongWindowCell(row),
 		"Reset":     usageGridResetCell(row),
 		"Spark":     usageGridShortNamedWindowCell(row),
 		"Spark wk":  usageGridNamedWindowCell(row.windows, true),
@@ -2153,6 +2588,53 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
 	}
+}
+
+func usageGridPlan(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderQwenToken {
+		plan := strings.TrimSpace(row.planType)
+		if plan == "" || strings.HasPrefix(strings.ToLower(plan), "token plan") {
+			return plan
+		}
+		return "Token Plan " + plan
+	}
+	if row.authMode != accounts.AuthModeAPIKey || !isKeyedProviderSection(usageProvider(row)) || usageProvider(row) == accounts.ProviderQwenToken {
+		return row.planType
+	}
+	lower := strings.ToLower(row.planType)
+	if strings.Contains(lower, "credit") {
+		return "credits"
+	}
+	return "API key"
+}
+
+func usageGridSessions(row srUsageRow) string {
+	if !row.sessionsKnown {
+		return "?"
+	}
+	return strconv.Itoa(row.assignedSessions)
+}
+
+func usageGridProviderQuota(row srUsageRow) string {
+	if row.quotaStatus != "" {
+		return row.quotaStatus
+	}
+	switch usageProvider(row) {
+	case accounts.ProviderKimi:
+		return "OAuth only"
+	case accounts.ProviderQwen, accounts.ProviderQwenToken, accounts.ProviderQwenAnthropic:
+		return "console only"
+	default:
+		return "not exposed"
+	}
+}
+
+func usageGridProviderShortWindowCell(row srUsageRow) usageGridCell {
+	return usageGridShortWindowCell(row)
+}
+
+func usageGridProviderLongWindowCell(row srUsageRow) usageGridCell {
+	return usageGridWindowCell(row.windows, isLongQuotaWindow)
 }
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
@@ -2275,6 +2757,74 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if (usageProvider(row) == accounts.ProviderKimi || usageProvider(row) == accounts.ProviderGrok) && row.authMode == accounts.AuthModeOAuth {
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.gtoRecommended {
+			states = append(states, "rec")
+		}
+		if row.cooked {
+			states = append(states, "cooked")
+		} else if row.tempCooked {
+			states = append(states, "temp")
+		}
+		if row.err != nil {
+			states = append(states, "error")
+		}
+		if len(states) == 0 {
+			return "ready"
+		}
+		return strings.Join(states, ", ")
+	}
+	if usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus != "" {
+		if row.providerHealth != "" && row.providerHealth != "auth ok" {
+			return row.providerHealth
+		}
+		if row.quotaStatus != "live" && row.quotaStatus != "partial" {
+			return row.quotaStatus
+		}
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.gtoRecommended {
+			states = append(states, "rec")
+		}
+		if row.err != nil {
+			states = append(states, "error")
+		}
+		if len(states) > 0 {
+			return strings.Join(states, ", ")
+		}
+		if row.providerHealth == "auth ok" {
+			return "ready"
+		}
+		return "quota live"
+	}
+	if isKeyedProviderSection(usageProvider(row)) && row.authMode == accounts.AuthModeAPIKey {
+		if row.providerHealth != "" && row.providerHealth != "auth ok" {
+			return row.providerHealth
+		}
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.gtoRecommended {
+			states = append(states, "rec")
+		}
+		if row.err != nil {
+			states = append(states, "error")
+		}
+		if len(states) > 0 {
+			return strings.Join(states, ", ")
+		}
+		if row.providerHealth == "auth ok" {
+			return "ready"
+		}
+		return "unchecked"
+	}
 	// For a keyed provider the useful state is whether the key still works,
 	// not the Codex scheduler's view of it: none of the Codex states apply to a
 	// vendor that publishes no quota.
@@ -2305,7 +2855,11 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
-	case row.providerHealth != "" && row.providerHealth != "ok" && row.providerHealth != "not checked":
+	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "error":
+		return ansiRed
+	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "live" && row.providerHealth == "":
+		return ansiDim
+	case row.providerHealth != "" && row.providerHealth != "auth ok" && row.providerHealth != "ok" && row.providerHealth != "not checked":
 		return ansiRed
 	case row.err != nil || row.cooked:
 		return ansiRed
@@ -2324,7 +2878,7 @@ func usageGridPickColor(row srUsageRow) string {
 	switch {
 	case row.err != nil || row.cooked:
 		return ansiRed
-	case row.tempCooked || !recommendedForNewSession(row):
+	case row.tempCooked || !displayRecommendedForNewSession(row):
 		if usageProvider(row) == accounts.ProviderClaude {
 			return ""
 		}
@@ -2352,6 +2906,15 @@ func compactPickReason(row srUsageRow) string {
 	}
 	if row.tempCooked {
 		return "temp cooked, cannot start"
+	}
+	if usageProvider(row) == accounts.ProviderQwenToken && row.quotaUsageKnown && len(row.windows) > 0 {
+		return fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
+	}
+	if isKeyedProviderSection(usageProvider(row)) {
+		if usageProvider(row) == accounts.ProviderKimi {
+			return "OAuth quota only"
+		}
+		return "quota not exposed"
 	}
 	if row.authMode == accounts.AuthModeAPIKey {
 		return "API key fallback"
@@ -2765,6 +3328,22 @@ func displayAccountName(email string) string {
 		return strings.TrimPrefix(email, "apikey:") + " (api key)"
 	}
 	return email
+}
+
+func displayUsageAccountName(row srUsageRow) string {
+	if row.displayAccount != "" {
+		return row.displayAccount
+	}
+	return displayUsageSavedAccountName(row)
+}
+
+func displayUsageSavedAccountName(row srUsageRow) string {
+	name := displayAccountName(row.email)
+	if !isKeyedProviderSection(usageProvider(row)) {
+		return name
+	}
+	prefix := string(usageProvider(row)) + ":"
+	return strings.TrimPrefix(name, prefix)
 }
 
 func formatDate(value string) string {

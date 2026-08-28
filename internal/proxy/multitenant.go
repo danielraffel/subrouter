@@ -16,6 +16,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -244,6 +245,7 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 	}
 	if strings.HasPrefix(path, "/_subrouter/accounts/") ||
 		path == "/_subrouter/account-import" ||
+		path == "/_subrouter/qwen-console" ||
 		path == "/_subrouter/reload-accounts" {
 		return key.Allows(tenant.CapabilityManageAccounts)
 	}
@@ -376,6 +378,7 @@ var tenantControlPaths = map[string]bool{
 	"/_subrouter/sessions":        true,
 	"/_subrouter/reload-accounts": true, // loopback-only inside the Server handler
 	"/_subrouter/account-import":  true,
+	"/_subrouter/qwen-console":    true,
 }
 
 func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
@@ -406,6 +409,10 @@ func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
 		}
 		if r.URL.Path == "/_subrouter/accounts/migration/rollback" && r.Method == http.MethodPost {
 			handleTenantMigrationRollback(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/qwen-console" && r.Method == http.MethodPost {
+			server.handleQwenConsoleImport(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/_subrouter/accounts/") && r.Method == http.MethodDelete {
@@ -1113,11 +1120,22 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		return
 	}
 	removed := false
-	if _, ok, err := server.AccountRef.store.RemoveStored(id); err != nil {
+	stored, ok, err := server.AccountRef.store.FindStored(id)
+	if err != nil {
 		http.Error(w, "remove account", http.StatusInternalServerError)
 		return
-	} else if ok {
-		removed = true
+	}
+	if ok {
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			if err := agentqwen.RemoveConsoleCredentialIn(server.AccountRef.qwenRoot(), stored.Email); err != nil {
+				http.Error(w, "remove Qwen console credential", http.StatusInternalServerError)
+				return
+			}
+		}
+		if _, removed, err = server.AccountRef.store.RemoveStored(stored.Email); err != nil {
+			http.Error(w, "remove account", http.StatusInternalServerError)
+			return
+		}
 	}
 	if ok, err := server.AccountRef.claudeStore.RemoveProfile(id); err != nil {
 		http.Error(w, "remove account", http.StatusInternalServerError)

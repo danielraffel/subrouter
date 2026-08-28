@@ -29,6 +29,9 @@ type Config struct {
 	Scope    string
 	// ExtraAuthParams are provider-specific fields on the device-code request.
 	ExtraAuthParams map[string]string
+	// Headers are provider-required client identity fields sent on device-code,
+	// polling, and refresh requests.
+	Headers map[string]string
 }
 
 // Code is the device-authorization response. The caller shows UserCode and
@@ -106,7 +109,7 @@ func RequestCode(ctx context.Context, client *http.Client, cfg Config, now time.
 	for key, value := range cfg.ExtraAuthParams {
 		form.Set(key, value)
 	}
-	body, err := postForm(ctx, client, cfg.DeviceAuthURL, form)
+	body, err := postForm(ctx, client, cfg.DeviceAuthURL, form, cfg.Headers)
 	if err != nil {
 		return Code{}, err
 	}
@@ -173,7 +176,7 @@ func Poll(ctx context.Context, client *http.Client, cfg Config, code Code, sleep
 		if cfg.ClientSecret != "" {
 			form.Set("client_secret", cfg.ClientSecret)
 		}
-		token, retry, err := exchange(ctx, client, cfg.TokenURL, form, now())
+		token, retry, err := exchange(ctx, client, cfg, form, now())
 		if err == nil {
 			return token, nil
 		}
@@ -199,7 +202,7 @@ func Refresh(ctx context.Context, client *http.Client, cfg Config, refreshToken 
 	if cfg.ClientSecret != "" {
 		form.Set("client_secret", cfg.ClientSecret)
 	}
-	token, _, err := exchange(ctx, client, cfg.TokenURL, form, now)
+	token, _, err := exchange(ctx, client, cfg, form, now)
 	if err != nil {
 		return Token{}, err
 	}
@@ -219,8 +222,8 @@ var errAuthorizationPending = errors.New("authorization_pending")
 
 // exchange posts a token request and classifies the response. retry reports
 // whether Poll should keep waiting.
-func exchange(ctx context.Context, client *http.Client, tokenURL string, form url.Values, now time.Time) (token Token, retry bool, err error) {
-	body, httpErr := postForm(ctx, client, tokenURL, form)
+func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Values, now time.Time) (token Token, retry bool, err error) {
+	body, httpErr := postForm(ctx, client, cfg.TokenURL, form, cfg.Headers)
 	var parsed tokenResponse
 	if len(body) > 0 {
 		_ = json.Unmarshal(body, &parsed)
@@ -260,7 +263,7 @@ func exchange(ctx context.Context, client *http.Client, tokenURL string, form ur
 	return token, false, nil
 }
 
-func postForm(ctx context.Context, client *http.Client, endpoint string, form url.Values) ([]byte, error) {
+func postForm(ctx context.Context, client *http.Client, endpoint string, form url.Values, headers map[string]string) ([]byte, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -270,6 +273,11 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	for name, value := range headers {
+		if strings.TrimSpace(name) != "" && strings.TrimSpace(value) != "" {
+			req.Header.Set(name, value)
+		}
+	}
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err

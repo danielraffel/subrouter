@@ -1,17 +1,13 @@
 package proxy
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -131,8 +127,12 @@ type keyedProvider struct {
 	// means editing every copy, and account listings double-count one
 	// subscription. Empty means the provider owns its own accounts.
 	AccountProvider accounts.Provider
-	// Upstream reads this provider's configured base URL off the server.
-	Upstream func(Server) *url.URL
+	// Upstream reads this provider's configured base URL off the server for
+	// the account's auth mode. Most providers have one upstream regardless of
+	// mode; a provider whose subscription and API-key traffic terminate at
+	// different hosts (Grok: cli-chat-proxy.grok.com vs api.x.ai) switches on
+	// the mode rather than growing a second registry entry for one provider.
+	Upstream func(s Server, mode accounts.AuthMode) *url.URL
 }
 
 // builtinKeyedProviders are the providers this build ships. Adding one means
@@ -155,7 +155,7 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseAPI:               "anthropic-messages",
 		LeasePath:              "/kimi/v1/messages",
 		LeaseEnv:               leaseEnvAnthropic,
-		Upstream:               func(s Server) *url.URL { return s.KimiUpstream },
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.KimiUpstream },
 	},
 	{
 		Provider:        accounts.ProviderZAI,
@@ -170,13 +170,13 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseAPI:        "openai-completions",
 		LeasePath:       "/zai/chat/completions",
 		LeaseEnv:        leaseEnvOpenAI,
-		Upstream:        func(s Server) *url.URL { return s.ZAIUpstream },
+		Upstream:        func(s Server, _ accounts.AuthMode) *url.URL { return s.ZAIUpstream },
 	},
 	{
 		Provider:        accounts.ProviderOpenRouter,
 		DefaultUpstream: "https://openrouter.ai/api/v1",
 		Metering:        "credits, per token",
-		HealthPath:      "/models",
+		HealthPath:      "/key",
 		PathPrefix:      "openrouter",
 		Aliases:         []string{"open-router"},
 		PlanLabel:       "openrouter api key",
@@ -188,7 +188,69 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseAPI:               "openai-completions",
 		LeasePath:              "/openrouter/chat/completions",
 		LeaseEnv:               leaseEnvOpenAI,
-		Upstream:               func(s Server) *url.URL { return s.OpenRouterUpstream },
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.OpenRouterUpstream },
+	},
+	{
+		Provider:               accounts.ProviderDeepSeek,
+		DefaultUpstream:        "https://api.deepseek.com",
+		Metering:               "credits, per token",
+		HealthPath:             "/models",
+		PathPrefix:             "deepseek",
+		ModelPrefix:            "deepseek-",
+		PlanLabel:              "deepseek api key",
+		Auth:                   authBearer,
+		CollapseVersionSegment: true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/deepseek/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.DeepSeekUpstream },
+	},
+	{
+		Provider:               accounts.ProviderTogether,
+		DefaultUpstream:        "https://api.together.ai/v1",
+		Metering:               "credits, per token",
+		HealthPath:             "/models",
+		PathPrefix:             "together",
+		Aliases:                []string{"together-ai"},
+		PlanLabel:              "together api key",
+		Auth:                   authBearer,
+		CollapseVersionSegment: true,
+		VendorPrefixedModels:   true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/together/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.TogetherUpstream },
+	},
+	{
+		Provider:               accounts.ProviderFireworks,
+		DefaultUpstream:        "https://api.fireworks.ai/inference/v1",
+		Metering:               "credits, per token",
+		HealthPath:             "/models",
+		PathPrefix:             "fireworks",
+		Aliases:                []string{"fireworks-ai"},
+		PlanLabel:              "fireworks api key",
+		Auth:                   authBearer,
+		CollapseVersionSegment: true,
+		VendorPrefixedModels:   true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/fireworks/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.FireworksUpstream },
+	},
+	{
+		Provider:               accounts.ProviderOpenCodeZen,
+		DefaultUpstream:        "https://opencode.ai/zen/v1",
+		Metering:               "credits, per request",
+		HealthPath:             "/models",
+		PathPrefix:             "opencode-zen",
+		Aliases:                []string{"zen"},
+		PlanLabel:              "opencode zen api key",
+		Auth:                   authBearer,
+		CollapseVersionSegment: true,
+		LeaseAPI:               "openai-completions",
+		LeasePath:              "/opencode-zen/chat/completions",
+		LeaseEnv:               leaseEnvOpenAI,
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.OpenCodeZenUpstream },
 	},
 	{
 		Provider:        accounts.ProviderGrok,
@@ -206,7 +268,15 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseAPI:               "openai-completions",
 		LeasePath:              "/grok/chat/completions",
 		LeaseEnv:               leaseEnvOpenAI,
-		Upstream:               func(s Server) *url.URL { return s.GrokUpstream },
+		// A subscription reached through device-code OAuth is served by the
+		// Grok CLI's chat proxy, not the API-key host; the cli-chat-proxy base
+		// also ends in /v1, so the collapse above stays right for both.
+		Upstream: func(s Server, mode accounts.AuthMode) *url.URL {
+			if mode == accounts.AuthModeOAuth {
+				return s.GrokSubscriptionUpstream
+			}
+			return s.GrokUpstream
+		},
 	},
 	{
 		Provider:        accounts.ProviderQwen,
@@ -223,12 +293,12 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseAPI:               "openai-completions",
 		LeasePath:              "/qwen/chat/completions",
 		LeaseEnv:               leaseEnvOpenAI,
-		Upstream:               func(s Server) *url.URL { return s.QwenUpstream },
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.QwenUpstream },
 	},
 	{
 		Provider:        accounts.ProviderQwenToken,
 		DefaultUpstream: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
-		Metering:        "token plan, per credit",
+		Metering:        "token plan",
 		HealthPath:      "/models",
 		PathPrefix:      "qwen-token",
 		Aliases:         []string{"tokenplan", "qwen-tokenplan"},
@@ -239,12 +309,12 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseAPI:               "openai-completions",
 		LeasePath:              "/qwen-token/chat/completions",
 		LeaseEnv:               leaseEnvOpenAI,
-		Upstream:               func(s Server) *url.URL { return s.QwenTokenUpstream },
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.QwenTokenUpstream },
 	},
 	{
 		Provider:        accounts.ProviderQwenAnthropic,
 		DefaultUpstream: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
-		Metering:        "token plan, per credit",
+		Metering:        "token plan",
 		HealthPath:      "",
 		// One Token Plan subscription, reachable over two protocols.
 		AccountProvider: accounts.ProviderQwenToken,
@@ -259,7 +329,7 @@ var builtinKeyedProviders = []keyedProvider{
 		LeaseAPI:               "anthropic-messages",
 		LeasePath:              "/qwen-anthropic/v1/messages",
 		LeaseEnv:               leaseEnvAnthropic,
-		Upstream:               func(s Server) *url.URL { return s.QwenAnthropicUpstream },
+		Upstream:               func(s Server, _ accounts.AuthMode) *url.URL { return s.QwenAnthropicUpstream },
 	},
 }
 
@@ -353,7 +423,21 @@ func keyedProviderNames() []string {
 
 // applyKeyedProviderAuth presents the account's API key the way this provider
 // expects it. Authorization is already set to the bearer form by the caller.
-func applyKeyedProviderAuth(headers http.Header, account accounts.Account, entry keyedProvider) {
+func applyKeyedProviderAuth(headers http.Header, account accounts.Account, entry keyedProvider, model string) {
+	if entry.Provider == accounts.ProviderGrok {
+		// The subscription proxy rejects a normal API bearer token unless the
+		// request is explicitly identified as Grok CLI OAuth. Always clear these
+		// headers first so a client cannot smuggle them onto an API-key request or
+		// leave them behind when failover changes auth modes.
+		headers.Del("X-XAI-Token-Auth")
+		headers.Del("X-Grok-Model-Override")
+		if account.AuthMode == accounts.AuthModeOAuth {
+			headers.Set("X-XAI-Token-Auth", "xai-grok-cli")
+			if model = strings.TrimSpace(model); model != "" {
+				headers.Set("X-Grok-Model-Override", model)
+			}
+		}
+	}
 	switch entry.Auth {
 	case authBearerWithAnthropicVersion:
 		headers.Del("X-Api-Key")
@@ -470,44 +554,6 @@ func ProviderHealthURL(provider accounts.Provider, upstream string) string {
 	parsed.RawPath = ""
 	parsed.Fragment = ""
 	return parsed.String()
-}
-
-// ProbeProviderKey validates a key only against an explicitly supplied
-// upstream and reports the model count when the endpoint returns an OpenAI
-// models payload. It never selects a default host.
-func ProbeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, upstream, token string) (state string, models int) {
-	healthURL := ProviderHealthURL(provider, upstream)
-	if healthURL == "" {
-		return "", -1
-	}
-	if client == nil {
-		client = &http.Client{Timeout: 6 * time.Second}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
-	if err != nil {
-		return "unreachable", -1
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	res, err := client.Do(req)
-	if err != nil {
-		return "unreachable", -1
-	}
-	defer func() { _ = res.Body.Close() }()
-	switch {
-	case res.StatusCode == http.StatusUnauthorized:
-		return "bad key", -1
-	case res.StatusCode == http.StatusForbidden:
-		return "denied", -1
-	case res.StatusCode < 200 || res.StatusCode >= 300:
-		return fmt.Sprintf("http %d", res.StatusCode), -1
-	}
-	var payload struct {
-		Data []struct{} `json:"data"`
-	}
-	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&payload); err != nil {
-		return "ok", -1
-	}
-	return "ok", len(payload.Data)
 }
 
 // ProviderEndpoints lists every path prefix served by one provider's

@@ -131,6 +131,52 @@ func (s *Store) Touch(agentType, sessionID string) (Assignment, bool, error) {
 	return assignment, true, nil
 }
 
+// CompareAndPut replaces one sticky assignment only while it still points at
+// expectedAccountID. Deferred proxy responses use it so an older stream cannot
+// overwrite a newer forced/admin move that completed while the stream was in
+// flight. swapped is false, without error, when another writer won the race.
+func (s *Store) CompareAndPut(agentType, sessionID, expectedAccountID, accountID, userEmail string) (assignment Assignment, swapped bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return Assignment{}, false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return Assignment{}, false, err
+	}
+
+	now := time.Now().UTC()
+	normalizedAgent := NormalizeAgentType(agentType)
+	if normalizedAgent == "" {
+		normalizedAgent = "codex"
+	}
+	stickySessionID := StickySessionID(normalizedAgent, sessionID)
+	key := ScopedSessionKey(normalizedAgent, stickySessionID)
+	existing, ok := s.data[key]
+	if !ok || existing.AccountID != expectedAccountID {
+		return existing, false, nil
+	}
+	assignment = Assignment{
+		AgentType: normalizedAgent,
+		SessionID: stickySessionID,
+		AccountID: accountID,
+		UserEmail: NormalizeUserEmail(userEmail),
+		CreatedAt: existing.CreatedAt,
+		UpdatedAt: now,
+	}
+	if assignment.UserEmail == "" {
+		assignment.UserEmail = existing.UserEmail
+	}
+	s.data[key] = assignment
+	if err := s.saveLocked(); err != nil {
+		s.data[key] = existing
+		return Assignment{}, false, err
+	}
+	return assignment, true, nil
+}
+
 // Delete removes one scoped sticky assignment and its self-reported identity
 // metadata. It is used by the admin-only sessions endpoint.
 func (s *Store) Delete(agentType, sessionID string) (bool, error) {

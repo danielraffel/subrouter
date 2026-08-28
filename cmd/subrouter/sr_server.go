@@ -1097,6 +1097,7 @@ type remoteServerAccount struct {
 	ID       string            `json:"id"`
 	Provider accounts.Provider `json:"provider"`
 	AuthMode accounts.AuthMode `json:"auth_mode"`
+	Label    string            `json:"label,omitempty"`
 	Email    string            `json:"email,omitempty"`
 	Source   string            `json:"source"`
 }
@@ -1124,10 +1125,16 @@ type remoteServerUsageStatus struct {
 	Refreshed          bool                             `json:"refreshed,omitempty"`
 	Error              string                           `json:"error,omitempty"`
 	Active             bool                             `json:"active,omitempty"`
+	KeyFingerprint     string                           `json:"key_fingerprint,omitempty"`
+	AssignedSessions   int                              `json:"assigned_sessions,omitempty"`
+	SessionsKnown      bool                             `json:"sessions_known,omitempty"`
 	PlanType           string                           `json:"plan_type,omitempty"`
 	ProviderHealth     string                           `json:"provider_health,omitempty"`
 	ProviderModels     *int                             `json:"provider_models,omitempty"`
 	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
+	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	AccountIdentity    string                           `json:"account_identity,omitempty"`
+	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
@@ -1248,9 +1255,13 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
+			displayAccount:     status.AccountIdentity,
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,
+			quotaStatus:        status.QuotaStatus,
+			accountIdentity:    status.AccountIdentity,
+			quotaUsageKnown:    status.QuotaUsageKnown,
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
@@ -1258,9 +1269,25 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			providerHealth:     status.ProviderHealth,
 			providerModels:     -1,
 			providerEndpoints:  append([]string(nil), status.ProviderEndpoints...),
+			keyFingerprint:     status.KeyFingerprint,
+			assignedSessions:   status.AssignedSessions,
+			sessionsKnown:      status.SessionsKnown,
 		}
 		if status.ProviderModels != nil {
 			row.providerModels = *status.ProviderModels
+		}
+		row.providerHealth = status.ProviderHealth
+		if status.AuthMode == accounts.AuthModeOAuth && status.Provider == accounts.ProviderGrok && status.AuthChecked {
+			row.providerHealth = "auth error"
+			if status.AuthValid {
+				row.providerHealth = "auth ok"
+			}
+		}
+		if status.AuthMode == accounts.AuthModeAPIKey && row.providerHealth == "" && status.AuthChecked {
+			row.providerHealth = "bad key"
+			if status.AuthValid {
+				row.providerHealth = "auth ok"
+			}
 		}
 		if status.Provider == accounts.ProviderClaude && row.planType == "" {
 			row.planType = "claude"
@@ -1268,11 +1295,18 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
 			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+		} else if status.AuthMode == accounts.AuthModeAPIKey &&
+			(status.Provider == accounts.ProviderQwenToken || status.Provider == accounts.ProviderKimi) && status.QuotaUsageKnown {
+			row.score = scoreFromWindows(email, status.Windows)
+			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
 		} else if status.AuthMode == accounts.AuthModeAPIKey {
 			row.score = selectacct.Score{AccountID: email, Headroom: 0.01, ShortHeadroom: 0.01}
 			if row.planType == "" {
 				row.planType = "api key"
 			}
+		} else if status.Provider == accounts.ProviderGrok && status.AuthMode == accounts.AuthModeOAuth && status.AuthValid {
+			row.score = selectacct.Score{AccountID: email, Headroom: 1, ShortHeadroom: 1}
 		} else {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)

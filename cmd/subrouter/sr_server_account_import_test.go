@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,8 +12,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
 
 func TestValidateServerAccountImportURLRestrictsPlaintextToTailnetOrLoopback(t *testing.T) {
@@ -95,7 +98,7 @@ func TestServerAccountImportUsesScopedTokenInsteadOfAdminToken(t *testing.T) {
 func TestServerAccountImportFailureDoesNotEchoResponseOrCredential(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method == http.MethodGet {
-			_, _ = io.WriteString(w, `{"ok":true}`)
+			_, _ = io.WriteString(w, `{"ok":true,"providers":["kimi"]}`)
 			return
 		}
 		http.Error(w, "provider rejected sk-access-secret", http.StatusBadRequest)
@@ -120,6 +123,78 @@ func TestServerAccountImportFailureDoesNotEchoResponseOrCredential(t *testing.T)
 	}
 	if strings.Contains(err.Error(), "access-secret") || strings.Contains(err.Error(), "provider rejected") {
 		t.Fatalf("account import error leaked a credential-bearing response: %v", err)
+	}
+}
+
+func TestUploadAndRemoveServerKimiAccountUseProtectedImport(t *testing.T) {
+	var imports, removals atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if got := req.Header.Get("Authorization"); got != "Bearer import-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if req.Method == http.MethodGet {
+			_, _ = io.WriteString(w, `{"ok":true,"providers":["kimi"]}`)
+			return
+		}
+		var payload serverAccountImportRequest
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil || payload.Kimi == nil || payload.Provider != accounts.ProviderKimi {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if payload.Kimi.Remove {
+			removals.Add(1)
+			if payload.Kimi.Credential.AccessToken != "" || payload.Kimi.Credential.RefreshToken != "" {
+				t.Error("Kimi removal carried a credential")
+			}
+		} else {
+			imports.Add(1)
+			if payload.Kimi.Credential.RefreshToken != "refresh-secret" {
+				t.Error("Kimi import omitted its refresh-token chain")
+			}
+			if payload.Kimi.Credential.OAuthDeviceID != "authorized-device" {
+				t.Error("Kimi import omitted its OAuth device identity")
+			}
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	runner := srRunner{client: server.Client()}
+	target := srServerConfig{Name: "team", URL: server.URL, AccountImportToken: "import-secret"}
+	credential := agentkimi.CredentialInfo{
+		AccessToken: "access-secret", RefreshToken: "refresh-secret", ExpiresAt: time.Now().Add(time.Hour),
+		OAuthDeviceID: "authorized-device",
+	}
+	if err := runner.uploadServerKimiAccount(t.Context(), target, "work", credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.removeServerKimiAccount(t.Context(), target, "work"); err != nil {
+		t.Fatal(err)
+	}
+	if imports.Load() != 1 || removals.Load() != 1 {
+		t.Fatalf("Kimi mutations = imports:%d removals:%d", imports.Load(), removals.Load())
+	}
+}
+
+func TestRemoteKimiLoginPreflightsProviderBeforeDeviceAuthorization(t *testing.T) {
+	var requests atomic.Int32
+	runner := srRunner{
+		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"providers":["codex"]}`)),
+			}, nil
+		})},
+		out: io.Discard,
+	}
+	err := runner.kimiRemoteLogin(t.Context(), srServerConfig{Name: "old-server", URL: "https://subrouter.example.com"}, "work")
+	if err == nil || !strings.Contains(err.Error(), "does not advertise kimi account import") {
+		t.Fatalf("remote Kimi preflight error = %v", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("remote Kimi login made %d requests; OAuth must not start after failed preflight", requests.Load())
 	}
 }
 

@@ -30,8 +30,9 @@ const (
 )
 
 var (
-	errInvalidSessionLease  = errors.New("invalid or expired session lease")
-	errSessionLeaseNotFound = errors.New("session lease not found")
+	errInvalidSessionLease      = errors.New("invalid or expired session lease")
+	errSessionLeaseNotFound     = errors.New("session lease not found")
+	errSessionAssignmentChanged = errors.New("session assignment changed while creating lease")
 )
 
 // sessionLeaseStore keeps short-lived broker credentials in memory. The
@@ -149,35 +150,70 @@ func newSessionLeaseStore() *sessionLeaseStore {
 }
 
 func (s *sessionLeaseStore) put(template sessionLease) (sessionLease, error) {
+	lease, _, err := s.putWithDisposition(template)
+	return lease, err
+}
+
+func (s *sessionLeaseStore) putWithDisposition(template sessionLease) (sessionLease, bool, error) {
+	return s.putWithAccountReplacement(template, false, nil)
+}
+
+func (s *sessionLeaseStore) putReplacingAccountAfter(template sessionLease, beforeInstall func() error) (sessionLease, bool, error) {
+	return s.putWithAccountReplacement(template, true, beforeInstall)
+}
+
+func (s *sessionLeaseStore) putWithAccountReplacement(template sessionLease, replaceAccount bool, beforeInstall func() error) (sessionLease, bool, error) {
 	if s == nil {
-		return sessionLease{}, errors.New("session lease store is not configured")
+		return sessionLease{}, false, errors.New("session lease store is not configured")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now().UTC()
 	s.removeExpiredLocked(now)
+	var replaced *sessionLease
 	if existingID := s.byScope[template.ScopeKey]; existingID != "" {
 		if existing, ok := s.byID[existingID]; ok {
-			return existing, nil
+			if !replaceAccount || existing.AccountID == template.AccountID {
+				if beforeInstall != nil {
+					if err := beforeInstall(); err != nil {
+						return sessionLease{}, false, err
+					}
+				}
+				return existing, false, nil
+			}
+			replaced = &existing
 		}
 	}
 	id, err := randomLeaseValue("lease_", 18)
 	if err != nil {
-		return sessionLease{}, err
+		return sessionLease{}, false, err
 	}
 	expiresAt := now.Add(s.ttl)
 	token, err := newSessionLeaseToken(now, expiresAt)
 	if err != nil {
-		return sessionLease{}, err
+		return sessionLease{}, false, err
 	}
 	template.ID = id
 	template.Token = token
 	template.CreatedAt = now
 	template.ExpiresAt = expiresAt
+	if beforeInstall != nil {
+		// Persist the matching sticky assignment before changing the in-memory
+		// lease index. If persistence fails, the prior scoped lease and every
+		// one of its token bindings remain untouched.
+		if err := beforeInstall(); err != nil {
+			return sessionLease{}, false, err
+		}
+	}
+	if replaced != nil {
+		// Generate the replacement completely before invalidating the prior
+		// lease, so entropy/signing failures leave the existing lease intact.
+		s.removeLocked(*replaced)
+	}
 	s.byID[id] = template
 	s.byScope[template.ScopeKey] = id
 	s.bindTokenLocked(id, token, expiresAt, expiresAt)
-	return template, nil
+	return template, true, nil
 }
 
 func (s *sessionLeaseStore) resolve(token string) (sessionLease, error) {
@@ -420,6 +456,7 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 	if model != "" {
 		r.Header.Set("X-Subrouter-Model", model)
 	}
+	var pendingSessionCommit bool
 	account, sessionKey, _, err := s.accountForSessionProviderWithOptions(
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
@@ -429,13 +466,21 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 			allowFableAPIKeyPool: true,
 			ignoreForcedAccount:  true,
 			oauthOnly:            provider == accounts.ProviderCodex,
+			pendingSessionCommit: &pendingSessionCommit,
 		},
 	)
 	if err != nil {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
-	account, err = s.refreshSelectedAccount(
+	pendingSessionExpectedAccount := account.ID
+	if s.Sessions != nil {
+		if assignment, ok := s.Sessions.Get(agentTypeForProviderSession(request.Agent, provider), sessionKey); ok {
+			pendingSessionExpectedAccount = assignment.AccountID
+		}
+	}
+	var refreshPendingSessionCommit bool
+	account, refreshPendingSessionCommit, err = s.refreshSelectedAccount(
 		r.Context(),
 		provider,
 		agentTypeForProviderSession(request.Agent, provider),
@@ -444,11 +489,12 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		r,
 		account,
 	)
+	pendingSessionCommit = pendingSessionCommit || refreshPendingSessionCommit
 	if err != nil {
 		http.Error(w, "no account is available for the requested lease", http.StatusServiceUnavailable)
 		return
 	}
-	lease, err := s.sessionLeases.put(sessionLease{
+	template := sessionLease{
 		ScopeKey:       sessionLeaseScopeKey(request, provider, model),
 		OrganizationID: request.OrganizationID,
 		WorkspaceID:    request.WorkspaceID,
@@ -461,7 +507,27 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		AuthMode:       account.AuthMode,
 		Model:          model,
 		ProxyBaseURL:   proxyBaseURL,
-	})
+	}
+	var lease sessionLease
+	if pendingSessionCommit {
+		// The prior account has just been rejected by selection or refresh, so
+		// idempotency must not return its now-unusable lease. Replace the scoped
+		// lease atomically with one bound to the proven candidate. The session
+		// write runs before the swap while the scope is locked, so failure leaves
+		// the old lease usable rather than revoking it as a side effect.
+		lease, _, err = s.sessionLeases.putReplacingAccountAfter(template, func() error {
+			swapped, commitErr := s.commitSessionReassignment(agentTypeForProviderSession(request.Agent, provider), sessionKey, pendingSessionExpectedAccount, account.ID, "")
+			if commitErr != nil {
+				return commitErr
+			}
+			if !swapped {
+				return errSessionAssignmentChanged
+			}
+			return nil
+		})
+	} else {
+		lease, _, err = s.sessionLeases.putWithDisposition(template)
+	}
 	if err != nil {
 		http.Error(w, "create session lease", http.StatusInternalServerError)
 		return

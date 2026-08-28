@@ -35,9 +35,15 @@ it in place with an atomic rename:
 ```bash
 set -euo pipefail
 cp subrouter.new ~/bin/subrouter.new
-# Preserve release signatures; ad-hoc sign only an unsigned local build when
-# the supported macOS launchd policy requires a signature.
-codesign --verify --strict ~/bin/subrouter.new 2>/dev/null || codesign --force --sign - ~/bin/subrouter.new
+# Preserve release signatures. A failed release verification is fatal; only an
+# explicitly selected local build may replace its absent signature ad hoc.
+if ! codesign --verify --strict ~/bin/subrouter.new 2>/dev/null; then
+  [ "${SUBROUTER_LOCAL_BUILD:-0}" = 1 ] || {
+    echo "release artifact signature verification failed" >&2
+    exit 1
+  }
+  codesign --force --sign - ~/bin/subrouter.new
+fi
 codesign --verify --strict --verbose=4 ~/bin/subrouter.new
 ~/bin/subrouter.new --help >/dev/null            # prove it executes first
 cp -p ~/bin/subrouter ~/bin/subrouter.rollback
@@ -51,9 +57,11 @@ fi
 rm -f ~/bin/subrouter.rollback
 ```
 
-On macOS versions and launchd policies that reject an unsigned local build, the
-fallback ad-hoc signature makes that build runnable without replacing a valid
-release signature.
+On macOS versions whose launchd policy accepts ad-hoc signatures, the explicit
+local-build fallback makes an unsigned build runnable without replacing a valid
+release signature. A deployment using `SpawnConstraint` with a
+`team-identifier` must instead use a certificate-backed signature for that team;
+an ad-hoc signature has no Team ID and cannot satisfy the constraint.
 
 ### What a restart costs
 
@@ -66,8 +74,10 @@ plist, the escalation timeout is system-defined and may be shorter than
 survive, because the session store is read back from its file at startup; the
 scheduler's exhaustion marks do not, since they are in-memory only.
 
-Behind `subrouter supervise` none of this applies — the supervisor owns the
-listener and hands connections over without dropping them.
+During a supervised worker upgrade, the supervisor keeps owning the listener
+and hands existing connections to their original worker, avoiding listener
+interruption and connection drops. Restarting the supervisor itself still
+closes the listener and uses the normal drain/restart behavior.
 
 ## Supervised handoff
 

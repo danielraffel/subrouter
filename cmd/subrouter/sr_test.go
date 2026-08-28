@@ -17,11 +17,417 @@ import (
 	"time"
 	"unicode/utf8"
 
+	baseaccount "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
+
+type fakeKimiUsageStore struct {
+	accounts []baseaccount.Account
+	plan     string
+	windows  []accounts.UsageWindow
+	err      error
+}
+
+type fakeGrokStore struct {
+	authorized bool
+	saved      bool
+	removed    bool
+	refreshDid bool
+	credential agentgrok.CredentialInfo
+	account    baseaccount.Account
+}
+
+func (s *fakeGrokStore) Authorize(context.Context, *http.Client, io.Writer) (agentgrok.CredentialInfo, error) {
+	s.authorized = true
+	return s.credential, nil
+}
+
+func (s *fakeGrokStore) SaveCredential(credential agentgrok.CredentialInfo) (baseaccount.Account, error) {
+	s.saved = true
+	s.credential = credential
+	return s.account, nil
+}
+
+func (s *fakeGrokStore) RemoveCredential() (baseaccount.Account, bool, error) {
+	if s.account.ID == "" {
+		return baseaccount.Account{}, false, nil
+	}
+	removed := s.account
+	s.account = baseaccount.Account{}
+	s.removed = true
+	return removed, true, nil
+}
+
+func (s *fakeGrokStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {
+	if s.account.ID == "" {
+		return nil, nil
+	}
+	return []baseaccount.Account{s.account}, nil
+}
+
+func (s *fakeGrokStore) RefreshAccount(_ context.Context, _ *http.Client, account baseaccount.Account) (baseaccount.Account, error) {
+	return account, nil
+}
+
+func (s *fakeGrokStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, account baseaccount.Account) (baseaccount.Account, bool, error) {
+	return account, s.refreshDid, nil
+}
+
+func TestGrokSignInAuthorizesThenPublishesWithoutPrintingIdentityOrTokens(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	fake := &fakeGrokStore{
+		credential: agentgrok.CredentialInfo{
+			AccessToken: "secret-access", RefreshToken: "secret-refresh",
+			ExpiresAt: time.Now().Add(time.Hour), Email: "private@example.com",
+		},
+		account: baseaccount.Account{
+			ID: "grok-subscription", Provider: baseaccount.ProviderGrok,
+			AuthMode: baseaccount.AuthModeOAuth, Token: "secret-access",
+		},
+	}
+	var out bytes.Buffer
+	runner := srRunner{store: store, out: &out, grok: fake}
+	if err := runner.grokSignIn(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.authorized || !fake.saved {
+		t.Fatalf("authorize=%v saved=%v, want both lifecycle stages", fake.authorized, fake.saved)
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("Grok add did not publish account generation: %v", err)
+	}
+	message := out.String()
+	for _, secret := range []string{"secret-access", "secret-refresh", "private@example.com"} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("public success text leaked %q: %q", secret, message)
+		}
+	}
+	if !strings.Contains(message, "Added Grok subscription account") {
+		t.Fatalf("success text = %q", message)
+	}
+}
+
+func TestRemoteAndHostedGrokAddAreExplicitlyUnsupported(t *testing.T) {
+	runner := srRunner{program: "sr", out: io.Discard}
+	remoteErr := runner.runRemoteAccountCommand(t.Context(), srServerConfig{Name: "test", URL: "https://example.invalid"}, []string{"add", "grok"})
+	if remoteErr == nil || !strings.Contains(remoteErr.Error(), "Grok subscription import is not available yet") || !strings.Contains(remoteErr.Error(), "sr remote use local") {
+		t.Fatalf("remote Grok error = %v", remoteErr)
+	}
+	hostedErr := runner.hostedAccountAdd(t.Context(), nil, []string{"grok"})
+	if hostedErr == nil || !strings.Contains(hostedErr.Error(), "hosted Grok subscription accounts are not supported yet") || !strings.Contains(hostedErr.Error(), "sr remote use local") {
+		t.Fatalf("hosted Grok error = %v", hostedErr)
+	}
+}
+
+func TestGrokRemovePublishesAccountGeneration(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	fake := &fakeGrokStore{account: baseaccount.Account{
+		ID: "grok-subscription", Provider: baseaccount.ProviderGrok, AuthMode: baseaccount.AuthModeOAuth,
+	}}
+	var out bytes.Buffer
+	runner := srRunner{store: store, out: &out, grok: fake}
+	if err := runner.remove(t.Context(), "grok-subscription"); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.removed {
+		t.Fatal("Grok credential was not removed")
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("Grok removal did not publish account generation: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "Removed account: grok-subscription") {
+		t.Fatalf("removal output = %q", got)
+	}
+}
+
+type refreshingKimiUsageStore struct {
+	fetchedToken string
+}
+
+type partialKimiUsageStore struct{}
+
+func (partialKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {
+	return []baseaccount.Account{{
+		ID: "kimi-subscription:healthy", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth, Label: "healthy", Token: "access",
+	}}, errors.New("managed profile is unreadable")
+}
+
+func (partialKimiUsageStore) FetchUsage(context.Context, *http.Client, baseaccount.Account) (string, []accounts.UsageWindow, error) {
+	return "subscription", []accounts.UsageWindow{{Name: "weekly", UsedPercent: 1}}, nil
+}
+
+func (*refreshingKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {
+	return []baseaccount.Account{{
+		ID: "kimi-subscription:work", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth, Token: "stale",
+	}}, nil
+}
+
+func (*refreshingKimiUsageStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, acct baseaccount.Account) (baseaccount.Account, bool, error) {
+	acct.Token = "fresh"
+	return acct, true, nil
+}
+
+func (s *refreshingKimiUsageStore) FetchUsage(_ context.Context, _ *http.Client, acct baseaccount.Account) (string, []accounts.UsageWindow, error) {
+	s.fetchedToken = acct.Token
+	return "subscription", []accounts.UsageWindow{{Name: "weekly", UsedPercent: 1}}, nil
+}
+
+func TestLocalKimiRemovalPublishesAccountGeneration(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	if _, err := agentkimi.DefaultStore().SaveManagedCredential("work", agentkimi.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{store: store, out: &out}
+	if err := runner.kimiCommand(t.Context(), []string{"remove", "work"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("Kimi removal did not publish the shared account generation: %v", err)
+	}
+	if _, ok, err := agentkimi.DefaultStore().ReadManagedCredential("work", time.Now()); err != nil || ok {
+		t.Fatalf("Kimi profile remains after removal (ok=%v err=%v)", ok, err)
+	}
+}
+
+func TestGenericRemoveStillRemovesKimiAPIKeyAccounts(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	apiKey, _, err := store.AddAPIKeyForProvider("work", "test-kimi-key", accounts.ProviderKimi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{store: store, out: &out}
+	if err := runner.remove(t.Context(), apiKey.Email); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.FindStored(apiKey.Email); err != nil || ok {
+		t.Fatalf("Kimi API key remains after generic removal (ok=%v err=%v)", ok, err)
+	}
+}
+
+func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := &refreshingKimiUsageStore{}
+	runner := srRunner{
+		store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")},
+		kimi:  store,
+	}
+	rows, err := runner.fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.fetchedToken != "fresh" {
+		t.Fatal("local Kimi status fetched usage with the stale access token")
+	}
+	found := false
+	for _, row := range rows {
+		if row.email == "kimi-subscription:work" && row.err == nil {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("refreshed Kimi status row is missing")
+	}
+}
+
+func TestLocalKimiStatusSeparatesPartialSourceErrorFromHealthyAccount(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	runner := srRunner{
+		store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")},
+		kimi:  partialKimiUsageStore{},
+	}
+	rows, err := runner.fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sourceErrors, healthy int
+	for _, row := range rows {
+		switch row.email {
+		case "kimi":
+			if row.err != nil && row.displayAccount == "credential source" && !row.active {
+				sourceErrors++
+			}
+		case "kimi-subscription:healthy":
+			if row.err == nil {
+				healthy++
+			}
+		}
+	}
+	if sourceErrors != 1 || healthy != 1 {
+		t.Fatalf("partial Kimi rows = source-errors:%d healthy:%d", sourceErrors, healthy)
+	}
+}
+
+func TestKimiListPrintsHealthyProfilesAlongsidePartialWarning(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := agentkimi.DefaultStore()
+	if _, err := store.SaveManagedCredential("healthy", agentkimi.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	brokenName := base64.RawURLEncoding.EncodeToString([]byte("broken")) + ".json"
+	brokenPath := filepath.Join(root, "state", "kimi", brokenName)
+	if err := os.WriteFile(brokenPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(root, "state", "codex", "accounts")}, out: &out, errOut: &errOut}
+	if err := runner.kimiCommand(t.Context(), []string{"list"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "kimi-subscription:healthy") {
+		t.Fatal("Kimi list hid the healthy managed profile")
+	}
+	if !strings.Contains(errOut.String(), "Warning: some Kimi credentials are unavailable") {
+		t.Fatal("Kimi list did not surface the partial credential error")
+	}
+}
+
+func (f fakeKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {
+	return f.accounts, f.err
+}
+
+func (f fakeKimiUsageStore) FetchUsage(context.Context, *http.Client, baseaccount.Account) (string, []accounts.UsageWindow, error) {
+	return f.plan, f.windows, f.err
+}
+
+func TestFetchUsageRowsIncludesLocalKimiSubscription(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	windows := []accounts.UsageWindow{
+		{Name: "weekly", UsedPercent: 25, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 24 * 60 * 60},
+		{Name: "5h", UsedPercent: 40, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 60 * 60},
+	}
+	runner := srRunner{
+		store:  accounts.CodexStore{Dir: filepath.Join(home, ".codex", "accounts")},
+		client: &http.Client{Timeout: time.Second},
+		kimi: fakeKimiUsageStore{
+			accounts: []baseaccount.Account{{ID: "kimi-code", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth}},
+			plan:     "subscription", windows: windows,
+		},
+	}
+	rows, err := runner.fetchUsageRows(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.provider != accounts.ProviderKimi {
+			continue
+		}
+		if row.email != "kimi-code" || row.active || row.planType != "subscription" {
+			t.Fatalf("Kimi row metadata = %+v", row)
+		}
+		if !row.sessionsKnown {
+			t.Fatal("Kimi row did not distinguish ready from an assigned session")
+		}
+		if !slices.Equal(row.windows, windows) {
+			t.Fatalf("Kimi windows = %+v, want %+v", row.windows, windows)
+		}
+		return
+	}
+	t.Fatal("local Kimi subscription row is missing")
+}
+
+func TestFetchUsageRowsKeepsMultipleKimiAccountsDistinct(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	runner := srRunner{
+		store:  accounts.CodexStore{Dir: filepath.Join(home, ".codex", "accounts")},
+		client: &http.Client{Timeout: time.Second},
+		kimi: fakeKimiUsageStore{
+			accounts: []baseaccount.Account{
+				{ID: "kimi-code:first", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth},
+				{ID: "kimi-code:second", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth},
+			},
+			plan: "subscription",
+			windows: []accounts.UsageWindow{{
+				Name: "5h", UsedPercent: 20,
+				LimitWindowSeconds: int64((5 * time.Hour) / time.Second),
+			}},
+		},
+	}
+	rows, err := runner.fetchUsageRows(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, row := range rows {
+		if row.provider == accounts.ProviderKimi {
+			got[row.email] = row.planType == "subscription" && len(row.windows) == 1
+		}
+	}
+	for _, accountID := range []string{"kimi-code:first", "kimi-code:second"} {
+		if !got[accountID] {
+			t.Fatalf("Kimi account %q was lost or incompletely updated: %v", accountID, got)
+		}
+	}
+}
+
+func TestFetchUsageRowsIncludesAuthOnlyGrokSubscriptionActivity(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	grokStore := &fakeGrokStore{account: baseaccount.Account{
+		ID: "grok-subscription", Provider: baseaccount.ProviderGrok,
+		AuthMode: baseaccount.AuthModeOAuth, Token: "access", Email: "person@example.com",
+	}}
+	sessions, err := session.NewStore(session.DefaultStorePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("grok", "conversation", "grok-subscription", ""); err != nil {
+		t.Fatal(err)
+	}
+	runner := srRunner{
+		store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")},
+		grok:  grokStore,
+	}
+	rows, err := runner.fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.provider != accounts.ProviderGrok || row.authMode != accounts.AuthModeOAuth {
+			continue
+		}
+		if row.email != "grok-subscription" || row.displayAccount != "person@example.com" || row.planType != "subscription" {
+			t.Fatalf("Grok row metadata = %+v", row)
+		}
+		if row.providerHealth != "auth ok" || row.err != nil || len(row.windows) != 0 {
+			t.Fatalf("Grok row should expose auth without invented quota: %+v", row)
+		}
+		if !row.sessionsKnown || row.assignedSessions != 1 || !row.active {
+			t.Fatalf("Grok activity = %+v", row)
+		}
+		return
+	}
+	t.Fatal("local Grok subscription row is missing")
+}
 
 func TestSRListReadsNativeCodexStore(t *testing.T) {
 	home := t.TempDir()
@@ -174,6 +580,259 @@ func TestUsageRowsKeepProviderAPIKeysOutOfCodexSwitching(t *testing.T) {
 	if err := ensureUsageRowSwitchable(rows[0]); err == nil {
 		t.Fatal("OpenRouter API key was switchable as an active Codex credential")
 	}
+}
+
+func TestSRQwenKeyAccountsCanBeAddedListedAndRemoved(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.DefaultCodexStore()
+	for _, input := range []string{
+		"large-plan\nsk-sp-large-test\n",
+		"small-plan\nsk-sp-small-test\n",
+	} {
+		var out bytes.Buffer
+		runner := srRunner{store: store, in: strings.NewReader(input), out: &out, errOut: &out}
+		if err := runner.run(context.Background(), []string{"add-key", "--provider", "qwen-token"}); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out.String(), "(sk-...)") {
+			t.Fatalf("Qwen prompt claimed a Codex-specific key format: %s", out.String())
+		}
+	}
+	stored, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("stored Qwen accounts = %+v", stored)
+	}
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(context.Background(), []string{"list"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"qwen-token:large-plan", "qwen-token:small-plan"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("list is missing %q:\n%s", want, out.String())
+		}
+	}
+	root := agentqwen.ConsoleRootForStore(store)
+	for _, accountID := range []string{"qwen-token:large-plan", "qwen-token:small-plan"} {
+		if err := agentqwen.SaveConsoleCredentialIn(root, accountID, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runner.run(context.Background(), []string{"remove", "qwen-token:small-plan"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.FindStored("qwen-token:small-plan"); err != nil || ok {
+		t.Fatalf("removed Qwen account remains: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.FindStored("qwen-token:large-plan"); err != nil || !ok {
+		t.Fatalf("unrelated Qwen account was removed: ok=%v err=%v", ok, err)
+	}
+	if _, err := agentqwen.ExportConsoleCredentialIn(root, "qwen-token:small-plan"); err == nil {
+		t.Fatal("removed Qwen account retained its console credential")
+	}
+	if _, err := agentqwen.ExportConsoleCredentialIn(root, "qwen-token:large-plan"); err != nil {
+		t.Fatalf("unrelated Qwen console credential was removed: %v", err)
+	}
+}
+
+func TestSRQwenRemovalRetainsAccountWhenCredentialCleanupFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.DefaultCodexStore()
+	accountID := "qwen-token:work"
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:    accountID,
+		Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "model-secret",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root := agentqwen.ConsoleRootForStore(store)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), agentqwen.ConsoleConfigDirIn(root, accountID)); err != nil {
+		t.Fatal(err)
+	}
+	runner := srRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.run(context.Background(), []string{"remove", accountID}); err == nil {
+		t.Fatal("removal succeeded despite unsafe console credential directory")
+	}
+	if _, ok, err := store.FindStored(accountID); err != nil || !ok {
+		t.Fatalf("Qwen account should remain retryable: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSRQwenLoginPreparesBrowserAuthAndStoresIdentity(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:    "qwen-token:work",
+		Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "model-secret",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	command := &qwenLoginCommandRunner{}
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out, cmd: command}
+	if err := runner.run(context.Background(), []string{"qwen", "login", "--console-account", "person@example.com", "qwen-token:work"}); err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := []string{"auth", "login", "--console", "--console-site", "international"}
+	if command.name != "bl" || !slices.Equal(command.args, wantArgs) {
+		t.Fatalf("Bailian command = %q %v", command.name, command.args)
+	}
+	if got := agentqwen.ConsoleAccount("qwen-token:work"); got != "person@example.com" {
+		t.Fatalf("console account = %q", got)
+	}
+	body, err := os.ReadFile(agentqwen.ConsoleConfigPath("qwen-token:work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "model-secret") || !strings.Contains(string(body), "console-secret") {
+		t.Fatalf("console config did not strip the temporary model key: %s", body)
+	}
+}
+
+func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if err := agentqwen.SaveConsoleCredential("qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken:   "console-secret",
+		ConsoleRegion: "ap-southeast-1",
+		ConsoleSite:   "international",
+		Account:       "person@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	received := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/qwen-console" || req.Header.Get("Authorization") != "Bearer admin-secret" {
+			t.Fatalf("unexpected Qwen sync request: %s auth=%q", req.URL.Path, req.Header.Get("Authorization"))
+		}
+		var payload struct {
+			AccountID  string                      `json:"account_id"`
+			Credential agentqwen.ConsoleCredential `json:"credential"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.AccountID != "qwen-token:work" || payload.Credential.AccessToken != "console-secret" {
+			t.Fatalf("payload = %+v", payload)
+		}
+		received = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "test", Servers: []srServerConfig{{Name: "test", URL: server.URL, AdminToken: "admin-secret"}}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_SERVER", "test")
+	var out bytes.Buffer
+	runner := srRunner{store: store, out: &out, errOut: &out, client: server.Client()}
+	if err := runner.syncQwenConsoleToSelectedRemote(context.Background(), "qwen-token:work"); err != nil {
+		t.Fatal(err)
+	}
+	if !received || !strings.Contains(out.String(), "Synced Qwen quota authorization to server: test") {
+		t.Fatalf("sync output = %q received=%v", out.String(), received)
+	}
+}
+
+func TestSRQwenLoginTargetsSelectedRemoteAccount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	accountID := "qwen-token:work"
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:    accountID,
+		Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "model-secret",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	received := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer admin-secret" {
+			t.Fatalf("authorization = %q", req.Header.Get("Authorization"))
+		}
+		switch req.URL.Path {
+		case "/_subrouter/accounts":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": accountID, "provider": "qwen-token", "auth_mode": "apikey",
+			}})
+		case "/_subrouter/qwen-console":
+			received = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer server.Close()
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "test", Servers: []srServerConfig{{Name: "test", URL: server.URL, AdminToken: "admin-secret"}}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_SERVER", "test")
+	command := &qwenLoginCommandRunner{}
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader("sk-sp-remote-test\n"), out: &out, errOut: &out, client: server.Client(), cmd: command}
+	if err := runner.run(context.Background(), []string{"qwen", "login", "--console-account", "person@example.com", accountID}); err != nil {
+		t.Fatal(err)
+	}
+	if !received || !strings.Contains(out.String(), "Synced Qwen quota authorization to server: test") {
+		t.Fatalf("sync output = %q received=%v", out.String(), received)
+	}
+}
+
+type qwenLoginCommandRunner struct {
+	name string
+	args []string
+}
+
+func (r *qwenLoginCommandRunner) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return r.RunWithEnv(ctx, name, args, nil, stdin, stdout, stderr)
+}
+
+func (r *qwenLoginCommandRunner) RunWithEnv(_ context.Context, name string, args, env []string, _ io.Reader, _, _ io.Writer) error {
+	r.name = name
+	r.args = append([]string(nil), args...)
+	var configDir string
+	for _, value := range env {
+		if strings.HasPrefix(value, "BAILIAN_CONFIG_DIR=") {
+			configDir = strings.TrimPrefix(value, "BAILIAN_CONFIG_DIR=")
+		}
+	}
+	body, err := os.ReadFile(filepath.Join(configDir, "config.json"))
+	if err != nil {
+		return err
+	}
+	var config map[string]any
+	if err := json.Unmarshal(body, &config); err != nil {
+		return err
+	}
+	config["access_token"] = "console-secret"
+	body, err = json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(configDir, "config.json"), body, 0o600)
+}
+
+func (r *qwenLoginCommandRunner) Output(context.Context, string, []string) ([]byte, error) {
+	return nil, nil
 }
 
 func TestSRTraceShowsOAuthBreadcrumbs(t *testing.T) {
@@ -1589,7 +2248,7 @@ func TestUsageRowsGroupByTheirOwnProvider(t *testing.T) {
 		{provider: accounts.ProviderCodex, wantLabel: "Codex accounts", wantPlan: "api key"},
 		{provider: "", wantLabel: "Codex accounts", wantPlan: "api key"},
 		{provider: accounts.ProviderClaude, wantLabel: "Claude profiles", wantPlan: "claude key"},
-		{provider: accounts.ProviderQwenToken, wantLabel: "Qwen-token accounts", wantPlan: "qwen-token key"},
+		{provider: accounts.ProviderQwenToken, wantLabel: "Qwen accounts", wantPlan: "qwen-token key"},
 		{provider: accounts.ProviderQwenAnthropic, wantLabel: "Qwen-anthropic accounts", wantPlan: "qwen-anthropic key"},
 		{provider: accounts.ProviderGrok, wantLabel: "Grok accounts", wantPlan: "grok key"},
 	}
@@ -1615,32 +2274,50 @@ func TestUsageRowsGroupByTheirOwnProvider(t *testing.T) {
 	}
 }
 
+func TestRankUsageRowsKeepsProviderHeadingsContiguous(t *testing.T) {
+	rows := []srUsageRow{
+		{email: "qwen-token:z", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey},
+		{email: "kimi:z-api", provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey},
+		{email: "qwen-token:a", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey},
+		{email: "kimi:a-oauth", provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth},
+	}
+	rankUsageRows(rows)
+	got := make([]string, 0, len(rows))
+	for _, row := range rows {
+		got = append(got, usageProviderLabel(row))
+	}
+	want := []string{
+		"Kimi API-key accounts",
+		"Kimi subscription accounts",
+		"Qwen accounts",
+		"Qwen accounts",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("provider groups = %v, want %v", got, want)
+	}
+}
+
 // The Codex windows and the scheduler's "Use" advice mean nothing for a vendor
 // that publishes no quota, so a keyed-provider section gets its own columns.
 func TestKeyedProviderSectionUsesItsOwnColumns(t *testing.T) {
 	var out bytes.Buffer
-	keyed := usageGridColumns(&out, false, accounts.ProviderQwenToken)
+	keyed := usageGridColumns(&out, false, srUsageRow{provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, showShortWindow: true, showLongWindow: true})
 	keys := map[string]int{}
 	for _, column := range keyed {
 		keys[column.Key] = column.Width
 	}
-	for _, want := range []string{"Account", "Plan", "State", "Models", "Endpoints", "Quota"} {
+	for _, want := range []string{"Account", "Plan", "State", "Pick", "5h", "7d"} {
 		if _, ok := keys[want]; !ok {
 			t.Fatalf("keyed section is missing the %q column: %v", want, keys)
 		}
 	}
-	for _, unwanted := range []string{"Pick", "5h", "7d", "Reset", "Credits"} {
+	for _, unwanted := range []string{"Key ID", "Sessions", "Login", "Models", "Endpoints", "Reset", "Credits"} {
 		if _, ok := keys[unwanted]; ok {
 			t.Fatalf("keyed section should not carry the %q column", unwanted)
 		}
 	}
-	// "token plan, per credit" must not be truncated to an ellipsis.
-	if keys["Plan"] < len("token plan, per credit") {
-		t.Fatalf("Plan width %d truncates the metering description", keys["Plan"])
-	}
-
 	// Codex keeps its own columns untouched.
-	codex := usageGridColumns(&out, false, accounts.ProviderCodex)
+	codex := usageGridColumns(&out, false, srUsageRow{provider: accounts.ProviderCodex})
 	codexKeys := map[string]bool{}
 	for _, column := range codex {
 		codexKeys[column.Key] = true
@@ -1658,13 +2335,285 @@ func TestKeyedProviderSectionUsesItsOwnColumns(t *testing.T) {
 	// stored provider still identifies this as an API-key section. It must not
 	// fall back to Codex quota and switch columns merely because metering is
 	// unknown locally.
-	custom := usageGridColumns(&out, false, accounts.Provider("acme-relay"))
+	custom := usageGridColumns(&out, false, srUsageRow{
+		provider: accounts.Provider("acme-relay"), authMode: accounts.AuthModeAPIKey,
+	})
 	customKeys := map[string]bool{}
 	for _, column := range custom {
 		customKeys[column.Key] = true
 	}
-	if !customKeys["Endpoints"] || !customKeys["Quota"] || customKeys["5h"] || customKeys["7d"] {
-		t.Fatalf("declared-provider columns = %v, want keyed-provider layout", customKeys)
+	if customKeys["Endpoints"] || customKeys["Quota"] || customKeys["5h"] || customKeys["7d"] {
+		t.Fatalf("declared-provider columns = %v, want compact provider layout", customKeys)
+	}
+}
+
+func TestKimiSubscriptionSectionShowsIndependentQuotaWindows(t *testing.T) {
+	t.Setenv("COLUMNS", "120")
+	var out bytes.Buffer
+	columns := usageGridColumns(&out, false, srUsageRow{provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth})
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+		if column.Key == "5h" && column.Width < len("100%/12h34m") {
+			t.Fatalf("Kimi 5h width = %d, want an untruncated reset value", column.Width)
+		}
+	}
+	for _, want := range []string{"Account", "State", "5h", "Weekly"} {
+		if !keys[want] {
+			t.Fatalf("Kimi section is missing %q: %+v", want, columns)
+		}
+	}
+	for _, unwanted := range []string{"Plan", "Pick", "Models", "Endpoints", "Quota", "7d"} {
+		if keys[unwanted] {
+			t.Fatalf("Kimi subscription section should not carry %q", unwanted)
+		}
+	}
+
+	displayUsageRows(&out, []srUsageRow{{
+		email:    "kimi-code",
+		provider: accounts.ProviderKimi,
+		authMode: accounts.AuthModeOAuth,
+		active:   true,
+		planType: "subscription",
+		windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 25, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: 3600},
+			{Name: "weekly", UsedPercent: 40, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 86400},
+		},
+	}}, false)
+	text := out.String()
+	for _, want := range []string{"Kimi subscription accounts", "kimi-code", "75%/1h", "60%/2d"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Kimi status is missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestKimiSubscriptionStateDistinguishesReadyRecommendedAndActive(t *testing.T) {
+	ready := srUsageRow{
+		provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth,
+		sessionsKnown: true, score: selectacct.Score{Headroom: 1, ShortHeadroom: 1},
+	}
+	if got := usageGridState(ready); got != "ready" {
+		t.Fatalf("ready Kimi state = %q", got)
+	}
+	ready.gtoRecommended = true
+	if got := usageGridState(ready); got != "rec" {
+		t.Fatalf("recommended Kimi state = %q", got)
+	}
+	ready.active = true
+	ready.assignedSessions = 1
+	if got := usageGridState(ready); got != "active, rec" {
+		t.Fatalf("active recommended Kimi state = %q", got)
+	}
+}
+
+func TestKimiAPIKeyShowsQuotaWindowsOnlyWhenAvailable(t *testing.T) {
+	withQuota := srUsageRow{
+		provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey,
+		quotaUsageKnown: true,
+	}
+	keys := map[string]bool{}
+	for _, column := range usageGridColumns(&bytes.Buffer{}, false, withQuota) {
+		keys[column.Key] = true
+	}
+	if !keys["5h"] || !keys["Weekly"] {
+		t.Fatalf("Kimi subscription key columns = %v", keys)
+	}
+	withoutQuota := withQuota
+	withoutQuota.quotaUsageKnown = false
+	keys = map[string]bool{}
+	for _, column := range usageGridColumns(&bytes.Buffer{}, false, withoutQuota) {
+		keys[column.Key] = true
+	}
+	if keys["5h"] || keys["Weekly"] {
+		t.Fatalf("Kimi key without quota exposed empty windows: %v", keys)
+	}
+}
+
+func TestQwenTokenPlanNamesAndQuotaWindowsDoNotTruncate(t *testing.T) {
+	t.Setenv("COLUMNS", "120")
+	row := srUsageRow{
+		provider:        accounts.ProviderQwenToken,
+		authMode:        accounts.AuthModeAPIKey,
+		planType:        "Standard",
+		showShortWindow: true,
+		showLongWindow:  true,
+	}
+	if got := usageGridPlan(row); got != "Token Plan Standard" {
+		t.Fatalf("usageGridPlan = %q, want Token Plan Standard", got)
+	}
+	for _, column := range usageGridColumns(&bytes.Buffer{}, false, row) {
+		switch column.Key {
+		case "Plan":
+			if column.Width < len("Token Plan Standard") {
+				t.Fatalf("Qwen plan width = %d, want untruncated Token Plan Standard", column.Width)
+			}
+		case "5h", "7d":
+			if column.Width < len("100%/12h34m") {
+				t.Fatalf("Qwen %s width = %d, want an untruncated reset value", column.Key, column.Width)
+			}
+		}
+	}
+}
+
+func TestKimiAPIKeySectionDoesNotClaimSubscriptionQuota(t *testing.T) {
+	columns := usageGridColumns(&bytes.Buffer{}, false, srUsageRow{provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey})
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+	}
+	if keys["5h"] || keys["Weekly"] || keys["Quota"] || !keys["Pick"] {
+		t.Fatalf("Kimi API-key columns = %+v", columns)
+	}
+	if got := usageGridProviderQuota(srUsageRow{provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey}); got != "OAuth only" {
+		t.Fatalf("Kimi API-key quota = %q", got)
+	}
+	if got := usageGridProviderQuota(srUsageRow{provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey}); got != "console only" {
+		t.Fatalf("Qwen Token Plan quota = %q", got)
+	}
+}
+
+func TestAPIKeyProviderStatusUsesCompactRoutingColumns(t *testing.T) {
+	t.Setenv("COLUMNS", "120")
+	var out bytes.Buffer
+	rows := []srUsageRow{
+		{email: "deepseek:primary", provider: accounts.ProviderDeepSeek, authMode: accounts.AuthModeAPIKey, providerHealth: "auth ok", planType: "credits, per token", assignedSessions: 2, sessionsKnown: true},
+		{email: "deepseek:reserve", provider: accounts.ProviderDeepSeek, authMode: accounts.AuthModeAPIKey, providerHealth: "auth ok", planType: "credits, per token", sessionsKnown: true},
+	}
+	rankUsageRows(rows)
+	displayUsageRows(&out, rows, false)
+	text := out.String()
+	for _, want := range []string{"Deepseek accounts", "Account", "Plan", "State", "Use", "credits", "active", "rec", "ready", "quota not exposed"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("compact API-key provider status should show %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"Key ID", "Sessions", "Models", "Endpoints", "Quota", "5h", "7d"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("compact API-key provider status should not show %q:\n%s", unwanted, text)
+		}
+	}
+}
+
+func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
+	var out bytes.Buffer
+	rows := []srUsageRow{
+		{email: "qwen-token:team-a", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, planType: "Lite", providerHealth: "auth ok", quotaStatus: "live", accountIdentity: "first@example.com", keyFingerprint: "key:1111111111", assignedSessions: 2, sessionsKnown: true, windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 25, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 86400}}},
+		{email: "qwen-token:team-b", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, planType: "Pro", providerHealth: "auth ok", quotaStatus: "live", accountIdentity: "second@example.com", keyFingerprint: "key:2222222222", assignedSessions: 0, sessionsKnown: true, windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: 3600}, {Name: "7d", UsedPercent: 40, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 3 * 86400}}},
+	}
+	for i := range rows {
+		rows[i].quotaUsageKnown = true
+		rows[i].score = scoreFromWindows(rows[i].email, rows[i].windows)
+	}
+	rankUsageRows(rows)
+	displayUsageRows(&out, rows, false)
+	text := out.String()
+	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "first@example.com", "second@example.com"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Qwen status should show %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"qwen-token:team-", "key:1111111111", "key:2222222222", "Sessions", "Login", "Key ID", "unknown"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("Qwen status should not show %q:\n%s", unwanted, text)
+		}
+	}
+}
+
+func TestQwenStatusOmitsUnreportedQuotaWindow(t *testing.T) {
+	var out bytes.Buffer
+	rows := []srUsageRow{{
+		email: "qwen-token:weekly-only", provider: accounts.ProviderQwenToken,
+		authMode: accounts.AuthModeAPIKey, providerHealth: "auth ok", quotaStatus: "live",
+		quotaUsageKnown: true, windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 5}},
+	}}
+	rows[0].score = scoreFromWindows(rows[0].email, rows[0].windows)
+	rankUsageRows(rows)
+	displayUsageRows(&out, rows, false)
+	text := out.String()
+	if strings.Contains(text, "5h") || strings.Contains(text, "unknown") || !strings.Contains(text, "7d") {
+		t.Fatalf("Qwen weekly-only status should omit the unreported 5h window:\n%s", text)
+	}
+}
+
+func TestQwenStatusDisambiguatesSharedLoginWithSavedLabel(t *testing.T) {
+	t.Setenv("COLUMNS", "160")
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{
+		{email: "qwen-token:large", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
+		{email: "qwen-token:small", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
+	}, false)
+	for _, want := range []string{"same@example.com (large)", "same@example.com (small)"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("duplicate Qwen login should retain saved-label disambiguation %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestQwenRemoteLiveQuotaDoesNotImplyModelKeyHealth(t *testing.T) {
+	row := srUsageRow{provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, quotaStatus: "live"}
+	if got := usageGridState(row); got != "quota live" {
+		t.Fatalf("state = %q", got)
+	}
+	if got := usageGridStateColor(row); got == ansiGreen {
+		t.Fatal("an unprobed remote model key was rendered healthy")
+	}
+}
+
+func TestQwenRemoteStatusStillShowsQuotaStateWithoutLocalHealthProbe(t *testing.T) {
+	row := srUsageRow{provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, quotaStatus: "login needed"}
+	if got := usageGridState(row); got != "login needed" {
+		t.Fatalf("Qwen remote state = %q", got)
+	}
+}
+
+func TestUsageRowsFromServerPreserveKeyIdentityAndSessions(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:               "qwen-token:large-plan",
+		Provider:         accounts.ProviderQwenToken,
+		AuthMode:         accounts.AuthModeAPIKey,
+		KeyFingerprint:   "key:1234567890",
+		AssignedSessions: 3,
+		SessionsKnown:    true,
+	}})
+	if len(rows) != 1 || rows[0].keyFingerprint != "key:1234567890" || rows[0].assignedSessions != 3 || !rows[0].sessionsKnown {
+		t.Fatalf("remote Qwen identity/session fields lost: %+v", rows)
+	}
+}
+
+func TestUsageRowsFromServerApplyKimiAPIKeyQuota(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "kimi:work-key", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeAPIKey,
+		AuthChecked: true, AuthValid: true, QuotaUsageKnown: true,
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: 900},
+			{Name: "weekly", UsedPercent: 20, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		},
+	}})
+	if len(rows) != 1 || rows[0].providerHealth != "auth ok" || !rows[0].tempCooked || rows[0].score.ShortHeadroom != 0 {
+		t.Fatalf("remote Kimi quota was not applied: %+v", rows)
+	}
+}
+
+func TestUsageRowsFromServerRecommendAValidatedKimiAPIKey(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "kimi:healthy", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeAPIKey,
+		AuthChecked: true, AuthValid: true, QuotaUsageKnown: true,
+		Windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+			{Name: "weekly", UsedPercent: 20, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		},
+	}})
+	if len(rows) != 1 || rows[0].providerHealth != "auth ok" || !displayRecommendedForNewSession(rows[0]) {
+		t.Fatalf("validated remote Kimi key was not recommendable: %+v", rows)
+	}
+}
+
+func TestKeyedProviderSectionFitsNarrowTerminal(t *testing.T) {
+	t.Setenv("COLUMNS", "80")
+	columns := usageGridColumns(&bytes.Buffer{}, false, srUsageRow{provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey})
+	if width := usageGridWidth(columns); width > 80 {
+		t.Fatalf("keyed provider grid width = %d, want <= 80", width)
 	}
 }
 
@@ -1698,8 +2647,8 @@ func TestProbeProviderKeyClassifiesTheResponse(t *testing.T) {
 		{http.StatusUnauthorized, `{}`, "bad key", -1},
 		{http.StatusForbidden, `{}`, "denied", -1},
 		{http.StatusBadGateway, `{}`, "http 502", -1},
-		{http.StatusOK, `{"data":[{},{}]}`, "ok", 2},
-		{http.StatusOK, `{`, "ok", -1},
+		{http.StatusOK, `{"data":[{},{}]}`, "auth ok", 2},
+		{http.StatusOK, `{`, "auth ok", -1},
 	}
 	for _, tc := range cases {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1738,6 +2687,8 @@ func TestProbeProviderKeyClassifiesTheResponse(t *testing.T) {
 func TestProviderDefaultUpstreamsAreDeclared(t *testing.T) {
 	for _, provider := range []accounts.Provider{
 		accounts.ProviderKimi, accounts.ProviderZAI, accounts.ProviderOpenRouter,
+		accounts.ProviderDeepSeek, accounts.ProviderTogether, accounts.ProviderFireworks,
+		accounts.ProviderOpenCodeZen,
 		accounts.ProviderGrok, accounts.ProviderQwen, accounts.ProviderQwenToken,
 		accounts.ProviderQwenAnthropic,
 	} {

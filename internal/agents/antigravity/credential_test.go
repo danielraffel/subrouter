@@ -357,6 +357,25 @@ func TestRefreshCredentialDoesNotRetryInvalidGrantAcrossClients(t *testing.T) {
 	}
 }
 
+func TestRefreshCredentialUsesCachedClientBeforeDiscoveringCandidates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh", "expires_in": 3600})
+	}))
+	defer server.Close()
+	stubTokenURL(t, server)
+	discoveryCalls := 0
+	restore := oauthClientsForRefresh
+	oauthClientsForRefresh = func() []oauthClient { discoveryCalls++; return nil }
+	workingClient.Store(&oauthClient{id: "cached", secret: "cached-secret"})
+	t.Cleanup(func() { oauthClientsForRefresh = restore; workingClient.Store(nil) })
+	if _, err := RefreshCredential(context.Background(), server.Client(), CredentialInfo{RefreshToken: "rt"}, reference); err != nil {
+		t.Fatal(err)
+	}
+	if discoveryCalls != 0 {
+		t.Fatalf("candidate discovery ran %d times with a working cached client", discoveryCalls)
+	}
+}
+
 // With no installed CLI and no configured client there is nothing to refresh
 // with; the error must say so rather than reporting an upstream failure.
 func TestRefreshCredentialReportsWhenNoClientIsAvailable(t *testing.T) {

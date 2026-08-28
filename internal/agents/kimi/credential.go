@@ -14,14 +14,16 @@ import (
 
 // CredentialInfo is the Kimi Code CLI's OAuth credential.
 type CredentialInfo struct {
-	AccessToken  string
-	RefreshToken string
-	TokenType    string
-	Scope        string
+	AccessToken   string `json:"access_token,omitempty"`
+	RefreshToken  string `json:"refresh_token,omitempty"`
+	TokenType     string `json:"token_type,omitempty"`
+	Scope         string `json:"scope,omitempty"`
+	AccountLabel  string `json:"account_label,omitempty"`
+	OAuthDeviceID string `json:"oauth_device_id,omitempty"`
 	// ExpiresAt is when the access token stops being accepted. Zero means the
 	// stored credential did not say, in which case it is treated as expired so
 	// a refresh happens rather than a request failing upstream.
-	ExpiresAt time.Time
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
 // unreadableCredentialPhrase appears in every credential-decode error. A
@@ -34,12 +36,14 @@ const unreadableCredentialPhrase = "unreadable credential"
 // so expires_at is what keeps a stored credential from being refreshed on
 // every request.
 type credentialPayload struct {
-	AccessToken  string          `json:"access_token"`
-	RefreshToken string          `json:"refresh_token"`
-	TokenType    string          `json:"token_type"`
-	Scope        string          `json:"scope"`
-	ExpiresAt    json.RawMessage `json:"expires_at"`
-	ExpiresIn    int64           `json:"expires_in"`
+	AccessToken   string          `json:"access_token"`
+	RefreshToken  string          `json:"refresh_token"`
+	TokenType     string          `json:"token_type"`
+	Scope         string          `json:"scope"`
+	AccountLabel  string          `json:"account_label"`
+	OAuthDeviceID string          `json:"oauth_device_id"`
+	ExpiresAt     json.RawMessage `json:"expires_at"`
+	ExpiresIn     int64           `json:"expires_in"`
 }
 
 // ParseCredential decodes a stored Kimi credential. source names where the
@@ -55,10 +59,12 @@ func ParseCredential(body []byte, source string, now time.Time) (CredentialInfo,
 		return CredentialInfo{}, fmt.Errorf("%s from %s (bytes=%d): no access or refresh token", unreadableCredentialPhrase, source, len(body))
 	}
 	credential := CredentialInfo{
-		AccessToken:  payload.AccessToken,
-		RefreshToken: payload.RefreshToken,
-		TokenType:    payload.TokenType,
-		Scope:        payload.Scope,
+		AccessToken:   payload.AccessToken,
+		RefreshToken:  payload.RefreshToken,
+		TokenType:     payload.TokenType,
+		Scope:         payload.Scope,
+		AccountLabel:  payload.AccountLabel,
+		OAuthDeviceID: payload.OAuthDeviceID,
 	}
 	expiry, err := payload.expiresAt(now)
 	if err != nil {
@@ -124,4 +130,19 @@ func (c CredentialInfo) NeedsRefresh(now time.Time) bool {
 		return true
 	}
 	return !now.Add(refreshLead).Before(c.ExpiresAt)
+}
+
+// ValidateOAuthDeviceID checks the stable device identity Kimi binds to an
+// installed-app authorization. Managed credentials retain this value so a
+// refresh uses the same identity even after the profile moves to a server.
+func ValidateOAuthDeviceID(value string) error {
+	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value {
+		return fmt.Errorf("OAuth device identity is empty or invalid")
+	}
+	for _, char := range value {
+		if char < 0x20 || char > 0x7e {
+			return fmt.Errorf("OAuth device identity contains a non-ASCII character")
+		}
+	}
+	return nil
 }

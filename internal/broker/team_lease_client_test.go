@@ -111,6 +111,9 @@ func TestTeamModeRequiresHostedTenantConfiguration(t *testing.T) {
 	if !config.TeamModeReady() {
 		t.Fatal("team mode was not ready with hosted tenant configuration")
 	}
+	if !config.HostedTenantReady() {
+		t.Fatal("hosted tenant endpoint was not recognized")
+	}
 	if err := config.Validate(); err != nil {
 		t.Fatal(err)
 	}

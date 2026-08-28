@@ -15,6 +15,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
 
 const serverAccountImportPath = "/_subrouter/account-import"
@@ -23,6 +24,7 @@ type serverAccountImportRequest struct {
 	Provider accounts.Provider            `json:"provider"`
 	Codex    *accounts.StoredCodexAccount `json:"codex,omitempty"`
 	Claude   *serverClaudeAccountImport   `json:"claude,omitempty"`
+	Kimi     *serverKimiAccountImport     `json:"kimi,omitempty"`
 }
 
 type serverClaudeAccountImport struct {
@@ -30,7 +32,17 @@ type serverClaudeAccountImport struct {
 	Credential agentclaude.CredentialInfo `json:"credential"`
 }
 
+type serverKimiAccountImport struct {
+	Label      string                   `json:"label"`
+	Credential agentkimi.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                     `json:"remove,omitempty"`
+}
+
 func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server srServerConfig) error {
+	return r.ensureServerAccountImportProviderAvailable(ctx, server, "")
+}
+
+func (r srRunner) ensureServerAccountImportProviderAvailable(ctx context.Context, server srServerConfig, provider accounts.Provider) error {
 	// Ask the server rather than assuming a stored credential is required. A
 	// self-hosted server can authenticate callers by tailnet identity, in which
 	// case this entry has nothing to carry and the preflight simply succeeds.
@@ -46,10 +58,23 @@ func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server
 	switch {
 	case res.StatusCode >= 200 && res.StatusCode < 300:
 		var response struct {
-			OK bool `json:"ok"`
+			OK        bool     `json:"ok"`
+			Providers []string `json:"providers"`
 		}
 		if err := json.Unmarshal(body, &response); err != nil || !response.OK {
 			return fmt.Errorf("server %s returned an invalid account-import preflight", server.Name)
+		}
+		if provider != "" {
+			available := false
+			for _, advertised := range response.Providers {
+				if strings.EqualFold(strings.TrimSpace(advertised), string(provider)) {
+					available = true
+					break
+				}
+			}
+			if !available {
+				return fmt.Errorf("server %s does not advertise %s account import; run '%s install %s' first", server.Name, provider, r.serverCommand(), server.Name)
+			}
 		}
 		return nil
 	case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
@@ -65,10 +90,10 @@ func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server
 }
 
 func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {
+	provider := account.ProviderOrDefault()
 	if err := r.ensureServerAccountImportAvailable(ctx, server); err != nil {
 		return err
 	}
-	provider := account.ProviderOrDefault()
 	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
 		Provider: provider,
 		Codex:    &account,
@@ -85,6 +110,26 @@ func (r srRunner) uploadServerClaudeAccount(ctx context.Context, server srServer
 			Name:       name,
 			Credential: credential,
 		},
+	})
+}
+
+func (r srRunner) uploadServerKimiAccount(ctx context.Context, server srServerConfig, label string, credential agentkimi.CredentialInfo) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderKimi); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider: accounts.ProviderKimi,
+		Kimi:     &serverKimiAccountImport{Label: label, Credential: credential},
+	})
+}
+
+func (r srRunner) removeServerKimiAccount(ctx context.Context, server srServerConfig, label string) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderKimi); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider: accounts.ProviderKimi,
+		Kimi:     &serverKimiAccountImport{Label: label, Remove: true},
 	})
 }
 

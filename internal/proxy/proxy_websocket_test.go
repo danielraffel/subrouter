@@ -101,6 +101,111 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 }
 
+func TestWebSocketCommitsSchedulerRerouteOnlyAfterBothUpgradesSucceed(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		upgrades     bool
+		breakStore   bool
+		wantCommit   bool
+		wantReadOkay bool
+	}{
+		{name: "upstream rejects", upgrades: false},
+		{name: "both upgrades succeed", upgrades: true, wantCommit: true, wantReadOkay: true},
+		{name: "assignment persistence fails", upgrades: true, breakStore: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.Header.Get("Authorization") != "Bearer fresh-token" {
+					t.Errorf("Authorization = %q, want scheduler-selected account", request.Header.Get("Authorization"))
+				}
+				if !test.upgrades {
+					http.Error(w, "try later", http.StatusServiceUnavailable)
+					return
+				}
+				conn, err := upgrader.Upgrade(w, request, nil)
+				if err != nil {
+					t.Errorf("upstream upgrade: %v", err)
+					return
+				}
+				defer conn.Close()
+				_ = conn.WriteMessage(websocket.TextMessage, []byte("ok"))
+			}))
+			defer upstream.Close()
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storePath := filepath.Join(t.TempDir(), "sessions.json")
+			store, err := session.NewStore(storePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const sessionID = "ws-scheduler-success-boundary"
+			if _, err := store.Put("codex", sessionID, "spent@example.com", ""); err != nil {
+				t.Fatal(err)
+			}
+			if test.breakStore {
+				if err := os.Remove(storePath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(storePath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			handler := Server{
+				Upstream: upstreamURL,
+				Accounts: []accounts.Account{
+					{ID: "spent@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "spent-token"},
+					{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "fresh-token"},
+				},
+				Sessions: store,
+				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+					{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
+					{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+				})),
+				MaxBodyBytes: 1024,
+			}.Handler()
+			proxy := httptest.NewServer(handler)
+			defer proxy.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
+			conn, response, dialErr := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Codex-Session-ID": []string{sessionID}})
+			if test.upgrades {
+				if dialErr != nil {
+					t.Fatalf("dial: %v", dialErr)
+				}
+				defer conn.Close()
+				_, _, readErr := conn.ReadMessage()
+				if test.wantReadOkay && readErr != nil {
+					t.Fatalf("read: %v", readErr)
+				}
+				if !test.wantReadOkay && readErr == nil {
+					t.Fatal("websocket remained usable after sticky assignment persistence failed")
+				}
+			} else if dialErr == nil {
+				conn.Close()
+				t.Fatal("websocket unexpectedly upgraded")
+			}
+			if response != nil && response.Body != nil {
+				response.Body.Close()
+			}
+
+			assignment, ok := store.Get("codex", sessionID)
+			if !ok {
+				t.Fatal("sticky assignment disappeared")
+			}
+			want := "spent@example.com"
+			if test.wantCommit {
+				want = "fresh@example.com"
+			}
+			if assignment.AccountID != want {
+				t.Fatalf("sticky assignment = %q, want %q", assignment.AccountID, want)
+			}
+		})
+	}
+}
+
 func TestHandlerRejectsCrossOriginBrowserWebSocketBeforeUpstreamDial(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3695,6 +3800,57 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 	}
 }
 
+func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		auth := request.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer incompatible-token" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+			{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		})),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	request.Header.Set("X-Subrouter-Session", "session-1")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want failed alternate 503", response.Code)
+	}
+	wantAuths := []string{"Bearer incompatible-token", "Bearer compatible-token"}
+	if strings.Join(auths, "\x00") != strings.Join(wantAuths, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, wantAuths)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok || assignment.AccountID != "incompatible@example.com" {
+		t.Fatalf("failed compatibility replay changed sticky assignment: %+v", assignment)
+	}
+}
+
 func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3817,13 +3973,24 @@ func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *te
 }
 
 func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
-	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
-		AccountID:     "incompatible@example.com",
-		Provider:      accounts.ProviderCodex,
-		Headroom:      0.8,
-		ShortHeadroom: 0.8,
-	}}))
-	server := Server{SchedulerRef: schedulerRef}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "incompatible@example.com", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "compatible@example.com", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8},
+	}))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions: store, SchedulerRef: schedulerRef,
+	}
 	response := &http.Response{
 		StatusCode: http.StatusBadRequest,
 		Header:     http.Header{},
@@ -3842,6 +4009,10 @@ func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
 	}
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
 		t.Fatal("passive compatibility inspection must not mark the whole account")
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok || assignment.AccountID != "compatible@example.com" {
+		t.Fatalf("passive compatibility inspection did not persist the next-request account: %+v", assignment)
 	}
 }
 

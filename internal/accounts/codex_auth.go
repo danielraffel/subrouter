@@ -166,6 +166,13 @@ func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, erro
 	return s.AddProviderAPIKey(ProviderCodex, label, key)
 }
 
+// AddAPIKeyForProvider preserves the original provider-aware call shape for
+// callers on older stacked branches. New code should prefer AddProviderAPIKey,
+// whose provider-first order matches the account's routing identity.
+func (s CodexStore) AddAPIKeyForProvider(label, key string, provider Provider) (StoredCodexAccount, bool, error) {
+	return s.AddProviderAPIKey(provider, label, key)
+}
+
 // AddProviderAPIKey stores an API key under the provider-scoped identifier
 // used by proxy routing. ProviderCodex retains the legacy apikey: prefix and
 // sk- validation; registry-backed providers may use their own key formats.

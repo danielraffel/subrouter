@@ -9,17 +9,18 @@ const (
 	ProviderClaude Provider = "claude"
 	ProviderKimi   Provider = "kimi"
 	ProviderZAI    Provider = "zai"
-	// ProviderAntigravity is a Google Antigravity subscription reached through
-	// the Antigravity CLI's OAuth credential. OAuth-only: there is no API-key
-	// mode for it.
-	ProviderAntigravity Provider = "antigravity"
 
 	// ProviderOpenRouter routes to OpenRouter's OpenAI-compatible API with a
 	// per-account API key.
-	ProviderOpenRouter Provider = "openrouter"
+	ProviderOpenRouter  Provider = "openrouter"
+	ProviderDeepSeek    Provider = "deepseek"
+	ProviderTogether    Provider = "together"
+	ProviderFireworks   Provider = "fireworks"
+	ProviderOpenCodeZen Provider = "opencode-zen"
 
-	// ProviderGrok routes to xAI's OpenAI-compatible API with a per-account
-	// API key.
+	// ProviderGrok routes to xAI. An API-key account reaches the
+	// OpenAI-compatible API; an OAuth account is a Grok subscription behind
+	// the device-code grant and reaches the CLI's chat-proxy endpoint.
 	ProviderGrok Provider = "grok"
 
 	// ProviderQwen routes to Alibaba Cloud Model Studio's Coding Plan, whose
@@ -35,6 +36,11 @@ const (
 	// ProviderQwenAnthropic routes to the Token Plan's Anthropic-protocol
 	// endpoint, which serves the same subscription to Anthropic-shaped clients.
 	ProviderQwenAnthropic Provider = "qwen-anthropic"
+
+	// ProviderAntigravity is a Google Antigravity subscription reached through
+	// the Antigravity CLI's OAuth credential. OAuth-only: there is no API-key
+	// mode for it.
+	ProviderAntigravity Provider = "antigravity"
 )
 
 type AuthMode string

@@ -136,7 +136,7 @@ func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &statuses); err != nil {
 		t.Fatal(err)
 	}
-	if len(statuses) != 1 || statuses[0].Provider != accounts.ProviderQwenToken || statuses[0].ProviderHealth != "ok" || statuses[0].ProviderModels == nil || *statuses[0].ProviderModels != 2 || !slices.Equal(statuses[0].ProviderEndpoints, []string{"/qwen-anthropic", "/qwen-token"}) {
+	if len(statuses) != 1 || statuses[0].Provider != accounts.ProviderQwenToken || statuses[0].ProviderHealth != "auth ok" || statuses[0].ProviderModels == nil || *statuses[0].ProviderModels != 2 || !slices.Equal(statuses[0].ProviderEndpoints, []string{"/qwen-anthropic", "/qwen-token"}) {
 		t.Fatalf("usage statuses = %+v, want healthy key with 2 models", statuses)
 	}
 	if gotAuthorization != "Bearer test-provider-key" {
@@ -162,6 +162,7 @@ func TestConfigureRejectsShadowingAnExistingProvider(t *testing.T) {
 		{name: "built-in alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"glm"}, BaseURL: "https://x.test/v1"}},
 		{name: "reserved alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"anthropic"}, BaseURL: "https://x.test/v1"}},
 		{name: "legacy API-key alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"apikey"}, BaseURL: "https://x.test/v1"}},
+		{name: "antigravity route", declared: OpenAICompatibleProvider{Name: "antigravity", BaseURL: "https://x.test/v1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

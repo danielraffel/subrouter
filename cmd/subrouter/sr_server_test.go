@@ -1927,6 +1927,13 @@ func TestParseAPIKeyProviderCoversEveryProvider(t *testing.T) {
 		"open-router":     accounts.ProviderOpenRouter,
 		"  OpenRouter  ":  accounts.ProviderOpenRouter,
 		"qwen-anthropic":  accounts.ProviderQwenToken,
+		"deepseek":        accounts.ProviderDeepSeek,
+		"together":        accounts.ProviderTogether,
+		"together-ai":     accounts.ProviderTogether,
+		"fireworks":       accounts.ProviderFireworks,
+		"fireworks-ai":    accounts.ProviderFireworks,
+		"opencode-zen":    accounts.ProviderOpenCodeZen,
+		"zen":             accounts.ProviderOpenCodeZen,
 	}
 	for value, want := range cases {
 		got, err := parseAPIKeyProvider(value)

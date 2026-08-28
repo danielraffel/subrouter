@@ -19,10 +19,10 @@ func TestHandlerRoutesKimiProviderPrefixToKimiUpstream(t *testing.T) {
 			t.Fatalf("upstream path = %q, want /coding/v1/messages", r.URL.Path)
 		}
 		if got := r.Header.Get("X-Api-Key"); got != "kimi-token" {
-			t.Fatalf("X-Api-Key = %q, want kimi token", got)
+			t.Fatal("upstream did not receive the expected Kimi API-key credential")
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer kimi-token" {
-			t.Fatalf("Authorization = %q, want kimi bearer", got)
+			t.Fatal("upstream did not receive the expected Kimi bearer credential")
 		}
 		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
 			t.Fatalf("Anthropic-Version = %q, want 2023-06-01", got)
@@ -75,10 +75,10 @@ func TestHandlerRoutesZAIProviderPrefixToZAIUpstream(t *testing.T) {
 			t.Fatalf("upstream path = %q, want /api/coding/paas/v4/chat/completions", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer zai-token" {
-			t.Fatalf("Authorization = %q, want zai bearer", got)
+			t.Fatal("upstream did not receive the expected ZAI bearer credential")
 		}
 		if got := r.Header.Get("X-Api-Key"); got != "" {
-			t.Fatalf("X-Api-Key = %q, want stripped", got)
+			t.Fatal("upstream received an X-Api-Key header that should have been stripped")
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))
@@ -115,6 +115,8 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		Sessions:     store,
 		MaxBodyBytes: 1024,
 	}
+	// Antigravity is OAuth-only and stays out of the keyed-provider registry,
+	// so it bypasses the registry resolution.
 	if provider == accounts.ProviderAntigravity {
 		server.AntigravityUpstream = upstream
 		return server
@@ -133,6 +135,14 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		server.ZAIUpstream = upstream
 	case accounts.ProviderOpenRouter:
 		server.OpenRouterUpstream = upstream
+	case accounts.ProviderDeepSeek:
+		server.DeepSeekUpstream = upstream
+	case accounts.ProviderTogether:
+		server.TogetherUpstream = upstream
+	case accounts.ProviderFireworks:
+		server.FireworksUpstream = upstream
+	case accounts.ProviderOpenCodeZen:
+		server.OpenCodeZenUpstream = upstream
 	case accounts.ProviderGrok:
 		server.GrokUpstream = upstream
 	case accounts.ProviderQwen:
@@ -144,10 +154,43 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 	default:
 		t.Fatalf("no upstream field wired for provider %s", provider)
 	}
-	if entry.Upstream(server) != upstream {
+	if entry.Upstream(server, account.AuthMode) != upstream {
 		t.Fatalf("provider %s upstream accessor does not read the field this helper set", provider)
 	}
 	return server
+}
+
+func TestHandlerRoutesAdditionalOpenAICompatibleProviders(t *testing.T) {
+	for _, provider := range []accounts.Provider{
+		accounts.ProviderDeepSeek,
+		accounts.ProviderTogether,
+		accounts.ProviderFireworks,
+		accounts.ProviderOpenCodeZen,
+	} {
+		t.Run(string(provider), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/chat/completions" {
+					t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer provider-token" {
+					t.Fatal("upstream did not receive the expected provider bearer credential")
+				}
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+			}))
+			defer upstream.Close()
+
+			handler := opencodeProviderTestServer(t, accounts.Account{
+				ID: string(provider) + ":main", Provider: provider,
+				AuthMode: accounts.AuthModeAPIKey, Token: "provider-token",
+			}, provider, upstream.URL+"/v1").Handler()
+			req := httptest.NewRequest(http.MethodPost, "/"+string(provider)+"/chat/completions", strings.NewReader(`{"model":"test"}`))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
 }
 
 func TestHandlerRoutesOpenRouterProviderPrefixToOpenRouterUpstream(t *testing.T) {
@@ -156,10 +199,10 @@ func TestHandlerRoutesOpenRouterProviderPrefixToOpenRouterUpstream(t *testing.T)
 			t.Fatalf("upstream path = %q, want /api/v1/chat/completions", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-or-v1-token" {
-			t.Fatalf("Authorization = %q, want openrouter bearer", got)
+			t.Fatal("upstream did not receive the expected OpenRouter bearer credential")
 		}
 		if got := r.Header.Get("X-Api-Key"); got != "" {
-			t.Fatalf("X-Api-Key = %q, want stripped", got)
+			t.Fatal("upstream received an X-Api-Key header that should have been stripped")
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))
@@ -174,6 +217,36 @@ func TestHandlerRoutesOpenRouterProviderPrefixToOpenRouterUpstream(t *testing.T)
 
 	req := httptest.NewRequest(http.MethodPost, "/openrouter/chat/completions", strings.NewReader(`{"model":"anthropic/claude-opus-5"}`))
 	req.Header.Set("X-Api-Key", "client-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// An Antigravity request carries the API version in the path the CLI sends
+// (v1internal:method), so routing strips only the provider prefix and swaps in
+// the OAuth token.
+func TestHandlerRoutesAntigravityPrefixToCloudCodeUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1internal:loadCodeAssist" {
+			t.Fatalf("upstream path = %q, want /v1internal:loadCodeAssist", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer antigravity-token" {
+			t.Fatal("upstream did not receive the expected Antigravity OAuth credential")
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "antigravity",
+		Provider: accounts.ProviderAntigravity,
+		AuthMode: accounts.AuthModeOAuth,
+		Token:    "antigravity-token",
+	}, accounts.ProviderAntigravity, upstream.URL).Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/antigravity/v1internal:loadCodeAssist", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -254,10 +327,10 @@ func TestHandlerRoutesGrokProviderPrefixToGrokUpstream(t *testing.T) {
 			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer xai-token" {
-			t.Fatalf("Authorization = %q, want the xai bearer", got)
+			t.Fatal("upstream did not receive the expected xAI bearer credential")
 		}
 		if got := r.Header.Get("X-Api-Key"); got != "" {
-			t.Fatalf("X-Api-Key = %q, want stripped", got)
+			t.Fatal("upstream received an X-Api-Key header that should have been stripped")
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))
@@ -276,6 +349,116 @@ func TestHandlerRoutesGrokProviderPrefixToGrokUpstream(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A Grok subscription (device-code OAuth) terminates at the CLI's chat
+// proxy, not the API-key host — the one provider whose upstream depends on the
+// account's auth mode.
+func TestHandlerRoutesGrokOAuthToTheSubscriptionUpstream(t *testing.T) {
+	apiKeyUpstreamHit := false
+	apiKeyUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		apiKeyUpstreamHit = true
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer apiKeyUpstream.Close()
+	subscriptionUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /v1/chat/completions (the /v1 collapsed, not duplicated)", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer grok-oauth-token" {
+			t.Fatal("upstream did not receive the expected Grok OAuth credential")
+		}
+		if got := r.Header.Get("X-XAI-Token-Auth"); got != "xai-grok-cli" {
+			t.Fatalf("X-XAI-Token-Auth = %q, want the Grok subscription marker", got)
+		}
+		if got := r.Header.Get("X-Grok-Model-Override"); got != "grok-4" {
+			t.Fatalf("X-Grok-Model-Override = %q, want the requested model", got)
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer subscriptionUpstream.Close()
+
+	apiKeyURL, err := url.Parse(apiKeyUpstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscriptionURL, err := url.Parse(subscriptionUpstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Accounts: []accounts.Account{{
+			ID:       "grok:subscription",
+			Provider: accounts.ProviderGrok,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "grok-oauth-token",
+		}},
+		Sessions:                 store,
+		MaxBodyBytes:             1024,
+		GrokUpstream:             apiKeyURL,
+		GrokSubscriptionUpstream: subscriptionURL,
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/grok/v1/chat/completions", strings.NewReader(`{"model":"grok-4"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if apiKeyUpstreamHit {
+		t.Fatal("an OAuth grok account must not reach the API-key upstream")
+	}
+}
+
+// The API-key path must keep its own upstream after the auth-mode split.
+func TestHandlerKeepsGrokAPIKeyOnTheAPIKeyUpstream(t *testing.T) {
+	subscriptionUpstreamHit := false
+	subscriptionUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		subscriptionUpstreamHit = true
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer subscriptionUpstream.Close()
+	apiKeyUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
+		}
+		if got := r.Header.Get("X-XAI-Token-Auth"); got != "" {
+			t.Fatalf("API-key request retained subscription header X-XAI-Token-Auth=%q", got)
+		}
+		if got := r.Header.Get("X-Grok-Model-Override"); got != "" {
+			t.Fatalf("API-key request retained subscription model override=%q", got)
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer apiKeyUpstream.Close()
+
+	// The server must also carry the subscription upstream so the split is
+	// observable.
+	server := opencodeProviderTestServer(t, accounts.Account{
+		ID:       "grok:main",
+		Provider: accounts.ProviderGrok,
+		AuthMode: accounts.AuthModeAPIKey,
+		Token:    "xai-token",
+	}, accounts.ProviderGrok, apiKeyUpstream.URL+"/v1")
+	server.GrokSubscriptionUpstream = mustParseURL(t, subscriptionUpstream.URL+"/v1")
+	handler := server.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/grok/v1/chat/completions", strings.NewReader(`{"model":"grok-4"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-XAI-Token-Auth", "spoofed")
+	req.Header.Set("X-Grok-Model-Override", "spoofed-model")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if subscriptionUpstreamHit {
+		t.Fatal("an API-key grok account must not reach the subscription upstream")
 	}
 }
 
@@ -333,10 +516,10 @@ func TestHandlerRoutesQwenProviderPrefixToCodingPlanUpstream(t *testing.T) {
 			t.Fatalf("upstream path = %q, want /v1/chat/completions", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-sp-token" {
-			t.Fatalf("Authorization = %q, want the coding-plan bearer", got)
+			t.Fatal("upstream did not receive the expected Qwen Coding Plan credential")
 		}
 		if got := r.Header.Get("X-Api-Key"); got != "" {
-			t.Fatalf("X-Api-Key = %q, want stripped", got)
+			t.Fatal("upstream received an X-Api-Key header that should have been stripped")
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))
@@ -389,7 +572,7 @@ func TestHandlerRoutesQwenTokenPlanAlongsideCodingPlan(t *testing.T) {
 			t.Fatalf("coding-plan path = %q", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-sp-coding" {
-			t.Fatalf("coding-plan Authorization = %q", got)
+			t.Fatal("upstream did not receive the expected Qwen Coding Plan credential")
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -400,7 +583,7 @@ func TestHandlerRoutesQwenTokenPlanAlongsideCodingPlan(t *testing.T) {
 			t.Fatalf("token-plan path = %q, want /compatible-mode/v1/chat/completions", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-token-plan" {
-			t.Fatalf("token-plan Authorization = %q", got)
+			t.Fatal("upstream did not receive the expected Qwen Token Plan credential")
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -448,7 +631,7 @@ func TestHandlerPreservesTheVersionSegmentForQwenAnthropic(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.URL.Path)
 		if got := r.Header.Get("Authorization"); got != "Bearer sk-token-plan" {
-			t.Fatalf("Authorization = %q", got)
+			t.Fatal("upstream did not receive the expected Qwen Token Plan credential")
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -500,38 +683,17 @@ func TestQwenAnthropicLeaseUsesAnthropicEnvironment(t *testing.T) {
 	}
 }
 
-func TestHandlerRoutesAntigravityPrefixToCloudCodeUpstream(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1internal:loadCodeAssist" {
-			t.Fatalf("upstream path = %q, want /v1internal:loadCodeAssist", r.URL.Path)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer antigravity-token" {
-			t.Fatalf("Authorization = %q, want the OAuth bearer token", got)
-		}
-		_, _ = io.WriteString(w, `{}`)
-	}))
-	defer upstream.Close()
-
-	handler := opencodeProviderTestServer(t, accounts.Account{
-		ID: "antigravity", Provider: accounts.ProviderAntigravity,
-		AuthMode: accounts.AuthModeOAuth, Token: "antigravity-token",
-	}, accounts.ProviderAntigravity, upstream.URL).Handler()
-	req := httptest.NewRequest(http.MethodPost, "/antigravity/v1internal:loadCodeAssist", strings.NewReader(`{}`))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
-	}
-}
-
+// A legacy provider-less account must never serve an Antigravity request: the
+// provider is OAuth-only, so falling back to a bare Codex credential would
+// forward it to Google.
 func TestFilterAccountsForProviderWithholdsLegacyAccountsFromAntigravity(t *testing.T) {
 	legacy := accounts.Account{ID: "legacy", Token: "codex-token"}
 	if got := filterAccountsForProvider([]accounts.Account{legacy}, accounts.ProviderAntigravity); len(got) != 0 {
-		t.Fatalf("got %d accounts, want none", len(got))
+		t.Fatalf("got %+v, want no accounts", got)
 	}
 	antigravity := accounts.Account{ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
 	got := filterAccountsForProvider([]accounts.Account{legacy, antigravity}, accounts.ProviderAntigravity)
 	if len(got) != 1 || got[0].ID != "antigravity" {
-		t.Fatalf("got %d accounts, want only Antigravity", len(got))
+		t.Fatalf("got %+v, want only the antigravity account", got)
 	}
 }

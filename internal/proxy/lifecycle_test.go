@@ -120,6 +120,86 @@ func TestDrainRejectsNewProxySessionsButAllowsExistingSessions(t *testing.T) {
 	}
 }
 
+func TestStrictQuiesceRejectsAllProxyIngressAndResumes(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "sticky-session", "account@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := NewLifecycle()
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{ID: "account@example.com", AuthMode: accounts.AuthModeOAuth, Token: "token"}},
+		Sessions: store, Scheduler: selectacct.NewScheduler(nil), Lifecycle: lifecycle, MaxBodyBytes: 1024,
+	}.Handler()
+
+	firstDone := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+		req.Header.Set("X-Subrouter-Session", "sticky-session")
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		firstDone <- resp.Code
+	}()
+	<-requestStarted
+
+	quiesceReq := httptest.NewRequest(http.MethodPost, "/_subrouter/quiesce", nil)
+	quiesceReq.RemoteAddr = "127.0.0.1:12345"
+	quiesceResp := httptest.NewRecorder()
+	handler.ServeHTTP(quiesceResp, quiesceReq)
+	if quiesceResp.Code != http.StatusOK {
+		t.Fatalf("quiesce status = %d", quiesceResp.Code)
+	}
+	var status struct {
+		Quiesced               bool  `json:"quiesced"`
+		AcceptingProxyRequests bool  `json:"accepting_proxy_requests"`
+		ActiveProxyRequests    int64 `json:"active_proxy_requests"`
+	}
+	if err := json.Unmarshal(quiesceResp.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Quiesced || status.AcceptingProxyRequests || status.ActiveProxyRequests != 1 {
+		t.Fatalf("quiesce status = %+v", status)
+	}
+
+	blocked := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	blocked.Header.Set("X-Subrouter-Session", "sticky-session")
+	blockedResp := httptest.NewRecorder()
+	handler.ServeHTTP(blockedResp, blocked)
+	if blockedResp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("sticky request entered after quiesce: status=%d", blockedResp.Code)
+	}
+	close(releaseRequest)
+	if code := <-firstDone; code != http.StatusNoContent {
+		t.Fatalf("pre-quiesce request status = %d", code)
+	}
+	if lifecycle.ActiveProxyRequests() != 0 {
+		t.Fatalf("active requests after release = %d", lifecycle.ActiveProxyRequests())
+	}
+
+	resumeReq := httptest.NewRequest(http.MethodPost, "/_subrouter/resume", nil)
+	resumeReq.RemoteAddr = "127.0.0.1:12345"
+	resumeResp := httptest.NewRecorder()
+	handler.ServeHTTP(resumeResp, resumeReq)
+	if resumeResp.Code != http.StatusOK || lifecycle.Quiesced() || lifecycle.Draining() {
+		t.Fatalf("resume failed: status=%d lifecycle=%+v", resumeResp.Code, lifecycle.Status())
+	}
+}
+
 func TestAdminTokenRequiredForNonLoopbackAdminEndpoint(t *testing.T) {
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {

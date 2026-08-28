@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -99,6 +100,116 @@ func TestAccountForSessionLogsAccountMove(t *testing.T) {
 	if !strings.Contains(logs.String(), "from_account=spent@example.com") ||
 		!strings.Contains(logs.String(), "to_account=fresh@example.com") {
 		t.Fatalf("account move log is missing the from/to accounts: %s", logs.String())
+	}
+}
+
+func TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstream.Close()
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "sessions.json")
+	store, err := session.NewStore(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "failed-persistence"
+	if _, err := store.Put("codex", sessionID, "spent@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(storePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(storePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		CodexUpstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{
+			{ID: "spent@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-spent"},
+			{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
+			{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+		})),
+		MaxBodyBytes: 1024,
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	request.Header.Set("X-Subrouter-Agent", "codex")
+	request.Header.Set("X-Subrouter-Session", sessionID)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Body.String() == `{}` {
+		t.Fatalf("response status=%d body=%q, want a visibly truncated 200 when terminal persistence fails after headers", response.Code, response.Body.String())
+	}
+	assignment, ok := store.Get("codex", sessionID)
+	if !ok || assignment.AccountID != "spent@example.com" {
+		t.Fatalf("failed persistence changed sticky assignment: %+v", assignment)
+	}
+}
+
+func TestHandlerCommitsSchedulerRerouteOnlyAfterUpstreamSuccess(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		status     int
+		wantCommit bool
+	}{
+		{name: "success", status: http.StatusOK, wantCommit: true},
+		{name: "failure", status: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.Header.Get("Authorization") != "Bearer tok-fresh" {
+					t.Errorf("Authorization = %q, want scheduler-selected account", request.Header.Get("Authorization"))
+				}
+				w.WriteHeader(test.status)
+				_, _ = io.WriteString(w, `{}`)
+			}))
+			defer upstream.Close()
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const sessionID = "scheduler-success-boundary"
+			if _, err := store.Put("codex", sessionID, "spent@example.com", ""); err != nil {
+				t.Fatal(err)
+			}
+			server := Server{
+				CodexUpstream: mustParseURL(t, upstream.URL),
+				Accounts: []accounts.Account{
+					{ID: "spent@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-spent"},
+					{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
+				},
+				Sessions: store,
+				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+					{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
+					{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+				})),
+				MaxBodyBytes: 1024,
+			}
+			request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+			request.Header.Set("X-Subrouter-Agent", "codex")
+			request.Header.Set("X-Subrouter-Session", sessionID)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("status = %d, want %d", response.Code, test.status)
+			}
+			assignment, ok := store.Get("codex", sessionID)
+			if !ok {
+				t.Fatal("sticky assignment disappeared")
+			}
+			want := "spent@example.com"
+			if test.wantCommit {
+				want = "fresh@example.com"
+			}
+			if assignment.AccountID != want {
+				t.Fatalf("sticky assignment = %q, want %q", assignment.AccountID, want)
+			}
+		})
 	}
 }
 

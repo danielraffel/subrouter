@@ -219,10 +219,16 @@ func RefreshCredential(ctx context.Context, client *http.Client, credential Cred
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	clients := oauthClientsForRefresh()
 	if cached := workingClient.Load(); cached != nil {
-		clients = append([]oauthClient{*cached}, clients...)
+		refreshed, err := refreshWithClient(ctx, client, credential, now, *cached)
+		if err == nil {
+			return refreshed, nil
+		}
+		if !isInvalidClient(err) {
+			return credential, err
+		}
 	}
+	clients := oauthClientsForRefresh()
 	if len(clients) == 0 {
 		return credential, fmt.Errorf("no Antigravity OAuth client available: install the agy CLI or set SUBROUTER_ANTIGRAVITY_CLIENT_ID and SUBROUTER_ANTIGRAVITY_CLIENT_SECRET")
 	}

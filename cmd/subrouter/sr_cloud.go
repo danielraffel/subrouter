@@ -764,7 +764,7 @@ func (r srRunner) cloudStatus(ctx context.Context) error {
 	if err := r.printCredentialSource(config); err != nil {
 		return err
 	}
-	if config.HostedReady() {
+	if config.HostedTenantReady() {
 		statuses, err := client.UsageStatuses(ctx)
 		if err != nil {
 			return err
@@ -818,7 +818,13 @@ func usageRowsFromHostedStatuses(statuses []broker.UsageStatus) []srUsageRow {
 			Refreshed:          status.Refreshed,
 			Error:              status.Error,
 			Active:             status.Active,
+			KeyFingerprint:     status.KeyFingerprint,
+			AssignedSessions:   status.AssignedSessions,
+			SessionsKnown:      status.SessionsKnown,
 			PlanType:           status.PlanType,
+			QuotaStatus:        status.QuotaStatus,
+			AccountIdentity:    status.AccountIdentity,
+			QuotaUsageKnown:    status.QuotaUsageKnown,
 			Windows:            status.Windows,
 			Credits:            status.Credits,
 			ComplimentaryReset: status.ComplimentaryReset,
@@ -1008,6 +1014,8 @@ func (r srRunner) hostedAccountAdd(
 			return fmt.Errorf("usage: sr add %s", args[0])
 		}
 		return r.hostedAPIKeyAdd(ctx, client, args[0])
+	case "grok", "xai":
+		return fmt.Errorf("hosted Grok subscription accounts are not supported yet; use 'sr remote use local' and then 'sr add grok'")
 	default:
 		return fmt.Errorf(
 			"unknown provider %q; use codex, claude, openai-key, or anthropic-key",

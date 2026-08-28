@@ -6,9 +6,10 @@ import (
 	"testing"
 )
 
-func TestCodexArgsInjectsSubrouterBaseURLAsGlobalConfig(t *testing.T) {
+func TestCodexArgsUsesAuthenticatedSubrouterProviderByDefault(t *testing.T) {
 	got := codexArgs([]string{"exec", "--cd", "/tmp", "prompt"}, "http://127.0.0.1:31415/v1", "", "")
-	want := []string{"exec", "-c", `openai_base_url="http://127.0.0.1:31415/v1"`, "--cd", "/tmp", "prompt"}
+	want := append([]string{"exec"}, defaultSubrouterCodexConfigArgs("http://127.0.0.1:31415/v1")...)
+	want = append(want, "--cd", "/tmp", "prompt")
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -91,7 +92,7 @@ func TestCodexBaseURLUsesExplicitURLBeforeServerDefault(t *testing.T) {
 
 func TestCodexArgsWorksWithoutSubcommand(t *testing.T) {
 	got := codexArgs(nil, "http://127.0.0.1:31415/v1", "", "")
-	want := []string{"-c", `openai_base_url="http://127.0.0.1:31415/v1"`}
+	want := defaultSubrouterCodexConfigArgs("http://127.0.0.1:31415/v1")
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -99,7 +100,7 @@ func TestCodexArgsWorksWithoutSubcommand(t *testing.T) {
 
 func TestCodexArgsPassesThroughCodexFlags(t *testing.T) {
 	got := codexArgs([]string{"--version"}, "http://127.0.0.1:31415/v1", "", "")
-	want := []string{"-c", `openai_base_url="http://127.0.0.1:31415/v1"`, "--version"}
+	want := append(defaultSubrouterCodexConfigArgs("http://127.0.0.1:31415/v1"), "--version")
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -115,7 +116,8 @@ func TestCodexArgsDoesNotInjectIntoUtilitySubcommands(t *testing.T) {
 
 func TestCodexArgsInjectsSubrouterBaseURLIntoAppServer(t *testing.T) {
 	got := codexArgs([]string{"app-server", "--listen", "off"}, "http://127.0.0.1:31415/v1", "", "")
-	want := []string{"app-server", "-c", `openai_base_url="http://127.0.0.1:31415/v1"`, "--listen", "off"}
+	want := append([]string{"app-server"}, defaultSubrouterCodexConfigArgs("http://127.0.0.1:31415/v1")...)
+	want = append(want, "--listen", "off")
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
@@ -131,9 +133,21 @@ func TestCodexArgsDoesNotInjectIntoDesktopAppLauncher(t *testing.T) {
 
 func TestCodexArgsTreatsUnknownCommandAsInteractivePrompt(t *testing.T) {
 	got := codexArgs([]string{"write", "tests"}, "http://127.0.0.1:31415/v1", "", "")
-	want := []string{"-c", `openai_base_url="http://127.0.0.1:31415/v1"`, "write", "tests"}
+	want := append(defaultSubrouterCodexConfigArgs("http://127.0.0.1:31415/v1"), "write", "tests")
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func defaultSubrouterCodexConfigArgs(baseURL string) []string {
+	return []string{
+		"-c", `model_provider="subrouter"`,
+		"-c", `model_providers.subrouter.name="Subrouter"`,
+		"-c", `model_providers.subrouter.base_url="` + baseURL + `"`,
+		"-c", `model_providers.subrouter.experimental_bearer_token="subrouter"`,
+		"-c", `model_providers.subrouter.wire_api="responses"`,
+		"-c", `model_providers.subrouter.supports_websockets=true`,
+		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex"}`,
 	}
 }
 
