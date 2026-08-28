@@ -27,26 +27,12 @@ func DefaultCodexAuthPath() string {
 }
 
 func (s CodexStore) SwitchActive(accountID string) error {
-	if err := s.markStoredCredentialInteractive(accountID); err != nil {
-		return err
-	}
-	_, rawAuth, err := s.rawAuthFor(accountID)
+	stored, ok, err := s.FindStored(accountID)
 	if err != nil {
 		return err
 	}
-	if err := writeCodexActiveAuth(DefaultCodexAuthPath(), rawAuth); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s CodexStore) markStoredCredentialInteractive(accountID string) error {
-	stored, ok, err := s.FindStored(accountID)
-	if err != nil || !ok {
-		return err
-	}
-	if stored.IsAPIKey() || stored.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
-		return nil
+	if !ok {
+		return fmt.Errorf("account %q not found", accountID)
 	}
 	lock, err := s.lockStoredAccount(stored.Email)
 	if err != nil {
@@ -54,20 +40,43 @@ func (s CodexStore) markStoredCredentialInteractive(accountID string) error {
 	}
 	defer lock.Close()
 	stored, ok, err = s.findStoredExact(stored.Email)
-	if err != nil || !ok {
+	if err != nil {
 		return err
 	}
-	if stored.IsAPIKey() || stored.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
-		return nil
+	if !ok {
+		return fmt.Errorf("account %q not found", accountID)
 	}
+	_, usable := stored.toAccount(stored.SourcePath(s))
+	if !usable {
+		return fmt.Errorf("account %q is not usable", accountID)
+	}
+	rawAuth, err := readRawAuth(stored.SourcePath(s))
+	if err != nil {
+		return err
+	}
+
 	previous := stored
-	stored.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
-	appendCodexAuthBreadcrumb(
-		context.Background(), s, &stored,
-		"credential_exported_to_active", "account_manager", false,
-		&previous, &stored, nil, nil,
-	)
-	return s.saveStoredUnlocked(stored)
+	downgraded := !stored.IsAPIKey() && stored.OAuthCredentialOrigin == CodexOAuthOriginIsolatedServerLogin
+	if downgraded {
+		stored.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
+		appendCodexAuthBreadcrumb(
+			context.Background(), s, &stored,
+			"credential_exported_to_active", "account_manager", false,
+			&previous, &stored, nil, nil,
+		)
+		if err := s.saveStoredUnlocked(stored); err != nil {
+			return err
+		}
+	}
+	if err := writeCodexActiveAuth(DefaultCodexAuthPath(), rawAuth); err != nil {
+		if downgraded {
+			if rollbackErr := s.saveStoredUnlocked(previous); rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("restore isolated credential provenance: %w", rollbackErr))
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func (s CodexStore) rawAuthFor(accountID string) (Account, json.RawMessage, error) {

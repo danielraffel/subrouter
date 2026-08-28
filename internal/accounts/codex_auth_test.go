@@ -333,6 +333,52 @@ func TestRefreshStoredDoesNotRotateSharedInteractiveCredentialWhenSyncDisabled(t
 	}
 }
 
+func TestRefreshStoredRejectsFreshUnisolatedCredentialBeforeUse(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{
+		Dir: t.TempDir(), DisableActiveAuthSync: true, RequireIsolatedOAuth: true,
+	}
+	fresh := storedOAuthAccount("founders@example.com", "legacy", time.Now().Add(time.Hour))
+	if err := store.SaveStored(fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	_, refreshed, err := store.RefreshStoredIfExpired(context.Background(), nil, fresh)
+	var unisolated *CodexUnisolatedCredentialError
+	if !errors.As(err, &unisolated) {
+		t.Fatalf("refresh error = %v, want CodexUnisolatedCredentialError", err)
+	}
+	if refreshed {
+		t.Fatal("fresh unisolated credential was accepted")
+	}
+}
+
+func TestRefreshStoredReloadsFreshCredentialBeforeIsolationDecision(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{
+		Dir: t.TempDir(), DisableActiveAuthSync: true, RequireIsolatedOAuth: true,
+	}
+	staleView := storedOAuthAccount("founders@example.com", "isolated", time.Now().Add(time.Hour))
+	staleView.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	if err := store.SaveStored(staleView); err != nil {
+		t.Fatal(err)
+	}
+	exported := staleView
+	exported.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
+	if err := store.SaveStored(exported); err != nil {
+		t.Fatal(err)
+	}
+
+	_, refreshed, err := store.RefreshStoredIfExpired(context.Background(), nil, staleView)
+	var unisolated *CodexUnisolatedCredentialError
+	if !errors.As(err, &unisolated) {
+		t.Fatalf("refresh error = %v, want CodexUnisolatedCredentialError", err)
+	}
+	if refreshed {
+		t.Fatal("stale isolated view was accepted after stored export")
+	}
+}
+
 func TestRefreshStoredDoesNotTrustDifferentTokenGenerationWithoutIsolatedProvenance(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true, RequireIsolatedOAuth: true}

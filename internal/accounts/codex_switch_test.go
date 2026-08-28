@@ -59,6 +59,36 @@ func TestSwitchActiveDowngradesIsolatedOAuthOriginBeforeExport(t *testing.T) {
 	}
 }
 
+func TestSwitchActiveRestoresIsolatedOriginWhenActiveWriteFails(t *testing.T) {
+	root := t.TempDir()
+	blockedCodexHome := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(blockedCodexHome, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", blockedCodexHome)
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{
+		Email:                 "isolated@example.com",
+		OAuthCredentialOrigin: CodexOAuthOriginIsolatedServerLogin,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "access", RefreshToken: "refresh", IDToken: "id",
+		}},
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SwitchActive(account.Email); err == nil {
+		t.Fatal("switch unexpectedly succeeded")
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored account = %#v, found = %v, err = %v", stored, ok, err)
+	}
+	if stored.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("OAuth origin = %q, want isolated server login", stored.OAuthCredentialOrigin)
+	}
+}
+
 func TestCodexStoreListIgnoresHiddenAccountArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	writeStoredAccount(t, dir, "b@example.com", `{"auth_mode":"chatgpt","tokens":{"access_token":"token"},"last_refresh":"now"}`)
