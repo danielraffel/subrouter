@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,6 +38,17 @@ type stubOAuthUsageSource struct {
 	usageErr error
 }
 
+type concurrentOAuthUsageSource struct {
+	accounts []accounts.Account
+	entered  chan string
+	release  chan struct{}
+
+	mu                 sync.Mutex
+	sawListDeadline    bool
+	sawRefreshDeadline int
+	sawUsageDeadline   int
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -59,6 +71,42 @@ func (s *stubOAuthSource) RefreshAccount(_ context.Context, _ *http.Client, acco
 		return account, s.err
 	}
 	return s.refreshed, nil
+}
+
+func (s *concurrentOAuthUsageSource) Provider() accounts.Provider { return accounts.ProviderKimi }
+
+func (s *concurrentOAuthUsageSource) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
+	_, hasDeadline := ctx.Deadline()
+	s.mu.Lock()
+	s.sawListDeadline = hasDeadline
+	s.mu.Unlock()
+	return s.accounts, nil
+}
+
+func (s *concurrentOAuthUsageSource) RefreshAccount(ctx context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
+	_, hasDeadline := ctx.Deadline()
+	s.mu.Lock()
+	if hasDeadline {
+		s.sawRefreshDeadline++
+	}
+	s.mu.Unlock()
+	s.entered <- account.ID
+	select {
+	case <-s.release:
+		return account, nil
+	case <-ctx.Done():
+		return account, ctx.Err()
+	}
+}
+
+func (s *concurrentOAuthUsageSource) FetchUsage(ctx context.Context, _ *http.Client, _ accounts.Account) (string, []accounts.UsageWindow, error) {
+	_, hasDeadline := ctx.Deadline()
+	s.mu.Lock()
+	if hasDeadline {
+		s.sawUsageDeadline++
+	}
+	s.mu.Unlock()
+	return "subscription", nil, nil
 }
 
 // An OAuth account of a registered provider must refresh through its source
@@ -598,6 +646,46 @@ func TestUsageStatusesIncludesOAuthUsageSources(t *testing.T) {
 	}
 	if len(got.Windows) != 1 || got.Windows[0].UsedPercent != 25 {
 		t.Fatalf("windows = %+v", got.Windows)
+	}
+}
+
+func TestUsageStatusesBoundsAndParallelizesOAuthSourceAccounts(t *testing.T) {
+	source := &concurrentOAuthUsageSource{
+		accounts: []accounts.Account{
+			{ID: "kimi-subscription:first", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+			{ID: "kimi-subscription:second", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+		},
+		entered: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, http.DefaultClient)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	ref.oauthSources = []OAuthAccountSource{source}
+
+	result := make(chan []AccountUsageStatus, 1)
+	go func() { result <- ref.UsageStatuses(context.Background()) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-source.entered:
+		case <-time.After(time.Second):
+			t.Fatal("OAuth account status checks did not run concurrently")
+		}
+	}
+	close(source.release)
+
+	var statuses []AccountUsageStatus
+	select {
+	case statuses = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("OAuth account status sweep did not complete after release")
+	}
+	if len(statuses) != 2 || !statuses[0].AuthValid || !statuses[1].AuthValid {
+		t.Fatalf("statuses = %+v, want two valid accounts", statuses)
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if !source.sawListDeadline || source.sawRefreshDeadline != 2 || source.sawUsageDeadline != 2 {
+		t.Fatalf("deadline coverage: list=%v refresh=%d usage=%d", source.sawListDeadline, source.sawRefreshDeadline, source.sawUsageDeadline)
 	}
 }
 

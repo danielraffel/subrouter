@@ -210,6 +210,41 @@ func TestCodexArgsInjectsSubrouterProviderIntoRemoteControl(t *testing.T) {
 	}
 }
 
+func TestCodexArgsDoesNotInjectIntoRemoteControlManagement(t *testing.T) {
+	for _, args := range [][]string{
+		{"remote-control", "stop"},
+		{"remote-control", "pair"},
+		{"remote-control", "--help"},
+	} {
+		got := codexArgs(args, "http://127.0.0.1:31415/v1", "", "")
+		if strings.Join(got, "\x00") != strings.Join(args, "\x00") {
+			t.Fatalf("args = %#v, want management pass-through %#v", got, args)
+		}
+	}
+}
+
+func TestCodexRemoteControlManagementDoesNotResolveProxy(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "codex-fake")
+	record := filepath.Join(home, "record")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_BIN", bin)
+	t.Setenv("SUBROUTER_CODEX_SERVER", "missing-server-that-must-not-be-resolved")
+	if err := codex([]string{"remote-control", "stop"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body); got != "remote-control stop\n" {
+		t.Fatalf("management launch record = %q", got)
+	}
+}
+
 func TestCodexArgsDoesNotInjectIntoDesktopAppLauncher(t *testing.T) {
 	got := codexArgs([]string{"app", "/tmp/project"}, "http://127.0.0.1:31415/v1", "", "")
 	want := []string{"app", "/tmp/project"}

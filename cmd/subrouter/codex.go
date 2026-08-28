@@ -24,8 +24,7 @@ const (
 
 func codex(args []string) error {
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
-	if command := codexSubcommand(args); command != "" &&
-		!isSubrouterRoutedCodexCommand(command) {
+	if !codexInvocationUsesSubrouter(args) {
 		return runCodexCommand(
 			bin,
 			args,
@@ -313,8 +312,7 @@ func codexArgsWithLocalProxyToken(
 	accountID string,
 	localProxyToken string,
 ) []string {
-	if command := codexSubcommand(args); command != "" &&
-		!isSubrouterRoutedCodexCommand(command) {
+	if !codexInvocationUsesSubrouter(args) {
 		return append([]string(nil), args...)
 	}
 	args = sanitizeCodexRoutingArgs(args)
@@ -537,11 +535,33 @@ func codexModelArg(args []string) string {
 
 func isSubrouterRoutedCodexCommand(command string) bool {
 	switch command {
-	case "exec", "e", "review", "resume", "fork", "app-server", "remote-control":
+	case "exec", "e", "review", "resume", "fork", "app-server":
 		return true
 	default:
 		return false
 	}
+}
+
+func codexInvocationUsesSubrouter(args []string) bool {
+	command, commandIndex := codexSubcommandAt(args)
+	if command == "" {
+		return true
+	}
+	if command != "remote-control" {
+		return isSubrouterRoutedCodexCommand(command)
+	}
+	// Only the app-server-creating operation sends model traffic. The other
+	// remote-control operations manage that local process and must remain usable
+	// even when the selected Subrouter server is unavailable.
+	for _, arg := range args[commandIndex+1:] {
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") {
+			return arg == "start"
+		}
+	}
+	return false
 }
 
 // codexSubcommand finds a documented Codex subcommand after global options.
@@ -549,10 +569,15 @@ func isSubrouterRoutedCodexCommand(command string) bool {
 // prompt, so scanning must stop there instead of searching arbitrary prompt
 // words for a command name.
 func codexSubcommand(args []string) string {
+	command, _ := codexSubcommandAt(args)
+	return command
+}
+
+func codexSubcommandAt(args []string) (string, int) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
-			return ""
+			return "", -1
 		}
 		if strings.HasPrefix(arg, "-") {
 			if isCodexImageOption(arg) {
@@ -570,11 +595,11 @@ func codexSubcommand(args []string) string {
 			continue
 		}
 		if isKnownCodexCommand(arg) {
-			return arg
+			return arg, i
 		}
-		return ""
+		return "", -1
 	}
-	return ""
+	return "", -1
 }
 
 func isCodexImageOption(arg string) bool {

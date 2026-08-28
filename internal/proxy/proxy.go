@@ -1183,53 +1183,80 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	}
 	wg.Wait()
 	promoteUsableClaudeStatus(out[claudeOffset:])
-	for _, source := range r.oauthSources {
-		usageSource, hasUsage := source.(OAuthUsageSource)
-		sourceAccounts, listErr := source.ListAccounts(ctx)
-		if listErr != nil {
-			out = append(out, AccountUsageStatus{AccountStatus: AccountStatus{
-				ID:          string(source.Provider()),
-				Provider:    source.Provider(),
-				AuthMode:    accounts.AuthModeOAuth,
-				AuthChecked: true,
-				Error:       listErr.Error(),
-			}})
-		}
-		for _, sourceAccount := range sourceAccounts {
-			status := AccountUsageStatus{
-				AccountStatus: AccountStatus{
-					ID:          sourceAccount.ID,
-					Provider:    sourceAccount.Provider,
+	sourceBatches := make([][]AccountUsageStatus, len(r.oauthSources))
+	for sourceIndex, source := range r.oauthSources {
+		sourceIndex, source := sourceIndex, source
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			listCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
+			sourceAccounts, listErr := source.ListAccounts(listCtx)
+			cancel()
+			errorRows := 0
+			if listErr != nil {
+				errorRows = 1
+			}
+			batch := make([]AccountUsageStatus, errorRows+len(sourceAccounts))
+			if listErr != nil {
+				batch[0] = AccountUsageStatus{AccountStatus: AccountStatus{
+					ID:          string(source.Provider()),
+					Provider:    source.Provider(),
 					AuthMode:    accounts.AuthModeOAuth,
-					Email:       sourceAccount.Email,
-					Source:      sourceAccount.Source,
 					AuthChecked: true,
-				},
-				Active:          false,
-				AccountIdentity: sourceAccount.Label,
+					Error:       listErr.Error(),
+				}}
 			}
-			refreshed, refreshErr := source.RefreshAccount(ctx, r.client, sourceAccount)
-			if refreshErr != nil {
-				status.Error = refreshErr.Error()
-				out = append(out, status)
-				continue
+			usageSource, hasUsage := source.(OAuthUsageSource)
+			var accountWG sync.WaitGroup
+			for accountIndex, sourceAccount := range sourceAccounts {
+				accountIndex, sourceAccount := errorRows+accountIndex, sourceAccount
+				batch[accountIndex] = AccountUsageStatus{
+					AccountStatus: AccountStatus{
+						ID:          sourceAccount.ID,
+						Provider:    sourceAccount.Provider,
+						AuthMode:    accounts.AuthModeOAuth,
+						Email:       sourceAccount.Email,
+						Source:      sourceAccount.Source,
+						AuthChecked: true,
+					},
+					AccountIdentity: sourceAccount.Label,
+				}
+				accountWG.Add(1)
+				go func() {
+					defer accountWG.Done()
+					fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
+					defer cancel()
+					status := batch[accountIndex]
+					refreshed, refreshErr := source.RefreshAccount(fetchCtx, r.client, sourceAccount)
+					if refreshErr != nil {
+						status.Error = refreshErr.Error()
+						batch[accountIndex] = status
+						return
+					}
+					status.AuthValid = true
+					r.replace(refreshed)
+					if !hasUsage {
+						status.PlanType = "subscription"
+						batch[accountIndex] = status
+						return
+					}
+					planType, windows, usageErr := usageSource.FetchUsage(fetchCtx, r.client, refreshed)
+					status.PlanType = planType
+					status.Windows = windows
+					status.UsageFresh = usageErr == nil
+					if usageErr != nil {
+						status.Error = usageErr.Error()
+					}
+					batch[accountIndex] = status
+				}()
 			}
-			status.AuthValid = true
-			r.replace(refreshed)
-			if !hasUsage {
-				status.PlanType = "subscription"
-				out = append(out, status)
-				continue
-			}
-			planType, windows, usageErr := usageSource.FetchUsage(ctx, r.client, refreshed)
-			status.PlanType = planType
-			status.Windows = windows
-			status.UsageFresh = usageErr == nil
-			if usageErr != nil {
-				status.Error = usageErr.Error()
-			}
-			out = append(out, status)
-		}
+			accountWG.Wait()
+			sourceBatches[sourceIndex] = batch
+		}()
+	}
+	wg.Wait()
+	for _, batch := range sourceBatches {
+		out = append(out, batch...)
 	}
 	return out
 }
