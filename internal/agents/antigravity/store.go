@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/account"
 )
 
 const (
@@ -314,4 +316,60 @@ func refreshWithClient(ctx context.Context, client *http.Client, credential Cred
 		refreshed.ExpiresAt = time.Time{}
 	}
 	return refreshed, nil
+}
+
+// accountID is the stable identifier of the one account the CLI keychain
+// credential represents.
+const accountID = "antigravity"
+
+// Store adapts the CLI's keychain credential to the proxy's OAuth account
+// source.
+type Store struct{}
+
+// Provider implements the proxy's OAuth account source.
+func (Store) Provider() account.Provider {
+	return account.ProviderAntigravity
+}
+
+// ListAccounts surfaces the CLI credential as one account, or none when the
+// CLI is not signed in.
+func (Store) ListAccounts(ctx context.Context) ([]account.Account, error) {
+	credential, ok, err := ReadLocalCredential(ctx, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	return []account.Account{credentialAccount(credential)}, nil
+}
+
+// RefreshAccount refreshes the credential when its access token is near
+// expiry. Unlike the Claude and Kimi stores it does not write the refreshed
+// pair back: Google does not rotate the refresh token on exchange, so the CLI
+// keeps its own credential valid and both sides refresh independently.
+func (Store) RefreshAccount(ctx context.Context, client *http.Client, acct account.Account) (account.Account, error) {
+	credential, ok, err := ReadLocalCredential(ctx, time.Now())
+	if err != nil || !ok {
+		return acct, err
+	}
+	if !credential.NeedsRefresh(time.Now()) {
+		return credentialAccount(credential), nil
+	}
+	refreshed, err := RefreshCredential(ctx, client, credential, time.Now())
+	if err != nil {
+		return acct, err
+	}
+	return credentialAccount(refreshed), nil
+}
+
+func credentialAccount(credential CredentialInfo) account.Account {
+	return account.Account{
+		ID:       accountID,
+		Provider: account.ProviderAntigravity,
+		AuthMode: account.AuthModeOAuth,
+		Label:    "Antigravity",
+		Token:    credential.AccessToken,
+		Source:   "antigravity keychain",
+	}
 }

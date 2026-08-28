@@ -9,6 +9,10 @@ const (
 	ProviderClaude Provider = "claude"
 	ProviderKimi   Provider = "kimi"
 	ProviderZAI    Provider = "zai"
+	// ProviderAntigravity is a Google Antigravity subscription reached through
+	// the Antigravity CLI's OAuth credential. OAuth-only: there is no API-key
+	// mode for it.
+	ProviderAntigravity Provider = "antigravity"
 
 	// ProviderOpenRouter routes to OpenRouter's OpenAI-compatible API with a
 	// per-account API key.

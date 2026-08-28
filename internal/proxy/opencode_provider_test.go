@@ -115,6 +115,10 @@ func opencodeProviderTestServer(t *testing.T, account accounts.Account, provider
 		Sessions:     store,
 		MaxBodyBytes: 1024,
 	}
+	if provider == accounts.ProviderAntigravity {
+		server.AntigravityUpstream = upstream
+		return server
+	}
 	// Resolve through the registry so a newly registered provider is testable
 	// without editing this helper, and so an entry whose Upstream accessor reads
 	// the wrong field fails loudly instead of silently routing nowhere.
@@ -493,5 +497,41 @@ func TestQwenAnthropicLeaseUsesAnthropicEnvironment(t *testing.T) {
 	openaiSibling, ok := keyedProviderFor(accounts.ProviderQwenToken)
 	if !ok || openaiSibling.LeaseEnv != leaseEnvOpenAI || !openaiSibling.CollapseVersionSegment {
 		t.Fatal("the OpenAI-protocol Token Plan entry must be unaffected")
+	}
+}
+
+func TestHandlerRoutesAntigravityPrefixToCloudCodeUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1internal:loadCodeAssist" {
+			t.Fatalf("upstream path = %q, want /v1internal:loadCodeAssist", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer antigravity-token" {
+			t.Fatalf("Authorization = %q, want the OAuth bearer token", got)
+		}
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstream.Close()
+
+	handler := opencodeProviderTestServer(t, accounts.Account{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity,
+		AuthMode: accounts.AuthModeOAuth, Token: "antigravity-token",
+	}, accounts.ProviderAntigravity, upstream.URL).Handler()
+	req := httptest.NewRequest(http.MethodPost, "/antigravity/v1internal:loadCodeAssist", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFilterAccountsForProviderWithholdsLegacyAccountsFromAntigravity(t *testing.T) {
+	legacy := accounts.Account{ID: "legacy", Token: "codex-token"}
+	if got := filterAccountsForProvider([]accounts.Account{legacy}, accounts.ProviderAntigravity); len(got) != 0 {
+		t.Fatalf("got %d accounts, want none", len(got))
+	}
+	antigravity := accounts.Account{ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	got := filterAccountsForProvider([]accounts.Account{legacy, antigravity}, accounts.ProviderAntigravity)
+	if len(got) != 1 || got[0].ID != "antigravity" {
+		t.Fatalf("got %d accounts, want only Antigravity", len(got))
 	}
 }

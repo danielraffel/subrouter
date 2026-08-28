@@ -19,10 +19,11 @@ type (
 )
 
 const (
-	ProviderCodex  = account.ProviderCodex
-	ProviderClaude = account.ProviderClaude
-	ProviderKimi   = account.ProviderKimi
-	ProviderZAI    = account.ProviderZAI
+	ProviderCodex       = account.ProviderCodex
+	ProviderClaude      = account.ProviderClaude
+	ProviderKimi        = account.ProviderKimi
+	ProviderZAI         = account.ProviderZAI
+	ProviderAntigravity = account.ProviderAntigravity
 
 	ProviderOpenRouter = account.ProviderOpenRouter
 

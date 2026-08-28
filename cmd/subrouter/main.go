@@ -24,6 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	"github.com/manaflow-ai/subrouter/internal/broker"
@@ -287,6 +288,7 @@ func serve(args []string) error {
 	claudeUpstreamRaw := flags.String("claude-upstream", "https://api.anthropic.com", "Claude subscription upstream base URL")
 	kimiUpstreamRaw := flags.String("kimi-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderKimi), "Kimi For Coding upstream base URL")
 	zaiUpstreamRaw := flags.String("zai-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderZAI), "Z.AI coding upstream base URL")
+	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
 	openRouterUpstreamRaw := flags.String("openrouter-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderOpenRouter), "OpenRouter upstream base URL")
 	grokUpstreamRaw := flags.String("grok-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderGrok), "xAI Grok upstream base URL")
 	var openAICompatibleRaw stringList
@@ -443,6 +445,10 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	antigravityUpstream, err := url.Parse(*antigravityUpstreamRaw)
+	if err != nil {
+		return err
+	}
 	openRouterUpstream, err := url.Parse(*openRouterUpstreamRaw)
 	if err != nil {
 		return err
@@ -553,7 +559,7 @@ func serve(args []string) error {
 
 	codexStore := accounts.DefaultCodexStore()
 	claudeStore := agentclaude.DefaultStore()
-	oauthSources := []proxy.OAuthAccountSource{agentkimi.DefaultStore()}
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.DefaultStore(), agentantigravity.Store{}}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var codexAccounts, claudeAccounts []accounts.Account
@@ -662,6 +668,7 @@ func serve(args []string) error {
 		ClaudeUpstream:        claudeUpstream,
 		KimiUpstream:          kimiUpstream,
 		ZAIUpstream:           zaiUpstream,
+		AntigravityUpstream:   antigravityUpstream,
 		OpenRouterUpstream:    openRouterUpstream,
 		GrokUpstream:          grokUpstream,
 		QwenUpstream:          qwenUpstream,
@@ -1483,7 +1490,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--grok-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--antigravity-upstream URL] [--openrouter-upstream URL] [--grok-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
   %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]

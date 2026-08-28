@@ -48,12 +48,15 @@ type CredentialBroker interface {
 }
 
 type Server struct {
-	Upstream              *url.URL
-	CodexUpstream         *url.URL
-	APIUpstream           *url.URL
-	ClaudeUpstream        *url.URL
-	KimiUpstream          *url.URL
-	ZAIUpstream           *url.URL
+	Upstream       *url.URL
+	CodexUpstream  *url.URL
+	APIUpstream    *url.URL
+	ClaudeUpstream *url.URL
+	KimiUpstream   *url.URL
+	ZAIUpstream    *url.URL
+	// AntigravityUpstream fronts Google's cloudcode-pa endpoint, which the
+	// Antigravity CLI reaches when CLOUD_CODE_URL points at this proxy.
+	AntigravityUpstream   *url.URL
 	OpenRouterUpstream    *url.URL
 	GrokUpstream          *url.URL
 	QwenUpstream          *url.URL
@@ -4555,6 +4558,9 @@ func (s Server) upstreamForRequest(path string, account accounts.Account) *url.U
 	if entry, ok := keyedProviderFor(account.Provider); ok {
 		return entry.Upstream(s)
 	}
+	if account.Provider == accounts.ProviderAntigravity {
+		return s.AntigravityUpstream
+	}
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return s.APIUpstream
 	}
@@ -4580,6 +4586,11 @@ func (s Server) pathForUpstream(path string, account accounts.Account) string {
 			return collapseDuplicateVersionSegment(path, entry.Upstream(s))
 		}
 		return path
+	}
+	if account.Provider == accounts.ProviderAntigravity {
+		// The CLI sends the API version itself (v1internal:method), so only
+		// the provider prefix is stripped.
+		return stripProviderPathPrefix(path, "antigravity")
 	}
 	if account.AuthMode == accounts.AuthModeOAuth {
 		if stripped, ok := stripChatGPTBackendPath(path); ok {
@@ -5126,10 +5137,16 @@ func agentTypeForProviderSession(agentType string, provider accounts.Provider) s
 	if isKeyedProvider(provider) {
 		return string(provider)
 	}
+	if provider == accounts.ProviderAntigravity {
+		return string(provider)
+	}
 	return agentType
 }
 
 func providerForPath(path string) (accounts.Provider, bool) {
+	if firstPathSegment(path) == "antigravity" {
+		return accounts.ProviderAntigravity, true
+	}
 	entry, ok := keyedProviderForPathPrefix(firstPathSegment(path))
 	if !ok {
 		return "", false
@@ -5190,7 +5207,7 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	}
 	// A keyed provider never inherits provider-less legacy accounts: those
 	// predate multi-provider support and are Codex credentials.
-	if isKeyedProvider(provider) {
+	if isKeyedProvider(provider) || provider == accounts.ProviderAntigravity {
 		return nil
 	}
 	return legacy
