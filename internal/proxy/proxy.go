@@ -3837,8 +3837,8 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 		// self-heals on a schedule. A longer TTL avoids probing every few
 		// minutes while still picking the account back up within the hour after
 		// an org re-enable. Token rotation must not clear this exclusion.
-		s.SchedulerRef.MarkExhaustedUntil(
-			account.Provider, account.ID, "", time.Now().Add(credentialExhaustionTTL),
+		s.SchedulerRef.MarkAccountUnavailableUntil(
+			account.Provider, account.ID, time.Now().Add(credentialExhaustionTTL),
 		)
 		return
 	}

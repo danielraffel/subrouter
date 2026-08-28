@@ -34,6 +34,11 @@ type SchedulerRef struct {
 	credentialExhaustedUntil map[string]time.Time
 	credentialFingerprints   map[string]string
 	credentialRevision       uint64
+	// accountUnavailableUntil records account-state exclusions, such as an
+	// organization disabling OAuth. Neither healthy quota evidence nor token
+	// rotation proves that account state recovered, so those events must not
+	// clear this overlay.
+	accountUnavailableUntil map[string]time.Time
 	// incompatibleUntil records account/model exclusions learned from upstream
 	// entitlement errors. Usage refreshes cannot supersede these marks because
 	// quota headroom says nothing about whether an account supports a model.
@@ -59,6 +64,7 @@ func (r *SchedulerRef) Get() Scheduler {
 	defer r.mu.RUnlock()
 	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
 	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
+	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
 }
 
@@ -94,6 +100,14 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		}
 	}
 	if !anyExpired {
+		for _, until := range r.accountUnavailableUntil {
+			if !until.After(now) {
+				anyExpired = true
+				break
+			}
+		}
+	}
+	if !anyExpired {
 		for _, until := range r.incompatibleUntil {
 			if !until.After(now) {
 				anyExpired = true
@@ -116,6 +130,11 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 	for key, until := range r.credentialExhaustedUntil {
 		if !until.After(now) {
 			delete(r.credentialExhaustedUntil, key)
+		}
+	}
+	for key, until := range r.accountUnavailableUntil {
+		if !until.After(now) {
+			delete(r.accountUnavailableUntil, key)
 		}
 	}
 	for key, until := range r.incompatibleUntil {
@@ -415,6 +434,22 @@ func (r *SchedulerRef) activeCredentialExhaustionLocked() map[string]time.Time {
 	return active
 }
 
+// MarkAccountUnavailableUntil excludes an account because of state that is
+// independent of both its quota and its current credential. Usage refreshes
+// and token rotation cannot supersede this evidence; only expiry can.
+func (r *SchedulerRef) MarkAccountUnavailableUntil(provider account.Provider, accountID string, until time.Time) {
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.accountUnavailableUntil == nil {
+		r.accountUnavailableUntil = make(map[string]time.Time)
+	}
+	r.accountUnavailableUntil[poolScopedExhaustionKey(provider, accountID, "")] = until
+	r.updatedAt = time.Now()
+}
+
 // MarkModelIncompatibleUntil excludes one account from one model until the
 // supplied expiry. Unlike quota exhaustion, usage-score refreshes cannot clear
 // this mark because they do not carry entitlement evidence.
@@ -445,6 +480,9 @@ func (r *SchedulerRef) ExhaustedUntilFor(provider account.Provider, accountID, p
 	if credentialUntil, credentialOK := r.activeCredentialExhaustionLocked()[key]; credentialOK && (!ok || credentialUntil.After(until)) {
 		until, ok = credentialUntil, true
 	}
+	if accountUntil, accountOK := r.accountUnavailableUntil[key]; accountOK && (!ok || accountUntil.After(until)) {
+		until, ok = accountUntil, true
+	}
 	return until, ok
 }
 
@@ -456,11 +494,16 @@ func (r *SchedulerRef) ModelIncompatibleUntilFor(provider account.Provider, acco
 }
 
 func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
-	marks := make(map[string]time.Time, len(r.exhaustedUntil)+len(r.incompatibleUntil))
+	marks := make(map[string]time.Time, len(r.exhaustedUntil)+len(r.accountUnavailableUntil)+len(r.incompatibleUntil))
 	for key, until := range r.exhaustedUntil {
 		marks[key] = until
 	}
 	for key, until := range r.incompatibleUntil {
+		if until.After(marks[key]) {
+			marks[key] = until
+		}
+	}
+	for key, until := range r.accountUnavailableUntil {
 		if until.After(marks[key]) {
 			marks[key] = until
 		}

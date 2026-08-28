@@ -521,6 +521,41 @@ func TestModelIncompatibilitySurvivesHealthyPoolRefresh(t *testing.T) {
 	}
 }
 
+func TestAccountUnavailableSurvivesHealthyRefreshAndCredentialRotation(t *testing.T) {
+	const accountID = "disabled@example.com"
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID:     accountID,
+		Provider:      account.ProviderClaude,
+		Headroom:      0.8,
+		ShortHeadroom: 0.8,
+		Fresh:         true,
+	}}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{{
+		ID: accountID, Provider: account.ProviderClaude, Token: "old-token",
+	}})
+	until := time.Now().Add(time.Hour)
+	ref.MarkAccountUnavailableUntil(account.ProviderClaude, accountID, until)
+
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID:     accountID,
+		Provider:      account.ProviderClaude,
+		Headroom:      0.9,
+		ShortHeadroom: 0.9,
+		Fresh:         true,
+	}}), true)
+	ref.AdvanceAccountGenerationWithAccounts(2, 2, []account.Account{{
+		ID: accountID, Provider: account.ProviderClaude, Token: "rotated-token",
+	}})
+
+	if !ref.Get().Exhausted(account.ProviderClaude, accountID) {
+		t.Fatal("healthy quota refresh and credential rotation cleared account-state exclusion")
+	}
+	got, ok := ref.ExhaustedUntilFor(account.ProviderClaude, accountID, "")
+	if !ok || !got.Equal(until) {
+		t.Fatalf("account-state expiry = %v, %t; want %v, true", got, ok, until)
+	}
+}
+
 func TestPoolScopedRetainLeavesOtherPoolMark(t *testing.T) {
 	const (
 		fable = "claudefable"
