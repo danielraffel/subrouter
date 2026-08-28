@@ -80,6 +80,44 @@ func TestKeyedProviderLookupsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestValidateCredentialUpstreamsRejectsNonLoopbackCleartext(t *testing.T) {
+	t.Parallel()
+
+	server := Server{
+		OpenRouterUpstream: mustParseURL(t, "http://openrouter.example/v1"),
+	}
+	if err := server.ValidateCredentialUpstreams(); err == nil || !strings.Contains(err.Error(), "OpenRouter") || !strings.Contains(err.Error(), "HTTPS") {
+		t.Fatalf("ValidateCredentialUpstreams() error = %v, want OpenRouter HTTPS error", err)
+	}
+}
+
+func TestValidateCredentialUpstreamsAllowsHTTPSAndLoopbackHTTP(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		"https://openrouter.example/v1",
+		"http://127.0.0.1:8080/v1",
+		"http://[::1]:8080/v1",
+		"http://localhost:8080/v1",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			server := Server{OpenRouterUpstream: mustParseURL(t, raw)}
+			if err := server.ValidateCredentialUpstreams(); err != nil {
+				t.Fatalf("ValidateCredentialUpstreams() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateCredentialUpstreamsRejectsMissingHost(t *testing.T) {
+	t.Parallel()
+
+	server := Server{OpenRouterUpstream: mustParseURL(t, "https:///v1")}
+	if err := server.ValidateCredentialUpstreams(); err == nil || !strings.Contains(err.Error(), "host") {
+		t.Fatalf("ValidateCredentialUpstreams() error = %v, want missing-host error", err)
+	}
+}
+
 func TestAPIKeyProviderListNamesEveryProvider(t *testing.T) {
 	list := APIKeyProviderList()
 	for _, want := range append([]string{"codex", "claude"}, keyedProviderNames()...) {

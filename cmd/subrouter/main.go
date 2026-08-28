@@ -652,6 +652,9 @@ func serve(args []string) error {
 		FableBedrockPrimary:           fableBedrockEnabled,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
 	}
+	if err := server.ValidateCredentialUpstreams(); err != nil {
+		return err
+	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,
 		Destination:    *transcriptGCSURI,

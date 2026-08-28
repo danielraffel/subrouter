@@ -1,12 +1,55 @@
 package proxy
 
 import (
+	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+// ValidateCredentialUpstreams rejects configurations that could send a
+// selected account credential over cleartext. HTTP remains available on
+// loopback for local development and tests; every remote upstream must use
+// HTTPS. Every URL field on Server is an upstream, so walking those fields
+// keeps the startup gate complete when a provider adds another upstream.
+func (s Server) ValidateCredentialUpstreams() error {
+	value := reflect.ValueOf(s)
+	typeOfURL := reflect.TypeOf((*url.URL)(nil))
+	for i := 0; i < value.NumField(); i++ {
+		field := value.Type().Field(i)
+		if field.Type != typeOfURL || !strings.HasSuffix(field.Name, "Upstream") {
+			continue
+		}
+		upstream, _ := value.Field(i).Interface().(*url.URL)
+		if err := validateCredentialUpstream(field.Name, upstream); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCredentialUpstream(name string, upstream *url.URL) error {
+	if upstream == nil {
+		return nil
+	}
+	host := strings.TrimSpace(upstream.Hostname())
+	if host == "" {
+		return fmt.Errorf("credential-bearing upstream %s must include a host", name)
+	}
+	if strings.EqualFold(upstream.Scheme, "https") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+	if strings.EqualFold(upstream.Scheme, "http") && loopback {
+		return nil
+	}
+	return fmt.Errorf("credential-bearing upstream %s must use HTTPS, except HTTP on loopback", name)
+}
 
 // authStyle names how a provider expects its API key to be presented.
 type authStyle int
