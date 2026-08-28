@@ -293,6 +293,43 @@ func TestAzureCodexFallbackServesAndPinsSession(t *testing.T) {
 	}
 }
 
+func TestAzureCodexFallbackResponseIsNotAttributedToPoolAccount(t *testing.T) {
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 1)
+	server.azureCodexSessions = newAzureCodexSticky()
+	transport := azureCodexFallbackTransport{
+		base: &stubRoundTripper{responses: func(*http.Request) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached"}}`)),
+			}
+		}},
+		server:     &server,
+		sessionKey: "codex\x00session-1",
+		accountID:  "pool@example.com",
+		replayBody: func() ([]byte, bool) {
+			return []byte(`{"model":"gpt-5.6-codex","input":[]}`), true
+		},
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	routed, ok := routedResponseAccount(response)
+	if !ok || routed.ID != "" || routed.Provider != accounts.ProviderCodex {
+		t.Fatalf("Azure fallback attribution = %+v, %t; want unattributed Codex response", routed, ok)
+	}
+}
+
 // A 400 is the client's own fault: paying Azure to repeat it would waste money
 // and hide the error.
 func TestAzureCodexFallbackIgnoresClientErrors(t *testing.T) {
