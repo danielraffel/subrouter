@@ -265,11 +265,31 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 			configLine := strings.SplitN(got, "\n", 2)[0]
 			configDir := strings.TrimPrefix(configLine, "config=")
-			if configDir == "" || configDir == "/must-not-leak" || !strings.Contains(filepath.Base(configDir), "subrouter-claude-proxy-") {
+			if configDir == "" || configDir == "/must-not-leak" || filepath.Dir(configDir) != filepath.Join(store.StoreDir(), "claude-proxy") {
 				t.Fatalf("proxy did not use an isolated config directory: %q", configLine)
 			}
-			if _, err := os.Stat(configDir); !os.IsNotExist(err) {
-				t.Fatalf("temporary proxy config was not cleaned up: %v", err)
+			if tc.tenantKey != "" && strings.Contains(configDir, tc.tenantKey) {
+				t.Fatalf("proxy config path exposed tenant credential: %q", configDir)
+			}
+			if info, err := os.Stat(configDir); err != nil || !info.IsDir() {
+				t.Fatalf("durable proxy config is unavailable after launch: info=%v err=%v", info, err)
+			}
+			sessionMarker := filepath.Join(configDir, "session-marker")
+			if err := os.WriteFile(sessionMarker, []byte("resume-me"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := runner.claude(context.Background(), []string{"proxy", "--resume", "session-a"}); err != nil {
+				t.Fatal(err)
+			}
+			if marker, err := os.ReadFile(sessionMarker); err != nil || string(marker) != "resume-me" {
+				t.Fatalf("proxy launch did not preserve resumable session state: marker=%q err=%v", marker, err)
+			}
+			secondBody, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if secondConfig := strings.TrimPrefix(strings.SplitN(string(secondBody), "\n", 2)[0], "config="); secondConfig != configDir {
+				t.Fatalf("proxy config changed across resume: first=%q second=%q", configDir, secondConfig)
 			}
 		})
 	}

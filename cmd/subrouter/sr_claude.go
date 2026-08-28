@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -98,13 +99,19 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string) 
 		if proxyToken == "" {
 			proxyToken = "subrouter"
 		}
-		return r.proxyClaudeArgsTo(ctx, args, localBaseURL(), proxyToken)
+		return r.proxyClaudeArgsTo(ctx, args, localBaseURL(), proxyToken, "local")
 	}
 	proxyToken := strings.TrimSpace(server.TenantKey)
 	if proxyToken == "" {
 		proxyToken = "subrouter"
 	}
-	return r.proxyClaudeArgsTo(ctx, args, serverProxyRootURL(server), proxyToken)
+	scope := "server:" + strings.TrimSpace(server.Name)
+	if strings.TrimSpace(server.TenantKey) != "" {
+		scope = "tenant:" + strings.TrimSpace(server.TenantKey)
+	} else if strings.TrimSpace(server.TailscaleNodeID) != "" {
+		scope = "tailscale-node:" + strings.TrimSpace(server.TailscaleNodeID)
+	}
+	return r.proxyClaudeArgsTo(ctx, args, serverProxyRootURL(server), proxyToken, scope)
 }
 
 // cloudClaude launches Claude against the local proxy. The proxy leases an
@@ -154,12 +161,16 @@ func (r srRunner) proxyClaudeArgsTo(
 	args []string,
 	baseURL string,
 	proxyToken string,
+	scope string,
 ) error {
-	configDir, err := os.MkdirTemp("", "subrouter-claude-proxy-")
-	if err != nil {
+	scopeHash := sha256.Sum256([]byte(scope))
+	configDir := filepath.Join(r.store.StoreDir(), "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return fmt.Errorf("create isolated Claude proxy config: %w", err)
 	}
-	defer os.RemoveAll(configDir)
+	if err := os.Chmod(configDir, 0o700); err != nil {
+		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
+	}
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir)
 }
 
