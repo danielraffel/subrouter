@@ -992,8 +992,8 @@ func TestSRQwenRemovalRetainsAccountWhenCredentialCleanupFails(t *testing.T) {
 	if _, ok, err := store.FindStored(accountID); err != nil || !ok {
 		t.Fatalf("Qwen account should remain retryable: ok=%v err=%v", ok, err)
 	}
-	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("failed Qwen removal published account generation: %v", err)
+	if generation, err := os.ReadFile(filepath.Join(store.StoreDir(), ".account-generation")); err != nil || len(generation) == 0 {
+		t.Fatalf("failed Qwen removal did not publish rollback invalidation: %q err=%v", generation, err)
 	}
 }
 
@@ -1128,6 +1128,11 @@ func TestSRQwenLoginTargetsSelectedRemoteAccount(t *testing.T) {
 		case "/_subrouter/accounts":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{
 				"id": accountID, "provider": "qwen-token", "auth_mode": "apikey",
+			}})
+		case "/_subrouter/usage-status":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"id": accountID, "provider": "qwen-token", "auth_mode": "apikey",
+				"key_fingerprint": accounts.APIKeyFingerprint("sk-sp-remote-test"),
 			}})
 		case "/_subrouter/qwen-console":
 			received = true

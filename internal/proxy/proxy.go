@@ -5795,11 +5795,15 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	if len(filtered) > 0 {
 		return filtered
 	}
-	// A keyed provider never inherits provider-less legacy accounts: those
-	// predate multi-provider support and are Codex credentials. Antigravity is
-	// OAuth-only and withheld the same way.
-	if isKeyedProvider(provider) || provider == accounts.ProviderAntigravity {
+	// Provider-less records predate multi-provider support and are Codex
+	// credentials. Stamp their effective provider before returning them: later
+	// protocol-specific paths (including WebSocket failure classification) must
+	// not have to reinterpret the legacy empty value.
+	if credentialProvider != accounts.ProviderCodex {
 		return nil
+	}
+	for i := range legacy {
+		legacy[i].Provider = accounts.ProviderCodex
 	}
 	return legacy
 }
