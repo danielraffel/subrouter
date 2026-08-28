@@ -1006,6 +1006,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		i, account := i, account
 		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: account.ProviderOrDefault()}
 		if account.IsAPIKey() {
+			rowProvider := rows[i].provider
 			rows[i].authMode = accounts.AuthModeAPIKey
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
 			rows[i].planType = apiKeyPlanLabel(rowProvider)

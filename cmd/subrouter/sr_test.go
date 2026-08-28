@@ -102,7 +102,7 @@ func TestSRAddKeyRejectsUnknownLocalProviderBeforePrompting(t *testing.T) {
 	var out bytes.Buffer
 	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
 
-	err := runner.run(context.Background(), []string{"add-key", "--provider", "not-a-provider"})
+	err := runner.run(context.Background(), []string{"add-key", "--provider", "not/a/provider"})
 	if err == nil || !strings.Contains(err.Error(), "unsupported API-key provider") {
 		t.Fatalf("error = %v, want unsupported provider", err)
 	}
