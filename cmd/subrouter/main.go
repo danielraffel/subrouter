@@ -622,12 +622,12 @@ func serve(args []string) error {
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
 	allInitialAccounts := append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...)
-	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, allInitialAccounts)
+	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, proxy.SchedulerAccounts(allInitialAccounts))
 	if *fetchUsage && credentialBroker == nil {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithAccountRef(context.Background(), accountRef, codexAccounts)
 			loaded, generation, revision := accountRef.CredentialSnapshot()
-			schedulerRef.SyncAccountCredentials(generation, revision, loaded)
+			schedulerRef.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(loaded))
 			if successful > 0 {
 				if !schedulerRef.SetForAccountGeneration(selectacct.NewScheduler(fetchedScores), accountGeneration) {
 					slog.Debug("initial usage score fetch discarded after account reload")
@@ -803,7 +803,7 @@ func serve(args []string) error {
 			FetchScores: func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
 				scores, successful := fetchCodexScoresWithAccountRef(ctx, accountRef, candidates)
 				loaded, generation, revision := accountRef.CredentialSnapshot()
-				schedulerRef.SyncAccountCredentials(generation, revision, loaded)
+				schedulerRef.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(loaded))
 				return scores, successful
 			},
 			Lease: newSRAutoSwitchLease(storepath.StateDir()),

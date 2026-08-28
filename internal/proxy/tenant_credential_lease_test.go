@@ -141,7 +141,7 @@ func TestQwenAnthropicTransportFailuresMarkSharedTokenPlanAccount(t *testing.T) 
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			account := accounts.Account{
-				ID: accountID, Provider: accounts.ProviderQwenToken,
+				ID: accountID, Provider: accounts.ProviderQwenAnthropic,
 				AuthMode: accounts.AuthModeAPIKey, Token: "key", CredentialVersion: "credential-v1",
 			}
 			ref := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
@@ -167,7 +167,7 @@ func TestQwenAnthropicTransportFailuresMarkSharedTokenPlanAccount(t *testing.T) 
 func TestQwenAnthropicCredentialLookupUsesSharedTokenPlanOwner(t *testing.T) {
 	const accountID = "qwen-token:shared"
 	account := accounts.Account{
-		ID: accountID, Provider: accounts.ProviderQwenToken,
+		ID: accountID, Provider: accounts.ProviderQwenAnthropic,
 		AuthMode: accounts.AuthModeAPIKey, Token: "key", CredentialVersion: "credential-v1",
 	}
 	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{

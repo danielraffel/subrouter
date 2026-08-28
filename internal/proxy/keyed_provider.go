@@ -535,6 +535,12 @@ func schedulerAccounts(accountsIn []accounts.Account) []accounts.Account {
 	return out
 }
 
+// SchedulerAccounts returns credential-owner identities for scheduler state.
+// Transport aliases still remain on request-facing account copies.
+func SchedulerAccounts(accountsIn []accounts.Account) []accounts.Account {
+	return schedulerAccounts(accountsIn)
+}
+
 func pickRoutingAccount(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, error) {
 	picked, err := scheduler.Pick(schedulerAccounts(candidates))
 	if err != nil {

@@ -1792,7 +1792,7 @@ func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 		statuses := s.AccountRef.Statuses(r.Context(), forceRefresh)
 		if s.SchedulerRef != nil {
 			loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
-			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, schedulerAccounts(loaded))
 		}
 		writeJSON(w, statuses)
 		return
@@ -1820,7 +1820,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		statuses := s.AccountRef.UsageStatuses(r.Context())
 		if s.SchedulerRef != nil {
 			loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
-			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, schedulerAccounts(loaded))
 		}
 		s.updateSchedulerFromUsageStatusesContext(r.Context(), statuses)
 		writeJSON(w, s.withSessionCounts(s.withRequestTimeExhaustionWindows(statuses)))
@@ -2361,7 +2361,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 	}
 	loaded, accountGeneration, credentialRevision := s.AccountRef.CredentialSnapshot()
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, loaded)
+		s.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, schedulerAccounts(loaded))
 	}
 	if closeErr := transactionLock.Close(); closeErr != nil {
 		return "", closeErr
@@ -2584,7 +2584,7 @@ func (s Server) reloadAccounts(ctx context.Context) (accountCount int, scoredCou
 	}
 	loaded, accountGeneration, credentialRevision := s.AccountRef.CredentialSnapshot()
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, loaded)
+		s.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, schedulerAccounts(loaded))
 	}
 	if err := transactionLock.Close(); err != nil {
 		return 0, 0, err
@@ -4678,7 +4678,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	}
 	s.SchedulerRef.MarkCredentialExhaustedForSnapshot(
 		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL),
-		generation, credentialRevision, loaded,
+		generation, credentialRevision, schedulerAccounts(loaded),
 	)
 }
 
@@ -6116,9 +6116,9 @@ func (s Server) accountListSnapshotContext(ctx context.Context) ([]accounts.Acco
 		}
 		loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
 		if reloaded && s.SchedulerRef != nil {
-			s.SchedulerRef.AdvanceAccountGenerationWithAccounts(generation, credentialRevision, loaded)
+			s.SchedulerRef.AdvanceAccountGenerationWithAccounts(generation, credentialRevision, schedulerAccounts(loaded))
 		} else if s.SchedulerRef != nil {
-			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+			s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, schedulerAccounts(loaded))
 		}
 		out = append(out, loaded...)
 		return out, generation
@@ -6136,7 +6136,7 @@ func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (a
 	refreshed, err := s.AccountRef.Refresh(ctx, account)
 	if err == nil && s.SchedulerRef != nil {
 		loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
-		s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
+		s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, schedulerAccounts(loaded))
 	}
 	return refreshed, err
 }
