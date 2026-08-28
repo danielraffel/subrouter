@@ -530,19 +530,24 @@ func (r srRunner) promptProvider() (string, error) {
 }
 
 func (r srRunner) add(ctx context.Context) error {
-	previousActive, err := r.store.DetectActiveAccount()
+	auth, email, err := r.isolatedCodexLogin(ctx, false)
 	if err != nil {
 		return err
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
+	account, existed, err := r.store.FindStored(email)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintln(r.out, "Opening Codex OAuth login...")
-	if err := r.commandRunner().Run(ctx, "codex", []string{"login"}, r.in, r.out, r.errOut); err != nil {
-		return fmt.Errorf("codex login failed: %w", err)
+	if !existed {
+		account = accounts.StoredCodexAccount{
+			Email:   email,
+			AddedAt: time.Now().UTC().Format(time.RFC3339),
+		}
 	}
-	account, existed, err := r.store.ImportActive()
-	if err != nil {
+	account.Provider = accounts.ProviderCodex
+	account.OAuthCredentialOrigin = accounts.CodexOAuthOriginIsolatedServerLogin
+	account.Auth = auth
+	if err := r.store.SaveStored(account); err != nil {
 		return err
 	}
 	if existed {
@@ -550,25 +555,7 @@ func (r srRunner) add(ctx context.Context) error {
 	} else {
 		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.Email)
 	}
-	if previousActive != "" && previousActive != account.Email {
-		if err := r.store.SwitchActive(previousActive); err != nil {
-			return fmt.Errorf("restore active account %s: %w", previousActive, err)
-		}
-		previous, ok, err := r.store.FindStored(previousActive)
-		if err != nil {
-			return err
-		}
-		if ok {
-			for _, result := range syncCodexCompatibleAuth(previous) {
-				if result.Err != nil {
-					fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
-					continue
-				}
-				fmt.Fprintf(r.out, "Synced %s auth: %s\n", result.Tool, result.Path)
-			}
-		}
-		fmt.Fprintf(r.out, "Restored active account: %s\n", previousActive)
-	}
+	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	return nil
 }
 

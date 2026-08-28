@@ -1043,49 +1043,8 @@ func (r srRunner) isolatedCodexAccountUpload(
 	ctx context.Context,
 	deviceAuth bool,
 ) (broker.AccountUpload, string, error) {
-	lock, err := accounts.AcquireActiveCodexAuthLock(func() {
-		fmt.Fprintln(r.out, "Another sr add/login is in progress; waiting...")
-	})
+	auth, email, err := r.isolatedCodexLogin(ctx, deviceAuth)
 	if err != nil {
-		return nil, "", fmt.Errorf("lock shared Codex login: %w", err)
-	}
-	defer func() { _ = lock.Close() }()
-
-	loginHome, err := os.MkdirTemp("", "sr-hosted-codex-*")
-	if err != nil {
-		return nil, "", err
-	}
-	defer os.RemoveAll(loginHome)
-
-	loginArgs := []string{"login"}
-	if deviceAuth {
-		loginArgs = append(loginArgs, "--device-auth")
-	}
-	fmt.Fprintln(r.out, "Opening Codex OAuth login for the shared team...")
-	if err := r.commandRunner().RunWithEnv(
-		ctx,
-		"codex",
-		loginArgs,
-		[]string{"CODEX_HOME=" + loginHome},
-		r.in,
-		r.out,
-		r.errOut,
-	); err != nil {
-		return nil, "", fmt.Errorf("codex login failed: %w", err)
-	}
-	auth, ok, err := accounts.ReadCodexAuthFile(filepath.Join(loginHome, "auth.json"))
-	if err != nil {
-		return nil, "", err
-	}
-	if !ok || auth.Tokens == nil || auth.Tokens.AccessToken == "" ||
-		auth.Tokens.RefreshToken == "" || auth.Tokens.IDToken == "" {
-		return nil, "", fmt.Errorf("codex login did not write complete OAuth auth")
-	}
-	email, err := accounts.ExtractEmailFromJWT(auth.Tokens.IDToken)
-	if err != nil || strings.TrimSpace(email) == "" {
-		return nil, "", fmt.Errorf("could not extract email from logged-in auth")
-	}
-	if err := lock.Close(); err != nil {
 		return nil, "", err
 	}
 	return broker.AccountUpload{
@@ -1099,6 +1058,58 @@ func (r srRunner) isolatedCodexAccountUpload(
 			"accountID":    auth.Tokens.AccountID,
 		},
 	}, email, nil
+}
+
+func (r srRunner) isolatedCodexLogin(
+	ctx context.Context,
+	deviceAuth bool,
+) (accounts.CodexAuthFile, string, error) {
+	lock, err := accounts.AcquireActiveCodexAuthLock(func() {
+		fmt.Fprintln(r.out, "Another sr add/login is in progress; waiting...")
+	})
+	if err != nil {
+		return accounts.CodexAuthFile{}, "", fmt.Errorf("lock isolated Codex login: %w", err)
+	}
+	defer func() { _ = lock.Close() }()
+
+	loginHome, err := os.MkdirTemp("", "sr-hosted-codex-*")
+	if err != nil {
+		return accounts.CodexAuthFile{}, "", err
+	}
+	defer os.RemoveAll(loginHome)
+
+	loginArgs := []string{"login"}
+	if deviceAuth {
+		loginArgs = append(loginArgs, "--device-auth")
+	}
+	fmt.Fprintln(r.out, "Opening isolated Codex OAuth login...")
+	if err := r.commandRunner().RunWithEnv(
+		ctx,
+		"codex",
+		loginArgs,
+		[]string{"CODEX_HOME=" + loginHome},
+		r.in,
+		r.out,
+		r.errOut,
+	); err != nil {
+		return accounts.CodexAuthFile{}, "", fmt.Errorf("codex login failed: %w", err)
+	}
+	auth, ok, err := accounts.ReadCodexAuthFile(filepath.Join(loginHome, "auth.json"))
+	if err != nil {
+		return accounts.CodexAuthFile{}, "", err
+	}
+	if !ok || auth.Tokens == nil || auth.Tokens.AccessToken == "" ||
+		auth.Tokens.RefreshToken == "" || auth.Tokens.IDToken == "" {
+		return accounts.CodexAuthFile{}, "", fmt.Errorf("codex login did not write complete OAuth auth")
+	}
+	email, err := accounts.ExtractEmailFromJWT(auth.Tokens.IDToken)
+	if err != nil || strings.TrimSpace(email) == "" {
+		return accounts.CodexAuthFile{}, "", fmt.Errorf("could not extract email from logged-in auth")
+	}
+	if err := lock.Close(); err != nil {
+		return accounts.CodexAuthFile{}, "", err
+	}
+	return auth, email, nil
 }
 
 func (r srRunner) hostedClaudeAdd(
