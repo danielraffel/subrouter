@@ -456,19 +456,30 @@ pooled Claude accounts. When the selected server is remote, this needs neither
 local Claude profiles nor a local Subrouter daemon; Claude arguments such as
 `--resume <session-id>` pass through unchanged.
 
-Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Generate a long-lived token with `claude setup-token`, then configure the Claude user settings env:
+For manual client configuration, authenticate to the Subrouter proxy rather
+than exposing an upstream Claude OAuth token. A trusted local or legacy
+single-tenant server accepts the non-secret placeholder `subrouter`:
 
 ```json
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:31415",
-    "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-...",
-    "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-..."
+    "ANTHROPIC_AUTH_TOKEN": "subrouter",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude"
   }
 }
 ```
 
-For a shared server, replace `127.0.0.1` with the server URL. Subrouter recognizes Claude Code traffic, selects a Claude OAuth account from its own store, strips API-key auth, and forwards to Anthropic with the OAuth beta header. Claude Code prompt caching does not require Subrouter-specific cache settings: Subrouter keeps the same Claude conversation pinned to the same Claude account when that account is still available, and forwards the client `Anthropic-Beta` values and request body `cache_control` blocks unchanged.
+For a tenant-scoped shared server, use its `/t/<key>` URL and the same tenant
+key as `ANTHROPIC_AUTH_TOKEN`. The `X-Subrouter-Agent: claude` marker is required
+because the unprefixed `/v1/messages` path alone does not identify the agent.
+`sr claude proxy` sets all three values correctly from the selected server.
+Subrouter then selects a Claude OAuth account from its own store, strips client
+auth before forwarding, and adds the OAuth beta header. Claude Code prompt
+caching does not require Subrouter-specific cache settings: Subrouter keeps the
+same Claude conversation pinned to the same Claude account when that account is
+still available, and forwards the client `Anthropic-Beta` values and request
+body `cache_control` blocks unchanged.
 
 Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
 
