@@ -440,7 +440,7 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	}
 	res, err := securedClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("sync Qwen console credential to server %s: %w", server.Name, err)
+		return fmt.Errorf("sync Qwen console credential to server %s: %w", server.Name, redactServerAccountImportError(err, server))
 	}
 	defer res.Body.Close()
 	_, _ = io.CopyN(io.Discard, res.Body, 4096)

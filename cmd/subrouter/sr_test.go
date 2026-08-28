@@ -1137,6 +1137,29 @@ func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	}
 }
 
+func TestQwenConsoleCredentialSyncRedactsTenantKeyFromTransportError(t *testing.T) {
+	root := t.TempDir()
+	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	client := server.Client()
+	server.Close()
+	const tenantKey = "srt_tenant_secret"
+	runner := srRunner{client: client, out: io.Discard}
+	err := runner.syncQwenConsoleToServer(t.Context(), root, srServerConfig{
+		Name: "tenant", URL: server.URL, TenantKey: tenantKey,
+	}, "qwen-token:work")
+	if err == nil {
+		t.Fatal("sync unexpectedly succeeded against a closed server")
+	}
+	if strings.Contains(err.Error(), tenantKey) || !strings.Contains(err.Error(), "[redacted]") {
+		t.Fatalf("sync transport error exposed tenant credential: %v", err)
+	}
+}
+
 func TestSRQwenLoginTargetsSelectedRemoteAccount(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
