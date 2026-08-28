@@ -345,6 +345,52 @@ func (r *SchedulerRef) MarkCredentialExhaustedUntil(
 	return true
 }
 
+// MarkCredentialExhaustedForSnapshot atomically publishes a coherent account
+// snapshot and records a terminal failure against the credential in that same
+// snapshot. This closes the reload window where AccountRef has advanced but a
+// separate scheduler-generation sync has not arrived yet.
+func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
+	provider account.Provider,
+	accountID string,
+	credentialIdentity string,
+	until time.Time,
+	accountGeneration uint64,
+	credentialRevision uint64,
+	accounts []account.Account,
+) bool {
+	if r == nil || accountID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if accountGeneration < r.accountGeneration ||
+		(accountGeneration == r.accountGeneration && credentialRevision < r.credentialRevision) {
+		return false
+	}
+	if accountGeneration > r.accountGeneration {
+		r.advanceAccountGenerationLocked(accountGeneration)
+	}
+	if credentialRevision > r.credentialRevision || r.credentialFingerprints == nil {
+		r.credentialRevision = credentialRevision
+		r.credentialFingerprints = make(map[string]string, len(accounts))
+		for _, candidate := range accounts {
+			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+		}
+	}
+
+	fingerprint := credentialFingerprint(credentialIdentity)
+	scoreKey := ScoreKey(provider, accountID)
+	if current, tracked := r.credentialFingerprints[scoreKey]; !tracked || current != fingerprint {
+		return false
+	}
+	if r.credentialExhaustedUntil == nil {
+		r.credentialExhaustedUntil = make(map[string]time.Time)
+	}
+	r.credentialExhaustedUntil[scoreKey+"\x00"+fingerprint] = until
+	r.updatedAt = time.Now()
+	return true
+}
+
 func credentialFingerprint(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])

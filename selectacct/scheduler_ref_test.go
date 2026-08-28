@@ -125,6 +125,35 @@ func TestCredentialExhaustionIsScopedToAccountGeneration(t *testing.T) {
 	}
 }
 
+func TestCredentialFailureAtomicallyAdvancesAccountSnapshot(t *testing.T) {
+	old := account.Account{
+		ID: "reloaded@example.com", Provider: account.ProviderCodex,
+		CredentialVersion: "old-refresh-chain",
+	}
+	current := old
+	current.CredentialVersion = "current-refresh-chain"
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: current.ID, Provider: current.Provider, Headroom: 1, ShortHeadroom: 1,
+	}}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{old})
+
+	if !ref.MarkCredentialExhaustedForSnapshot(
+		current.Provider, current.ID, current.CredentialIdentity(), time.Now().Add(time.Hour),
+		2, 2, []account.Account{current},
+	) {
+		t.Fatal("current credential failure was dropped before the reload publisher synchronized")
+	}
+	if !ref.Get().Exhausted(current.Provider, current.ID) {
+		t.Fatal("current credential was not excluded")
+	}
+	if ref.MarkCredentialExhaustedForSnapshot(
+		old.Provider, old.ID, old.CredentialIdentity(), time.Now().Add(time.Hour),
+		1, 1, []account.Account{old},
+	) {
+		t.Fatal("stale credential snapshot regressed the scheduler generation")
+	}
+}
+
 func TestSyncAccountCredentialsDropsExclusionAfterTokenRotation(t *testing.T) {
 	old := account.Account{
 		ID: "rotated@example.com", Provider: account.ProviderCodex, Token: "same-access-token",

@@ -3789,9 +3789,9 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	if !current {
 		return
 	}
-	s.SchedulerRef.SyncAccountCredentials(generation, credentialRevision, loaded)
-	s.SchedulerRef.MarkCredentialExhaustedUntil(
-		account.Provider, account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL), generation,
+	s.SchedulerRef.MarkCredentialExhaustedForSnapshot(
+		account.Provider, account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL),
+		generation, credentialRevision, loaded,
 	)
 }
 
