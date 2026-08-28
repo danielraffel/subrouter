@@ -468,7 +468,7 @@ func (r *AccountRef) credentialSnapshot(provider accounts.Provider, id string) a
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 		for _, candidate := range r.accounts {
-			if sameProvider(candidate.Provider, provider) && candidate.ID == id {
+			if accountProviderFor(candidate.Provider) == accountProviderFor(provider) && candidate.ID == id {
 				return candidate
 			}
 		}
@@ -4667,7 +4667,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	loaded, generation, credentialRevision := s.AccountRef.CredentialSnapshot()
 	current := false
 	for _, candidate := range loaded {
-		if sameProvider(candidate.Provider, account.Provider) && candidate.ID == account.ID &&
+		if accountProviderFor(candidate.Provider) == accountProviderFor(account.Provider) && candidate.ID == account.ID &&
 			candidate.CredentialIdentity() == account.CredentialIdentity() {
 			current = true
 			break

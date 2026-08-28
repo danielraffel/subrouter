@@ -140,10 +140,17 @@ func TestQwenAnthropicTransportFailuresMarkSharedTokenPlanAccount(t *testing.T) 
 	const accountID = "qwen-token:shared"
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
+			account := accounts.Account{
+				ID: accountID, Provider: accounts.ProviderQwenToken,
+				AuthMode: accounts.AuthModeAPIKey, Token: "key", CredentialVersion: "credential-v1",
+			}
 			ref := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
 				AccountID: accountID, Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1,
 			}}))
-			server := Server{SchedulerRef: ref}
+			server := Server{
+				AccountRef:   NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil),
+				SchedulerRef: ref,
+			}
 			server.markAccountExhaustedFromResponseForAccount(accounts.Account{
 				ID: accountID, Provider: accounts.ProviderQwenAnthropic, CredentialVersion: "credential-v1",
 			}, "", status, nil)
@@ -154,5 +161,24 @@ func TestQwenAnthropicTransportFailuresMarkSharedTokenPlanAccount(t *testing.T) 
 				t.Fatalf("status %d left a mark under the transport alias", status)
 			}
 		})
+	}
+}
+
+func TestQwenAnthropicCredentialLookupUsesSharedTokenPlanOwner(t *testing.T) {
+	const accountID = "qwen-token:shared"
+	account := accounts.Account{
+		ID: accountID, Provider: accounts.ProviderQwenToken,
+		AuthMode: accounts.AuthModeAPIKey, Token: "key", CredentialVersion: "credential-v1",
+	}
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: accountID, Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1,
+	}}))
+	server := Server{
+		AccountRef:   NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil),
+		SchedulerRef: ref,
+	}
+	server.markAccountExhaustedFromResponse(accounts.ProviderQwenAnthropic, accountID, "", http.StatusUnauthorized, nil)
+	if !ref.Get().Exhausted(accounts.ProviderQwenToken, accountID) {
+		t.Fatal("transport alias lookup did not mark the canonical Token Plan credential")
 	}
 }
