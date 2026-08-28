@@ -517,6 +517,11 @@ func serve(args []string) error {
 	// interactive Codex login. Stored credentials may refresh for proxy routing,
 	// but only explicit account-manager commands may replace auth.json.
 	codexStore.DisableActiveAuthSync = true
+	// A serving process cannot safely rotate a legacy refresh-token chain whose
+	// independence from interactive auth is unknown. Account-manager commands
+	// provide the explicit isolated re-enrollment path for both local and shared
+	// stores, so serve fails closed until each legacy account is re-added.
+	codexStore.RequireIsolatedOAuth = true
 	claudeStore := agentclaude.DefaultStore()
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64

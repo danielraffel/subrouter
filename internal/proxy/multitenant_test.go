@@ -145,6 +145,9 @@ func TestMultiTenantServingStoreDoesNotSyncInteractiveCodexAuth(t *testing.T) {
 	if !server.AccountRef.store.DisableActiveAuthSync {
 		t.Fatal("tenant serving store can rewrite interactive Codex auth")
 	}
+	if !server.AccountRef.store.RequireIsolatedOAuth {
+		t.Fatal("tenant serving store accepts OAuth credentials without isolated provenance")
+	}
 }
 
 func writeTenantAPIKeyAccount(t *testing.T, registry *tenant.Registry, tenantID, email, apiKey string) {
@@ -1527,6 +1530,56 @@ func TestTenantCodexOAuthUploadRequiresIsolatedLoginOrigin(t *testing.T) {
 	))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("upload status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex",
+			"accountId":"stable-routing-id",
+			"label":"Production Codex",
+			"oauthCredentialOrigin":"isolated-server-login",
+			"tokens":{
+				"accessToken":"access",
+				"refreshToken":"refresh",
+				"idToken":%q,
+				"accountID":"provider-account"
+			}
+		}`, idToken)),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet,
+		"/t/"+key+"/_subrouter/accounts",
+		nil,
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var listed []struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != "stable-routing-id" || listed[0].Label != "Production Codex" || listed[0].Email != "owner@example.com" {
+		t.Fatalf("listed accounts = %#v", listed)
 	}
 }
 

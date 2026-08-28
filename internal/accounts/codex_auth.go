@@ -241,7 +241,7 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		return account, false, err
 	}
 	if s.DisableActiveAuthSync {
-		if account.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+		if s.RequireIsolatedOAuth && account.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
 			err := &CodexUnisolatedCredentialError{}
 			logCodexRefreshSkipped(ctx, s, account, force, "oauth_origin_not_isolated")
 			return account, false, err
@@ -324,7 +324,7 @@ type CodexStoredRefreshFailureError struct {
 type CodexUnisolatedCredentialError struct{}
 
 func (*CodexUnisolatedCredentialError) Error() string {
-	return "stored Codex credential is not proven isolated from interactive auth; reauthenticate it with an isolated server login"
+	return "stored Codex credential is not proven isolated from interactive auth; re-add or repair it with an isolated Codex login"
 }
 
 func (e *CodexStoredRefreshFailureError) Error() string {

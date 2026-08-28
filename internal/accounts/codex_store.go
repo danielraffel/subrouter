@@ -17,6 +17,7 @@ import (
 type CodexStore struct {
 	Dir                   string
 	DisableActiveAuthSync bool
+	RequireIsolatedOAuth  bool
 }
 
 const migrationBatchControlLockID = ".subrouter-migration-batch-control"
@@ -250,6 +251,9 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 	out.AuthMode = AuthModeOAuth
 	out.Token = a.Auth.Tokens.AccessToken
 	out.AccountID = a.Auth.Tokens.AccountID
+	if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
+		out.Email = strings.TrimSpace(email)
+	}
 	return out, true
 }
 

@@ -187,6 +187,8 @@ When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to
 
 A server with neither credential configured rejects every account import, including `sr add`. That state is reported as `"account_import": "disabled"` by `/_subrouter/health` and logged as a warning at startup, and `sr doctor` runs the same preflight `sr add` runs against the selected server.
 
+Serving processes accept and refresh only Codex OAuth credentials created by an isolated Subrouter login. This keeps proxy refresh-token chains independent from interactive `~/.codex/auth.json`. After upgrading a store that contains older accounts without provenance metadata, re-enroll each local account with `sr add codex`, or each shared account with `sr server login <name>` / `sr account repair <account-id>`, before its current access token expires. Re-enrollment leaves the active Codex login unchanged.
+
 ### Tailnet authentication for self-hosted servers
 
 A server whose port is already restricted to a tailnet by ACL does not need a second credential system on top of it. Start it with `--tailscale-auth` (or `SUBROUTER_TAILSCALE_AUTH=1`) and non-loopback callers are authenticated by their tailnet identity instead:
@@ -422,7 +424,7 @@ Clients authenticate by base URL prefix, because agent CLIs can only override ba
 On startup, Subrouter fetches current Codex usage for OAuth accounts and scores each account by its most constrained usage window. The scheduler keeps existing sessions sticky. For a new session it protects low-headroom accounts, spends healthy quota that resets soonest, then breaks ties by live assigned-session counts.
 If all else ties, subscription OAuth accounts are preferred before API-key accounts.
 
-The daemon also refreshes usage and updates Codex, OpenCode, and pi auth every 10 minutes by default so local agents follow the same OAuth-only policy. Configure it with `subrouter serve --sr-switch-interval 5m`, or disable it with `--sr-switch-interval 0`. If `--fetch-usage=false`, auto-switch is disabled because fresh usage is required.
+The daemon refreshes usage scores used for routing every 10 minutes by default. It never rewrites interactive Codex, OpenCode, or pi auth; only an explicit account-manager command such as `sr switch` does that. Configure score refresh with `subrouter serve --sr-switch-interval 5m`, or disable it with `--sr-switch-interval 0`. If `--fetch-usage=false`, scheduled score refresh is disabled because fresh usage is required.
 
 By default, OAuth accounts are forwarded to `https://chatgpt.com/backend-api/codex` and API-key accounts are forwarded to `https://api.openai.com`. Subrouter accepts either `/v1/responses` or `/responses` from clients and normalizes the path for the selected account type.
 

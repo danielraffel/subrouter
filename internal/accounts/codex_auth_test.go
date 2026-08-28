@@ -335,7 +335,7 @@ func TestRefreshStoredDoesNotRotateSharedInteractiveCredentialWhenSyncDisabled(t
 
 func TestRefreshStoredDoesNotTrustDifferentTokenGenerationWithoutIsolatedProvenance(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true}
+	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true, RequireIsolatedOAuth: true}
 	stored := storedOAuthAccount("founders@example.com", "older-generation", time.Now().Add(-time.Hour))
 	if err := store.SaveStored(stored); err != nil {
 		t.Fatal(err)

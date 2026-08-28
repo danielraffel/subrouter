@@ -319,6 +319,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	codexStore := accounts.CodexStore{
 		Dir:                   filepath.Join(dir, "codex", "accounts"),
 		DisableActiveAuthSync: true,
+		RequireIsolatedOAuth:  true,
 	}
 	claudeStore := agentclaude.Store{Dir: filepath.Join(dir, "codex")}
 	sessions, err := session.NewStore(filepath.Join(dir, "sessions.json"))

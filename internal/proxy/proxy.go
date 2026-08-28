@@ -6345,7 +6345,7 @@ func accountMatches(account accounts.Account, id string) bool {
 	if id == "" {
 		return false
 	}
-	if strings.EqualFold(account.ID, id) || strings.EqualFold(account.Label, id) || strings.EqualFold(account.Email, id) {
+	if strings.EqualFold(account.ID, id) || strings.EqualFold(account.Label, id) {
 		return true
 	}
 	if account.AuthMode == accounts.AuthModeAPIKey && strings.EqualFold(strings.TrimPrefix(account.ID, "apikey:"), id) {
