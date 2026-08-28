@@ -853,6 +853,29 @@ func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing
 	}
 }
 
+func TestAccountImportCapacityCountsOAuthSourceAccounts(t *testing.T) {
+	listed := make([]accounts.Account, 0, maxAccountImportAccounts)
+	for index := 0; index < maxAccountImportAccounts; index++ {
+		listed = append(listed, accounts.Account{
+			ID:       fmt.Sprintf("kimi-subscription:seed-%03d", index),
+			Provider: accounts.ProviderKimi,
+			AuthMode: accounts.AuthModeOAuth,
+		})
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	ref.oauthSources = []OAuthAccountSource{&stubOAuthSource{
+		provider: accounts.ProviderKimi,
+		listed:   listed,
+	}}
+
+	_, err := (Server{AccountRef: ref}).ensureAccountImportCapacity(context.Background(), "apikey:new", false)
+	var capacityErr *accountImportCapacityError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("import error = %v, want capacity error from OAuth-source accounts", err)
+	}
+}
+
 func TestCompletedImportIsObservedByAnotherWorkerGeneration(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	seed := accounts.StoredCodexAccount{
