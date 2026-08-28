@@ -53,7 +53,7 @@ const (
 const srHelp = `sr - Manage Subrouter accounts
 
 Usage:
-  sr                    Show Codex and Claude usage, grouped by provider
+  sr                    Show usage across all configured providers
   sr add                Ask whether to add Codex or Claude
   sr add codex          Add Codex to the active local or hosted pool
   sr add claude         Add Claude to the active local or hosted pool
@@ -71,7 +71,7 @@ Usage:
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove an account (for example qwen-token:large-plan)
-  sr status             Show Codex and Claude usage (non-interactive)
+  sr status             Show usage across all configured providers (non-interactive)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
   sr kimi login <label> Add an isolated Kimi subscription account

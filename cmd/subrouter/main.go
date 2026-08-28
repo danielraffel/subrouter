@@ -1471,7 +1471,7 @@ Team vault management:
   %[1]s logout             Revoke this machine's cmux.com session
 
 Usage:
-  %[1]s                    Show Codex and Claude usage, grouped by provider
+  %[1]s                    Show usage across all configured providers
   %[1]s add                Add an account; asks whether it is Codex or Claude
   %[1]s add codex          Add a Codex account (opens OAuth login)
   %[1]s add claude         Add a Claude account (opens OAuth login)
@@ -1483,7 +1483,7 @@ Usage:
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s remove <account>   Remove an account (for example qwen-token:large-plan)
-  %[1]s status             Show Codex and Claude usage (non-interactive)
+  %[1]s status             Show usage across all configured providers (non-interactive)
   %[1]s qwen login [--console-account <email-or-label>] <account>
                            Authorize live Qwen Token Plan quota status
   %[1]s kimi login <label> Add an isolated Kimi subscription account

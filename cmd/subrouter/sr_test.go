@@ -967,6 +967,43 @@ func TestAddKeyHelpListsEveryAdditionalKeyedProvider(t *testing.T) {
 	}
 }
 
+func TestSRQwenHelpDocumentsGenericAccountLifecycle(t *testing.T) {
+	var out bytes.Buffer
+	runner := srRunner{out: &out}
+	if err := runner.qwen(t.Context(), []string{"--help"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"sr add-key --provider qwen-token",
+		"sr status",
+		"sr remove <account>",
+		"sr qwen login [--console-account <email-or-label>] <account>",
+		"sr qwen label <account> <email-or-label>",
+		"console plan/quota metadata",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("Qwen help missing %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "sr qwen add") {
+		t.Fatalf("Qwen help advertises a redundant add alias:\n%s", out.String())
+	}
+}
+
+func TestStatusHelpCoversEveryConfiguredProvider(t *testing.T) {
+	for name, help := range map[string]string{
+		"sr":        srHelp,
+		"subrouter": usageText("subrouter"),
+	} {
+		if !strings.Contains(help, "status             Show usage across all configured providers") {
+			t.Errorf("%s help does not describe provider-wide status", name)
+		}
+		if strings.Contains(help, "status             Show Codex and Claude usage") {
+			t.Errorf("%s help still limits status to Codex and Claude", name)
+		}
+	}
+}
+
 func TestRemoteQwenKeyFingerprintRequiresSelectedAccount(t *testing.T) {
 	statuses := []remoteServerUsageStatus{
 		{ID: "qwen-token:other", KeyFingerprint: "key:1111111111"},

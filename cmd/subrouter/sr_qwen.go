@@ -26,9 +26,18 @@ import (
 
 func (r srRunner) qwen(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
-		fmt.Fprintln(r.out, "Usage: sr qwen login [--console-account <email-or-label>] <qwen-token-account>")
-		fmt.Fprintln(r.out, "       sr qwen label <qwen-token-account> <email-or-label>")
-		fmt.Fprintln(r.out, "Authorizes Alibaba console access so sr status can show Lite/Pro, 5h, and 7d quota.")
+		fmt.Fprint(r.out, `Qwen Token Plan accounts use the standard provider account lifecycle:
+  sr add-key --provider qwen-token
+                           Add a Token Plan API-key account
+  sr status                List accounts and show available plan/quota status
+  sr remove <account>      Remove a Token Plan account
+
+Qwen console commands attach plan and quota metadata to an existing account:
+  sr qwen login [--console-account <email-or-label>] <account>
+                           Authorize Alibaba console plan/quota metadata
+  sr qwen label <account> <email-or-label>
+                           Set the saved sign-in label shown by sr status
+`)
 		return nil
 	}
 	if args[0] != "login" {
