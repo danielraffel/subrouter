@@ -61,12 +61,12 @@ func (s Store) lockLocalCLIRefresh(ctx context.Context) (*cliRefreshLock, error)
 			return nil, fmt.Errorf("acquire Kimi Code OAuth refresh lock: %w", err)
 		}
 		if staleCLILock(lockDir, time.Now()) {
-			// proper-lockfile represents the lock as an empty directory. Remove
-			// only that exact directory; a concurrent heartbeat or owner change
-			// makes the next loop retry instead of widening the target.
-			if err := os.Remove(lockDir); err == nil || errors.Is(err, os.ErrNotExist) {
-				continue
-			}
+			// An empty-directory lock has no portable compare-and-delete
+			// operation. Removing it after a stale Stat can displace an owner that
+			// heartbeats in the gap and let two refresh-token exchanges overlap.
+			// Fail closed; a human can verify no Kimi process is running before
+			// removing the named stale directory.
+			return nil, fmt.Errorf("Kimi Code OAuth refresh lock appears stale; verify no Kimi process is running, then remove %s", lockDir)
 		}
 		timer := time.NewTimer(cliRefreshLockPoll)
 		select {

@@ -724,7 +724,7 @@ func TestLocalCLIRefreshRereadsAfterTheOfficialCrossProcessLock(t *testing.T) {
 	}
 }
 
-func TestLocalCLIRefreshReclaimsTheOfficialStaleLock(t *testing.T) {
+func TestLocalCLIRefreshRefusesRacyStaleLockTakeover(t *testing.T) {
 	store := writeCredentialFile(t, credentialFileJSON("stale", "rt", time.Now().Add(-time.Hour)))
 	home := filepath.Dir(filepath.Dir(store.Path))
 	lockDir := filepath.Join(home, "oauth", "kimi-code.lock")
@@ -735,18 +735,12 @@ func TestLocalCLIRefreshReclaimsTheOfficialStaleLock(t *testing.T) {
 	if err := os.Chtimes(lockDir, stale, stale); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh", "refresh_token": "rotated", "expires_in": 900})
-	}))
-	defer server.Close()
-	stubOAuthConfig(t, server.URL)
-
-	refreshed, err := store.RefreshAccount(context.Background(), server.Client(), account.Account{ID: accountID, Provider: account.ProviderKimi})
-	if err != nil || refreshed.Token != "fresh" {
-		t.Fatalf("stale-lock refresh = %+v err=%v", refreshed, err)
+	_, err := store.RefreshAccount(context.Background(), http.DefaultClient, account.Account{ID: accountID, Provider: account.ProviderKimi})
+	if err == nil || !strings.Contains(err.Error(), "appears stale") || !strings.Contains(err.Error(), lockDir) {
+		t.Fatalf("stale-lock refresh error = %v, want fail-closed recovery guidance", err)
 	}
-	if _, err := os.Stat(lockDir); !os.IsNotExist(err) {
-		t.Fatalf("stale lock remains after refresh: %v", err)
+	if info, err := os.Stat(lockDir); err != nil || !info.IsDir() {
+		t.Fatalf("stale lock was removed automatically: %v", err)
 	}
 }
 
