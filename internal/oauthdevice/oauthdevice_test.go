@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,6 +51,33 @@ func TestRequestCodeParsesTheDeviceAuthorization(t *testing.T) {
 		if !contains(gotForm, want) {
 			t.Fatalf("device request form %q is missing %q", gotForm, want)
 		}
+	}
+}
+
+func TestPostFormDoesNotReplayCredentialsAcrossRedirects(t *testing.T) {
+	var sinkCalls int
+	sink := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		sinkCalls++
+	}))
+	defer sink.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if err := request.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if request.Form.Get("refresh_token") != "refresh-secret" {
+			t.Fatalf("source refresh token = %q", request.Form.Get("refresh_token"))
+		}
+		http.Redirect(w, request, sink.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	_, err := postForm(t.Context(), redirector.Client(), redirector.URL,
+		map[string][]string{"refresh_token": {"refresh-secret"}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("postForm error = %v, want rejected redirect", err)
+	}
+	if sinkCalls != 0 {
+		t.Fatalf("redirect sink received %d credential-bearing requests", sinkCalls)
 	}
 }
 

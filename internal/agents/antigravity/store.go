@@ -272,7 +272,11 @@ func refreshWithClient(ctx context.Context, client *http.Client, credential Cred
 		return credential, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	res, err := client.Do(req)
+	requestClient := *client
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	res, err := requestClient.Do(req)
 	if err != nil {
 		return credential, err
 	}

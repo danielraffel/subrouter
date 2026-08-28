@@ -294,6 +294,34 @@ func TestRefreshCredentialExchangesTheRefreshToken(t *testing.T) {
 	}
 }
 
+func TestRefreshCredentialDoesNotReplaySecretsAcrossRedirects(t *testing.T) {
+	var sinkCalls int
+	sink := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		sinkCalls++
+	}))
+	defer sink.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if err := request.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if request.Form.Get("refresh_token") != "refresh-secret" || request.Form.Get("client_secret") != "client-secret" {
+			t.Fatalf("source form = %q", request.Form.Encode())
+		}
+		http.Redirect(w, request, sink.URL, http.StatusPermanentRedirect)
+	}))
+	defer redirector.Close()
+	stubTokenURL(t, redirector)
+	stubOAuthClients(t, oauthClient{id: "client-id", secret: "client-secret"})
+
+	_, err := RefreshCredential(t.Context(), redirector.Client(), CredentialInfo{RefreshToken: "refresh-secret"}, reference)
+	if err == nil || !strings.Contains(err.Error(), "308") {
+		t.Fatalf("refresh error = %v, want rejected redirect", err)
+	}
+	if sinkCalls != 0 {
+		t.Fatalf("redirect sink received %d credential-bearing requests", sinkCalls)
+	}
+}
+
 // A rotated refresh token must replace the stored one, or the next refresh
 // presents a token Google has already retired.
 func TestRefreshCredentialAdoptsARotatedRefreshToken(t *testing.T) {

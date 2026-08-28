@@ -278,7 +278,11 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 			req.Header.Set(name, value)
 		}
 	}
-	res, err := client.Do(req)
+	requestClient := *client
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	res, err := requestClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
