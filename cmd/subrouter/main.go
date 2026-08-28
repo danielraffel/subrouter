@@ -557,7 +557,9 @@ func serve(args []string) error {
 	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, allInitialAccounts)
 	if *fetchUsage && credentialBroker == nil {
 		go func() {
-			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
+			fetchedScores, successful := fetchCodexScoresWithAccountRef(context.Background(), accountRef, codexAccounts)
+			loaded, generation, revision := accountRef.CredentialSnapshot()
+			schedulerRef.SyncAccountCredentials(generation, revision, loaded)
 			if successful > 0 {
 				if !schedulerRef.SetForAccountGeneration(selectacct.NewScheduler(fetchedScores), accountGeneration) {
 					slog.Debug("initial usage score fetch discarded after account reload")
@@ -717,7 +719,10 @@ func serve(args []string) error {
 			SchedulerRef:         schedulerRef,
 			Logger:               slog.Default(),
 			FetchScores: func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
-				return fetchCodexScoresWithStore(ctx, codexStore, candidates)
+				scores, successful := fetchCodexScoresWithAccountRef(ctx, accountRef, candidates)
+				loaded, generation, revision := accountRef.CredentialSnapshot()
+				schedulerRef.SyncAccountCredentials(generation, revision, loaded)
+				return scores, successful
 			},
 			Lease: newSRAutoSwitchLease(storepath.StateDir()),
 		})
@@ -1246,6 +1251,39 @@ func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.A
 }
 
 func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	return fetchCodexScoresWithRefresh(ctx, codexAccounts, func(
+		ctx context.Context, client *http.Client, account accounts.Account,
+	) (accounts.Account, error) {
+		stored, ok, err := store.FindStored(account.ID)
+		if err != nil || !ok {
+			return account, err
+		}
+		refreshed, _, err := store.RefreshStoredIfExpired(
+			accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored,
+		)
+		if err != nil {
+			return account, err
+		}
+		if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
+			return refreshedAccount, nil
+		}
+		return account, nil
+	})
+}
+
+func fetchCodexScoresWithAccountRef(ctx context.Context, ref *proxy.AccountRef, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	return fetchCodexScoresWithRefresh(ctx, codexAccounts, func(
+		ctx context.Context, _ *http.Client, account accounts.Account,
+	) (accounts.Account, error) {
+		return ref.Refresh(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), account)
+	})
+}
+
+func fetchCodexScoresWithRefresh(
+	ctx context.Context,
+	codexAccounts []accounts.Account,
+	refresh func(context.Context, *http.Client, accounts.Account) (accounts.Account, error),
+) ([]selectacct.Score, int) {
 	client := &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: proxy.NewOutboundTransport(),
@@ -1266,10 +1304,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 		wg.Add(1)
 		go func(account accounts.Account) {
 			defer wg.Done()
-			stored, ok, err := store.FindStored(account.ID)
-			if err != nil || !ok {
-				slog.Warn("account refresh lookup failed", "account", account.ID, "error", err)
-			} else if refreshed, _, err := store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored); err != nil {
+			refreshed, err := refresh(ctx, client, account)
+			if err != nil {
 				slog.Warn("account refresh failed", "account", account.ID, "error", err)
 				mu.Lock()
 				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
@@ -1277,9 +1313,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 				}
 				mu.Unlock()
 				return
-			} else if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
-				account = refreshedAccount
 			}
+			account = refreshed
 			windows, err := accounts.FetchCodexUsage(ctx, client, account)
 			if err != nil {
 				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
