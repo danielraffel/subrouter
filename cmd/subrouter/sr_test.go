@@ -951,6 +951,19 @@ func TestRemoteQwenKeyFingerprintRequiresSelectedAccount(t *testing.T) {
 	}
 }
 
+func TestRemoteQwenConsoleRootIsTenantScopedWithoutExposingTenantKey(t *testing.T) {
+	serverA := srServerConfig{Name: "shared", URL: "https://router.example", TenantKey: "srt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	serverB := srServerConfig{Name: "shared", URL: "https://router.example", TenantKey: "srt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	rootA := qwenRemoteConsoleRoot(serverA)
+	rootB := qwenRemoteConsoleRoot(serverB)
+	if rootA == rootB {
+		t.Fatal("different tenants reused one remote Qwen console credential root")
+	}
+	if strings.Contains(rootA, serverA.TenantKey) || strings.Contains(rootB, serverB.TenantKey) {
+		t.Fatal("tenant key was exposed in a remote Qwen console credential path")
+	}
+}
+
 func TestSRQwenRemovalRetainsAccountWhenCredentialCleanupFails(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.DefaultCodexStore()

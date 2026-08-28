@@ -282,7 +282,7 @@ func (r srRunner) cloudQwen(ctx context.Context, args []string) error {
 }
 
 func qwenRemoteConsoleRoot(server srServerConfig) string {
-	return agentqwen.ConsoleRootForScope("remote\x00" + server.Name + "\x00" + server.URL)
+	return agentqwen.ConsoleRootForScope("remote\x00" + server.Name + "\x00" + server.URL + "\x00" + server.TenantKey)
 }
 
 func qwenHostedConsoleRoot(config broker.Config) string {

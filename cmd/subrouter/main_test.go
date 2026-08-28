@@ -357,6 +357,7 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"gui-switch",
 		"gui-use",
 		"import",
+		"kimi",
 		"list",
 		"list-admin-keys",
 		"login",
@@ -402,6 +403,15 @@ func TestDirectSRCommandNames(t *testing.T) {
 	for _, command := range []string{"serve", "codex", "install-daemon", "install-systemd"} {
 		if isDirectSRCommand(command) {
 			t.Fatalf("%s should stay a subrouter command", command)
+		}
+	}
+}
+
+func TestKimiNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, program := range []string{"sr", "subrouter"} {
+		if err := runForProgram(program, []string{"kimi", "help"}); err != nil {
+			t.Fatalf("%s kimi help: %v", program, err)
 		}
 	}
 }
