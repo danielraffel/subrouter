@@ -155,8 +155,51 @@ func TestStoreCachesRefreshedCredentialUntilItExpires(t *testing.T) {
 	if first.Token != "fresh" || second.Token != "fresh" {
 		t.Fatalf("tokens = %q, %q, want cached fresh token", first.Token, second.Token)
 	}
-	if reads != 1 || refreshes != 1 {
-		t.Fatalf("keychain reads=%d refreshes=%d, want one each", reads, refreshes)
+	if reads != 2 || refreshes != 1 {
+		t.Fatalf("keychain reads=%d refreshes=%d, want two authoritative reads and one refresh", reads, refreshes)
+	}
+}
+
+func TestStoreReplacesCachedCredentialWhenKeychainAccountChanges(t *testing.T) {
+	now := time.Now().UTC()
+	keychain := CredentialInfo{AccessToken: "account-a", RefreshToken: "refresh-a", ExpiresAt: now.Add(time.Hour)}
+	store := &Store{readCredential: func(context.Context, time.Time) (CredentialInfo, bool, error) {
+		return keychain, true, nil
+	}}
+	first, err := store.ListAccounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	keychain = CredentialInfo{AccessToken: "account-b", RefreshToken: "refresh-b", ExpiresAt: now.Add(time.Hour)}
+	second, err := store.ListAccounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[0].Token != "account-a" || second[0].Token != "account-b" {
+		t.Fatalf("tokens = %q then %q, want keychain account switch", first[0].Token, second[0].Token)
+	}
+}
+
+func TestStoreRejectsCachedCredentialAfterKeychainLogout(t *testing.T) {
+	now := time.Now().UTC()
+	signedIn := true
+	store := &Store{readCredential: func(context.Context, time.Time) (CredentialInfo, bool, error) {
+		if !signedIn {
+			return CredentialInfo{}, false, nil
+		}
+		return CredentialInfo{AccessToken: "account-a", RefreshToken: "refresh-a", ExpiresAt: now.Add(time.Hour)}, true, nil
+	}}
+	accounts, err := store.ListAccounts(t.Context())
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("initial accounts = %+v err=%v", accounts, err)
+	}
+	signedIn = false
+	if _, err := store.RefreshAccount(t.Context(), http.DefaultClient, accounts[0]); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("refresh after logout error = %v, want missing credential", err)
+	}
+	accounts, err = store.ListAccounts(t.Context())
+	if err != nil || len(accounts) != 0 {
+		t.Fatalf("accounts after logout = %+v err=%v", accounts, err)
 	}
 }
 

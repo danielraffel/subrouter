@@ -334,6 +334,7 @@ const accountID = "antigravity"
 type Store struct {
 	mu                sync.Mutex
 	cached            CredentialInfo
+	sourceFingerprint string
 	readCredential    func(context.Context, time.Time) (CredentialInfo, bool, error)
 	refreshCredential func(context.Context, *http.Client, CredentialInfo, time.Time) (CredentialInfo, error)
 }
@@ -349,17 +350,21 @@ func (s *Store) ListAccounts(ctx context.Context) ([]account.Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	if s.cached.AccessToken != "" && !s.cached.NeedsRefresh(now) {
-		return []account.Account{credentialAccount(s.cached)}, nil
-	}
 	credential, ok, err := s.read(ctx, now)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
+		s.cached = CredentialInfo{}
+		s.sourceFingerprint = ""
 		return nil, nil
 	}
+	fingerprint := credentialFingerprint(credential)
+	if s.cached.AccessToken != "" && s.sourceFingerprint == fingerprint && !s.cached.NeedsRefresh(now) {
+		return []account.Account{credentialAccount(s.cached)}, nil
+	}
 	s.cached = credential
+	s.sourceFingerprint = fingerprint
 	return []account.Account{credentialAccount(credential)}, nil
 }
 
@@ -371,19 +376,27 @@ func (s *Store) RefreshAccount(ctx context.Context, client *http.Client, acct ac
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	if s.cached.AccessToken != "" && !s.cached.NeedsRefresh(now) {
-		return credentialAccount(s.cached), nil
-	}
 	credential, ok, err := s.read(ctx, now)
-	if err != nil || !ok {
+	if err != nil {
 		return acct, err
+	}
+	if !ok {
+		s.cached = CredentialInfo{}
+		s.sourceFingerprint = ""
+		return acct, fmt.Errorf("Antigravity keychain credential is missing")
+	}
+	fingerprint := credentialFingerprint(credential)
+	if s.cached.AccessToken != "" && s.sourceFingerprint == fingerprint && !s.cached.NeedsRefresh(now) {
+		return credentialAccount(s.cached), nil
 	}
 	// A prior refresh may have rotated the refresh token even though the CLI's
 	// keychain entry is unchanged. Continue from the in-process credential when
 	// available; otherwise the stale keychain token can force a refresh on every
 	// request or eventually fail after rotation.
-	if s.cached.RefreshToken != "" {
+	if s.cached.RefreshToken != "" && s.sourceFingerprint == fingerprint {
 		credential = s.cached
+	} else {
+		s.sourceFingerprint = fingerprint
 	}
 	if !credential.NeedsRefresh(now) {
 		s.cached = credential
@@ -395,6 +408,16 @@ func (s *Store) RefreshAccount(ctx context.Context, client *http.Client, acct ac
 	}
 	s.cached = refreshed
 	return credentialAccount(refreshed), nil
+}
+
+func credentialFingerprint(credential CredentialInfo) string {
+	if credential.RefreshToken != "" {
+		return "refresh:" + credential.RefreshToken
+	}
+	if credential.IDToken != "" {
+		return "id:" + credential.IDToken
+	}
+	return "access:" + credential.AccessToken
 }
 
 func (s *Store) read(ctx context.Context, now time.Time) (CredentialInfo, bool, error) {
