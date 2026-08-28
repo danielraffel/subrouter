@@ -4676,7 +4676,7 @@ func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail 
 		"account":   account.ID,
 		"method":    r.Method,
 		"path":      r.URL.Path,
-		"upstream":  upstream.String(),
+		"upstream":  redactedTranscriptURL(upstream),
 		"headers":   transcript.RedactedHeaders(r.Header),
 	}
 	if hash := userEmailHash(userEmail); hash != "" {
@@ -4694,14 +4694,28 @@ func (s Server) recordWebSocketMeta(r *http.Request, upstreamURL *url.URL, heade
 		"account":      account.ID,
 		"method":       r.Method,
 		"path":         r.URL.Path,
-		"upstream":     upstream.String(),
-		"upstream_url": upstreamURL.String(),
+		"upstream":     redactedTranscriptURL(upstream),
+		"upstream_url": redactedTranscriptURL(upstreamURL),
 		"headers":      transcript.RedactedHeaders(headers),
 	}
 	if hash := userEmailHash(userEmail); hash != "" {
 		metadata["user_hash"] = hash
 	}
 	s.Transcripts.RecordMeta(agentType, sessionID, metadata)
+}
+
+// transcriptURL retains enough location data to identify an upstream without
+// persisting credentials or opaque tokens supplied in its query string. The
+// copy is deliberate: the live request keeps its query for forwarding.
+func redactedTranscriptURL(upstream *url.URL) string {
+	if upstream == nil {
+		return ""
+	}
+	redacted := *upstream
+	redacted.RawQuery = ""
+	redacted.ForceQuery = false
+	redacted.Fragment = ""
+	return redacted.Redacted()
 }
 
 func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string) {

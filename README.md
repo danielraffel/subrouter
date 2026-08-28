@@ -536,9 +536,9 @@ does not claim it can import or fail over their subscriptions.
 
 `sr status` groups these under their own provider rather than under Codex. Kimi
 OAuth subscriptions report their independent 5-hour and weekly windows and
-reset times from Kimi's usage endpoint. API-key rows report key health, model
-entitlements, endpoints, and the honest quota source: Kimi quota requires the
-OAuth subscription credential.
+reset times from Kimi's usage endpoint. The condensed API-key rows report key
+health and only quota data the provider actually exposes; Kimi quota requires
+the OAuth subscription credential.
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that
@@ -628,7 +628,8 @@ unchanged, so an Anthropic-shaped client can run on that subscription without
 any translation in the proxy — the vendor does the adaptation:
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:31415/qwen-anthropic claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:31415/qwen-anthropic \
+  ANTHROPIC_AUTH_TOKEN=subrouter claude
 ```
 
 The two entries differ in one detail worth knowing if you add a provider like
