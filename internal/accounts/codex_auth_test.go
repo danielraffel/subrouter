@@ -384,6 +384,25 @@ func TestRefreshStoredAcceptsIsolatedCredentialWhenInteractiveAuthIsUnreadable(t
 	}
 }
 
+func TestRefreshStoredAcceptsServerAttestedCredential(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{
+		Dir: t.TempDir(), DisableActiveAuthSync: true, RequireIsolatedOAuth: true,
+	}
+	fresh := storedOAuthAccount("founders@example.com", "attested", time.Now().Add(time.Hour))
+	fresh.OAuthCredentialOrigin = CodexOAuthOriginServerAttested
+	if err := store.SaveStored(fresh); err != nil {
+		t.Fatal(err)
+	}
+	got, refreshed, err := store.RefreshStoredIfExpired(context.Background(), nil, fresh)
+	if err != nil {
+		t.Fatalf("server-attested credential rejected: %v", err)
+	}
+	if refreshed || got.OAuthCredentialOrigin != CodexOAuthOriginServerAttested {
+		t.Fatalf("server-attested credential changed unexpectedly: refreshed=%v account=%#v", refreshed, got)
+	}
+}
+
 func TestRefreshStoredReloadsFreshCredentialBeforeIsolationDecision(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := CodexStore{

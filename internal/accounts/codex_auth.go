@@ -290,7 +290,9 @@ func (s CodexStore) validateServingCredentialIsolation(account StoredCodexAccoun
 	if !s.DisableActiveAuthSync || account.Auth.Tokens == nil {
 		return "", nil
 	}
-	if s.RequireIsolatedOAuth && account.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+	if s.RequireIsolatedOAuth &&
+		account.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin &&
+		account.OAuthCredentialOrigin != CodexOAuthOriginServerAttested {
 		return "oauth_origin_not_isolated", &CodexUnisolatedCredentialError{}
 	}
 	active, ok, err := ReadActiveCodexAuth()

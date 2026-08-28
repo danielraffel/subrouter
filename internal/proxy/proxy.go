@@ -273,7 +273,10 @@ const usageWindowsLastGoodTTL = 15 * time.Minute
 // status sweep open indefinitely. The sweep runs accounts concurrently, so a
 // slow account costs at most this timeout instead of adding to every other
 // account's latency.
-const usageStatusFetchTimeout = 5 * time.Second
+const (
+	usageStatusFetchTimeout = 5 * time.Second
+	accountFetchConcurrency = 4
+)
 
 const credFailureTTL = credentialExhaustionTTL
 
@@ -796,6 +799,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	claudeOffset := len(storedAccounts)
 	out := make([]AccountUsageStatus, claudeOffset+len(claudeProfiles))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, accountFetchConcurrency)
 	for i, stored := range storedAccounts {
 		i, stored := i, stored
 		provider := stored.ProviderOrDefault()
@@ -831,8 +835,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}
 		out[i] = status
 		wg.Add(1)
+		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer func() { <-sem }()
 			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
 			defer cancel()
 			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "usage-status.if-expired")
@@ -897,8 +903,10 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}
 		out[i] = status
 		wg.Add(1)
+		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer func() { <-sem }()
 			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
 			defer cancel()
 			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(fetchCtx, r.client, profile)
@@ -1588,6 +1596,18 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 }
 
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
+	if s.tenantAccountImportAuthorized && input.Provider == accounts.ProviderCodex &&
+		input.Codex != nil && !input.Codex.IsAPIKey() {
+		account, validationErr := validateStoredAccountImportOrigin(input.Provider, *input.Codex, false)
+		if validationErr != nil {
+			return "", validationErr
+		}
+		account, validationErr = attestTenantCodexOAuth(ctx, s.AccountRef.client, account)
+		if validationErr != nil {
+			return "", validationErr
+		}
+		input.Codex = &account
+	}
 	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
 		return "", err
 	}
@@ -1707,6 +1727,10 @@ func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool
 }
 
 func validateStoredAccountImport(provider accounts.Provider, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {
+	return validateStoredAccountImportOrigin(provider, account, true)
+}
+
+func validateStoredAccountImportOrigin(provider accounts.Provider, account accounts.StoredCodexAccount, requireTrustedOrigin bool) (accounts.StoredCodexAccount, error) {
 	account.Email = strings.TrimSpace(account.Email)
 	if account.Email == "" || strings.HasPrefix(account.Email, ".") || len(account.Email) > 320 || strings.ContainsAny(account.Email, "/\\") || containsTerminalControl(account.Email) {
 		return account, invalidAccountImport("account identifier is invalid")
@@ -1735,7 +1759,9 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 	if provider != accounts.ProviderCodex || account.Auth.Tokens == nil || account.Auth.OpenAIAPIKey != "" {
 		return account, invalidAccountImport("OAuth account payload is invalid")
 	}
-	if account.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+	if requireTrustedOrigin &&
+		account.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin &&
+		account.OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested {
 		return account, invalidAccountImport("OAuth account payload must come from an isolated server login")
 	}
 	tokens := account.Auth.Tokens
@@ -1750,6 +1776,28 @@ func validateStoredAccountImport(provider accounts.Provider, account accounts.St
 		return account, invalidAccountImport("OAuth access token is not fresh")
 	}
 	account.Email = strings.TrimSpace(email)
+	return account, nil
+}
+
+func attestTenantCodexOAuth(ctx context.Context, client *http.Client, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {
+	if account.Auth.Tokens == nil ||
+		strings.TrimSpace(account.Auth.Tokens.AccessToken) == "" ||
+		strings.TrimSpace(account.Auth.Tokens.RefreshToken) == "" ||
+		strings.TrimSpace(account.Auth.Tokens.IDToken) == "" {
+		return account, invalidAccountImport("OAuth account payload is incomplete")
+	}
+	submittedRefreshToken := account.Auth.Tokens.RefreshToken
+	refreshed, err := accounts.RefreshCodexAuth(ctx, client, account.Auth)
+	if err != nil {
+		return account, invalidAccountImport("OAuth credential transfer could not be attested by the server")
+	}
+	if refreshed.Tokens == nil || subtle.ConstantTimeCompare(
+		[]byte(refreshed.Tokens.RefreshToken), []byte(submittedRefreshToken),
+	) == 1 {
+		return account, invalidAccountImport("OAuth provider did not rotate the submitted credential")
+	}
+	account.Auth = refreshed
+	account.OAuthCredentialOrigin = accounts.CodexOAuthOriginServerAttested
 	return account, nil
 }
 
@@ -2161,6 +2209,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	scored := 0
 	var scoreMu sync.Mutex
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, accountFetchConcurrency)
 	for _, account := range available {
 		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
@@ -2175,8 +2224,10 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			continue
 		}
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(account accounts.Account) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
 			defer cancel()
 			refreshCtx := accounts.WithCodexRefreshReason(fetchCtx, "proxy.score-accounts")

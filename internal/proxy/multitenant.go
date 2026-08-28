@@ -955,23 +955,10 @@ func storedTenantMigrationAccount(input tenantAccountUpload) (accounts.StoredCod
 	}
 	switch input.Provider {
 	case "codex":
-		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
-			return accounts.StoredCodexAccount{}, errors.New("complete Codex OAuth tokens are required")
-		}
-		if input.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
-			return accounts.StoredCodexAccount{}, errors.New("Codex OAuth credential must come from an isolated server login")
-		}
-		return accounts.StoredCodexAccount{
-			Email: input.AccountID, Label: input.Label, Provider: accounts.ProviderCodex,
-			OAuthCredentialOrigin: input.OAuthCredentialOrigin,
-			Auth: accounts.CodexAuthFile{
-				AuthMode: "chatgpt",
-				Tokens: &accounts.CodexTokens{
-					AccessToken: input.Tokens.AccessToken, RefreshToken: input.Tokens.RefreshToken,
-					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
-				},
-			},
-		}, nil
+		// OAuth refresh-token ownership cannot be transferred atomically with a
+		// migration batch. Accept it only through the individual upload endpoint,
+		// which rotates the chain before publishing the account.
+		return accounts.StoredCodexAccount{}, errors.New("Codex OAuth migration requires individual server-attested account upload")
 	case "openai-apikey", "anthropic-apikey":
 		if strings.TrimSpace(input.APIKey) == "" {
 			return accounts.StoredCodexAccount{}, errors.New("API key is required")
@@ -1035,10 +1022,6 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "complete Codex OAuth tokens are required", http.StatusBadRequest)
 			return
 		}
-		if input.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
-			http.Error(w, "Codex OAuth credential must come from an isolated server login", http.StatusBadRequest)
-			return
-		}
 		id, kind = input.AccountID, "codex"
 		if id == "" {
 			id = input.Label
@@ -1047,9 +1030,8 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+		account, err := attestTenantCodexOAuth(r.Context(), server.AccountRef.client, accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
-			OAuthCredentialOrigin: input.OAuthCredentialOrigin,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
 				Tokens: &accounts.CodexTokens{
@@ -1058,6 +1040,11 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 				},
 			},
 		})
+		if err != nil {
+			http.Error(w, "Codex OAuth credential transfer failed", http.StatusBadRequest)
+			return
+		}
+		err = server.AccountRef.store.SaveStored(account)
 		if err != nil {
 			http.Error(w, "save Codex account", http.StatusInternalServerError)
 			return

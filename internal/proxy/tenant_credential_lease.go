@@ -294,8 +294,15 @@ func applyTenantCredentialLeaseReport(
 		}
 		server.markAccountExhaustedCredentialForAccount(account)
 	case broker.LeaseForbidden:
+		poolKey := ""
+		if report.Scope == broker.LeaseCooldownQuota {
+			poolKey = lease.model
+			if lease.provider == accounts.ProviderClaude {
+				poolKey = claudePoolModel(poolKey)
+			}
+		}
 		server.SchedulerRef.MarkExhaustedUntil(
-			lease.provider, lease.accountID, "", time.Now().Add(credentialExhaustionTTL),
+			lease.provider, lease.accountID, poolKey, time.Now().Add(credentialExhaustionTTL),
 		)
 	case broker.LeaseRateLimited:
 		poolKey := ""

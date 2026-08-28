@@ -51,6 +51,7 @@ type CodexOAuthCredentialOrigin string
 const (
 	CodexOAuthOriginInteractiveImport   CodexOAuthCredentialOrigin = "interactive-import"
 	CodexOAuthOriginIsolatedServerLogin CodexOAuthCredentialOrigin = "isolated-server-login"
+	CodexOAuthOriginServerAttested      CodexOAuthCredentialOrigin = "server-attested-transfer"
 )
 
 type CodexAuthFile struct {

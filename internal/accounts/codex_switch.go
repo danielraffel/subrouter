@@ -65,7 +65,9 @@ func (s CodexStore) SwitchActiveStored(accountID string) (StoredCodexAccount, er
 	}
 
 	previous := stored
-	downgraded := !stored.IsAPIKey() && stored.OAuthCredentialOrigin == CodexOAuthOriginIsolatedServerLogin
+	downgraded := !stored.IsAPIKey() &&
+		(stored.OAuthCredentialOrigin == CodexOAuthOriginIsolatedServerLogin ||
+			stored.OAuthCredentialOrigin == CodexOAuthOriginServerAttested)
 	if downgraded {
 		stored.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
 		appendCodexAuthBreadcrumb(

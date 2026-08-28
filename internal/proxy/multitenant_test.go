@@ -73,6 +73,14 @@ func newMultiTenantFixtureWithAccountImportToken(
 	t *testing.T,
 	accountImportToken string,
 ) (*tenant.Registry, http.Handler, func() string) {
+	return newMultiTenantFixtureWithTransport(t, accountImportToken, nil)
+}
+
+func newMultiTenantFixtureWithTransport(
+	t *testing.T,
+	accountImportToken string,
+	transport http.RoundTripper,
+) (*tenant.Registry, http.Handler, func() string) {
 	t.Helper()
 	var lastAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -100,6 +108,7 @@ func newMultiTenantFixtureWithAccountImportToken(
 		Scheduler:          selectacct.NewScheduler(nil),
 		MaxBodyBytes:       1024,
 		AccountImportToken: accountImportToken,
+		Transport:          transport,
 	}
 	registry := tenant.NewRegistry(t.TempDir())
 	multi := &MultiTenant{Base: base, Registry: registry}
@@ -458,6 +467,54 @@ func TestMultiTenantAccountImportUsesTenantKeyAndStaysInTenantPool(t *testing.T)
 	handler.ServeHTTP(globalResponse, global)
 	if globalResponse.Code != http.StatusUnauthorized {
 		t.Fatalf("unscoped import status = %d, want 401", globalResponse.Code)
+	}
+}
+
+func TestMultiTenantOAuthAccountImportRotatesUntrustedCredential(t *testing.T) {
+	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return usageOKResponse(), nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT("owner@example.com", "access-token", time.Now().Add(time.Hour)), idToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := fmt.Sprintf(`{
+		"provider":"codex",
+		"codex":{
+			"email":"owner@example.com",
+			"provider":"codex",
+			"oauthCredentialOrigin":"interactive-import",
+			"auth":{"auth_mode":"chatgpt","tokens":{
+				"access_token":%q,"refresh_token":"caller-refresh","id_token":%q
+			}}
+		}
+	}`, proxyTestCodexJWT("owner@example.com", "caller-access", time.Now().Add(time.Hour)), idToken)
+	request := httptest.NewRequest(http.MethodPost, "/t/"+key+"/_subrouter/account-import", strings.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("tenant OAuth import status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := (accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested ||
+		stored[0].Auth.Tokens == nil || stored[0].Auth.Tokens.RefreshToken != "server-refresh" {
+		t.Fatalf("tenant import stored caller-declared provenance: %#v", stored)
 	}
 }
 
@@ -1462,17 +1519,11 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 	path := "/t/" + key + "/_subrouter/accounts"
 	for _, id := range []string{"legacy-account-a", "legacy-account-b"} {
 		body := fmt.Sprintf(`{
-			"provider":"codex",
+			"provider":"openai-apikey",
 			"accountId":%q,
 			"label":"Shared account",
-			"oauthCredentialOrigin":"isolated-server-login",
-			"tokens":{
-				"accessToken":"access-%s",
-				"refreshToken":"refresh-%s",
-				"idToken":"id-%s",
-				"accountID":"provider-%s"
-			}
-		}`, id, id, id, id, id)
+			"apiKey":"sk-%s"
+		}`, id, id)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(
 			response,
@@ -1506,8 +1557,19 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 	}
 }
 
-func TestTenantCodexOAuthUploadRequiresIsolatedLoginOrigin(t *testing.T) {
-	registry, handler, _ := newMultiTenantFixture(t)
+func TestTenantCodexOAuthUploadRequiresServerAttestedTransfer(t *testing.T) {
+	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"refresh","id_token":%q}`,
+				proxyTestCodexJWT("owner@example.com", "access-token", time.Now().Add(time.Hour)),
+				proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour)),
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
 	_, key, err := registry.Create("team")
 	if err != nil {
 		t.Fatal(err)
@@ -1520,6 +1582,7 @@ func TestTenantCodexOAuthUploadRequiresIsolatedLoginOrigin(t *testing.T) {
 			"provider":"codex",
 			"accountId":"unproven-account",
 			"label":"Unproven",
+			"oauthCredentialOrigin":"interactive-import",
 			"tokens":{
 				"accessToken":"access",
 				"refreshToken":"refresh",
@@ -1534,12 +1597,33 @@ func TestTenantCodexOAuthUploadRequiresIsolatedLoginOrigin(t *testing.T) {
 }
 
 func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T) {
-	registry, handler, _ := newMultiTenantFixture(t)
+	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
+	var submittedRefresh string
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return usageOKResponse(), nil
+		}
+		var payload struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		submittedRefresh = payload.RefreshToken
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT("owner@example.com", "access-token", time.Now().Add(time.Hour)), idToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
 	_, key, err := registry.Create("team")
 	if err != nil {
 		t.Fatal(err)
 	}
-	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(
 		http.MethodPost,
@@ -1548,7 +1632,7 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 			"provider":"codex",
 			"accountId":"stable-routing-id",
 			"label":"Production Codex",
-			"oauthCredentialOrigin":"isolated-server-login",
+			"oauthCredentialOrigin":"interactive-import",
 			"tokens":{
 				"accessToken":"access",
 				"refreshToken":"refresh",
@@ -1580,6 +1664,24 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 	}
 	if len(listed) != 1 || listed[0].ID != "stable-routing-id" || listed[0].Label != "Production Codex" || listed[0].Email != "owner@example.com" {
 		t.Fatalf("listed accounts = %#v", listed)
+	}
+	if submittedRefresh != "refresh" {
+		t.Fatalf("server attestation used refresh token %q, want submitted chain", submittedRefresh)
+	}
+	tenants, err := registry.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantRecord := tenants[0]
+	store := accounts.CodexStore{Dir: filepath.Join(registry.Dir(tenantRecord.ID), "codex", "accounts")}
+	storedAccounts, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(storedAccounts) != 1 ||
+		storedAccounts[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested ||
+		storedAccounts[0].Auth.Tokens == nil || storedAccounts[0].Auth.Tokens.RefreshToken != "server-refresh" {
+		t.Fatalf("stored credential was not server-attested: %#v", storedAccounts)
 	}
 }
 
@@ -1667,16 +1769,10 @@ func TestTenantMigrationBatchStaysInactiveUntilAtomicActivation(t *testing.T) {
 	stage := request(basePath+"/migration/stage", `{
 		"migrationId":"legacy-team",
 		"accounts":[{
-			"provider":"codex",
+			"provider":"openai-apikey",
 			"accountId":"legacy-account",
 			"label":"Shared account",
-			"oauthCredentialOrigin":"isolated-server-login",
-			"tokens":{
-				"accessToken":"access",
-				"refreshToken":"refresh",
-				"idToken":"id",
-				"accountID":"provider"
-			}
+			"apiKey":"sk-test"
 		}]
 	}`)
 	if stage.Code != http.StatusOK {
@@ -1712,6 +1808,30 @@ func TestTenantMigrationBatchStaysInactiveUntilAtomicActivation(t *testing.T) {
 	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, basePath, nil))
 	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
 		t.Fatalf("rolled-back account remained active: %d %s", list.Code, list.Body.String())
+	}
+}
+
+func TestTenantMigrationRejectsUnattestedCodexOAuth(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts/migration/stage",
+		strings.NewReader(`{
+			"migrationId":"legacy-team",
+			"accounts":[{
+				"provider":"codex","accountId":"legacy-account","label":"Legacy",
+			"oauthCredentialOrigin":"interactive-import",
+				"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":"id"}
+			}]
+		}`),
+	))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "server-attested") {
+		t.Fatalf("migration OAuth stage = %d %s", response.Code, response.Body.String())
 	}
 }
 

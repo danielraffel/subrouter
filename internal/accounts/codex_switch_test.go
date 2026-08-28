@@ -66,6 +66,28 @@ func TestSwitchActiveDowngradesIsolatedOAuthOriginBeforeExport(t *testing.T) {
 	}
 }
 
+func TestSwitchActiveDowngradesServerAttestedOAuthOriginBeforeExport(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{
+		Email:                 "attested@example.com",
+		OAuthCredentialOrigin: CodexOAuthOriginServerAttested,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "access", RefreshToken: "refresh", IDToken: "id",
+		}},
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	activated, err := store.SwitchActiveStored(account.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated.OAuthCredentialOrigin != CodexOAuthOriginInteractiveImport {
+		t.Fatalf("activated OAuth origin = %q, want interactive import", activated.OAuthCredentialOrigin)
+	}
+}
+
 func TestSwitchActiveRestoresIsolatedOriginWhenActiveWriteFails(t *testing.T) {
 	root := t.TempDir()
 	blockedCodexHome := filepath.Join(root, "not-a-directory")
