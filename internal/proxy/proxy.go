@@ -5281,7 +5281,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// fallback chain directly.
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
-	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
+	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi {
 		s.refreshUsageScoresIfStale(r.Context())
 	}
 	base := s.scheduler()

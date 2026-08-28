@@ -378,6 +378,48 @@ func TestKimiAPIKeysFailOverOnAuthoritativeQuotaAndCommitStickyAccount(t *testin
 	}
 }
 
+func TestKimiSelectionRefreshesOAuthUsageScoresBeforePicking(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountsList := []accounts.Account{
+		{ID: "kimi:a-low", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "low"},
+		{ID: "kimi:z-high", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "high"},
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "kimi:a-low", Provider: accounts.ProviderKimi, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "kimi:z-high", Provider: accounts.ProviderKimi, Headroom: 0.1, ShortHeadroom: 0.1},
+	}))
+	schedulerRef.SetUpdatedAt(time.Time{})
+	scoreCalls := 0
+	server := Server{
+		Accounts: accountsList, Sessions: store, SchedulerRef: schedulerRef,
+		UsageScoreTTL: time.Minute,
+		ScoreAccounts: func(_ context.Context, got []accounts.Account) ([]selectacct.Score, int) {
+			scoreCalls++
+			if len(got) != 2 {
+				t.Fatalf("score accounts = %+v, want both Kimi OAuth profiles", got)
+			}
+			return []selectacct.Score{
+				{AccountID: "kimi:a-low", Provider: accounts.ProviderKimi, Headroom: 0.1, ShortHeadroom: 0.1, Fresh: true},
+				{AccountID: "kimi:z-high", Provider: accounts.ProviderKimi, Headroom: 0.9, ShortHeadroom: 0.9, Fresh: true},
+			}, 2
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/kimi/v1/messages", strings.NewReader(`{"model":"kimi-for-coding","messages":[]}`))
+	account, _, _, err := server.accountForSessionProvider(accounts.ProviderKimi, "kimi", "kimi-score-refresh", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoreCalls != 1 {
+		t.Fatalf("score calls = %d, want one pre-selection refresh", scoreCalls)
+	}
+	if account.ID != "kimi:z-high" {
+		t.Fatalf("selected account = %q, want high-quota Kimi profile", account.ID)
+	}
+}
+
 // Two separately purchased Token Plan keys are two schedulable accounts. A
 // quota response from the account holding the sticky session must be consumed,
 // replayed once with the other key, and leave the session on that healthy key.
