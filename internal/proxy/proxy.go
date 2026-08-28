@@ -237,6 +237,7 @@ type AccountRef struct {
 	diskGeneration    string
 	store             accounts.CodexStore
 	claudeStore       agentclaude.Store
+	oauthSources      []OAuthAccountSource
 	client            *http.Client
 
 	usageStatusMu    sync.Mutex
@@ -249,6 +250,16 @@ type AccountRef struct {
 
 	credFailMu sync.Mutex
 	credFail   map[string]credFailure
+}
+
+// OAuthAccountSource is one provider's OAuth credential store. Claude and
+// Codex predate it and keep their bespoke wiring; every OAuth provider added
+// since (Kimi, Antigravity, Grok) plugs in here instead of growing another
+// hardcoded branch in Refresh and loadAccountRefAccounts.
+type OAuthAccountSource interface {
+	Provider() accounts.Provider
+	ListAccounts(ctx context.Context) ([]accounts.Account, error)
+	RefreshAccount(ctx context.Context, client *http.Client, account accounts.Account) (accounts.Account, error)
 }
 
 type usageStatusSnapshot struct {
@@ -441,7 +452,7 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 	// with the post-import marker. Legacy stores without a marker retain the
 	// supplied snapshot for test and compatibility callers.
 	if diskGeneration != "" {
-		if loaded, loadErr := loadAccountRefAccounts(store, claudeStore); loadErr == nil {
+		if loaded, loadErr := loadAccountRefAccounts(store, claudeStore, nil); loadErr == nil {
 			ref.accounts = loaded
 			ref.diskGeneration = diskGeneration
 		}
@@ -455,18 +466,24 @@ func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client
 // cross-process transaction lock. Production callers use this constructor so
 // worker startup can never make a stale snapshot look current.
 func OpenAccountRef(store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client) (*AccountRef, error) {
-	return OpenAccountRefContext(context.Background(), store, claudeStore, client)
+	return OpenAccountRefWithSources(context.Background(), store, claudeStore, client, nil)
 }
 
 // OpenAccountRefContext loads one account snapshot while honoring cancellation
 // if another process is currently committing an import transaction.
 func OpenAccountRefContext(ctx context.Context, store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client) (*AccountRef, error) {
+	return OpenAccountRefWithSources(ctx, store, claudeStore, client, nil)
+}
+
+// OpenAccountRefWithSources is OpenAccountRefContext plus the OAuth account
+// sources of every provider beyond Codex and Claude.
+func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client, sources []OAuthAccountSource) (*AccountRef, error) {
 	transactionLock, err := lockAccountImportTransaction(ctx, store.StoreDir())
 	if err != nil {
 		return nil, err
 	}
 	defer transactionLock.Close()
-	loaded, err := loadAccountRefAccounts(store, claudeStore)
+	loaded, err := loadAccountRefAccounts(store, claudeStore, sources)
 	if err != nil {
 		return nil, err
 	}
@@ -479,11 +496,12 @@ func OpenAccountRefContext(ctx context.Context, store accounts.CodexStore, claud
 		diskGeneration: diskGeneration,
 		store:          store,
 		claudeStore:    claudeStore,
+		oauthSources:   sources,
 		client:         client,
 	}, nil
 }
 
-func loadAccountRefAccounts(store accounts.CodexStore, claudeStore agentclaude.Store) ([]accounts.Account, error) {
+func loadAccountRefAccounts(store accounts.CodexStore, claudeStore agentclaude.Store, sources []OAuthAccountSource) ([]accounts.Account, error) {
 	loaded, err := store.List()
 	if err != nil {
 		return nil, err
@@ -492,7 +510,15 @@ func loadAccountRefAccounts(store accounts.CodexStore, claudeStore agentclaude.S
 	if err != nil {
 		return nil, err
 	}
-	return append(loaded, claudeAccounts...), nil
+	loaded = append(loaded, claudeAccounts...)
+	for _, source := range sources {
+		sourceAccounts, err := source.ListAccounts(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		loaded = append(loaded, sourceAccounts...)
+	}
+	return loaded, nil
 }
 
 func (r *AccountRef) All() []accounts.Account {
@@ -527,7 +553,7 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	if r == nil {
 		return nil, 0, nil
 	}
-	loaded, err := loadAccountRefAccounts(r.store, r.claudeStore)
+	loaded, err := loadAccountRefAccounts(r.store, r.claudeStore, r.oauthSources)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -549,6 +575,17 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	}
 	if account.Provider == accounts.ProviderClaude {
 		refreshed, _, err := r.claudeStore.RefreshAccountIfExpired(ctx, r.client, account)
+		if err != nil {
+			return account, err
+		}
+		r.replace(refreshed)
+		return refreshed, nil
+	}
+	for _, source := range r.oauthSources {
+		if source.Provider() != account.Provider {
+			continue
+		}
+		refreshed, err := source.RefreshAccount(ctx, r.client, account)
 		if err != nil {
 			return account, err
 		}

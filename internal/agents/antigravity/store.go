@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -146,16 +147,33 @@ func ReadLocalCredential(ctx context.Context, now time.Time) (credential Credent
 	}
 	ctx, cancel := context.WithTimeout(ctx, keychainReadTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "security", "find-generic-password",
-		"-s", keychainService, "-a", current.Username, "-w")
-	body, runErr := cmd.Output()
-	if runErr != nil || len(bytes.TrimSpace(body)) == 0 {
+	lookup := func(account string) ([]byte, bool, error) {
+		cmd := exec.CommandContext(ctx, "security", "find-generic-password", "-s", keychainService, "-a", account, "-w")
+		body, runErr := cmd.Output()
+		if runErr == nil {
+			return body, len(bytes.TrimSpace(body)) > 0, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, false, ctxErr
+		}
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) && exitErr.ExitCode() == 44 {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read Antigravity keychain item: %w", runErr)
+	}
+	body, found, lookupErr := lookup(current.Username)
+	if lookupErr != nil {
+		return CredentialInfo{}, false, lookupErr
+	}
+	if !found {
 		// The CLI stores the item under its own account name rather than the
 		// unix user on some versions; try that before concluding it is absent.
-		cmd = exec.CommandContext(ctx, "security", "find-generic-password",
-			"-s", keychainService, "-a", keychainAccount, "-w")
-		body, runErr = cmd.Output()
-		if runErr != nil || len(bytes.TrimSpace(body)) == 0 {
+		body, found, lookupErr = lookup(keychainAccount)
+		if lookupErr != nil {
+			return CredentialInfo{}, false, lookupErr
+		}
+		if !found {
 			return CredentialInfo{}, false, nil
 		}
 	}
@@ -250,26 +268,27 @@ func refreshWithClient(ctx context.Context, client *http.Client, credential Cred
 		return credential, err
 	}
 	defer func() { _ = res.Body.Close() }()
-	var buf bytes.Buffer
-	if _, copyErr := buf.ReadFrom(res.Body); copyErr != nil {
+	body, copyErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if copyErr != nil {
 		return credential, copyErr
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		err := fmt.Errorf("Antigravity OAuth refresh failed: %s: %s", res.Status, strings.TrimSpace(buf.String()))
-		// A client rejection means the presented pair is wrong, not the
-		// credential, so it is the one failure worth retrying with the next
-		// candidate.
 		var rejection struct {
 			Error string `json:"error"`
 		}
-		if json.Unmarshal(buf.Bytes(), &rejection) == nil &&
+		_ = json.Unmarshal(body, &rejection)
+		err := fmt.Errorf("Antigravity OAuth refresh failed: %s (error=%s)", res.Status, rejection.Error)
+		// A client rejection means the presented pair is wrong, not the
+		// credential, so it is the one failure worth retrying with the next
+		// candidate.
+		if rejection.Error != "" &&
 			(rejection.Error == "invalid_client" || rejection.Error == "unauthorized_client") {
 			return credential, invalidClientError{err}
 		}
 		return credential, err
 	}
 	var parsed tokenResponse
-	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+	if err := json.Unmarshal(body, &parsed); err != nil {
 		return credential, fmt.Errorf("Antigravity OAuth refresh returned an undecodable body: %w", err)
 	}
 	if strings.TrimSpace(parsed.AccessToken) == "" {

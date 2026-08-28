@@ -235,6 +235,12 @@ func exchange(ctx context.Context, client *http.Client, tokenURL string, form ur
 	case "expired_token":
 		return Token{}, false, ErrAuthorizationExpired
 	}
+	if parsed.Error != "" {
+		if httpErr != nil {
+			return Token{}, false, fmt.Errorf("device flow token error %s: %w", parsed.Error, httpErr)
+		}
+		return Token{}, false, fmt.Errorf("device flow token error %s", parsed.Error)
+	}
 	if httpErr != nil {
 		return Token{}, false, httpErr
 	}
@@ -276,7 +282,7 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		// The body is returned alongside the error because RFC 8628 signals
 		// authorization_pending and slow_down with a 400.
-		return body, fmt.Errorf("device flow request to %s failed: %s: %s", endpoint, res.Status, strings.TrimSpace(string(body)))
+		return body, fmt.Errorf("device flow request to %s failed: %s", endpoint, res.Status)
 	}
 	return body, nil
 }

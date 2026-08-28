@@ -25,6 +25,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
@@ -552,23 +553,25 @@ func serve(args []string) error {
 
 	codexStore := accounts.DefaultCodexStore()
 	claudeStore := agentclaude.DefaultStore()
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.DefaultStore()}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
-		accountRef, err = proxy.OpenAccountRef(codexStore, claudeStore, &http.Client{
+		accountRef, err = proxy.OpenAccountRefWithSources(context.Background(), codexStore, claudeStore, &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: outboundTransport,
-		})
+		}, oauthSources)
 		if err != nil {
 			return err
 		}
 		initialAccounts, generation := accountRef.Snapshot()
 		accountGeneration = generation
 		for _, account := range initialAccounts {
-			if account.Provider == accounts.ProviderClaude {
+			switch account.Provider {
+			case accounts.ProviderClaude:
 				claudeAccounts = append(claudeAccounts, account)
-			} else {
+			case "", accounts.ProviderCodex:
 				codexAccounts = append(codexAccounts, account)
 			}
 		}

@@ -169,11 +169,15 @@ func TestRefreshCredentialExchangesTheRefreshToken(t *testing.T) {
 	var gotForm string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			t.Errorf("ParseForm failed: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 		gotForm = r.Form.Encode()
 		if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
-			t.Fatalf("Content-Type = %q, want form encoding", r.Header.Get("Content-Type"))
+			t.Errorf("Content-Type = %q, want form encoding", r.Header.Get("Content-Type"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"access_token": "fresh-access",
@@ -283,7 +287,9 @@ func TestRefreshCredentialTriesTheNextClientOnInvalidClient(t *testing.T) {
 	var attempts []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			t.Errorf("ParseForm failed: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 		attempts = append(attempts, r.Form.Get("client_id"))
 		if r.Form.Get("client_secret") == "wrong-secret" {
