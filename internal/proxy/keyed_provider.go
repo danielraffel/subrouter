@@ -404,6 +404,13 @@ func APIKeyProviderForName(name string) (accounts.Provider, bool) {
 	return entry.Provider, true
 }
 
+// APIKeyAccountProvider returns the canonical owner of a provider's stored
+// credential. Protocol variants such as qwen-anthropic share one subscription
+// and must not create a duplicate account record.
+func APIKeyAccountProvider(provider accounts.Provider) accounts.Provider {
+	return accountProviderFor(provider)
+}
+
 // APIKeyProviderList renders the providers a user may name, for flag help and
 // for the error returned when they name something else.
 func APIKeyProviderList() string {

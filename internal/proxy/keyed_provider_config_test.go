@@ -112,7 +112,9 @@ func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
 	}
 
 	store := accounts.CodexStore{Dir: t.TempDir()}
-	stored, _, err := store.AddProviderAPIKey(accounts.ProviderQwenToken, "main", "test-provider-key")
+	// Preserve a legacy endpoint-named record: health still comes from the
+	// shared credential owner's Token Plan upstream.
+	stored, _, err := store.AddProviderAPIKey(accounts.ProviderQwenAnthropic, "main", "test-provider-key")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +136,7 @@ func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &statuses); err != nil {
 		t.Fatal(err)
 	}
-	if len(statuses) != 1 || statuses[0].ProviderHealth != "ok" || statuses[0].ProviderModels == nil || *statuses[0].ProviderModels != 2 || !slices.Equal(statuses[0].ProviderEndpoints, []string{"/qwen-anthropic", "/qwen-token"}) {
+	if len(statuses) != 1 || statuses[0].Provider != accounts.ProviderQwenToken || statuses[0].ProviderHealth != "ok" || statuses[0].ProviderModels == nil || *statuses[0].ProviderModels != 2 || !slices.Equal(statuses[0].ProviderEndpoints, []string{"/qwen-anthropic", "/qwen-token"}) {
 		t.Fatalf("usage statuses = %+v, want healthy key with 2 models", statuses)
 	}
 	if gotAuthorization != "Bearer test-provider-key" {
@@ -152,6 +154,9 @@ func TestConfigureRejectsShadowingAnExistingProvider(t *testing.T) {
 	}{
 		{name: "reserved provider name", declared: OpenAICompatibleProvider{Name: "claude", BaseURL: "https://x.test/v1"}},
 		{name: "legacy API-key namespace", declared: OpenAICompatibleProvider{Name: "apikey", BaseURL: "https://x.test/v1"}},
+		{name: "Bedrock outer route", declared: OpenAICompatibleProvider{Name: "bedrock", BaseURL: "https://x.test/v1"}},
+		{name: "tenant outer route", declared: OpenAICompatibleProvider{Name: "t", BaseURL: "https://x.test/v1"}},
+		{name: "internal outer route", declared: OpenAICompatibleProvider{Name: "internal", BaseURL: "https://x.test/v1"}},
 		{name: "reserved path segment", declared: OpenAICompatibleProvider{Name: "v1", BaseURL: "https://x.test/v1"}},
 		{name: "built-in name", declared: OpenAICompatibleProvider{Name: "kimi", BaseURL: "https://x.test/v1"}},
 		{name: "built-in alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"glm"}, BaseURL: "https://x.test/v1"}},
@@ -184,8 +189,10 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 		{name: "alias with whitespace", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a b"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with control", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a\nb"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with URL delimiter", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a?b"}, BaseURL: "https://x.test/v1"}},
+		{name: "oversized name", declared: OpenAICompatibleProvider{Name: strings.Repeat("a", 319), BaseURL: "https://x.test/v1"}},
 		{name: "non-http scheme", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "ftp://x.test/v1"}},
 		{name: "no host", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "https:///v1"}},
+		{name: "URL userinfo", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "https://user:password@x.test/v1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -95,6 +95,33 @@ func TestSRAddKeyStoresRegistryProviderInLocalStorage(t *testing.T) {
 	}
 }
 
+func TestSRAddKeyStoresSharedSubscriptionUnderCredentialOwner(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	var out bytes.Buffer
+	runner := srRunner{
+		store:  store,
+		in:     strings.NewReader("work\ntest-provider-key\n"),
+		out:    &out,
+		errOut: &out,
+	}
+
+	if err := runner.run(context.Background(), []string{"add-key", "--provider", "qwen-anthropic"}); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := store.FindStored("qwen-token:work")
+	if err != nil || !ok {
+		t.Fatalf("shared credential owner found=%t err=%v", ok, err)
+	}
+	if stored.Provider != accounts.ProviderQwenToken {
+		t.Fatalf("stored provider = %q, want qwen-token", stored.Provider)
+	}
+	if _, duplicate, err := store.FindStored("qwen-anthropic:work"); err != nil || duplicate {
+		t.Fatalf("protocol-specific duplicate exists=%t err=%v", duplicate, err)
+	}
+}
+
 func TestSRAddKeyRejectsUnknownLocalProviderBeforePrompting(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

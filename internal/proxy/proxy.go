@@ -1313,20 +1313,25 @@ func (s Server) withKeyedProviderHealth(ctx context.Context, statuses []AccountU
 		if status.AuthMode != accounts.AuthModeAPIKey {
 			continue
 		}
-		entry, ok := keyedProviderForName(string(status.Provider))
+		requestedEntry, ok := keyedProviderForName(string(status.Provider))
 		if !ok {
 			continue
 		}
-		out[i].Provider = entry.Provider
-		out[i].PlanType = entry.PlanLabel
-		out[i].ProviderHealth = "not checked"
-		out[i].ProviderEndpoints = ProviderEndpoints(entry.Provider)
-		account, ok := byID[status.ID]
-		if !ok || strings.TrimSpace(account.Token) == "" || entry.Upstream == nil {
+		owner := accountProviderFor(requestedEntry.Provider)
+		healthEntry, ok := keyedProviderFor(owner)
+		if !ok {
 			continue
 		}
-		upstream := entry.Upstream(s)
-		if upstream == nil || ProviderHealthURL(entry.Provider, upstream.String()) == "" {
+		out[i].Provider = owner
+		out[i].PlanType = healthEntry.PlanLabel
+		out[i].ProviderHealth = "not checked"
+		out[i].ProviderEndpoints = ProviderEndpoints(requestedEntry.Provider)
+		account, ok := byID[status.ID]
+		if !ok || strings.TrimSpace(account.Token) == "" || healthEntry.Upstream == nil {
+			continue
+		}
+		upstream := healthEntry.Upstream(s)
+		if upstream == nil || ProviderHealthURL(healthEntry.Provider, upstream.String()) == "" {
 			continue
 		}
 		wg.Add(1)
@@ -1334,7 +1339,7 @@ func (s Server) withKeyedProviderHealth(ctx context.Context, statuses []AccountU
 			defer wg.Done()
 			probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 			defer cancel()
-			state, models := ProbeProviderKey(probeCtx, client, entry.Provider, upstream.String(), account.Token)
+			state, models := ProbeProviderKey(probeCtx, client, healthEntry.Provider, upstream.String(), account.Token)
 			if state == "" {
 				return
 			}
@@ -1564,7 +1569,11 @@ func canonicalizeAccountImportProvider(input *accountImportRequest) {
 	}
 	original := input.Provider
 	canonical, ok := canonicalKeyedProvider(original)
-	if !ok || canonical == original {
+	if !ok {
+		return
+	}
+	canonical = accountProviderFor(canonical)
+	if canonical == original {
 		return
 	}
 	if input.Codex != nil {

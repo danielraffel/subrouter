@@ -35,15 +35,16 @@ var (
 	configuredFrozen    bool
 )
 
-// reservedProviderNames are the names and path segments the non-registry
-// providers already route on. A configured provider claiming one would shadow
-// Codex or Claude, so it is rejected rather than silently accepted.
+// reservedProviderNames are names and path segments owned by core or outer
+// routers. A configured provider claiming one would be shadowed or redirect an
+// existing route, so it is rejected rather than silently accepted.
 var reservedProviderNames = map[string]bool{
 	"apikey": true,
 	"codex":  true, "openai": true, "openai-codex": true,
 	"claude": true, "anthropic": true,
-	"gemini": true,
-	"v1":     true, "backend-api": true, "messages": true, "responses": true,
+	"gemini": true, "bedrock": true,
+	"internal": true, "_subrouter": true, "t": true,
+	"v1": true, "backend-api": true, "messages": true, "responses": true,
 }
 
 // ConfigureOpenAICompatibleProviders registers operator-declared providers.
@@ -64,7 +65,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 			return fmt.Errorf("openai-compatible provider needs a name")
 		}
 		if !validDeclaredProviderIdentifier(name) {
-			return fmt.Errorf("openai-compatible provider name %q must use only lowercase letters, digits, '.', '_', or '-'", item.Name)
+			return fmt.Errorf("openai-compatible provider name %q must be 1-318 characters, start with a letter or digit, and use only lowercase letters, digits, '.', '_', or '-'", item.Name)
 		}
 		base, err := parseProviderBaseURL(item.BaseURL, name)
 		if err != nil {
@@ -138,7 +139,7 @@ func ValidDeclaredProviderName(raw string) bool {
 }
 
 func validDeclaredProviderIdentifier(name string) bool {
-	if name == "" {
+	if name == "" || len(name) > 318 {
 		return false
 	}
 	first := name[0]
@@ -173,6 +174,9 @@ func parseProviderBaseURL(raw, name string) (*url.URL, error) {
 	}
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("openai-compatible provider %q base URL has no host", name)
+	}
+	if parsed.User != nil {
+		return nil, fmt.Errorf("openai-compatible provider %q base URL must not contain userinfo", name)
 	}
 	return parsed, nil
 }

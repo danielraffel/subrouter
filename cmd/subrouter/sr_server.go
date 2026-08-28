@@ -1007,7 +1007,7 @@ func parseAPIKeyProvider(value string) (accounts.Provider, error) {
 		return accounts.ProviderClaude, nil
 	default:
 		if provider, ok := proxy.APIKeyProviderForName(normalized); ok {
-			return provider, nil
+			return proxy.APIKeyAccountProvider(provider), nil
 		}
 		if proxy.ValidDeclaredProviderName(normalized) {
 			return accounts.Provider(normalized), nil

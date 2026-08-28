@@ -204,6 +204,20 @@ func TestAccountImportCanonicalizesDeclaredProviderAlias(t *testing.T) {
 	}
 }
 
+func TestAccountImportCanonicalizesSharedSubscriptionOwner(t *testing.T) {
+	input := accountImportRequest{
+		Provider: accounts.ProviderQwenAnthropic,
+		Codex: &accounts.StoredCodexAccount{
+			Email: "qwen-anthropic:work",
+			Auth:  accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "test-provider-key"},
+		},
+	}
+	canonicalizeAccountImportProvider(&input)
+	if input.Provider != accounts.ProviderQwenToken || input.Codex.Provider != accounts.ProviderQwenToken || input.Codex.Email != "qwen-token:work" {
+		t.Fatalf("canonical input = %+v, want qwen-token owner", input)
+	}
+}
+
 func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	ref := NewAccountRef(codexStore, nil, nil)
