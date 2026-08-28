@@ -1698,6 +1698,62 @@ func TestTenantCodexOAuthUploadRejectsCapacityBeforeAttestation(t *testing.T) {
 	}
 }
 
+func TestConcurrentTenantUploadsShareCrossProcessCapacityLock(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	for index := 0; index < maxAccountImportAccounts-1; index++ {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newServer := func() *Server {
+		ref := NewAccountRef(store, nil, nil)
+		ref.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+		return &Server{AccountRef: ref, MaxBodyBytes: 1 << 20}
+	}
+	servers := []*Server{newServer(), newServer()}
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, len(servers))
+	for index, server := range servers {
+		go func(index int, server *Server) {
+			<-start
+			response := httptest.NewRecorder()
+			handleTenantAccountUpload(server, response, httptest.NewRequest(
+				http.MethodPost,
+				"/_subrouter/accounts",
+				strings.NewReader(fmt.Sprintf(`{
+					"provider":"openai-apikey","accountId":"apikey:concurrent-%d",
+					"label":"Concurrent %d","apiKey":"sk-concurrent-%d"
+				}`, index, index, index)),
+			))
+			responses <- response
+		}(index, server)
+	}
+	close(start)
+	codes := make([]int, 0, len(servers))
+	for range servers {
+		codes = append(codes, (<-responses).Code)
+	}
+	sort.Ints(codes)
+	want := []int{http.StatusOK, http.StatusInsufficientStorage}
+	sort.Ints(want)
+	if !reflect.DeepEqual(codes, want) {
+		t.Fatalf("concurrent upload statuses = %v, want %v", codes, want)
+	}
+	stored, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != maxAccountImportAccounts {
+		t.Fatalf("concurrent uploads stored %d accounts, want %d", len(stored), maxAccountImportAccounts)
+	}
+}
+
 func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T) {
 	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
 	var submittedRefresh string
