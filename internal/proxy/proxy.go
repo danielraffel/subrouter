@@ -2887,7 +2887,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
-			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, account, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
+			responseAccount := account
+			if routed, ok := routedResponseAccount(response); ok {
+				responseAccount = routed
+			}
+			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			if credentialLease != nil {
 				s.reportCredentialLease(
 					credentialLease.ID,
@@ -5515,6 +5519,28 @@ type usageLimitRetryTransport struct {
 	budget *attemptBudget
 }
 
+type routedResponseAccountKey struct{}
+
+func tagRoutedResponseAccount(response *http.Response, routed accounts.Account) *http.Response {
+	if response == nil {
+		return nil
+	}
+	request := response.Request
+	if request == nil {
+		request = &http.Request{}
+	}
+	response.Request = request.WithContext(context.WithValue(request.Context(), routedResponseAccountKey{}, routed))
+	return response
+}
+
+func routedResponseAccount(response *http.Response) (accounts.Account, bool) {
+	if response == nil || response.Request == nil {
+		return accounts.Account{}, false
+	}
+	routed, ok := response.Request.Context().Value(routedResponseAccountKey{}).(accounts.Account)
+	return routed, ok
+}
+
 // fableFallbackResponse swaps the pool's give-up response for one served by the
 // Fable fallback chain (Bedrock, then the dedicated API key). Returns false
 // when no chain is configured for this request or every stage failed, in which
@@ -5543,7 +5569,10 @@ func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, a
 	if giveUp != nil && giveUp.Body != nil {
 		_ = giveUp.Body.Close()
 	}
-	return fallback, true
+	// The fallback chain is not the subscription account that produced the
+	// rejected response, so prevent passive response capture from attributing
+	// the fallback result to that account.
+	return tagRoutedResponseAccount(fallback, accounts.Account{Provider: t.provider}), true
 }
 
 // claudeOverloadMaxRetries bounds the same-account retries subrouter itself
@@ -5761,6 +5790,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
+		response = tagRoutedResponseAccount(response, accounts.Account{
+			ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+		})
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
 			return response, err
 		}
@@ -5937,7 +5969,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
 		}
 	}
-	return base.RoundTrip(req)
+	response, err := base.RoundTrip(req)
+	return tagRoutedResponseAccount(response, accounts.Account{
+		ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+	}), err
 }
 
 // retryWithoutSealedReasoning inspects a 400 and, when the upstream refused
