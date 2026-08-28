@@ -290,35 +290,36 @@ func applyTenantCredentialLeaseReport(
 	if server.SchedulerRef == nil {
 		return
 	}
+	accountProvider := schedulerAccountProvider(lease.provider)
 	switch report.Outcome {
 	case broker.LeaseUnauthorized:
 		account := accounts.Account{
-			ID: lease.accountID, Provider: lease.provider,
+			ID: lease.accountID, Provider: accountProvider,
 			CredentialVersion: lease.credentialIdentity,
 		}
 		server.markAccountExhaustedCredentialForAccount(account)
 	case broker.LeaseForbidden:
 		if report.Scope == broker.LeaseCooldownAccount {
 			server.SchedulerRef.MarkAccountUnavailableUntil(
-				lease.provider, lease.accountID, time.Now().Add(credentialExhaustionTTL),
+				accountProvider, lease.accountID, time.Now().Add(credentialExhaustionTTL),
 			)
 			return
 		}
 		poolKey := ""
 		if report.Scope == broker.LeaseCooldownQuota {
 			poolKey = lease.model
-			if lease.provider == accounts.ProviderClaude {
+			if accountProvider == accounts.ProviderClaude {
 				poolKey = claudePoolModel(poolKey)
 			}
 		}
 		server.SchedulerRef.MarkExhaustedUntil(
-			lease.provider, lease.accountID, poolKey, time.Now().Add(credentialExhaustionTTL),
+			accountProvider, lease.accountID, poolKey, time.Now().Add(credentialExhaustionTTL),
 		)
 	case broker.LeaseRateLimited:
 		poolKey := ""
 		if report.Scope == broker.LeaseCooldownQuota {
 			poolKey = lease.model
-			if lease.provider == accounts.ProviderClaude {
+			if accountProvider == accounts.ProviderClaude {
 				poolKey = claudePoolModel(poolKey)
 			}
 		}
@@ -333,7 +334,7 @@ func applyTenantCredentialLeaseReport(
 		if maximum := now.Add(8 * 24 * time.Hour); until.After(maximum) {
 			until = maximum
 		}
-		server.SchedulerRef.MarkExhaustedUntil(lease.provider, lease.accountID, poolKey, until)
+		server.SchedulerRef.MarkExhaustedUntil(accountProvider, lease.accountID, poolKey, until)
 	}
 }
 

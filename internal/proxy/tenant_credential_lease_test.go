@@ -84,3 +84,53 @@ func TestQwenAnthropicLeaseSelectionUsesSharedTokenPlanScores(t *testing.T) {
 		t.Fatalf("picked %q, want healthy shared Token Plan account", picked.ID)
 	}
 }
+
+func TestQwenAnthropicLeaseFailuresCooldownTheSharedTokenPlanAccount(t *testing.T) {
+	const accountID = "qwen-token:shared"
+	const model = "qwen3.7-plus"
+	account := accounts.Account{
+		ID: accountID, Provider: accounts.ProviderQwenToken,
+		AuthMode: accounts.AuthModeAPIKey, Token: "key", CredentialVersion: "credential-v1",
+	}
+	newServer := func() *Server {
+		ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+		return &Server{
+			AccountRef: ref,
+			SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+				AccountID: accountID, Provider: accounts.ProviderQwenToken,
+				Headroom: 1, ShortHeadroom: 1,
+			}})),
+		}
+	}
+	lease := tenantCredentialLease{
+		accountID: accountID, provider: accounts.ProviderQwenAnthropic,
+		credentialIdentity: account.CredentialIdentity(), model: model,
+	}
+
+	tests := []struct {
+		name    string
+		report  tenantCredentialLeaseReport
+		isQuota bool
+	}{
+		{name: "unauthorized", report: tenantCredentialLeaseReport{Outcome: broker.LeaseUnauthorized}},
+		{name: "forbidden account", report: tenantCredentialLeaseReport{Outcome: broker.LeaseForbidden, Scope: broker.LeaseCooldownAccount}},
+		{name: "forbidden quota", report: tenantCredentialLeaseReport{Outcome: broker.LeaseForbidden, Scope: broker.LeaseCooldownQuota}, isQuota: true},
+		{name: "rate limited quota", report: tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, Scope: broker.LeaseCooldownQuota, RetryAt: time.Now().Add(time.Minute).UnixMilli()}, isQuota: true},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := newServer()
+			applyTenantCredentialLeaseReport(server, lease, testCase.report)
+			scheduler := server.SchedulerRef.Get()
+			if testCase.isQuota {
+				scheduler = scheduler.ForModel(model)
+			}
+			if !scheduler.Exhausted(accounts.ProviderQwenToken, accountID) {
+				t.Fatalf("shared Token Plan account remained usable after %s", testCase.name)
+			}
+			if server.SchedulerRef.Get().Exhausted(accounts.ProviderQwenAnthropic, accountID) {
+				t.Fatalf("failure was recorded under the transport alias for %s", testCase.name)
+			}
+		})
+	}
+}
