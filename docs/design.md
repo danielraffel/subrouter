@@ -197,7 +197,10 @@ New session selection:
 
 Codex has both shorter rolling and daily/weekly style windows, so using the minimum headroom prevents saturating one window while another still looks available. Later, this can become weighted by expected task size.
 
-Daemon `sr` auto-switching uses the same score refresh on an interval. It only considers usable OAuth Codex accounts, then writes the selected account auth to Codex's active auth file. If no usable OAuth account exists, it leaves the current active account alone. API-key accounts remain a proxy fallback and are not selected for active `sr` switching.
+In serve mode, the periodic `--sr-switch-interval` sweep refreshes the usage
+scores used for routing. It never rewrites local Codex, OpenCode, or pi auth;
+only an explicit account-manager command can change active auth. Set the
+interval to `0` to disable scheduled score refresh.
 
 ## Account sources
 
