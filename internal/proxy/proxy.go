@@ -782,6 +782,22 @@ func apiKeyPlanType(provider accounts.Provider) string {
 	}
 }
 
+func acquireAccountFetchSlot(ctx context.Context, sem chan struct{}) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case sem <- struct{}{}:
+		if ctx.Err() != nil {
+			<-sem
+			return false
+		}
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus {
 	storedAccounts, err := r.store.ListStored()
 	if err != nil {
@@ -843,15 +859,13 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-sweepCtx.Done():
+			if !acquireAccountFetchSlot(sweepCtx, sem) {
 				next := out[i]
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
 			}
+			defer func() { <-sem }()
 			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "usage-status.if-expired")
 			refreshed, didRefresh, refreshErr := r.store.RefreshStoredIfExpired(refreshCtx, r.client, stored)
 			r.noteCredResult(credential, refreshErr)
@@ -916,15 +930,13 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-sweepCtx.Done():
+			if !acquireAccountFetchSlot(sweepCtx, sem) {
 				next := out[i]
 				next.Error = sweepCtx.Err().Error()
 				out[i] = next
 				return
 			}
+			defer func() { <-sem }()
 			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(sweepCtx, r.client, profile)
 			r.noteCredResult(credential, err)
 			next := out[i]
@@ -2251,12 +2263,10 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 		wg.Add(1)
 		go func(account accounts.Account) {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-sweepCtx.Done():
+			if !acquireAccountFetchSlot(sweepCtx, sem) {
 				return
 			}
+			defer func() { <-sem }()
 			refreshCtx := accounts.WithCodexRefreshReason(sweepCtx, "proxy.score-accounts")
 			refreshed, err := s.refreshAccount(refreshCtx, account)
 			s.AccountRef.noteCredResult(account, err)

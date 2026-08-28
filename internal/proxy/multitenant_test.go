@@ -1757,6 +1757,61 @@ func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
 	}
 }
 
+func TestTenantCodexRepairUsesCanonicalStoredIDForPartialSelector(t *testing.T) {
+	const canonicalID = "owner@example.com"
+	identityToken := proxyTestCodexJWT(canonicalID, "id-token", time.Now().Add(time.Hour))
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return usageOKResponse(), nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT(canonicalID, "access-token", time.Now().Add(time.Hour)), identityToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: canonicalID, Provider: accounts.ProviderCodex,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginServerAttested,
+		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+			AccessToken:  proxyTestCodexJWT(canonicalID, "old-access", time.Now().Add(time.Hour)),
+			RefreshToken: "old-refresh", IDToken: identityToken,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	submittedID := proxyTestCodexJWT(canonicalID, "submitted-id", time.Now().Add(time.Hour))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex","accountId":"owner","targetAccountID":"owner","label":"Owner",
+			"tokens":{"accessToken":"access","refreshToken":"replacement-refresh","idToken":%q}
+		}`, submittedID)),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("partial repair status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].Email != canonicalID ||
+		stored[0].Auth.Tokens == nil || stored[0].Auth.Tokens.RefreshToken != "server-refresh" {
+		t.Fatalf("partial repair did not update canonical account: %#v", stored)
+	}
+}
+
 func TestTenantCodexUploadRejectsMalformedRefreshedIdentity(t *testing.T) {
 	var refreshCalls atomic.Int32
 	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {

@@ -195,3 +195,36 @@ func TestSharedScoreDeadlinePreservesSeedsForQueuedAccounts(t *testing.T) {
 		t.Fatalf("blocked sweep calls/max = %d/%d, want %d/%d", calls, maximum, accountFetchConcurrency, accountFetchConcurrency)
 	}
 }
+
+func TestAccountFetchSweepsDoNotStartWorkAfterCallerDeadline(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		run  func(context.Context, *AccountRef, []accounts.Account)
+	}{
+		{
+			name: "usage status",
+			run: func(ctx context.Context, ref *AccountRef, _ []accounts.Account) {
+				ref.usageStatusesLive(ctx)
+			},
+		},
+		{
+			name: "score accounts",
+			run: func(ctx context.Context, ref *AccountRef, available []accounts.Account) {
+				Server{AccountRef: ref, Scheduler: selectacct.NewScheduler(nil)}.scoreAccounts(ctx, available)
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			for attempt := 0; attempt < 20; attempt++ {
+				ref, available, transport := accountFetchConcurrencyFixture(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				testCase.run(ctx, ref, available)
+				calls, _ := transport.counts()
+				if calls != 0 {
+					t.Fatalf("attempt %d started %d upstream calls after caller deadline", attempt, calls)
+				}
+			}
+		})
+	}
+}

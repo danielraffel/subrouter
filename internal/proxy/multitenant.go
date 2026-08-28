@@ -1056,6 +1056,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 				http.Error(w, "Codex repair target is unavailable", http.StatusConflict)
 				return
 			}
+			id = existing.Email
 			expectedIdentity, err = accounts.ExtractEmailFromJWT(existing.Auth.Tokens.IDToken)
 			if err != nil || !strings.EqualFold(
 				strings.TrimSpace(expectedIdentity), strings.TrimSpace(submittedIdentity),
