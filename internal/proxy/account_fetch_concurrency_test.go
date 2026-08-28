@@ -109,6 +109,32 @@ func TestUsageStatusesLiveBoundsUpstreamConcurrency(t *testing.T) {
 	}
 }
 
+func TestUsageStatusesLiveBoundsKeyedProviderConcurrency(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	for i := 0; i < 8; i++ {
+		label := "key-" + string(rune('a'+i))
+		if _, _, err := store.AddAPIKeyForProvider(label, "secret-"+label, accounts.ProviderDeepSeek); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transport := &contextBlockingTransport{}
+	ref := NewAccountRef(store, nil, &http.Client{Transport: transport})
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	ref.apiKeyUpstreams = map[accounts.Provider]string{
+		accounts.ProviderDeepSeek: ProviderDefaultUpstream(accounts.ProviderDeepSeek),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	statuses := ref.usageStatusesLive(ctx)
+	if len(statuses) != 8 {
+		t.Fatalf("statuses = %d, want 8", len(statuses))
+	}
+	if calls, maximum := transport.counts(); calls != accountFetchConcurrency || maximum != accountFetchConcurrency {
+		t.Fatalf("blocked keyed-provider calls/max = %d/%d, want %d/%d", calls, maximum, accountFetchConcurrency, accountFetchConcurrency)
+	}
+}
+
 func TestScoreAccountsBoundsUpstreamConcurrency(t *testing.T) {
 	ref, available, transport := accountFetchConcurrencyFixture(t)
 	server := Server{

@@ -689,6 +689,35 @@ func TestUsageStatusesBoundsAndParallelizesOAuthSourceAccounts(t *testing.T) {
 	}
 }
 
+func TestUsageStatusesBoundsOAuthSourceConcurrencyWithTheSweepSemaphore(t *testing.T) {
+	listed := make([]accounts.Account, 0, 8)
+	for i := 0; i < 8; i++ {
+		listed = append(listed, accounts.Account{
+			ID:       "kimi-subscription:" + string(rune('a'+i)),
+			Provider: accounts.ProviderKimi,
+			AuthMode: accounts.AuthModeOAuth,
+		})
+	}
+	source := &concurrentOAuthUsageSource{
+		accounts: listed,
+		entered:  make(chan string, len(listed)),
+		release:  make(chan struct{}),
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, http.DefaultClient)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	ref.oauthSources = []OAuthAccountSource{source}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	statuses := ref.usageStatusesLive(ctx)
+	if len(statuses) != len(listed) {
+		t.Fatalf("statuses = %d, want %d", len(statuses), len(listed))
+	}
+	if calls := len(source.entered); calls != accountFetchConcurrency {
+		t.Fatalf("OAuth source refresh calls = %d, want %d before the sweep deadline", calls, accountFetchConcurrency)
+	}
+}
+
 func TestUsageStatusesKeepsKimiAPIKeyHealthWhenQuotaIsForbidden(t *testing.T) {
 	store := accounts.CodexStore{Dir: t.TempDir()}
 	stored, _, err := store.AddAPIKeyForProvider("work", "test-kimi-key", accounts.ProviderKimi)

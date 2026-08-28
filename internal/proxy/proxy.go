@@ -1161,7 +1161,14 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					out[i] = r.keyedAPIUsageStatus(ctx, stored, out[i])
+					if !acquireAccountFetchSlot(sweepCtx, sem) {
+						next := out[i]
+						next.Error = sweepCtx.Err().Error()
+						out[i] = next
+						return
+					}
+					defer func() { <-sem }()
+					out[i] = r.keyedAPIUsageStatus(sweepCtx, stored, out[i])
 				}()
 			}
 			continue
@@ -1287,17 +1294,24 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			out[i] = next
 		}()
 	}
-	wg.Wait()
-	promoteUsableClaudeStatus(out[claudeOffset:])
 	sourceBatches := make([][]AccountUsageStatus, len(r.oauthSources))
 	for sourceIndex, source := range r.oauthSources {
 		sourceIndex, source := sourceIndex, source
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			listCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
-			sourceAccounts, listErr := source.ListAccounts(listCtx)
-			cancel()
+			if !acquireAccountFetchSlot(sweepCtx, sem) {
+				sourceBatches[sourceIndex] = []AccountUsageStatus{{AccountStatus: AccountStatus{
+					ID:          string(source.Provider()),
+					Provider:    source.Provider(),
+					AuthMode:    accounts.AuthModeOAuth,
+					AuthChecked: true,
+					Error:       sweepCtx.Err().Error(),
+				}}}
+				return
+			}
+			sourceAccounts, listErr := source.ListAccounts(sweepCtx)
+			<-sem
 			errorRows := 0
 			if listErr != nil {
 				errorRows = 1
@@ -1330,10 +1344,14 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				accountWG.Add(1)
 				go func() {
 					defer accountWG.Done()
-					fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
-					defer cancel()
 					status := batch[accountIndex]
-					refreshed, refreshErr := source.RefreshAccount(fetchCtx, r.client, sourceAccount)
+					if !acquireAccountFetchSlot(sweepCtx, sem) {
+						status.Error = sweepCtx.Err().Error()
+						batch[accountIndex] = status
+						return
+					}
+					defer func() { <-sem }()
+					refreshed, refreshErr := source.RefreshAccount(sweepCtx, r.client, sourceAccount)
 					if refreshErr != nil {
 						status.Error = refreshErr.Error()
 						batch[accountIndex] = status
@@ -1346,7 +1364,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 						batch[accountIndex] = status
 						return
 					}
-					planType, windows, usageErr := usageSource.FetchUsage(fetchCtx, r.client, refreshed)
+					planType, windows, usageErr := usageSource.FetchUsage(sweepCtx, r.client, refreshed)
 					status.PlanType = planType
 					status.Windows = windows
 					status.UsageFresh = usageErr == nil
@@ -1361,6 +1379,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 		}()
 	}
 	wg.Wait()
+	promoteUsableClaudeStatus(out[claudeOffset:])
 	for _, batch := range sourceBatches {
 		out = append(out, batch...)
 	}
