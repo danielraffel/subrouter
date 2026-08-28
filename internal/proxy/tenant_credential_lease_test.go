@@ -50,4 +50,11 @@ func TestForbiddenCredentialLeaseHonorsCooldownScope(t *testing.T) {
 		!accountScheduler.ForModel(agentclaude.FableFeature).Exhausted(accounts.ProviderClaude, accountID) {
 		t.Fatal("account-scoped forbidden report did not exhaust the account and all model pools")
 	}
+	accountServer.SchedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: accountID, Provider: accounts.ProviderClaude,
+		Headroom: 1, ShortHeadroom: 1, Fresh: true,
+	}}))
+	if !accountServer.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, accountID) {
+		t.Fatal("healthy quota refresh cleared account-scoped forbidden report")
+	}
 }
