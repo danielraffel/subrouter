@@ -1044,6 +1044,29 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "Codex OAuth credential transfer failed", http.StatusBadRequest)
 			return
 		}
+		refreshedIdentity, err := accounts.ExtractEmailFromJWT(account.Auth.Tokens.IDToken)
+		if err != nil || strings.TrimSpace(refreshedIdentity) == "" {
+			http.Error(w, "Codex OAuth credential identity is invalid", http.StatusBadRequest)
+			return
+		}
+		if input.TargetAccountID != "" {
+			existing, found, findErr := server.AccountRef.store.FindStored(input.TargetAccountID)
+			if findErr != nil {
+				http.Error(w, "read Codex repair target", http.StatusInternalServerError)
+				return
+			}
+			if !found || existing.Auth.Tokens == nil {
+				http.Error(w, "Codex repair target is unavailable", http.StatusConflict)
+				return
+			}
+			existingIdentity, identityErr := accounts.ExtractEmailFromJWT(existing.Auth.Tokens.IDToken)
+			if identityErr != nil || !strings.EqualFold(
+				strings.TrimSpace(existingIdentity), strings.TrimSpace(refreshedIdentity),
+			) {
+				http.Error(w, "Codex repair identity does not match existing account", http.StatusConflict)
+				return
+			}
+		}
 		err = server.AccountRef.store.SaveStored(account)
 		if err != nil {
 			http.Error(w, "save Codex account", http.StatusInternalServerError)

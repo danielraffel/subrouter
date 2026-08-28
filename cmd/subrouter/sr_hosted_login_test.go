@@ -355,13 +355,30 @@ func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
 	}
 }
 
-func TestHostedCodexAddPersistsIsolatedCredentialThroughTenantEndpoint(t *testing.T) {
+func TestHostedCodexAddPersistsServerAttestedCredentialThroughTenantEndpoint(t *testing.T) {
 	registry := tenant.NewRegistry(t.TempDir())
 	created, tenantKey, err := registry.Create("hosted")
 	if err != nil {
 		t.Fatal(err)
 	}
-	multi := &proxy.MultiTenant{Base: proxy.Server{}, Registry: registry}
+	rotated := testCodexAuth("hosted@example.com", "account-hosted")
+	rotated.Tokens.RefreshToken = "server-refresh-account-hosted"
+	transport := srRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		body, err := json.Marshal(map[string]string{
+			"access_token":  rotated.Tokens.AccessToken,
+			"refresh_token": rotated.Tokens.RefreshToken,
+			"id_token":      rotated.Tokens.IDToken,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})
+	multi := &proxy.MultiTenant{Base: proxy.Server{Transport: transport}, Registry: registry}
 	server := httptest.NewServer(multi.Handler(multi.Base.Handler()))
 	defer server.Close()
 
@@ -412,7 +429,7 @@ func TestHostedCodexAddPersistsIsolatedCredentialThroughTenantEndpoint(t *testin
 	if len(stored) != 1 {
 		t.Fatalf("stored accounts = %d, want 1", len(stored))
 	}
-	if stored[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+	if stored[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested {
 		t.Fatalf("stored OAuth origin = %q", stored[0].OAuthCredentialOrigin)
 	}
 	body, err := os.ReadFile(filepath.Join(localCodexHome, "auth.json"))

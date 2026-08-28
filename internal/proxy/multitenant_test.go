@@ -1685,6 +1685,100 @@ func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T)
 	}
 }
 
+func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
+	var refreshedIdentity = "owner@example.com"
+	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		idToken := proxyTestCodexJWT(refreshedIdentity, "id-token", time.Now().Add(time.Hour))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT(refreshedIdentity, "access-token", time.Now().Add(time.Hour)), idToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/t/" + key + "/_subrouter/accounts"
+	upload := func(identity, refreshToken, target string) *httptest.ResponseRecorder {
+		t.Helper()
+		idToken := proxyTestCodexJWT(identity, "submitted-id", time.Now().Add(time.Hour))
+		body := fmt.Sprintf(`{
+			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
+			"targetAccountID":%q,
+			"tokens":{"accessToken":%q,"refreshToken":%q,"idToken":%q}
+		}`,
+			target,
+			proxyTestCodexJWT(identity, "submitted-access", time.Now().Add(time.Hour)),
+			refreshToken,
+			idToken,
+		)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return response
+	}
+
+	if response := upload("owner@example.com", "owner-refresh", ""); response.Code != http.StatusOK {
+		t.Fatalf("initial upload status = %d, body = %s", response.Code, response.Body.String())
+	}
+	refreshedIdentity = "other@example.com"
+	response := upload("other@example.com", "other-refresh", "stable-routing-id")
+	if response.Code != http.StatusConflict {
+		t.Fatalf("cross-identity repair status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}
+	stored, found, err := store.FindStored("stable-routing-id")
+	if err != nil || !found {
+		t.Fatalf("find original account: found=%v err=%v", found, err)
+	}
+	identity, err := accounts.ExtractEmailFromJWT(stored.Auth.Tokens.IDToken)
+	if err != nil || identity != "owner@example.com" {
+		t.Fatalf("cross-identity repair changed stored identity: identity=%q err=%v", identity, err)
+	}
+}
+
+func TestTenantCodexUploadRejectsMalformedRefreshedIdentity(t *testing.T) {
+	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"access_token":"access","refresh_token":"server-refresh","id_token":"not-a-jwt"}`,
+			)),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(`{
+			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
+			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":"id"}
+		}`),
+	))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("malformed identity status = %d, want 400, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := (accounts.CodexStore{
+		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),
+	}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("malformed refreshed identity stored an account: %#v", stored)
+	}
+}
+
 func TestTenantAccountTextRejectsControlsAndUsesUTF8ByteLimits(t *testing.T) {
 	base := tenantAccountUpload{
 		Provider:  "openai-apikey",
