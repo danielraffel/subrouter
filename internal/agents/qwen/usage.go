@@ -28,6 +28,8 @@ const (
 	domesticURL      = "https://modelstudio-cs.console.aliyun.com"
 )
 
+var ErrConsoleLoginRequired = errors.New("Qwen Token Plan console login required")
+
 // UsageDetails is the pair of independent fixed-window quotas returned by the
 // Token Plan console. A nil window means Alibaba omitted that window; callers
 // must not infer either zero usage or unlimited quota from its absence.
@@ -221,10 +223,78 @@ func callConsole(ctx context.Context, client *http.Client, config consoleConfig,
 		_, _ = io.CopyN(io.Discard, res.Body, 4096)
 		return fmt.Errorf("Qwen Token Plan console returned HTTP %d", res.StatusCode)
 	}
-	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(output); err != nil {
+	bodyBytes, err := io.ReadAll(io.LimitReader(res.Body, (1<<20)+1))
+	if err != nil {
+		return fmt.Errorf("read Qwen Token Plan console response: %w", err)
+	}
+	if len(bodyBytes) > 1<<20 {
+		return fmt.Errorf("Qwen Token Plan console response exceeds 1 MiB")
+	}
+	var envelope any
+	if err := json.Unmarshal(bodyBytes, &envelope); err != nil {
+		return fmt.Errorf("decode Qwen Token Plan console response: %w", err)
+	}
+	if containsConsoleErrorCode(envelope, "BailianGateway.Login.NotLogined") {
+		return ErrConsoleLoginRequired
+	}
+	if err := json.Unmarshal(bodyBytes, output); err != nil {
 		return fmt.Errorf("decode Qwen Token Plan console response: %w", err)
 	}
 	return nil
+}
+
+func containsConsoleErrorCode(value any, code string) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if strings.EqualFold(key, "code") {
+				if value, ok := child.(string); ok && value == code {
+					return true
+				}
+			}
+			if containsConsoleErrorCode(child, code) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsConsoleErrorCode(child, code) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// StatusError turns the two independent console fetch failures into one
+// operator-facing error. Alibaba returns the same expired-login response from
+// both endpoints, so identical messages are collapsed instead of printed
+// twice.
+func StatusError(accountID string, errs ...error) error {
+	unique := make([]string, 0, len(errs))
+	seen := make(map[string]struct{}, len(errs))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrConsoleLoginRequired) {
+			return fmt.Errorf("Qwen console login needed; run sr qwen login %s: %w", shellQuoteArgument(accountID), ErrConsoleLoginRequired)
+		}
+		message := err.Error()
+		if _, ok := seen[message]; ok {
+			continue
+		}
+		seen[message] = struct{}{}
+		unique = append(unique, message)
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(unique, "\n"))
+}
+
+func shellQuoteArgument(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func readConsoleConfig(accountID string) (consoleConfig, error) {

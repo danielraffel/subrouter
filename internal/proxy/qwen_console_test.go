@@ -193,7 +193,10 @@ func TestQwenUsageStatusPreservesQuotaWhenPlanLookupFails(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("unavailable"))}, nil
 	})}
 	ref := NewAccountRef(store, []accounts.Account{account}, client)
-	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{
+		AccessToken: "console-secret",
+		Account:     "saved-account@example.test",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	statuses := ref.UsageStatuses(t.Context())
@@ -204,7 +207,8 @@ func TestQwenUsageStatusPreservesQuotaWhenPlanLookupFails(t *testing.T) {
 			break
 		}
 	}
-	if status == nil || status.QuotaStatus != "partial" || len(status.Windows) != 1 || status.Error == "" {
+	if status == nil || status.QuotaStatus != "partial" || len(status.Windows) != 1 || status.Error == "" ||
+		status.AccountIdentity != "saved-account@example.test" {
 		t.Fatalf("Qwen status = %+v; all statuses = %+v", status, statuses)
 	}
 	includeWindow = false
@@ -219,4 +223,41 @@ func TestQwenUsageStatusPreservesQuotaWhenPlanLookupFails(t *testing.T) {
 	if status == nil || !status.QuotaUsageKnown || len(status.Windows) != 0 {
 		t.Fatalf("successful empty quota response restored stale windows: %+v", status)
 	}
+}
+
+func TestQwenUsageStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "codex", "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := stored.Account(stored.SourcePath(store))
+	if !ok {
+		t.Fatal("stored Qwen account was not loadable")
+	}
+	client := &http.Client{Transport: qwenConsoleRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"code":"BailianGateway.Login.NotLogined","message":"login expired"}`
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+	ref := NewAccountRef(store, []accounts.Account{account}, client)
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{
+		AccessToken: "expired-console-token", Account: "saved-account@example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	statuses := ref.UsageStatuses(t.Context())
+	for _, status := range statuses {
+		if status.ID != stored.Email {
+			continue
+		}
+		if status.QuotaStatus != "login needed" || status.AccountIdentity != "saved-account@example.test" ||
+			!strings.Contains(status.Error, "sr qwen login 'qwen-token:work'") || strings.Count(status.Error, "login needed") != 1 {
+			t.Fatalf("expired Qwen status = %+v", status)
+		}
+		return
+	}
+	t.Fatal("Qwen status row was missing")
 }

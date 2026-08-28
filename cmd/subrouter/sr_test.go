@@ -2985,6 +2985,43 @@ func TestQwenRemoteStatusStillShowsQuotaStateWithoutLocalHealthProbe(t *testing.
 	}
 }
 
+func TestLocalQwenStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	store := accounts.DefaultCodexStore()
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := agentqwen.SaveConsoleCredential(stored.Email, agentqwen.ConsoleCredential{
+		AccessToken: "expired-console-token", Account: "saved-account@example.test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"code":"BailianGateway.Login.NotLogined","message":"login expired"}`
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.email != stored.Email {
+			continue
+		}
+		if row.quotaStatus != "login needed" || row.accountIdentity != "saved-account@example.test" || row.err == nil ||
+			!strings.Contains(row.err.Error(), "sr qwen login 'qwen-token:work'") || strings.Count(row.err.Error(), "login needed") != 1 {
+			t.Fatalf("expired local Qwen row = %+v", row)
+		}
+		return
+	}
+	t.Fatal("Qwen status row was missing")
+}
+
 func TestUsageRowsFromServerPreserveKeyIdentityAndSessions(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
 		ID:               "qwen-token:large-plan",

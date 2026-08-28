@@ -3,6 +3,8 @@ package qwen
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -83,6 +85,68 @@ func TestConsoleRequestDoesNotFollowRedirectWithBearerToken(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want exactly the original request", requests)
+	}
+}
+
+func TestConsoleRequestClassifiesExpiredLoginResponse(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"code":"BailianGateway.Login.NotLogined","message":"login expired"}`,
+			)),
+			Request: req,
+		}, nil
+	})}
+	err := callConsole(context.Background(), client, consoleConfig{
+		AccessToken: "expired-console-token", ConsoleRegion: defaultRegion, ConsoleSite: defaultSite,
+	}, usageAPI, nil, new(any))
+	if !errors.Is(err, ErrConsoleLoginRequired) {
+		t.Fatalf("console error = %v, want ErrConsoleLoginRequired", err)
+	}
+}
+
+func TestConsoleRequestDoesNotClassifyLoginMarkerOutsideExactCode(t *testing.T) {
+	for _, body := range []string{
+		`{"code":"Wrapper.BailianGateway.Login.NotLogined","message":"different error"}`,
+		`{"code":"Other.Error","message":"BailianGateway.Login.NotLogined"}`,
+		`{"data":{"message":"BailianGateway.Login.NotLogined"}}`,
+	} {
+		client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(body)), Request: req,
+			}, nil
+		})}
+		var output any
+		err := callConsole(context.Background(), client, consoleConfig{
+			AccessToken: "console-token", ConsoleRegion: defaultRegion, ConsoleSite: defaultSite,
+		}, usageAPI, nil, &output)
+		if errors.Is(err, ErrConsoleLoginRequired) {
+			t.Fatalf("response %s was misclassified as an expired login", body)
+		}
+	}
+}
+
+func TestStatusErrorDeduplicatesAndExplainsExpiredLogin(t *testing.T) {
+	expired := fmt.Errorf("usage: %w", ErrConsoleLoginRequired)
+	err := StatusError("qwen-token:work", expired, expired)
+	if err == nil {
+		t.Fatal("expired login errors were discarded")
+	}
+	message := err.Error()
+	if strings.Count(message, "login needed") != 1 ||
+		!strings.Contains(message, "sr qwen login 'qwen-token:work'") {
+		t.Fatalf("status error = %q", message)
+	}
+}
+
+func TestStatusErrorShellQuotesAccountID(t *testing.T) {
+	err := StatusError("qwen-token:team's $(unsafe); value", ErrConsoleLoginRequired)
+	want := `sr qwen login 'qwen-token:team'"'"'s $(unsafe); value'`
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("status error = %q, want safely quoted command %q", err, want)
 	}
 }
 

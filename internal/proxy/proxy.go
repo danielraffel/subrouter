@@ -995,6 +995,7 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 
 	switch provider {
 	case accounts.ProviderQwenToken:
+		status.AccountIdentity = agentqwen.ConsoleAccountIn(r.qwenRoot(), stored.Email)
 		hasCredential, credentialErr := agentqwen.HasConsoleCredentialIn(r.qwenRoot(), stored.Email)
 		if credentialErr != nil {
 			status.QuotaStatus = "error"
@@ -1009,7 +1010,6 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 		subscription, subscriptionErr := agentqwen.FetchSubscriptionIn(ctx, r.client, r.qwenRoot(), stored.Email)
 		if subscriptionErr == nil {
 			status.PlanType = subscription.Plan
-			status.AccountIdentity = agentqwen.ConsoleAccountIn(r.qwenRoot(), stored.Email)
 			if status.AccountIdentity == "" {
 				status.AccountIdentity = subscription.InstanceCode
 			}
@@ -1030,8 +1030,11 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 			status.UsageFresh = true
 		}
 		if usageErr != nil || subscriptionErr != nil {
-			status.Error = errors.Join(usageErr, subscriptionErr).Error()
-			if usageErr != nil && subscriptionErr != nil {
+			combinedErr := agentqwen.StatusError(stored.Email, usageErr, subscriptionErr)
+			status.Error = combinedErr.Error()
+			if errors.Is(combinedErr, agentqwen.ErrConsoleLoginRequired) {
+				status.QuotaStatus = "login needed"
+			} else if usageErr != nil && subscriptionErr != nil {
 				status.QuotaStatus = "error"
 			} else if subscriptionErr != nil || subscription.Status == "" || subscription.Status == "valid" {
 				status.QuotaStatus = "partial"

@@ -1226,6 +1226,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				wg.Add(1)
 				go func(idx int, accountID string) {
 					defer wg.Done()
+					rows[idx].accountIdentity = agentqwen.ConsoleAccount(accountID)
 					hasCredential, credentialErr := agentqwen.HasConsoleCredential(accountID)
 					if credentialErr != nil {
 						rows[idx].quotaStatus = "error"
@@ -1239,7 +1240,6 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					subscription, subscriptionErr := agentqwen.FetchSubscription(ctx, r.client, accountID)
 					if subscriptionErr == nil {
 						rows[idx].planType = subscription.Plan
-						rows[idx].accountIdentity = agentqwen.ConsoleAccount(accountID)
 						if rows[idx].accountIdentity == "" {
 							rows[idx].accountIdentity = subscription.InstanceCode
 						}
@@ -1259,8 +1259,10 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 						}
 					}
 					if usageErr != nil || subscriptionErr != nil {
-						rows[idx].err = errors.Join(usageErr, subscriptionErr)
-						if usageErr != nil && subscriptionErr != nil {
+						rows[idx].err = agentqwen.StatusError(accountID, usageErr, subscriptionErr)
+						if errors.Is(rows[idx].err, agentqwen.ErrConsoleLoginRequired) {
+							rows[idx].quotaStatus = "login needed"
+						} else if usageErr != nil && subscriptionErr != nil {
 							rows[idx].quotaStatus = "error"
 						} else if subscriptionErr != nil || subscription.Status == "" || subscription.Status == "valid" {
 							rows[idx].quotaStatus = "partial"
