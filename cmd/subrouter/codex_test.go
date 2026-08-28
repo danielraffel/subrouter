@@ -272,7 +272,7 @@ func TestCodexModelArgSupportsEqualsForm(t *testing.T) {
 }
 
 func TestCodexArgsDropsStaleSubrouterOverridesFromResume(t *testing.T) {
-	parentOverride := `model_providers={subrouter={name="Parent",base_url="http://parent-table.example/v1",wire_api="responses"}}`
+	parentOverride := `model_providers={subrouter={name="Parent",base_url="http://parent-table.example/v1",env_key="STALE",query_params={stale="1"},wire_api="responses"}}`
 	got := codexArgs([]string{
 		"resume",
 		"-c", parentOverride,
@@ -289,6 +289,9 @@ func TestCodexArgsDropsStaleSubrouterOverridesFromResume(t *testing.T) {
 	if strings.Contains(joined, "retired.invalid") || strings.Contains(joined, "supports_websockets=false") {
 		t.Fatalf("stale routing override survived:\n%s", joined)
 	}
+	if strings.Contains(joined, parentOverride) || strings.Contains(joined, `env_key="STALE"`) || strings.Contains(joined, `query_params={stale="1"}`) {
+		t.Fatalf("stale parent-table provider override survived:\n%s", joined)
+	}
 	for _, want := range []string{
 		`model_provider="subrouter"`,
 		`model_providers.subrouter.base_url="http://current.example/v1"`,
@@ -303,9 +306,25 @@ func TestCodexArgsDropsStaleSubrouterOverridesFromResume(t *testing.T) {
 	if strings.Count(joined, `model_provider="subrouter"`) != 1 {
 		t.Fatalf("model provider was not canonicalized:\n%s", joined)
 	}
-	if strings.LastIndex(joined, `model_providers.subrouter.base_url="http://current.example/v1"`) <
-		strings.Index(joined, parentOverride) {
-		t.Fatalf("authoritative provider block does not follow parent-table override:\n%s", joined)
+}
+
+func TestInlineTableOwnsSubrouterOnlyAtTheParentLevel(t *testing.T) {
+	for _, value := range []string{
+		`{subrouter={env_key="STALE"}}`,
+		`{"subrouter"={query_params={stale="1"}}}`,
+		`{subrouter.base_url="http://stale.invalid"}`,
+	} {
+		if !inlineTableOwnsSubrouter(value) {
+			t.Errorf("inlineTableOwnsSubrouter(%q) = false", value)
+		}
+	}
+	for _, value := range []string{
+		`{openai={name="mentions subrouter= only in a string"}}`,
+		`{openai={query_params={subrouter="not a provider"}}}`,
+	} {
+		if inlineTableOwnsSubrouter(value) {
+			t.Errorf("inlineTableOwnsSubrouter(%q) = true", value)
+		}
 	}
 }
 

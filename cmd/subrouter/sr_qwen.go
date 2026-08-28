@@ -127,6 +127,17 @@ func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []
 	if err != nil {
 		return err
 	}
+	usageStatuses, available, err := r.fetchServerUsageStatuses(ctx, server)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return fmt.Errorf("remote server cannot expose the selected Qwen key fingerprint; update Subrouter on %s before authorizing quota", server.Name)
+	}
+	expectedFingerprint, err := remoteQwenKeyFingerprint(usageStatuses, accountID)
+	if err != nil {
+		return err
+	}
 	reader := bufio.NewReader(r.in)
 	key, err := promptSecret(r.out, reader, r.in, "Qwen Token Plan API key for this remote account (used only for authorization): ")
 	if err != nil {
@@ -134,6 +145,9 @@ func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []
 	}
 	if !strings.HasPrefix(strings.TrimSpace(key), "sk-sp-") {
 		return fmt.Errorf("Qwen Token Plan API key must start with sk-sp-")
+	}
+	if actual := accounts.APIKeyFingerprint(key); actual != expectedFingerprint {
+		return fmt.Errorf("Qwen Token Plan API key does not match remote account %s", accountID)
 	}
 	stored := accounts.StoredCodexAccount{
 		Email:    accountID,
@@ -147,6 +161,20 @@ func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []
 	return r.qwenLoginStored(ctx, root, stored, consoleAccount, func(ctx context.Context, accountID string) error {
 		return r.syncQwenConsoleToServer(ctx, root, server, accountID)
 	})
+}
+
+func remoteQwenKeyFingerprint(statuses []remoteServerUsageStatus, accountID string) (string, error) {
+	for _, status := range statuses {
+		if status.ID != accountID {
+			continue
+		}
+		fingerprint := strings.TrimSpace(status.KeyFingerprint)
+		if fingerprint == "" {
+			return "", fmt.Errorf("remote Qwen account %s does not expose a key fingerprint; update the remote Subrouter before authorizing quota", accountID)
+		}
+		return fingerprint, nil
+	}
+	return "", fmt.Errorf("remote Qwen account %s is missing from usage status", accountID)
 }
 
 func matchRemoteQwenAccount(all []remoteServerAccount, selector string) (string, error) {

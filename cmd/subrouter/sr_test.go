@@ -739,6 +739,23 @@ func TestAddKeyHelpListsEveryAdditionalKeyedProvider(t *testing.T) {
 	}
 }
 
+func TestRemoteQwenKeyFingerprintRequiresSelectedAccount(t *testing.T) {
+	statuses := []remoteServerUsageStatus{
+		{ID: "qwen-token:other", KeyFingerprint: "key:1111111111"},
+		{ID: "qwen-token:work", KeyFingerprint: "key:2222222222"},
+	}
+	got, err := remoteQwenKeyFingerprint(statuses, "qwen-token:work")
+	if err != nil || got != "key:2222222222" {
+		t.Fatalf("fingerprint = %q err=%v", got, err)
+	}
+	if _, err := remoteQwenKeyFingerprint(statuses, "qwen-token:missing"); err == nil {
+		t.Fatal("missing selected remote Qwen account was accepted")
+	}
+	if _, err := remoteQwenKeyFingerprint([]remoteServerUsageStatus{{ID: "qwen-token:work"}}, "qwen-token:work"); err == nil {
+		t.Fatal("empty remote Qwen fingerprint was accepted")
+	}
+}
+
 func TestSRQwenRemovalRetainsAccountWhenCredentialCleanupFails(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.DefaultCodexStore()

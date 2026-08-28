@@ -297,7 +297,7 @@ func sanitizeCodexRoutingArgs(args []string) []string {
 }
 
 func isSubrouterOwnedCodexConfig(assignment string) bool {
-	key, _, ok := strings.Cut(strings.TrimSpace(assignment), "=")
+	key, value, ok := strings.Cut(strings.TrimSpace(assignment), "=")
 	if !ok {
 		return false
 	}
@@ -305,6 +305,9 @@ func isSubrouterOwnedCodexConfig(assignment string) bool {
 	// unquoted as TOML keys. For example, model_providers."subrouter" creates
 	// a different path and cannot replace model_providers.subrouter.
 	key = strings.TrimSpace(key)
+	if key == "model_providers" && inlineTableOwnsSubrouter(value) {
+		return true
+	}
 	switch key {
 	case "model_provider",
 		"openai_base_url",
@@ -315,6 +318,58 @@ func isSubrouterOwnedCodexConfig(assignment string) bool {
 	default:
 		return strings.HasPrefix(key, "model_providers.subrouter.")
 	}
+}
+
+func inlineTableOwnsSubrouter(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || value[0] != '{' {
+		return false
+	}
+	depth := 0
+	segmentStart := -1
+	var quote byte
+	escaped := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if quote == '"' && ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			quote = ch
+		case '{', '[':
+			depth++
+			if depth == 1 {
+				segmentStart = i + 1
+			}
+		case '}', ']':
+			depth--
+		case ',':
+			if depth == 1 {
+				segmentStart = i + 1
+			}
+		case '=':
+			if depth == 1 && segmentStart >= 0 {
+				candidate := strings.TrimSpace(value[segmentStart:i])
+				candidate = strings.Trim(candidate, `"'`)
+				if candidate == "subrouter" || strings.HasPrefix(candidate, "subrouter.") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func codexConfigArgs(
