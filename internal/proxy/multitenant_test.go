@@ -1652,6 +1652,52 @@ func TestTenantCodexOAuthUploadRequiresServerAttestedTransfer(t *testing.T) {
 	}
 }
 
+func TestTenantCodexOAuthUploadRejectsCapacityBeforeAttestation(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	for index := 0; index < maxAccountImportAccounts; index++ {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var refreshCalls atomic.Int32
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		refreshCalls.Add(1)
+		return nil, errors.New("attestation must not run at capacity")
+	})}
+	ref := NewAccountRef(store, nil, client)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+	server := Server{AccountRef: ref, MaxBodyBytes: 1 << 20}
+	idToken := proxyTestCodexJWT("new@example.com", "submitted-id", time.Now().Add(time.Hour))
+	response := httptest.NewRecorder()
+	handleTenantAccountUpload(&server, response, httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex","accountId":"new-routing-id","label":"New Codex",
+			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":%q}
+		}`, idToken)),
+	))
+	if response.Code != http.StatusInsufficientStorage {
+		t.Fatalf("upload status = %d, want %d; body = %s", response.Code, http.StatusInsufficientStorage, response.Body.String())
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("capacity rejection made %d attestation request(s)", refreshCalls.Load())
+	}
+	stored, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != maxAccountImportAccounts {
+		t.Fatalf("capacity rejection changed account count to %d", len(stored))
+	}
+}
+
 func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T) {
 	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
 	var submittedRefresh string

@@ -1087,6 +1087,17 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "Codex account already exists; use repair", http.StatusConflict)
 			return
 		}
+		canonicalID, capacityErr := server.ensureAccountImportCapacity(r.Context(), id, false)
+		if capacityErr != nil {
+			var limitErr *accountImportCapacityError
+			if errors.As(capacityErr, &limitErr) {
+				http.Error(w, limitErr.Error(), http.StatusInsufficientStorage)
+			} else {
+				http.Error(w, "check Codex account capacity", http.StatusInternalServerError)
+			}
+			return
+		}
+		id = canonicalID
 		account, err := attestTenantCodexOAuth(r.Context(), server.AccountRef.client, accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
@@ -1144,13 +1155,31 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
+		if err := lockMutexContext(r.Context(), &server.AccountRef.installMu); err != nil {
+			http.Error(w, "API key account update canceled", http.StatusRequestTimeout)
+			return
+		}
+		canonicalID, capacityErr := server.ensureAccountImportCapacity(r.Context(), id, false)
+		if capacityErr != nil {
+			server.AccountRef.installMu.Unlock()
+			var limitErr *accountImportCapacityError
+			if errors.As(capacityErr, &limitErr) {
+				http.Error(w, limitErr.Error(), http.StatusInsufficientStorage)
+			} else {
+				http.Error(w, "check API key account capacity", http.StatusInternalServerError)
+			}
+			return
+		}
+		id = canonicalID
 		if err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: provider,
 			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
 		}); err != nil {
+			server.AccountRef.installMu.Unlock()
 			http.Error(w, "save API key", http.StatusInternalServerError)
 			return
 		}
+		server.AccountRef.installMu.Unlock()
 	case "claude":
 		if input.ClaudeAIOAuth == nil || input.ClaudeAIOAuth.AccessToken == "" || input.ClaudeAIOAuth.RefreshToken == "" {
 			http.Error(w, "complete Claude OAuth tokens are required", http.StatusBadRequest)
@@ -1161,10 +1190,28 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		if _, err := server.AccountRef.claudeStore.UpsertCredentialProfile(input.Label, *input.ClaudeAIOAuth); err != nil {
+		if err := lockMutexContext(r.Context(), &server.AccountRef.installMu); err != nil {
+			http.Error(w, "Claude account update canceled", http.StatusRequestTimeout)
+			return
+		}
+		canonicalName, capacityErr := server.ensureAccountImportCapacity(r.Context(), id, true)
+		if capacityErr != nil {
+			server.AccountRef.installMu.Unlock()
+			var limitErr *accountImportCapacityError
+			if errors.As(capacityErr, &limitErr) {
+				http.Error(w, limitErr.Error(), http.StatusInsufficientStorage)
+			} else {
+				http.Error(w, "check Claude account capacity", http.StatusInternalServerError)
+			}
+			return
+		}
+		id = canonicalName
+		if _, err := server.AccountRef.claudeStore.UpsertCredentialProfile(id, *input.ClaudeAIOAuth); err != nil {
+			server.AccountRef.installMu.Unlock()
 			http.Error(w, "save Claude account", http.StatusInternalServerError)
 			return
 		}
+		server.AccountRef.installMu.Unlock()
 	default:
 		http.Error(w, "unsupported provider", http.StatusBadRequest)
 		return
