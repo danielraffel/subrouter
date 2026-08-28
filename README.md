@@ -531,14 +531,31 @@ sr add-key --provider opencode-zen
 Their client base URLs are respectively `/deepseek/v1`, `/together/v1`,
 `/fireworks/v1`, and `/opencode-zen/v1` beneath the Subrouter origin. Cursor
 and GitHub Copilot subscription credentials are not included in this API-key
-support: those products use their own login/session protocols, so Subrouter
-does not claim it can import or fail over their subscriptions.
+support. Cursor's public API manages Cloud Agents rather than exposing raw
+inference, and its CLI has its own authentication flow
+([API](https://cursor.com/docs/cloud-agent/api/endpoints),
+[CLI auth](https://docs.cursor.com/en/cli/reference/authentication)). The
+Copilot SDK speaks JSON-RPC to a Copilot CLI agent/session server rather than an
+OpenAI-compatible subscription endpoint
+([compatibility](https://docs.github.com/en/copilot/how-tos/copilot-sdk/troubleshooting/compatibility),
+[authentication](https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate),
+[SDK](https://github.com/github/copilot-sdk)). Subrouter therefore does not
+claim it can import or fail over either product's subscription.
 
 `sr status` groups these under their own provider rather than under Codex. Kimi
 OAuth subscriptions report their independent 5-hour and weekly windows and
 reset times from Kimi's usage endpoint. The condensed API-key rows report key
-health and only quota data the provider actually exposes; Kimi quota requires
-the OAuth subscription credential.
+health and only quota data the provider actually exposes.
+
+Antigravity OAuth is intentionally limited to the single CLI login available
+on a machine. The official CLI documents cached keyring sign-in/logout, but no
+token export or account selector, so Subrouter does not advertise binary token
+extraction or multi-account OAuth failover as upstream-ready. Direct
+`GEMINI_API_KEY` and Application Default Credentials are separate supported
+authentication paths, not additional selectable OAuth profiles
+([install](https://antigravity.google/docs/cli/install/),
+[headless auth](https://antigravity.google/docs/cli/headless/),
+[enterprise](https://antigravity.google/docs/enterprise/)).
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that

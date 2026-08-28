@@ -600,13 +600,7 @@ func serve(args []string) error {
 		}
 		initialAccounts, generation := accountRef.Snapshot()
 		accountGeneration = generation
-		for _, account := range initialAccounts {
-			if account.Provider == accounts.ProviderClaude {
-				claudeAccounts = append(claudeAccounts, account)
-			} else {
-				codexAccounts = append(codexAccounts, account)
-			}
-		}
+		codexAccounts, claudeAccounts = schedulerAccountsByProvider(initialAccounts)
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -867,6 +861,18 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+}
+
+func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {
+	for _, account := range all {
+		switch account.Provider {
+		case accounts.ProviderCodex:
+			codex = append(codex, account)
+		case accounts.ProviderClaude:
+			claude = append(claude, account)
+		}
+	}
+	return codex, claude
 }
 
 func validatePublicSubrouterURL(raw string) error {
@@ -1318,6 +1324,7 @@ func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.A
 }
 
 func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	codexAccounts, _ = schedulerAccountsByProvider(codexAccounts)
 	client := &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: proxy.NewOutboundTransport(),
@@ -1393,6 +1400,9 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 func fallbackScores(codexAccounts []accounts.Account) []selectacct.Score {
 	scores := make([]selectacct.Score, 0, len(codexAccounts))
 	for _, account := range codexAccounts {
+		if account.Provider != accounts.ProviderCodex {
+			continue
+		}
 		headroom := 1.0
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			headroom = 0.01

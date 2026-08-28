@@ -16,6 +16,31 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
+func TestSchedulerAccountsByProviderExcludesNonCodexPools(t *testing.T) {
+	all := []accounts.Account{
+		{ID: "codex", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+		{ID: "claude", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "kimi-oauth", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+		{ID: "kimi-key", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "grok", Provider: accounts.ProviderGrok, AuthMode: accounts.AuthModeOAuth},
+		{ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+		{ID: "qwen", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "legacy-empty-provider", AuthMode: accounts.AuthModeOAuth},
+	}
+	codex, claude := schedulerAccountsByProvider(all)
+	if len(codex) != 1 || codex[0].ID != "codex" {
+		t.Fatalf("Codex scheduler accounts = %+v", codex)
+	}
+	if len(claude) != 1 || claude[0].ID != "claude" {
+		t.Fatalf("Claude scheduler accounts = %+v", claude)
+	}
+
+	scores := fallbackScores(all)
+	if len(scores) != 1 || scores[0].AccountID != "codex" || scores[0].Provider != accounts.ProviderCodex {
+		t.Fatalf("Codex fallback scores = %+v", scores)
+	}
+}
+
 func TestSecretValueUsesFileEnvironmentWithoutOverridingFlag(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tenant-secret")
 	if err := os.WriteFile(path, []byte("file-secret\n"), 0o600); err != nil {

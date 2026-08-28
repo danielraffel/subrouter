@@ -149,6 +149,54 @@ func TestTenantCredentialLeaseReturnsAccessOnlyRefreshedCredential(t *testing.T)
 	}
 }
 
+func TestTenantCredentialLeaseCanonicalizesQwenAnthropicToTokenPlanAccount(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+			AuthMode: accounts.AuthModeAPIKey, Token: "leased-token-plan-key",
+		}},
+		Scheduler: selectacct.NewScheduler(nil),
+	}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/_subrouter/leases",
+		strings.NewReader(`{
+			"provider":"qwen-anthropic",
+			"agentType":"qwen-console-setup",
+			"sessionId":"qwen-console:qwen-token:work",
+			"preferAccountId":"qwen-token:work",
+			"requiredAuthMode":"apikey"
+		}`),
+	)
+	response := httptest.NewRecorder()
+	newTenantCredentialLeaseStore().handleIssue(
+		&server,
+		tenant.Tenant{ID: "team"},
+		response,
+		request,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Lease struct {
+			AccountID string `json:"accountId"`
+			Provider  string `json:"provider"`
+			AuthMode  string `json:"authMode"`
+			Token     string `json:"token"`
+		} `json:"lease"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Lease.AccountID != "qwen-token:work" ||
+		envelope.Lease.Provider != string(accounts.ProviderQwenToken) ||
+		envelope.Lease.AuthMode != string(accounts.AuthModeAPIKey) ||
+		envelope.Lease.Token != "leased-token-plan-key" {
+		t.Fatalf("Qwen lease = %+v", envelope.Lease)
+	}
+}
+
 func TestTenantCredentialLeaseRejectsUnknownOrMalformedRequests(t *testing.T) {
 	t.Parallel()
 

@@ -3,10 +3,12 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -94,6 +96,62 @@ func TestConfiguredProviderRoutesEndToEnd(t *testing.T) {
 	}})
 	if len(statuses) != 1 || !slices.Equal(statuses[0].ProviderEndpoints, []string{"/acme-relay"}) {
 		t.Fatalf("declared-provider endpoints = %+v, want /acme-relay", statuses)
+	}
+}
+
+func TestConfiguredProviderFailsOverAndCommitsStickyAccount(t *testing.T) {
+	resetConfiguredProviders(t)
+	var attempts []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.Header.Get("Authorization") {
+		case "Bearer primary-key":
+			attempts = append(attempts, "primary")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"quota exceeded"}}`)
+		case "Bearer secondary-key":
+			attempts = append(attempts, "secondary")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+		default:
+			t.Error("upstream received an unexpected configured-provider key")
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{
+		Name: "acme-relay", BaseURL: upstream.URL + "/v1",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := accounts.Provider("acme-relay")
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "acme-relay:a-primary", Provider: provider, AuthMode: accounts.AuthModeAPIKey, Token: "primary-key"},
+			{ID: "acme-relay:z-secondary", Provider: provider, AuthMode: accounts.AuthModeAPIKey, Token: "secondary-key"},
+		},
+		Sessions: store, SchedulerRef: schedulerRef, MaxBodyBytes: 1024,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/acme-relay/chat/completions", strings.NewReader(`{"model":"acme-model","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "acme-failover")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if want := []string{"primary", "secondary"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("configured-provider attempts = %v, want %v", attempts, want)
+	}
+	if !schedulerRef.Get().Exhausted(provider, "acme-relay:a-primary") {
+		t.Fatal("quota-limited configured-provider key was not exhausted")
+	}
+	assignment, ok := store.Get("acme-relay", "acme-failover")
+	if !ok || assignment.AccountID != "acme-relay:z-secondary" {
+		t.Fatalf("configured-provider sticky assignment = %+v, want secondary key", assignment)
 	}
 }
 

@@ -45,6 +45,8 @@ func TestRetryableUpstreamPostRequestAdditionalKeyedProviders(t *testing.T) {
 		return httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}"))
 	}
 	for _, provider := range []accounts.Provider{
+		accounts.ProviderOpenRouter,
+		accounts.ProviderQwen,
 		accounts.ProviderDeepSeek,
 		accounts.ProviderTogether,
 		accounts.ProviderFireworks,
@@ -106,6 +108,13 @@ func TestGrokFailoverRetargetsBetweenAPIAndSubscriptionUpstreams(t *testing.T) {
 	}
 	if apiCalls != 1 || subscriptionCalls != 1 {
 		t.Fatalf("upstream calls api=%d subscription=%d, want one each", apiCalls, subscriptionCalls)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderGrok, "grok:a-api") {
+		t.Fatal("quota-limited Grok API key was not exhausted")
+	}
+	assignment, ok := store.Get("grok", "grok-mixed-auth")
+	if !ok || assignment.AccountID != "grok:z-subscription" {
+		t.Fatalf("Grok sticky assignment = %+v, want subscription account", assignment)
 	}
 }
 
@@ -200,6 +209,8 @@ func TestDeepSeek429FailsOverWithoutCookingTheKey(t *testing.T) {
 
 func TestAdditionalKeyedProvidersFailOverOn429AndCommitStickyAccount(t *testing.T) {
 	for _, provider := range []accounts.Provider{
+		accounts.ProviderOpenRouter,
+		accounts.ProviderQwen,
 		accounts.ProviderDeepSeek,
 		accounts.ProviderTogether,
 		accounts.ProviderFireworks,
@@ -255,6 +266,56 @@ func TestAdditionalKeyedProvidersFailOverOn429AndCommitStickyAccount(t *testing.
 				t.Fatalf("primary exhausted = %v, want %v", got, wantExhausted)
 			}
 		})
+	}
+}
+
+func TestKimiAPIKeysFailOverOnAuthoritativeQuotaAndCommitStickyAccount(t *testing.T) {
+	var attempts []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.Header.Get("Authorization") {
+		case "Bearer primary-key":
+			attempts = append(attempts, "primary")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":{"message":"You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends."}}`)
+		case "Bearer secondary-key":
+			attempts = append(attempts, "secondary")
+			_, _ = io.WriteString(w, `{"id":"msg_ok","content":[]}`)
+		default:
+			t.Error("upstream received an unexpected Kimi credential")
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "kimi:a-primary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeAPIKey, Token: "primary-key"},
+			{ID: "kimi:z-secondary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeAPIKey, Token: "secondary-key"},
+		},
+		Sessions: store, SchedulerRef: schedulerRef,
+		KimiUpstream: mustParseURL(t, upstream.URL+"/coding/v1"), MaxBodyBytes: 1024,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/kimi/v1/messages", strings.NewReader(`{"model":"kimi-for-coding","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "kimi-api-key-failover")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if want := []string{"primary", "secondary"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("Kimi API-key attempts = %v, want %v", attempts, want)
+	}
+	if !schedulerRef.Get().Exhausted(accounts.ProviderKimi, "kimi:a-primary") {
+		t.Fatal("quota-limited Kimi API key was not exhausted")
+	}
+	assignment, ok := store.Get("kimi", "kimi-api-key-failover")
+	if !ok || assignment.AccountID != "kimi:z-secondary" {
+		t.Fatalf("Kimi API-key sticky assignment = %+v, want secondary key", assignment)
 	}
 }
 
