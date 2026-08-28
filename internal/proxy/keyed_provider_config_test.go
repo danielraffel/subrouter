@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -158,7 +159,9 @@ func TestConfiguredProviderFailsOverAndCommitsStickyAccount(t *testing.T) {
 func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
 	resetConfiguredProviders(t)
 	var gotAuthorization string
+	var healthRequests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		healthRequests.Add(1)
 		gotAuthorization = r.Header.Get("Authorization")
 		if r.URL.Path != "/models" {
 			t.Fatalf("health path = %q, want /models", r.URL.Path)
@@ -201,6 +204,37 @@ func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
 	}
 	if gotAuthorization != "Bearer test-provider-key" {
 		t.Fatal("configured upstream did not receive the selected provider credential")
+	}
+	if got := healthRequests.Load(); got != 1 {
+		t.Fatalf("configured upstream health requests = %d, want 1", got)
+	}
+}
+
+func TestKeyedProviderHealthPreservesSpecificPlan(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID: "qwen-token:main", Provider: accounts.ProviderQwenToken,
+			AuthMode: accounts.AuthModeAPIKey, Token: "test-provider-key",
+		}},
+		QwenTokenUpstream: upstreamURL,
+	}
+	statuses := server.withKeyedProviderHealth(t.Context(), []AccountUsageStatus{{
+		AccountStatus: AccountStatus{
+			ID: "qwen-token:main", Provider: accounts.ProviderQwenToken,
+			AuthMode: accounts.AuthModeAPIKey,
+		},
+		PlanType: "Pro",
+	}})
+	if len(statuses) != 1 || statuses[0].PlanType != "Pro" {
+		t.Fatalf("enriched plan = %+v, want Pro", statuses)
 	}
 }
 

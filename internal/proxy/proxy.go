@@ -968,7 +968,7 @@ func apiKeyPlanType(provider accounts.Provider) string {
 }
 
 func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.StoredCodexAccount, status AccountUsageStatus) AccountUsageStatus {
-	provider := stored.ProviderOrDefault()
+	provider := accountProviderFor(stored.ProviderOrDefault())
 	account, ok := stored.Account(stored.SourcePath(r.store))
 	if !ok {
 		status.Error = "API-key account has no credential"
@@ -976,6 +976,10 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 	}
 	probe := ProbeProviderKeyStatus(ctx, r.client, provider, r.apiKeyUpstream(provider), account.Token)
 	status.ProviderHealth = probe.State
+	if probe.Models >= 0 {
+		models := probe.Models
+		status.ProviderModels = &models
+	}
 	status.AuthChecked = probe.State != ""
 	status.AuthValid = probe.State == "auth ok"
 	status.QuotaStatus = probe.QuotaStatus
@@ -1074,8 +1078,13 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			status.AuthMode = accounts.AuthModeAPIKey
 			status.KeyFingerprint = accounts.APIKeyFingerprint(stored.Auth.OpenAIAPIKey)
 			status.PlanType = apiKeyPlanType(provider)
+			requestedEntry, keyedProvider := keyedProviderForName(string(provider))
+			if keyedProvider {
+				status.Provider = accountProviderFor(requestedEntry.Provider)
+				status.ProviderEndpoints = ProviderEndpoints(requestedEntry.Provider)
+			}
 			out[i] = status
-			if _, keyedProvider := keyedProviderFor(provider); keyedProvider {
+			if keyedProvider {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -1684,7 +1693,6 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.AccountRef != nil {
 		statuses := s.AccountRef.UsageStatuses(r.Context())
-		statuses = s.withKeyedProviderHealth(r.Context(), statuses)
 		s.updateSchedulerFromUsageStatusesContext(r.Context(), statuses)
 		writeJSON(w, s.withSessionCounts(s.withRequestTimeExhaustionWindows(statuses)))
 		return
@@ -1795,7 +1803,9 @@ func (s Server) withKeyedProviderHealth(ctx context.Context, statuses []AccountU
 			continue
 		}
 		out[i].Provider = owner
-		out[i].PlanType = healthEntry.PlanLabel
+		if strings.TrimSpace(out[i].PlanType) == "" {
+			out[i].PlanType = healthEntry.PlanLabel
+		}
 		out[i].ProviderHealth = "not checked"
 		out[i].ProviderEndpoints = ProviderEndpoints(requestedEntry.Provider)
 		account, ok := byID[status.ID]
