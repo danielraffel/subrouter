@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 )
 
@@ -184,6 +187,101 @@ func TestProxyClaudeAllowsProfilelessFlagAndRunInvocations(t *testing.T) {
 		if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
 			t.Fatalf("args for %v = %v, want %v", input, args, want)
 		}
+	}
+}
+
+func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tenantKey string
+		wantBase  string
+		wantToken string
+	}{
+		{name: "trusted legacy", wantBase: "https://m3.example", wantToken: "subrouter"},
+		{name: "tenant", tenantKey: "srt_team", wantBase: "https://m3.example/t/srt_team", wantToken: "srt_team"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+			serverStore := defaultSRServerStore(store)
+			if err := serverStore.save(srServerFile{
+				Default: "m3-pilot",
+				Servers: []srServerConfig{{
+					Name:      "m3-pilot",
+					URL:       "https://m3.example/v1",
+					TenantKey: tc.tenantKey,
+				}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			binDir := filepath.Join(home, "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			recordPath := filepath.Join(home, "claude-proxy.txt")
+			claudePath := filepath.Join(binDir, "claude")
+			script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\nbase=%s\\ntoken=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\"; } > " + shellQuote(recordPath) + "\n"
+			if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("HOME", home)
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "/must-not-leak")
+
+			runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+			if err := runner.claude(context.Background(), []string{"proxy", "--resume", "session-a", "--model", "opus"}); err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(body)
+			for _, want := range []string{
+				"config=\n",
+				"args=--resume session-a --model opus\n",
+				"base=" + tc.wantBase + "\n",
+				"token=" + tc.wantToken + "\n",
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("proxy invocation missing %q:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestSRClaudeBareRemainsProfileManager(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	var out bytes.Buffer
+	runner := srRunner{
+		store:  accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")},
+		in:     strings.NewReader(""),
+		out:    &out,
+		errOut: &out,
+		client: http.DefaultClient,
+	}
+	if err := runner.claude(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "No Claude profiles") {
+		t.Fatalf("bare command did not show profile manager output: %q", out.String())
+	}
+	if strings.Contains(out.String(), "daemon") {
+		t.Fatalf("bare command attempted daemon management: %q", out.String())
+	}
+}
+
+func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
+	var out bytes.Buffer
+	runner := srRunner{out: &out, errOut: &out}
+	if err := runner.claude(context.Background(), []string{"help"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "sr claude proxy [args...]") {
+		t.Fatalf("help missing proxy command:\n%s", out.String())
 	}
 }
 

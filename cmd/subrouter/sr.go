@@ -121,7 +121,8 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
-  sr claude [args]      Run claude through Subrouter
+  sr claude proxy [args]
+                        Run Claude profilelessly through the selected server
   sr gemini [args]      Run gemini through Subrouter
 
   sr server             Legacy form of sr remote

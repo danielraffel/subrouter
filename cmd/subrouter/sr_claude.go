@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
-	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -31,6 +30,7 @@ Usage:
   sr claude env                 Print export CLAUDE_CONFIG_DIR=...
   sr claude push [name]         Upload a profile to the default Subrouter server pool
   sr claude pick                Switch to the profile with the most quota left
+  sr claude proxy [args...]     Launch Claude profilelessly through the selected server
   sr claude run [name] [...]    Launch Claude with a specific profile
   sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
@@ -57,42 +57,8 @@ type claudeRunner struct {
 }
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
-	// Launching Claude needs a live daemon; account management does not. Start
-	// the daemon only for the launching forms so `sr claude list` stays quiet.
 	if claudeLaunchesAgent(args) {
-		config, err := cloudModeConfig()
-		if err != nil {
-			return fmt.Errorf("load cmux.com login: %w", err)
-		}
-		source := config.EffectiveCredentialSource()
-		if source == broker.CredentialSourceTeam && !config.Ready() {
-			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
-		}
-		if source == broker.CredentialSourceHosted {
-			server, ok, err := r.selectedRemoteServer()
-			if err != nil {
-				return err
-			}
-			if !ok || server.Name != "cmux" || server.TenantKey == "" {
-				return fmt.Errorf("hosted cmux remote is unavailable; run '%s login'", programBase())
-			}
-			return r.proxyClaudeTo(ctx, args, serverProxyRootURL(server), server.TenantKey)
-		}
-		if source == broker.CredentialSourceTeam ||
-			source == broker.CredentialSourceLocal {
-			if !ensureLocalHealthy(
-				ctx,
-				fallbackHTTPClient(),
-				localBaseURL(),
-				defaultDaemonStarter(),
-				r.errOut,
-			) {
-				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
-			}
-			localProxyToken := cloudClientProxyToken(config, localBaseURL())
-			return r.proxyClaude(ctx, args, localProxyToken)
-		}
-		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
+		return r.proxyClaudeSelectedRemote(ctx, args[1:])
 	}
 	cr := claudeRunner{
 		store:        claude.DefaultStore(),
@@ -105,6 +71,25 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		pick:         r.pickClaudeProfile,
 	}
 	return cr.run(ctx, args)
+}
+
+// proxyClaudeSelectedRemote launches Claude without consulting any local
+// profile. The selected server owns account selection and failover; legacy
+// trusted-tailnet servers accept the same non-secret compatibility token used
+// by other profileless proxy clients.
+func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string) error {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no remote Subrouter server selected; run '%s remote use <name>'", r.programOrSubrouter())
+	}
+	proxyToken := strings.TrimSpace(server.TenantKey)
+	if proxyToken == "" {
+		proxyToken = "subrouter"
+	}
+	return r.proxyClaudeArgsTo(ctx, args, serverProxyRootURL(server), proxyToken)
 }
 
 // cloudClaude launches Claude against the local proxy. The proxy leases an
@@ -146,11 +131,30 @@ func (r srRunner) proxyClaudeTo(
 	if err != nil {
 		return err
 	}
+	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir)
+}
+
+func (r srRunner) proxyClaudeArgsTo(
+	ctx context.Context,
+	args []string,
+	baseURL string,
+	proxyToken string,
+) error {
+	return r.runProxyClaude(ctx, args, baseURL, proxyToken, "")
+}
+
+func (r srRunner) runProxyClaude(
+	ctx context.Context,
+	args []string,
+	baseURL string,
+	proxyToken string,
+	configDir string,
+) error {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
@@ -762,6 +766,8 @@ var claudeRoutingEnvKeys = []string{
 	"ANTHROPIC_BASE_URL",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_API_KEY",
+	"CLAUDE_CONFIG_DIR",
+	"CLAUDE_CODE_CONFIG_DIR",
 	"CLAUDE_CODE_USE_BEDROCK",
 	"ANTHROPIC_BEDROCK_BASE_URL",
 	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
