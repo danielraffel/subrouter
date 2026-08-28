@@ -773,6 +773,32 @@ func TestSRQwenLoginPreparesBrowserAuthAndStoresIdentity(t *testing.T) {
 	}
 }
 
+func TestSRQwenLoginPreservesCompletedAuthorizationWhenDurableSaveFails(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "blocked-root")
+	if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := &qwenLoginCommandRunner{}
+	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: command}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	err := runner.qwenLoginStored(t.Context(), root, stored, "person@example.com", nil)
+	if err == nil || !strings.Contains(err.Error(), "authorization preserved at") {
+		t.Fatalf("login error = %v, want preserved-authorization location", err)
+	}
+	stageRoot := filepath.Dir(command.configDir)
+	t.Cleanup(func() { _ = os.RemoveAll(stageRoot) })
+	credential, exportErr := agentqwen.ExportConsoleCredentialIn(stageRoot, stored.Email)
+	if exportErr != nil {
+		t.Fatalf("completed staged authorization was removed: %v", exportErr)
+	}
+	if credential.AccessToken != "console-secret" || credential.Account != "person@example.com" {
+		t.Fatalf("preserved credential = %+v", credential)
+	}
+}
+
 func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -867,8 +893,9 @@ func TestSRQwenLoginTargetsSelectedRemoteAccount(t *testing.T) {
 }
 
 type qwenLoginCommandRunner struct {
-	name string
-	args []string
+	name      string
+	args      []string
+	configDir string
 }
 
 func (r *qwenLoginCommandRunner) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -884,6 +911,7 @@ func (r *qwenLoginCommandRunner) RunWithEnv(_ context.Context, name string, args
 			configDir = strings.TrimPrefix(value, "BAILIAN_CONFIG_DIR=")
 		}
 	}
+	r.configDir = configDir
 	body, err := os.ReadFile(filepath.Join(configDir, "config.json"))
 	if err != nil {
 		return err

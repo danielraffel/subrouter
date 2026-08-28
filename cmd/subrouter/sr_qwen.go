@@ -287,8 +287,9 @@ func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accou
 		return fmt.Errorf("prepare temporary Qwen login profile: %w", err)
 	}
 	stageRemoved := false
+	preserveStage := false
 	defer func() {
-		if !stageRemoved {
+		if !stageRemoved && !preserveStage {
 			_ = os.RemoveAll(stageRoot)
 		}
 	}()
@@ -322,11 +323,18 @@ func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accou
 		return removeQwenLoginStage(stageRoot, &stageRemoved, err)
 	}
 	credential.Account = consoleAccount
-	if err := removeQwenLoginStage(stageRoot, &stageRemoved, nil); err != nil {
-		return err
+	if err := agentqwen.SaveConsoleCredentialIn(stageRoot, stored.Email, credential); err != nil {
+		return removeQwenLoginStage(stageRoot, &stageRemoved, fmt.Errorf("preserve completed Alibaba authorization: %w", err))
 	}
 	if err := agentqwen.SaveConsoleCredentialIn(root, stored.Email, credential); err != nil {
-		return fmt.Errorf("save Alibaba console credential: %w", err)
+		// Keep the completed browser authorization recoverable when the durable
+		// destination is temporarily unwritable. It contains a credential, so the
+		// error names the private staging directory explicitly for recovery.
+		preserveStage = true
+		return fmt.Errorf("save Alibaba console credential (authorization preserved at %s): %w", stageRoot, err)
+	}
+	if err := removeQwenLoginStage(stageRoot, &stageRemoved, nil); err != nil {
+		return err
 	}
 	if syncCredential != nil {
 		if err := syncCredential(ctx, stored.Email); err != nil {

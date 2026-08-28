@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -330,23 +331,35 @@ const accountID = "antigravity"
 
 // Store adapts the CLI's keychain credential to the proxy's OAuth account
 // source.
-type Store struct{}
+type Store struct {
+	mu                sync.Mutex
+	cached            CredentialInfo
+	readCredential    func(context.Context, time.Time) (CredentialInfo, bool, error)
+	refreshCredential func(context.Context, *http.Client, CredentialInfo, time.Time) (CredentialInfo, error)
+}
 
 // Provider implements the proxy's OAuth account source.
-func (Store) Provider() account.Provider {
+func (*Store) Provider() account.Provider {
 	return account.ProviderAntigravity
 }
 
 // ListAccounts surfaces the CLI credential as one account, or none when the
 // CLI is not signed in.
-func (Store) ListAccounts(ctx context.Context) ([]account.Account, error) {
-	credential, ok, err := ReadLocalCredential(ctx, time.Now())
+func (s *Store) ListAccounts(ctx context.Context) ([]account.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if s.cached.AccessToken != "" && !s.cached.NeedsRefresh(now) {
+		return []account.Account{credentialAccount(s.cached)}, nil
+	}
+	credential, ok, err := s.read(ctx, now)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, nil
 	}
+	s.cached = credential
 	return []account.Account{credentialAccount(credential)}, nil
 }
 
@@ -354,19 +367,48 @@ func (Store) ListAccounts(ctx context.Context) ([]account.Account, error) {
 // expiry. Unlike the Claude and Kimi stores it does not write the refreshed
 // pair back: Google does not rotate the refresh token on exchange, so the CLI
 // keeps its own credential valid and both sides refresh independently.
-func (Store) RefreshAccount(ctx context.Context, client *http.Client, acct account.Account) (account.Account, error) {
-	credential, ok, err := ReadLocalCredential(ctx, time.Now())
+func (s *Store) RefreshAccount(ctx context.Context, client *http.Client, acct account.Account) (account.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if s.cached.AccessToken != "" && !s.cached.NeedsRefresh(now) {
+		return credentialAccount(s.cached), nil
+	}
+	credential, ok, err := s.read(ctx, now)
 	if err != nil || !ok {
 		return acct, err
 	}
-	if !credential.NeedsRefresh(time.Now()) {
+	// A prior refresh may have rotated the refresh token even though the CLI's
+	// keychain entry is unchanged. Continue from the in-process credential when
+	// available; otherwise the stale keychain token can force a refresh on every
+	// request or eventually fail after rotation.
+	if s.cached.RefreshToken != "" {
+		credential = s.cached
+	}
+	if !credential.NeedsRefresh(now) {
+		s.cached = credential
 		return credentialAccount(credential), nil
 	}
-	refreshed, err := RefreshCredential(ctx, client, credential, time.Now())
+	refreshed, err := s.refresh(ctx, client, credential, now)
 	if err != nil {
 		return acct, err
 	}
+	s.cached = refreshed
 	return credentialAccount(refreshed), nil
+}
+
+func (s *Store) read(ctx context.Context, now time.Time) (CredentialInfo, bool, error) {
+	if s.readCredential != nil {
+		return s.readCredential(ctx, now)
+	}
+	return ReadLocalCredential(ctx, now)
+}
+
+func (s *Store) refresh(ctx context.Context, client *http.Client, credential CredentialInfo, now time.Time) (CredentialInfo, error) {
+	if s.refreshCredential != nil {
+		return s.refreshCredential(ctx, client, credential, now)
+	}
+	return RefreshCredential(ctx, client, credential, now)
 }
 
 func credentialAccount(credential CredentialInfo) account.Account {

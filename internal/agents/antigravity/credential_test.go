@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/manaflow-ai/subrouter/account"
 )
 
 var reference = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
@@ -122,6 +124,39 @@ func TestNeedsRefreshUsesTheSameLeadAsTheCLI(t *testing.T) {
 	empty := CredentialInfo{ExpiresAt: reference.Add(time.Hour)}
 	if !empty.NeedsRefresh(reference) {
 		t.Fatal("a credential with no access token always needs a refresh")
+	}
+}
+
+func TestStoreCachesRefreshedCredentialUntilItExpires(t *testing.T) {
+	now := time.Now().UTC()
+	reads := 0
+	refreshes := 0
+	store := &Store{
+		readCredential: func(context.Context, time.Time) (CredentialInfo, bool, error) {
+			reads++
+			return CredentialInfo{AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: now.Add(-time.Minute)}, true, nil
+		},
+		refreshCredential: func(_ context.Context, _ *http.Client, credential CredentialInfo, _ time.Time) (CredentialInfo, error) {
+			refreshes++
+			credential.AccessToken = "fresh"
+			credential.ExpiresAt = now.Add(time.Hour)
+			return credential, nil
+		},
+	}
+
+	first, err := store.RefreshAccount(t.Context(), http.DefaultClient, account.Account{Token: "expired"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.RefreshAccount(t.Context(), http.DefaultClient, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Token != "fresh" || second.Token != "fresh" {
+		t.Fatalf("tokens = %q, %q, want cached fresh token", first.Token, second.Token)
+	}
+	if reads != 1 || refreshes != 1 {
+		t.Fatalf("keychain reads=%d refreshes=%d, want one each", reads, refreshes)
 	}
 }
 

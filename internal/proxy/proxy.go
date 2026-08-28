@@ -6559,6 +6559,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		attemptReq.Body = body
 		attemptReq.GetBody = req.GetBody
 		attemptReq.ContentLength = req.ContentLength
+		// A provider may route API-key and subscription credentials to different
+		// hosts (Grok does). Rebuild the target from the replacement account so a
+		// mixed-auth failover never sends a credential to the previous account's
+		// upstream.
+		if nextUpstream := t.server.upstreamForRequest(t.path, nextAccount); nextUpstream != nil {
+			attemptReq.URL.Scheme = nextUpstream.Scheme
+			attemptReq.URL.Host = nextUpstream.Host
+			attemptReq.URL.User = nextUpstream.User
+			attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.path)
+			attemptReq.URL.RawPath = ""
+		}
 		setAccountAuthHeaders(attemptReq.Header, nextAccount, t.poolModel)
 		if t.logger != nil {
 			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
