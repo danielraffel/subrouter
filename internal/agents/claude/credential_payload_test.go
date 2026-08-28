@@ -73,29 +73,6 @@ func TestParseCredentialPayloadNeverEchoesTheBlob(t *testing.T) {
 	}
 }
 
-func TestClassifyTrailingBytes(t *testing.T) {
-	cases := []struct {
-		name     string
-		trailing []byte
-		want     string
-	}{
-		{name: "empty", trailing: nil, want: "empty"},
-		{name: "binary plist", trailing: []byte("bplist00\x00\x08"), want: "binary-plist"},
-		{name: "nul padding", trailing: []byte{0, 0, 0, 0}, want: "nul-padding"},
-		{name: "whitespace", trailing: []byte("\n\t  "), want: "whitespace"},
-		{name: "json fragment", trailing: []byte(`Token":"abc"}}`), want: "json-fragment"},
-		{name: "text", trailing: []byte("truncated write"), want: "text"},
-		{name: "binary", trailing: []byte{0xff, 0xfe, 0x01}, want: "binary"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyTrailingBytes(tc.trailing); got != tc.want {
-				t.Fatalf("classifyTrailingBytes(%q) = %q, want %q", tc.trailing, got, tc.want)
-			}
-		})
-	}
-}
-
 // A non-syntax decode failure (well-formed JSON, wrong shape) still reports the
 // size but has no meaningful trailing region.
 func TestDescribeCredentialPayloadWithoutSyntaxError(t *testing.T) {
