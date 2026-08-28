@@ -2380,3 +2380,13 @@ func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
 		t.Fatalf("account list presented uncached health: %#v", items[0])
 	}
 }
+
+func TestTenantFallbackScoresUseSharedCredentialOwner(t *testing.T) {
+	scores := tenantFallbackScores([]accounts.Account{{
+		ID: "qwen-anthropic:work", Provider: accounts.ProviderQwenAnthropic,
+		AuthMode: accounts.AuthModeAPIKey, Token: "key",
+	}})
+	if len(scores) != 1 || scores[0].Provider != accounts.ProviderQwenToken {
+		t.Fatalf("fallback scores = %+v, want canonical Qwen Token Plan owner", scores)
+	}
+}
