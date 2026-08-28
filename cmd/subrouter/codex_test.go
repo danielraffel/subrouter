@@ -358,6 +358,16 @@ func TestCodexArgsDropsStaleSubrouterOverridesFromResume(t *testing.T) {
 	if strings.Count(joined, `model_provider="subrouter"`) != 1 {
 		t.Fatalf("model provider was not canonicalized:\n%s", joined)
 	}
+	lastAssignment := ""
+	for i := 0; i+1 < len(got); i++ {
+		if got[i] == "-c" || got[i] == "--config" {
+			lastAssignment = got[i+1]
+			i++
+		}
+	}
+	if !strings.HasPrefix(lastAssignment, `model_providers.subrouter={`) || strings.Contains(lastAssignment, "Parent") {
+		t.Fatalf("last config is not the authoritative whole provider table: %q", lastAssignment)
+	}
 }
 
 func TestInlineTableOwnsSubrouterOnlyAtTheParentLevel(t *testing.T) {
@@ -377,16 +387,6 @@ func TestInlineTableOwnsSubrouterOnlyAtTheParentLevel(t *testing.T) {
 		if inlineTableOwnsSubrouter(value) {
 			t.Errorf("inlineTableOwnsSubrouter(%q) = true", value)
 		}
-	}
-	lastAssignment := ""
-	for i := 0; i+1 < len(got); i++ {
-		if got[i] == "-c" || got[i] == "--config" {
-			lastAssignment = got[i+1]
-			i++
-		}
-	}
-	if !strings.HasPrefix(lastAssignment, `model_providers.subrouter={`) || strings.Contains(lastAssignment, "Parent") {
-		t.Fatalf("last config is not the authoritative whole provider table: %q", lastAssignment)
 	}
 }
 

@@ -217,6 +217,10 @@ Claude Code:
 - Read profile metadata from `~/.subrouter/codex/claude.json`.
 - Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
 - Profile switching, env output, run, remove, and OAuth login are native Go commands under `sr claude`.
+- Bare `sr claude` manages local profiles. `sr claude proxy [claude args...]` is
+  the explicit profileless pooled launcher: it uses the selected Subrouter
+  server, needs no local daemon when that server is remote, and passes Claude
+  arguments through unchanged.
 
 Gemini:
 

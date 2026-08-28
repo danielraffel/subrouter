@@ -446,7 +446,15 @@ sr claude list
 sr claude switch <profile>
 sr claude env
 sr claude run <profile>
+sr claude proxy [claude args...]
 ```
+
+Bare `sr claude` opens the local profile manager, and `sr claude run <profile>`
+launches one managed local profile directly. `sr claude proxy [claude args...]`
+instead launches Claude profilelessly through the selected Subrouter server's
+pooled Claude accounts. When the selected server is remote, this needs neither
+local Claude profiles nor a local Subrouter daemon; Claude arguments such as
+`--resume <session-id>` pass through unchanged.
 
 Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Generate a long-lived token with `claude setup-token`, then configure the Claude user settings env:
 
