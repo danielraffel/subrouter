@@ -154,6 +154,31 @@ func TestCredentialFailureAtomicallyAdvancesAccountSnapshot(t *testing.T) {
 	}
 }
 
+func TestAccountCredentialSnapshotCannotRegressGeneration(t *testing.T) {
+	old := account.Account{
+		ID: "reloaded@example.com", Provider: account.ProviderCodex,
+		CredentialVersion: "old-refresh-chain",
+	}
+	current := old
+	current.CredentialVersion = "current-refresh-chain"
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.AdvanceAccountGenerationWithAccounts(2, 2, []account.Account{current})
+
+	// A delayed publisher with a superficially newer credential revision must
+	// not roll the account generation or credential identity backward.
+	ref.AdvanceAccountGenerationWithAccounts(1, 3, []account.Account{old})
+	if !ref.MarkCredentialExhaustedUntil(
+		current.Provider, current.ID, current.CredentialIdentity(), time.Now().Add(time.Hour), 2,
+	) {
+		t.Fatal("stale publisher replaced the current account generation")
+	}
+	if ref.MarkCredentialExhaustedUntil(
+		old.Provider, old.ID, old.CredentialIdentity(), time.Now().Add(time.Hour), 1,
+	) {
+		t.Fatal("stale account generation became current")
+	}
+}
+
 func TestSyncAccountCredentialsDropsExclusionAfterTokenRotation(t *testing.T) {
 	old := account.Account{
 		ID: "rotated@example.com", Provider: account.ProviderCodex, Token: "same-access-token",

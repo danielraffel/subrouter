@@ -166,6 +166,9 @@ func (r *SchedulerRef) AdvanceAccountGenerationWithAccounts(generation, credenti
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if generation < r.accountGeneration {
+		return
+	}
 	if generation == r.accountGeneration && credentialRevision <= r.credentialRevision && r.credentialFingerprints != nil {
 		return
 	}
