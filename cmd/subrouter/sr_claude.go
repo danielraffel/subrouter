@@ -155,7 +155,12 @@ func (r srRunner) proxyClaudeArgsTo(
 	baseURL string,
 	proxyToken string,
 ) error {
-	return r.runProxyClaude(ctx, args, baseURL, proxyToken, "")
+	configDir, err := os.MkdirTemp("", "subrouter-claude-proxy-")
+	if err != nil {
+		return fmt.Errorf("create isolated Claude proxy config: %w", err)
+	}
+	defer os.RemoveAll(configDir)
+	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir)
 }
 
 func (r srRunner) runProxyClaude(

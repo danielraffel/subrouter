@@ -57,7 +57,7 @@ type credentialPayload struct {
 // the blob came from and appears in the error along with a redacted summary of
 // its shape, because a decode failure is otherwise indistinguishable between a
 // keychain wrapper, a partial write, and a format change after a CLI update.
-func ParseCredential(body []byte, source string, now time.Time) (CredentialInfo, error) {
+func ParseCredential(body []byte, source string, _ time.Time) (CredentialInfo, error) {
 	body = unwrapKeyringBlob(body)
 	// The current CLI nests the oauth2.Token under "token" next to an
 	// "auth_method" marker; earlier versions persisted the token flat.
@@ -81,7 +81,7 @@ func ParseCredential(body []byte, source string, now time.Time) (CredentialInfo,
 		TokenType:    payload.TokenType,
 		Scope:        payload.Scope,
 	}
-	expiry, err := payload.expiresAt(now)
+	expiry, err := payload.expiresAt()
 	if err != nil {
 		return CredentialInfo{}, fmt.Errorf("%s from %s: %w", unreadableCredentialPhrase, source, err)
 	}
@@ -89,10 +89,10 @@ func ParseCredential(body []byte, source string, now time.Time) (CredentialInfo,
 	return credential, nil
 }
 
-// expiresAt resolves the expiry from whichever field the writer used. An
+// expiresAt resolves an absolute expiry from whichever field the writer used. An
 // unparseable expiry is an error rather than a zero value: silently treating a
 // live token as expired would burn a refresh on every request.
-func (p credentialPayload) expiresAt(now time.Time) (time.Time, error) {
+func (p credentialPayload) expiresAt() (time.Time, error) {
 	if raw := strings.TrimSpace(p.Expiry); raw != "" {
 		parsed, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
@@ -109,9 +109,10 @@ func (p credentialPayload) expiresAt(now time.Time) (time.Time, error) {
 			return time.UnixMilli(millis).UTC(), nil
 		}
 	}
-	if p.ExpiresIn > 0 {
-		return now.Add(time.Duration(p.ExpiresIn) * time.Second).UTC(), nil
-	}
+	// expires_in is meaningful only when paired with a stable issuance time.
+	// The keychain blob provides none, and rebasing it on every read would make
+	// an expired token appear perpetually fresh. Leave it unknown so callers
+	// refresh before use.
 	return time.Time{}, nil
 }
 

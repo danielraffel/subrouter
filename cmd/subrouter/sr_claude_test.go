@@ -240,7 +240,6 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 			got := string(body)
 			for _, want := range []string{
-				"config=\n",
 				"args=--resume session-a --model opus\n",
 				"base=" + tc.wantBase + "\n",
 				"token=" + tc.wantToken + "\n",
@@ -249,6 +248,14 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 				if !strings.Contains(got, want) {
 					t.Fatalf("proxy invocation missing %q:\n%s", want, got)
 				}
+			}
+			configLine := strings.SplitN(got, "\n", 2)[0]
+			configDir := strings.TrimPrefix(configLine, "config=")
+			if configDir == "" || configDir == "/must-not-leak" || !strings.Contains(filepath.Base(configDir), "subrouter-claude-proxy-") {
+				t.Fatalf("proxy did not use an isolated config directory: %q", configLine)
+			}
+			if _, err := os.Stat(configDir); !os.IsNotExist(err) {
+				t.Fatalf("temporary proxy config was not cleaned up: %v", err)
 			}
 		})
 	}

@@ -60,13 +60,13 @@ func TestParseCredentialAcceptsBothExpiryEncodings(t *testing.T) {
 }
 
 // expires_in is relative, so it only means anything against a clock.
-func TestParseCredentialResolvesRelativeExpiry(t *testing.T) {
+func TestParseCredentialTreatsPersistedRelativeExpiryAsUnknown(t *testing.T) {
 	credential, err := ParseCredential([]byte(`{"access_token":"at","refresh_token":"rt","expires_in":3600}`), "test", reference)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
-	if want := reference.Add(time.Hour); !credential.ExpiresAt.Equal(want) {
-		t.Fatalf("ExpiresAt = %s, want %s", credential.ExpiresAt, want)
+	if !credential.ExpiresAt.IsZero() || !credential.NeedsRefresh(reference) {
+		t.Fatalf("persisted relative expiry = %s, want unknown/refresh-required", credential.ExpiresAt)
 	}
 }
 
