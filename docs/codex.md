@@ -36,6 +36,17 @@ Subrouter replaces the outbound Authorization and `ChatGPT-Account-ID` headers
 with the selected `sr` account. Resume with `sr codex resume ...`; a bare
 `codex resume ...` does not recreate wrapper-only overrides.
 
+The two launch modes are intentionally independent: plain `codex` uses Codex's
+normal direct OpenAI configuration, while `sr codex` opts that process into the
+Subrouter pool. The launcher strips older Subrouter-owned `-c` routing values
+and local-provider `--oss` settings from copied or saved commands before adding
+the current provider settings, so another provider or a retired URL cannot
+override the selected server by argument precedence. It
+also exports `SUBROUTER_CODEX_LAUNCHER="<launcher> codex"` and
+`SUBROUTER_CODEX_RESUME_COMMAND="<launcher> codex resume"` for session managers
+that persist a resume command. The launcher name follows the invoked `sr`,
+`subrouter`, or `cx` alias; unrelated clients can ignore these variables.
+
 ## Server Switching
 
 Register and select a remote server:

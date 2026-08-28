@@ -290,6 +290,12 @@ subrouter codex exec "your prompt"
 subrouter codex --version
 ```
 
+The wrapper is intentionally opt-in. Plain `codex` keeps Codex's normal direct
+OpenAI configuration and does not depend on a running Subrouter; `sr codex`
+routes that process through the configured Subrouter account pool. A session
+started or migrated through the wrapper should be reopened with the directly
+copyable `sr codex resume <session-id>` form.
+
 The wrapper launches the child with an authenticated custom provider pointed at
 Subrouter:
 
@@ -310,6 +316,14 @@ token only for the local hop. Subrouter replaces it with the selected account
 before forwarding. Responses and realtime WebSocket requests use the same
 route. Resume through `sr codex resume ...` so the provider overrides are
 present on the resumed process.
+
+`sr codex` owns its routing overrides. It removes older Subrouter provider,
+backend `-c`, and local-provider `--oss` values from a copied or saved command
+before adding the selected server, preventing another provider or a retired URL
+from overriding the current configuration. Session managers can preserve the
+opt-in launcher identity via the exported `SUBROUTER_CODEX_LAUNCHER` and
+`SUBROUTER_CODEX_RESUME_COMMAND` variables; their value follows the invoked
+`sr`, `subrouter`, or `cx` alias.
 
 Override the subrouter URL with `SUBROUTER_CODEX_BASE_URL` if needed. See [docs/codex.md](docs/codex.md) for details and the custom-provider fallback.
 

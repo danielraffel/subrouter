@@ -16,6 +16,11 @@ import (
 
 const defaultCodexBaseURL = "http://127.0.0.1:31415/v1"
 
+const (
+	subrouterCodexLauncherEnv      = "SUBROUTER_CODEX_LAUNCHER"
+	subrouterCodexResumeCommandEnv = "SUBROUTER_CODEX_RESUME_COMMAND"
+)
+
 func codex(args []string) error {
 	baseURL, err := codexBaseURLWithFallback(defaultSRServerStore(accounts.DefaultCodexStore()), os.Stderr)
 	if err != nil {
@@ -51,14 +56,25 @@ func codex(args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = codexChildEnv(os.Environ(), localProxyToken, programBase())
+	return cmd.Run()
+}
+
+func codexChildEnv(environ []string, localProxyToken, launcher string) []string {
+	launcher = strings.TrimSpace(launcher)
+	if launcher == "" {
+		launcher = "sr"
+	}
+	environ = upsertEnv(environ, subrouterCodexLauncherEnv, launcher+" codex")
+	environ = upsertEnv(environ, subrouterCodexResumeCommandEnv, launcher+" codex resume")
 	if localProxyToken != "" {
-		cmd.Env = upsertEnv(
-			os.Environ(),
+		environ = upsertEnv(
+			environ,
 			"SUBROUTER_CODEX_DUMMY_API_KEY",
 			localProxyToken,
 		)
 	}
-	return cmd.Run()
+	return environ
 }
 
 func codexBaseURL(store srServerStore) (string, error) {
@@ -203,6 +219,11 @@ func codexArgsWithLocalProxyToken(
 	accountID string,
 	localProxyToken string,
 ) []string {
+	if command := codexSubcommand(args); command != "" &&
+		!isSubrouterRoutedCodexCommand(command) {
+		return append([]string(nil), args...)
+	}
+	args = sanitizeCodexRoutingArgs(args)
 	model := codexModelArg(args)
 	configArgs := codexConfigArgs(
 		baseURL,
@@ -211,16 +232,89 @@ func codexArgsWithLocalProxyToken(
 		model,
 		localProxyToken != "",
 	)
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") || !isKnownCodexCommand(args[0]) {
-		return append(configArgs, args...)
+	return appendCodexConfigBeforeTerminator(args, configArgs)
+}
+
+// appendCodexConfigBeforeTerminator keeps the launcher's authoritative block
+// after every real CLI override so Codex's last-value-wins merge cannot be
+// superseded by an equivalent parent-table spelling. Arguments after -- are
+// positional data and remain last and untouched.
+func appendCodexConfigBeforeTerminator(args, configArgs []string) []string {
+	insertAt := len(args)
+	for i, arg := range args {
+		if arg == "--" {
+			insertAt = i
+			break
+		}
 	}
-	if !isSubrouterRoutedCodexCommand(args[0]) {
-		return append([]string(nil), args...)
-	}
-	out := []string{args[0]}
+	out := make([]string, 0, len(args)+len(configArgs))
+	out = append(out, args[:insertAt]...)
 	out = append(out, configArgs...)
-	out = append(out, args[1:]...)
+	out = append(out, args[insertAt:]...)
 	return out
+}
+
+// sanitizeCodexRoutingArgs removes routing settings owned by the sr codex
+// launcher before appending its authoritative provider block. This prevents a
+// shell shim, saved resume command, or copied older invocation from placing a
+// stale Subrouter URL after the current one and silently winning by argument
+// order. Direct Codex remains available by invoking codex without sr.
+func sanitizeCodexRoutingArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return append(append(out, arg), args[i+1:]...)
+		}
+		switch {
+		case arg == "--oss":
+			continue
+		case arg == "--local-provider":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		case strings.HasPrefix(arg, "--local-provider="):
+			continue
+		case arg == "-c" || arg == "--config":
+			if i+1 < len(args) && isSubrouterOwnedCodexConfig(args[i+1]) {
+				i++
+				continue
+			}
+		case strings.HasPrefix(arg, "-c") && len(arg) > len("-c"):
+			assignment := strings.TrimPrefix(strings.TrimPrefix(arg, "-c"), "=")
+			if isSubrouterOwnedCodexConfig(assignment) {
+				continue
+			}
+		case strings.HasPrefix(arg, "--config="):
+			if isSubrouterOwnedCodexConfig(strings.TrimPrefix(arg, "--config=")) {
+				continue
+			}
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func isSubrouterOwnedCodexConfig(assignment string) bool {
+	key, _, ok := strings.Cut(strings.TrimSpace(assignment), "=")
+	if !ok {
+		return false
+	}
+	// Codex override paths are split on literal dots; quoted segments are not
+	// unquoted as TOML keys. For example, model_providers."subrouter" creates
+	// a different path and cannot replace model_providers.subrouter.
+	key = strings.TrimSpace(key)
+	switch key {
+	case "model_provider",
+		"openai_base_url",
+		"chatgpt_base_url",
+		"experimental_realtime_ws_base_url",
+		"model_providers.subrouter":
+		return true
+	default:
+		return strings.HasPrefix(key, "model_providers.subrouter.")
+	}
 }
 
 func codexConfigArgs(
@@ -278,7 +372,64 @@ func codexModelArg(args []string) string {
 
 func isSubrouterRoutedCodexCommand(command string) bool {
 	switch command {
-	case "exec", "e", "review", "resume", "fork", "app-server":
+	case "exec", "e", "review", "resume", "fork", "app-server", "remote-control":
+		return true
+	default:
+		return false
+	}
+}
+
+// codexSubcommand finds a documented Codex subcommand after global options.
+// The first non-option positional argument is otherwise the interactive
+// prompt, so scanning must stop there instead of searching arbitrary prompt
+// words for a command name.
+func codexSubcommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return ""
+		}
+		if strings.HasPrefix(arg, "-") {
+			if isCodexImageOption(arg) {
+				if arg == "-i" || arg == "--image" {
+					i++
+				}
+				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					i++
+				}
+				continue
+			}
+			if codexGlobalOptionTakesValue(arg) && !strings.Contains(arg, "=") {
+				i++
+			}
+			continue
+		}
+		if isKnownCodexCommand(arg) {
+			return arg
+		}
+		return ""
+	}
+	return ""
+}
+
+func isCodexImageOption(arg string) bool {
+	return arg == "-i" || arg == "--image" ||
+		strings.HasPrefix(arg, "-i=") || strings.HasPrefix(arg, "--image=") ||
+		(strings.HasPrefix(arg, "-i") && len(arg) > len("-i"))
+}
+
+func codexGlobalOptionTakesValue(arg string) bool {
+	switch arg {
+	case "-c", "--config",
+		"--enable", "--disable",
+		"--remote", "--remote-auth-token-env",
+		"-m", "--model",
+		"--local-provider",
+		"-p", "--profile",
+		"-s", "--sandbox",
+		"-C", "--cd",
+		"--add-dir",
+		"-a", "--ask-for-approval":
 		return true
 	default:
 		return false
@@ -287,7 +438,11 @@ func isSubrouterRoutedCodexCommand(command string) bool {
 
 func isKnownCodexCommand(command string) bool {
 	switch command {
-	case "exec", "e", "review", "login", "logout", "mcp", "plugin", "mcp-server", "app-server", "app", "completion", "sandbox", "debug", "apply", "a", "resume", "fork", "cloud", "exec-server", "features", "help":
+	case "agents", "exec", "e", "review", "login", "logout", "mcp", "plugin",
+		"mcp-server", "app-server", "remote-control", "app", "completion", "update",
+		"doctor", "sandbox", "debug", "apply", "a", "resume", "queue", "archive",
+		"delete", "migrate-rollouts", "unarchive", "fork", "cloud", "exec-server",
+		"features", "help":
 		return true
 	default:
 		return false
