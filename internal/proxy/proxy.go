@@ -410,6 +410,8 @@ type AccountUsageStatus struct {
 	AccountStatus
 	Active             bool                             `json:"active,omitempty"`
 	PlanType           string                           `json:"plan_type,omitempty"`
+	ProviderHealth     string                           `json:"provider_health,omitempty"`
+	ProviderModels     *int                             `json:"provider_models,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
@@ -738,7 +740,7 @@ func authLikeUsageError(message string) bool {
 }
 
 func apiKeyPlanType(provider accounts.Provider) string {
-	if entry, ok := keyedProviderFor(provider); ok {
+	if entry, ok := keyedProviderForName(string(provider)); ok {
 		return entry.PlanLabel
 	}
 	return "api key"
@@ -1268,6 +1270,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.AccountRef != nil {
 		statuses := s.AccountRef.UsageStatuses(r.Context())
+		statuses = s.withKeyedProviderHealth(r.Context(), statuses)
 		s.updateSchedulerFromUsageStatusesContext(r.Context(), statuses)
 		writeJSON(w, s.withRequestTimeExhaustionWindows(statuses))
 		return
@@ -1285,7 +1288,60 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
+	out = s.withKeyedProviderHealth(r.Context(), out)
 	writeJSON(w, s.withRequestTimeExhaustionWindows(out))
+}
+
+func (s Server) withKeyedProviderHealth(ctx context.Context, statuses []AccountUsageStatus) []AccountUsageStatus {
+	out := append([]AccountUsageStatus(nil), statuses...)
+	byID := make(map[string]accounts.Account)
+	for _, account := range s.accountListContext(ctx) {
+		byID[account.ID] = account
+	}
+	client := &http.Client{Timeout: 6 * time.Second}
+	if s.AccountRef != nil && s.AccountRef.client != nil {
+		client = s.AccountRef.client
+	} else if s.Transport != nil {
+		client.Transport = s.Transport
+	}
+
+	var wg sync.WaitGroup
+	for i := range out {
+		i := i
+		status := out[i]
+		if status.AuthMode != accounts.AuthModeAPIKey {
+			continue
+		}
+		entry, ok := keyedProviderForName(string(status.Provider))
+		if !ok {
+			continue
+		}
+		out[i].Provider = entry.Provider
+		out[i].PlanType = entry.PlanLabel
+		out[i].ProviderHealth = "not checked"
+		account, ok := byID[status.ID]
+		if !ok || strings.TrimSpace(account.Token) == "" || entry.Upstream == nil {
+			continue
+		}
+		upstream := entry.Upstream(s)
+		if upstream == nil || ProviderHealthURL(entry.Provider, upstream.String()) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+			defer cancel()
+			state, models := ProbeProviderKey(probeCtx, client, entry.Provider, upstream.String(), account.Token)
+			if state == "" {
+				return
+			}
+			out[i].ProviderHealth = state
+			out[i].ProviderModels = &models
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) {
@@ -1468,6 +1524,7 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid account import body", http.StatusBadRequest)
 		return
 	}
+	canonicalizeAccountImportProvider(&input)
 
 	accountID, err := s.installImportedAccount(r.Context(), input)
 	if err != nil {
@@ -1497,6 +1554,25 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		"provider": input.Provider,
 		"account":  accountID,
 	})
+}
+
+func canonicalizeAccountImportProvider(input *accountImportRequest) {
+	if input == nil {
+		return
+	}
+	original := input.Provider
+	canonical, ok := canonicalKeyedProvider(original)
+	if !ok || canonical == original {
+		return
+	}
+	if input.Codex != nil {
+		originalPrefix := string(original) + ":"
+		if strings.HasPrefix(input.Codex.Email, originalPrefix) {
+			input.Codex.Email = string(canonical) + ":" + strings.TrimPrefix(input.Codex.Email, originalPrefix)
+		}
+		input.Codex.Provider = canonical
+	}
+	input.Provider = canonical
 }
 
 type accountImportValidationError struct {

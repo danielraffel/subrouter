@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/session"
 )
 
@@ -73,6 +76,62 @@ func TestConfiguredProviderRoutesEndToEnd(t *testing.T) {
 	if !isKeyedProvider(accounts.Provider("acme-relay")) {
 		t.Fatal("a declared provider must be a keyed provider")
 	}
+	// The standalone CLI cannot recover the serving process's alias map, so an
+	// account stored under an alias must still join the canonical provider pool.
+	aliasAccounts := []accounts.Account{{
+		ID: "acme:main", Provider: accounts.Provider("acme"),
+		AuthMode: accounts.AuthModeAPIKey, Token: "declared-key",
+	}}
+	if got := filterAccountsForProvider(aliasAccounts, accounts.Provider("acme-relay")); len(got) != 1 || got[0].Provider != accounts.Provider("acme-relay") {
+		t.Fatalf("alias-stored accounts = %+v, want one canonical provider account", got)
+	}
+}
+
+func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
+	resetConfiguredProviders(t)
+	var gotAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthorization = r.Header.Get("Authorization")
+		if r.URL.Path != "/models" {
+			t.Fatalf("health path = %q, want /models", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":[{},{}]}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	stored, _, err := store.AddProviderAPIKey(accounts.ProviderQwenToken, "main", "test-provider-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, ok := stored.Account(stored.SourcePath(store))
+	if !ok {
+		t.Fatal("stored API key did not produce a routing account")
+	}
+	ref := NewAccountRef(store, []accounts.Account{account}, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "admin", QwenTokenUpstream: upstreamURL}.Handler()
+	req := httptest.NewRequest(http.MethodGet, "/_subrouter/usage-status", nil)
+	req.Header.Set("Authorization", "Bearer admin")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	var statuses []AccountUsageStatus
+	if err := json.Unmarshal(resp.Body.Bytes(), &statuses); err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].ProviderHealth != "ok" || statuses[0].ProviderModels == nil || *statuses[0].ProviderModels != 2 {
+		t.Fatalf("usage statuses = %+v, want healthy key with 2 models", statuses)
+	}
+	if gotAuthorization != "Bearer test-provider-key" {
+		t.Fatal("configured upstream did not receive the selected provider credential")
+	}
 }
 
 // A declared provider must not be able to shadow Codex, Claude, or a built-in,
@@ -109,8 +168,12 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 		{name: "no name", declared: OpenAICompatibleProvider{BaseURL: "https://x.test/v1"}},
 		{name: "no base url", declared: OpenAICompatibleProvider{Name: "thing"}},
 		{name: "name with a slash", declared: OpenAICompatibleProvider{Name: "a/b", BaseURL: "https://x.test/v1"}},
+		{name: "name with a colon", declared: OpenAICompatibleProvider{Name: "apikey:team", BaseURL: "https://x.test/v1"}},
 		{name: "alias with a slash", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a/b"}, BaseURL: "https://x.test/v1"}},
+		{name: "alias with a colon", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"apikey:team"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with whitespace", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a b"}, BaseURL: "https://x.test/v1"}},
+		{name: "alias with control", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a\nb"}, BaseURL: "https://x.test/v1"}},
+		{name: "alias with URL delimiter", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a?b"}, BaseURL: "https://x.test/v1"}},
 		{name: "non-http scheme", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "ftp://x.test/v1"}},
 		{name: "no host", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "https:///v1"}},
 	}
@@ -130,7 +193,7 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 }
 
 func TestValidDeclaredProviderNameRejectsStorageAndRoutingNamespaces(t *testing.T) {
-	for _, value := range []string{"apikey", "codex", "anthropic", "qwen", "a/b", "a b"} {
+	for _, value := range []string{"apikey", "apikey:team", "codex", "anthropic", "qwen", "a/b", "a b"} {
 		if ValidDeclaredProviderName(value) {
 			t.Fatalf("ValidDeclaredProviderName(%q) = true, want false", value)
 		}

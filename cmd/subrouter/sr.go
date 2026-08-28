@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -2900,38 +2899,7 @@ func usageGridModels(row srUsageRow) string {
 // reports no result rather than sending a possibly gateway-specific secret to
 // a vendor default.
 func probeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, upstream, token string) (state string, models int) {
-	url := proxy.ProviderHealthURL(provider, upstream)
-	if url == "" {
-		return "", -1
-	}
-	if client == nil {
-		client = &http.Client{Timeout: 6 * time.Second}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "unreachable", -1
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	res, err := client.Do(req)
-	if err != nil {
-		return "unreachable", -1
-	}
-	defer func() { _ = res.Body.Close() }()
-	switch {
-	case res.StatusCode == http.StatusUnauthorized:
-		return "bad key", -1
-	case res.StatusCode == http.StatusForbidden:
-		return "denied", -1
-	case res.StatusCode < 200 || res.StatusCode >= 300:
-		return fmt.Sprintf("http %d", res.StatusCode), -1
-	}
-	var payload struct {
-		Data []struct{} `json:"data"`
-	}
-	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&payload); err != nil {
-		return "ok", -1
-	}
-	return "ok", len(payload.Data)
+	return proxy.ProbeProviderKey(ctx, client, provider, upstream, token)
 }
 
 // dropUsageGridColumn removes a column that does not apply to a section.

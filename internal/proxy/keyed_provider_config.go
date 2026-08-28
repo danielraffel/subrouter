@@ -64,7 +64,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 			return fmt.Errorf("openai-compatible provider needs a name")
 		}
 		if !validDeclaredProviderIdentifier(name) {
-			return fmt.Errorf("openai-compatible provider name %q cannot contain a slash or whitespace", item.Name)
+			return fmt.Errorf("openai-compatible provider name %q must use only lowercase letters, digits, '.', '_', or '-'", item.Name)
 		}
 		base, err := parseProviderBaseURL(item.BaseURL, name)
 		if err != nil {
@@ -73,7 +73,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 		names := append([]string{name}, normalizeAliases(item.Aliases)...)
 		for _, candidate := range names {
 			if !validDeclaredProviderIdentifier(candidate) {
-				return fmt.Errorf("openai-compatible provider %q has invalid alias %q: aliases cannot contain a slash or whitespace", item.Name, candidate)
+				return fmt.Errorf("openai-compatible provider %q has invalid alias %q: aliases must use only lowercase letters, digits, '.', '_', or '-'", item.Name, candidate)
 			}
 			if reservedProviderNames[candidate] {
 				return fmt.Errorf("openai-compatible provider %q claims the reserved name %q", item.Name, candidate)
@@ -138,7 +138,21 @@ func ValidDeclaredProviderName(raw string) bool {
 }
 
 func validDeclaredProviderIdentifier(name string) bool {
-	return name != "" && !strings.ContainsAny(name, "/ \t")
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if char >= 'a' && char <= 'z' || char >= '0' && char <= '9' {
+			continue
+		}
+		switch char {
+		case '-', '_', '.':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func parseProviderBaseURL(raw, name string) (*url.URL, error) {

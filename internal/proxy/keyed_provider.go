@@ -1,13 +1,17 @@
 package proxy
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -311,6 +315,14 @@ func keyedProviderForName(name string) (keyedProvider, bool) {
 	return keyedProvider{}, false
 }
 
+func canonicalKeyedProvider(provider accounts.Provider) (accounts.Provider, bool) {
+	entry, ok := keyedProviderForName(strings.ToLower(strings.TrimSpace(string(provider))))
+	if !ok {
+		return "", false
+	}
+	return entry.Provider, true
+}
+
 // keyedProviderForModelPrefix infers a provider from a bare model id.
 func keyedProviderForModelPrefix(lowerModel string) (keyedProvider, bool) {
 	for _, entry := range keyedProviders() {
@@ -324,7 +336,7 @@ func keyedProviderForModelPrefix(lowerModel string) (keyedProvider, bool) {
 
 // isKeyedProvider reports whether a provider is routed through the registry.
 func isKeyedProvider(provider accounts.Provider) bool {
-	_, ok := keyedProviderFor(provider)
+	_, ok := canonicalKeyedProvider(provider)
 	return ok
 }
 
@@ -406,6 +418,9 @@ func APIKeyProviderList() string {
 // this provider. Providers that share a subscription across protocol endpoints
 // resolve to the one that owns the credential.
 func accountProviderFor(provider accounts.Provider) accounts.Provider {
+	if canonical, ok := canonicalKeyedProvider(provider); ok {
+		provider = canonical
+	}
 	if entry, ok := keyedProviderFor(provider); ok && entry.AccountProvider != "" {
 		return entry.AccountProvider
 	}
@@ -415,7 +430,7 @@ func accountProviderFor(provider accounts.Provider) accounts.Provider {
 // ProviderDefaultUpstream returns a provider's documented base URL, so a flag
 // default and a health probe read the same value.
 func ProviderDefaultUpstream(provider accounts.Provider) string {
-	entry, ok := keyedProviderFor(provider)
+	entry, ok := keyedProviderForName(string(provider))
 	if !ok {
 		return ""
 	}
@@ -425,7 +440,7 @@ func ProviderDefaultUpstream(provider accounts.Provider) string {
 // ProviderMetering describes how a vendor charges this provider. These vendors
 // expose no quota API, so this is the only plan information available.
 func ProviderMetering(provider accounts.Provider) string {
-	entry, ok := keyedProviderFor(provider)
+	entry, ok := keyedProviderForName(string(provider))
 	if !ok {
 		return ""
 	}
@@ -436,11 +451,49 @@ func ProviderMetering(provider accounts.Provider) string {
 // must supply the actual configured upstream: silently falling back to a vendor
 // default can disclose a gateway-specific credential to an unrelated host.
 func ProviderHealthURL(provider accounts.Provider, upstream string) string {
-	entry, ok := keyedProviderFor(provider)
+	entry, ok := keyedProviderForName(string(provider))
 	if !ok || entry.HealthPath == "" || strings.TrimSpace(upstream) == "" {
 		return ""
 	}
 	return strings.TrimRight(upstream, "/") + entry.HealthPath
+}
+
+// ProbeProviderKey validates a key only against an explicitly supplied
+// upstream and reports the model count when the endpoint returns an OpenAI
+// models payload. It never selects a default host.
+func ProbeProviderKey(ctx context.Context, client *http.Client, provider accounts.Provider, upstream, token string) (state string, models int) {
+	healthURL := ProviderHealthURL(provider, upstream)
+	if healthURL == "" {
+		return "", -1
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 6 * time.Second}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return "unreachable", -1
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := client.Do(req)
+	if err != nil {
+		return "unreachable", -1
+	}
+	defer func() { _ = res.Body.Close() }()
+	switch {
+	case res.StatusCode == http.StatusUnauthorized:
+		return "bad key", -1
+	case res.StatusCode == http.StatusForbidden:
+		return "denied", -1
+	case res.StatusCode < 200 || res.StatusCode >= 300:
+		return fmt.Sprintf("http %d", res.StatusCode), -1
+	}
+	var payload struct {
+		Data []struct{} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&payload); err != nil {
+		return "ok", -1
+	}
+	return "ok", len(payload.Data)
 }
 
 // ProviderEndpoints lists every path prefix served by one provider's

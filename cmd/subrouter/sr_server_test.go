@@ -981,6 +981,21 @@ func TestUsageRowsFromServerUsageStatusesPreservesComplimentaryReset(t *testing.
 	}
 }
 
+func TestUsageRowsFromServerUsageStatusesPreservesProviderProbe(t *testing.T) {
+	models := 12
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID:             "qwen-token:work",
+		Provider:       accounts.ProviderQwenToken,
+		AuthMode:       accounts.AuthModeAPIKey,
+		PlanType:       "qwen token plan key",
+		ProviderHealth: "ok",
+		ProviderModels: &models,
+	}})
+	if len(rows) != 1 || rows[0].providerHealth != "ok" || rows[0].providerModels != 12 {
+		t.Fatalf("rows = %+v, want provider health and model count", rows)
+	}
+}
+
 func TestSRServerRenameUpdatesDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

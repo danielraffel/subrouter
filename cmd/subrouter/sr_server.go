@@ -1125,6 +1125,8 @@ type remoteServerUsageStatus struct {
 	Error              string                           `json:"error,omitempty"`
 	Active             bool                             `json:"active,omitempty"`
 	PlanType           string                           `json:"plan_type,omitempty"`
+	ProviderHealth     string                           `json:"provider_health,omitempty"`
+	ProviderModels     *int                             `json:"provider_models,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
@@ -1252,6 +1254,11 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
 			provider:           status.Provider,
+			providerHealth:     status.ProviderHealth,
+			providerModels:     -1,
+		}
+		if status.ProviderModels != nil {
+			row.providerModels = *status.ProviderModels
 		}
 		if status.Provider == accounts.ProviderClaude && row.planType == "" {
 			row.planType = "claude"

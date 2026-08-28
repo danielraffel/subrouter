@@ -167,6 +167,43 @@ func TestAccountImportCodexPersistsAndHotLoadsWithoutReturningSecrets(t *testing
 	}
 }
 
+func TestAccountImportCanonicalizesDeclaredProviderAlias(t *testing.T) {
+	resetConfiguredProviders(t)
+	if err := ConfigureOpenAICompatibleProviders([]OpenAICompatibleProvider{{
+		Name: "acme-relay", Aliases: []string{"acme"}, BaseURL: "https://relay.example/v1",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	payload, err := json.Marshal(map[string]any{
+		"provider": "acme",
+		"codex": accounts.StoredCodexAccount{
+			Email: "acme:work",
+			Auth:  accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "test-provider-key"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := serveProtectedAccountImport(handler, payload)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	stored, ok, err := codexStore.FindStored("acme-relay:work")
+	if err != nil || !ok {
+		t.Fatalf("canonical account found=%t err=%v", ok, err)
+	}
+	if stored.Provider != accounts.Provider("acme-relay") {
+		t.Fatalf("stored provider = %q, want acme-relay", stored.Provider)
+	}
+	if _, aliasExists, err := codexStore.FindStored("acme:work"); err != nil || aliasExists {
+		t.Fatalf("alias storage entry exists=%t err=%v", aliasExists, err)
+	}
+}
+
 func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: t.TempDir()}
 	ref := NewAccountRef(codexStore, nil, nil)
