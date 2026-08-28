@@ -767,9 +767,16 @@ func parseAddKeyProviderArgs(command string, errOut io.Writer, args []string) (a
 }
 
 func (r srRunner) importActive(ctx context.Context) error {
+	ready, err := activeCodexOAuthImportReady()
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("no active Codex OAuth auth found in %s", accounts.DefaultCodexAuthPath())
+	}
 	var account accounts.StoredCodexAccount
 	var existed bool
-	err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
 		var importErr error
 		account, existed, importErr = r.store.ImportActive()
 		return importErr == nil, importErr
@@ -790,16 +797,63 @@ func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 	if err != nil || len(all) > 0 {
 		return err
 	}
+	// Kimi and Grok OAuth credentials live outside the Codex store. They still
+	// make this a configured provider installation, so status/pick must not try
+	// to bootstrap an unrelated Codex account first. A source error also proves
+	// that provider state exists (for example, an unreadable credential), and
+	// fetchUsageRows will surface that error in its own provider section.
+	kimiStore := r.kimi
+	if kimiStore == nil {
+		kimiStore = agentkimi.DefaultStore()
+	}
+	if providerAccounts, providerErr := kimiStore.ListAccounts(ctx); len(providerAccounts) > 0 || providerErr != nil {
+		return nil
+	}
+	grokStore := r.grok
+	if grokStore == nil {
+		defaultStore := agentgrok.DefaultStore()
+		grokStore = defaultStore
+	}
+	if providerAccounts, providerErr := grokStore.ListAccounts(ctx); len(providerAccounts) > 0 || providerErr != nil {
+		return nil
+	}
+	// PublishAccountDiskMutation deliberately publishes before invoking the
+	// mutation so a committed credential change can never be missed. Avoid
+	// entering that transaction when Codex has no active auth to import.
+	ready, activeErr := activeCodexOAuthImportReady()
+	if activeErr != nil || !ready {
+		return activeErr
+	}
 	var account accounts.StoredCodexAccount
+	var imported bool
 	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
 		var importErr error
 		account, _, importErr = r.store.ImportActive()
-		return importErr == nil, importErr
+		imported = importErr == nil && strings.TrimSpace(account.Email) != ""
+		return imported, importErr
 	})
-	if err == nil {
+	if err == nil && imported {
 		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.Email)
 	}
 	return nil
+}
+
+// activeCodexOAuthImportReady mirrors ImportActive's non-mutating validation.
+// Keeping this check outside PublishAccountDiskMutation avoids advertising a
+// new account generation when there is no importable Codex OAuth credential.
+func activeCodexOAuthImportReady() (bool, error) {
+	auth, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok {
+		return false, err
+	}
+	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.IDToken) == "" {
+		return false, nil
+	}
+	email, err := accounts.ExtractEmailFromJWT(auth.Tokens.IDToken)
+	if err != nil || strings.TrimSpace(email) == "" {
+		return false, fmt.Errorf("could not extract email from current auth token")
+	}
+	return true, nil
 }
 
 func (r srRunner) publishActiveSync(ctx context.Context) error {
@@ -1384,15 +1438,23 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		rows[i].cooked, rows[i].cookedReason = cookedFromWindows(rows[i].windows)
 		rows[i].tempCooked, rows[i].tempCookedReason = tempCookedFromWindows(rows[i].windows)
 	}
-	if sessionStore, sessionErr := session.NewStore(session.DefaultStorePath()); sessionErr == nil {
-		counts := proxy.SchedulerSessionCounts(sessionStore)
-		for i := range rows {
-			if rows[i].authMode == accounts.AuthModeAPIKey ||
-				((rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok) && rows[i].authMode == accounts.AuthModeOAuth) {
-				rows[i].assignedSessions = counts[selectacct.ScoreKey(rows[i].provider, rows[i].email)]
-				rows[i].sessionsKnown = true
-				if rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok {
-					rows[i].active = rows[i].assignedSessions > 0
+	// A standalone local status process cannot discover an arbitrary --sessions
+	// flag used by a separately launched daemon. Installed daemons export the
+	// same path as SUBROUTER_SESSIONS; without that explicit shared setting,
+	// leave session activity unknown instead of reading the default store and
+	// presenting unrelated assignments as current.
+	sessionsPath := strings.TrimSpace(os.Getenv("SUBROUTER_SESSIONS"))
+	if sessionsPath != "" {
+		if sessionStore, sessionErr := session.NewStore(sessionsPath); sessionErr == nil {
+			counts := proxy.SchedulerSessionCounts(sessionStore)
+			for i := range rows {
+				if rows[i].authMode == accounts.AuthModeAPIKey ||
+					((rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok) && rows[i].authMode == accounts.AuthModeOAuth) {
+					rows[i].assignedSessions = counts[selectacct.ScoreKey(rows[i].provider, rows[i].email)]
+					rows[i].sessionsKnown = true
+					if rows[i].provider == accounts.ProviderKimi || rows[i].provider == accounts.ProviderGrok {
+						rows[i].active = rows[i].assignedSessions > 0
+					}
 				}
 			}
 		}

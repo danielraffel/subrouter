@@ -360,9 +360,113 @@ func (f fakeKimiUsageStore) FetchUsage(context.Context, *http.Client, baseaccoun
 	return f.plan, f.windows, f.err
 }
 
+func TestAutoImportIfEmptySkipsProviderOnlyOAuthInstallations(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kimi srKimiUsageStore
+		grok srGrokStore
+	}{
+		{
+			name: "Kimi",
+			kimi: fakeKimiUsageStore{accounts: []baseaccount.Account{{
+				ID: "kimi-subscription:work", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth,
+			}}},
+		},
+		{
+			name: "Grok",
+			grok: &fakeGrokStore{account: baseaccount.Account{
+				ID: "grok-subscription", Provider: baseaccount.ProviderGrok, AuthMode: baseaccount.AuthModeOAuth,
+			}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", filepath.Join(root, "home"))
+			t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+			store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+			var out bytes.Buffer
+			runner := srRunner{store: store, out: &out, kimi: test.kimi, grok: test.grok}
+			if err := runner.autoImportIfEmpty(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("provider-only status printed Codex import output: %q", out.String())
+			}
+			if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+				t.Fatalf("provider-only status published a Codex mutation: %v", err)
+			}
+		})
+	}
+}
+
+func TestAutoImportIfEmptyDoesNotPublishMissingActiveCodexAuth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, out: &out,
+		kimi: fakeKimiUsageStore{},
+		grok: &fakeGrokStore{},
+	}
+	if err := runner.autoImportIfEmpty(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("missing active auth printed false import success: %q", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+		t.Fatalf("missing active auth published a mutation: %v", err)
+	}
+}
+
+func TestAutoImportIfEmptyDoesNotPublishNonOAuthActiveCodexAuth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	if err := accounts.WriteActiveCodexAuth(accounts.CodexAuthFile{OpenAIAPIKey: "sk-test"}); err != nil {
+		t.Fatal(err)
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, out: &out,
+		kimi: fakeKimiUsageStore{},
+		grok: &fakeGrokStore{},
+	}
+	if err := runner.autoImportIfEmpty(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("non-OAuth auth printed false import success: %q", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+		t.Fatalf("non-OAuth auth published a mutation: %v", err)
+	}
+}
+
+func TestImportActiveRejectsMissingAuthBeforePublishingGeneration(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	var out bytes.Buffer
+	runner := srRunner{store: store, out: &out}
+	if err := runner.importActive(t.Context()); err == nil || !strings.Contains(err.Error(), "no active Codex OAuth auth") {
+		t.Fatalf("import error = %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("failed import printed success: %q", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+		t.Fatalf("failed import published a mutation: %v", err)
+	}
+}
+
 func TestFetchUsageRowsIncludesLocalKimiSubscription(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_SESSIONS", session.DefaultStorePath())
 	windows := []accounts.UsageWindow{
 		{Name: "weekly", UsedPercent: 25, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 24 * 60 * 60},
 		{Name: "5h", UsedPercent: 40, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 60 * 60},
@@ -436,6 +540,7 @@ func TestFetchUsageRowsIncludesAuthOnlyGrokSubscriptionActivity(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	t.Setenv("SUBROUTER_SESSIONS", session.DefaultStorePath())
 	grokStore := &fakeGrokStore{account: baseaccount.Account{
 		ID: "grok-subscription", Provider: baseaccount.ProviderGrok,
 		AuthMode: baseaccount.AuthModeOAuth, Token: "access", Email: "person@example.com",
@@ -471,6 +576,70 @@ func TestFetchUsageRowsIncludesAuthOnlyGrokSubscriptionActivity(t *testing.T) {
 		return
 	}
 	t.Fatal("local Grok subscription row is missing")
+}
+
+func TestFetchUsageRowsUsesOnlyConfiguredSessionStore(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	configuredPath := filepath.Join(root, "daemon", "assignments.json")
+	t.Setenv("SUBROUTER_SESSIONS", configuredPath)
+	configured, err := session.NewStore(configuredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := configured.Put("kimi", "configured-session", "kimi-code", ""); err != nil {
+		t.Fatal(err)
+	}
+	defaultStore, err := session.NewStore(session.DefaultStorePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaultStore.Put("kimi", "wrong-session", "someone-else", ""); err != nil {
+		t.Fatal(err)
+	}
+	runner := srRunner{
+		store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")},
+		kimi: fakeKimiUsageStore{accounts: []baseaccount.Account{{
+			ID: "kimi-code", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth,
+		}}, plan: "subscription"},
+	}
+	rows, err := runner.fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.provider == accounts.ProviderKimi {
+			if !row.sessionsKnown || row.assignedSessions != 1 || !row.active {
+				t.Fatalf("Kimi session activity = %+v", row)
+			}
+			return
+		}
+	}
+	t.Fatal("local Kimi subscription row is missing")
+}
+
+func TestFetchUsageRowsLeavesSessionsUnknownWithoutConfiguredStore(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	runner := srRunner{
+		store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")},
+		kimi: fakeKimiUsageStore{accounts: []baseaccount.Account{{
+			ID: "kimi-code", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth,
+		}}, plan: "subscription"},
+	}
+	rows, err := runner.fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.provider == accounts.ProviderKimi {
+			if row.sessionsKnown || row.active {
+				t.Fatalf("Kimi session activity was inferred without a configured store: %+v", row)
+			}
+			return
+		}
+	}
+	t.Fatal("local Kimi subscription row is missing")
 }
 
 func TestSRListReadsNativeCodexStore(t *testing.T) {

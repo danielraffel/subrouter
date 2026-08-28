@@ -132,8 +132,11 @@ func (s CodexStore) SyncActiveToStore() error {
 
 func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	auth, ok, err := ReadActiveCodexAuth()
-	if err != nil || !ok {
+	if err != nil {
 		return StoredCodexAccount{}, false, err
+	}
+	if !ok {
+		return StoredCodexAccount{}, false, fmt.Errorf("no active Codex OAuth auth found in %s", DefaultCodexAuthPath())
 	}
 	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("no active Codex OAuth auth found in %s", DefaultCodexAuthPath())
