@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +14,47 @@ import (
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
+
+func TestAccountForSessionContinuesWhenActivityTouchFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	store, err := session.NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "healthy@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path + ".lock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path+".lock", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID: "healthy@example.com", Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth, Token: "tok-healthy",
+		}},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: "healthy@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1,
+		}})),
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{}`))
+	account, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "session-1", req)
+	if err != nil {
+		t.Fatalf("sticky routing failed because activity persistence failed: %v", err)
+	}
+	if account.ID != "healthy@example.com" {
+		t.Fatalf("account = %q, want sticky account", account.ID)
+	}
+	if !strings.Contains(logs.String(), "session activity update failed") {
+		t.Fatalf("activity persistence failure was not logged: %s", logs.String())
+	}
+}
 
 // A Codex session that moves to another account loses the upstream prompt
 // cache and re-bills its whole prefix, so the move has to be logged.

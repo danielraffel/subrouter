@@ -4075,31 +4075,37 @@ func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail 
 	if s.Transcripts == nil || !transcriptWorthRecording(sessionID) {
 		return
 	}
-	s.Transcripts.RecordMeta(agentType, sessionID, map[string]any{
+	metadata := map[string]any{
 		"transport": "http",
-		"user":      userEmail,
 		"account":   account.ID,
 		"method":    r.Method,
 		"path":      r.URL.Path,
 		"upstream":  upstream.String(),
 		"headers":   transcript.RedactedHeaders(r.Header),
-	})
+	}
+	if hash := userEmailHash(userEmail); hash != "" {
+		metadata["user_hash"] = hash
+	}
+	s.Transcripts.RecordMeta(agentType, sessionID, metadata)
 }
 
 func (s Server) recordWebSocketMeta(r *http.Request, upstreamURL *url.URL, headers http.Header, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
 	if s.Transcripts == nil || !transcriptWorthRecording(sessionID) {
 		return
 	}
-	s.Transcripts.RecordMeta(agentType, sessionID, map[string]any{
+	metadata := map[string]any{
 		"transport":    "websocket",
-		"user":         userEmail,
 		"account":      account.ID,
 		"method":       r.Method,
 		"path":         r.URL.Path,
 		"upstream":     upstream.String(),
 		"upstream_url": upstreamURL.String(),
 		"headers":      transcript.RedactedHeaders(headers),
-	})
+	}
+	if hash := userEmailHash(userEmail); hash != "" {
+		metadata["user_hash"] = hash
+	}
+	s.Transcripts.RecordMeta(agentType, sessionID, metadata)
 }
 
 func (s Server) captureRequestBody(r *http.Request, agentType, sessionID string) {
@@ -4680,9 +4686,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
 			if s.reuseStickyAssignment(agentType, sessionID, account, scheduler) {
 				s.logStickyReuse(agentType, sessionID, account, scheduler)
-				if _, _, err := s.Sessions.Touch(agentType, sessionID); err != nil {
-					return accounts.Account{}, sessionID, userEmail, err
-				}
+				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
 			}
 			candidate, pickErr := scheduler.Pick(availableAccounts)
@@ -4697,9 +4701,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 						"exhausted", scheduler.Exhausted(account.Provider, account.ID),
 					)
 				}
-				if _, _, err := s.Sessions.Touch(agentType, sessionID); err != nil {
-					return accounts.Account{}, sessionID, userEmail, err
-				}
+				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
 			}
 			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(candidate.Provider, candidate.ID) {
@@ -4806,6 +4808,19 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 		"usable_for_new_session", false,
 		"exhausted", false,
 	)
+}
+
+func (s Server) touchSessionBestEffort(agentType, sessionID string) {
+	if s.Sessions == nil {
+		return
+	}
+	if _, _, err := s.Sessions.Touch(agentType, sessionID); err != nil && s.Logger != nil {
+		s.Logger.Warn("session activity update failed; continuing with sticky assignment",
+			"agent", agentType,
+			"session", sessionID,
+			"error", err,
+		)
+	}
 }
 
 // providerSelectionPolicy states, per provider, how session routing treats

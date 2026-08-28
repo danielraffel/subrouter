@@ -189,7 +189,7 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 		{name: "alias with whitespace", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a b"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with control", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a\nb"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with URL delimiter", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a?b"}, BaseURL: "https://x.test/v1"}},
-		{name: "oversized name", declared: OpenAICompatibleProvider{Name: strings.Repeat("a", 319), BaseURL: "https://x.test/v1"}},
+		{name: "oversized name", declared: OpenAICompatibleProvider{Name: strings.Repeat("a", 64), BaseURL: "https://x.test/v1"}},
 		{name: "non-http scheme", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "ftp://x.test/v1"}},
 		{name: "no host", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "https:///v1"}},
 		{name: "URL userinfo", declared: OpenAICompatibleProvider{Name: "thing", BaseURL: "https://user:password@x.test/v1"}},
@@ -217,6 +217,9 @@ func TestValidDeclaredProviderNameRejectsStorageAndRoutingNamespaces(t *testing.
 	}
 	if !ValidDeclaredProviderName("acme-relay") {
 		t.Fatal("a non-reserved provider identifier should be valid")
+	}
+	if !ValidDeclaredProviderName(strings.Repeat("a", 63)) {
+		t.Fatal("a 63-byte provider identifier should fit the credential store")
 	}
 }
 

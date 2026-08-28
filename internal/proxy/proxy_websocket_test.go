@@ -2815,6 +2815,7 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	transcripts := transcript.NewRecorder(filepath.Join(t.TempDir(), "transcripts"))
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{{
@@ -2823,6 +2824,7 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 			Token:    "a-token",
 		}},
 		Sessions:     store,
+		Transcripts:  transcripts,
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
@@ -2867,6 +2869,17 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 	}
 	if assignment.UserEmail != "alice@example.com" {
 		t.Fatalf("UserEmail = %q, want alice@example.com", assignment.UserEmail)
+	}
+	events := readTranscriptEventsEventually(t, transcripts.PathForSession("claude", "session-1"), 1)
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "alice@example.com") {
+		t.Fatalf("transcript metadata exposed the full user email: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), userEmailHash("alice@example.com")) {
+		t.Fatalf("transcript metadata omitted the user hash: %s", encoded)
 	}
 }
 

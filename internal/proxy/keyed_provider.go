@@ -462,7 +462,14 @@ func ProviderHealthURL(provider accounts.Provider, upstream string) string {
 	if !ok || entry.HealthPath == "" || strings.TrimSpace(upstream) == "" {
 		return ""
 	}
-	return strings.TrimRight(upstream, "/") + entry.HealthPath
+	parsed, err := url.Parse(strings.TrimSpace(upstream))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + entry.HealthPath
+	parsed.RawPath = ""
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 // ProbeProviderKey validates a key only against an explicitly supplied

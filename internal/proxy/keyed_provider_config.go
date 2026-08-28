@@ -139,7 +139,10 @@ func ValidDeclaredProviderName(raw string) bool {
 }
 
 func validDeclaredProviderIdentifier(name string) bool {
-	if name == "" || len(name) > 318 {
+	// Keep provider-scoped account identifiers comfortably inside the 255-byte
+	// filename-component limit after the label, JSON suffix, lock prefix, and
+	// atomic-write suffix are added by the credential store.
+	if name == "" || len(name) > 63 {
 		return false
 	}
 	first := name[0]

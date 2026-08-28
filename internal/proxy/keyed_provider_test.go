@@ -137,6 +137,9 @@ func TestProviderHealthURLRequiresTheConfiguredUpstream(t *testing.T) {
 	if got := ProviderHealthURL(accounts.ProviderQwenToken, "https://gateway.example/v1"); got != "https://gateway.example/v1/models" {
 		t.Fatalf("configured gateway health URL = %q", got)
 	}
+	if got := ProviderHealthURL(accounts.ProviderQwenToken, "https://gateway.example/v1?tenant=alpha#ignored"); got != "https://gateway.example/v1/models?tenant=alpha" {
+		t.Fatalf("configured gateway health URL with query = %q", got)
+	}
 }
 
 func TestApplyKeyedProviderAuthPresentsTheKeyPerStyle(t *testing.T) {

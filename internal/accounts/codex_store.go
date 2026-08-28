@@ -338,6 +338,12 @@ func validateStoredAccountIdentifier(identifier string) error {
 	if strings.HasPrefix(emailToFilename(trimmed), ".") {
 		return errors.New("account identifier cannot create a hidden store entry")
 	}
+	// Save, lock, and atomic-temp paths all decorate this component. Bounding
+	// the undecorated filename leaves room below common 255-byte filesystem
+	// limits for every decoration.
+	if len(emailToFilename(trimmed)) > 220 {
+		return errors.New("account identifier is too long for the credential store")
+	}
 	return nil
 }
 
