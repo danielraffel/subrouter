@@ -735,7 +735,7 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
-func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
+func TestClaudeFailoverTriesMarkedExhaustedAlternateWhenScoreMayBeStale(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-exhausted-alt", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
@@ -745,9 +745,6 @@ func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		calls++
-		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
-			t.Fatal("fresh account is marked exhausted and must not be retried")
-		}
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
@@ -771,8 +768,8 @@ func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	if response.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want original 429", response.StatusCode)
 	}
-	if calls != 1 {
-		t.Fatalf("upstream calls=%d, want 1 because marked-exhausted alternates are skipped", calls)
+	if calls != 2 {
+		t.Fatalf("upstream calls=%d, want the stale-scored alternate tried once", calls)
 	}
 }
 

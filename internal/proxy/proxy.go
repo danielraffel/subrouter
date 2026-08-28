@@ -7087,16 +7087,13 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
 				continue
 			}
-			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-				continue
-			}
 			candidates = append(candidates, account)
 		}
 		if len(candidates) == 0 {
 			if lastErr != nil {
 				return accounts.Account{}, lastErr
 			}
-			return accounts.Account{}, fmt.Errorf("no untried non-exhausted %s accounts available", provider)
+			return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
 		}
 		account, err := pickRoutingAccount(scheduler, candidates)
 		if err != nil {
