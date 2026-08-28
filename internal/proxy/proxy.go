@@ -5795,15 +5795,15 @@ func filterAccountsForProvider(all []accounts.Account, provider accounts.Provide
 	if len(filtered) > 0 {
 		return filtered
 	}
-	// Provider-less records predate multi-provider support and are Codex
-	// credentials. Stamp their effective provider before returning them: later
-	// protocol-specific paths (including WebSocket failure classification) must
-	// not have to reinterpret the legacy empty value.
-	if credentialProvider != accounts.ProviderCodex {
+	// Built-in Codex and Claude routing historically accepted provider-less
+	// static accounts. Keyed and Antigravity pools must never inherit them.
+	// Stamp the requested built-in provider before returning: downstream paths
+	// such as WebSocket failure classification cannot reinterpret an empty value.
+	if isKeyedProvider(provider) || provider == accounts.ProviderAntigravity {
 		return nil
 	}
 	for i := range legacy {
-		legacy[i].Provider = accounts.ProviderCodex
+		legacy[i].Provider = provider
 	}
 	return legacy
 }
