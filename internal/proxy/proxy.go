@@ -4634,7 +4634,7 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 		// minutes while still picking the account back up within the hour after
 		// an org re-enable. Token rotation must not clear this exclusion.
 		s.SchedulerRef.MarkAccountUnavailableUntil(
-			account.Provider, account.ID, time.Now().Add(credentialExhaustionTTL),
+			schedulerAccountProvider(account.Provider), account.ID, time.Now().Add(credentialExhaustionTTL),
 		)
 		return
 	}
@@ -4660,7 +4660,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 	// generation to advance, so retain the historical TTL-backed behavior.
 	if s.AccountRef == nil {
 		s.SchedulerRef.MarkExhaustedUntil(
-			account.Provider, account.ID, "", time.Now().Add(credentialExhaustionTTL),
+			schedulerAccountProvider(account.Provider), account.ID, "", time.Now().Add(credentialExhaustionTTL),
 		)
 		return
 	}
@@ -4677,7 +4677,7 @@ func (s Server) markAccountExhaustedCredentialForAccount(account accounts.Accoun
 		return
 	}
 	s.SchedulerRef.MarkCredentialExhaustedForSnapshot(
-		account.Provider, account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL),
+		schedulerAccountProvider(account.Provider), account.ID, account.CredentialIdentity(), time.Now().Add(credentialExhaustionTTL),
 		generation, credentialRevision, loaded,
 	)
 }

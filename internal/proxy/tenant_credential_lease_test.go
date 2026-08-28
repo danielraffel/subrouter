@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -130,6 +131,27 @@ func TestQwenAnthropicLeaseFailuresCooldownTheSharedTokenPlanAccount(t *testing.
 			}
 			if server.SchedulerRef.Get().Exhausted(accounts.ProviderQwenAnthropic, accountID) {
 				t.Fatalf("failure was recorded under the transport alias for %s", testCase.name)
+			}
+		})
+	}
+}
+
+func TestQwenAnthropicTransportFailuresMarkSharedTokenPlanAccount(t *testing.T) {
+	const accountID = "qwen-token:shared"
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			ref := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+				AccountID: accountID, Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1,
+			}}))
+			server := Server{SchedulerRef: ref}
+			server.markAccountExhaustedFromResponseForAccount(accounts.Account{
+				ID: accountID, Provider: accounts.ProviderQwenAnthropic, CredentialVersion: "credential-v1",
+			}, "", status, nil)
+			if !ref.Get().Exhausted(accounts.ProviderQwenToken, accountID) {
+				t.Fatalf("status %d did not mark canonical Token Plan account", status)
+			}
+			if ref.Get().Exhausted(accounts.ProviderQwenAnthropic, accountID) {
+				t.Fatalf("status %d left a mark under the transport alias", status)
 			}
 		})
 	}

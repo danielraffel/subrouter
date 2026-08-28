@@ -73,7 +73,7 @@ func TestKeyedProviderQuotaExhaustionIsAccountWideWithRequestModel(t *testing.T)
 				Body:   io.NopCloser(strings.NewReader(`{"error":{"message":"quota exhausted"}}`)), Request: request}, nil
 		}),
 		server: server, provider: accounts.ProviderQwenToken, account: accountID,
-		poolModel: "qwen3.7-plus", maxAttempts: 1,
+		accountCredential: "credential-v1", poolModel: "qwen3.7-plus", maxAttempts: 1,
 	}
 	request := httptest.NewRequest(http.MethodPost, "https://qwen.test/v1/chat/completions", strings.NewReader(`{"model":"qwen3.7-plus"}`))
 	request.GetBody = func() (io.ReadCloser, error) {
