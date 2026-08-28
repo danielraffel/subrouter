@@ -88,7 +88,8 @@ func whamResponder(t *testing.T, consumeCounter *int, cookedBeforeReset bool) pr
 func TestRateLimitResetEndpointRedeemsCookedAccountWithCredit(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := accounts.CodexStore{Dir: t.TempDir()}
-	stored := proxyStoredOAuthAccount("cooked@example.com", "fresh", time.Now().Add(time.Hour))
+	stored := proxyStoredOAuthAccount("oauth-identity@example.com", "fresh", time.Now().Add(time.Hour))
+	stored.Email = "stable-routing-id"
 	if err := store.SaveStored(stored); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +99,7 @@ func TestRateLimitResetEndpointRedeemsCookedAccountWithCredit(t *testing.T) {
 	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
 
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=cooked@example.com", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/_subrouter/rate-limit-reset?email=stable-routing-id", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -116,11 +117,42 @@ func TestRateLimitResetEndpointRedeemsCookedAccountWithCredit(t *testing.T) {
 		t.Fatalf("unexpected payload: %+v", payload)
 	}
 	res := payload.Results[0]
+	if res.Email != "stable-routing-id" {
+		t.Fatalf("result account = %q, want stable routing ID", res.Email)
+	}
 	if !res.Reset || res.Credit == nil || res.Credit.Status != "redeemed" {
 		t.Errorf("unexpected result: %+v", res)
 	}
 	if len(res.WindowsBefore) == 0 || len(res.WindowsAfter) == 0 {
 		t.Errorf("expected before+after windows: %+v", res)
+	}
+}
+
+func TestResetCreditsListsStableRoutingIdentifier(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	stored := proxyStoredOAuthAccount("oauth-identity@example.com", "fresh", time.Now().Add(time.Hour))
+	stored.Email = "stable-routing-id"
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	var consume int
+	client := &http.Client{Transport: whamResponder(t, &consume, true)}
+	handler := Server{AccountRef: NewAccountRef(store, nil, client), MaxBodyBytes: 1024}.Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_subrouter/reset-credits", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Accounts []ResetCreditsAccount `json:"accounts"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Accounts) != 1 || payload.Accounts[0].Email != "stable-routing-id" {
+		t.Fatalf("reset credit accounts = %+v, want stable routing ID", payload.Accounts)
 	}
 }
 

@@ -1948,7 +1948,10 @@ func (s Server) handleResetCredits(w http.ResponseWriter, r *http.Request) {
 			if !ok || account.Token == "" {
 				return
 			}
-			entry := ResetCreditsAccount{Email: account.Email}
+			// This value is also the selector clients send back to the reset
+			// endpoint, so expose the stable routing ID rather than the OAuth
+			// identity email decoded from the token.
+			entry := ResetCreditsAccount{Email: account.ID}
 			credits, err := accounts.ListRateLimitResetCredits(ctx, s.AccountRef.client, account)
 			if err != nil {
 				entry.Error = err.Error()
@@ -2056,7 +2059,7 @@ func (s Server) rateLimitResetAllAccounts(ctx context.Context, dryRun bool) []Ra
 // on its 7d window with a credit available, redeems one credit. dryRun lists
 // eligibility without consuming.
 func (s Server) redeemAccountIfEligible(ctx context.Context, account accounts.Account, dryRun bool) RateLimitResetResult {
-	result := RateLimitResetResult{Email: account.Email, DryRun: dryRun}
+	result := RateLimitResetResult{Email: account.ID, DryRun: dryRun}
 	before, err := accounts.FetchCodexUsageDetails(ctx, s.AccountRef.client, account)
 	if err != nil {
 		result.Error = err.Error()
