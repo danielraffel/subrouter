@@ -697,6 +697,7 @@ func TestUsageStatusesKeepsKimiAPIKeyHealthWhenQuotaIsForbidden(t *testing.T) {
 	}
 	const kimiUpstream = "https://custom.kimi.test/coding/v1"
 	var healthURL string
+	var quotaRequested bool
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		status := http.StatusForbidden
 		body := `{}`
@@ -704,6 +705,8 @@ func TestUsageStatusesKeepsKimiAPIKeyHealthWhenQuotaIsForbidden(t *testing.T) {
 			healthURL = request.URL.String()
 			status = http.StatusOK
 			body = `{"data":[]}`
+		} else {
+			quotaRequested = true
 		}
 		return &http.Response{
 			StatusCode: status,
@@ -730,6 +733,9 @@ func TestUsageStatusesKeepsKimiAPIKeyHealthWhenQuotaIsForbidden(t *testing.T) {
 	}
 	if healthURL != kimiUpstream+"/models" {
 		t.Fatalf("Kimi health probe URL = %q, want configured upstream", healthURL)
+	}
+	if quotaRequested {
+		t.Fatal("custom-upstream Kimi key was sent to the vendor quota endpoint")
 	}
 }
 

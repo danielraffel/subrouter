@@ -1268,23 +1268,6 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 				}(i, account.Email)
 			}
-			if rowProvider == accounts.ProviderKimi {
-				wg.Add(1)
-				go func(idx int, token string) {
-					defer wg.Done()
-					plan, windows, usageErr := kimiStore.FetchUsage(ctx, r.client, baseaccount.Account{Token: token})
-					if usageErr != nil {
-						// Some Kimi keys authorize generation without exposing
-						// membership quota. A missing quota view must not turn an
-						// otherwise usable key into an authentication error.
-						return
-					}
-					rows[idx].planType = plan + " key"
-					rows[idx].windows = windows
-					rows[idx].quotaStatus = "live"
-					rows[idx].quotaUsageKnown = true
-				}(i, account.Auth.OpenAIAPIKey)
-			}
 			rows[i].apiKeyHint = r.apiKeyHint(account, admins)
 			if admin, ok, err := r.store.PickAdminKeyFor(account); err == nil && ok {
 				if fresh, ok, err := r.store.ReadUsageCache(admin.Label, account.ProjectID, srUsageCacheTTL); err == nil && ok {

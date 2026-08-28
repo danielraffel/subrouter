@@ -562,6 +562,34 @@ func ProviderDefaultUpstream(provider accounts.Provider) string {
 	return entry.DefaultUpstream
 }
 
+func providerUpstreamUsesDefaultAuthority(provider accounts.Provider, rawUpstream string) bool {
+	upstream, err := url.Parse(strings.TrimSpace(rawUpstream))
+	if err != nil || upstream.Hostname() == "" {
+		return false
+	}
+	defaultUpstream, err := url.Parse(ProviderDefaultUpstream(provider))
+	if err != nil || defaultUpstream.Hostname() == "" {
+		return false
+	}
+	return strings.EqualFold(upstream.Scheme, defaultUpstream.Scheme) &&
+		strings.EqualFold(upstream.Hostname(), defaultUpstream.Hostname()) &&
+		effectiveURLPort(upstream) == effectiveURLPort(defaultUpstream)
+}
+
+func effectiveURLPort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(value.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
+	}
+}
+
 // ProviderMetering describes how a vendor charges this provider. These vendors
 // expose no quota API, so this is the only plan information available.
 func ProviderMetering(provider accounts.Provider) string {

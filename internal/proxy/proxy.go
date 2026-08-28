@@ -1033,6 +1033,9 @@ func (r *AccountRef) keyedAPIUsageStatus(ctx context.Context, stored accounts.St
 			}
 		}
 	case accounts.ProviderKimi:
+		if !providerUpstreamUsesDefaultAuthority(provider, r.apiKeyUpstream(provider)) {
+			break
+		}
 		plan, windows, usageErr := r.kimiStore().FetchUsage(ctx, r.client, account)
 		if usageErr == nil {
 			status.PlanType = plan + " key"

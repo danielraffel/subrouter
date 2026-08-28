@@ -208,6 +208,27 @@ func TestCollapseDuplicateVersionSegment(t *testing.T) {
 	}
 }
 
+func TestProviderUpstreamUsesDefaultAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		upstream string
+		want     bool
+	}{
+		{name: "documented upstream", upstream: "https://api.kimi.com/coding/v1", want: true},
+		{name: "explicit default port", upstream: "https://API.KIMI.COM:443/gateway", want: true},
+		{name: "custom gateway", upstream: "https://custom.kimi.test/coding/v1", want: false},
+		{name: "different port", upstream: "https://api.kimi.com:8443/coding/v1", want: false},
+		{name: "cleartext", upstream: "http://api.kimi.com/coding/v1", want: false},
+		{name: "missing", upstream: "", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := providerUpstreamUsesDefaultAuthority(accounts.ProviderKimi, test.upstream); got != test.want {
+				t.Fatalf("providerUpstreamUsesDefaultAuthority(%q) = %v, want %v", test.upstream, got, test.want)
+			}
+		})
+	}
+}
+
 // A provider that addresses models as vendor/model must keep the whole id,
 // while every other provider keeps reading the leading segment as a provider
 // selector. OpenRouter uses this flag; the synthetic entry below also proves

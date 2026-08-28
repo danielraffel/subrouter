@@ -34,6 +34,7 @@ type fakeKimiUsageStore struct {
 	plan     string
 	windows  []accounts.UsageWindow
 	err      error
+	fetches  *int
 }
 
 type fakeGrokStore struct {
@@ -357,7 +358,39 @@ func (f fakeKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account
 }
 
 func (f fakeKimiUsageStore) FetchUsage(context.Context, *http.Client, baseaccount.Account) (string, []accounts.UsageWindow, error) {
+	if f.fetches != nil {
+		*f.fetches++
+	}
 	return f.plan, f.windows, f.err
+}
+
+func TestFetchUsageRowsDoesNotSendKimiAPIKeyToUnconfiguredVendorQuota(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	if _, _, err := store.AddAPIKeyForProvider("gateway", "gateway-only-key", accounts.ProviderKimi); err != nil {
+		t.Fatal(err)
+	}
+	fetches := 0
+	runner := srRunner{store: store, kimi: fakeKimiUsageStore{fetches: &fetches}}
+	rows, err := runner.fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, row := range rows {
+		if row.provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeAPIKey {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Kimi API-key row is missing: %+v", rows)
+	}
+	if fetches != 0 {
+		t.Fatalf("standalone status sent Kimi API key to vendor quota endpoint %d time(s)", fetches)
+	}
 }
 
 func TestAutoImportIfEmptySkipsProviderOnlyOAuthInstallations(t *testing.T) {
