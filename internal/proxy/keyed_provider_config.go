@@ -45,6 +45,7 @@ var reservedProviderNames = map[string]bool{
 	"gemini": true, "bedrock": true,
 	"internal": true, "_subrouter": true, "t": true,
 	"v1": true, "backend-api": true, "messages": true, "responses": true,
+	"models": true, "alpha": true, "ps": true, "plugins": true,
 }
 
 // ConfigureOpenAICompatibleProviders registers operator-declared providers.
@@ -65,7 +66,7 @@ func ConfigureOpenAICompatibleProviders(declared []OpenAICompatibleProvider) err
 			return fmt.Errorf("openai-compatible provider needs a name")
 		}
 		if !validDeclaredProviderIdentifier(name) {
-			return fmt.Errorf("openai-compatible provider name %q must be 1-318 characters, start with a letter or digit, and use only lowercase letters, digits, '.', '_', or '-'", item.Name)
+			return fmt.Errorf("openai-compatible provider name %q must be 1-63 characters, start with a letter or digit, and use only lowercase letters, digits, '.', '_', or '-'", item.Name)
 		}
 		base, err := parseProviderBaseURL(item.BaseURL, name)
 		if err != nil {

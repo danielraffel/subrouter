@@ -210,7 +210,10 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 }
 
 func TestValidDeclaredProviderNameRejectsStorageAndRoutingNamespaces(t *testing.T) {
-	for _, value := range []string{"apikey", "apikey:team", "codex", "anthropic", "qwen", "a/b", "a b"} {
+	for _, value := range []string{
+		"apikey", "apikey:team", "codex", "anthropic", "qwen", "a/b", "a b",
+		"models", "alpha", "ps", "plugins",
+	} {
 		if ValidDeclaredProviderName(value) {
 			t.Fatalf("ValidDeclaredProviderName(%q) = true, want false", value)
 		}
