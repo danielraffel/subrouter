@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -83,7 +84,21 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string) 
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("no remote Subrouter server selected; run '%s remote use <name>'", r.programOrSubrouter())
+		config, configErr := cloudModeConfig()
+		if configErr != nil {
+			return fmt.Errorf("load cmux.com login: %w", configErr)
+		}
+		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
+			return fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
+		}
+		proxyToken := cloudClientProxyToken(config, localBaseURL())
+		if proxyToken == "" {
+			proxyToken = "subrouter"
+		}
+		return r.proxyClaudeArgsTo(ctx, args, localBaseURL(), proxyToken)
 	}
 	proxyToken := strings.TrimSpace(server.TenantKey)
 	if proxyToken == "" {

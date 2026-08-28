@@ -18,6 +18,15 @@ import (
 
 var reference = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
+func TestDefaultStoreUsesConfiguredStateRoot(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	want := filepath.Join(root, "grok", "oauth.json")
+	if got := DefaultStore().credentialPath(); got != want {
+		t.Fatalf("credential path = %q, want %q", got, want)
+	}
+}
+
 func TestParseCredentialReadsTheStoredShape(t *testing.T) {
 	credential, err := ParseCredential([]byte(
 		`{"access_token":"at","refresh_token":"rt","expires_at":1787144400,"scope":"`+oauthScope+`","token_type":"Bearer","email":"dev@example.com"}`),

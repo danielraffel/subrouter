@@ -254,6 +254,51 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 	}
 }
 
+func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
+	home := t.TempDir()
+	local := healthServer(t, http.StatusOK)
+	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud.json"))
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(home, "claude-local.txt")
+	claudePath := filepath.Join(binDir, "claude")
+	script := "#!/bin/sh\nprintf 'args=%s\\nbase=%s\\ntoken=%s\\nheaders=%s\\n' \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\" > " + shellQuote(recordPath) + "\n"
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := srRunner{
+		program: "sr",
+		store:   accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")},
+		in:      strings.NewReader(""),
+		out:     io.Discard,
+		errOut:  io.Discard,
+	}
+	if err := runner.claude(context.Background(), []string{"proxy", "-p", "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	for _, want := range []string{
+		"args=-p hello\n",
+		"base=" + local.URL + "\n",
+		"token=subrouter\n",
+		"headers=X-Subrouter-Agent: claude\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("local proxy invocation missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestSRClaudeBareRemainsProfileManager(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

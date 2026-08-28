@@ -14,6 +14,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/oauthdevice"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 // OAuth constants for the Grok CLI's installed-app client, matching what the
@@ -50,11 +51,7 @@ func (s Store) credentialPath() string {
 	if s.Path != "" {
 		return s.Path
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".subrouter", "grok", "oauth.json")
+	return filepath.Join(storepath.StateDir(), "grok", "oauth.json")
 }
 
 // ReadLocalCredential returns the credential currently on this machine. It
