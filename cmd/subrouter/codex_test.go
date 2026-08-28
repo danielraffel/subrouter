@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -158,6 +159,41 @@ func TestCodexArgsFindsUtilitySubcommandAfterVariadicImagesEndAtOption(t *testin
 	}
 }
 
+func TestCodexArgsFindsUtilitySubcommandAfterAttachedImageValue(t *testing.T) {
+	for _, imageArg := range []string{"--image=first.png", "-i=first.png", "-ifirst.png"} {
+		args := []string{imageArg, "login", "--help"}
+		got := codexArgs(args, "http://127.0.0.1:31415/v1", "", "")
+		if strings.Join(got, "\x00") != strings.Join(args, "\x00") {
+			t.Fatalf("%s args = %#v, want utility pass-through %#v", imageArg, got, args)
+		}
+	}
+}
+
+func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "codex-fake")
+	record := filepath.Join(home, "record")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep -E '^(SUBROUTER_CODEX_LAUNCHER|SUBROUTER_CODEX_RESUME_COMMAND|SUBROUTER_CODEX_DUMMY_API_KEY)=' >> " + shellQuote(record) + " || true\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_BIN", bin)
+	t.Setenv("SUBROUTER_CODEX_SERVER", "missing-server-that-must-not-be-resolved")
+	t.Setenv(subrouterCodexLauncherEnv, "stale launcher")
+	t.Setenv(subrouterCodexResumeCommandEnv, "stale resume")
+	t.Setenv("SUBROUTER_CODEX_DUMMY_API_KEY", "stale-key")
+	if err := codex([]string{"login", "--help"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body); got != "login --help\n" {
+		t.Fatalf("utility launch record = %q", got)
+	}
+}
+
 func TestCodexArgsInjectsSubrouterBaseURLIntoAppServer(t *testing.T) {
 	got := codexArgs([]string{"app-server", "--listen", "off"}, "http://127.0.0.1:31415/v1", "", "")
 	want := append([]string{"app-server", "--listen", "off"}, defaultSubrouterCodexConfigArgs("http://127.0.0.1:31415/v1")...)
@@ -199,6 +235,7 @@ func defaultSubrouterCodexConfigArgs(baseURL string) []string {
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex"}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="` + baseURL + `",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex"}}`,
 	}
 }
 
@@ -214,6 +251,7 @@ func TestCodexArgsInjectsUserEmailWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-User-Email"="alice@example.com"}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-User-Email"="alice@example.com"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
@@ -232,6 +270,7 @@ func TestCodexArgsInjectsAccountIDWithCustomSubrouterProvider(t *testing.T) {
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Account-ID"="team-codex-1"}`,
+		"-c", `model_providers.subrouter={name="Subrouter",base_url="http://127.0.0.1:31415/v1",experimental_bearer_token="subrouter",wire_api="responses",supports_websockets=true,http_headers={"X-Subrouter-Agent"="codex","X-Subrouter-Account-ID"="team-codex-1"}}`,
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("args = %#v, want %#v", got, want)
@@ -268,6 +307,19 @@ func TestCodexArgsInjectsModelHeader(t *testing.T) {
 func TestCodexModelArgSupportsEqualsForm(t *testing.T) {
 	if got := codexModelArg([]string{"exec", "--model=GPT-5.3-Codex-Spark"}); got != "GPT-5.3-Codex-Spark" {
 		t.Fatalf("model = %q", got)
+	}
+}
+
+func TestCodexModelArgUsesLastOverrideBeforeTerminator(t *testing.T) {
+	got := codexModelArg([]string{
+		"-m", "first",
+		"--model=second",
+		"-m=third",
+		"--",
+		"--model=prompt-value",
+	})
+	if got != "third" {
+		t.Fatalf("model = %q, want third", got)
 	}
 }
 
@@ -325,6 +377,16 @@ func TestInlineTableOwnsSubrouterOnlyAtTheParentLevel(t *testing.T) {
 		if inlineTableOwnsSubrouter(value) {
 			t.Errorf("inlineTableOwnsSubrouter(%q) = true", value)
 		}
+	}
+	lastAssignment := ""
+	for i := 0; i+1 < len(got); i++ {
+		if got[i] == "-c" || got[i] == "--config" {
+			lastAssignment = got[i+1]
+			i++
+		}
+	}
+	if !strings.HasPrefix(lastAssignment, `model_providers.subrouter={`) || strings.Contains(lastAssignment, "Parent") {
+		t.Fatalf("last config is not the authoritative whole provider table: %q", lastAssignment)
 	}
 }
 
@@ -425,6 +487,24 @@ func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in:\n%s", want, joined)
+		}
+	}
+}
+
+func TestCodexChildEnvOnlyTrustsKnownLauncherAliases(t *testing.T) {
+	for _, test := range []struct {
+		launcher string
+		want     string
+	}{
+		{launcher: "sr", want: "sr"},
+		{launcher: "subrouter", want: "subrouter"},
+		{launcher: "cx", want: "cx"},
+		{launcher: "/tmp/malicious launcher", want: "sr"},
+		{launcher: "SR", want: "sr"},
+	} {
+		got := strings.Join(codexChildEnv(nil, "", test.launcher), "\n")
+		if !strings.Contains(got, subrouterCodexResumeCommandEnv+"="+test.want+" codex resume") {
+			t.Fatalf("launcher %q env = %q", test.launcher, got)
 		}
 	}
 }

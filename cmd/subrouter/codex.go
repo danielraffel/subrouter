@@ -23,6 +23,19 @@ const (
 )
 
 func codex(args []string) error {
+	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
+	if command := codexSubcommand(args); command != "" &&
+		!isSubrouterRoutedCodexCommand(command) {
+		return runCodexCommand(
+			bin,
+			args,
+			envWithout(os.Environ(), []string{
+				subrouterCodexLauncherEnv,
+				subrouterCodexResumeCommandEnv,
+				"SUBROUTER_CODEX_DUMMY_API_KEY",
+			}),
+		)
+	}
 	baseURL, err := codexBaseURLWithFallback(defaultSRServerStore(accounts.DefaultCodexStore()), os.Stderr)
 	if err != nil {
 		return err
@@ -32,7 +45,6 @@ func codex(args []string) error {
 		return err
 	}
 	localProxyToken := cloudClientProxyToken(cloudConfig, baseURL)
-	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
 	userEmail := ""
@@ -43,8 +55,7 @@ func codex(args []string) error {
 		}
 	}
 
-	cmd := exec.CommandContext(
-		context.Background(),
+	return runCodexCommand(
 		bin,
 		codexArgsWithLocalProxyToken(
 			args,
@@ -52,20 +63,22 @@ func codex(args []string) error {
 			userEmail,
 			accountID,
 			localProxyToken,
-		)...,
+		),
+		codexChildEnv(os.Environ(), localProxyToken, programBase()),
 	)
+}
+
+func runCodexCommand(bin string, args, env []string) error {
+	cmd := exec.CommandContext(context.Background(), bin, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = codexChildEnv(os.Environ(), localProxyToken, programBase())
+	cmd.Env = env
 	return cmd.Run()
 }
 
 func codexChildEnv(environ []string, localProxyToken, launcher string) []string {
-	launcher = strings.TrimSpace(launcher)
-	if launcher == "" {
-		launcher = "sr"
-	}
+	launcher = trustedCodexLauncher(launcher)
 	environ = upsertEnv(environ, subrouterCodexLauncherEnv, launcher+" codex")
 	environ = upsertEnv(environ, subrouterCodexResumeCommandEnv, launcher+" codex resume")
 	if localProxyToken != "" {
@@ -76,6 +89,19 @@ func codexChildEnv(environ []string, localProxyToken, launcher string) []string 
 		)
 	}
 	return environ
+}
+
+func trustedCodexLauncher(launcher string) string {
+	switch strings.TrimSpace(launcher) {
+	case "sr":
+		return "sr"
+	case "subrouter":
+		return "subrouter"
+	case "cx":
+		return "cx"
+	default:
+		return "sr"
+	}
 }
 
 func codexBaseURL(store srServerStore) (string, error) {
@@ -459,7 +485,18 @@ func codexConfigArgs(
 		"-c", `model_providers.subrouter.wire_api="responses"`,
 		"-c", `model_providers.subrouter.supports_websockets=true`,
 		"-c", `model_providers.subrouter.http_headers=` + codexSubrouterHeaders(userEmail, accountID, model),
+		// A final whole-table override removes unknown leaves inherited through a
+		// parent model_providers table; leaf overrides alone do not replace them.
+		"-c", `model_providers.subrouter=` + codexSubrouterProviderTable(baseURL, userEmail, accountID, model, forceAuthenticatedProvider),
 	}
+}
+
+func codexSubrouterProviderTable(baseURL, userEmail, accountID, model string, forceAuthenticatedProvider bool) string {
+	auth := `experimental_bearer_token="subrouter"`
+	if forceAuthenticatedProvider {
+		auth = `env_key="SUBROUTER_CODEX_DUMMY_API_KEY"`
+	}
+	return `{name="Subrouter",base_url=` + strconv.Quote(baseURL) + `,` + auth + `,wire_api="responses",supports_websockets=true,http_headers=` + codexSubrouterHeaders(userEmail, accountID, model) + `}`
 }
 
 func codexSubrouterHeaders(userEmail, accountID, model string) string {
@@ -477,20 +514,25 @@ func codexSubrouterHeaders(userEmail, accountID, model string) string {
 }
 
 func codexModelArg(args []string) string {
+	model := ""
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+		if arg == "--" {
+			break
+		}
 		switch {
 		case arg == "-m" || arg == "--model":
 			if i+1 < len(args) {
-				return session.NormalizeModel(args[i+1])
+				model = session.NormalizeModel(args[i+1])
+				i++
 			}
 		case strings.HasPrefix(arg, "--model="):
-			return session.NormalizeModel(strings.TrimPrefix(arg, "--model="))
+			model = session.NormalizeModel(strings.TrimPrefix(arg, "--model="))
 		case strings.HasPrefix(arg, "-m="):
-			return session.NormalizeModel(strings.TrimPrefix(arg, "-m="))
+			model = session.NormalizeModel(strings.TrimPrefix(arg, "-m="))
 		}
 	}
-	return ""
+	return model
 }
 
 func isSubrouterRoutedCodexCommand(command string) bool {
@@ -516,9 +558,9 @@ func codexSubcommand(args []string) string {
 			if isCodexImageOption(arg) {
 				if arg == "-i" || arg == "--image" {
 					i++
-				}
-				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-					i++
+					for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+						i++
+					}
 				}
 				continue
 			}
