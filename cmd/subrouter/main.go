@@ -314,7 +314,7 @@ func serve(args []string) error {
 	transcriptAzureRate := flags.String("transcript-azure-max-bytes-per-second", "2MiB", "cap on Azure transcript upload throughput; supports KiB/MiB/GiB suffixes; 0 disables the cap")
 	transcriptAzureURL := flags.String("transcript-azure-url", "", "optional Azure blob container URL (https://<account>.blob.core.windows.net/<container>[/<prefix>]) for background transcript sync; defaults to SUBROUTER_TRANSCRIPT_AZURE_URL")
 	srSwitchInterval := defaultSRSwitchInterval
-	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for switching the active sr account to the best OAuth account; 0 disables")
+	flags.DurationVar(&srSwitchInterval, "sr-switch-interval", defaultSRSwitchInterval, "interval for refreshing OAuth usage scores used by routing; non-positive disables scheduled refresh")
 	flags.DurationVar(&srSwitchInterval, "cx-switch-interval", defaultSRSwitchInterval, "compatibility alias for --sr-switch-interval")
 	usageScoreTTL := flags.Duration("usage-score-ttl", 30*time.Second, "maximum age for usage scores before account selection refreshes them; 0 disables")
 	shutdownTimeout := flags.Duration("shutdown-timeout", 10*time.Minute, "maximum time to drain in-flight proxy requests after SIGTERM/SIGINT")
@@ -586,10 +586,20 @@ func serve(args []string) error {
 	}
 
 	codexStore := accounts.DefaultCodexStore()
+	// Serving traffic is credential-read-only with respect to the daemon user's
+	// interactive Codex login. Stored credentials may refresh for proxy routing,
+	// but only explicit account-manager commands may replace auth.json.
+	codexStore.DisableActiveAuthSync = true
+	// A serving process cannot safely rotate a legacy refresh-token chain whose
+	// independence from interactive auth is unknown. Account-manager commands
+	// provide the explicit isolated re-enrollment path for both local and shared
+	// stores, so serve fails closed until each legacy account is re-added.
+	codexStore.RequireIsolatedOAuth = true
 	claudeStore := agentclaude.DefaultStore()
 	oauthSources := []proxy.OAuthAccountSource{agentkimi.DefaultStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
+	var credentialRevision uint64
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
 		accountRef, err = proxy.OpenAccountRefWithSources(context.Background(), codexStore, claudeStore, &http.Client{
@@ -599,8 +609,9 @@ func serve(args []string) error {
 		if err != nil {
 			return err
 		}
-		initialAccounts, generation := accountRef.Snapshot()
+		initialAccounts, generation, revision := accountRef.CredentialSnapshot()
 		accountGeneration = generation
+		credentialRevision = revision
 		codexAccounts, claudeAccounts = schedulerAccountsByProvider(initialAccounts)
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
@@ -610,10 +621,13 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
-	schedulerRef.AdvanceAccountGeneration(accountGeneration)
+	allInitialAccounts := append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...)
+	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, allInitialAccounts)
 	if *fetchUsage && credentialBroker == nil {
 		go func() {
-			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
+			fetchedScores, successful := fetchCodexScoresWithAccountRef(context.Background(), accountRef, codexAccounts)
+			loaded, generation, revision := accountRef.CredentialSnapshot()
+			schedulerRef.SyncAccountCredentials(generation, revision, loaded)
 			if successful > 0 {
 				if !schedulerRef.SetForAccountGeneration(selectacct.NewScheduler(fetchedScores), accountGeneration) {
 					slog.Debug("initial usage score fetch discarded after account reload")
@@ -786,7 +800,13 @@ func serve(args []string) error {
 			Sessions:             store,
 			SchedulerRef:         schedulerRef,
 			Logger:               slog.Default(),
-			Lease:                newSRAutoSwitchLease(storepath.StateDir()),
+			FetchScores: func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+				scores, successful := fetchCodexScoresWithAccountRef(ctx, accountRef, candidates)
+				loaded, generation, revision := accountRef.CredentialSnapshot()
+				schedulerRef.SyncAccountCredentials(generation, revision, loaded)
+				return scores, successful
+			},
+			Lease: newSRAutoSwitchLease(storepath.StateDir()),
 		})
 	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
@@ -1325,6 +1345,39 @@ func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.A
 }
 
 func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	return fetchCodexScoresWithRefresh(ctx, codexAccounts, func(
+		ctx context.Context, client *http.Client, account accounts.Account,
+	) (accounts.Account, error) {
+		stored, ok, err := store.FindStored(account.ID)
+		if err != nil || !ok {
+			return account, err
+		}
+		refreshed, _, err := store.RefreshStoredIfExpired(
+			accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored,
+		)
+		if err != nil {
+			return account, err
+		}
+		if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
+			return refreshedAccount, nil
+		}
+		return account, nil
+	})
+}
+
+func fetchCodexScoresWithAccountRef(ctx context.Context, ref *proxy.AccountRef, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	return fetchCodexScoresWithRefresh(ctx, codexAccounts, func(
+		ctx context.Context, _ *http.Client, account accounts.Account,
+	) (accounts.Account, error) {
+		return ref.Refresh(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), account)
+	})
+}
+
+func fetchCodexScoresWithRefresh(
+	ctx context.Context,
+	codexAccounts []accounts.Account,
+	refresh func(context.Context, *http.Client, accounts.Account) (accounts.Account, error),
+) ([]selectacct.Score, int) {
 	codexAccounts, _ = schedulerAccountsByProvider(codexAccounts)
 	client := &http.Client{
 		Timeout:   10 * time.Second,
@@ -1346,10 +1399,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 		wg.Add(1)
 		go func(account accounts.Account) {
 			defer wg.Done()
-			stored, ok, err := store.FindStored(account.ID)
-			if err != nil || !ok {
-				slog.Warn("account refresh lookup failed", "account", account.ID, "error", err)
-			} else if refreshed, _, err := store.RefreshStoredIfExpired(accounts.WithCodexRefreshReason(ctx, "serve.fetch-usage"), client, stored); err != nil {
+			refreshed, err := refresh(ctx, client, account)
+			if err != nil {
 				slog.Warn("account refresh failed", "account", account.ID, "error", err)
 				mu.Lock()
 				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
@@ -1357,9 +1408,8 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 				}
 				mu.Unlock()
 				return
-			} else if refreshedAccount, ok := refreshed.Account(refreshed.SourcePath(store)); ok {
-				account = refreshedAccount
 			}
+			account = refreshed
 			windows, err := accounts.FetchCodexUsage(ctx, client, account)
 			if err != nil {
 				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
@@ -1553,7 +1603,7 @@ Session stickiness:
   Send X-Subrouter-Agent when the client is not Codex.
   Send X-Subrouter-User-Email for teammate-level observability.
   Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
-  Subrouter switches the active sr account every 10m by default; set --sr-switch-interval=0 to disable.
+  Subrouter refreshes routing scores every 10m by default; set --sr-switch-interval=0 to disable.
   For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
   The proxy also checks common session headers, query params, and small JSON bodies.
 `, program)

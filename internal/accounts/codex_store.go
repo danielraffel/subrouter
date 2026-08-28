@@ -11,11 +11,14 @@ import (
 	"strings"
 	"time"
 
+	accountpkg "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 type CodexStore struct {
-	Dir string
+	Dir                   string
+	DisableActiveAuthSync bool
+	RequireIsolatedOAuth  bool
 }
 
 const migrationBatchControlLockID = ".subrouter-migration-batch-control"
@@ -30,17 +33,26 @@ func (e *StorageKeyCollisionError) Error() string {
 }
 
 type StoredCodexAccount struct {
-	Email            string                `json:"email"`
-	Label            string                `json:"label,omitempty"`
-	Provider         Provider              `json:"provider,omitempty"`
-	MigrationBatchID string                `json:"migrationBatchId,omitempty"`
-	AddedAt          string                `json:"addedAt"`
-	Auth             CodexAuthFile         `json:"auth"`
-	ProjectID        string                `json:"projectId,omitempty"`
-	ProjectName      string                `json:"projectName,omitempty"`
-	AdminKeyLabel    string                `json:"adminKeyLabel,omitempty"`
-	Breadcrumbs      []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
+	Email                 string                     `json:"email"`
+	Label                 string                     `json:"label,omitempty"`
+	Provider              Provider                   `json:"provider,omitempty"`
+	OAuthCredentialOrigin CodexOAuthCredentialOrigin `json:"oauthCredentialOrigin,omitempty"`
+	MigrationBatchID      string                     `json:"migrationBatchId,omitempty"`
+	AddedAt               string                     `json:"addedAt"`
+	Auth                  CodexAuthFile              `json:"auth"`
+	ProjectID             string                     `json:"projectId,omitempty"`
+	ProjectName           string                     `json:"projectName,omitempty"`
+	AdminKeyLabel         string                     `json:"adminKeyLabel,omitempty"`
+	Breadcrumbs           []CodexAuthBreadcrumb      `json:"breadcrumbs,omitempty"`
 }
+
+type CodexOAuthCredentialOrigin string
+
+const (
+	CodexOAuthOriginInteractiveImport   CodexOAuthCredentialOrigin = "interactive-import"
+	CodexOAuthOriginIsolatedServerLogin CodexOAuthCredentialOrigin = "isolated-server-login"
+	CodexOAuthOriginServerAttested      CodexOAuthCredentialOrigin = "server-attested-transfer"
+)
 
 type CodexAuthFile struct {
 	Tokens         *CodexTokens         `json:"tokens,omitempty"`
@@ -240,7 +252,13 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 
 	out.AuthMode = AuthModeOAuth
 	out.Token = a.Auth.Tokens.AccessToken
+	out.CredentialVersion = accountpkg.OAuthCredentialVersion(
+		a.Auth.Tokens.AccessToken, a.Auth.Tokens.RefreshToken,
+	)
 	out.AccountID = a.Auth.Tokens.AccountID
+	if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
+		out.Email = strings.TrimSpace(email)
+	}
 	return out, true
 }
 

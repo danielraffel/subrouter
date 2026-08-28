@@ -122,6 +122,7 @@ func (s CodexStore) SyncActiveToStore() error {
 	}
 	previous := account
 	account.Auth = auth
+	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_synced", "active_auth", false, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		return err
@@ -157,6 +158,7 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	}
 	previous := account
 	account.Auth = auth
+	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_imported", "active_auth", false, &previous, &account, nil, nil)
 	err = s.SaveStored(account)
 	if err == nil {
@@ -234,13 +236,15 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens")
 		return account, false, nil
 	}
-	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
-		logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh")
-		return account, false, nil
-	}
-	if err := terminalStoredRefreshFailure(account); err != nil {
-		logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure")
-		return account, false, err
+	if !s.DisableActiveAuthSync {
+		if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
+			logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh")
+			return account, false, nil
+		}
+		if err := terminalStoredRefreshFailure(account); err != nil {
+			logCodexRefreshSkipped(ctx, s, account, force, "terminal_refresh_failure")
+			return account, false, err
+		}
 	}
 
 	lock, err := s.lockStoredAccount(account.Email)
@@ -261,6 +265,10 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens_after_lock")
 		return account, false, nil
+	}
+	if reason, err := s.validateServingCredentialIsolation(account); err != nil {
+		logCodexRefreshSkipped(ctx, s, account, force, reason)
+		return account, false, err
 	}
 	if !force && !IsJWTExpired(account.Auth.Tokens.AccessToken, 60*time.Second) {
 		logCodexRefreshSkipped(ctx, s, account, force, "access_token_fresh_after_lock")
@@ -300,12 +308,39 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, true, err
 	}
-	if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
-		logCodexRefreshFailed(ctx, s, account, force, err)
-		return account, true, err
+	if !s.DisableActiveAuthSync {
+		if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
+			logCodexRefreshFailed(ctx, s, account, force, err)
+			return account, true, err
+		}
 	}
 	logCodexRefreshSucceeded(ctx, s, previous, account, force)
 	return account, true, nil
+}
+
+func (s CodexStore) validateServingCredentialIsolation(account StoredCodexAccount) (string, error) {
+	if !s.DisableActiveAuthSync || account.Auth.Tokens == nil {
+		return "", nil
+	}
+	if s.RequireIsolatedOAuth &&
+		account.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin &&
+		account.OAuthCredentialOrigin != CodexOAuthOriginServerAttested {
+		return "oauth_origin_not_isolated", &CodexUnisolatedCredentialError{}
+	}
+	active, ok, err := ReadActiveCodexAuth()
+	if err != nil {
+		// Explicit isolated provenance is the serving authority. The active file
+		// is only a defense-in-depth check for a known shared refresh token; an
+		// unrelated malformed or unreadable interactive file must not disable
+		// every isolated account on a shared server.
+		return "", nil
+	}
+	if ok && active.Tokens != nil &&
+		active.Tokens.RefreshToken != "" &&
+		active.Tokens.RefreshToken == account.Auth.Tokens.RefreshToken {
+		return "shared_active_refresh_token", &CodexUnisolatedCredentialError{}
+	}
+	return "", nil
 }
 
 func (s CodexStore) recoverRefreshedAccount(previous StoredCodexAccount) (StoredCodexAccount, bool) {
@@ -326,6 +361,14 @@ func (s CodexStore) recoverRefreshedAccount(previous StoredCodexAccount) (Stored
 
 type CodexStoredRefreshFailureError struct {
 	Failure CodexRefreshFailure
+}
+
+// CodexUnisolatedCredentialError prevents a serving process from rotating a
+// refresh-token chain that is not proven independent of interactive Codex.
+type CodexUnisolatedCredentialError struct{}
+
+func (*CodexUnisolatedCredentialError) Error() string {
+	return "stored Codex credential is not proven isolated from interactive auth; re-add or repair it with an isolated Codex login"
 }
 
 func (e *CodexStoredRefreshFailureError) Error() string {

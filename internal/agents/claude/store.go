@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode"
 
+	accountpkg "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
@@ -1486,7 +1487,10 @@ func profileAccount(profile Profile, configDir string, credential *CredentialInf
 		Email:    email,
 		AddedAt:  addedAt,
 		Token:    credential.AccessToken,
-		Source:   configDir,
+		CredentialVersion: accountpkg.OAuthCredentialVersion(
+			credential.AccessToken, credential.RefreshToken,
+		),
+		Source: configDir,
 	}, true
 }
 

@@ -65,6 +65,27 @@ func TestSRAutoSwitchPicksBestOAuthAccount(t *testing.T) {
 	}
 }
 
+func TestSRAutoSwitchWithoutAccountManagerHookOnlyPublishesScores(t *testing.T) {
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+		Accounts:     []accounts.Account{{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth}},
+		SchedulerRef: schedulerRef,
+		FetchScores: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
+			return []selectacct.Score{{AccountID: "healthy@example.com", Headroom: 0.9, ShortHeadroom: 0.9}}, 1
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked != "healthy@example.com" {
+		t.Fatalf("picked = %q", picked)
+	}
+	selected, err := schedulerRef.Get().PickBest([]accounts.Account{{ID: "healthy@example.com", AuthMode: accounts.AuthModeOAuth}})
+	if err != nil || selected.ID != picked {
+		t.Fatalf("published scheduler selected %+v, err=%v", selected, err)
+	}
+}
+
 func TestSRAutoSwitchIgnoresClaudeAccountWithSameID(t *testing.T) {
 	var switchedTo string
 	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{

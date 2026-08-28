@@ -318,7 +318,14 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	if err := os.MkdirAll(filepath.Join(dir, "codex", "accounts"), 0o700); err != nil {
 		return nil, err
 	}
-	codexStore := accounts.CodexStore{Dir: filepath.Join(dir, "codex", "accounts")}
+	// Tenant handlers are serving paths, not interactive account managers. A
+	// token refresh may update the tenant's stored credential, but it must not
+	// replace the daemon user's ~/.codex/auth.json even when the emails match.
+	codexStore := accounts.CodexStore{
+		Dir:                   filepath.Join(dir, "codex", "accounts"),
+		DisableActiveAuthSync: true,
+		RequireIsolatedOAuth:  true,
+	}
 	claudeStore := agentclaude.Store{Dir: filepath.Join(dir, "codex")}
 	sessions, err := session.NewStore(filepath.Join(dir, "sessions.json"))
 	if err != nil {
@@ -338,7 +345,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	if err != nil {
 		return nil, err
 	}
-	initial, accountGeneration := ref.Snapshot()
+	initial, accountGeneration, credentialRevision := ref.CredentialSnapshot()
 
 	server := m.Base
 	server.Accounts = nil
@@ -350,7 +357,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.Sessions = sessions
 	server.Scheduler = selectacct.Scheduler{}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
-	server.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+	server.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initial)
 	server.ActiveSessions = NewActiveSessions()
 	server.CacheFlight = newSingleFlight()
 	// Reaching a tenant handler already proves possession of the tenant key,
@@ -838,12 +845,13 @@ func validStackTeamName(name string) bool {
 }
 
 type tenantAccountUpload struct {
-	Provider        string `json:"provider"`
-	AccountID       string `json:"accountId,omitempty"`
-	Label           string `json:"label"`
-	APIKey          string `json:"apiKey"`
-	TargetAccountID string `json:"targetAccountID,omitempty"`
-	Tokens          *struct {
+	Provider              string                              `json:"provider"`
+	AccountID             string                              `json:"accountId,omitempty"`
+	Label                 string                              `json:"label"`
+	APIKey                string                              `json:"apiKey"`
+	TargetAccountID       string                              `json:"targetAccountID,omitempty"`
+	OAuthCredentialOrigin accounts.CodexOAuthCredentialOrigin `json:"oauthCredentialOrigin,omitempty"`
+	Tokens                *struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		IDToken      string `json:"idToken"`
@@ -966,19 +974,10 @@ func storedTenantMigrationAccount(input tenantAccountUpload) (accounts.StoredCod
 	}
 	switch input.Provider {
 	case "codex":
-		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
-			return accounts.StoredCodexAccount{}, errors.New("complete Codex OAuth tokens are required")
-		}
-		return accounts.StoredCodexAccount{
-			Email: input.AccountID, Label: input.Label, Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode: "chatgpt",
-				Tokens: &accounts.CodexTokens{
-					AccessToken: input.Tokens.AccessToken, RefreshToken: input.Tokens.RefreshToken,
-					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
-				},
-			},
-		}, nil
+		// OAuth refresh-token ownership cannot be transferred atomically with a
+		// migration batch. Accept it only through the individual upload endpoint,
+		// which rotates the chain before publishing the account.
+		return accounts.StoredCodexAccount{}, errors.New("Codex OAuth migration requires individual server-attested account upload")
 	case "openai-apikey", "anthropic-apikey":
 		if strings.TrimSpace(input.APIKey) == "" {
 			return accounts.StoredCodexAccount{}, errors.New("API key is required")
@@ -1050,7 +1049,45 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+		if err := lockMutexContext(r.Context(), &server.AccountRef.installMu); err != nil {
+			http.Error(w, "Codex account update canceled", http.StatusRequestTimeout)
+			return
+		}
+		accountUpdateLocked := true
+		defer func() {
+			if accountUpdateLocked {
+				server.AccountRef.installMu.Unlock()
+			}
+		}()
+		submittedIdentity, err := accounts.ExtractEmailFromJWT(input.Tokens.IDToken)
+		if err != nil || strings.TrimSpace(submittedIdentity) == "" {
+			http.Error(w, "Codex OAuth credential identity is invalid", http.StatusBadRequest)
+			return
+		}
+		expectedIdentity := ""
+		existing, found, findErr := server.AccountRef.store.FindStored(id)
+		if findErr != nil {
+			http.Error(w, "read Codex account target", http.StatusInternalServerError)
+			return
+		}
+		if input.TargetAccountID != "" {
+			if !found || existing.Auth.Tokens == nil {
+				http.Error(w, "Codex repair target is unavailable", http.StatusConflict)
+				return
+			}
+			id = existing.Email
+			expectedIdentity, err = accounts.ExtractEmailFromJWT(existing.Auth.Tokens.IDToken)
+			if err != nil || !strings.EqualFold(
+				strings.TrimSpace(expectedIdentity), strings.TrimSpace(submittedIdentity),
+			) {
+				http.Error(w, "Codex repair identity does not match existing account", http.StatusConflict)
+				return
+			}
+		} else if found {
+			http.Error(w, "Codex account already exists; use repair", http.StatusConflict)
+			return
+		}
+		account, err := attestTenantCodexOAuth(r.Context(), server.AccountRef.client, accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
@@ -1061,9 +1098,35 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			},
 		})
 		if err != nil {
+			http.Error(w, "Codex OAuth credential transfer failed", http.StatusBadRequest)
+			return
+		}
+		refreshedIdentity, err := accounts.ExtractEmailFromJWT(account.Auth.Tokens.IDToken)
+		if err != nil || strings.TrimSpace(refreshedIdentity) == "" {
+			http.Error(w, "Codex OAuth credential identity is invalid", http.StatusBadRequest)
+			return
+		}
+		if !strings.EqualFold(
+			strings.TrimSpace(submittedIdentity), strings.TrimSpace(refreshedIdentity),
+		) {
+			http.Error(w, "Codex OAuth credential identity changed during transfer", http.StatusConflict)
+			return
+		}
+		if expectedIdentity != "" {
+			if !strings.EqualFold(
+				strings.TrimSpace(expectedIdentity), strings.TrimSpace(refreshedIdentity),
+			) {
+				http.Error(w, "Codex repair identity does not match existing account", http.StatusConflict)
+				return
+			}
+		}
+		err = server.AccountRef.store.SaveStored(account)
+		if err != nil {
 			http.Error(w, "save Codex account", http.StatusInternalServerError)
 			return
 		}
+		server.AccountRef.installMu.Unlock()
+		accountUpdateLocked = false
 	case "openai-apikey", "anthropic-apikey":
 		if strings.TrimSpace(input.APIKey) == "" {
 			http.Error(w, "API key is required", http.StatusBadRequest)

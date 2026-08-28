@@ -1805,9 +1805,10 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
 	}
 	account := accounts.StoredCodexAccount{
-		Email:   email,
-		AddedAt: time.Now().UTC().Format(time.RFC3339),
-		Auth:    auth,
+		Email:                 email,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
+		Auth:                  auth,
 	}
 	if err := lock.Close(); err != nil {
 		return err

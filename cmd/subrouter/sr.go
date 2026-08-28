@@ -657,23 +657,31 @@ func (r srRunner) promptProvider() (string, error) {
 }
 
 func (r srRunner) add(ctx context.Context) error {
-	previousActive, err := r.store.DetectActiveAccount()
+	auth, email, err := r.isolatedCodexLogin(ctx, false)
 	if err != nil {
 		return err
-	}
-	if err := r.publishActiveSync(ctx); err != nil {
-		return err
-	}
-	fmt.Fprintln(r.out, "Opening Codex OAuth login...")
-	if err := r.commandRunner().Run(ctx, "codex", []string{"login"}, r.in, r.out, r.errOut); err != nil {
-		return fmt.Errorf("codex login failed: %w", err)
 	}
 	var account accounts.StoredCodexAccount
 	var existed bool
 	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
-		var importErr error
-		account, existed, importErr = r.store.ImportActive()
-		return importErr == nil, importErr
+		var findErr error
+		account, existed, findErr = r.store.FindStored(email)
+		if findErr != nil {
+			return false, findErr
+		}
+		if !existed {
+			account = accounts.StoredCodexAccount{
+				Email:   email,
+				AddedAt: time.Now().UTC().Format(time.RFC3339),
+			}
+		}
+		account.Provider = accounts.ProviderCodex
+		account.OAuthCredentialOrigin = accounts.CodexOAuthOriginIsolatedServerLogin
+		account.Auth = auth
+		if saveErr := r.store.SaveStored(account); saveErr != nil {
+			return false, saveErr
+		}
+		return true, nil
 	})
 	if err != nil {
 		return err
@@ -683,25 +691,7 @@ func (r srRunner) add(ctx context.Context) error {
 	} else {
 		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.Email)
 	}
-	if previousActive != "" && previousActive != account.Email {
-		if err := r.store.SwitchActive(previousActive); err != nil {
-			return fmt.Errorf("restore active account %s: %w", previousActive, err)
-		}
-		previous, ok, err := r.store.FindStored(previousActive)
-		if err != nil {
-			return err
-		}
-		if ok {
-			for _, result := range syncCodexCompatibleAuth(previous) {
-				if result.Err != nil {
-					fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
-					continue
-				}
-				fmt.Fprintf(r.out, "Synced %s auth: %s\n", result.Tool, result.Path)
-			}
-		}
-		fmt.Fprintf(r.out, "Restored active account: %s\n", previousActive)
-	}
+	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	return nil
 }
 
@@ -1516,11 +1506,12 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err := r.ensureSwitchableForFreshUsage(ctx, account); err != nil {
 		return err
 	}
-	if err := accounts.WriteActiveCodexAuth(account.Auth); err != nil {
+	activated, err := r.store.SwitchActiveStored(account.Email)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Switched to %s\n", account.Email)
-	for _, result := range syncCodexCompatibleAuth(account) {
+	fmt.Fprintf(r.out, "Switched to %s\n", activated.Email)
+	for _, result := range syncCodexCompatibleAuth(activated) {
 		if result.Err != nil {
 			fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
 			continue
