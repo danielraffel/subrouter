@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -350,6 +351,36 @@ func TestRefreshStoredRejectsFreshUnisolatedCredentialBeforeUse(t *testing.T) {
 	}
 	if refreshed {
 		t.Fatal("fresh unisolated credential was accepted")
+	}
+}
+
+func TestRefreshStoredAcceptsIsolatedCredentialWhenInteractiveAuthIsUnreadable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{
+		Dir: t.TempDir(), DisableActiveAuthSync: true, RequireIsolatedOAuth: true,
+	}
+	fresh := storedOAuthAccount("founders@example.com", "isolated", time.Now().Add(time.Hour))
+	fresh.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	if err := store.SaveStored(fresh); err != nil {
+		t.Fatal(err)
+	}
+	activePath := DefaultCodexAuthPath()
+	if err := os.MkdirAll(filepath.Dir(activePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activePath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, refreshed, err := store.RefreshStoredIfExpired(context.Background(), nil, fresh)
+	if err != nil {
+		t.Fatalf("isolated credential rejected because interactive auth is unreadable: %v", err)
+	}
+	if refreshed {
+		t.Fatal("fresh isolated credential unexpectedly refreshed")
+	}
+	if got.Auth.Tokens == nil || got.Auth.Tokens.RefreshToken != fresh.Auth.Tokens.RefreshToken {
+		t.Fatalf("credential changed: got %#v", got.Auth.Tokens)
 	}
 }
 

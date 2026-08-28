@@ -295,7 +295,11 @@ func (s CodexStore) validateServingCredentialIsolation(account StoredCodexAccoun
 	}
 	active, ok, err := ReadActiveCodexAuth()
 	if err != nil {
-		return "active_auth_unreadable", err
+		// Explicit isolated provenance is the serving authority. The active file
+		// is only a defense-in-depth check for a known shared refresh token; an
+		// unrelated malformed or unreadable interactive file must not disable
+		// every isolated account on a shared server.
+		return "", nil
 	}
 	if ok && active.Tokens != nil &&
 		active.Tokens.RefreshToken != "" &&
