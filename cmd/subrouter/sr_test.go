@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -635,6 +636,74 @@ func TestSRQwenKeyAccountsCanBeAddedListedAndRemoved(t *testing.T) {
 	}
 	if _, err := agentqwen.ExportConsoleCredentialIn(root, "qwen-token:large-plan"); err != nil {
 		t.Fatalf("unrelated Qwen console credential was removed: %v", err)
+	}
+}
+
+func TestAdditionalKeyedProvidersCanBeAddedListedAndRemoved(t *testing.T) {
+	for _, provider := range []accounts.Provider{
+		accounts.ProviderDeepSeek,
+		accounts.ProviderTogether,
+		accounts.ProviderFireworks,
+		accounts.ProviderOpenCodeZen,
+	} {
+		t.Run(string(provider), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			store := accounts.DefaultCodexStore()
+			var out bytes.Buffer
+			runner := srRunner{
+				store: store, in: strings.NewReader("primary\nprovider-test-key\n"),
+				out: &out, errOut: &out,
+			}
+			if err := runner.run(t.Context(), []string{"add-key", "--provider", string(provider)}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(out.String(), "provider-test-key") {
+				t.Fatal("add-key output leaked the API key")
+			}
+			accountID := string(provider) + ":primary"
+			stored, ok, err := store.FindStored(accountID)
+			if err != nil || !ok || stored.Provider != provider {
+				t.Fatalf("stored account = %+v ok=%v err=%v", stored, ok, err)
+			}
+			out.Reset()
+			runner.in = strings.NewReader("")
+			if err := runner.run(t.Context(), []string{"list"}); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), accountID) {
+				t.Fatalf("list omitted %q: %s", accountID, out.String())
+			}
+			if strings.Contains(out.String(), "provider-test-key") {
+				t.Fatal("list output leaked the API key")
+			}
+			out.Reset()
+			if err := runner.run(t.Context(), []string{"remove", accountID}); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok, err := store.FindStored(accountID); err != nil || ok {
+				t.Fatalf("removed account remains: ok=%v err=%v", ok, err)
+			}
+			if strings.Contains(out.String(), "provider-test-key") {
+				t.Fatal("account lifecycle output leaked the API key")
+			}
+		})
+	}
+}
+
+func TestAddKeyHelpListsEveryAdditionalKeyedProvider(t *testing.T) {
+	var out bytes.Buffer
+	runner := srRunner{store: accounts.DefaultCodexStore(), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"add-key", "--help"}); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("add-key --help error = %v, want flag.ErrHelp", err)
+	}
+	for _, provider := range []string{"deepseek", "together", "fireworks", "opencode-zen"} {
+		if !strings.Contains(out.String(), provider) {
+			t.Fatalf("add-key --help omits %q:\n%s", provider, out.String())
+		}
+		if !strings.Contains(srHelp, provider) {
+			t.Fatalf("top-level sr help omits %q", provider)
+		}
 	}
 }
 

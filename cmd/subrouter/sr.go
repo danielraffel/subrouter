@@ -61,7 +61,8 @@ Usage:
   sr add-key            Add an API key account for Codex
   sr add-key --provider <name>
                         Add an API key account for another provider
-                        (kimi, zai, openrouter, grok, qwen, qwen-token,
+                        (kimi, zai, openrouter, deepseek, together, fireworks,
+                        opencode-zen, grok, qwen, qwen-token,
                         qwen-anthropic, claude)
   sr import             Import current ~/.codex/auth.json account
   sr list               List all Codex accounts

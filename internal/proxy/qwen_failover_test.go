@@ -147,6 +147,66 @@ func TestDeepSeek429FailsOverWithoutCookingTheKey(t *testing.T) {
 	}
 }
 
+func TestAdditionalKeyedProvidersFailOverOn429AndCommitStickyAccount(t *testing.T) {
+	for _, provider := range []accounts.Provider{
+		accounts.ProviderDeepSeek,
+		accounts.ProviderTogether,
+		accounts.ProviderFireworks,
+		accounts.ProviderOpenCodeZen,
+	} {
+		t.Run(string(provider), func(t *testing.T) {
+			var attempts []string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				authorization := request.Header.Get("Authorization")
+				switch authorization {
+				case "Bearer primary-key":
+					attempts = append(attempts, "primary")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+				case "Bearer secondary-key":
+					attempts = append(attempts, "secondary")
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+				default:
+					attempts = append(attempts, "unexpected")
+					t.Error("upstream received an unexpected credential")
+					w.WriteHeader(http.StatusUnauthorized)
+				}
+			}))
+			defer upstream.Close()
+
+			primaryID := string(provider) + ":a-primary"
+			secondaryID := string(provider) + ":z-secondary"
+			server := opencodeProviderTestServer(t, accounts.Account{
+				ID: primaryID, Provider: provider, AuthMode: accounts.AuthModeAPIKey, Token: "primary-key",
+			}, provider, upstream.URL+"/v1")
+			server.Accounts = []accounts.Account{
+				{ID: primaryID, Provider: provider, AuthMode: accounts.AuthModeAPIKey, Token: "primary-key"},
+				{ID: secondaryID, Provider: provider, AuthMode: accounts.AuthModeAPIKey, Token: "secondary-key"},
+			}
+			server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+			sessionID := string(provider) + "-429"
+			req := httptest.NewRequest(http.MethodPost, "/"+string(provider)+"/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`))
+			req.Header.Set("X-Subrouter-Session", sessionID)
+			rec := httptest.NewRecorder()
+			server.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+			}
+			if want := []string{"primary", "secondary"}; !reflect.DeepEqual(attempts, want) {
+				t.Fatalf("account attempt sequence = %v, want %v", attempts, want)
+			}
+			assignment, ok := server.Sessions.Get(string(provider), sessionID)
+			if !ok || assignment.AccountID != secondaryID {
+				t.Fatalf("sticky assignment = %+v, want %s", assignment, secondaryID)
+			}
+			wantExhausted := provider != accounts.ProviderDeepSeek
+			if got := server.SchedulerRef.Get().Exhausted(provider, primaryID); got != wantExhausted {
+				t.Fatalf("primary exhausted = %v, want %v", got, wantExhausted)
+			}
+		})
+	}
+}
+
 // Two separately purchased Token Plan keys are two schedulable accounts. A
 // quota response from the account holding the sticky session must be consumed,
 // replayed once with the other key, and leave the session on that healthy key.
@@ -202,6 +262,143 @@ func TestHandlerFailsOverBetweenQwenTokenPlanAccounts(t *testing.T) {
 	assignment, ok := store.Get("qwen-token", "qwen-failover")
 	if !ok || assignment.AccountID != "qwen-token:z-secondary" {
 		t.Fatalf("sticky assignment = %+v, want the successful alternate account", assignment)
+	}
+}
+
+func TestQwenAnthropicFailoverSharesExhaustionWithTokenPlan(t *testing.T) {
+	var attempts []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		authorization := request.Header.Get("Authorization")
+		switch authorization {
+		case "Bearer token-primary":
+			attempts = append(attempts, "primary")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"quota exceeded"}}`)
+		case "Bearer token-secondary":
+			attempts = append(attempts, "secondary")
+			_, _ = io.WriteString(w, `{"id":"msg_ok","content":[]}`)
+		default:
+			attempts = append(attempts, "unexpected")
+			t.Error("upstream received an unexpected credential")
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "qwen-token:a-primary", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "token-primary"},
+			{ID: "qwen-token:z-secondary", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "token-secondary"},
+		},
+		Sessions: store, SchedulerRef: schedulerRef,
+		QwenAnthropicUpstream: mustParseURL(t, upstream.URL+"/apps/anthropic"), MaxBodyBytes: 1024,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/qwen-anthropic/v1/messages", strings.NewReader(`{"model":"qwen3.7-plus","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "qwen-anthropic-failover")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if want := []string{"primary", "secondary"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("account attempt sequence = %v, want %v", attempts, want)
+	}
+	if !schedulerRef.Get().Exhausted(accounts.ProviderQwenToken, "qwen-token:a-primary") {
+		t.Fatal("Anthropic endpoint quota response did not exhaust the shared Token Plan account")
+	}
+	if schedulerRef.Get().Exhausted(accounts.ProviderQwenAnthropic, "qwen-token:a-primary") {
+		t.Fatal("shared exhaustion was recorded under the transport endpoint instead of the account owner")
+	}
+	assignment, ok := store.Get("qwen-anthropic", "qwen-anthropic-failover")
+	if !ok || assignment.AccountID != "qwen-token:z-secondary" {
+		t.Fatalf("sticky assignment = %+v, want secondary Token Plan account", assignment)
+	}
+
+	// A later OpenAI-protocol request must observe the exhaustion recorded by
+	// the Anthropic endpoint. The two endpoints spend the same purchased pool;
+	// keeping separate scheduler namespaces would send this request back to the
+	// already limited key.
+	req = httptest.NewRequest(http.MethodPost, "/qwen-token/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "qwen-openai-after-anthropic-limit")
+	rec = httptest.NewRecorder()
+	server.QwenTokenUpstream = mustParseURL(t, upstream.URL+"/compatible-mode/v1")
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cross-protocol status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if want := []string{"primary", "secondary", "secondary"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("cross-protocol account sequence = %v, want %v", attempts, want)
+	}
+}
+
+func TestQwenProtocolsShareSchedulerLiveLoadThroughHandler(t *testing.T) {
+	var attempts []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.Header.Get("Authorization") {
+		case "Bearer busy-key":
+			attempts = append(attempts, "busy")
+		case "Bearer idle-key":
+			attempts = append(attempts, "idle")
+		default:
+			attempts = append(attempts, "unexpected")
+			t.Error("upstream received an unexpected credential")
+		}
+		if strings.Contains(request.URL.Path, "messages") {
+			_, _ = io.WriteString(w, `{"id":"msg_ok","content":[]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer upstream.Close()
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "qwen-token:a-busy", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "busy-key"},
+			{ID: "qwen-token:z-idle", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "idle-key"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "qwen-token:a-busy", Provider: accounts.ProviderQwenToken, Headroom: 0.41, ShortHeadroom: 0.41},
+			{AccountID: "qwen-token:z-idle", Provider: accounts.ProviderQwenToken, Headroom: 0.41, ShortHeadroom: 0.41},
+		})),
+		QwenTokenUpstream:     mustParseURL(t, upstream.URL+"/compatible-mode/v1"),
+		QwenAnthropicUpstream: mustParseURL(t, upstream.URL+"/apps/anthropic"), MaxBodyBytes: 1024,
+	}
+
+	// Route one Anthropic-protocol turn to the first key. Its live debit must be
+	// recorded against the Token Plan owner namespace, reducing 41% headroom to
+	// 39% and making the untouched key the deterministic next-session choice.
+	req := httptest.NewRequest(http.MethodPost, "/qwen-anthropic/v1/messages", strings.NewReader(`{"model":"qwen3.7-plus","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "anthropic-live-debit")
+	req.Header.Set("X-Subrouter-Account-ID", "qwen-token:a-busy")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Anthropic status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/qwen-token/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "new-openai-session")
+	rec = httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if want := []string{"busy", "idle"}; !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("cross-protocol live-load sequence = %v, want %v", attempts, want)
+	}
+	assignment, ok := store.Get("qwen-token", "new-openai-session")
+	if !ok || assignment.AccountID != "qwen-token:z-idle" {
+		t.Fatalf("sticky assignment = %+v, want idle Token Plan account", assignment)
 	}
 }
 

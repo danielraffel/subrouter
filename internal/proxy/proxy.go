@@ -1813,11 +1813,12 @@ func (s Server) updateSchedulerFromUsageStatusesContext(ctx context.Context, sta
 	scores := make([]selectacct.Score, 0, len(available))
 	scoreByID := make(map[string]int, len(available))
 	for _, account := range available {
-		seed := current.ScoreFor(account.Provider, account.ID)
+		scoreProvider := schedulerAccountProvider(account.Provider)
+		seed := current.ScoreFor(scoreProvider, account.ID)
 		seed.AccountID = account.ID
-		seed.Provider = account.Provider
+		seed.Provider = scoreProvider
 		seed.Fresh = false
-		scoreByID[selectacct.ScoreKey(account.Provider, account.ID)] = len(scores)
+		scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)] = len(scores)
 		scores = append(scores, seed)
 	}
 	scored := 0
@@ -1825,8 +1826,9 @@ func (s Server) updateSchedulerFromUsageStatusesContext(ctx context.Context, sta
 		if !status.UsageFresh || status.AuthMode != accounts.AuthModeOAuth || len(status.Windows) == 0 {
 			continue
 		}
-		if idx, ok := scoreByID[selectacct.ScoreKey(status.Provider, status.ID)]; ok {
-			next := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
+		statusProvider := schedulerAccountProvider(status.Provider)
+		if idx, ok := scoreByID[selectacct.ScoreKey(statusProvider, status.ID)]; ok {
+			next := scoreFromUsageWindows(statusProvider, status.ID, status.Windows)
 			next.Fresh = true
 			scores[idx] = next
 			scored++
@@ -2676,15 +2678,16 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	scores := make([]selectacct.Score, 0, len(available))
 	scoreByID := make(map[string]int, len(available))
 	for _, account := range available {
-		seed := current.ScoreFor(account.Provider, account.ID)
+		scoreProvider := schedulerAccountProvider(account.Provider)
+		seed := current.ScoreFor(scoreProvider, account.ID)
 		seed.AccountID = account.ID
-		seed.Provider = account.Provider
+		seed.Provider = scoreProvider
 		seed.Fresh = false // carried forward until a fresh fetch overwrites it
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			seed.Headroom = 0.01
 			seed.ShortHeadroom = 0.01
 		}
-		scoreByID[selectacct.ScoreKey(account.Provider, account.ID)] = len(scores)
+		scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)] = len(scores)
 		scores = append(scores, seed)
 	}
 
@@ -2709,7 +2712,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				s.Logger.Debug("skipping account with known-dead credential", "account", account.ID, "error", failure)
 			}
 			scoreMu.Lock()
-			setZeroScore(scores, scoreByID, account.Provider, account.ID)
+			setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
 			scoreMu.Unlock()
 			continue
 		}
@@ -2729,7 +2732,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				// Transient refresh errors preserve the seed.
 				if authLikeUsageError(err.Error()) {
 					scoreMu.Lock()
-					setZeroScore(scores, scoreByID, account.Provider, account.ID)
+					setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
 					scoreMu.Unlock()
 				}
 				return
@@ -2743,7 +2746,7 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				// scheduler avoids it. Transient failures preserve the seed.
 				if authLikeUsageError(err.Error()) {
 					scoreMu.Lock()
-					setZeroScore(scores, scoreByID, account.Provider, account.ID)
+					setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
 					scoreMu.Unlock()
 				}
 				return
@@ -2755,8 +2758,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			}
 			scoreMu.Lock()
 			defer scoreMu.Unlock()
-			if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-				next := scoreFromUsageWindows(account.Provider, account.ID, windows)
+			scoreProvider := schedulerAccountProvider(account.Provider)
+			if idx, ok := scoreByID[selectacct.ScoreKey(scoreProvider, account.ID)]; ok {
+				next := scoreFromUsageWindows(scoreProvider, account.ID, windows)
 				next.Fresh = true
 				scores[idx] = next
 				scored++
@@ -3439,7 +3443,7 @@ func (s Server) proxyHandler() http.Handler {
 			// Live debit: the scheduler sees its own routed traffic draining
 			// the usage snapshot between refreshes (sticky and fresh picks
 			// both consume quota).
-			s.SchedulerRef.NoteRouted(requestProvider, account.ID)
+			s.SchedulerRef.NoteRouted(schedulerAccountProvider(requestProvider), account.ID)
 		}
 		if s.Logger != nil {
 			// remote_addr + user_agent attribute each request to a source (tailnet
@@ -4329,7 +4333,7 @@ func webSocketCloseCodeCanBeForwarded(code int) bool {
 
 func (s Server) markAccountExhausted(provider accounts.Provider, accountID, poolKey string) {
 	if s.SchedulerRef != nil {
-		s.SchedulerRef.MarkExhausted(provider, accountID, poolKey)
+		s.SchedulerRef.MarkExhausted(schedulerAccountProvider(provider), accountID, poolKey)
 	}
 }
 
@@ -4356,7 +4360,7 @@ func (s Server) markAccountExhaustedFromResponse(provider accounts.Provider, acc
 		s.markAccountExhaustedCredential(provider, accountID, "")
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(provider), accountID, poolKey, claudeExhaustionExpiry(header, time.Now()))
 }
 
 // credentialExhaustionTTL is how long an account with a dead credential
@@ -4370,7 +4374,7 @@ func (s Server) markAccountExhaustedCredential(provider accounts.Provider, accou
 	if s.SchedulerRef == nil {
 		return
 	}
-	s.SchedulerRef.MarkExhaustedUntil(provider, accountID, "", time.Now().Add(credentialExhaustionTTL))
+	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(provider), accountID, "", time.Now().Add(credentialExhaustionTTL))
 }
 
 // markAccountExhaustedRefreshFailure picks the mark TTL by failure class: a
@@ -5270,7 +5274,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
 			}
-			candidate, pickErr := scheduler.Pick(availableAccounts)
+			candidate, pickErr := pickRoutingAccount(scheduler, availableAccounts)
 			if pickErr != nil || s.keepConstrainedStickyAssignment(scheduler, account, candidate) {
 				if s.Logger != nil {
 					s.Logger.Info("keeping sticky session on constrained account; no materially better account",
@@ -5279,13 +5283,13 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 						"account", account.ID,
 						"candidate", candidate.ID,
 						"active", s.activeSession(agentType, sessionID),
-						"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+						"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
 					)
 				}
 				s.touchSessionBestEffort(agentType, sessionID)
 				return account, sessionID, userEmail, nil
 			}
-			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(candidate.Provider, candidate.ID) {
+			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
 				// The whole pool is exhausted: Pick ranks exhausted accounts
 				// last but still returns one, and the post-selection check
 				// below rejects it before the assignment is ever persisted.
@@ -5303,9 +5307,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					"account", account.ID,
 					"to_account", candidate.ID,
 					"active", s.activeSession(agentType, sessionID),
-					"usable_for_new_session", scheduler.UsableForNewSession(account.Provider, account.ID),
-					"usable_for_sticky_session", scheduler.UsableForStickySession(account.Provider, account.ID),
-					"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+					"usable_for_new_session", scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID),
+					"usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(account.Provider), account.ID),
+					"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
 				)
 			}
 			picked = &candidate
@@ -5317,15 +5321,15 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		account = *picked
 	} else {
 		var err error
-		account, err = scheduler.Pick(availableAccounts)
+		account, err = pickRoutingAccount(scheduler, availableAccounts)
 		if err != nil {
 			return accounts.Account{}, sessionID, userEmail, err
 		}
 	}
-	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(account.Provider, account.ID) {
+	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 	}
-	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
+	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
 		// stale: the per-request re-score reads usage through a cache that falls
 		// back to stale "last good" data when the upstream usage endpoint
@@ -5338,7 +5342,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Warn("selected OAuth account below new-session headroom; routing optimistically",
 			"provider", provider,
 			"account", account.ID,
-			"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+			"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
 			"threshold", selectacct.MinNewSessionHeadroom)
 	}
 	if options.pendingSessionCommit != nil && previousAccountID != "" && previousAccountID != account.ID {
@@ -5371,8 +5375,8 @@ func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAcc
 		fields = append(fields, "forced", true)
 	} else {
 		fields = append(fields,
-			"from_exhausted", scheduler.Exhausted(provider, fromAccountID),
-			"from_usable_for_sticky_session", scheduler.UsableForStickySession(provider, fromAccountID),
+			"from_exhausted", scheduler.Exhausted(schedulerAccountProvider(provider), fromAccountID),
+			"from_usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(provider), fromAccountID),
 			"retention_threshold", selectacct.MinStickyRetentionHeadroom,
 		)
 	}
@@ -5383,7 +5387,7 @@ func (s Server) logStickyReuse(agentType, sessionID string, account accounts.Acc
 	if s.Logger == nil || accountProviderOrCodex(account) != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth {
 		return
 	}
-	if scheduler.UsableForNewSession(account.Provider, account.ID) || scheduler.Exhausted(account.Provider, account.ID) || !s.activeSession(agentType, sessionID) {
+	if scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) || scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) || !s.activeSession(agentType, sessionID) {
 		return
 	}
 	s.Logger.Info("keeping active sticky session on constrained account",
@@ -5444,7 +5448,7 @@ func selectionPolicyFor(account accounts.Account) providerSelectionPolicy {
 }
 
 func (s Server) reuseStickyAssignment(agentType, sessionID string, account accounts.Account, scheduler selectacct.Scheduler) bool {
-	if scheduler.Exhausted(account.Provider, account.ID) {
+	if scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		return false
 	}
 	if s.activeSession(agentType, sessionID) {
@@ -5456,7 +5460,7 @@ func (s Server) reuseStickyAssignment(agentType, sessionID string, account accou
 		// moved every idle session off any account past 60% used, which in a
 		// busy pool is all of them, so stickiness stopped existing exactly
 		// when the pool could least afford re-billing whole prefixes.
-		return scheduler.UsableForStickySession(account.Provider, account.ID)
+		return scheduler.UsableForStickySession(schedulerAccountProvider(account.Provider), account.ID)
 	}
 	return true
 }
@@ -5492,11 +5496,11 @@ func (s Server) keepConstrainedStickyAssignment(scheduler selectacct.Scheduler, 
 	if picked.ID == current.ID {
 		return true
 	}
-	if scheduler.Exhausted(current.Provider, current.ID) {
-		return scheduler.Exhausted(picked.Provider, picked.ID)
+	if scheduler.Exhausted(schedulerAccountProvider(current.Provider), current.ID) {
+		return scheduler.Exhausted(schedulerAccountProvider(picked.Provider), picked.ID)
 	}
-	currentScore := scheduler.ScoreFor(current.Provider, current.ID)
-	pickedScore := scheduler.ScoreFor(picked.Provider, picked.ID)
+	currentScore := scheduler.ScoreFor(schedulerAccountProvider(current.Provider), current.ID)
+	pickedScore := scheduler.ScoreFor(schedulerAccountProvider(picked.Provider), picked.ID)
 	currentMin := math.Min(currentScore.Headroom, currentScore.ShortHeadroom)
 	pickedMin := math.Min(pickedScore.Headroom, pickedScore.ShortHeadroom)
 	if pickedMin < selectacct.MinStickyRetentionHeadroom {
@@ -5869,11 +5873,11 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	}
-	account, err := scheduler.Pick(untried)
+	account, err := pickRoutingAccount(scheduler, untried)
 	if err != nil {
 		return accounts.Account{}, err
 	}
-	if scheduler.Exhausted(account.Provider, account.ID) {
+	if scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
 	}
 	return account, nil
@@ -6549,7 +6553,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		accountID = nextAccount.ID
 		tried[accountID] = struct{}{}
 		if t.server != nil && t.server.SchedulerRef != nil {
-			t.server.SchedulerRef.NoteRouted(t.provider, accountID)
+			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 		}
 		attemptReq = req.Clone(req.Context())
 		attemptReq.Body = body
@@ -7019,7 +7023,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
 				continue
 			}
-			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(account.Provider, account.ID) {
+			if account.AuthMode == accounts.AuthModeOAuth && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 				continue
 			}
 			candidates = append(candidates, account)
@@ -7030,7 +7034,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			}
 			return accounts.Account{}, fmt.Errorf("no untried non-exhausted %s accounts available", provider)
 		}
-		account, err := scheduler.Pick(candidates)
+		account, err := pickRoutingAccount(scheduler, candidates)
 		if err != nil {
 			return accounts.Account{}, err
 		}
@@ -7041,11 +7045,11 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		// can be stale, so trying it (the retry loop is bounded by maxAttempts and
 		// the tried set) is strictly better than refusing an account that may have
 		// quota. A truly exhausted account just returns the upstream's own limit.
-		if !scheduler.UsableForNewSession(account.Provider, account.ID) && s.Logger != nil {
+		if !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 			s.Logger.Warn("usage-limit retry selecting OAuth account below new-session headroom; trying anyway",
 				"provider", provider,
 				"account", account.ID,
-				"exhausted", scheduler.Exhausted(account.Provider, account.ID),
+				"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
 				"threshold", selectacct.MinNewSessionHeadroom)
 		}
 		refreshed, err := s.refreshAccount(ctx, account)

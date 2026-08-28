@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
 
@@ -366,5 +368,37 @@ func TestOneSubscriptionServesBothProtocolEntries(t *testing.T) {
 	}
 	if got := filterAccountsForProvider(stored, accounts.ProviderCodex); len(got) != 0 {
 		t.Fatalf("codex selected %d qwen accounts, want none", len(got))
+	}
+}
+
+func TestQwenAnthropicSchedulingUsesSharedTokenPlanSessionLoad(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("qwen-anthropic", "existing", "qwen-token:a-busy", ""); err != nil {
+		t.Fatal(err)
+	}
+	scheduler := selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "qwen-token:a-busy", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "qwen-token:z-idle", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+	}).WithSessionCounts(SchedulerSessionCounts(store))
+	candidates := filterAccountsForProvider([]accounts.Account{
+		{ID: "qwen-token:a-busy", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "busy"},
+		{ID: "qwen-token:z-idle", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "idle"},
+	}, accounts.ProviderQwenAnthropic)
+	picked, err := scheduler.PickBest(schedulerAccounts(candidates))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "qwen-token:z-idle" {
+		t.Fatalf("shared Token Plan session load picked %q, want idle account", picked.ID)
+	}
+	candidate := candidates[0]
+	if normalized := schedulerAccount(candidate); normalized.Provider != accounts.ProviderQwenToken {
+		t.Fatalf("scheduler provider = %q, want Token Plan owner", normalized.Provider)
+	}
+	if candidate.Provider != accounts.ProviderQwenAnthropic {
+		t.Fatalf("transport provider = %q, want Anthropic endpoint", candidate.Provider)
 	}
 }

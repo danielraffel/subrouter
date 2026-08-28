@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 // ValidateCredentialUpstreams rejects configurations that could send a
@@ -516,6 +517,39 @@ func accountProviderFor(provider accounts.Provider) accounts.Provider {
 		return entry.AccountProvider
 	}
 	return provider
+}
+
+// schedulerAccount keeps transport identity separate from quota identity. A
+// Qwen Anthropic request must still route through the Anthropic upstream, but
+// both protocols spend and load-balance the same Token Plan account pool.
+func schedulerAccount(account accounts.Account) accounts.Account {
+	account.Provider = accountProviderFor(account.Provider)
+	return account
+}
+
+func schedulerAccounts(accountsIn []accounts.Account) []accounts.Account {
+	out := make([]accounts.Account, len(accountsIn))
+	for i, account := range accountsIn {
+		out[i] = schedulerAccount(account)
+	}
+	return out
+}
+
+func pickRoutingAccount(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, error) {
+	picked, err := scheduler.Pick(schedulerAccounts(candidates))
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	for _, candidate := range candidates {
+		if candidate.ID == picked.ID && accountProviderFor(candidate.Provider) == picked.Provider {
+			return candidate, nil
+		}
+	}
+	return accounts.Account{}, fmt.Errorf("scheduler returned unknown account %q", picked.ID)
+}
+
+func schedulerAccountProvider(provider accounts.Provider) accounts.Provider {
+	return accountProviderFor(provider)
 }
 
 // ProviderDefaultUpstream returns a provider's documented base URL, so a flag
