@@ -637,6 +637,36 @@ func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
 	}
 }
 
+func TestLocalAccountUploadsExcludeInteractiveCodexOAuthChains(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	interactive := accounts.StoredCodexAccount{
+		Email:                 "interactive@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginInteractiveImport,
+		Auth:                  testCodexAuth("interactive@example.com", "interactive"),
+	}
+	isolated := accounts.StoredCodexAccount{
+		Email:                 "isolated@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  testCodexAuth("isolated@example.com", "isolated"),
+	}
+	for _, account := range []accounts.StoredCodexAccount{interactive, isolated} {
+		if err := store.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	uploads, err := localAccountUploads(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uploads) != 1 || uploads[0].label != "isolated@example.com" {
+		t.Fatalf("uploads = %#v, want only isolated OAuth", uploads)
+	}
+	if uploads[0].body["oauthCredentialOrigin"] != string(accounts.CodexOAuthOriginIsolatedServerLogin) {
+		t.Fatalf("OAuth origin = %#v", uploads[0].body["oauthCredentialOrigin"])
+	}
+}
+
 func TestMatchCloudTeamPrefersExactIDAndRejectsAmbiguousOrUnusableNames(
 	t *testing.T,
 ) {

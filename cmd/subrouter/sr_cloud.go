@@ -891,6 +891,16 @@ func (r srRunner) cloudAccountAdd(
 	if client.Config.HostedReady() {
 		return r.hostedAccountAdd(ctx, client, args)
 	}
+	if args[0] == "codex" {
+		deviceAuth := false
+		for _, arg := range args[1:] {
+			if arg != "--device-auth" {
+				return fmt.Errorf("usage: sr account add codex [--device-auth]")
+			}
+			deviceAuth = true
+		}
+		return r.hostedCodexAdd(ctx, client, deviceAuth)
+	}
 	if args[0] == "anthropic-key" {
 		reader := bufio.NewReader(r.in)
 		label, err := promptLine(r.out, reader, "Label (e.g. work, personal): ")
@@ -928,10 +938,6 @@ func (r srRunner) cloudAccountAdd(
 		beforeKeys[sharedAccountKey(upload.kind, upload.label)] = true
 	}
 	switch args[0] {
-	case "codex":
-		if err := r.add(ctx); err != nil {
-			return err
-		}
 	case "claude":
 		name := ""
 		if len(args) > 1 {
@@ -1021,17 +1027,33 @@ func (r srRunner) hostedCodexAdd(
 	client *broker.Client,
 	deviceAuth bool,
 ) error {
+	upload, email, err := r.isolatedCodexAccountUpload(ctx, deviceAuth)
+	if err != nil {
+		return err
+	}
+	if _, err := client.UploadAccount(ctx, upload); err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Added Codex account %s to the shared team.\n", email)
+	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
+	return nil
+}
+
+func (r srRunner) isolatedCodexAccountUpload(
+	ctx context.Context,
+	deviceAuth bool,
+) (broker.AccountUpload, string, error) {
 	lock, err := accounts.AcquireActiveCodexAuthLock(func() {
 		fmt.Fprintln(r.out, "Another sr add/login is in progress; waiting...")
 	})
 	if err != nil {
-		return fmt.Errorf("lock hosted Codex login: %w", err)
+		return nil, "", fmt.Errorf("lock shared Codex login: %w", err)
 	}
 	defer func() { _ = lock.Close() }()
 
 	loginHome, err := os.MkdirTemp("", "sr-hosted-codex-*")
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	defer os.RemoveAll(loginHome)
 
@@ -1039,7 +1061,7 @@ func (r srRunner) hostedCodexAdd(
 	if deviceAuth {
 		loginArgs = append(loginArgs, "--device-auth")
 	}
-	fmt.Fprintln(r.out, "Opening Codex OAuth login for hosted cmux...")
+	fmt.Fprintln(r.out, "Opening Codex OAuth login for the shared team...")
 	if err := r.commandRunner().RunWithEnv(
 		ctx,
 		"codex",
@@ -1049,38 +1071,34 @@ func (r srRunner) hostedCodexAdd(
 		r.out,
 		r.errOut,
 	); err != nil {
-		return fmt.Errorf("codex login failed: %w", err)
+		return nil, "", fmt.Errorf("codex login failed: %w", err)
 	}
 	auth, ok, err := accounts.ReadCodexAuthFile(filepath.Join(loginHome, "auth.json"))
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	if !ok || auth.Tokens == nil || auth.Tokens.AccessToken == "" ||
 		auth.Tokens.RefreshToken == "" || auth.Tokens.IDToken == "" {
-		return fmt.Errorf("codex login did not write complete OAuth auth")
+		return nil, "", fmt.Errorf("codex login did not write complete OAuth auth")
 	}
 	email, err := accounts.ExtractEmailFromJWT(auth.Tokens.IDToken)
 	if err != nil || strings.TrimSpace(email) == "" {
-		return fmt.Errorf("could not extract email from logged-in auth")
+		return nil, "", fmt.Errorf("could not extract email from logged-in auth")
 	}
 	if err := lock.Close(); err != nil {
-		return err
+		return nil, "", err
 	}
-	if _, err := client.UploadAccount(ctx, broker.AccountUpload{
-		"provider": "codex",
-		"label":    email,
+	return broker.AccountUpload{
+		"provider":              "codex",
+		"label":                 email,
+		"oauthCredentialOrigin": string(accounts.CodexOAuthOriginIsolatedServerLogin),
 		"tokens": map[string]any{
 			"accessToken":  auth.Tokens.AccessToken,
 			"refreshToken": auth.Tokens.RefreshToken,
 			"idToken":      auth.Tokens.IDToken,
 			"accountID":    auth.Tokens.AccountID,
 		},
-	}); err != nil {
-		return err
-	}
-	fmt.Fprintf(r.out, "Added Codex account %s to hosted cmux.\n", email)
-	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
-	return nil
+	}, email, nil
 }
 
 func (r srRunner) hostedClaudeAdd(
@@ -1170,11 +1188,12 @@ func (r srRunner) cloudAccountRepair(
 ) error {
 	flags := flag.NewFlagSet("account repair", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	deviceAuth := flags.Bool("device-auth", false, "use Codex device authorization")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 {
-		return fmt.Errorf("usage: sr account repair <account-id>")
+		return fmt.Errorf("usage: sr account repair [--device-auth] <account-id>")
 	}
 	accountID := flags.Arg(0)
 	shared, err := client.ListAccounts(ctx)
@@ -1190,6 +1209,37 @@ func (r srRunner) cloudAccountRepair(
 	}
 	if target == nil {
 		return fmt.Errorf("shared account %q not found", accountID)
+	}
+	if target.Kind == "codex" {
+		replacement, email, err := r.isolatedCodexAccountUpload(ctx, *deviceAuth)
+		if err != nil {
+			return err
+		}
+		expectedEmail := strings.TrimSpace(target.Email)
+		if expectedEmail == "" && strings.EqualFold(strings.TrimSpace(email), strings.TrimSpace(target.Label)) {
+			expectedEmail = strings.TrimSpace(target.Label)
+		}
+		if expectedEmail == "" {
+			return fmt.Errorf(
+				"shared account %s does not expose its OAuth identity; shared account was not changed",
+				target.ID,
+			)
+		}
+		if !strings.EqualFold(strings.TrimSpace(email), expectedEmail) {
+			return fmt.Errorf(
+				"logged in as %s, expected %s; shared account was not changed",
+				email,
+				expectedEmail,
+			)
+		}
+		replacement["accountId"] = target.ID
+		replacement["label"] = target.Label
+		if _, err := client.RepairAccount(ctx, accountID, replacement); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "Repaired shared account %s (%s).\n", target.Label, accountID)
+		fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
+		return restartInstalledDaemon()
 	}
 	local, err := localAccountUploads(ctx, r.store)
 	if err != nil {
@@ -1502,12 +1552,16 @@ func localAccountUploads(
 			item.Auth.Tokens.IDToken == "" {
 			continue
 		}
+		if item.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+			continue
+		}
 		out = append(out, localAccountUpload{
 			kind:  "codex",
 			label: label,
 			body: broker.AccountUpload{
-				"provider": "codex",
-				"label":    label,
+				"provider":              "codex",
+				"label":                 label,
+				"oauthCredentialOrigin": string(item.OAuthCredentialOrigin),
 				"tokens": map[string]any{
 					"accessToken":  item.Auth.Tokens.AccessToken,
 					"refreshToken": item.Auth.Tokens.RefreshToken,

@@ -44,6 +44,7 @@ type SharedAccount struct {
 	ID        string `json:"id"`
 	Kind      string `json:"kind"`
 	Label     string `json:"label,omitempty"`
+	Email     string `json:"email,omitempty"`
 	CreatedAt string `json:"createdAt,omitempty"`
 	Health    *struct {
 		OK      bool   `json:"ok"`
@@ -248,7 +249,7 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 				label = item.ID
 			}
 			out = append(out, SharedAccount{
-				ID: item.ID, Kind: kind, Label: label, Health: item.Health,
+				ID: item.ID, Kind: kind, Label: label, Email: item.Email, Health: item.Health,
 			})
 		}
 		return out, nil

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
 func TestSRLoginNativeStackConfiguresBuiltInCMUXRemote(t *testing.T) {
@@ -152,6 +155,7 @@ func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 
 	root := t.TempDir()
 	localCodexHome := filepath.Join(root, "codex-home")
+	t.Setenv("HOME", root)
 	t.Setenv("CODEX_HOME", localCodexHome)
 	if err := os.MkdirAll(localCodexHome, 0o700); err != nil {
 		t.Fatal(err)
@@ -193,6 +197,9 @@ func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 	if uploaded["provider"] != "codex" || uploaded["label"] != "hosted@example.com" {
 		t.Fatalf("upload = %#v", uploaded)
 	}
+	if uploaded["oauthCredentialOrigin"] != string(accounts.CodexOAuthOriginIsolatedServerLogin) {
+		t.Fatalf("OAuth origin = %#v", uploaded["oauthCredentialOrigin"])
+	}
 	tokens, ok := uploaded["tokens"].(map[string]any)
 	if !ok {
 		t.Fatalf("tokens = %#v", uploaded["tokens"])
@@ -223,6 +230,197 @@ func TestHostedCodexAddUsesTemporaryHomeAndUploadsCredential(t *testing.T) {
 				t.Fatalf("Codex login used the real home: %#v", command.envs)
 			}
 		}
+	}
+}
+
+func TestCloudCodexRepairUsesFreshIsolatedLogin(t *testing.T) {
+	var repaired broker.AccountUpload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/subrouter/accounts":
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": []map[string]string{{
+				"id": "shared-codex", "kind": "codex", "label": "Production Codex",
+				"email": "hosted@example.com",
+			}}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/subrouter/accounts/shared-codex/repair":
+			if r.URL.Query().Get("adopt") != "1" {
+				http.Error(w, "missing adoption", http.StatusBadRequest)
+				return
+			}
+			if err := json.NewDecoder(r.Body).Decode(&repaired); err != nil {
+				http.Error(w, "invalid upload", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"account": map[string]string{
+				"id": "shared-codex", "kind": "codex", "label": "Production Codex",
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	localCodexHome := filepath.Join(root, "codex-home")
+	t.Setenv("HOME", root)
+	t.Setenv("CODEX_HOME", localCodexHome)
+	if err := os.MkdirAll(localCodexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	localAuth := []byte(`{"sentinel":"unchanged"}`)
+	if err := os.WriteFile(filepath.Join(localCodexHome, "auth.json"), localAuth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := &recordingSRCommandRunner{
+		loginAuth: testCodexAuth("hosted@example.com", "account-hosted"),
+	}
+	var output bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   accounts.CodexStore{Dir: filepath.Join(root, "state", "codex", "accounts")},
+		in:      strings.NewReader(""),
+		out:     &output,
+		errOut:  &output,
+		client:  server.Client(),
+		cmd:     command,
+	}
+	client := broker.NewClient(broker.Config{
+		BaseURL: server.URL, AccessToken: "stack-access", RefreshToken: "stack-refresh",
+		TeamID: "team-1", CredentialSource: broker.CredentialSourceTeam,
+	})
+	client.HTTPClient = server.Client()
+	if err := runner.cloudAccountRepair(context.Background(), client, []string{"shared-codex"}); err != nil {
+		t.Fatal(err)
+	}
+	if repaired["oauthCredentialOrigin"] != string(accounts.CodexOAuthOriginIsolatedServerLogin) {
+		t.Fatalf("OAuth origin = %#v", repaired["oauthCredentialOrigin"])
+	}
+	if repaired["accountId"] != "shared-codex" || repaired["label"] != "Production Codex" {
+		t.Fatalf("repair = %#v", repaired)
+	}
+	body, err := os.ReadFile(filepath.Join(localCodexHome, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, localAuth) {
+		t.Fatalf("local auth changed: %s", body)
+	}
+}
+
+func TestCloudCodexRepairRejectsDifferentLoginIdentity(t *testing.T) {
+	repairCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/subrouter/accounts":
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": []map[string]string{{
+				"id": "shared-codex", "kind": "codex", "label": "Production Codex",
+				"email": "expected@example.com",
+			}}})
+		case r.Method == http.MethodPost:
+			repairCalled = true
+			http.Error(w, "unexpected repair", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex-home"))
+	command := &recordingSRCommandRunner{
+		loginAuth: testCodexAuth("different@example.com", "account-different"),
+	}
+	runner := srRunner{
+		program: "sr",
+		store:   accounts.CodexStore{Dir: filepath.Join(root, "state", "codex", "accounts")},
+		in:      strings.NewReader(""),
+		out:     io.Discard,
+		errOut:  io.Discard,
+		client:  server.Client(),
+		cmd:     command,
+	}
+	client := broker.NewClient(broker.Config{
+		BaseURL: server.URL, AccessToken: "stack-access", RefreshToken: "stack-refresh",
+		TeamID: "team-1", CredentialSource: broker.CredentialSourceTeam,
+	})
+	client.HTTPClient = server.Client()
+	err := runner.cloudAccountRepair(context.Background(), client, []string{"shared-codex"})
+	if err == nil || !strings.Contains(err.Error(), "shared account was not changed") {
+		t.Fatalf("repair error = %v", err)
+	}
+	if repairCalled {
+		t.Fatal("repair endpoint was called for a different login identity")
+	}
+}
+
+func TestHostedCodexAddPersistsIsolatedCredentialThroughTenantEndpoint(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, tenantKey, err := registry.Create("hosted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi := &proxy.MultiTenant{Base: proxy.Server{}, Registry: registry}
+	server := httptest.NewServer(multi.Handler(multi.Base.Handler()))
+	defer server.Close()
+
+	root := t.TempDir()
+	localCodexHome := filepath.Join(root, "codex-home")
+	t.Setenv("CODEX_HOME", localCodexHome)
+	if err := os.MkdirAll(localCodexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	localAuth := []byte(`{"sentinel":"unchanged"}`)
+	if err := os.WriteFile(filepath.Join(localCodexHome, "auth.json"), localAuth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := &recordingSRCommandRunner{
+		loginAuth: testCodexAuth("hosted@example.com", "account-hosted"),
+	}
+	var output bytes.Buffer
+	runner := srRunner{
+		program: "sr",
+		store:   accounts.CodexStore{Dir: filepath.Join(root, "state", "codex", "accounts")},
+		in:      strings.NewReader(""),
+		out:     &output,
+		errOut:  &output,
+		client:  server.Client(),
+		cmd:     command,
+	}
+	client := &broker.Client{
+		Config: broker.Config{
+			BaseURL: "https://cmux.com", AccessToken: "stack-access",
+			RefreshToken: "stack-refresh", TeamID: "team-1",
+			CredentialSource: broker.CredentialSourceHosted,
+			HostedURL:        server.URL,
+			TenantKey:        tenantKey,
+		},
+		HTTPClient: server.Client(),
+	}
+	if err := runner.cloudAccountAdd(context.Background(), client, []string{"codex"}); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := (accounts.CodexStore{
+		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),
+	}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("stored accounts = %d, want 1", len(stored))
+	}
+	if stored[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("stored OAuth origin = %q", stored[0].OAuthCredentialOrigin)
+	}
+	body, err := os.ReadFile(filepath.Join(localCodexHome, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, localAuth) {
+		t.Fatalf("local auth changed: %s", body)
 	}
 }
 
