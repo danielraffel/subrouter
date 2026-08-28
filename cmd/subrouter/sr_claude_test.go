@@ -221,13 +221,14 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 			recordPath := filepath.Join(home, "claude-proxy.txt")
 			claudePath := filepath.Join(binDir, "claude")
-			script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\nbase=%s\\ntoken=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\"; } > " + shellQuote(recordPath) + "\n"
+			script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\nbase=%s\\ntoken=%s\\nheaders=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\"; } > " + shellQuote(recordPath) + "\n"
 			if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("HOME", home)
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("CLAUDE_CONFIG_DIR", "/must-not-leak")
+			t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Subrouter-Agent: stale")
 
 			runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 			if err := runner.claude(context.Background(), []string{"proxy", "--resume", "session-a", "--model", "opus"}); err != nil {
@@ -243,6 +244,7 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 				"args=--resume session-a --model opus\n",
 				"base=" + tc.wantBase + "\n",
 				"token=" + tc.wantToken + "\n",
+				"headers=X-Subrouter-Agent: claude\n",
 			} {
 				if !strings.Contains(got, want) {
 					t.Fatalf("proxy invocation missing %q:\n%s", want, got)

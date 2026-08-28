@@ -225,7 +225,8 @@ func cloudClaudeEnvironment(
 	baseURL = strings.TrimSuffix(baseURL, "/v1")
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
-	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", proxyToken)
+	env = upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", proxyToken)
+	return upsertEnv(env, "ANTHROPIC_CUSTOM_HEADERS", "X-Subrouter-Agent: claude")
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -766,6 +767,7 @@ var claudeRoutingEnvKeys = []string{
 	"ANTHROPIC_BASE_URL",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_CUSTOM_HEADERS",
 	"CLAUDE_CONFIG_DIR",
 	"CLAUDE_CODE_CONFIG_DIR",
 	"CLAUDE_CODE_USE_BEDROCK",

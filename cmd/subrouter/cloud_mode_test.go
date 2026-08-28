@@ -479,6 +479,7 @@ func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T)
 		"ANTHROPIC_BASE_URL=https://remote.example",
 		"ANTHROPIC_AUTH_TOKEN=old-token",
 		"ANTHROPIC_API_KEY=sk-ant-secret",
+		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK=1",
 	}, "http://127.0.0.1:31415/v1", "stack-local-token")
 	joined := strings.Join(env, "\n")
@@ -486,6 +487,7 @@ func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T)
 		"https://remote.example",
 		"old-token",
 		"sk-ant-secret",
+		"X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK",
 	} {
 		if strings.Contains(joined, banned) {
@@ -495,6 +497,7 @@ func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T)
 	for _, want := range []string{
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:31415",
 		"ANTHROPIC_AUTH_TOKEN=stack-local-token",
+		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("cloud Claude env missing %q:\n%s", want, joined)
