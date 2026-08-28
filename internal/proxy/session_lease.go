@@ -46,6 +46,14 @@ type sessionLeaseStore struct {
 	tokensByID map[string]map[[32]byte]struct{}
 	now        func() time.Time
 	ttl        time.Duration
+
+	scopeLocksMu sync.Mutex
+	scopeLocks   map[string]*sessionLeaseScopeLock
+}
+
+type sessionLeaseScopeLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // sessionLeaseTokenBinding separates the short overlap in which a rotated
@@ -144,6 +152,7 @@ func newSessionLeaseStore() *sessionLeaseStore {
 		byScope:    make(map[string]string),
 		byToken:    make(map[[32]byte]sessionLeaseTokenBinding),
 		tokensByID: make(map[string]map[[32]byte]struct{}),
+		scopeLocks: make(map[string]*sessionLeaseScopeLock),
 		now:        time.Now,
 		ttl:        defaultSessionLeaseTTL,
 	}
@@ -166,23 +175,30 @@ func (s *sessionLeaseStore) putWithAccountReplacement(template sessionLease, rep
 	if s == nil {
 		return sessionLease{}, false, errors.New("session lease store is not configured")
 	}
+	unlockScope := s.lockScopeInstall(template.ScopeKey)
+	defer unlockScope()
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	now := s.now().UTC()
 	s.removeExpiredLocked(now)
-	var replaced *sessionLease
-	if existingID := s.byScope[template.ScopeKey]; existingID != "" {
+	existingAtStart := s.byScope[template.ScopeKey]
+	if existingID := existingAtStart; existingID != "" {
 		if existing, ok := s.byID[existingID]; ok {
 			if !replaceAccount || existing.AccountID == template.AccountID {
-				if beforeInstall != nil {
-					if err := beforeInstall(); err != nil {
-						return sessionLease{}, false, err
-					}
-				}
+				s.mu.Unlock()
+				// Installation happens only after the matching sticky assignment
+				// commits, so an existing lease for the requested account is already
+				// durable. A concurrent identical request must be idempotent instead
+				// of replaying a stale compare-and-swap callback.
 				return existing, false, nil
+			} else {
+				s.mu.Unlock()
 			}
-			replaced = &existing
+		} else {
+			s.mu.Unlock()
 		}
+	} else {
+		s.mu.Unlock()
 	}
 	id, err := randomLeaseValue("lease_", 18)
 	if err != nil {
@@ -205,15 +221,61 @@ func (s *sessionLeaseStore) putWithAccountReplacement(template sessionLease, rep
 			return sessionLease{}, false, err
 		}
 	}
-	if replaced != nil {
-		// Generate the replacement completely before invalidating the prior
-		// lease, so entropy/signing failures leave the existing lease intact.
-		s.removeLocked(*replaced)
+	installNow := s.now().UTC()
+	if !installNow.Before(expiresAt) {
+		// A cross-process persistence lock can outlive the original lease TTL.
+		// Refresh the capability timestamps rather than installing a token that
+		// is already expired when the callback finally completes.
+		expiresAt = installNow.Add(s.ttl)
+		token, err = newSessionLeaseToken(installNow, expiresAt)
+		if err != nil {
+			return sessionLease{}, false, err
+		}
+		template.Token = token
+		template.CreatedAt = installNow
+		template.ExpiresAt = expiresAt
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeExpiredLocked(s.now().UTC())
+	// Release/expiry may remove the old lease while persistence is in flight;
+	// another creator for this scope cannot race because lockScopeInstall
+	// serializes only this scope without blocking unrelated leases or resolves.
+	if existingID := s.byScope[template.ScopeKey]; existingID != "" {
+		if existingID != existingAtStart {
+			return sessionLease{}, false, errSessionAssignmentChanged
+		}
+		if replaced, ok := s.byID[existingID]; ok {
+			// Generate the replacement completely before invalidating the prior
+			// lease, so entropy/signing failures leave the existing lease intact.
+			s.removeLocked(replaced)
+		}
 	}
 	s.byID[id] = template
 	s.byScope[template.ScopeKey] = id
 	s.bindTokenLocked(id, token, expiresAt, expiresAt)
 	return template, true, nil
+}
+
+func (s *sessionLeaseStore) lockScopeInstall(scope string) func() {
+	s.scopeLocksMu.Lock()
+	lock := s.scopeLocks[scope]
+	if lock == nil {
+		lock = &sessionLeaseScopeLock{}
+		s.scopeLocks[scope] = lock
+	}
+	lock.refs++
+	s.scopeLocksMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.scopeLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(s.scopeLocks, scope)
+		}
+		s.scopeLocksMu.Unlock()
+	}
 }
 
 func (s *sessionLeaseStore) resolve(token string) (sessionLease, error) {

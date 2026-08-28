@@ -1365,6 +1365,151 @@ func TestSessionLeaseExpiryRejectsBrokerToken(t *testing.T) {
 	}
 }
 
+func TestSessionLeaseReplacementCallbackDoesNotBlockStore(t *testing.T) {
+	store := newSessionLeaseStore()
+	original, err := store.put(sessionLease{
+		ScopeKey: "blocked-scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "original",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	replaced := make(chan error, 1)
+	go func() {
+		_, _, replaceErr := store.putReplacingAccountAfter(sessionLease{
+			ScopeKey: "blocked-scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "replacement",
+		}, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+		replaced <- replaceErr
+	}()
+	<-entered
+	renewed := make(chan error, 1)
+	go func() {
+		lease, renewErr := store.renew(original.ID, original.Token)
+		if renewErr == nil && lease.Token == original.Token {
+			renewErr = errors.New("renewal did not rotate the token")
+		}
+		renewed <- renewErr
+	}()
+	select {
+	case renewErr := <-renewed:
+		if renewErr != nil {
+			t.Fatalf("renewal during persistence failed: %v", renewErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked replacement persistence held renewal behind the store mutex")
+	}
+
+	resolved := make(chan error, 1)
+	go func() {
+		_, resolveErr := store.resolve(original.Token)
+		resolved <- resolveErr
+	}()
+	select {
+	case resolveErr := <-resolved:
+		if resolveErr != nil {
+			t.Fatalf("existing lease stopped resolving during persistence: %v", resolveErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked replacement persistence held the store mutex")
+	}
+
+	unrelated := make(chan error, 1)
+	go func() {
+		_, putErr := store.put(sessionLease{
+			ScopeKey: "unrelated-scope", SessionKey: "other", Provider: accounts.ProviderCodex, AccountID: "other",
+		})
+		unrelated <- putErr
+	}()
+	select {
+	case putErr := <-unrelated:
+		if putErr != nil {
+			t.Fatalf("unrelated lease creation failed: %v", putErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked replacement persistence serialized an unrelated scope")
+	}
+
+	close(release)
+	if replaceErr := <-replaced; replaceErr != nil {
+		t.Fatal(replaceErr)
+	}
+}
+
+func TestSessionLeaseReplacementCallbackFailurePreservesExistingLease(t *testing.T) {
+	store := newSessionLeaseStore()
+	original, err := store.put(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "original",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("sticky persistence failed")
+	if _, _, err := store.putReplacingAccountAfter(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "replacement",
+	}, func() error { return wantErr }); !errors.Is(err, wantErr) {
+		t.Fatalf("replacement error = %v, want %v", err, wantErr)
+	}
+	resolved, err := store.resolve(original.Token)
+	if err != nil || resolved.AccountID != "original" {
+		t.Fatalf("existing lease after failed replacement = %+v, error %v", resolved, err)
+	}
+}
+
+func TestSessionLeaseIdenticalReplacementIsIdempotent(t *testing.T) {
+	store := newSessionLeaseStore()
+	original, err := store.put(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "account",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackCalled := false
+	got, created, err := store.putReplacingAccountAfter(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "account",
+	}, func() error {
+		callbackCalled = true
+		return errors.New("stale compare-and-swap")
+	})
+	if err != nil || created || got.ID != original.ID {
+		t.Fatalf("identical replacement = lease %+v, created %v, error %v", got, created, err)
+	}
+	if callbackCalled {
+		t.Fatal("identical replacement replayed persistence after the lease was already installed")
+	}
+}
+
+func TestSessionLeaseReplacementRefreshesTokenAfterLongPersistence(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	store := newSessionLeaseStore()
+	store.now = func() time.Time { return now }
+	store.ttl = time.Minute
+	if _, err := store.put(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "original",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replacement, _, err := store.putReplacingAccountAfter(sessionLease{
+		ScopeKey: "scope", SessionKey: "session", Provider: accounts.ProviderCodex, AccountID: "replacement",
+	}, func() error {
+		now = now.Add(2 * time.Minute)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replacement.ExpiresAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("replacement expiry = %v, want %v", replacement.ExpiresAt, now.Add(time.Minute))
+	}
+	if _, err := store.resolve(replacement.Token); err != nil {
+		t.Fatalf("replacement token was born expired: %v", err)
+	}
+}
+
 func TestSessionLeaseRenewalRotatesSafelyAndPreservesScope(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	store := newSessionLeaseStore()
