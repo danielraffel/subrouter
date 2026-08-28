@@ -20,6 +20,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"golang.org/x/term"
 )
@@ -253,7 +254,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "storage":
 		return r.cloudStorage(args[1:])
 	case "add-key", "add-api-key":
-		return r.addKey()
+		return r.addKey(args[1:])
 	case "import":
 		return r.importActive()
 	case "list", "ls":
@@ -395,6 +396,13 @@ func (r srRunner) runTeamCredentialCommand(
 		}
 		return true, r.cloudAccountAdd(ctx, client, providerArgs)
 	case "add-key", "add-api-key":
+		provider, err := parseAddKeyProviderArgs(r.programOrSubrouter()+" add-key", r.errOut, args[1:])
+		if err != nil {
+			return true, err
+		}
+		if provider != accounts.ProviderCodex {
+			return true, fmt.Errorf("hosted credential storage does not support %s API keys; use 'sr storage local' or a self-hosted remote", provider)
+		}
 		_, _, client, err := loadCloudClient(true)
 		if err != nil {
 			return true, err
@@ -572,7 +580,11 @@ func (r srRunner) add(ctx context.Context) error {
 	return nil
 }
 
-func (r srRunner) addKey() error {
+func (r srRunner) addKey(args []string) error {
+	provider, err := parseAddKeyProviderArgs(r.programOrSubrouter()+" add-key", r.errOut, args)
+	if err != nil {
+		return err
+	}
 	if err := r.store.SyncActiveToStore(); err != nil {
 		return err
 	}
@@ -581,16 +593,20 @@ func (r srRunner) addKey() error {
 	if err != nil {
 		return err
 	}
+	keyPrompt := "API key"
+	if provider == accounts.ProviderCodex {
+		keyPrompt = "API key (sk-...)"
+	}
 	key, err := promptSecret(
 		r.out,
 		reader,
 		r.in,
-		"API key (sk-...): ",
+		keyPrompt+": ",
 	)
 	if err != nil {
 		return err
 	}
-	account, existed, err := r.store.AddAPIKey(label, key)
+	account, existed, err := r.store.AddProviderAPIKey(provider, label, key)
 	if err != nil {
 		return err
 	}
@@ -600,6 +616,23 @@ func (r srRunner) addKey() error {
 		fmt.Fprintf(r.out, "Added API key account: %s\n", account.APIKeyLabel())
 	}
 	return nil
+}
+
+func parseAddKeyProviderArgs(command string, errOut io.Writer, args []string) (accounts.Provider, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(errOut)
+	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: "+proxy.APIKeyProviderList())
+	if err := flags.Parse(args); err != nil {
+		return "", err
+	}
+	if flags.NArg() != 0 {
+		return "", fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	provider, err := parseAPIKeyProvider(*providerRaw)
+	if err != nil {
+		return "", err
+	}
+	return provider, nil
 }
 
 func (r srRunner) importActive() error {
@@ -959,7 +992,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	var wg sync.WaitGroup
 	for i, account := range all {
 		i, account := i, account
-		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: accounts.ProviderCodex}
+		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: account.ProviderOrDefault()}
 		if account.IsAPIKey() {
 			rows[i].authMode = accounts.AuthModeAPIKey
 			rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0.01, ShortHeadroom: 0.01}
@@ -1331,7 +1364,7 @@ func (r srRunner) usage(ctx context.Context, days int) error {
 func accountFromStored(account accounts.StoredCodexAccount) accounts.Account {
 	out := accounts.Account{
 		ID:       account.Email,
-		Provider: accounts.ProviderCodex,
+		Provider: account.ProviderOrDefault(),
 		Label:    account.Email,
 		Email:    account.Email,
 		Source:   account.Email,
@@ -1535,7 +1568,7 @@ func hasSwitchableUsageRows(rows []srUsageRow) bool {
 
 func ensureUsageRowSwitchable(row srUsageRow) error {
 	if row.provider != "" && row.provider != accounts.ProviderCodex {
-		return fmt.Errorf("cannot switch to %s with sr; use sr claude switch %s", row.email, row.email)
+		return fmt.Errorf("cannot switch to %s with sr; %s credentials are selected by provider routing", row.email, row.provider)
 	}
 	if row.cooked {
 		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", row.email, row.cookedReason)

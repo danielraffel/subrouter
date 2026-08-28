@@ -61,6 +61,92 @@ func TestSRListReadsNativeCodexStore(t *testing.T) {
 	}
 }
 
+func TestSRAddKeyStoresRegistryProviderInLocalStorage(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	var out bytes.Buffer
+	runner := srRunner{
+		store:  store,
+		in:     strings.NewReader("work\nsk-or-v1-test\n"),
+		out:    &out,
+		errOut: &out,
+	}
+
+	if err := runner.run(context.Background(), []string{"add-key", "--provider", "open-router"}); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := store.FindStored("openrouter:work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing provider-scoped OpenRouter account")
+	}
+	if stored.Provider != accounts.ProviderOpenRouter || stored.Auth.AuthMode != "apikey" || stored.Auth.OpenAIAPIKey != "sk-or-v1-test" {
+		t.Fatalf("stored account provider=%q auth_mode=%q key_matches=%t, want OpenRouter API-key account", stored.Provider, stored.Auth.AuthMode, stored.Auth.OpenAIAPIKey == "sk-or-v1-test")
+	}
+	if _, codex, err := store.FindStored("apikey:work"); err != nil {
+		t.Fatal(err)
+	} else if codex {
+		t.Fatal("OpenRouter key was also stored in the Codex API-key pool")
+	}
+}
+
+func TestSRAddKeyRejectsUnknownLocalProviderBeforePrompting(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+
+	err := runner.run(context.Background(), []string{"add-key", "--provider", "not-a-provider"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported API-key provider") {
+		t.Fatalf("error = %v, want unsupported provider", err)
+	}
+	stored, listErr := store.ListStored()
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("invalid provider stored accounts: %+v", stored)
+	}
+}
+
+func TestHostedAddKeyRejectsRegistryProviderInsteadOfReclassifyingIt(t *testing.T) {
+	var out bytes.Buffer
+	runner := srRunner{in: strings.NewReader(""), out: &out, errOut: &out}
+
+	handled, err := runner.runTeamCredentialCommand(context.Background(), []string{"add-key", "--provider", "openrouter"})
+	if !handled {
+		t.Fatal("hosted add-key command was not handled")
+	}
+	if err == nil || !strings.Contains(err.Error(), "hosted credential storage does not support openrouter API keys") {
+		t.Fatalf("error = %v, want explicit hosted OpenRouter rejection", err)
+	}
+}
+
+func TestUsageRowsKeepProviderAPIKeysOutOfCodexSwitching(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	if _, _, err := store.AddProviderAPIKey(accounts.ProviderOpenRouter, "work", "sk-or-v1-test"); err != nil {
+		t.Fatal(err)
+	}
+	runner := srRunner{store: store, client: http.DefaultClient}
+
+	rows, err := runner.fetchUsageRows(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].provider != accounts.ProviderOpenRouter {
+		t.Fatalf("usage rows = %+v, want one OpenRouter row", rows)
+	}
+	if err := ensureUsageRowSwitchable(rows[0]); err == nil {
+		t.Fatal("OpenRouter API key was switchable as an active Codex credential")
+	}
+}
+
 func TestSRTraceShowsOAuthBreadcrumbs(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
