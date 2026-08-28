@@ -118,6 +118,17 @@ func TestValidateCredentialUpstreamsRejectsMissingHost(t *testing.T) {
 	}
 }
 
+func TestValidateCredentialUpstreamsIncludesAntigravityOAuth(t *testing.T) {
+	t.Parallel()
+
+	server := Server{
+		AntigravityUpstream: mustParseURL(t, "http://cloudcode.example"),
+	}
+	if err := server.ValidateCredentialUpstreams(); err == nil || !strings.Contains(err.Error(), "Antigravity") {
+		t.Fatalf("ValidateCredentialUpstreams() error = %v, want Antigravity upstream error", err)
+	}
+}
+
 func TestAPIKeyProviderListNamesEveryProvider(t *testing.T) {
 	list := APIKeyProviderList()
 	for _, want := range append([]string{"codex", "claude"}, keyedProviderNames()...) {
