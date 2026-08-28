@@ -795,6 +795,40 @@ func TestFetchUsageWindowsCachedUsesMatchingOAuthUsageSource(t *testing.T) {
 	}
 }
 
+func TestFetchUsageWindowsCachedDoesNotSendCredentialOnlyOAuthTokenToCodex(t *testing.T) {
+	acct := accounts.Account{
+		ID: "grok-subscription", Provider: accounts.ProviderGrok,
+		AuthMode: accounts.AuthModeOAuth, Token: "grok-access-token",
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{acct}, nil)
+	ref.oauthSources = []OAuthAccountSource{&stubOAuthSource{provider: accounts.ProviderGrok}}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		t.Fatalf("credential-only Grok token was sent to %s", request.URL)
+		return nil, errors.New("unexpected request")
+	})}
+
+	windows, fresh, err := ref.FetchUsageWindowsCached(t.Context(), client, acct)
+	if err == nil || !strings.Contains(err.Error(), "usage unavailable") {
+		t.Fatalf("windows=%+v fresh=%v err=%v, want unavailable without a request", windows, fresh, err)
+	}
+}
+
+func TestLegacyUsageFetchRejectsNonCodexOAuthProvider(t *testing.T) {
+	acct := accounts.Account{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity,
+		AuthMode: accounts.AuthModeOAuth, Token: "antigravity-access-token",
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		t.Fatalf("non-Codex OAuth token was sent to %s", request.URL)
+		return nil, errors.New("unexpected request")
+	})}
+
+	windows, err := fetchAccountUsageWindowsLive(t.Context(), client, acct)
+	if err == nil || !strings.Contains(err.Error(), "usage unavailable") {
+		t.Fatalf("windows=%+v err=%v, want unavailable without a request", windows, err)
+	}
+}
+
 func TestUsageStatusesReportsPartialSourceErrorAndHealthyAccount(t *testing.T) {
 	acct := accounts.Account{ID: "kimi-subscription:healthy", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Label: "healthy", Token: "access"}
 	source := &stubOAuthUsageSource{

@@ -415,6 +415,8 @@ const usageStatusFetchTimeout = 5 * time.Second
 
 const credFailureTTL = credentialExhaustionTTL
 
+var errOAuthUsageUnavailable = errors.New("OAuth usage unavailable")
+
 func (r *AccountRef) terminalCredFailure(provider accounts.Provider, id string) (string, bool) {
 	if r == nil {
 		return "", false
@@ -497,9 +499,12 @@ func (r *AccountRef) FetchUsageWindowsCached(ctx context.Context, client *http.C
 func (r *AccountRef) fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, error) {
 	if account.AuthMode == accounts.AuthModeOAuth {
 		for _, source := range r.oauthSources {
-			usageSource, ok := source.(OAuthUsageSource)
-			if !ok || usageSource.Provider() != account.Provider {
+			if source.Provider() != account.Provider {
 				continue
+			}
+			usageSource, ok := source.(OAuthUsageSource)
+			if !ok {
+				return nil, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
 			}
 			_, windows, err := usageSource.FetchUsage(ctx, client, account)
 			return windows, err
@@ -2841,6 +2846,9 @@ func fetchAccountUsageWindowsLive(ctx context.Context, client *http.Client, acco
 			return nil, err
 		}
 		return windows, nil
+	}
+	if account.Provider != "" && account.Provider != accounts.ProviderCodex {
+		return nil, fmt.Errorf("%w for provider %q", errOAuthUsageUnavailable, account.Provider)
 	}
 	return accounts.FetchCodexUsage(ctx, client, account)
 }
