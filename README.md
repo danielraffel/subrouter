@@ -333,6 +333,29 @@ If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:3141
 sr server add team --url http://100.64.0.1:31415 --default
 ```
 
+For a server reached through Tailscale, record its exact node ID so a MagicDNS
+rename does not strand clients:
+
+```bash
+sr server add team \
+  --url http://current-host.example.ts.net:31415 \
+  --tailscale-node-id nEXAMPLE11CNTRL \
+  --default
+```
+
+Subrouter loads `tailscale status --json`, requires an exact node-ID match, and
+only trusts the stored URL when its host is still one of that node's advertised
+addresses and its health check passes. Otherwise it rebuilds only the URL host,
+tries the node's current MagicDNS name and Tailscale IPs, health-checks the
+candidate, and atomically updates the server registry. It never matches a
+similar hostname, and discovery is time-bounded and fail-closed. The CLI is
+found through `PATH` or the standard macOS Tailscale app bundle; set
+`SUBROUTER_TAILSCALE_BIN` only for a non-standard installation.
+Replacing a named server with a different `--url` clears its prior node binding
+unless `--tailscale-node-id` is supplied again. If discovery for the unpinned
+default fails, `sr codex` may use a healthy local daemon under the normal local
+fallback policy; an explicit environment pin remains fail-closed.
+
 `sr server add --default` and `sr server use <name>` write these top-level keys in `CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset:
 
 ```toml

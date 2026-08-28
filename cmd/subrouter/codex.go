@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -102,6 +103,50 @@ func defaultCodexBaseURLFor(store srServerStore) (string, error) {
 	return codexBaseURLForServer(server), nil
 }
 
+func codexBaseURLWithTailscaleHealing(store srServerStore, warn io.Writer) (string, error) {
+	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
+		return baseURL, nil
+	}
+	serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
+	if serverName == "local" || serverName == "localhost" {
+		return defaultCodexBaseURL, nil
+	}
+	if serverName != "" {
+		server, ok, err := store.find(serverName)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("Subrouter server %q not found", serverName)
+		}
+		server, err = healTailscaleServer(
+			context.Background(), store, server, fallbackHTTPClient(), warn, nil,
+		)
+		if err != nil {
+			return "", err
+		}
+		return codexBaseURLForServer(server), nil
+	}
+	file, err := store.load()
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(file.Default) == "" {
+		return defaultCodexBaseURL, nil
+	}
+	server, ok := file.find(file.Default)
+	if !ok {
+		return "", fmt.Errorf("default Subrouter server %q not found; run sr server use <name> or sr server clear-default", file.Default)
+	}
+	server, err = healTailscaleServer(
+		context.Background(), store, server, fallbackHTTPClient(), warn, nil,
+	)
+	if err != nil {
+		return "", err
+	}
+	return codexBaseURLForServer(server), nil
+}
+
 // codexBaseURLWithFallback resolves the base URL for launching codex, then
 // substitutes the local daemon when the configured server is unreachable. An
 // explicit SUBROUTER_CODEX_BASE_URL or SUBROUTER_CODEX_SERVER is treated as a
@@ -120,7 +165,7 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		local := localBaseURL()
 		if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
 			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {
-			pinned, pinErr := codexBaseURL(store)
+			pinned, pinErr := codexBaseURLWithTailscaleHealing(store, warn)
 			if pinErr != nil {
 				return "", pinErr
 			}
@@ -148,9 +193,32 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 		return local, nil
 	}
 
-	baseURL, err := codexBaseURL(store)
+	baseURL, err := codexBaseURLWithTailscaleHealing(store, warn)
 	if err != nil {
-		return "", err
+		// An explicit environment selection is a deliberate fail-closed pin.
+		// For the registry default, preserve the existing local fallback contract
+		// without ever contacting the stale, identity-unverified remote URL.
+		var repairFailure tailscaleRepairFailure
+		if !errors.As(err, &repairFailure) ||
+			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
+			strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" ||
+			fallbackDisabled() {
+			return "", err
+		}
+		local := localBaseURL()
+		if !ensureLocalHealthy(
+			context.Background(),
+			fallbackHTTPClient(),
+			local,
+			defaultDaemonStarter(),
+			warn,
+		) {
+			return "", fmt.Errorf("repair default Subrouter server: %w; local proxy is unavailable", err)
+		}
+		if warn != nil {
+			fmt.Fprintf(warn, "subrouter: cannot safely resolve the configured server (%v); falling back to the local daemon at %s\n", err, local)
+		}
+		return local, nil
 	}
 	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" ||
 		strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")) != "" {

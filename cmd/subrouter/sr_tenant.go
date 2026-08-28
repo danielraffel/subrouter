@@ -91,12 +91,9 @@ func (r srRunner) parseTenantArgs(name string, args []string, positional int) ([
 		if isLocalServerName(*serverName) {
 			return flags.Args(), srServerConfig{}, false, nil
 		}
-		server, ok, err := store.find(*serverName)
+		server, err := r.namedRemoteServer(context.Background(), store, *serverName)
 		if err != nil {
 			return nil, srServerConfig{}, false, err
-		}
-		if !ok {
-			return nil, srServerConfig{}, false, fmt.Errorf("server %q not found", *serverName)
 		}
 		return flags.Args(), server, true, nil
 	}
@@ -106,6 +103,10 @@ func (r srRunner) parseTenantArgs(name string, args []string, positional int) ([
 	}
 	if strings.TrimSpace(file.Default) != "" {
 		if server, ok := file.find(file.Default); ok {
+			server, err = r.healRemoteServer(store, server)
+			if err != nil {
+				return nil, srServerConfig{}, false, err
+			}
 			return flags.Args(), server, true, nil
 		}
 	}

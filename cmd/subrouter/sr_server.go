@@ -68,7 +68,7 @@ This machine's daemon:
 
 Named servers:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
@@ -105,12 +105,16 @@ type srServerStore struct {
 }
 
 type srServerConfig struct {
-	Name        string `json:"name"`
-	URL         string `json:"url"`
-	GCPProject  string `json:"gcpProject,omitempty"`
-	GCPZone     string `json:"gcpZone,omitempty"`
-	GCPInstance string `json:"gcpInstance,omitempty"`
-	AdminToken  string `json:"adminToken,omitempty"`
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	// TailscaleNodeID identifies the exact tailnet node hosting this server.
+	// When URL becomes stale after a MagicDNS rename, clients may use this
+	// stable identity to discover and health-check the node's current address.
+	TailscaleNodeID string `json:"tailscaleNodeID,omitempty"`
+	GCPProject      string `json:"gcpProject,omitempty"`
+	GCPZone         string `json:"gcpZone,omitempty"`
+	GCPInstance     string `json:"gcpInstance,omitempty"`
+	AdminToken      string `json:"adminToken,omitempty"`
 	// AccountImportToken grants only protected HTTP account import. Keeping it
 	// separate prevents a self-service login from gaining administrator access.
 	AccountImportToken string `json:"accountImportToken,omitempty"`
@@ -417,7 +421,11 @@ func (r srRunner) serverList(store srServerStore) error {
 		if server.Name == file.Default {
 			suffix = "\t(default)"
 		}
-		fmt.Fprintf(r.out, "%s\t%s\t%s\t%s%s\n", server.Name, server.URL, server.GCPInstance, server.GCPZone, suffix)
+		tailscaleIdentity := ""
+		if server.TailscaleNodeID != "" {
+			tailscaleIdentity = "tailscale:" + server.TailscaleNodeID
+		}
+		fmt.Fprintf(r.out, "%s\t%s\t%s\t%s\t%s%s\n", server.Name, server.URL, server.GCPInstance, server.GCPZone, tailscaleIdentity, suffix)
 	}
 	return nil
 }
@@ -425,7 +433,7 @@ func (r srRunner) serverList(store srServerStore) error {
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
+		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	}
 	name := args[0]
 	if isBuiltInRemoteName(name) {
@@ -434,6 +442,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	serverURL := flags.String("url", "", "subrouter base URL, such as http://100.64.0.1:31415")
+	tailscaleNodeID := flags.String("tailscale-node-id", "", "stable Tailscale node ID used to repair renamed MagicDNS hosts")
 	gcpProject := flags.String("gcp-project", "", "GCP project; defaults to current gcloud project")
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
@@ -450,6 +459,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	accountImportTokenSet := false
 	tenantKeySet := false
 	sshHostSet := false
+	tailscaleNodeIDSet := false
 	flags.Visit(func(flag *flag.Flag) {
 		if flag.Name == "ssh-host" {
 			sshHostSet = true
@@ -463,9 +473,15 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		if flag.Name == "tenant-key" {
 			tenantKeySet = true
 		}
+		if flag.Name == "tailscale-node-id" {
+			tailscaleNodeIDSet = true
+		}
 	})
 	if strings.TrimSpace(*tenantKey) != "" && !tenant.ValidKeyFormat(strings.TrimSpace(*tenantKey)) {
 		return fmt.Errorf("--tenant-key must look like srt_<32 hex>")
+	}
+	if strings.TrimSpace(*tailscaleNodeID) != "" && !validTailscaleNodeID(*tailscaleNodeID) {
+		return fmt.Errorf("--tailscale-node-id must be a stable Tailscale node ID")
 	}
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("server name is required")
@@ -479,6 +495,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	next := srServerConfig{
 		Name:               name,
 		URL:                strings.TrimRight(*serverURL, "/"),
+		TailscaleNodeID:    strings.TrimSpace(*tailscaleNodeID),
 		GCPProject:         *gcpProject,
 		GCPZone:            *gcpZone,
 		GCPInstance:        *gcpInstance,
@@ -491,6 +508,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	if err := store.update(func(file *srServerFile) error {
 		for i := range file.Servers {
 			if file.Servers[i].Name == name {
+				previousURL := strings.TrimRight(strings.TrimSpace(file.Servers[i].URL), "/")
 				if !adminTokenSet {
 					next.AdminToken = file.Servers[i].AdminToken
 				}
@@ -502,6 +520,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 				}
 				if !sshHostSet {
 					next.SSHHost = file.Servers[i].SSHHost
+				}
+				if !tailscaleNodeIDSet && next.URL == previousURL {
+					next.TailscaleNodeID = file.Servers[i].TailscaleNodeID
 				}
 				file.Servers[i] = next
 				replaced = true
@@ -566,6 +587,10 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 	}
 	rollbackSelection := func(cause error) error {
 		return rollbackSRServerDefault(store, name, previousDefault, cause)
+	}
+	server, err = r.healRemoteServer(store, server)
+	if err != nil {
+		return rollbackSelection(err)
 	}
 	var (
 		hostedConfigPath string
@@ -778,12 +803,9 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 		if isLocalServerName(serverName) {
 			return srServerConfig{}, false, nil
 		}
-		server, ok, err := store.find(serverName)
+		server, err := r.namedRemoteServer(context.Background(), store, serverName)
 		if err != nil {
 			return srServerConfig{}, false, err
-		}
-		if !ok {
-			return srServerConfig{}, false, fmt.Errorf("Subrouter server %q not found", serverName)
 		}
 		return server, true, nil
 	}
@@ -798,7 +820,22 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	if !ok {
 		return srServerConfig{}, false, fmt.Errorf("default server %q not found; run %s server use local or %s server clear-default", file.Default, r.programOrSubrouter(), r.programOrSubrouter())
 	}
+	server, err = r.healRemoteServer(store, server)
+	if err != nil {
+		return srServerConfig{}, false, err
+	}
 	return server, true, nil
+}
+
+func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
+	server, ok, err := store.find(name)
+	if err != nil {
+		return srServerConfig{}, err
+	}
+	if !ok {
+		return srServerConfig{}, fmt.Errorf("Subrouter server %q not found", name)
+	}
+	return r.healRemoteServerContext(ctx, store, server)
 }
 
 func (r srRunner) programOrSubrouter() string {
@@ -874,12 +911,9 @@ func (r srRunner) serverRemove(store srServerStore, name string) error {
 }
 
 func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name string) error {
-	server, ok, err := store.find(name)
+	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
 	}
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
@@ -1486,12 +1520,9 @@ func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []s
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
-	server, ok, err := store.find(name)
+	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
 	}
 	return r.serverLoginOne(ctx, server, *deviceAuth, "")
 }
@@ -1516,12 +1547,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	server, ok, err := store.find(name)
+	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
 	}
 	localStored, err := r.store.ListStored()
 	if err != nil {
