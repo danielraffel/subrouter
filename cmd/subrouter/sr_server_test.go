@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -984,14 +985,15 @@ func TestUsageRowsFromServerUsageStatusesPreservesComplimentaryReset(t *testing.
 func TestUsageRowsFromServerUsageStatusesPreservesProviderProbe(t *testing.T) {
 	models := 12
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
-		ID:             "qwen-token:work",
-		Provider:       accounts.ProviderQwenToken,
-		AuthMode:       accounts.AuthModeAPIKey,
-		PlanType:       "qwen token plan key",
-		ProviderHealth: "ok",
-		ProviderModels: &models,
+		ID:                "qwen-token:work",
+		Provider:          accounts.ProviderQwenToken,
+		AuthMode:          accounts.AuthModeAPIKey,
+		PlanType:          "qwen token plan key",
+		ProviderHealth:    "ok",
+		ProviderModels:    &models,
+		ProviderEndpoints: []string{"/qwen-anthropic", "/qwen-token"},
 	}})
-	if len(rows) != 1 || rows[0].providerHealth != "ok" || rows[0].providerModels != 12 {
+	if len(rows) != 1 || rows[0].providerHealth != "ok" || rows[0].providerModels != 12 || !slices.Equal(rows[0].providerEndpoints, []string{"/qwen-anthropic", "/qwen-token"}) {
 		t.Fatalf("rows = %+v, want provider health and model count", rows)
 	}
 }

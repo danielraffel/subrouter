@@ -164,6 +164,7 @@ type srUsageRow struct {
 	// providerModels counts the models the key is entitled to, from that same
 	// probe. Negative means unknown.
 	providerModels     int
+	providerEndpoints  []string
 	email              string
 	active             bool
 	planType           string
@@ -2136,7 +2137,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Plan":      {Text: row.planType, Style: ansiDim},
 		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
 		"Models":    {Text: usageGridModels(row), Style: ansiDim},
-		"Endpoints": {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
+		"Endpoints": {Text: usageGridEndpoints(row), Style: ansiDim},
 		"Quota":     {Text: "not exposed", Style: ansiDim},
 		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
 		"5h":        usageGridShortWindowCell(row),
@@ -2892,6 +2893,14 @@ func usageGridModels(row srUsageRow) string {
 		return "?"
 	}
 	return strconv.Itoa(row.providerModels)
+}
+
+func usageGridEndpoints(row srUsageRow) string {
+	endpoints := row.providerEndpoints
+	if len(endpoints) == 0 {
+		endpoints = proxy.ProviderEndpoints(row.provider)
+	}
+	return strings.Join(endpoints, " ")
 }
 
 // probeProviderKey asks the explicitly configured upstream whether this key

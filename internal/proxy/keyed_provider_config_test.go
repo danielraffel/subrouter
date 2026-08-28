@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -85,6 +87,12 @@ func TestConfiguredProviderRoutesEndToEnd(t *testing.T) {
 	if got := filterAccountsForProvider(aliasAccounts, accounts.Provider("acme-relay")); len(got) != 1 || got[0].Provider != accounts.Provider("acme-relay") {
 		t.Fatalf("alias-stored accounts = %+v, want one canonical provider account", got)
 	}
+	statuses := server.withKeyedProviderHealth(context.Background(), []AccountUsageStatus{{
+		AccountStatus: AccountStatus{ID: "acme-relay:main", Provider: accounts.Provider("acme-relay"), AuthMode: accounts.AuthModeAPIKey},
+	}})
+	if len(statuses) != 1 || !slices.Equal(statuses[0].ProviderEndpoints, []string{"/acme-relay"}) {
+		t.Fatalf("declared-provider endpoints = %+v, want /acme-relay", statuses)
+	}
 }
 
 func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
@@ -126,7 +134,7 @@ func TestUsageStatusProbesKeyThroughConfiguredUpstream(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &statuses); err != nil {
 		t.Fatal(err)
 	}
-	if len(statuses) != 1 || statuses[0].ProviderHealth != "ok" || statuses[0].ProviderModels == nil || *statuses[0].ProviderModels != 2 {
+	if len(statuses) != 1 || statuses[0].ProviderHealth != "ok" || statuses[0].ProviderModels == nil || *statuses[0].ProviderModels != 2 || !slices.Equal(statuses[0].ProviderEndpoints, []string{"/qwen-anthropic", "/qwen-token"}) {
 		t.Fatalf("usage statuses = %+v, want healthy key with 2 models", statuses)
 	}
 	if gotAuthorization != "Bearer test-provider-key" {
@@ -169,8 +177,10 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 		{name: "no base url", declared: OpenAICompatibleProvider{Name: "thing"}},
 		{name: "name with a slash", declared: OpenAICompatibleProvider{Name: "a/b", BaseURL: "https://x.test/v1"}},
 		{name: "name with a colon", declared: OpenAICompatibleProvider{Name: "apikey:team", BaseURL: "https://x.test/v1"}},
+		{name: "hidden storage name", declared: OpenAICompatibleProvider{Name: ".acme", BaseURL: "https://x.test/v1"}},
 		{name: "alias with a slash", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a/b"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with a colon", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"apikey:team"}, BaseURL: "https://x.test/v1"}},
+		{name: "hidden storage alias", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{".acme"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with whitespace", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a b"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with control", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a\nb"}, BaseURL: "https://x.test/v1"}},
 		{name: "alias with URL delimiter", declared: OpenAICompatibleProvider{Name: "thing", Aliases: []string{"a?b"}, BaseURL: "https://x.test/v1"}},

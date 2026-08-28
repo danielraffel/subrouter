@@ -141,6 +141,10 @@ func validDeclaredProviderIdentifier(name string) bool {
 	if name == "" {
 		return false
 	}
+	first := name[0]
+	if !(first >= 'a' && first <= 'z' || first >= '0' && first <= '9') {
+		return false
+	}
 	for _, char := range name {
 		if char >= 'a' && char <= 'z' || char >= '0' && char <= '9' {
 			continue
