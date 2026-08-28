@@ -221,7 +221,7 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 			recordPath := filepath.Join(home, "claude-proxy.txt")
 			claudePath := filepath.Join(binDir, "claude")
-			script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\nbase=%s\\ntoken=%s\\nheaders=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\"; } > " + shellQuote(recordPath) + "\n"
+			script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\nbase=%s\\ntoken=%s\\nheaders=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\"; env | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_API_KEY|CLAUDE_CODE_AUTH_TOKEN|CLAUDE_CODE_BASE_URL|ANTHROPIC_API_KEY)=' || true; } > " + shellQuote(recordPath) + "\n"
 			if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -229,6 +229,11 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("CLAUDE_CONFIG_DIR", "/must-not-leak")
 			t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Subrouter-Agent: stale")
+			t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "personal-oauth-must-not-leak")
+			t.Setenv("CLAUDE_CODE_API_KEY", "personal-api-must-not-leak")
+			t.Setenv("CLAUDE_CODE_AUTH_TOKEN", "personal-auth-must-not-leak")
+			t.Setenv("CLAUDE_CODE_BASE_URL", "https://personal-route.invalid")
+			t.Setenv("ANTHROPIC_API_KEY", "personal-anthropic-key-must-not-leak")
 
 			runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 			if err := runner.claude(context.Background(), []string{"proxy", "--resume", "session-a", "--model", "opus"}); err != nil {
@@ -247,6 +252,15 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			} {
 				if !strings.Contains(got, want) {
 					t.Fatalf("proxy invocation missing %q:\n%s", want, got)
+				}
+			}
+			for _, forbidden := range []string{
+				"CLAUDE_CODE_OAUTH_TOKEN=", "CLAUDE_CODE_API_KEY=",
+				"CLAUDE_CODE_AUTH_TOKEN=", "CLAUDE_CODE_BASE_URL=",
+				"ANTHROPIC_API_KEY=", "personal-",
+			} {
+				if strings.Contains(got, forbidden) {
+					t.Fatalf("proxy invocation inherited %q:\n%s", forbidden, got)
 				}
 			}
 			configLine := strings.SplitN(got, "\n", 2)[0]

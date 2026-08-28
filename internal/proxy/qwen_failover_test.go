@@ -118,6 +118,65 @@ func TestGrokFailoverRetargetsBetweenAPIAndSubscriptionUpstreams(t *testing.T) {
 	}
 }
 
+func TestGrokFailoverRetargetsFromSubscriptionToAPIUpstream(t *testing.T) {
+	subscriptionCalls := 0
+	subscriptionUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		subscriptionCalls++
+		if request.Header.Get("Authorization") != "Bearer oauth-token" || request.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
+			t.Fatalf("subscription authorization=%q marker=%q", request.Header.Get("Authorization"), request.Header.Get("X-XAI-Token-Auth"))
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"Rate limit exceeded"}}`)
+	}))
+	defer subscriptionUpstream.Close()
+
+	apiCalls := 0
+	apiUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		apiCalls++
+		if request.Header.Get("Authorization") != "Bearer api-key" || request.Header.Get("X-XAI-Token-Auth") != "" {
+			t.Fatalf("API authorization=%q marker=%q", request.Header.Get("Authorization"), request.Header.Get("X-XAI-Token-Auth"))
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer apiUpstream.Close()
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("grok", "grok-subscription-first", "grok:a-subscription", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "grok:a-subscription", Provider: accounts.ProviderGrok, AuthMode: accounts.AuthModeOAuth, Token: "oauth-token"},
+			{ID: "grok:z-api", Provider: accounts.ProviderGrok, AuthMode: accounts.AuthModeAPIKey, Token: "api-key"},
+		},
+		Sessions: store, SchedulerRef: schedulerRef,
+		GrokUpstream:             mustParseURL(t, apiUpstream.URL+"/v1"),
+		GrokSubscriptionUpstream: mustParseURL(t, subscriptionUpstream.URL+"/v1"),
+		MaxBodyBytes:             1024,
+	}
+	req := httptest.NewRequest(http.MethodPost, "/grok/chat/completions", strings.NewReader(`{"model":"grok-4","messages":[]}`))
+	req.Header.Set("X-Subrouter-Session", "grok-subscription-first")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if subscriptionCalls != 1 || apiCalls != 1 {
+		t.Fatalf("upstream calls subscription=%d api=%d, want one each", subscriptionCalls, apiCalls)
+	}
+	if !schedulerRef.Get().Exhausted(accounts.ProviderGrok, "grok:a-subscription") {
+		t.Fatal("rate-limited Grok subscription was not exhausted")
+	}
+	assignment, ok := store.Get("grok", "grok-subscription-first")
+	if !ok || assignment.AccountID != "grok:z-api" {
+		t.Fatalf("Grok sticky assignment = %+v, want API account", assignment)
+	}
+}
+
 func TestHandlerFailsOverBetweenDeepSeekAPIKeys(t *testing.T) {
 	var authorizations []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

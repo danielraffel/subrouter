@@ -76,17 +76,28 @@ func advanceAccountDiskGeneration(storeDir string) (err error) {
 }
 
 // PublishAccountDiskMutation serializes a local CLI credential mutation with
-// HTTP account imports and advances the shared generation marker only after a
-// real mutation commits. Running workers observe that marker before routing
-// their next request, so additions become usable and removals cannot linger in
-// an in-memory account snapshot.
+// HTTP account imports. It publishes the new generation before invoking the
+// mutation while still holding the same cross-process lock workers acquire to
+// reload. A worker that observes the marker therefore waits until the mutation
+// commits before reading credentials. Publication failure happens before any
+// credential change; an unchanged or failed mutation may cause a harmless
+// extra reload but can never leave committed credentials unpublished.
 func PublishAccountDiskMutation(ctx context.Context, storeDir string, mutate func() (bool, error)) (err error) {
+	return publishAccountDiskMutation(ctx, storeDir, advanceAccountDiskGeneration, mutate)
+}
+
+func publishAccountDiskMutation(
+	ctx context.Context,
+	storeDir string,
+	publish func(string) error,
+	mutate func() (bool, error),
+) (err error) {
 	return withAccountDiskTransaction(ctx, storeDir, func() error {
-		changed, err := mutate()
-		if err != nil || !changed {
+		if err := publish(storeDir); err != nil {
 			return err
 		}
-		return advanceAccountDiskGeneration(storeDir)
+		_, err := mutate()
+		return err
 	})
 }
 
