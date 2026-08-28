@@ -16,6 +16,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
@@ -324,7 +325,16 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 		return nil, err
 	}
 	client := &http.Client{Timeout: 15 * time.Second, Transport: m.Base.Transport}
-	ref, err := OpenAccountRefContext(ctx, codexStore, claudeStore, client)
+	kimiDir := filepath.Join(dir, "kimi")
+	kimiStore := agentkimi.Store{
+		// Tenant pools contain only explicitly imported managed profiles. Point
+		// the singleton CLI slot at an unused tenant-local path so it can never
+		// inherit the host user's global Kimi login.
+		Path:       filepath.Join(kimiDir, "cli-disabled.json"),
+		KimiHome:   kimiDir,
+		ManagedDir: kimiDir,
+	}
+	ref, err := OpenAccountRefWithSources(ctx, codexStore, claudeStore, client, []OAuthAccountSource{kimiStore})
 	if err != nil {
 		return nil, err
 	}

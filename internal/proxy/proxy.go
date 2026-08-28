@@ -6956,6 +6956,9 @@ func isTerminalCredentialError(err error) bool {
 		// as transient would retry the same unparseable blob forever instead of
 		// failing over to an account that still works.
 		"unreadable credential",
+		"kimi credential for",
+		"grok subscription credential was not found",
+		"antigravity keychain credential is missing",
 		"invalid_client",
 		"unauthorized_client",
 	} {

@@ -1091,6 +1091,9 @@ func TestIsTerminalCredentialError(t *testing.T) {
 	}{
 		{fmt.Errorf(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`), true},
 		{fmt.Errorf("profile has no refresh token"), true},
+		{fmt.Errorf("Kimi credential for kimi-subscription:work was not found"), true},
+		{fmt.Errorf("Grok subscription credential was not found"), true},
+		{fmt.Errorf("Antigravity keychain credential is missing"), true},
 		{fmt.Errorf("dial tcp: connection refused"), false},
 		{context.Canceled, false},
 		{context.DeadlineExceeded, false},

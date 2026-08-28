@@ -150,6 +150,23 @@ func TestGrokRemovePublishesAccountGeneration(t *testing.T) {
 	}
 }
 
+func TestGrokRemoveAcceptsDisplayedEmail(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	fake := &fakeGrokStore{account: baseaccount.Account{
+		ID: "grok-subscription", Provider: baseaccount.ProviderGrok,
+		AuthMode: baseaccount.AuthModeOAuth, Email: "shown@example.com",
+		Label: "Grok (shown@example.com)",
+	}}
+	runner := srRunner{store: store, out: io.Discard, grok: fake}
+	if err := runner.remove(t.Context(), "shown@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.removed {
+		t.Fatal("displayed Grok email did not remove the subscription account")
+	}
+}
+
 type refreshingKimiUsageStore struct {
 	fetchedToken string
 }

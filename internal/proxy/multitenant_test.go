@@ -21,6 +21,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
@@ -129,6 +130,37 @@ func TestMultiTenantUsageStatusNeedsOnlyTheTenantKey(t *testing.T) {
 	var statuses []AccountUsageStatus
 	if err := json.Unmarshal(response.Body.Bytes(), &statuses); err != nil {
 		t.Fatalf("decode usage status: %v", err)
+	}
+}
+
+func TestTenantServerScopesKimiProfilesToTenantState(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, _, err := registry.Create("kimi-isolated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi := &MultiTenant{Base: Server{}, Registry: registry}
+	server, err := multi.newTenantServer(t.Context(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := server.AccountRef.kimiStore()
+	wantDir := filepath.Join(registry.Dir(created.ID), "kimi")
+	if store.ManagedDir != wantDir || filepath.Dir(store.Path) != wantDir {
+		t.Fatalf("tenant Kimi store = path %q managed %q, want root %q", store.Path, store.ManagedDir, wantDir)
+	}
+	installed, err := store.SaveManagedCredential("work", agentkimi.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.ID != "kimi-subscription:work" {
+		t.Fatalf("installed account = %+v", installed)
+	}
+	entries, err := os.ReadDir(wantDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("tenant Kimi credential was not stored under tenant state: entries=%v err=%v", entries, err)
 	}
 }
 

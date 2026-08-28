@@ -1506,7 +1506,22 @@ func (r srRunner) reportCodexGUIRestart(ctx context.Context) error {
 }
 
 func (r srRunner) remove(ctx context.Context, selector string) error {
-	if strings.TrimSpace(selector) == "grok-subscription" {
+	selector = strings.TrimSpace(selector)
+	removeGrok := selector == "grok-subscription"
+	if !removeGrok {
+		grokAccounts, listErr := r.grokStore().ListAccounts(ctx)
+		if listErr == nil {
+			for _, candidate := range grokAccounts {
+				if strings.EqualFold(selector, candidate.ID) ||
+					strings.EqualFold(selector, candidate.Email) ||
+					strings.EqualFold(selector, candidate.Label) {
+					removeGrok = true
+					break
+				}
+			}
+		}
+	}
+	if removeGrok {
 		var removed baseaccount.Account
 		var ok bool
 		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
@@ -1523,7 +1538,7 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 		fmt.Fprintf(r.out, "Removed account: %s\n", removed.ID)
 		return nil
 	}
-	if strings.HasPrefix(strings.TrimSpace(selector), "kimi-subscription:") {
+	if strings.HasPrefix(selector, "kimi-subscription:") {
 		var removed baseaccount.Account
 		var ok bool
 		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
