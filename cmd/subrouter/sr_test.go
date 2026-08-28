@@ -167,6 +167,32 @@ func TestGrokRemoveAcceptsDisplayedEmail(t *testing.T) {
 	}
 }
 
+func TestGrokRemoveRejectsEmailSharedWithStoredAccount(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: "shared@example.com",
+		Auth:  accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "codex-key"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeGrokStore{account: baseaccount.Account{
+		ID: "grok-subscription", Provider: baseaccount.ProviderGrok,
+		AuthMode: baseaccount.AuthModeOAuth, Email: "shared@example.com",
+	}}
+	runner := srRunner{store: store, out: io.Discard, grok: fake}
+	err := runner.remove(t.Context(), "shared@example.com")
+	if err == nil || !strings.Contains(err.Error(), "matches both") || !strings.Contains(err.Error(), "grok-subscription") {
+		t.Fatalf("ambiguous removal error = %v", err)
+	}
+	if fake.removed {
+		t.Fatal("ambiguous selector removed the Grok credential")
+	}
+	if _, ok, err := store.FindStored("shared@example.com"); err != nil || !ok {
+		t.Fatalf("ambiguous selector removed stored account: ok=%v err=%v", ok, err)
+	}
+}
+
 type refreshingKimiUsageStore struct {
 	fetchedToken string
 }

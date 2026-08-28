@@ -210,6 +210,19 @@ func TestCodexArgsInjectsSubrouterProviderIntoRemoteControl(t *testing.T) {
 	}
 }
 
+func TestCodexArgsInjectsIntoRemoteControlStartAfterOptions(t *testing.T) {
+	for _, args := range [][]string{
+		{"remote-control", "-c", "features.foo=true", "start"},
+		{"remote-control", "--config", "features.foo=true", "--enable", "bar", "start"},
+		{"remote-control", "--disable", "bar", "--json", "start"},
+	} {
+		got := codexArgs(args, "http://127.0.0.1:31415/v1", "", "")
+		if !contains(got, `model_provider="subrouter"`) {
+			t.Fatalf("remote-control start options were mistaken for management args: %#v", got)
+		}
+	}
+}
+
 func TestCodexArgsDoesNotInjectIntoRemoteControlManagement(t *testing.T) {
 	for _, args := range [][]string{
 		{"remote-control", "stop"},

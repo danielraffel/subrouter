@@ -553,9 +553,14 @@ func codexInvocationUsesSubrouter(args []string) bool {
 	// Only the app-server-creating operation sends model traffic. The other
 	// remote-control operations manage that local process and must remain usable
 	// even when the selected Subrouter server is unavailable.
-	for _, arg := range args[commandIndex+1:] {
+	for i := commandIndex + 1; i < len(args); i++ {
+		arg := args[i]
 		if arg == "--" {
 			break
+		}
+		if arg == "-c" || arg == "--config" || arg == "--enable" || arg == "--disable" {
+			i++
+			continue
 		}
 		if !strings.HasPrefix(arg, "-") {
 			return arg == "start"

@@ -1522,6 +1522,13 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 		}
 	}
 	if removeGrok {
+		if selector != "grok-subscription" {
+			if stored, storedOK, storedErr := r.store.FindStored(selector); storedErr != nil {
+				return storedErr
+			} else if storedOK {
+				return fmt.Errorf("account selector %q matches both %s and the Grok subscription; use the exact account ID or 'grok-subscription'", selector, stored.Email)
+			}
+		}
 		var removed baseaccount.Account
 		var ok bool
 		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {

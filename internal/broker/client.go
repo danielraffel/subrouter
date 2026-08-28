@@ -176,6 +176,9 @@ type UsageStatus struct {
 	QuotaStatus        string                           `json:"quota_status,omitempty"`
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
+	ProviderHealth     string                           `json:"provider_health,omitempty"`
+	ProviderModels     *int                             `json:"provider_models,omitempty"`
+	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
