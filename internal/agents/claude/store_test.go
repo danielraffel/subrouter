@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -974,6 +975,7 @@ func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
 		err        error
 	}
 	results := make([]result, callers)
+	var publications atomic.Int32
 	var start sync.WaitGroup
 	var done sync.WaitGroup
 	start.Add(1)
@@ -982,7 +984,13 @@ func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
 		go func(i int) {
 			defer done.Done()
 			start.Wait()
-			account, didRefresh, err := store.RefreshCredentialIfExpired(context.Background(), server.Client(), profile)
+			account, _, didRefresh, err := store.RefreshCredentialDetailsIfExpiredBeforeRefresh(
+				context.Background(), server.Client(), profile,
+				func() error {
+					publications.Add(1)
+					return nil
+				},
+			)
 			results[i] = result{account: account, didRefresh: didRefresh, err: err}
 		}(i)
 	}
@@ -1003,6 +1011,9 @@ func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
 	}
 	if refreshes != 1 {
 		t.Fatalf("network refreshes reported = %d, want exactly 1", refreshes)
+	}
+	if publications.Load() != 1 {
+		t.Fatalf("refresh publications = %d, want exactly 1", publications.Load())
 	}
 
 	mu.Lock()

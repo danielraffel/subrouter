@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -348,6 +349,189 @@ func TestLocalProviderStatusDoesNotPublishFreshOAuthCredentials(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
 		t.Fatalf("fresh provider status published an account generation: %v", err)
 	}
+}
+
+func TestLocalClaudeStatusRefreshPublishesBeforeUsageAndReloadsAccount(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	profile := seedClaudeStatusCredential(t, claudeStore, "primary", agentclaude.CredentialInfo{
+		AccessToken: "stale-access", RefreshToken: "stale-refresh",
+		ExpiresAt: time.Now().Add(-time.Hour).UnixMilli(), SubscriptionType: "pro",
+	})
+
+	ref, err := proxy.OpenAccountRef(store, claudeStore, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := accountToken(ref.All(), accounts.ProviderClaude, profile.Name); got != "stale-access" {
+		t.Fatalf("initial Claude token = %q, want stale-access", got)
+	}
+
+	var refreshCalls, usageCalls atomic.Int32
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/v1/oauth/token":
+			refreshCalls.Add(1)
+			return srJSONResponse(req, http.StatusOK, `{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}`), nil
+		case "/api/oauth/usage":
+			usageCalls.Add(1)
+			if got := req.Header.Get("Authorization"); got != "Bearer fresh-access" {
+				return nil, fmt.Errorf("Claude usage authorization = %q, want refreshed access token", got)
+			}
+			if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+				return nil, fmt.Errorf("Claude refresh was not published before usage: %w", err)
+			}
+			lockCtx, cancel := context.WithTimeout(req.Context(), time.Second)
+			defer cancel()
+			if err := proxy.PublishAccountDiskMutation(lockCtx, store.StoreDir(), func() (bool, error) {
+				return false, nil
+			}); err != nil {
+				return nil, fmt.Errorf("Claude usage ran while account transaction remained locked: %w", err)
+			}
+			return srJSONResponse(req, http.StatusOK, `{"seven_day_oauth_apps":{"utilization":0.1,"resets_at":""}}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected Claude status request %s %s", req.Method, req.URL)
+		}
+	})}
+
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row := usageRowFor(rows, accounts.ProviderClaude, profile.Name); row == nil || row.err != nil {
+		t.Fatalf("refreshed Claude status row = %+v", row)
+	}
+	if refreshCalls.Load() != 1 || usageCalls.Load() != 1 {
+		t.Fatalf("Claude status calls refresh=%d usage=%d, want 1/1", refreshCalls.Load(), usageCalls.Load())
+	}
+	daemon := (proxy.Server{AccountRef: ref, AdminToken: "test-admin"}).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
+	request.Header.Set("Authorization", "Bearer test-admin")
+	response := httptest.NewRecorder()
+	daemon.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("daemon account lookup status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if got := accountToken(ref.All(), accounts.ProviderClaude, profile.Name); got != "fresh-access" {
+		t.Fatalf("generation-triggered daemon reload token = %q, want fresh-access", got)
+	}
+}
+
+func TestLocalClaudeStatusDoesNotPublishFreshCredential(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	profile := seedClaudeStatusCredential(t, claudeStore, "fresh", agentclaude.CredentialInfo{
+		AccessToken: "current-access", RefreshToken: "current-refresh",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), SubscriptionType: "max",
+	})
+
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/api/oauth/usage" {
+			return nil, fmt.Errorf("fresh Claude credential made unexpected request %s %s", req.Method, req.URL)
+		}
+		return srJSONResponse(req, http.StatusOK, `{"seven_day_oauth_apps":{"utilization":0.1,"resets_at":""}}`), nil
+	})}
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row := usageRowFor(rows, accounts.ProviderClaude, profile.Name); row == nil || row.err != nil {
+		t.Fatalf("fresh Claude status row = %+v", row)
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+		t.Fatalf("fresh Claude status published an account generation: %v", err)
+	}
+}
+
+func TestLocalClaudeStatusPublicationFailurePreventsRefresh(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	profile := seedClaudeStatusCredential(t, claudeStore, "blocked", agentclaude.CredentialInfo{
+		AccessToken: "stale-access", RefreshToken: "stale-refresh",
+		ExpiresAt: time.Now().Add(-time.Hour).UnixMilli(),
+	})
+	if err := os.MkdirAll(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var requests atomic.Int32
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, fmt.Errorf("credential request ran after publication failure: %s", req.URL)
+	})}
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row := usageRowFor(rows, accounts.ProviderClaude, profile.Name); row == nil || row.err == nil {
+		t.Fatalf("Claude publication failure row = %+v", row)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("Claude publication failure made %d credential requests, want 0", requests.Load())
+	}
+	credential, err := claudeStore.ReadCredential(t.Context(), claudeStore.ClaudeConfigDir(profile.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "stale-access" || credential.RefreshToken != "stale-refresh" {
+		t.Fatalf("credential changed after publication failure: %+v", credential)
+	}
+}
+
+func seedClaudeStatusCredential(t *testing.T, store agentclaude.Store, name string, credential agentclaude.CredentialInfo) agentclaude.Profile {
+	t.Helper()
+	if _, err := store.CreateProfile(name); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir(name)
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteCredential(t.Context(), configDir, credential); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile(name)
+	if !ok {
+		t.Fatalf("Claude profile %q was not created", name)
+	}
+	return profile
+}
+
+func srJSONResponse(req *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+}
+
+func usageRowFor(rows []srUsageRow, provider accounts.Provider, accountID string) *srUsageRow {
+	for i := range rows {
+		if rows[i].provider == provider && rows[i].email == accountID {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+func accountToken(all []baseaccount.Account, provider accounts.Provider, accountID string) string {
+	for _, account := range all {
+		if account.Provider == provider && account.ID == accountID {
+			return account.Token
+		}
+	}
+	return ""
 }
 
 func TestLocalKimiStatusSeparatesPartialSourceErrorFromHealthyAccount(t *testing.T) {
@@ -874,6 +1058,108 @@ func TestSRAddKeyStoresRegistryProviderInLocalStorage(t *testing.T) {
 		t.Fatal(err)
 	} else if codex {
 		t.Fatal("OpenRouter key was also stored in the Codex API-key pool")
+	}
+}
+
+func TestSRAddKeyForAnotherProviderDoesNotImportActiveCodexAuth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	storedAuth := testCodexAuth("isolated@example.com", "stored")
+	storedAuth.LastRefresh = "2026-08-28T00:00:00Z"
+	stored := accounts.StoredCodexAccount{
+		Email:   "isolated@example.com",
+		AddedAt: "2026-08-28T00:00:00Z",
+		Auth:    storedAuth,
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(stored.SourcePath(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeAuth := testCodexAuth("isolated@example.com", "active")
+	activeAuth.LastRefresh = "2026-08-29T00:00:00Z"
+	if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, in: strings.NewReader("work\nsk-or-v1-test\n"),
+		out: &out, errOut: &out,
+	}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(stored.SourcePath(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("unrelated provider add rewrote the isolated Codex credential")
+	}
+	persisted, ok, err := store.FindStored(stored.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored Codex account found=%t err=%v", ok, err)
+	}
+	if persisted.Auth.Tokens.RefreshToken != storedAuth.Tokens.RefreshToken {
+		t.Fatal("unrelated provider add replaced the isolated Codex token generation")
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("provider add did not publish its account generation: %v", err)
+	}
+}
+
+func TestSRAddKeyRejectedInputDoesNotMutateCodexOrPublishGeneration(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input string
+		args  []string
+	}{
+		{name: "empty label", input: "\n", args: []string{"add-key", "--provider", "openrouter"}},
+		{name: "empty key", input: "work\n\n", args: []string{"add-key", "--provider", "openrouter"}},
+		{name: "invalid Codex key", input: "work\nnot-an-api-key\n", args: []string{"add-key"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", filepath.Join(root, "home"))
+			store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+			stored := accounts.StoredCodexAccount{
+				Email:   "isolated@example.com",
+				AddedAt: "2026-08-28T00:00:00Z",
+				Auth:    testCodexAuth("isolated@example.com", "stored"),
+			}
+			if err := store.SaveStored(stored); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(stored.SourcePath(store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			activeAuth := testCodexAuth("isolated@example.com", "active")
+			activeAuth.LastRefresh = "2026-08-29T00:00:00Z"
+			if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+				t.Fatal(err)
+			}
+
+			var out bytes.Buffer
+			runner := srRunner{store: store, in: strings.NewReader(test.input), out: &out, errOut: &out}
+			if err := runner.run(t.Context(), test.args); err == nil {
+				t.Fatal("rejected add-key input unexpectedly succeeded")
+			}
+			after, err := os.ReadFile(stored.SourcePath(store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("rejected add-key input rewrote the isolated Codex credential")
+			}
+			if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+				t.Fatalf("rejected add-key input published an account generation: %v", err)
+			}
+		})
 	}
 }
 
@@ -1601,6 +1887,107 @@ func TestSRSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Switched to apikey:paid") {
 		t.Fatalf("missing switch confirmation:\n%s", out.String())
+	}
+}
+
+func TestSRSwitchPublishesOAuthIsolationDowngradeToRunningServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("isolated@example.test", "acct_isolated")
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "isolated@example.test",
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	servingStore := store
+	servingStore.DisableActiveAuthSync = true
+	servingStore.RequireIsolatedOAuth = true
+	ref, err := proxy.OpenAccountRef(servingStore, agentclaude.Store{Dir: filepath.Join(home, "claude-store")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration := ref.Generation()
+	handler := (proxy.Server{AccountRef: ref}).Handler()
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.switchAccount(context.Background(), "isolated@example.test", srSwitchOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://subrouter.local/_subrouter/accounts", nil)
+	request.RemoteAddr = "127.0.0.1:12345"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("account reload status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	if got := ref.Generation(); got <= beforeGeneration {
+		t.Fatalf("running server generation = %d, want > %d after switch", got, beforeGeneration)
+	}
+
+	stored, ok, err := store.FindStored("isolated@example.test")
+	if err != nil || !ok {
+		t.Fatalf("stored account found = %v, err = %v", ok, err)
+	}
+	if stored.OAuthCredentialOrigin != accounts.CodexOAuthOriginInteractiveImport {
+		t.Fatalf("stored OAuth origin = %q, want interactive import", stored.OAuthCredentialOrigin)
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok {
+		t.Fatalf("active auth found = %v, err = %v", ok, err)
+	}
+	if active.Tokens == nil || active.Tokens.RefreshToken != auth.Tokens.RefreshToken {
+		t.Fatal("active auth does not contain switched credential")
+	}
+
+	loaded := ref.All()
+	if len(loaded) != 1 {
+		t.Fatalf("running server account count = %d, want one", len(loaded))
+	}
+	_, refreshErr := ref.Refresh(context.Background(), loaded[0])
+	var unisolated *accounts.CodexUnisolatedCredentialError
+	if !errors.As(refreshErr, &unisolated) {
+		t.Fatalf("running server refresh error = %v, want isolation rejection", refreshErr)
+	}
+}
+
+func TestSRSwitchDoesNotWriteActiveAuthOrDowngradeWhenPublicationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	account := accounts.StoredCodexAccount{
+		Email:                 "isolated@example.test",
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  testCodexAuth("isolated@example.test", "acct_isolated"),
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.switchAccount(context.Background(), account.Email, srSwitchOptions{}); err == nil {
+		t.Fatal("switch unexpectedly succeeded when generation publication failed")
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored account found = %v, err = %v", ok, err)
+	}
+	if stored.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("stored OAuth origin = %q, want isolated server login", stored.OAuthCredentialOrigin)
+	}
+	if _, err := os.Stat(accounts.DefaultCodexAuthPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active auth was written despite publication failure: %v", err)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
@@ -358,7 +359,7 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: sr claude remove <name>")
 		}
-		return r.remove(args[1])
+		return r.remove(ctx, args[1])
 	case "env":
 		return r.env()
 	case "pick":
@@ -417,7 +418,11 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	var tempDir string
 	var err error
 	if name != "" {
-		instancePath, err = r.store.CreateProfile(name)
+		err = r.mutateProfileInventory(ctx, func() (bool, error) {
+			var createErr error
+			instancePath, createErr = r.store.CreateProfile(name)
+			return createErr == nil, createErr
+		})
 		if err != nil {
 			return err
 		}
@@ -447,7 +452,9 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
 	if exitErr != nil && !autoClosed {
 		if name != "" {
-			_, _ = r.store.RemoveProfile(name)
+			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
+				return errors.Join(fmt.Errorf("Claude login did not complete: %w", exitErr), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
+			}
 		} else {
 			_ = r.store.CleanupInstance(tempDir)
 		}
@@ -457,7 +464,9 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
 	if err != nil || status == nil || !status.LoggedIn {
 		if name != "" {
-			_, _ = r.store.RemoveProfile(name)
+			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
+				return errors.Join(errors.New("login was not completed"), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
+			}
 		} else {
 			_ = r.store.CleanupInstance(tempDir)
 		}
@@ -470,12 +479,25 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		if profileName == "" {
 			profileName = "default"
 		}
-		if _, ok := r.store.FindProfile(profileName); ok {
-			_, _ = r.store.RemoveProfile(profileName)
-		}
-		if err := r.store.RegisterProfile(profileName, tempDir); err != nil {
+		if err := r.mutateProfileInventory(ctx, func() (bool, error) {
+			if _, ok := r.store.FindProfile(profileName); ok {
+				if _, removeErr := r.store.RemoveProfile(profileName); removeErr != nil {
+					return false, removeErr
+				}
+			}
+			registerErr := r.store.RegisterProfile(profileName, tempDir)
+			return registerErr == nil, registerErr
+		}); err != nil {
 			return err
 		}
+	} else if err := r.mutateProfileInventory(ctx, func() (bool, error) {
+		// Claude writes the credential outside Subrouter's process during the
+		// interactive login. Publish a completion generation after verifying it
+		// so a worker that observed profile creation before credential landing
+		// receives a second, usable snapshot.
+		return true, nil
+	}); err != nil {
+		return err
 	}
 
 	plan := ""
@@ -669,7 +691,7 @@ func (r claudeRunner) switchProfile(selector string) error {
 	return nil
 }
 
-func (r claudeRunner) remove(selector string) error {
+func (r claudeRunner) remove(ctx context.Context, selector string) error {
 	profile, ok, err := r.store.MatchProfile(selector)
 	if err != nil {
 		return err
@@ -677,15 +699,36 @@ func (r claudeRunner) remove(selector string) error {
 	if !ok {
 		return fmt.Errorf("profile %q not found", selector)
 	}
-	removed, err := r.store.RemoveProfile(profile.Name)
-	if err != nil {
+	if err := r.removeProfileInventory(ctx, profile.Name); err != nil {
 		return err
-	}
-	if !removed {
-		return fmt.Errorf("profile %q not found", selector)
 	}
 	fmt.Fprintf(r.out, "Removed Claude profile: %s\n", profile.Name)
 	return nil
+}
+
+func (r claudeRunner) mutateProfileInventory(ctx context.Context, mutate func() (bool, error)) error {
+	if r.ephemeral {
+		_, err := mutate()
+		return err
+	}
+	return proxy.PublishAccountDiskMutation(ctx, r.store.Dir, mutate)
+}
+
+func (r claudeRunner) removeProfileInventory(ctx context.Context, name string) error {
+	return r.mutateProfileInventory(ctx, func() (bool, error) {
+		removed, err := r.store.RemoveProfile(name)
+		if err != nil {
+			return false, err
+		}
+		if !removed {
+			return false, fmt.Errorf("profile %q not found", name)
+		}
+		return true, nil
+	})
+}
+
+func (r claudeRunner) rollbackProfileInventory(ctx context.Context, name string) error {
+	return r.removeProfileInventory(context.WithoutCancel(ctx), name)
 }
 
 func (r claudeRunner) env() error {

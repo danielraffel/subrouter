@@ -708,13 +708,13 @@ func (r srRunner) addKey(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := r.publishActiveSync(ctx); err != nil {
-		return err
-	}
 	reader := bufio.NewReader(r.in)
 	label, err := promptLine(r.out, reader, "Label (e.g. work, personal): ")
 	if err != nil {
 		return err
+	}
+	if label == "" {
+		return errors.New("label is required")
 	}
 	keyPrompt := "API key"
 	if provider == accounts.ProviderCodex {
@@ -728,6 +728,12 @@ func (r srRunner) addKey(ctx context.Context, args []string) error {
 	)
 	if err != nil {
 		return err
+	}
+	if key == "" {
+		return errors.New("API key is required")
+	}
+	if provider == accounts.ProviderCodex && !strings.HasPrefix(key, "sk-") {
+		return errors.New("invalid API key format, expected sk-...")
 	}
 	var account accounts.StoredCodexAccount
 	var existed bool
@@ -1480,7 +1486,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			account, credential, _, err := claudeStore.RefreshCredentialDetailsIfExpired(ctx, r.client, profile)
+			account, credential, err := r.refreshStatusClaudeCredential(ctx, claudeStore, profile)
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
@@ -1539,6 +1545,31 @@ func (r srRunner) refreshStatusOAuthAccount(
 	return refreshed, nil
 }
 
+func (r srRunner) refreshStatusClaudeCredential(
+	ctx context.Context,
+	store agentclaude.Store,
+	profile agentclaude.Profile,
+) (baseaccount.Account, *agentclaude.CredentialInfo, error) {
+	account, credential, needsRefresh, err := store.CredentialRefreshState(ctx, profile, time.Now())
+	if err != nil || !needsRefresh {
+		return account, credential, err
+	}
+
+	var refreshedAccount baseaccount.Account
+	var refreshedCredential *agentclaude.CredentialInfo
+	err = proxy.WithAccountDiskMutationPublication(ctx, r.store.StoreDir(), func(publish func() error) error {
+		var refreshErr error
+		refreshedAccount, refreshedCredential, _, refreshErr = store.RefreshCredentialDetailsIfExpiredBeforeRefresh(
+			ctx, r.client, profile, publish,
+		)
+		return refreshErr
+	})
+	if err != nil {
+		return account, credential, err
+	}
+	return refreshedAccount, refreshedCredential, nil
+}
+
 func (r srRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accounts.AdminKeyEntry) string {
 	if len(admins) == 0 {
 		return "no admin key, run 'subrouter add-admin-key' to enable spend display"
@@ -1572,7 +1603,12 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err := r.ensureSwitchableForFreshUsage(ctx, account); err != nil {
 		return err
 	}
-	activated, err := r.store.SwitchActiveStored(account.Email)
+	var activated accounts.StoredCodexAccount
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var switchErr error
+		activated, switchErr = r.store.SwitchActiveStored(account.Email)
+		return switchErr == nil, switchErr
+	})
 	if err != nil {
 		return err
 	}

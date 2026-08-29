@@ -94,6 +94,42 @@ func PublishAccountDiskMutation(ctx context.Context, storeDir string, mutate fun
 	return publishAccountDiskMutation(ctx, storeDir, advanceAccountDiskGeneration, mutate)
 }
 
+// WithAccountDiskMutationPublication holds the cross-process account
+// transaction while mutate performs its own final freshness check. mutate must
+// call publish immediately before the first durable credential mutation. This
+// shape is for refreshers whose provider-specific lock must stay held across
+// that final check, publication, and rotation; a no-op refresh never calls
+// publish and therefore never advances the generation.
+func WithAccountDiskMutationPublication(
+	ctx context.Context,
+	storeDir string,
+	mutate func(publish func() error) error,
+) error {
+	return withAccountDiskMutationPublication(ctx, storeDir, advanceAccountDiskGeneration, mutate)
+}
+
+func withAccountDiskMutationPublication(
+	ctx context.Context,
+	storeDir string,
+	publishGeneration func(string) error,
+	mutate func(publish func() error) error,
+) error {
+	return withAccountDiskTransaction(ctx, storeDir, func() error {
+		published := false
+		publish := func() error {
+			if published {
+				return nil
+			}
+			if err := publishGeneration(storeDir); err != nil {
+				return err
+			}
+			published = true
+			return nil
+		}
+		return mutate(publish)
+	})
+}
+
 func publishAccountDiskMutation(
 	ctx context.Context,
 	storeDir string,
