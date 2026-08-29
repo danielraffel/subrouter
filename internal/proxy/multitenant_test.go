@@ -21,6 +21,8 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -128,6 +130,37 @@ func TestMultiTenantUsageStatusNeedsOnlyTheTenantKey(t *testing.T) {
 	var statuses []AccountUsageStatus
 	if err := json.Unmarshal(response.Body.Bytes(), &statuses); err != nil {
 		t.Fatalf("decode usage status: %v", err)
+	}
+}
+
+func TestTenantServerScopesKimiProfilesToTenantState(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, _, err := registry.Create("kimi-isolated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi := &MultiTenant{Base: Server{}, Registry: registry}
+	server, err := multi.newTenantServer(t.Context(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := server.AccountRef.kimiStore()
+	wantDir := filepath.Join(registry.Dir(created.ID), "kimi")
+	if store.ManagedDir != wantDir || filepath.Dir(store.Path) != wantDir {
+		t.Fatalf("tenant Kimi store = path %q managed %q, want root %q", store.Path, store.ManagedDir, wantDir)
+	}
+	installed, err := store.SaveManagedCredential("work", agentkimi.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.ID != "kimi-subscription:work" {
+		t.Fatalf("installed account = %+v", installed)
+	}
+	entries, err := os.ReadDir(wantDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("tenant Kimi credential was not stored under tenant state: entries=%v err=%v", entries, err)
 	}
 }
 
@@ -392,6 +425,29 @@ func TestMultiTenantScopedControlEndpoints(t *testing.T) {
 	for _, path := range []string{"/_subrouter/transcripts", "/_subrouter/dashboard", "/_subrouter/drain-status"} {
 		if resp := get("/t/" + key + path); resp.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want 404", path, resp.Code)
+		}
+	}
+}
+
+func TestTenantSessionsRequireManageAccountsCapability(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	const tenantID = "privacy-test"
+	const useKey = "srt_11111111111111111111111111111111"
+	const manageKey = "srt_22222222222222222222222222222222"
+	if _, err := registry.EnsureExternalRestricted(tenantID, "privacy", useKey, []tenant.Capability{tenant.CapabilityUse}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternalRestricted(tenantID, "privacy", manageKey, []tenant.Capability{tenant.CapabilityManageAccounts}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		key  string
+		want int
+	}{{useKey, http.StatusForbidden}, {manageKey, http.StatusOK}} {
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/t/"+test.key+"/_subrouter/sessions", nil))
+		if resp.Code != test.want {
+			t.Fatalf("sessions with scoped key status = %d, want %d", resp.Code, test.want)
 		}
 	}
 }
@@ -1809,6 +1865,41 @@ func TestTenantAccountDeleteReturnsUnavailableWithoutAccountStore(t *testing.T) 
 	)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTenantQwenDeleteRestoresAccountWhenCredentialCleanupFails(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email:    "qwen-token:work",
+		Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "model-secret",
+		},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := os.MkdirAll(ref.qwenRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), agentqwen.ConsoleConfigDirIn(ref.qwenRoot(), stored.Email)); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	handleTenantAccountDelete(
+		&Server{AccountRef: ref},
+		response,
+		httptest.NewRequest(http.MethodDelete, "/_subrouter/accounts/"+stored.Email, nil),
+	)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	if _, ok, err := store.FindStored(stored.Email); err != nil || !ok {
+		t.Fatalf("Qwen account was not restored after cleanup failure: ok=%v err=%v", ok, err)
 	}
 }
 

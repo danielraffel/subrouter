@@ -80,7 +80,12 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	}
 	input.normalize()
 	provider := accounts.Provider(input.Provider)
-	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude {
+	if keyedProvider, ok := APIKeyProviderForName(input.Provider); ok {
+		provider = keyedProvider
+		input.Provider = string(keyedProvider)
+	}
+	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude &&
+		provider != accounts.ProviderQwenToken && provider != accounts.ProviderQwenAnthropic {
 		http.Error(w, "unsupported credential lease provider", http.StatusBadRequest)
 		return
 	}
@@ -271,9 +276,9 @@ func pickTenantCredentialLeaseAccount(
 	}
 	scheduler := server.scheduler().ForModel(model)
 	if server.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(server.Sessions.CountByAccount())
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
 	}
-	return scheduler.Pick(candidates)
+	return pickRoutingAccount(scheduler, candidates)
 }
 
 func applyTenantCredentialLeaseReport(

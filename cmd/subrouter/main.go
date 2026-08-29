@@ -24,7 +24,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
@@ -244,12 +247,14 @@ var directSRCommands = map[string]struct{}{
 	"gui-switch":       {},
 	"gui-use":          {},
 	"import":           {},
+	"kimi":             {},
 	"list":             {},
 	"list-admin-keys":  {},
 	"login":            {},
 	"ls":               {},
 	"logout":           {},
 	"pick":             {},
+	"qwen":             {},
 	"remove":           {},
 	"remove-admin-key": {},
 	"remote":           {},
@@ -284,8 +289,21 @@ func serve(args []string) error {
 	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
 	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
 	claudeUpstreamRaw := flags.String("claude-upstream", "https://api.anthropic.com", "Claude subscription upstream base URL")
-	kimiUpstreamRaw := flags.String("kimi-upstream", "https://api.kimi.com/coding/v1", "Kimi For Coding upstream base URL")
-	zaiUpstreamRaw := flags.String("zai-upstream", "https://api.z.ai/api/coding/paas/v4", "Z.AI coding upstream base URL")
+	kimiUpstreamRaw := flags.String("kimi-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderKimi), "Kimi For Coding upstream base URL")
+	zaiUpstreamRaw := flags.String("zai-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderZAI), "Z.AI coding upstream base URL")
+	openRouterUpstreamRaw := flags.String("openrouter-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderOpenRouter), "OpenRouter upstream base URL")
+	deepSeekUpstreamRaw := flags.String("deepseek-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderDeepSeek), "DeepSeek upstream base URL")
+	togetherUpstreamRaw := flags.String("together-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderTogether), "Together AI upstream base URL")
+	fireworksUpstreamRaw := flags.String("fireworks-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderFireworks), "Fireworks AI upstream base URL")
+	openCodeZenUpstreamRaw := flags.String("opencode-zen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderOpenCodeZen), "OpenCode Zen upstream base URL")
+	grokUpstreamRaw := flags.String("grok-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderGrok), "xAI Grok upstream base URL")
+	grokSubscriptionUpstreamRaw := flags.String("grok-subscription-upstream", "https://cli-chat-proxy.grok.com/v1", "Grok subscription (OAuth) upstream base URL")
+	var openAICompatibleRaw stringList
+	flags.Var(&openAICompatibleRaw, "openai-compatible", "declare an OpenAI-compatible provider as name=BASE_URL (repeatable); aliases may follow the name as name|alias=BASE_URL")
+	qwenAnthropicUpstreamRaw := flags.String("qwen-anthropic-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenAnthropic), "Alibaba Model Studio Token Plan Anthropic-protocol upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic)")
+	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenToken), "Alibaba Model Studio Token Plan upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)")
+	qwenUpstreamRaw := flags.String("qwen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwen), "Alibaba Model Studio Coding Plan upstream base URL (Beijing: https://coding.dashscope.aliyuncs.com/v1)")
+	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -435,6 +453,61 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	openRouterUpstream, err := url.Parse(*openRouterUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	deepSeekUpstream, err := url.Parse(*deepSeekUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	togetherUpstream, err := url.Parse(*togetherUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	fireworksUpstream, err := url.Parse(*fireworksUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	openCodeZenUpstream, err := url.Parse(*openCodeZenUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	grokUpstream, err := url.Parse(*grokUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	grokSubscriptionUpstream, err := url.Parse(*grokSubscriptionUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	qwenUpstream, err := url.Parse(*qwenUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	qwenTokenUpstream, err := url.Parse(*qwenTokenUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	qwenAnthropicUpstream, err := url.Parse(*qwenAnthropicUpstreamRaw)
+	if err != nil {
+		return err
+	}
+	declaredProviders := make([]proxy.OpenAICompatibleProvider, 0, len(openAICompatibleRaw))
+	for _, raw := range openAICompatibleRaw {
+		declared, parseErr := proxy.ParseOpenAICompatibleFlag(raw)
+		if parseErr != nil {
+			return parseErr
+		}
+		declaredProviders = append(declaredProviders, declared)
+	}
+	if err := proxy.ConfigureOpenAICompatibleProviders(declaredProviders); err != nil {
+		return err
+	}
+	antigravityUpstream, err := url.Parse(*antigravityUpstreamRaw)
+	if err != nil {
+		return err
+	}
 
 	cloudConfig, err := broker.LoadConfig(*cloudConfigPath)
 	if err != nil {
@@ -514,26 +587,21 @@ func serve(args []string) error {
 
 	codexStore := accounts.DefaultCodexStore()
 	claudeStore := agentclaude.DefaultStore()
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.DefaultStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
-		accountRef, err = proxy.OpenAccountRef(codexStore, claudeStore, &http.Client{
+		accountRef, err = proxy.OpenAccountRefWithSources(context.Background(), codexStore, claudeStore, &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: outboundTransport,
-		})
+		}, oauthSources)
 		if err != nil {
 			return err
 		}
 		initialAccounts, generation := accountRef.Snapshot()
 		accountGeneration = generation
-		for _, account := range initialAccounts {
-			if account.Provider == accounts.ProviderClaude {
-				claudeAccounts = append(claudeAccounts, account)
-			} else {
-				codexAccounts = append(codexAccounts, account)
-			}
-		}
+		codexAccounts, claudeAccounts = schedulerAccountsByProvider(initialAccounts)
 	}
 	// Start with optimistic fallback scores so the proxy begins accepting
 	// connections immediately. Blocking startup on a synchronous usage fetch
@@ -614,37 +682,51 @@ func serve(args []string) error {
 	}
 
 	server := proxy.Server{
-		StreamDrops:           &proxy.StreamDropStats{},
-		Upstream:              upstream,
-		CodexUpstream:         codexUpstream,
-		APIUpstream:           apiUpstream,
-		ClaudeUpstream:        claudeUpstream,
-		KimiUpstream:          kimiUpstream,
-		ZAIUpstream:           zaiUpstream,
-		Accounts:              nil,
-		AccountRef:            accountRef,
-		CredentialBroker:      credentialBroker,
-		Sessions:              store,
-		SchedulerRef:          schedulerRef,
-		UsageScoreTTL:         usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
-		Transport:             outboundTransport,
-		Logger:                slog.Default(),
-		Lifecycle:             proxy.NewLifecycle(),
-		AdminToken:            *adminToken,
-		AccountImportToken:    *accountImportToken,
-		TailnetAuth:           tailnetAuthorizer,
-		RequireSessionLease:   *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
-		ForwardSessionHeaders: envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
-		LocalProxyToken:       localProxyToken,
-		MaxBodyBytes:          *maxBodyBytes,
-		Bedrock:               bedrockConfig,
-		ClaudeFableAPIKey:     fableAPIKey,
+		StreamDrops:              &proxy.StreamDropStats{},
+		Upstream:                 upstream,
+		CodexUpstream:            codexUpstream,
+		APIUpstream:              apiUpstream,
+		ClaudeUpstream:           claudeUpstream,
+		KimiUpstream:             kimiUpstream,
+		ZAIUpstream:              zaiUpstream,
+		OpenRouterUpstream:       openRouterUpstream,
+		DeepSeekUpstream:         deepSeekUpstream,
+		TogetherUpstream:         togetherUpstream,
+		FireworksUpstream:        fireworksUpstream,
+		OpenCodeZenUpstream:      openCodeZenUpstream,
+		GrokUpstream:             grokUpstream,
+		GrokSubscriptionUpstream: grokSubscriptionUpstream,
+		QwenUpstream:             qwenUpstream,
+		QwenTokenUpstream:        qwenTokenUpstream,
+		QwenAnthropicUpstream:    qwenAnthropicUpstream,
+		AntigravityUpstream:      antigravityUpstream,
+		Accounts:                 nil,
+		AccountRef:               accountRef,
+		CredentialBroker:         credentialBroker,
+		Sessions:                 store,
+		SchedulerRef:             schedulerRef,
+		UsageScoreTTL:            usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		Transport:                outboundTransport,
+		Logger:                   slog.Default(),
+		Lifecycle:                proxy.NewLifecycle(),
+		AdminToken:               *adminToken,
+		AccountImportToken:       *accountImportToken,
+		TailnetAuth:              tailnetAuthorizer,
+		RequireSessionLease:      *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),
+		ForwardSessionHeaders:    envTrue("SUBROUTER_FORWARD_SESSION_HEADERS"),
+		LocalProxyToken:          localProxyToken,
+		MaxBodyBytes:             *maxBodyBytes,
+		Bedrock:                  bedrockConfig,
+		ClaudeFableAPIKey:        fableAPIKey,
 		// SUBROUTER_FABLE_CACHE_1H_OFF=1 disables the ephemeral->1h
 		// cache_control TTL upgrade on the Bedrock path.
 		ClaudeFableCacheTTLUpgradeOff: envTrue("SUBROUTER_FABLE_CACHE_1H_OFF"),
 		AzureCodex:                    azureCodexConfig,
 		FableBedrockPrimary:           fableBedrockEnabled,
 		Transcripts:                   transcript.NewRecorder(*transcriptDir),
+	}
+	if err := server.ValidateCredentialUpstreams(); err != nil {
+		return err
 	}
 	transcriptGCSSyncer := transcript.NewGCSSyncer(transcript.GCSSyncerConfig{
 		SourceDir:      *transcriptDir,
@@ -780,6 +862,18 @@ func serve(args []string) error {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
 	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+}
+
+func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {
+	for _, account := range all {
+		switch account.Provider {
+		case accounts.ProviderCodex:
+			codex = append(codex, account)
+		case accounts.ProviderClaude:
+			claude = append(claude, account)
+		}
+	}
+	return codex, claude
 }
 
 func validatePublicSubrouterURL(raw string) error {
@@ -1231,6 +1325,7 @@ func fetchCodexScoresWithSuccess(ctx context.Context, codexAccounts []accounts.A
 }
 
 func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, codexAccounts []accounts.Account) ([]selectacct.Score, int) {
+	codexAccounts, _ = schedulerAccountsByProvider(codexAccounts)
 	client := &http.Client{
 		Timeout:   10 * time.Second,
 		Transport: proxy.NewOutboundTransport(),
@@ -1306,6 +1401,9 @@ func fetchCodexScoresWithStore(ctx context.Context, store accounts.CodexStore, c
 func fallbackScores(codexAccounts []accounts.Account) []selectacct.Score {
 	scores := make([]selectacct.Score, 0, len(codexAccounts))
 	for _, account := range codexAccounts {
+		if account.Provider != accounts.ProviderCodex {
+			continue
+		}
 		headroom := 1.0
 		if account.AuthMode == accounts.AuthModeAPIKey {
 			headroom = 0.01
@@ -1373,7 +1471,7 @@ Team vault management:
   %[1]s logout             Revoke this machine's cmux.com session
 
 Usage:
-  %[1]s                    Show Codex and Claude usage, grouped by provider
+  %[1]s                    Show usage across all configured providers
   %[1]s add                Add an account; asks whether it is Codex or Claude
   %[1]s add codex          Add a Codex account (opens OAuth login)
   %[1]s add claude         Add a Claude account (opens OAuth login)
@@ -1384,8 +1482,14 @@ Usage:
   %[1]s g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  %[1]s remove <email>     Remove a Codex account
-  %[1]s status             Show Codex and Claude usage (non-interactive)
+  %[1]s remove <account>   Remove an account (for example qwen-token:large-plan)
+  %[1]s status             Show usage across all configured providers (non-interactive)
+  %[1]s qwen login [--console-account <email-or-label>] <account>
+                           Authorize live Qwen Token Plan quota status
+  %[1]s kimi login <label> Add an isolated Kimi subscription account
+  %[1]s kimi list          List Kimi CLI and managed subscription accounts
+  %[1]s kimi remove <label>
+                           Remove one managed Kimi subscription account
   %[1]s pick               Switch to the recommended account, failing if none has quota
   %[1]s reset [email]      Redeem a rate-limit reset credit (best candidate, or --all, or --dry-run)
   %[1]s usage [days]       Refresh and show API-key spend
@@ -1434,7 +1538,7 @@ Usage:
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles
 
-  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
+  %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
   %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]
@@ -1468,4 +1572,14 @@ func splitAndTrim(value string) []string {
 		return nil
 	}
 	return result
+}
+
+// stringList collects a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(value string) error {
+	*l = append(*l, value)
+	return nil
 }

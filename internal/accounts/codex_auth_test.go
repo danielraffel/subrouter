@@ -446,3 +446,82 @@ func TestAccountMismatchMessageIsTerminalRefreshFailure(t *testing.T) {
 		t.Fatal("expected account-mismatch refresh failure to be terminal")
 	}
 }
+
+// A locally added API key must be stored against its provider. Storing one
+// without a provider made every non-Codex key look like a Codex account, so it
+// was selected for Codex and forwarded to the OpenAI upstream — the key's own
+// provider was unreachable from the local CLI entirely.
+func TestAddProviderAPIKeyScopesTheAccountToItsProvider(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+
+	account, existed, err := store.AddProviderAPIKey(ProviderQwenToken, "tokenplan", "sk-sp-qwen-key")
+	if err != nil {
+		t.Fatalf("add failed: %v", err)
+	}
+	if existed {
+		t.Fatal("a fresh account should not report as existing")
+	}
+	if account.Provider != ProviderQwenToken {
+		t.Fatalf("Provider = %q, want qwen-token", account.Provider)
+	}
+	if account.Email != "qwen-token:tokenplan" {
+		t.Fatalf("Email = %q, want the provider-prefixed identifier", account.Email)
+	}
+
+	// Codex keeps the historical apikey: prefix so existing accounts still
+	// resolve.
+	codex, _, err := store.AddProviderAPIKey(ProviderCodex, "work", "sk-openai-key")
+	if err != nil {
+		t.Fatalf("codex add failed: %v", err)
+	}
+	if codex.Email != "apikey:work" || codex.ProviderOrDefault() != ProviderCodex {
+		t.Fatalf("codex account = %+v, want apikey:work on the codex provider", codex)
+	}
+
+	// An empty provider defaults to Codex, which is what AddAPIKey relies on.
+	legacy, _, err := store.AddAPIKey("legacy", "sk-legacy")
+	if err != nil {
+		t.Fatalf("legacy add failed: %v", err)
+	}
+	if legacy.Email != "apikey:legacy" || legacy.ProviderOrDefault() != ProviderCodex {
+		t.Fatalf("legacy account = %+v, want the codex shape", legacy)
+	}
+
+	// Two providers may share a label without colliding.
+	other, _, err := store.AddProviderAPIKey(ProviderQwenAnthropic, "tokenplan", "sk-sp-qwen-key")
+	if err != nil {
+		t.Fatalf("second provider add failed: %v", err)
+	}
+	if other.Email == account.Email {
+		t.Fatal("the same label under two providers must not collide")
+	}
+	stored, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 4 {
+		t.Fatalf("stored %d accounts, want 4: %+v", len(stored), stored)
+	}
+}
+
+// Only Codex guarantees an sk- prefix. Other providers issue their own formats,
+// so requiring sk- there would reject valid keys — xAI's begin with xai-.
+func TestAddProviderAPIKeyValidatesTheKeyPerProvider(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+
+	if _, _, err := store.AddProviderAPIKey(ProviderCodex, "work", "not-an-sk-key"); err == nil {
+		t.Fatal("a Codex key without the sk- prefix must be rejected")
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderCodex, "empty", "  "); err == nil || err.Error() != "API key is required" {
+		t.Fatalf("empty Codex key error = %v, want missing-key error", err)
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderGrok, "grok", "xai-some-key"); err != nil {
+		t.Fatalf("a provider with its own key format must be accepted: %v", err)
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderGrok, "empty", ""); err == nil {
+		t.Fatal("an empty key must be rejected for every provider")
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderGrok, "", "xai-some-key"); err == nil {
+		t.Fatal("a missing label must be rejected")
+	}
+}

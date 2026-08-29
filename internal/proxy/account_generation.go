@@ -75,6 +75,53 @@ func advanceAccountDiskGeneration(storeDir string) (err error) {
 	return nil
 }
 
+func (r *AccountRef) advanceDiskGeneration() error {
+	publish := advanceAccountDiskGeneration
+	if r.publishGenerationForTest != nil {
+		publish = r.publishGenerationForTest
+	}
+	return publish(r.store.StoreDir())
+}
+
+// PublishAccountDiskMutation serializes a local CLI credential mutation with
+// HTTP account imports. It publishes the new generation before invoking the
+// mutation while still holding the same cross-process lock workers acquire to
+// reload. A worker that observes the marker therefore waits until the mutation
+// commits before reading credentials. Publication failure happens before any
+// credential change; an unchanged or failed mutation may cause a harmless
+// extra reload but can never leave committed credentials unpublished.
+func PublishAccountDiskMutation(ctx context.Context, storeDir string, mutate func() (bool, error)) (err error) {
+	return publishAccountDiskMutation(ctx, storeDir, advanceAccountDiskGeneration, mutate)
+}
+
+func publishAccountDiskMutation(
+	ctx context.Context,
+	storeDir string,
+	publish func(string) error,
+	mutate func() (bool, error),
+) (err error) {
+	return withAccountDiskTransaction(ctx, storeDir, func() error {
+		if err := publish(storeDir); err != nil {
+			return err
+		}
+		_, err := mutate()
+		return err
+	})
+}
+
+func withAccountDiskTransaction(ctx context.Context, storeDir string, mutate func() error) (err error) {
+	lock, err := lockAccountImportTransaction(ctx, storeDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	return mutate()
+}
+
 func (r *AccountRef) reloadIfDiskGenerationChanged(ctx context.Context) (reloaded bool, generation uint64, err error) {
 	if r == nil {
 		return false, 0, nil

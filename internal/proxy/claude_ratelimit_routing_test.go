@@ -735,7 +735,7 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
-func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
+func TestClaudeFailoverTriesMarkedExhaustedAlternateWhenScoreMayBeStale(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-exhausted-alt", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
@@ -745,9 +745,6 @@ func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		calls++
-		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
-			t.Fatal("fresh account is marked exhausted and must not be retried")
-		}
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
@@ -771,8 +768,8 @@ func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	if response.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want original 429", response.StatusCode)
 	}
-	if calls != 1 {
-		t.Fatalf("upstream calls=%d, want 1 because marked-exhausted alternates are skipped", calls)
+	if calls != 2 {
+		t.Fatalf("upstream calls=%d, want the stale-scored alternate tried once", calls)
 	}
 }
 
@@ -1091,6 +1088,9 @@ func TestIsTerminalCredentialError(t *testing.T) {
 	}{
 		{fmt.Errorf(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`), true},
 		{fmt.Errorf("profile has no refresh token"), true},
+		{fmt.Errorf("Kimi credential for kimi-subscription:work was not found"), true},
+		{fmt.Errorf("Grok subscription credential was not found"), true},
+		{fmt.Errorf("Antigravity keychain credential is missing"), true},
 		{fmt.Errorf("dial tcp: connection refused"), false},
 		{context.Canceled, false},
 		{context.DeadlineExceeded, false},
@@ -1253,8 +1253,8 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
 	}
-	if calls != 1+claudeOverloadMaxRetries {
-		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeOverloadMaxRetries)
+	if calls != 1+providerOverloadMaxRetries {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+providerOverloadMaxRetries)
 	}
 }
 
@@ -1309,19 +1309,19 @@ func TestClaudeOverloadRetryPreservesFailoverAccount(t *testing.T) {
 
 func TestClaudeOverloadBackoff(t *testing.T) {
 	h := http.Header{}
-	if d := claudeOverloadBackoff(h, 0); d != time.Second {
+	if d := providerOverloadBackoff(h, 0); d != time.Second {
 		t.Fatalf("retry0 = %v, want 1s", d)
 	}
-	if d := claudeOverloadBackoff(h, 1); d != 2*time.Second {
+	if d := providerOverloadBackoff(h, 1); d != 2*time.Second {
 		t.Fatalf("retry1 = %v, want 2s", d)
 	}
 	h.Set("Retry-After", "3")
-	if d := claudeOverloadBackoff(h, 0); d != 3*time.Second {
+	if d := providerOverloadBackoff(h, 0); d != 3*time.Second {
 		t.Fatalf("retry-after 3 = %v, want 3s", d)
 	}
 	h.Set("Retry-After", "9999")
-	if d := claudeOverloadBackoff(h, 0); d != claudeOverloadMaxWait {
-		t.Fatalf("retry-after 9999 = %v, want cap %v", d, claudeOverloadMaxWait)
+	if d := providerOverloadBackoff(h, 0); d != providerOverloadMaxWait {
+		t.Fatalf("retry-after 9999 = %v, want cap %v", d, providerOverloadMaxWait)
 	}
 	if !claudeOverloadStatus(529) || !claudeOverloadStatus(500) || claudeOverloadStatus(429) || claudeOverloadStatus(200) {
 		t.Fatal("claudeOverloadStatus classification wrong")

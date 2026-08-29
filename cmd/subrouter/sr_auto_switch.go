@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -119,7 +120,7 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 		}
 	}
 	if cfg.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(cfg.Sessions.CountByAccount())
+		scheduler = scheduler.WithSessionCounts(proxy.SchedulerSessionCounts(cfg.Sessions))
 	}
 
 	// PickBest, not Pick: auto-switch maintains one active CLI account over

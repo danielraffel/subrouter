@@ -54,6 +54,9 @@ func TestCredentialSourceMigratesTeamConfigAndAllowsExplicitLocal(t *testing.T) 
 	if !config.TeamModeReady() {
 		t.Fatal("pre-source team config should remain team-ready")
 	}
+	if config.HostedTenantReady() {
+		t.Fatal("pre-source team config unexpectedly has a hosted tenant endpoint")
+	}
 
 	config.CredentialSource = CredentialSourceLocal
 	if got := config.EffectiveCredentialSource(); got != CredentialSourceLocal {
@@ -362,6 +365,22 @@ func TestInvalidatingOneLeaseEvictsEveryCacheEntryForItsGeneration(
 	}
 	if requests.Load() != 3 {
 		t.Fatalf("lease requests after invalidation = %d, want 3", requests.Load())
+	}
+}
+
+func TestParseLeasePreservesQwenAnthropicTransportProvider(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	lease, err := parseLease(leaseWire{
+		LeaseID: "lease-qwen", AccountID: "qwen-token:work",
+		Provider: string(account.ProviderQwenAnthropic), AuthMode: string(account.AuthModeAPIKey),
+		Token: "token-plan-key", CredentialGeneration: 1,
+		IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(5 * time.Minute).Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Account.Provider != account.ProviderQwenAnthropic || lease.Account.ID != "qwen-token:work" {
+		t.Fatalf("lease account = %+v", lease.Account)
 	}
 }
 

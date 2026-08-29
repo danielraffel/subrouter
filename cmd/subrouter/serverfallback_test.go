@@ -275,12 +275,12 @@ func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
 }
 
 func TestClaudeLaunchesAgent(t *testing.T) {
-	for _, args := range [][]string{nil, {}, {"run"}, {"--model", "opus"}, {"-p", "hi"}} {
+	for _, args := range [][]string{{"proxy"}, {"proxy", "--resume", "session-a"}} {
 		if !claudeLaunchesAgent(args) {
 			t.Errorf("claudeLaunchesAgent(%v) = false, want true", args)
 		}
 	}
-	for _, args := range [][]string{{"list"}, {"ls"}, {"status"}, {"add"}, {"push"}, {"help"}, {"--help"}} {
+	for _, args := range [][]string{nil, {}, {"run"}, {"--model", "opus"}, {"-p", "hi"}, {"list"}, {"ls"}, {"status"}, {"add"}, {"push"}, {"help"}, {"--help"}} {
 		if claudeLaunchesAgent(args) {
 			t.Errorf("claudeLaunchesAgent(%v) = true, want false", args)
 		}

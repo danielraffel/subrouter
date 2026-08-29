@@ -94,6 +94,34 @@ type CredentialInfo struct {
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
 }
 
+// PlanType returns the subscription label explicitly carried by a Claude
+// credential. It never guesses a plan from token contents or observed usage.
+func (credential *CredentialInfo) PlanType() string {
+	if credential == nil {
+		return "unknown"
+	}
+	plan := strings.TrimSpace(credential.SubscriptionType)
+	if plan == "" {
+		plan = strings.TrimSpace(credential.RateLimitTier)
+	}
+	if plan == "" {
+		return "unknown"
+	}
+	lower := strings.ToLower(plan)
+	for _, part := range strings.FieldsFunc(lower, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		switch part {
+		case "max", "pro", "free":
+			return part
+		}
+	}
+	if len(plan) > 32 || strings.IndexFunc(plan, func(r rune) bool {
+		return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == ' ' || r == '-' || r == '_' || r == '.' || r == '+')
+	}) >= 0 {
+		return "unknown"
+	}
+	return plan
+}
+
 type RateLimit struct {
 	Utilization *float64 `json:"utilization"`
 	ResetsAt    string   `json:"resets_at"`
@@ -400,6 +428,25 @@ func (s Store) ListProfiles() []Profile {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// ProfileInventoryCount returns the durable number of registered profiles and
+// reports malformed or unreadable registry state. Routing can skip one broken
+// credential, but capacity enforcement must not silently erase every profile
+// when the registry itself cannot be inspected.
+func (s Store) ProfileInventoryCount() (int, error) {
+	body, err := readFileForAtomicReplace(s.ProfilesPath())
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var data profilesFile
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, err
+	}
+	return len(data.Profiles), nil
 }
 
 func (s Store) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
@@ -1046,6 +1093,7 @@ func EnvForConfigDir(instancePath string) []string {
 		"ANTHROPIC_API_KEY":        true,
 		"ANTHROPIC_AUTH_TOKEN":     true,
 		"ANTHROPIC_BASE_URL":       true,
+		"ANTHROPIC_CUSTOM_HEADERS": true,
 		"CLAUDE_CODE_OAUTH_TOKEN":  true,
 		"CLAUDE_CONFIG_DIR":        true,
 		"CLAUDE_CODE_API_KEY":      true,
@@ -1129,11 +1177,20 @@ func (s Store) readCredential(ctx context.Context, instancePath string) (*Creden
 }
 
 func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
-	return s.refreshProfileCredential(ctx, client, profile, false)
+	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, false)
+	return account, didRefresh, err
 }
 
 func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
-	return s.refreshProfileCredential(ctx, client, profile, true)
+	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, true)
+	return account, didRefresh, err
+}
+
+// RefreshCredentialDetailsIfExpired returns the credential snapshot used to
+// build the account so status callers do not need a second serialized disk or
+// Keychain read merely to obtain subscription metadata.
+func (s Store) RefreshCredentialDetailsIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, *CredentialInfo, bool, error) {
+	return s.refreshProfileCredential(ctx, client, profile, false)
 }
 
 // refreshProfileCredential serializes concurrent refreshes of the same
@@ -1148,11 +1205,11 @@ func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, 
 // unrelated ImportProfileCredential call for the same profile; each
 // individual disk read/write still takes the short-lived
 // lockProfileCredential via ReadCredential / writeRefreshedCredentialIfUnchanged.
-func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, didRefresh bool, err error) {
+func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, credential *CredentialInfo, didRefresh bool, err error) {
 	configDir := s.ClaudeConfigDir(profile.Name)
 	refreshLock, err := lockProfileRefresh(ctx, configDir)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, nil, false, err
 	}
 	defer func() {
 		if closeErr := refreshLock.Close(); err == nil {
@@ -1162,34 +1219,34 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 
 	current, ok := s.FindProfile(profile.Name)
 	if !ok || profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+		return accounts.Account{}, nil, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err := s.ReadCredential(ctx, configDir)
+	credential, err = s.ReadCredential(ctx, configDir)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, nil, false, err
 	}
 	if credential == nil || credential.AccessToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
 	if force && credential.RefreshToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
 	}
 	shouldRefresh := credential.RefreshToken != "" &&
 		(force || credentialExpired(credential, 60*time.Second))
 	if !shouldRefresh {
 		account, ok = profileAccount(profile, configDir, credential)
 		if !ok {
-			return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
+			return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 		}
-		return account, false, nil
+		return account, credential, false, nil
 	}
 
 	credentialBeforeRefresh := *credential
 	profileBeforeRefresh := profile
 	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, credential, false, err
 	}
 	didRefresh = true
 
@@ -1197,21 +1254,21 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	if !ok ||
 		current.CreatedAt != profileBeforeRefresh.CreatedAt ||
 		profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
 	credential, err = s.writeRefreshedCredentialIfUnchanged(ctx, configDir, credentialBeforeRefresh, refreshed)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, credential, false, err
 	}
 	if credential == nil || credential.AccessToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
 	account, ok = profileAccount(profile, configDir, credential)
 	if !ok {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 	}
-	return account, didRefresh, nil
+	return account, credential, didRefresh, nil
 }
 
 // writeRefreshedCredentialIfUnchanged briefly holds lockProfileCredential to
@@ -1365,11 +1422,34 @@ func readCredentialFile(instancePath string) (*CredentialInfo, bool) {
 // summary of the payload's shape: a decode failure is otherwise indistinguishable
 // between a keychain wrapper, a partial write, and a corrupt file.
 func parseCredentialPayload(body []byte, source string) (*CredentialInfo, error) {
+	credential, err := decodeCredentialPayload(body)
+	if err == nil {
+		return credential, nil
+	}
+	// Claude Code may store the credential as generic-password data instead of
+	// a string. On macOS, `security ... -w` renders that data as hexadecimal
+	// text. Accept that representation only for keychain reads and only when
+	// the complete decoded value is itself a valid credential payload.
+	if source == "keychain" {
+		trimmed := bytes.TrimSpace(body)
+		if len(trimmed) > 0 && len(trimmed)%2 == 0 {
+			decoded := make([]byte, hex.DecodedLen(len(trimmed)))
+			if _, decodeErr := hex.Decode(decoded, trimmed); decodeErr == nil {
+				if credential, decodeErr := decodeCredentialPayload(decoded); decodeErr == nil {
+					return credential, nil
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("%s from %s (%s): %w", unreadableCredentialPhrase, source, describeCredentialPayload(body, err), err)
+}
+
+func decodeCredentialPayload(body []byte) (*CredentialInfo, error) {
 	var raw struct {
 		ClaudeAIOAuth *CredentialInfo `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("%s from %s (%s): %w", unreadableCredentialPhrase, source, describeCredentialPayload(body, err), err)
+		return nil, err
 	}
 	return raw.ClaudeAIOAuth, nil
 }

@@ -21,6 +21,53 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
+func TestCredentialPlanTypeUsesOnlyCredentialMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		credential *CredentialInfo
+		want       string
+	}{
+		{name: "nil", want: "unknown"},
+		{name: "absent", credential: &CredentialInfo{AccessToken: "secret"}, want: "unknown"},
+		{name: "max normalized", credential: &CredentialInfo{SubscriptionType: " MAX "}, want: "max"},
+		{name: "pro normalized", credential: &CredentialInfo{SubscriptionType: "Pro"}, want: "pro"},
+		{name: "free from tier", credential: &CredentialInfo{RateLimitTier: "FREE"}, want: "free"},
+		{name: "max vendor tier", credential: &CredentialInfo{RateLimitTier: "default_claude_max_20x"}, want: "max"},
+		{name: "subscription wins", credential: &CredentialInfo{SubscriptionType: "max", RateLimitTier: "pro"}, want: "max"},
+		{name: "vendor label", credential: &CredentialInfo{RateLimitTier: "enterprise"}, want: "enterprise"},
+		{name: "unsafe vendor label", credential: &CredentialInfo{RateLimitTier: "enterprise\x1b[31m"}, want: "unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.credential.PlanType(); got != test.want {
+				t.Fatalf("PlanType() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRefreshCredentialDetailsReturnsSameCredentialSnapshot(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	credential := CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", SubscriptionType: "max",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}
+	if err := store.ImportProfileCredential("work", credential); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile("work")
+	if !ok {
+		t.Fatal("missing imported profile")
+	}
+	account, got, refreshed, err := store.RefreshCredentialDetailsIfExpired(t.Context(), http.DefaultClient, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed || got == nil || got.PlanType() != "max" || account.Token != credential.AccessToken {
+		t.Fatalf("details = account:%+v credential:%+v refreshed:%v", account, got, refreshed)
+	}
+}
+
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
 	instancePath, err := store.CreateProfile("work")
@@ -72,6 +119,7 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "api-key")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
 	t.Setenv("ANTHROPIC_BASE_URL", "http://stale-proxy:31415")
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: Bearer stale")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
 
@@ -86,6 +134,7 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_CUSTOM_HEADERS",
 		"CLAUDE_CODE_OAUTH_TOKEN",
 	} {
 		if _, ok := seen[key]; ok {

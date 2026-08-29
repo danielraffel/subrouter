@@ -34,19 +34,25 @@ func saveReadyCloudConfig(t *testing.T) {
 }
 
 func TestUsageRowsFromHostedStatusesPreservesQuotaWindows(t *testing.T) {
+	models := 12
 	rows := usageRowsFromHostedStatuses([]broker.UsageStatus{{
-		ID:        "account-1",
-		Provider:  accounts.ProviderCodex,
-		AuthMode:  accounts.AuthModeOAuth,
-		Email:     "user@example.com",
-		AuthValid: true,
+		ID:                "account-1",
+		Provider:          accounts.ProviderCodex,
+		AuthMode:          accounts.AuthModeOAuth,
+		Email:             "user@example.com",
+		AuthValid:         true,
+		ProviderHealth:    "unreachable",
+		ProviderModels:    &models,
+		ProviderEndpoints: []string{"/qwen-token", "/qwen-anthropic"},
 		Windows: []accounts.UsageWindow{{
 			Name:        "weekly",
 			UsedPercent: 25,
 		}},
 	}})
 	if len(rows) != 1 || rows[0].email != "user@example.com" ||
-		len(rows[0].windows) != 1 || rows[0].windows[0].UsedPercent != 25 {
+		len(rows[0].windows) != 1 || rows[0].windows[0].UsedPercent != 25 ||
+		rows[0].providerHealth != "unreachable" || rows[0].providerModels != 12 ||
+		len(rows[0].providerEndpoints) != 2 {
 		t.Fatalf("usage rows = %#v", rows)
 	}
 }
@@ -479,6 +485,7 @@ func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T)
 		"ANTHROPIC_BASE_URL=https://remote.example",
 		"ANTHROPIC_AUTH_TOKEN=old-token",
 		"ANTHROPIC_API_KEY=sk-ant-secret",
+		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK=1",
 	}, "http://127.0.0.1:31415/v1", "stack-local-token")
 	joined := strings.Join(env, "\n")
@@ -486,6 +493,7 @@ func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T)
 		"https://remote.example",
 		"old-token",
 		"sk-ant-secret",
+		"X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK",
 	} {
 		if strings.Contains(joined, banned) {
@@ -495,6 +503,7 @@ func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T)
 	for _, want := range []string{
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:31415",
 		"ANTHROPIC_AUTH_TOKEN=stack-local-token",
+		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("cloud Claude env missing %q:\n%s", want, joined)

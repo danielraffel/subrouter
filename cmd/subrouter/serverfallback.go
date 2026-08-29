@@ -204,25 +204,9 @@ func fallbackHTTPClient() *http.Client {
 	}
 }
 
-// claudeManagementSubcommands never launch the agent, so they must not trigger
-// a daemon autostart.
-var claudeManagementSubcommands = map[string]struct{}{
-	"add": {}, "login": {},
-	"list": {}, "ls": {}, "status": {},
-	"switch": {}, "use": {},
-	"remove": {}, "rm": {},
-	"env":  {},
-	"pick": {},
-	"push": {}, "upload": {},
-	"help": {}, "-h": {}, "--help": {},
-}
-
-// claudeLaunchesAgent reports whether `sr claude <args>` will start Claude Code.
-// No arguments means the interactive launcher, which does.
+// claudeLaunchesAgent reports whether `sr claude <args>` requests the explicit
+// profileless proxy launcher. All other forms retain their profile-management
+// and direct managed-profile semantics without starting a Subrouter daemon.
 func claudeLaunchesAgent(args []string) bool {
-	if len(args) == 0 {
-		return true
-	}
-	_, management := claudeManagementSubcommands[args[0]]
-	return !management
+	return len(args) > 0 && args[0] == "proxy"
 }

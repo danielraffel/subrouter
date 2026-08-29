@@ -2,12 +2,54 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
+
+func TestPublishAccountDiskMutationDoesNotMutateWhenPublicationFails(t *testing.T) {
+	called := false
+	want := errors.New("generation unavailable")
+	err := publishAccountDiskMutation(
+		context.Background(),
+		t.TempDir(),
+		func(string) error { return want },
+		func() (bool, error) {
+			called = true
+			return true, nil
+		},
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want publication failure", err)
+	}
+	if called {
+		t.Fatal("credential mutation ran after generation publication failed")
+	}
+}
+
+func TestPublishAccountDiskMutationPublishesBeforeMutation(t *testing.T) {
+	published := false
+	err := publishAccountDiskMutation(
+		context.Background(),
+		t.TempDir(),
+		func(string) error {
+			published = true
+			return nil
+		},
+		func() (bool, error) {
+			if !published {
+				t.Fatal("credential mutation ran before generation publication")
+			}
+			return true, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestOlderUsageRefreshCannotOverwriteNewerAccountReload(t *testing.T) {
 	accountStore := accounts.CodexStore{Dir: t.TempDir()}
