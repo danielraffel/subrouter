@@ -61,7 +61,12 @@ type claudeRunner struct {
 	// temporary store, the credential is uploaded, and no local profile or
 	// trajectory directory survives the command.
 	ephemeral bool
+	// afterAuthVerified is a test seam for cancellation and publication-failure
+	// races after Claude has durably written a credential.
+	afterAuthVerified func()
 }
+
+const claudeProfileReconcileTimeout = 10 * time.Second
 
 func (r srRunner) claude(ctx context.Context, args []string) error {
 	if claudeLaunchesAgent(args) {
@@ -472,6 +477,9 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		}
 		return fmt.Errorf("login was not completed")
 	}
+	if r.afterAuthVerified != nil {
+		r.afterAuthVerified()
+	}
 
 	profileName := name
 	if profileName == "" {
@@ -488,16 +496,34 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 			registerErr := r.store.RegisterProfile(profileName, tempDir)
 			return registerErr == nil, registerErr
 		}); err != nil {
+			if cleanupErr := r.cleanupTemporaryInstance(ctx, tempDir); cleanupErr != nil {
+				return errors.Join(err, fmt.Errorf("clean up authenticated temporary Claude profile: %w", cleanupErr))
+			}
 			return err
 		}
-	} else if err := r.mutateProfileInventory(ctx, func() (bool, error) {
-		// Claude writes the credential outside Subrouter's process during the
-		// interactive login. Publish a completion generation after verifying it
-		// so a worker that observed profile creation before credential landing
-		// receives a second, usable snapshot.
-		return true, nil
-	}); err != nil {
-		return err
+	} else if err := r.publishProfileCompletion(ctx); err != nil {
+		// OAuth has already committed outside Subrouter's process. A cancellation
+		// at this boundary must not leave the profile usable on disk but invisible
+		// to a worker that consumed the earlier, credential-less generation.
+		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+		reconcileErr := r.publishProfileCompletion(reconcileCtx)
+		cancel()
+		if reconcileErr != nil {
+			// A persistent generation-path failure would make the normal published
+			// rollback fail for the same reason as both completion attempts. Under
+			// the account transaction lock, remove the credential first, then publish
+			// its deletion; workers still hold only the credential-less generation.
+			rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+			rollbackErr := proxy.RollbackUnpublishedAccountDiskMutation(rollbackCtx, r.store.Dir, func() error {
+				return r.removeUnpublishedProfile(rollbackCtx, name)
+			})
+			rollbackCancel()
+			return errors.Join(
+				fmt.Errorf("publish completed Claude profile: %w", err),
+				fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
+				wrapClaudeReconcileError("remove unpublished Claude profile", rollbackErr),
+			)
+		}
 	}
 
 	plan := ""
@@ -728,7 +754,43 @@ func (r claudeRunner) removeProfileInventory(ctx context.Context, name string) e
 }
 
 func (r claudeRunner) rollbackProfileInventory(ctx context.Context, name string) error {
-	return r.removeProfileInventory(context.WithoutCancel(ctx), name)
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+	defer cancel()
+	return r.removeProfileInventory(rollbackCtx, name)
+}
+
+func (r claudeRunner) removeUnpublishedProfile(ctx context.Context, name string) error {
+	removed, err := r.store.RemoveProfileContext(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !removed {
+		return fmt.Errorf("profile %q not found", name)
+	}
+	return nil
+}
+
+func wrapClaudeReconcileError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func (r claudeRunner) publishProfileCompletion(ctx context.Context) error {
+	return r.mutateProfileInventory(ctx, func() (bool, error) {
+		// Claude writes the credential outside Subrouter's process during the
+		// interactive login. Publish a completion generation after verifying it
+		// so a worker that observed profile creation before credential landing
+		// receives a second, usable snapshot.
+		return true, nil
+	})
+}
+
+func (r claudeRunner) cleanupTemporaryInstance(ctx context.Context, dir string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+	defer cancel()
+	return r.store.CleanupInstanceContext(cleanupCtx, dir)
 }
 
 func (r claudeRunner) env() error {

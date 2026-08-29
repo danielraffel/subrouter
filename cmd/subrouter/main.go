@@ -612,10 +612,13 @@ func serve(args []string) error {
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
 	schedulerRef.AdvanceAccountGeneration(accountGeneration)
 	if *fetchUsage && credentialBroker == nil {
+		scoreRevision := schedulerRef.ScoreRevision()
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithStore(context.Background(), codexStore, codexAccounts)
 			if successful > 0 {
-				if !schedulerRef.SetForAccountGeneration(selectacct.NewScheduler(fetchedScores), accountGeneration) {
+				if !schedulerRef.SetForAccountGenerationAtScoreRevision(
+					selectacct.NewScheduler(fetchedScores), accountGeneration, scoreRevision,
+				) {
 					slog.Debug("initial usage score fetch discarded after account reload")
 				}
 			} else {

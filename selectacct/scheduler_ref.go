@@ -9,12 +9,14 @@ import (
 )
 
 type SchedulerRef struct {
-	mu                sync.RWMutex
-	scheduler         Scheduler
-	updatedAt         time.Time
-	refreshing        bool
-	accountGeneration uint64
-	refreshGeneration uint64
+	mu                 sync.RWMutex
+	scheduler          Scheduler
+	updatedAt          time.Time
+	refreshing         bool
+	refreshInvalidated bool
+	accountGeneration  uint64
+	refreshGeneration  uint64
+	scoreRevision      uint64
 	// legacyFinishInvalidated preserves the historical tokenless FinishRefresh
 	// API for callers that publish without BeginRefreshIfStale. New concurrent
 	// code uses the generation-aware methods below.
@@ -106,19 +108,29 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.refreshing {
-		r.legacyFinishInvalidated = true
-	}
+	inflightRefresh := r.refreshing
 	r.setLocked(scheduler)
+	if inflightRefresh {
+		r.refreshInvalidated = true
+		return
+	}
 	r.refreshing = false
+	r.refreshInvalidated = false
 }
 
 func (r *SchedulerRef) setLocked(scheduler Scheduler) {
+	r.setLockedForScoreKeys(scheduler, nil, true)
+}
+
+func (r *SchedulerRef) setLockedForScoreKeys(scheduler Scheduler, scoreKeys map[string]struct{}, touchUpdatedAt bool) {
 	base := r.scheduler
 	r.scheduler = scheduler
-	r.retainExhaustedExpiriesLocked()
-	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
-	r.updatedAt = time.Now()
+	r.retainExhaustedExpiriesForScoreKeysLocked(scoreKeys)
+	r.scheduler = stripCarriedForwardExhaustionOverlaysForScoreKeys(r.scheduler, base, r.expiryMarksLocked(), scoreKeys)
+	if touchUpdatedAt {
+		r.updatedAt = time.Now()
+	}
+	r.scoreRevision++
 }
 
 // AdvanceAccountGeneration invalidates refresh work computed from an older
@@ -138,24 +150,100 @@ func (r *SchedulerRef) AdvanceAccountGeneration(generation uint64) {
 	}
 	r.accountGeneration = generation
 	r.refreshing = false
+	r.refreshInvalidated = false
 	r.updatedAt = time.Time{}
+	r.scoreRevision++
 }
 
 // SetForAccountGeneration publishes a scheduler only when it was computed
 // from the current account snapshot. The comparison and write share one lock,
 // so a concurrent account reload cannot slip between them.
 func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation uint64) bool {
+	return r.SetForAccountGenerationAtScoreRevision(scheduler, generation, r.ScoreRevision())
+}
+
+// ScoreRevision identifies the measured score snapshot independently of the
+// account generation. Callers capture it before slow score work and present it
+// when publishing so a newer same-generation measurement cannot be replaced.
+func (r *SchedulerRef) ScoreRevision() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.scoreRevision
+}
+
+func (r *SchedulerRef) SetForAccountGenerationAtScoreRevision(
+	scheduler Scheduler,
+	generation uint64,
+	scoreRevision uint64,
+) bool {
 	if r == nil {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if generation != r.accountGeneration {
+	if generation != r.accountGeneration || scoreRevision != r.scoreRevision {
 		return false
 	}
+	inflightRefresh := r.refreshing
 	r.setLocked(scheduler)
-	r.refreshing = false
+	if inflightRefresh {
+		r.refreshInvalidated = true
+	} else {
+		r.refreshing = false
+		r.refreshInvalidated = false
+	}
 	return true
+}
+
+// MergeScoresForAccountGeneration atomically overlays measured scores onto the
+// current shared scheduler when they were computed from the current account
+// snapshot. Unlike SetForAccountGeneration, a partial provider refresh cannot
+// replace scores published concurrently for other providers, and it does not
+// cancel a full refresh already in progress for the same generation.
+func (r *SchedulerRef) MergeScoresForAccountGeneration(scores []Score, generation uint64) (Scheduler, bool) {
+	return r.MergeScoresForAccountGenerationAtScoreRevision(scores, generation, r.ScoreRevision())
+}
+
+func (r *SchedulerRef) MergeScoresForAccountGenerationAtScoreRevision(
+	scores []Score,
+	generation uint64,
+	scoreRevision uint64,
+) (Scheduler, bool) {
+	if r == nil {
+		return Scheduler{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration || scoreRevision != r.scoreRevision {
+		return Scheduler{}, false
+	}
+	merged := r.scheduler
+	scoreKeys := make(map[string]struct{}, len(scores))
+	for _, score := range scores {
+		merged = merged.WithScore(score)
+		scoreKeys[ScoreKey(score.Provider, score.AccountID)] = struct{}{}
+	}
+	// This is only a partial provider refresh, so it must not make the shared
+	// full-provider snapshot look fresh and suppress its next scheduled refresh.
+	r.setLockedForScoreKeys(merged, scoreKeys, false)
+	if r.refreshing {
+		// A full refresh that seeded before this merge is now stale for at least
+		// these scores. Keep its claim only until its finish is consumed and
+		// rejected; admitting a replacement sooner would give both attempts the
+		// same account-generation identity and let the older one publish first.
+		r.refreshInvalidated = true
+	}
+	debits := make(map[string]int, len(r.routedSinceRefresh))
+	for key, count := range r.routedSinceRefresh {
+		debits[key] = count
+	}
+	now := time.Now()
+	published := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	published = applyExhaustionMarks(published, r.incompatibleUntil, now)
+	return published.WithLiveDebits(debits), true
 }
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
@@ -175,12 +263,21 @@ func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation u
 //     optimistic default. Expiries only extend here, never shorten, so an
 //     authoritative long reset from a rejected response still holds.
 func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
+	r.retainExhaustedExpiriesForScoreKeysLocked(nil)
+}
+
+func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[string]struct{}) {
 	now := time.Now()
 	for key := range r.exhaustedUntil {
 		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 		if !ok {
 			delete(r.exhaustedUntil, key)
 			continue
+		}
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; !included {
+				continue
+			}
 		}
 		score, ok := r.scheduler.scores[scoreKey]
 		if ok && poolKey != "" {
@@ -399,6 +496,10 @@ func copyModelScores(modelScores map[string]Score) map[string]Score {
 }
 
 func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUntil map[string]time.Time) Scheduler {
+	return stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base, exhaustedUntil, nil)
+}
+
+func stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base Scheduler, exhaustedUntil map[string]time.Time, scoreKeys map[string]struct{}) Scheduler {
 	if len(exhaustedUntil) == 0 {
 		return current
 	}
@@ -415,8 +516,18 @@ func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUnt
 		if !ok {
 			continue
 		}
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; !included {
+				continue
+			}
+		}
 		if poolKey != "" && !base.hasModelScore(poolKey) {
 			for candidateKey, candidate := range next.scores {
+				if scoreKeys != nil {
+					if _, included := scoreKeys[candidateKey]; !included {
+						continue
+					}
+				}
 				modelScore, modelOK := candidate.ModelScores[poolKey]
 				if !modelOK || modelScore.Fresh {
 					continue
@@ -489,6 +600,7 @@ func (r *SchedulerRef) BeginRefreshIfStaleForAccountGeneration(ttl time.Duration
 		return false
 	}
 	r.refreshing = true
+	r.refreshInvalidated = false
 	r.refreshGeneration = generation
 	return true
 }
@@ -501,6 +613,11 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 	defer r.mu.Unlock()
 	if r.legacyFinishInvalidated {
 		r.legacyFinishInvalidated = false
+		return
+	}
+	if r.refreshing && r.refreshInvalidated {
+		r.refreshInvalidated = false
+		r.refreshing = false
 		return
 	}
 	if r.refreshing && r.refreshGeneration != r.accountGeneration {
@@ -518,6 +635,11 @@ func (r *SchedulerRef) FinishRefreshForAccountGeneration(scheduler Scheduler, up
 	if generation != r.accountGeneration || !r.refreshing || r.refreshGeneration != generation {
 		return false
 	}
+	if r.refreshInvalidated {
+		r.refreshInvalidated = false
+		r.refreshing = false
+		return false
+	}
 	r.finishRefreshLocked(scheduler, update)
 	return true
 }
@@ -532,9 +654,11 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 		// snapshot. A failed refresh (update=false) keeps them: the snapshot
 		// is still the old one, so its debits still apply.
 		r.routedSinceRefresh = nil
+		r.scoreRevision++
 	}
 	r.updatedAt = time.Now()
 	r.refreshing = false
+	r.refreshInvalidated = false
 }
 
 // NoteRouted records that one request was routed to the account, debiting its

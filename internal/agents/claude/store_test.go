@@ -98,6 +98,31 @@ func TestStoreCreateSetRemoveProfile(t *testing.T) {
 	}
 }
 
+func TestRemoveProfileContextStopsAtRegistryLockDeadline(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := lockProfileRegistry(store.ProfilesPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	removed, err := store.RemoveProfileContext(ctx, "work")
+	if removed {
+		t.Fatal("profile was removed without acquiring the registry lock")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("remove error = %v, want context deadline exceeded", err)
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("timed-out removal changed the profile registry")
+	}
+}
+
 func TestRegisterProfileAllowsEmailName(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
 	_, dir, err := store.CreateTempInstance()
@@ -612,6 +637,53 @@ func TestRemoveProfileRollsBackWhenKeychainDeletionFails(t *testing.T) {
 	}
 	if len(stagingRoots) != 0 {
 		t.Fatalf("profile rollback left staging roots: %v", stagingRoots)
+	}
+}
+
+func TestRemoveProfileContextUsesFreshDeadlineForRollback(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	fakeBin := t.TempDir()
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(
+		securityPath,
+		[]byte("#!/bin/sh\ncase \"$1\" in\ndelete-generic-password) sleep 1 ;;\nesac\nexit 0\n"),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	removed, removeErr := store.RemoveProfileContext(ctx, "work")
+	if removeErr == nil {
+		t.Fatal("profile removal ignored the expired keychain cleanup context")
+	}
+	if removed {
+		t.Fatal("rolled-back profile removal was reported as committed")
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("fresh rollback context did not restore the profile registry")
+	}
+	credential, err := store.ReadCredential(t.Context(), instancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "access" || credential.RefreshToken != "refresh" {
+		t.Fatalf("fresh rollback context did not restore the credential: %+v", credential)
 	}
 }
 

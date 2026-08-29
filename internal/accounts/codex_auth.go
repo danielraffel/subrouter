@@ -96,6 +96,13 @@ func (s CodexStore) DetectActiveAccount() (string, error) {
 }
 
 func (s CodexStore) SyncActiveToStore() error {
+	return s.SyncActiveToStoreBeforeSave(nil)
+}
+
+// SyncActiveToStoreBeforeSave performs its final freshness check while holding
+// the stored-account lock, then calls beforeSave immediately before the first
+// durable credential mutation. A nil hook preserves the legacy call shape.
+func (s CodexStore) SyncActiveToStoreBeforeSave(beforeSave func() error) error {
 	auth, ok, err := ReadActiveCodexAuth()
 	if err != nil || !ok {
 		return err
@@ -122,6 +129,11 @@ func (s CodexStore) SyncActiveToStore() error {
 	}
 	previous := account
 	account.Auth = auth
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return err
+		}
+	}
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_synced", "active_auth", false, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		return err
@@ -222,14 +234,33 @@ func (s CodexStore) AddProviderAPIKey(provider Provider, label, key string) (Sto
 }
 
 func (s CodexStore) RefreshStoredIfExpired(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, false)
+	return s.refreshStored(ctx, client, account, false, nil)
+}
+
+// RefreshStoredIfExpiredBeforeRefresh calls beforeRefresh after the final
+// locked freshness checks and immediately before contacting the token endpoint.
+// This lets callers publish a cross-process generation before an OAuth refresh
+// can rotate the credential chain or persist a terminal failure.
+func (s CodexStore) RefreshStoredIfExpiredBeforeRefresh(
+	ctx context.Context,
+	client *http.Client,
+	account StoredCodexAccount,
+	beforeRefresh func() error,
+) (StoredCodexAccount, bool, error) {
+	return s.refreshStored(ctx, client, account, false, beforeRefresh)
 }
 
 func (s CodexStore) RefreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, true)
+	return s.refreshStored(ctx, client, account, true, nil)
 }
 
-func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount, force bool) (StoredCodexAccount, bool, error) {
+func (s CodexStore) refreshStored(
+	ctx context.Context,
+	client *http.Client,
+	account StoredCodexAccount,
+	force bool,
+	beforeRefresh func() error,
+) (StoredCodexAccount, bool, error) {
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens")
 		return account, false, nil
@@ -272,6 +303,12 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	}
 
 	previous := account
+	if beforeRefresh != nil {
+		if err := beforeRefresh(); err != nil {
+			logCodexRefreshFailed(ctx, s, account, force, err)
+			return account, false, err
+		}
+	}
 	logCodexRefreshStart(ctx, s, previous, force)
 	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -97,6 +98,97 @@ func TestSRAutoSwitchIgnoresClaudeAccountWithSameID(t *testing.T) {
 	}
 	if picked != "healthy@example.com" || switchedTo != "healthy@example.com" {
 		t.Fatalf("picked=%q switchedTo=%q, want healthy@example.com", picked, switchedTo)
+	}
+}
+
+func TestSRAutoSwitchPreservesOtherProviderScores(t *testing.T) {
+	nonCodexScores := []selectacct.Score{
+		{AccountID: "claude", Provider: accounts.ProviderClaude, Headroom: 0.21, ShortHeadroom: 0.22},
+		{AccountID: "kimi", Provider: accounts.ProviderKimi, Headroom: 0.31, ShortHeadroom: 0.32},
+		{AccountID: "grok", Provider: accounts.ProviderGrok, Headroom: 0.41, ShortHeadroom: 0.42},
+		{AccountID: "antigravity", Provider: accounts.ProviderAntigravity, Headroom: 0.51, ShortHeadroom: 0.52},
+	}
+	initialScores := append([]selectacct.Score{
+		{AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.95, ShortHeadroom: 0.95},
+		{AccountID: "codex-b", Provider: accounts.ProviderCodex, Headroom: 0.05, ShortHeadroom: 0.05},
+	}, nonCodexScores...)
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(initialScores))
+
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+		Accounts: []accounts.Account{
+			{ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+			{ID: "codex-b", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+			{ID: "claude", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+			{ID: "kimi", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+			{ID: "grok", Provider: accounts.ProviderGrok, AuthMode: accounts.AuthModeOAuth},
+			{ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+		},
+		SchedulerRef: schedulerRef,
+		SwitchActive: func(context.Context, string) error { return nil },
+		FetchScores: func(_ context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+			if len(candidates) != 2 {
+				t.Fatalf("candidates = %#v, want only two Codex accounts", candidates)
+			}
+			for _, candidate := range candidates {
+				if candidate.Provider != accounts.ProviderCodex {
+					t.Fatalf("auto-switch scored non-Codex account: %#v", candidate)
+				}
+			}
+			return []selectacct.Score{
+				{AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.10, ShortHeadroom: 0.10},
+				{AccountID: "codex-b", Provider: accounts.ProviderCodex, Headroom: 0.90, ShortHeadroom: 0.90},
+			}, 2
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked != "codex-b" {
+		t.Fatalf("picked = %q, want codex-b", picked)
+	}
+
+	published := schedulerRef.Get()
+	for _, want := range nonCodexScores {
+		got := published.ScoreFor(want.Provider, want.AccountID)
+		if got.Headroom != want.Headroom || got.ShortHeadroom != want.ShortHeadroom {
+			t.Errorf("published %s score = %+v, want preserved %+v", want.Provider, got, want)
+		}
+	}
+	if got := published.ScoreFor(accounts.ProviderCodex, "codex-a"); got.Headroom != 0.10 {
+		t.Errorf("published Codex score = %+v, want refreshed headroom 0.10", got)
+	}
+}
+
+func TestSRAutoSwitchRejectsScoresOlderThanConcurrentFullRefresh(t *testing.T) {
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.5, ShortHeadroom: 0.5,
+	}}))
+	_, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+		Accounts: []accounts.Account{{
+			ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
+		}},
+		SchedulerRef: schedulerRef,
+		SwitchActive: func(context.Context, string) error {
+			t.Fatal("stale auto-switch scores reached account activation")
+			return nil
+		},
+		FetchScores: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
+			revision := schedulerRef.ScoreRevision()
+			if !schedulerRef.SetForAccountGenerationAtScoreRevision(selectacct.NewScheduler([]selectacct.Score{{
+				AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+			}}), 0, revision) {
+				t.Fatal("concurrent full refresh was rejected")
+			}
+			return []selectacct.Score{{
+				AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.2, ShortHeadroom: 0.2,
+			}}, 1
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "account pool changed") {
+		t.Fatalf("auto-switch error = %v, want stale publication rejection", err)
+	}
+	if got := schedulerRef.Get().ScoreFor(accounts.ProviderCodex, "codex-a").Headroom; got != 0.8 {
+		t.Fatalf("Codex headroom = %v, want concurrent full refresh value 0.8", got)
 	}
 }
 
