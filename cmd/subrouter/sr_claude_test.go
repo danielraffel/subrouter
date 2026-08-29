@@ -8,15 +8,147 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
+
+func TestClaudeAddPublishesProfileToRunningAccountRef(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	accountStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	ref, err := proxy.OpenAccountRef(accountStore, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration := ref.Generation()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"claude-refresh","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"add", "work"}); err != nil {
+		t.Fatal(err)
+	}
+	triggerClaudeAccountReload(t, ref)
+	if ref.Generation() <= beforeGeneration {
+		t.Fatalf("account generation = %d, want greater than %d", ref.Generation(), beforeGeneration)
+	}
+	if !containsClaudeAccount(ref.All(), "work") {
+		t.Fatalf("running account snapshot did not load added Claude profile: %+v", ref.All())
+	}
+}
+
+func TestClaudeRemovePublishesProfileToRunningAccountRef(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.UpsertCredentialProfile("work", claude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	accountStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	ref, err := proxy.OpenAccountRef(accountStore, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsClaudeAccount(ref.All(), "work") {
+		t.Fatalf("initial account snapshot omitted Claude profile: %+v", ref.All())
+	}
+	beforeGeneration := ref.Generation()
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"remove", "work"}); err != nil {
+		t.Fatal(err)
+	}
+	triggerClaudeAccountReload(t, ref)
+	if ref.Generation() <= beforeGeneration {
+		t.Fatalf("account generation = %d, want greater than %d", ref.Generation(), beforeGeneration)
+	}
+	if containsClaudeAccount(ref.All(), "work") {
+		t.Fatalf("running account snapshot retained removed Claude profile: %+v", ref.All())
+	}
+}
+
+func TestClaudeFailedAddPublishesRollbackToRunningAccountRef(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	accountStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	ref, err := proxy.OpenAccountRef(accountStore, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration := ref.Generation()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.run(t.Context(), []string{"add", "incomplete"}); err == nil {
+		t.Fatal("failed Claude login unexpectedly succeeded")
+	}
+	if _, ok := store.FindProfile("incomplete"); ok {
+		t.Fatal("failed Claude login retained its temporary profile")
+	}
+	triggerClaudeAccountReload(t, ref)
+	if ref.Generation() <= beforeGeneration {
+		t.Fatalf("account generation = %d, want rollback greater than %d", ref.Generation(), beforeGeneration)
+	}
+	if containsClaudeAccount(ref.All(), "incomplete") {
+		t.Fatalf("running account snapshot retained rolled-back Claude profile: %+v", ref.All())
+	}
+}
+
+func triggerClaudeAccountReload(t *testing.T, ref *proxy.AccountRef) {
+	t.Helper()
+	handler := proxy.Server{AccountRef: ref, MaxBodyBytes: 1 << 20}.Handler()
+	request := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
+	request.RemoteAddr = "127.0.0.1:12345"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("account reload request status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func containsClaudeAccount(all []accounts.Account, id string) bool {
+	for _, account := range all {
+		if account.Provider == accounts.ProviderClaude && account.ID == id {
+			return true
+		}
+	}
+	return false
+}
 
 func TestClaudeEnvPrintsActiveProfile(t *testing.T) {
 	store := claude.Store{Dir: t.TempDir()}
