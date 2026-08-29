@@ -319,6 +319,13 @@ func matchSharedQwenAccount(all []broker.SharedAccount, selector string) (string
 }
 
 func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accounts.StoredCodexAccount, consoleAccount string, syncCredential func(context.Context, string) error) error {
+	consoleAccount = strings.TrimSpace(consoleAccount)
+	if consoleAccount == "" {
+		// The recovery command printed for an expired console session intentionally
+		// needs only the account selector. Keep the operator-supplied identity from
+		// the previous authorization instead of replacing it with an empty label.
+		consoleAccount = agentqwen.ConsoleAccountIn(root, stored.Email)
+	}
 	stageRoot, err := os.MkdirTemp("", "subrouter-qwen-login-")
 	if err != nil {
 		return fmt.Errorf("prepare temporary Qwen login profile: %w", err)

@@ -1106,6 +1106,34 @@ func TestSRQwenLoginPreparesBrowserAuthAndStoresIdentity(t *testing.T) {
 	}
 }
 
+func TestSRQwenReauthPreservesSavedConsoleIdentity(t *testing.T) {
+	root := t.TempDir()
+	accountID := "qwen-token:work"
+	if err := agentqwen.SaveConsoleCredentialIn(root, accountID, agentqwen.ConsoleCredential{
+		AccessToken: "expired-console-token",
+		Account:     "person@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	command := &qwenLoginCommandRunner{}
+	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: command}
+	stored := accounts.StoredCodexAccount{
+		Email: accountID, Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	// This is the exact no-flag command suggested by an expired-login status.
+	if err := runner.qwenLoginStored(t.Context(), root, stored, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := agentqwen.ExportConsoleCredentialIn(root, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.AccessToken != "console-secret" || credential.Account != "person@example.com" {
+		t.Fatalf("reauthorized credential = %+v", credential)
+	}
+}
+
 func TestSRQwenLoginPreservesCompletedAuthorizationWhenDurableSaveFails(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "blocked-root")
 	if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
