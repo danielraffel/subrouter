@@ -1678,6 +1678,79 @@ func TestSRSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	}
 }
 
+func TestSRSwitchPublishesActiveAuthChangeToRunningServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("isolated@example.test", "acct_isolated")
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:   "isolated@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ref, err := proxy.OpenAccountRef(store, agentclaude.Store{Dir: filepath.Join(home, "claude-store")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration := ref.Generation()
+	handler := (proxy.Server{AccountRef: ref}).Handler()
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.switchAccount(context.Background(), "isolated@example.test", srSwitchOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://subrouter.local/_subrouter/accounts", nil)
+	request.RemoteAddr = "127.0.0.1:12345"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("account reload status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	if got := ref.Generation(); got <= beforeGeneration {
+		t.Fatalf("running server generation = %d, want > %d after switch", got, beforeGeneration)
+	}
+
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok {
+		t.Fatalf("active auth found = %v, err = %v", ok, err)
+	}
+	if active.Tokens == nil || active.Tokens.RefreshToken != auth.Tokens.RefreshToken {
+		t.Fatal("active auth does not contain switched credential")
+	}
+
+}
+
+func TestSRSwitchDoesNotWriteActiveAuthWhenPublicationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	account := accounts.StoredCodexAccount{
+		Email:   "isolated@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("isolated@example.test", "acct_isolated"),
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.switchAccount(context.Background(), account.Email, srSwitchOptions{}); err == nil {
+		t.Fatal("switch unexpectedly succeeded when generation publication failed")
+	}
+	if _, err := os.Stat(accounts.DefaultCodexAuthPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active auth was written despite publication failure: %v", err)
+	}
+}
+
 func TestSRSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	home := t.TempDir()
 	xdgData := t.TempDir()

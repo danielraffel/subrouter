@@ -1572,7 +1572,11 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err := r.ensureSwitchableForFreshUsage(ctx, account); err != nil {
 		return err
 	}
-	if err := accounts.WriteActiveCodexAuth(account.Auth); err != nil {
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		writeErr := accounts.WriteActiveCodexAuth(account.Auth)
+		return writeErr == nil, writeErr
+	})
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(r.out, "Switched to %s\n", account.Email)
