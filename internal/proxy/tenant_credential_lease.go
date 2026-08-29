@@ -450,20 +450,17 @@ func tenantCredentialLeaseTrustedBlockedUntil(
 	model string,
 	now time.Time,
 ) (time.Time, bool) {
+	if server.SchedulerRef == nil {
+		return time.Time{}, false
+	}
 	if account.AuthMode == accounts.AuthModeAPIKey {
-		if server.SchedulerRef == nil {
-			return time.Time{}, false
-		}
 		return server.SchedulerRef.ExplicitBlockedUntilFor(
 			account.Provider, account.ID, model, now,
 		)
 	}
-	if !server.scheduler().ForModel(model).Exhausted(account.Provider, account.ID) {
-		return time.Time{}, false
-	}
-	return tenantCredentialLeaseSchedulerRetryAt(
-		server, account.Provider, account.ID, model, now,
-	), true
+	return server.SchedulerRef.BlockedUntilFor(
+		account.Provider, account.ID, model, now,
+	)
 }
 
 func tenantCredentialLeaseAgentType(
@@ -474,25 +471,6 @@ func tenantCredentialLeaseAgentType(
 		return agentType
 	}
 	return string(provider)
-}
-
-func tenantCredentialLeaseSchedulerRetryAt(
-	server *Server,
-	provider accounts.Provider,
-	accountID string,
-	poolModel string,
-	now time.Time,
-) time.Time {
-	retryAt := now.Add(tenantCredentialLeaseReportDefaultCooldown)
-	if server.SchedulerRef == nil {
-		return retryAt
-	}
-	if until, blocked := server.SchedulerRef.BlockedUntilFor(
-		provider, accountID, poolModel, now,
-	); blocked && until.After(retryAt) {
-		retryAt = until
-	}
-	return retryAt
 }
 
 func tenantCredentialLeasePoolModel(provider accounts.Provider, model string) string {

@@ -432,6 +432,44 @@ func TestTenantCredentialLeaseFiltersBeforePreferredAndSticky(t *testing.T) {
 	}
 }
 
+func TestTenantCredentialLeaseRetriesMeasuredZeroAfterExplicitCooldownExpires(t *testing.T) {
+	now := time.Now()
+	account := tenantLeaseTestAccount("recovered-account", accounts.ProviderCodex)
+	server := tenantLeaseTestServer(account)
+	server.SchedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: account.Provider,
+		Headroom: 0, ShortHeadroom: 0, Fresh: false,
+	}}))
+	server.SchedulerRef.MarkExhaustedUntil(
+		account.Provider, account.ID, "gpt-5", now.Add(-time.Second),
+	)
+
+	picked, err := pickTenantCredentialLeaseAccount(
+		newTenantCredentialLeaseStore(), server, []accounts.Account{account}, nil,
+		tenantCredentialLeaseRequest{
+			Provider: string(account.Provider), AgentType: "codex",
+			SessionID: "session-a", PreferAccountID: account.ID, Model: "gpt-5",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != account.ID {
+		t.Fatalf("picked = %s, want recovered %s", picked.ID, account.ID)
+	}
+	published := false
+	if _, ok := server.SchedulerRef.RunIfAccountNotBlocked(
+		account.Provider, account.ID, "gpt-5", now, func() { published = true },
+	); !ok || !published {
+		t.Fatal("expired cooldown did not allow the recovery probe to publish")
+	}
+	if _, ok := server.SchedulerRef.RunIfAccountNotBlocked(
+		account.Provider, account.ID, "gpt-5", now, func() { t.Fatal("second probe published") },
+	); ok {
+		t.Fatal("expired cooldown allowed more than one recovery probe")
+	}
+}
+
 func TestTenantCredentialLeaseAllAvoidedReturnsRetryAfter(t *testing.T) {
 	now := time.Now()
 	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderCodex)
