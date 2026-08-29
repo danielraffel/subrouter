@@ -715,13 +715,13 @@ func (r srRunner) addKey(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := r.publishActiveSync(ctx); err != nil {
-		return err
-	}
 	reader := bufio.NewReader(r.in)
 	label, err := promptLine(r.out, reader, "Label (e.g. work, personal): ")
 	if err != nil {
 		return err
+	}
+	if label == "" {
+		return errors.New("label is required")
 	}
 	keyPrompt := "API key"
 	if provider == accounts.ProviderCodex {
@@ -735,6 +735,12 @@ func (r srRunner) addKey(ctx context.Context, args []string) error {
 	)
 	if err != nil {
 		return err
+	}
+	if key == "" {
+		return errors.New("API key is required")
+	}
+	if provider == accounts.ProviderCodex && !strings.HasPrefix(key, "sk-") {
+		return errors.New("invalid API key format, expected sk-...")
 	}
 	var account accounts.StoredCodexAccount
 	var existed bool

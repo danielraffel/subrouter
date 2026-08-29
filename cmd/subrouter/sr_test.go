@@ -877,6 +877,108 @@ func TestSRAddKeyStoresRegistryProviderInLocalStorage(t *testing.T) {
 	}
 }
 
+func TestSRAddKeyForAnotherProviderDoesNotImportActiveCodexAuth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	storedAuth := testCodexAuth("isolated@example.com", "stored")
+	storedAuth.LastRefresh = "2026-08-28T00:00:00Z"
+	stored := accounts.StoredCodexAccount{
+		Email:   "isolated@example.com",
+		AddedAt: "2026-08-28T00:00:00Z",
+		Auth:    storedAuth,
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(stored.SourcePath(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeAuth := testCodexAuth("isolated@example.com", "active")
+	activeAuth.LastRefresh = "2026-08-29T00:00:00Z"
+	if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, in: strings.NewReader("work\nsk-or-v1-test\n"),
+		out: &out, errOut: &out,
+	}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(stored.SourcePath(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("unrelated provider add rewrote the isolated Codex credential")
+	}
+	persisted, ok, err := store.FindStored(stored.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored Codex account found=%t err=%v", ok, err)
+	}
+	if persisted.Auth.Tokens.RefreshToken != storedAuth.Tokens.RefreshToken {
+		t.Fatal("unrelated provider add replaced the isolated Codex token generation")
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("provider add did not publish its account generation: %v", err)
+	}
+}
+
+func TestSRAddKeyRejectedInputDoesNotMutateCodexOrPublishGeneration(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input string
+		args  []string
+	}{
+		{name: "empty label", input: "\n", args: []string{"add-key", "--provider", "openrouter"}},
+		{name: "empty key", input: "work\n\n", args: []string{"add-key", "--provider", "openrouter"}},
+		{name: "invalid Codex key", input: "work\nnot-an-api-key\n", args: []string{"add-key"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("HOME", filepath.Join(root, "home"))
+			store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+			stored := accounts.StoredCodexAccount{
+				Email:   "isolated@example.com",
+				AddedAt: "2026-08-28T00:00:00Z",
+				Auth:    testCodexAuth("isolated@example.com", "stored"),
+			}
+			if err := store.SaveStored(stored); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(stored.SourcePath(store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			activeAuth := testCodexAuth("isolated@example.com", "active")
+			activeAuth.LastRefresh = "2026-08-29T00:00:00Z"
+			if err := accounts.WriteActiveCodexAuth(activeAuth); err != nil {
+				t.Fatal(err)
+			}
+
+			var out bytes.Buffer
+			runner := srRunner{store: store, in: strings.NewReader(test.input), out: &out, errOut: &out}
+			if err := runner.run(t.Context(), test.args); err == nil {
+				t.Fatal("rejected add-key input unexpectedly succeeded")
+			}
+			after, err := os.ReadFile(stored.SourcePath(store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("rejected add-key input rewrote the isolated Codex credential")
+			}
+			if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+				t.Fatalf("rejected add-key input published an account generation: %v", err)
+			}
+		})
+	}
+}
+
 func TestSRAddKeyStoresSharedSubscriptionUnderCredentialOwner(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
