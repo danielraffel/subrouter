@@ -45,6 +45,8 @@ type fakeGrokStore struct {
 	saved      bool
 	removed    bool
 	refreshDid bool
+	refreshes  int
+	preflights int
 	credential agentgrok.CredentialInfo
 	account    baseaccount.Account
 }
@@ -82,6 +84,12 @@ func (s *fakeGrokStore) RefreshAccount(_ context.Context, _ *http.Client, accoun
 }
 
 func (s *fakeGrokStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, account baseaccount.Account) (baseaccount.Account, bool, error) {
+	s.refreshes++
+	return account, s.refreshDid, nil
+}
+
+func (s *fakeGrokStore) AccountRefreshState(account baseaccount.Account, _ time.Time) (baseaccount.Account, bool, error) {
+	s.preflights++
 	return account, s.refreshDid, nil
 }
 
@@ -198,7 +206,11 @@ func TestGrokRemoveRejectsEmailSharedWithStoredAccount(t *testing.T) {
 }
 
 type refreshingKimiUsageStore struct {
-	fetchedToken string
+	fetchedToken   string
+	needsRefresh   bool
+	refreshes      int
+	preflights     int
+	preflightToken string
 }
 
 type partialKimiUsageStore struct{}
@@ -219,9 +231,18 @@ func (*refreshingKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Ac
 	}}, nil
 }
 
-func (*refreshingKimiUsageStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, acct baseaccount.Account) (baseaccount.Account, bool, error) {
+func (s *refreshingKimiUsageStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, acct baseaccount.Account) (baseaccount.Account, bool, error) {
+	s.refreshes++
 	acct.Token = "fresh"
 	return acct, true, nil
+}
+
+func (s *refreshingKimiUsageStore) AccountRefreshState(acct baseaccount.Account, _ time.Time) (baseaccount.Account, bool, error) {
+	s.preflights++
+	if s.preflightToken != "" {
+		acct.Token = s.preflightToken
+	}
+	return acct, s.needsRefresh, nil
 }
 
 func (s *refreshingKimiUsageStore) FetchUsage(_ context.Context, _ *http.Client, acct baseaccount.Account) (string, []accounts.UsageWindow, error) {
@@ -275,7 +296,7 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
-	store := &refreshingKimiUsageStore{}
+	store := &refreshingKimiUsageStore{needsRefresh: true}
 	runner := srRunner{
 		store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")},
 		kimi:  store,
@@ -287,6 +308,9 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	if store.fetchedToken != "fresh" {
 		t.Fatal("local Kimi status fetched usage with the stale access token")
 	}
+	if store.preflights != 1 || store.refreshes != 1 {
+		t.Fatalf("Kimi refresh preflights=%d refreshes=%d, want 1/1", store.preflights, store.refreshes)
+	}
 	found := false
 	for _, row := range rows {
 		if row.email == "kimi-subscription:work" && row.err == nil {
@@ -295,6 +319,34 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("refreshed Kimi status row is missing")
+	}
+}
+
+func TestLocalProviderStatusDoesNotPublishFreshOAuthCredentials(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+
+	kimi := &refreshingKimiUsageStore{preflightToken: "current-kimi"}
+	grok := &fakeGrokStore{account: baseaccount.Account{
+		ID: "grok-subscription", Provider: baseaccount.ProviderGrok,
+		AuthMode: baseaccount.AuthModeOAuth, Token: "fresh-grok",
+	}}
+	if _, err := (srRunner{store: store, kimi: kimi, grok: grok}).fetchUsageRows(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if kimi.preflights != 1 || kimi.refreshes != 0 {
+		t.Fatalf("Kimi preflights=%d refreshes=%d, want 1/0", kimi.preflights, kimi.refreshes)
+	}
+	if kimi.fetchedToken != "current-kimi" {
+		t.Fatalf("Kimi status used %q, want the credential returned by preflight", kimi.fetchedToken)
+	}
+	if grok.preflights != 1 || grok.refreshes != 0 {
+		t.Fatalf("Grok preflights=%d refreshes=%d, want 1/0", grok.preflights, grok.refreshes)
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+		t.Fatalf("fresh provider status published an account generation: %v", err)
 	}
 }
 

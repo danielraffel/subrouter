@@ -3,10 +3,13 @@ package proxy
 import (
 	"context"
 	"errors"
+	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
@@ -48,6 +51,59 @@ func TestPublishAccountDiskMutationPublishesBeforeMutation(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAccountRefKeepsServingCompleteSnapshotDuringPublishedMutation(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	seed := accounts.StoredCodexAccount{
+		Email: "apikey:seed", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-seed"},
+	}
+	if err := store.SaveStored(seed); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := OpenAccountRef(store, agentclaude.Store{Dir: t.TempDir()}, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := advanceAccountDiskGeneration(store.StoreDir()); err != nil {
+		_ = held.Close()
+		t.Fatal(err)
+	}
+	added := accounts.StoredCodexAccount{
+		Email: "apikey:added", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-added"},
+	}
+	if err := store.SaveStored(added); err != nil {
+		_ = held.Close()
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	reloaded, _, err := ref.reloadIfDiskGenerationChanged(ctx)
+	if err != nil || reloaded {
+		_ = held.Close()
+		t.Fatalf("in-flight mutation reload = %v, %v, want false/nil", reloaded, err)
+	}
+	if len(ref.All()) != 1 {
+		_ = held.Close()
+		t.Fatalf("in-flight mutation exposed partial snapshot: %+v", ref.All())
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, _, err = ref.reloadIfDiskGenerationChanged(context.Background())
+	if err != nil || !reloaded {
+		t.Fatalf("completed mutation reload = %v, %v, want true/nil", reloaded, err)
+	}
+	if len(ref.All()) != 2 {
+		t.Fatalf("completed mutation snapshot = %+v", ref.All())
 	}
 }
 

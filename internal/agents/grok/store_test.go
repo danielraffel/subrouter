@@ -527,3 +527,31 @@ func TestSignInWritesTheCredentialFile(t *testing.T) {
 		t.Fatalf("credential file mode = %o, want 0600", perm)
 	}
 }
+
+func TestAccountRefreshStatePreflightsCredentialWithoutMutation(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		expiresAt time.Time
+		want      bool
+	}{
+		{name: "fresh", expiresAt: time.Now().Add(time.Hour), want: false},
+		{name: "expiring", expiresAt: time.Now().Add(time.Minute), want: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := Store{Path: filepath.Join(t.TempDir(), "oauth.json")}
+			account, err := store.SaveCredential(CredentialInfo{
+				AccessToken: "access", RefreshToken: "refresh", ExpiresAt: testCase.expiresAt,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, got, err := store.AccountRefreshState(account, time.Now())
+			if err != nil || got != testCase.want {
+				t.Fatalf("AccountRefreshState() = %v, %v, want %v, nil", got, err, testCase.want)
+			}
+			if current.Token != "access" {
+				t.Fatalf("current token = %q", current.Token)
+			}
+		})
+	}
+}

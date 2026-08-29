@@ -110,6 +110,20 @@ func (s Store) RefreshAccount(ctx context.Context, client *http.Client, acct acc
 	return refreshed, err
 }
 
+// AccountRefreshState re-reads acct and reports whether refreshing it could
+// mutate the credential file. Returning the re-read account keeps status from
+// using a token another process already rotated.
+func (s Store) AccountRefreshState(acct account.Account, now time.Time) (account.Account, bool, error) {
+	credential, ok, err := s.ReadLocalCredential(now)
+	if err != nil {
+		return acct, false, err
+	}
+	if !ok {
+		return acct, false, fmt.Errorf("Grok subscription credential was not found")
+	}
+	return credentialAccount(credential), credential.NeedsRefresh(now), nil
+}
+
 // RefreshAccountIfNeeded is RefreshAccount plus whether the credential file
 // changed, allowing CLI callers to publish the account generation only after a
 // refresh actually committed new tokens.

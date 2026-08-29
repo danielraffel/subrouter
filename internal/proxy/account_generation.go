@@ -142,7 +142,15 @@ func (r *AccountRef) reloadIfDiskGenerationChanged(ctx context.Context) (reloade
 		return false, generation, err
 	}
 	defer r.installMu.Unlock()
-	lock, err := lockAccountImportTransaction(ctx, r.store.StoreDir())
+	lock, err := tryLockAccountImportTransaction(ctx, r.store.StoreDir())
+	if errors.Is(err, errAccountImportTransactionBusy) {
+		// The generation is published before a credential mutation so a crash
+		// can never strand committed state. While that transaction is still in
+		// flight, keep serving the last complete snapshot and retry on the next
+		// account lookup instead of stalling every request behind an OAuth token
+		// exchange or another slow credential operation.
+		return false, generation, nil
+	}
 	if err != nil {
 		return false, generation, err
 	}
