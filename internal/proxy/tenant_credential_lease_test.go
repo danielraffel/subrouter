@@ -470,6 +470,68 @@ func TestTenantCredentialLeaseRetriesMeasuredZeroAfterExplicitCooldownExpires(t 
 	}
 }
 
+func TestTenantCredentialLeaseAccountCooldownRecoversModelZeroSnapshot(t *testing.T) {
+	now := time.Now()
+	account := tenantLeaseTestAccount("recovered-model-account", accounts.ProviderClaude)
+	model := tenantCredentialLeasePoolModel(account.Provider, "claude-opus-4")
+	server := tenantLeaseTestServer(account)
+	server.SchedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: account.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+		ModelScores: map[string]selectacct.Score{
+			model: {AccountID: account.ID, Provider: account.Provider},
+		},
+	}}))
+	server.SchedulerRef.MarkExhaustedUntil(
+		account.Provider, account.ID, "", now.Add(-time.Second),
+	)
+	_ = server.SchedulerRef.Get() // exercise normal read-time expiry pruning
+
+	if until, blocked := tenantCredentialLeaseTrustedBlockedUntil(server, account, model, now); blocked {
+		t.Fatalf("recovered model remained blocked until %v", until)
+	}
+	published := false
+	if _, ok := server.SchedulerRef.RunIfAccountNotBlocked(
+		account.Provider, account.ID, model, now, func() { published = true },
+	); !ok || !published {
+		t.Fatal("account-wide expiry did not allow a model recovery probe")
+	}
+	if _, ok := server.SchedulerRef.RunIfAccountNotBlocked(
+		account.Provider, account.ID, model, now, func() { t.Fatal("second probe published") },
+	); ok {
+		t.Fatal("account-wide expiry allowed more than one model recovery probe")
+	}
+}
+
+func TestTenantCredentialLeaseFreshZeroRevokesExpiredRecoveryProbe(t *testing.T) {
+	now := time.Now()
+	account := tenantLeaseTestAccount("still-exhausted", accounts.ProviderCodex)
+	server := tenantLeaseTestServer(account)
+	zero := selectacct.Score{
+		AccountID: account.ID, Provider: account.Provider,
+		Headroom: 0, ShortHeadroom: 0,
+	}
+	server.SchedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{zero}))
+	server.SchedulerRef.MarkExhaustedUntil(
+		account.Provider, account.ID, "", now.Add(-time.Second),
+	)
+	_ = server.SchedulerRef.Get()
+	zero.Fresh = true
+	zero.ShortResetAfterSeconds = int64(time.Hour / time.Second)
+	server.SchedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{zero}))
+
+	if until, blocked := server.SchedulerRef.BlockedUntilFor(
+		account.Provider, account.ID, "gpt-5", now,
+	); !blocked || until.Before(now.Add(50*time.Minute)) {
+		t.Fatalf("fresh zero blocked=%v until=%v, want refreshed cooldown", blocked, until)
+	}
+	if _, ok := server.SchedulerRef.RunIfAccountNotBlocked(
+		account.Provider, account.ID, "gpt-5", now, func() { t.Fatal("fresh zero published") },
+	); ok {
+		t.Fatal("fresh zero retained an expired recovery probe")
+	}
+}
+
 func TestTenantCredentialLeaseAllAvoidedReturnsRetryAfter(t *testing.T) {
 	now := time.Now()
 	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderCodex)

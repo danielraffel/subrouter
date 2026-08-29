@@ -333,11 +333,14 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		if until.After(now) {
 			continue
 		}
-		if r.baseExhaustedForKeyLocked(key) {
+		probeKeys := r.recoveryProbeKeysForExpiredMarkLocked(key)
+		if len(probeKeys) > 0 {
 			if r.recoveryProbeReady == nil {
 				r.recoveryProbeReady = make(map[string]struct{})
 			}
-			r.recoveryProbeReady[key] = struct{}{}
+			for _, probeKey := range probeKeys {
+				r.recoveryProbeReady[probeKey] = struct{}{}
+			}
 		}
 		delete(r.exhaustedUntil, key)
 	}
@@ -359,23 +362,56 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 	}
 }
 
-func (r *SchedulerRef) baseExhaustedForKeyLocked(key string) bool {
+func (r *SchedulerRef) scoreForExhaustionKeyLocked(key string) (Score, bool) {
 	scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 	if !ok {
-		return false
+		return Score{}, false
 	}
 	score, ok := r.scheduler.scores[scoreKey]
 	if !ok {
-		return false
+		return Score{}, false
 	}
-	if poolKey != "" && r.scheduler.hasModelScore(poolKey) {
+	if poolKey != "" {
 		modelScore, exists := score.ModelScores[poolKey]
-		if !exists {
-			return true
+		if exists {
+			return modelScore, true
 		}
-		score = modelScore
+		if r.scheduler.hasModelScore(poolKey) {
+			return Score{}, false
+		}
 	}
-	return score.exhausted()
+	return score, true
+}
+
+func (r *SchedulerRef) recoveryProbeKeysForExpiredMarkLocked(key string) []string {
+	scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
+	if !ok {
+		return nil
+	}
+	score, ok := r.scheduler.scores[scoreKey]
+	if !ok {
+		return nil
+	}
+	if poolKey != "" {
+		modelScore, exists := score.ModelScores[poolKey]
+		if exists && modelScore.exhausted() {
+			return []string{key}
+		}
+		if !r.scheduler.hasModelScore(poolKey) && score.exhausted() {
+			return []string{key}
+		}
+		return nil
+	}
+	if score.exhausted() {
+		return []string{key}
+	}
+	keys := make([]string, 0, len(score.ModelScores))
+	for model, modelScore := range score.ModelScores {
+		if modelScore.exhausted() {
+			keys = append(keys, poolScopedExhaustionKey(provider, score.AccountID, model))
+		}
+	}
+	return keys
 }
 
 func (r *SchedulerRef) Set(scheduler Scheduler) {
@@ -393,9 +429,28 @@ func (r *SchedulerRef) setLocked(scheduler Scheduler) {
 	r.scheduler = scheduler
 	r.retainExhaustedExpiriesLocked()
 	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
+	now := time.Now()
 	for key := range r.recoveryProbeReady {
-		if !r.baseExhaustedForKeyLocked(key) {
+		score, ok := r.scoreForExhaustionKeyLocked(key)
+		if !ok || !score.exhausted() {
 			delete(r.recoveryProbeReady, key)
+			continue
+		}
+		if score.Fresh {
+			delete(r.recoveryProbeReady, key)
+			if r.exhaustedUntil == nil {
+				r.exhaustedUntil = make(map[string]time.Time)
+			}
+			until := now.Add(DefaultExhaustedTTL)
+			if score.ShortResetAfterSeconds > 0 {
+				if fromReset := now.Add(time.Duration(score.ShortResetAfterSeconds) * time.Second); fromReset.After(until) {
+					until = fromReset
+				}
+			}
+			if cap := now.Add(8 * 24 * time.Hour); until.After(cap) {
+				until = cap
+			}
+			r.exhaustedUntil[key] = until
 		}
 	}
 	r.updatedAt = time.Now()
