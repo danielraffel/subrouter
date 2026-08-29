@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -803,8 +804,8 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	if err := json.Unmarshal(overrideBody, &override); err != nil {
 		t.Fatalf("settings override = %q: %v", overrideBody, err)
 	}
-	if _, ok := override.Env["ANTHROPIC_AUTH_TOKEN"]; ok {
-		t.Fatalf("settings override duplicated a credential: %+v", override)
+	if got := override.Env["ANTHROPIC_AUTH_TOKEN"]; got != "" {
+		t.Fatalf("settings override retained an unintended credential: %+v", override)
 	}
 	if got := override.Env["ANTHROPIC_BASE_URL"]; got != "http://127.0.0.1:"+port {
 		t.Fatalf("settings override base URL = %q", got)
@@ -859,6 +860,62 @@ func TestManagedClaudeLaunchArgsMakesVerifiedSettingsFinal(t *testing.T) {
 	subcommand, err := managedClaudeLaunchArgs([]string{"mcp", "list"}, "/tmp/verified.json")
 	if err != nil || !slices.Equal(subcommand, []string{"--settings", "/tmp/verified.json", "mcp", "list"}) {
 		t.Fatalf("subcommand launch args = %#v, %v", subcommand, err)
+	}
+}
+
+func TestProxyClaudeLaunchSettingsNeutralizeHostilePersistedRouting(t *testing.T) {
+	hostile := make(map[string]string, len(claudeRoutingEnvKeys))
+	for _, key := range claudeRoutingEnvKeys {
+		hostile[key] = "hostile-" + strings.ToLower(key)
+	}
+	persistedBody, err := json.Marshal(map[string]any{
+		"theme": "dark",
+		"env":   hostile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), persistedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	overrideBody, err := proxyClaudeLaunchSettings("https://subrouter.example/v1", "route-token", configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted, override struct {
+		Env map[string]string `json:"env"`
+	}
+	body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(overrideBody, &override); err != nil {
+		t.Fatal(err)
+	}
+	effective := maps.Clone(persisted.Env)
+	for key, value := range override.Env {
+		effective[key] = value
+	}
+
+	want := map[string]string{
+		"ANTHROPIC_BASE_URL":       "https://subrouter.example",
+		"ANTHROPIC_AUTH_TOKEN":     "route-token",
+		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
+		"CLAUDE_CONFIG_DIR":        configDir,
+		"CLAUDE_CODE_CONFIG_DIR":   configDir,
+	}
+	for _, key := range claudeRoutingEnvKeys {
+		if got := effective[key]; got != want[key] {
+			t.Fatalf("effective routing setting %s = %q, want %q", key, got, want[key])
+		}
+		if strings.Contains(effective[key], "hostile-") {
+			t.Fatalf("hostile persisted routing survived for %s", key)
+		}
 	}
 }
 
@@ -1190,7 +1247,7 @@ func TestPrivateClaudeLaunchSettingsLeaveNothingAfterKilledProcess(t *testing.T)
 	copyPath := filepath.Join(tempRoot, "observed-settings.json")
 	readyPath := filepath.Join(tempRoot, "ready")
 	secret := "srt_must_not_survive_kill"
-	body, err := proxyClaudeLaunchSettings("https://proxy.example", secret)
+	body, err := proxyClaudeLaunchSettings("https://proxy.example", secret, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,7 +21,7 @@ func TestWindowsClaudeLaunchSettingsUsePrivateCredentialFreeTransport(t *testing
 	copyPath := filepath.Join(tempRoot, "observed-settings.json")
 	readyPath := filepath.Join(tempRoot, "ready")
 	secret := "srt_windows_must_not_leak"
-	body, err := proxyClaudeLaunchSettings("https://proxy.example", secret)
+	body, err := proxyClaudeLaunchSettings("https://proxy.example", secret, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

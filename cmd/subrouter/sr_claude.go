@@ -256,7 +256,7 @@ func (r srRunner) runProxyClaude(
 }
 
 func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir string) error {
-	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken)
+	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken, configDir)
 	if err != nil {
 		return err
 	}
@@ -962,7 +962,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	launchArgs := extra
 	var launchSettingsBody []byte
 	if secureBaseURL != "" {
-		settingsOverride, settingsErr := managedClaudeLaunchSettings(secureBaseURL)
+		settingsOverride, settingsErr := managedClaudeLaunchSettings(secureBaseURL, configDir)
 		if settingsErr != nil {
 			return settingsErr
 		}
@@ -1135,21 +1135,39 @@ func managedClaudeProfileLaunchMode(configDir string) (managedClaudeLaunchMode, 
 	return managedClaudeLaunchDirect, nil
 }
 
-func managedClaudeLaunchSettings(secureBaseURL string) ([]byte, error) {
-	return claudeLaunchSettingsJSON(map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
+func managedClaudeLaunchSettings(secureBaseURL, configDir string) ([]byte, error) {
+	return claudeLaunchSettingsJSON(configDir, map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
 }
 
-func proxyClaudeLaunchSettings(baseURL, proxyToken string) ([]byte, error) {
+func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string) ([]byte, error) {
 	baseURL = strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
-	return claudeLaunchSettingsJSON(map[string]string{
+	return claudeLaunchSettingsJSON(configDir, map[string]string{
 		"ANTHROPIC_BASE_URL":       baseURL,
 		"ANTHROPIC_AUTH_TOKEN":     proxyToken,
 		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
 	})
 }
 
-func claudeLaunchSettingsJSON(env map[string]string) ([]byte, error) {
-	override, err := json.Marshal(map[string]any{"env": env})
+func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, error) {
+	// Claude merges --settings with the selected CLAUDE_CONFIG_DIR settings.
+	// Empty strings are Claude's own neutral value for provider-selection flags:
+	// its provider overlay clears every flag before enabling one. Clear every
+	// known routing value here as well so a reused profile cannot retain a
+	// Bedrock, Vertex, gateway, or other alternate-provider route underneath the
+	// private launch settings. Intended Subrouter values are applied last.
+	authoritative := make(map[string]string, len(claudeRoutingEnvKeys)+len(env))
+	for _, key := range claudeRoutingEnvKeys {
+		authoritative[key] = ""
+	}
+	// Keep Claude's dynamically consulted config selectors pinned to the same
+	// durable profile selected for the child process. Clearing them would route
+	// later session reads and writes back to the user's default profile.
+	authoritative["CLAUDE_CONFIG_DIR"] = configDir
+	authoritative["CLAUDE_CODE_CONFIG_DIR"] = configDir
+	for key, value := range env {
+		authoritative[key] = value
+	}
+	override, err := json.Marshal(map[string]any{"env": authoritative})
 	if err != nil {
 		return nil, fmt.Errorf("encode managed Claude launch settings: %w", err)
 	}
@@ -1264,12 +1282,19 @@ var claudeRoutingEnvKeys = []string{
 	"CLAUDE_CODE_USE_VERTEX",
 	"ANTHROPIC_VERTEX_BASE_URL",
 	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"ANTHROPIC_FOUNDRY_BASE_URL",
+	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
 	"CLAUDE_CODE_USE_MANTLE",
 	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
 	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
 	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
 	"ANTHROPIC_AWS_BASE_URL",
 	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+	"CLAUDE_CODE_USE_GATEWAY",
 }
 
 // envWithout returns environ with the named keys removed (case-insensitive).
