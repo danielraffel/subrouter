@@ -7863,14 +7863,17 @@ func (s Server) transport() http.RoundTripper {
 
 func NewOutboundTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Keep ChatGPT traffic on IPv4 and pooled HTTP/1.1 connections. HTTP/2
-	// multiplexing lets one upstream TLS failure tear down unrelated streams.
+	// Keep hostname-based upstream traffic on the established IPv4 path and use
+	// pooled HTTP/1.1 connections. Literal IPv6 provider endpoints use tcp6 so
+	// every address accepted by provider validation remains reachable without
+	// changing ChatGPT's historically stable DNS/address-family behavior.
+	// HTTP/2 multiplexing lets one upstream TLS failure tear down unrelated streams.
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 	transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
-		return dialer.DialContext(ctx, "tcp4", addr)
+		return dialer.DialContext(ctx, outboundDialNetwork(addr), addr)
 	}
 	transport.ForceAttemptHTTP2 = false
 	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
@@ -7893,6 +7896,19 @@ func NewOutboundTransport() *http.Transport {
 	transport.IdleConnTimeout = outboundIdleConnTimeout
 	transport.ResponseHeaderTimeout = outboundResponseHeaderTimeout
 	return transport
+}
+
+func outboundDialNetwork(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err == nil {
+		if zone := strings.LastIndexByte(host, '%'); zone >= 0 {
+			host = host[:zone]
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+			return "tcp6"
+		}
+	}
+	return "tcp4"
 }
 
 const (
@@ -8016,7 +8032,7 @@ func outboundWebSocketDialer() *websocket.Dialer {
 			Proxy:            http.ProxyFromEnvironment,
 			HandshakeTimeout: websocketHandshakeTimeout,
 			NetDialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp4", addr)
+				return dialer.DialContext(ctx, outboundDialNetwork(addr), addr)
 			},
 			// Pin http/1.1. A websocket upgrade cannot proceed over h2, and
 			// advertising nothing lets the edge choose, which is what differs

@@ -2387,13 +2387,13 @@ func TestHandlerPreservesResponseBodyBytes(t *testing.T) {
 	}
 }
 
-func TestNewOutboundTransportUsesIPv4AndPooledHTTP1(t *testing.T) {
+func TestNewOutboundTransportUsesPinnedAddressFamiliesAndPooledHTTP1(t *testing.T) {
 	transport := NewOutboundTransport()
 	if transport.DisableKeepAlives {
 		t.Fatal("DisableKeepAlives = true, want pooled connections")
 	}
 	if transport.DialContext == nil {
-		t.Fatal("DialContext = nil, want IPv4-only dialer")
+		t.Fatal("DialContext = nil, want address-family-pinned dialer")
 	}
 	if transport.ForceAttemptHTTP2 {
 		t.Fatal("ForceAttemptHTTP2 = true, want false")
