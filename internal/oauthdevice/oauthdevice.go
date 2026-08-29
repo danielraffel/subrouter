@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -69,6 +70,10 @@ const (
 	slowDownIncrement = 5 * time.Second
 	// defaultExpiry applies when the provider omits expires_in on the device code.
 	defaultExpiry = 15 * time.Minute
+	// malformedTokenResponseRetries lets a transient intermediary response heal,
+	// but prevents a persistently broken 2xx endpoint from hiding the decode
+	// failure until the device code expires.
+	malformedTokenResponseRetries = 2
 )
 
 // ErrAuthorizationDeclined reports that the person refused the sign-in.
@@ -160,13 +165,23 @@ func Poll(ctx context.Context, client *http.Client, cfg Config, code Code, sleep
 	if interval <= 0 {
 		interval = defaultInterval
 	}
+	nextDelay := interval
+	malformedResponses := 0
 	for {
-		if !code.ExpiresAt.IsZero() && !now().Before(code.ExpiresAt) {
+		pollNow := now()
+		if !code.ExpiresAt.IsZero() && !pollNow.Before(code.ExpiresAt) {
 			return Token{}, ErrAuthorizationExpired
 		}
-		if err := sleep(ctx, interval); err != nil {
+		if !code.ExpiresAt.IsZero() {
+			remaining := code.ExpiresAt.Sub(pollNow)
+			if nextDelay > remaining {
+				nextDelay = remaining
+			}
+		}
+		if err := sleep(ctx, nextDelay); err != nil {
 			return Token{}, err
 		}
+		nextDelay = interval
 		if !code.ExpiresAt.IsZero() && !now().Before(code.ExpiresAt) {
 			return Token{}, ErrAuthorizationExpired
 		}
@@ -185,8 +200,21 @@ func Poll(ctx context.Context, client *http.Client, cfg Config, code Code, sleep
 		if !retry {
 			return Token{}, err
 		}
+		var malformedErr *malformedTokenResponseError
+		if errors.As(err, &malformedErr) {
+			malformedResponses++
+			if malformedResponses > malformedTokenResponseRetries {
+				return Token{}, err
+			}
+		} else {
+			malformedResponses = 0
+		}
 		if errors.Is(err, errSlowDown) {
 			interval += slowDownIncrement
+			nextDelay = interval
+		}
+		if retryAfter, ok := pollingRetryAfter(err, now()); ok && retryAfter > nextDelay {
+			nextDelay = retryAfter
 		}
 	}
 }
@@ -222,14 +250,21 @@ var errSlowDown = errors.New("slow_down")
 // errAuthorizationPending marks the ordinary "not approved yet" response.
 var errAuthorizationPending = errors.New("authorization_pending")
 
+type malformedTokenResponseError struct {
+	err error
+}
+
+func (err *malformedTokenResponseError) Error() string { return err.err.Error() }
+func (err *malformedTokenResponseError) Unwrap() error { return err.err }
+
 // exchange posts a token request and classifies the response. retry reports
 // whether Poll should keep waiting.
 func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Values, now time.Time) (token Token, retry bool, err error) {
 	body, httpErr := postForm(ctx, client, cfg.TokenURL, form, cfg.Headers)
 	var parsed tokenResponse
 	parseErr := json.Unmarshal(body, &parsed)
-	if parseErr != nil && len(body) > 0 {
-		parseErr = fmt.Errorf("device flow token endpoint returned an undecodable body: %w", parseErr)
+	if parseErr != nil {
+		parseErr = &malformedTokenResponseError{err: fmt.Errorf("device flow token endpoint returned an undecodable body: %w", parseErr)}
 	}
 	switch parsed.Error {
 	case "authorization_pending":
@@ -276,6 +311,7 @@ type endpointStatusError struct {
 	endpoint   string
 	status     string
 	statusCode int
+	retryAfter string
 }
 
 func (err *endpointStatusError) Error() string {
@@ -317,6 +353,32 @@ func retryablePollingStatus(statusCode int) bool {
 	default:
 		return false
 	}
+}
+
+func pollingRetryAfter(err error, now time.Time) (time.Duration, bool) {
+	var statusErr *endpointStatusError
+	if !errors.As(err, &statusErr) || statusErr.statusCode != http.StatusTooManyRequests {
+		return 0, false
+	}
+	value := strings.TrimSpace(statusErr.retryAfter)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil {
+		if seconds < 0 || seconds > int64((time.Duration(1<<63-1))/time.Second) {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	retryAt, parseErr := http.ParseTime(value)
+	if parseErr != nil {
+		return 0, false
+	}
+	delay := retryAt.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
 }
 
 // retryablePollingTransportError deliberately recognizes transient failures
@@ -396,6 +458,7 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 			endpoint:   endpoint,
 			status:     res.Status,
 			statusCode: res.StatusCode,
+			retryAfter: res.Header.Get("Retry-After"),
 		}
 	}
 	return body, nil

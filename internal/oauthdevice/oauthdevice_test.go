@@ -232,6 +232,109 @@ func TestPollRetriesTransientEndpointFailures(t *testing.T) {
 	}
 }
 
+func TestPollHonoursRetryAfterOnTooManyRequests(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"at"}`))
+	}))
+	defer server.Close()
+
+	var waited []time.Duration
+	token, err := Poll(t.Context(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Second, ExpiresAt: reference.Add(time.Hour)},
+		func(_ context.Context, delay time.Duration) error {
+			waited = append(waited, delay)
+			return nil
+		}, func() time.Time { return reference })
+	if err != nil {
+		t.Fatalf("poll failed after Retry-After: %v", err)
+	}
+	if token.AccessToken != "at" || calls != 2 {
+		t.Fatalf("token = %+v, calls = %d; want success on the second poll", token, calls)
+	}
+	if len(waited) != 2 || waited[0] != time.Second || waited[1] != 30*time.Second {
+		t.Fatalf("waits = %v, want [1s 30s]", waited)
+	}
+}
+
+func TestPollingRetryAfterParsesSecondsAndHTTPDates(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{name: "seconds", value: "45", want: 45 * time.Second, ok: true},
+		{name: "http date", value: reference.Add(90 * time.Second).Format(http.TimeFormat), want: 90 * time.Second, ok: true},
+		{name: "past date", value: reference.Add(-time.Minute).Format(http.TimeFormat), want: 0, ok: true},
+		{name: "negative seconds", value: "-1"},
+		{name: "invalid", value: "later"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := pollingRetryAfter(&endpointStatusError{
+				statusCode: http.StatusTooManyRequests,
+				retryAfter: tc.value,
+			}, reference)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("pollingRetryAfter(%q) = (%s, %t), want (%s, %t)", tc.value, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestPollBoundsRetryAfterByDeviceCodeExpiry(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Retry-After", "300")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	now := reference
+	var waited []time.Duration
+	_, err := Poll(t.Context(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Second, ExpiresAt: reference.Add(10 * time.Second)},
+		func(_ context.Context, delay time.Duration) error {
+			waited = append(waited, delay)
+			now = now.Add(delay)
+			return nil
+		}, func() time.Time { return now })
+	if !errors.Is(err, ErrAuthorizationExpired) {
+		t.Fatalf("err = %v, want ErrAuthorizationExpired", err)
+	}
+	if calls != 1 || len(waited) != 2 || waited[0] != time.Second || waited[1] != 9*time.Second {
+		t.Fatalf("calls = %d, waits = %v; want one request and waits [1s 9s]", calls, waited)
+	}
+}
+
+func TestPollStopsAfterBoundedMalformedSuccessfulResponses(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":`))
+	}))
+	defer server.Close()
+
+	_, err := Poll(t.Context(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Second, ExpiresAt: reference.Add(time.Hour)},
+		noSleep, func() time.Time { return reference })
+	if err == nil || !strings.Contains(err.Error(), "undecodable body") || !strings.Contains(err.Error(), "unexpected end of JSON input") {
+		t.Fatalf("err = %v, want actionable token-response decode error", err)
+	}
+	if calls != 1+malformedTokenResponseRetries {
+		t.Fatalf("poll attempts = %d, want %d", calls, 1+malformedTokenResponseRetries)
+	}
+}
+
 func TestPollRetriesTransientTransportFailure(t *testing.T) {
 	var calls int
 	client := &http.Client{Transport: oauthRoundTripFunc(func(*http.Request) (*http.Response, error) {
