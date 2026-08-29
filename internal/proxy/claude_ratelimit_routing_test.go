@@ -1309,20 +1309,35 @@ func TestClaudeOverloadRetryPreservesFailoverAccount(t *testing.T) {
 }
 
 func TestClaudeOverloadBackoff(t *testing.T) {
+	now := time.Date(2026, time.August, 28, 12, 0, 0, 0, time.UTC)
 	h := http.Header{}
-	if d := providerOverloadBackoff(h, 0); d != time.Second {
+	if d := providerOverloadBackoffAt(h, 0, now); d != time.Second {
 		t.Fatalf("retry0 = %v, want 1s", d)
 	}
-	if d := providerOverloadBackoff(h, 1); d != 2*time.Second {
+	if d := providerOverloadBackoffAt(h, 1, now); d != 2*time.Second {
 		t.Fatalf("retry1 = %v, want 2s", d)
 	}
 	h.Set("Retry-After", "3")
-	if d := providerOverloadBackoff(h, 0); d != 3*time.Second {
+	if d := providerOverloadBackoffAt(h, 0, now); d != 3*time.Second {
 		t.Fatalf("retry-after 3 = %v, want 3s", d)
 	}
 	h.Set("Retry-After", "9999")
-	if d := providerOverloadBackoff(h, 0); d != providerOverloadMaxWait {
+	if d := providerOverloadBackoffAt(h, 0, now); d != providerOverloadMaxWait {
 		t.Fatalf("retry-after 9999 = %v, want cap %v", d, providerOverloadMaxWait)
+	}
+	h.Set("Retry-After", now.Add(4*time.Second).Format(http.TimeFormat))
+	if d := providerOverloadBackoffAt(h, 0, now); d != 4*time.Second {
+		t.Fatalf("retry-after HTTP-date = %v, want 4s", d)
+	}
+	h.Set("Retry-After", now.Add(time.Hour).Format(http.TimeFormat))
+	if d := providerOverloadBackoffAt(h, 0, now); d != providerOverloadMaxWait {
+		t.Fatalf("retry-after future HTTP-date = %v, want cap %v", d, providerOverloadMaxWait)
+	}
+	for _, retryAfter := range []string{now.Add(-time.Second).Format(http.TimeFormat), "not-a-date"} {
+		h.Set("Retry-After", retryAfter)
+		if d := providerOverloadBackoffAt(h, 1, now); d != 2*time.Second {
+			t.Fatalf("retry-after %q = %v, want fallback 2s", retryAfter, d)
+		}
 	}
 	if !claudeOverloadStatus(529) || !claudeOverloadStatus(500) || claudeOverloadStatus(429) || claudeOverloadStatus(200) {
 		t.Fatal("claudeOverloadStatus classification wrong")
@@ -1403,6 +1418,21 @@ func TestClaudeExhaustionExpiry(t *testing.T) {
 	h.Set("Retry-After", "300")
 	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(5 * time.Minute)) {
 		t.Fatalf("retry-after = %v, want now+5m", got)
+	}
+	// HTTP-date is the second Retry-After form permitted by RFC 9110.
+	h.Set("Retry-After", now.Add(10*time.Minute).Format(http.TimeFormat))
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(10 * time.Minute)) {
+		t.Fatalf("retry-after HTTP-date = %v, want now+10m", got)
+	}
+	h.Set("Retry-After", now.Add(30*24*time.Hour).Format(http.TimeFormat))
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(8 * 24 * time.Hour)) {
+		t.Fatalf("retry-after future HTTP-date = %v, want cap now+8d", got)
+	}
+	for _, retryAfter := range []string{now.Add(-time.Second).Format(http.TimeFormat), "not-a-date"} {
+		h.Set("Retry-After", retryAfter)
+		if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(selectacct.DefaultExhaustedTTL)) {
+			t.Fatalf("retry-after %q = %v, want default", retryAfter, got)
+		}
 	}
 }
 

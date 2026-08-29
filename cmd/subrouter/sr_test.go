@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -28,6 +29,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
+	"github.com/mattn/go-runewidth"
 )
 
 type fakeKimiUsageStore struct {
@@ -2525,11 +2527,67 @@ func TestClaudeUsageGridUsesOneSchemaForMixedRows(t *testing.T) {
 	assertUsageGridLineWidths(t, got, 137)
 }
 
+func TestClaudeUsageGridFitsUnicodeAccountsByDisplayWidth(t *testing.T) {
+	row := srUsageRow{
+		email: "工程师-👩🏽‍💻-équipe@example.com", planType: "max", provider: accounts.ProviderClaude,
+		score: selectacct.Score{AccountID: "unicode", Headroom: .74, ShortHeadroom: .74, ShortResetAfterSeconds: 3600},
+		windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 0, ResetAfterSeconds: 3600},
+			{Name: "7d", UsedPercent: 0, ResetAfterSeconds: 86400},
+			{Name: "oauth-apps-weekly", UsedPercent: 0, ResetAfterSeconds: 86400},
+		},
+	}
+	for _, width := range []string{"137", "80"} {
+		t.Run(width, func(t *testing.T) {
+			t.Setenv("COLUMNS", width)
+			var out bytes.Buffer
+			displayUsageRows(&out, []srUsageRow{row}, false)
+			got := out.String()
+			if !utf8.ValidString(got) {
+				t.Fatalf("grid split a UTF-8 sequence: %q", got)
+			}
+			assertUsageGridLineWidths(t, got, mustAtoi(t, width))
+		})
+	}
+}
+
+func TestFitCellPreservesUnicodeGraphemesAndExactDisplayWidth(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		width int
+		want  string
+	}{
+		{value: "👩🏽‍💻abcdef", width: 5, want: "👩🏽‍💻..."},
+		{value: "界x", width: 1, want: " "},
+		{value: "界界界", width: 5, want: "界..."},
+	} {
+		got := fitCell(tc.value, tc.width)
+		if got != tc.want {
+			t.Fatalf("fitCell(%q, %d) = %q, want %q", tc.value, tc.width, got, tc.want)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("fitCell(%q, %d) returned invalid UTF-8: %q", tc.value, tc.width, got)
+		}
+		if gotWidth := runewidth.StringWidth(got); gotWidth != tc.width {
+			t.Fatalf("fitCell(%q, %d) display width = %d, want %d", tc.value, tc.width, gotWidth, tc.width)
+		}
+	}
+}
+
+func mustAtoi(t *testing.T, value string) int {
+	t.Helper()
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
 func assertUsageGridLineWidths(t *testing.T, output string, width int) {
 	t.Helper()
 	for _, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
-		if utf8.RuneCountInString(line) > width {
-			t.Fatalf("line width = %d, want <= %d:\n%s", utf8.RuneCountInString(line), width, line)
+		if lineWidth := runewidth.StringWidth(line); lineWidth > width {
+			t.Fatalf("line width = %d, want <= %d:\n%s", lineWidth, width, line)
 		}
 	}
 }
@@ -2629,7 +2687,7 @@ func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {
 		if line == "" {
 			continue
 		}
-		if width := utf8.RuneCountInString(line); width > 80 {
+		if width := runewidth.StringWidth(line); width > 80 {
 			t.Fatalf("line width = %d, want <= 80:\n%s\nfull output:\n%s", width, line, got)
 		}
 	}
