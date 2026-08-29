@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,11 +30,27 @@ func defaultCodexConfigPath() (string, error) {
 }
 
 func writeCodexConfigForServer(server srServerConfig) (string, error) {
-	baseURL, err := codexBaseURLForServer(server)
-	if err != nil {
+	if err := validateTenantServerConfig(context.Background(), server); err != nil {
 		return "", err
 	}
+	baseURL := canonicalServerProxyRootURL(server) + "/v1"
+	parsed, _ := url.Parse(baseURL)
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) {
+		// A durable config cannot carry the result of a one-time DNS/Tailscale
+		// check. Keep ordinary Codex on the local proxy; `sr codex` supplies the
+		// freshly verified remote URL as a process-scoped override.
+		baseURL = defaultCodexBaseURL
+	}
 	return writeCodexConfigForBaseURL(baseURL)
+}
+
+func isLoopbackServerHost(host string) bool {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func writeCodexConfigForLocal() (string, error) {

@@ -150,6 +150,7 @@ func TestRemoteClaudeUsagePlanRoundTripAndFallback(t *testing.T) {
 		{ID: "pro", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, PlanType: "pro"},
 		{ID: "free", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, PlanType: "free"},
 		{ID: "missing", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "legacy", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, PlanType: "claude"},
 	}
 	rows := usageRowsFromServerUsageStatuses(statuses)
 	got := map[string]string{}
@@ -159,7 +160,7 @@ func TestRemoteClaudeUsagePlanRoundTripAndFallback(t *testing.T) {
 			t.Fatalf("remote row retained provider placeholder: %+v", row)
 		}
 	}
-	want := map[string]string{"max": "max", "pro": "pro", "free": "free", "missing": "unknown"}
+	want := map[string]string{"max": "max", "pro": "pro", "free": "free", "missing": "unknown", "legacy": "unknown"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("remote plan labels = %v, want %v", got, want)
 	}
@@ -519,13 +520,16 @@ func TestSRServerUseSetsExplicitDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`openai_base_url = "http://100.64.0.1:31415/v1"`,
-		`chatgpt_base_url = "http://100.64.0.1:31415/backend-api"`,
-		`experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"`,
+		`openai_base_url = "http://127.0.0.1:31415/v1"`,
+		`chatgpt_base_url = "http://127.0.0.1:31415/backend-api"`,
+		`experimental_realtime_ws_base_url = "http://127.0.0.1:31415/v1"`,
 	} {
 		if !strings.Contains(string(configBody), want) {
 			t.Fatalf("missing %q in config:\n%s", want, string(configBody))
 		}
+	}
+	if strings.Contains(string(configBody), "100.64.0.1") {
+		t.Fatalf("durable config retained a one-time remote plaintext pin:\n%s", string(configBody))
 	}
 	out.Reset()
 	if err := runner.run(context.Background(), []string{"server", "list"}); err != nil {

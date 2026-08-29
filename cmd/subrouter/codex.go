@@ -301,11 +301,16 @@ func codexBaseURLForServer(server srServerConfig) (string, error) {
 // serverProxyRootURL is the data-plane root for a server entry: the bare URL,
 // or the tenant-scoped /t/<key> root when the entry carries a tenant key.
 func serverProxyRootURL(server srServerConfig) (string, error) {
+	root := canonicalServerProxyRootURL(server)
+	return secureTenantServerURL(context.Background(), root, server)
+}
+
+func canonicalServerProxyRootURL(server srServerConfig) string {
 	root := codexProxyRootURL(server.URL)
 	if key := strings.TrimSpace(server.TenantKey); key != "" {
 		root += "/t/" + key
 	}
-	return secureTenantServerURL(context.Background(), root, server)
+	return root
 }
 
 func codexArgs(args []string, baseURL, userEmail, accountID string) []string {

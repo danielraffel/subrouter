@@ -1420,11 +1420,7 @@ func (r srRunner) routeClaudeConfigDirThroughHosted(configDir string) error {
 	if !ok || server.Name != "cmux" || strings.TrimSpace(server.TenantKey) == "" {
 		return fmt.Errorf("hosted cmux remote is not selected")
 	}
-	proxyRoot, err := serverProxyRootURL(server)
-	if err != nil {
-		return err
-	}
-	return writeClaudeProxyEnv(filepath.Clean(configDir), proxyRoot, server.TenantKey)
+	return writeClaudeProxyEnvForServer(filepath.Clean(configDir), server)
 }
 
 type localAccountUpload struct {

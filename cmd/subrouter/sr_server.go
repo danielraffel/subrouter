@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -41,18 +42,24 @@ func protectedServerControlBaseURL(server srServerConfig) (string, error) {
 }
 
 func serverControlBaseURLFor(server srServerConfig, forceProtected bool) (string, error) {
+	return serverControlBaseURLForResolvers(server, forceProtected, net.DefaultResolver.LookupIPAddr, defaultTailscaleStatusLoader)
+}
+
+func serverControlBaseURLForResolvers(server srServerConfig, forceProtected bool, lookup serverIPLookup, load tailscaleStatusLoader) (string, error) {
 	base := codexProxyRootURL(server.URL)
 	if key := strings.TrimSpace(server.TenantKey); key != "" {
 		base += "/t/" + key
 	}
 	protectedServer := server
-	if strings.TrimSpace(protectedServer.TenantKey) == "" && (forceProtected || strings.TrimSpace(server.AdminToken) != "" || strings.TrimSpace(server.AccountImportToken) != "") {
+	parsedBase, _ := url.Parse(base)
+	plainHTTPWithNodeIdentity := parsedBase != nil && strings.EqualFold(parsedBase.Scheme, "http") && strings.TrimSpace(server.TailscaleNodeID) != ""
+	if strings.TrimSpace(protectedServer.TenantKey) == "" && (forceProtected || plainHTTPWithNodeIdentity || strings.TrimSpace(server.AdminToken) != "" || strings.TrimSpace(server.AccountImportToken) != "") {
 		// Control requests may carry admin or account-import credentials even
 		// when the server itself is not tenant scoped. Apply the same transport
 		// policy without adding a tenant path.
 		protectedServer.TenantKey = "protected-control-request"
 	}
-	return secureTenantServerURL(context.Background(), base, protectedServer)
+	return secureTenantServerURLWithResolvers(context.Background(), base, protectedServer, lookup, load)
 }
 
 func (r srRunner) serverCommand() string {
@@ -1371,7 +1378,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 				row.providerHealth = "auth ok"
 			}
 		}
-		if status.Provider == accounts.ProviderClaude && row.planType == "" {
+		if status.Provider == accounts.ProviderClaude && (row.planType == "" || strings.EqualFold(row.planType, "claude")) {
 			row.planType = "unknown"
 		}
 		if status.Error != "" {

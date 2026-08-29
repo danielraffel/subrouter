@@ -1177,11 +1177,20 @@ func (s Store) readCredential(ctx context.Context, instancePath string) (*Creden
 }
 
 func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
-	return s.refreshProfileCredential(ctx, client, profile, false)
+	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, false)
+	return account, didRefresh, err
 }
 
 func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
-	return s.refreshProfileCredential(ctx, client, profile, true)
+	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, true)
+	return account, didRefresh, err
+}
+
+// RefreshCredentialDetailsIfExpired returns the credential snapshot used to
+// build the account so status callers do not need a second serialized disk or
+// Keychain read merely to obtain subscription metadata.
+func (s Store) RefreshCredentialDetailsIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, *CredentialInfo, bool, error) {
+	return s.refreshProfileCredential(ctx, client, profile, false)
 }
 
 // refreshProfileCredential serializes concurrent refreshes of the same
@@ -1196,11 +1205,11 @@ func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, 
 // unrelated ImportProfileCredential call for the same profile; each
 // individual disk read/write still takes the short-lived
 // lockProfileCredential via ReadCredential / writeRefreshedCredentialIfUnchanged.
-func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, didRefresh bool, err error) {
+func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, credential *CredentialInfo, didRefresh bool, err error) {
 	configDir := s.ClaudeConfigDir(profile.Name)
 	refreshLock, err := lockProfileRefresh(ctx, configDir)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, nil, false, err
 	}
 	defer func() {
 		if closeErr := refreshLock.Close(); err == nil {
@@ -1210,34 +1219,34 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 
 	current, ok := s.FindProfile(profile.Name)
 	if !ok || profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+		return accounts.Account{}, nil, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
-	credential, err := s.ReadCredential(ctx, configDir)
+	credential, err = s.ReadCredential(ctx, configDir)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, nil, false, err
 	}
 	if credential == nil || credential.AccessToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
 	if force && credential.RefreshToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no refresh token", profile.Name)
 	}
 	shouldRefresh := credential.RefreshToken != "" &&
 		(force || credentialExpired(credential, 60*time.Second))
 	if !shouldRefresh {
 		account, ok = profileAccount(profile, configDir, credential)
 		if !ok {
-			return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
+			return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 		}
-		return account, false, nil
+		return account, credential, false, nil
 	}
 
 	credentialBeforeRefresh := *credential
 	profileBeforeRefresh := profile
 	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, credential, false, err
 	}
 	didRefresh = true
 
@@ -1245,21 +1254,21 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 	if !ok ||
 		current.CreatedAt != profileBeforeRefresh.CreatedAt ||
 		profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
 	}
 	profile = current
 	credential, err = s.writeRefreshedCredentialIfUnchanged(ctx, configDir, credentialBeforeRefresh, refreshed)
 	if err != nil {
-		return accounts.Account{}, false, err
+		return accounts.Account{}, credential, false, err
 	}
 	if credential == nil || credential.AccessToken == "" {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
 	}
 	account, ok = profileAccount(profile, configDir, credential)
 	if !ok {
-		return accounts.Account{}, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
 	}
-	return account, didRefresh, nil
+	return account, credential, didRefresh, nil
 }
 
 // writeRefreshedCredentialIfUnchanged briefly holds lockProfileCredential to

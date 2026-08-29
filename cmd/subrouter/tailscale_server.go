@@ -310,7 +310,7 @@ func redactedServerURL(raw string) string {
 	}
 	parsed.Path = strings.Join(parts, "/")
 	parsed.RawPath = ""
-	return parsed.Redacted()
+	return strings.ReplaceAll(parsed.Redacted(), "%5Bredacted%5D", "[redacted]")
 }
 
 func (s srServerStore) compareAndSwapServerURL(name, nodeID, oldURL, newURL string) (srServerConfig, error) {

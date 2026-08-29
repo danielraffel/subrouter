@@ -1451,11 +1451,10 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	activeClaude := claudeStore.ActiveProfile()
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
-		credential, _ := claudeStore.ReadCredential(ctx, claudeStore.ClaudeConfigDir(profile.Name))
 		rows[i] = srUsageRow{
 			email:    profile.Name,
 			active:   profile.Name == activeClaude,
-			planType: credential.PlanType(),
+			planType: "unknown",
 			authMode: accounts.AuthModeOAuth,
 			provider: accounts.ProviderClaude,
 			score:    selectacct.Score{AccountID: profile.Name, Headroom: 1, ShortHeadroom: 1},
@@ -1463,13 +1462,12 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			account, _, err := claudeStore.RefreshCredentialIfExpired(ctx, r.client, profile)
+			account, credential, _, err := claudeStore.RefreshCredentialDetailsIfExpired(ctx, r.client, profile)
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
-			credential, _ := claudeStore.ReadCredential(ctx, claudeStore.ClaudeConfigDir(profile.Name))
 			rows[i].planType = credential.PlanType()
 			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
 			if err != nil {

@@ -286,6 +286,38 @@ func TestTenantScopedHTTPUsesAuthenticatedTailscaleNode(t *testing.T) {
 	}
 }
 
+func TestTokenlessControlHTTPWithNodeIdentityIsPinned(t *testing.T) {
+	server := srServerConfig{URL: "http://m3.example.ts.net.:31415", TailscaleNodeID: "node-m3"}
+	lookup := func(context.Context, string) ([]net.IPAddr, error) {
+		return nil, errors.New("node identity must avoid DNS")
+	}
+	load := func(context.Context) ([]byte, error) {
+		return []byte(`{"Self":{"ID":"self","Online":true},"Peer":{"node-m3":{"ID":"node-m3","DNSName":"m3.example.ts.net.","TailscaleIPs":["100.88.0.9"],"Online":true}}}`), nil
+	}
+	got, err := serverControlBaseURLForResolvers(server, false, lookup, load)
+	if err != nil || got != "http://100.88.0.9:31415" {
+		t.Fatalf("tokenless node control URL = %q, %v", got, err)
+	}
+
+	legacy := srServerConfig{URL: "http://legacy.lan:31415"}
+	got, err = serverControlBaseURLForResolvers(legacy, false, lookup, nil)
+	if err != nil || got != legacy.URL {
+		t.Fatalf("legacy tokenless LAN URL = %q, %v", got, err)
+	}
+}
+
+func TestTenantTransportNilTailscaleLoaderFailsClosed(t *testing.T) {
+	lookup := func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("100.88.0.9")}}, nil
+	}
+	if _, err := secureTenantServerURLWithResolvers(
+		t.Context(), "http://m3.example.ts.net.:31415/t/"+testTenantKey,
+		srServerConfig{TenantKey: testTenantKey}, lookup, nil,
+	); err == nil || !strings.Contains(err.Error(), "verify Tailscale") {
+		t.Fatalf("nil loader error = %v", err)
+	}
+}
+
 func TestWriteClaudeProxyEnvTenantKeySetsAuthToken(t *testing.T) {
 	dir := t.TempDir()
 	if err := writeClaudeProxyEnv(dir, "https://host.example/t/"+testTenantKey, testTenantKey); err != nil {

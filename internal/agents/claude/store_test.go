@@ -46,6 +46,28 @@ func TestCredentialPlanTypeUsesOnlyCredentialMetadata(t *testing.T) {
 	}
 }
 
+func TestRefreshCredentialDetailsReturnsSameCredentialSnapshot(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	credential := CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", SubscriptionType: "max",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}
+	if err := store.ImportProfileCredential("work", credential); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile("work")
+	if !ok {
+		t.Fatal("missing imported profile")
+	}
+	account, got, refreshed, err := store.RefreshCredentialDetailsIfExpired(t.Context(), http.DefaultClient, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed || got == nil || got.PlanType() != "max" || account.Token != credential.AccessToken {
+		t.Fatalf("details = account:%+v credential:%+v refreshed:%v", account, got, refreshed)
+	}
+}
+
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
 	instancePath, err := store.CreateProfile("work")

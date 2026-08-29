@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
 const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
@@ -30,11 +33,11 @@ Usage:
   sr claude list                List all profiles with auth status
   sr claude switch [name]       Switch active profile
   sr claude remove <name>       Remove a profile
-  sr claude env                 Print export CLAUDE_CONFIG_DIR=...
+  sr claude env                 Print CLAUDE_CONFIG_DIR for local/HTTPS profiles
   sr claude push [name]         Upload a profile to the default Subrouter server pool
   sr claude pick                Switch to the profile with the most quota left
   sr claude proxy [args...]     Launch Claude profilelessly through the selected server
-  sr claude run [name] [...]    Launch Claude with a specific profile
+  sr claude run [name] [...]    Launch safely (required for plaintext remote profiles)
   sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
@@ -538,7 +541,7 @@ func (r claudeRunner) fetchInfos(ctx context.Context) []claude.ProfileInfo {
 		go func() {
 			defer wg.Done()
 			claudeConfigDir := r.store.ClaudeConfigDir(profile.Name)
-			if err := secureManagedClaudeProfileTransport(claudeConfigDir, false); err != nil {
+			if _, err := secureManagedClaudeProfileTransport(claudeConfigDir); err != nil {
 				infos[i].Error = err
 				return
 			}
@@ -590,7 +593,16 @@ func (r claudeRunner) switchProfile(selector string) error {
 		return err
 	}
 	fmt.Fprintf(r.out, "Active Claude profile: %s\n", profile.Name)
-	fmt.Fprintf(r.out, "\n  export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(profile.Name))
+	configDir := r.store.ClaudeConfigDir(profile.Name)
+	protectedRemote, err := managedClaudeProfileNeedsWrappedLaunch(configDir)
+	if err != nil {
+		return err
+	}
+	if protectedRemote {
+		fmt.Fprintf(r.out, "\nThis profile uses a protected plaintext server. Launch it with:\n\n  sr claude run %s [claude args...]\n", profile.Name)
+		return nil
+	}
+	fmt.Fprintf(r.out, "\n  export CLAUDE_CONFIG_DIR=%s\n", configDir)
 	fmt.Fprintln(r.out, "\nOr add to shell rc: eval \"$(sr claude env)\"")
 	return nil
 }
@@ -619,7 +631,15 @@ func (r claudeRunner) env() error {
 	if active == "" {
 		return nil
 	}
-	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(active))
+	configDir := r.store.ClaudeConfigDir(active)
+	protectedRemote, err := managedClaudeProfileNeedsWrappedLaunch(configDir)
+	if err != nil {
+		return err
+	}
+	if protectedRemote {
+		return fmt.Errorf("profile %q uses a protected plaintext server; launch it with 'sr claude run %s [claude args...]' so Subrouter can verify the server for each run", active, active)
+	}
+	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", configDir)
 	return nil
 }
 
@@ -708,7 +728,8 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		return fmt.Errorf("profile %q not found", name)
 	}
 	configDir := r.store.ClaudeConfigDir(profile.Name)
-	if err := secureManagedClaudeProfileTransport(configDir, true); err != nil {
+	secureBaseURL, err := secureManagedClaudeProfileTransport(configDir)
+	if err != nil {
 		return err
 	}
 	claudePath, ok := claude.DetectCLI()
@@ -726,46 +747,51 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 			fmt.Fprintf(r.errOut, "Copied session %s from profile %q.\n", sessionID, from)
 		}
 	}
-	cmd := exec.CommandContext(ctx, claudePath, extra...)
+	launchArgs := extra
+	launchSettingsPath := ""
+	if secureBaseURL != "" {
+		settingsOverride, settingsErr := managedClaudeLaunchSettings(secureBaseURL)
+		if settingsErr != nil {
+			return settingsErr
+		}
+		launchSettingsPath = settingsOverride
+		defer os.Remove(launchSettingsPath)
+		launchArgs = append([]string{"--settings", settingsOverride}, extra...)
+	}
+	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = directPlainHTTPEnvironment(claude.EnvForConfigDir(configDir), managedClaudeBaseURL(configDir))
+	env := claude.EnvForConfigDir(configDir)
+	if secureBaseURL != "" {
+		env = upsertEnv(env, "ANTHROPIC_BASE_URL", secureBaseURL)
+	}
+	cmd.Env = directPlainHTTPEnvironment(env, secureBaseURL)
 	return cmd.Run()
 }
 
-func managedClaudeBaseURL(configDir string) string {
-	body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
-	if err != nil {
-		return ""
-	}
-	var settings struct {
-		Env map[string]string `json:"env"`
-	}
-	if json.Unmarshal(body, &settings) != nil {
-		return ""
-	}
-	return strings.TrimSpace(settings.Env["ANTHROPIC_BASE_URL"])
+func secureManagedClaudeProfileTransport(configDir string) (string, error) {
+	return secureManagedClaudeProfileTransportWithResolvers(configDir, net.DefaultResolver.LookupIPAddr, defaultTailscaleStatusLoader)
 }
 
-func secureManagedClaudeProfileTransport(configDir string, pinForLaunch bool) error {
+func secureManagedClaudeProfileTransportWithResolvers(configDir string, lookup serverIPLookup, load tailscaleStatusLoader) (string, error) {
 	settingsPath := filepath.Join(configDir, "settings.json")
 	body, err := os.ReadFile(settingsPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return "", nil
 	}
 	if err != nil {
-		return fmt.Errorf("read managed Claude settings: %w", err)
+		return "", fmt.Errorf("read managed Claude settings: %w", err)
 	}
 	var settings struct {
 		Env map[string]string `json:"env"`
 	}
 	if err := json.Unmarshal(body, &settings); err != nil {
-		return fmt.Errorf("parse managed Claude settings: %w", err)
+		return "", fmt.Errorf("parse managed Claude settings: %w", err)
 	}
 	baseURL := strings.TrimSpace(settings.Env["ANTHROPIC_BASE_URL"])
 	if baseURL == "" {
-		return nil
+		return "", nil
 	}
 	authToken := strings.TrimSpace(settings.Env["ANTHROPIC_AUTH_TOKEN"])
 	transportCredential := authToken
@@ -788,24 +814,90 @@ func secureManagedClaudeProfileTransport(configDir string, pinForLaunch bool) er
 	if transportCredential == "" && strings.TrimSpace(settings.Env["ANTHROPIC_CUSTOM_HEADERS"]) != "" {
 		transportCredential = "protected-managed-custom-header"
 	}
-	secureBaseURL, err := secureTenantProxyURL(context.Background(), baseURL, transportCredential)
+	serverURL := strings.TrimSpace(settings.Env[managedClaudeServerURLEnv])
+	nodeID := strings.TrimSpace(settings.Env[managedClaudeTailscaleNodeEnv])
+	if serverURL != "" || nodeID != "" {
+		if serverURL == "" || nodeID == "" || baseURL != managedClaudeBlockedBaseURL {
+			return "", fmt.Errorf("managed Claude server identity is incomplete; run 'sr claude push' to repair it")
+		}
+		server := srServerConfig{
+			URL:             serverURL,
+			TailscaleNodeID: nodeID,
+		}
+		if tenant.ValidKeyFormat(authToken) {
+			server.TenantKey = authToken
+		}
+		proxyRoot := canonicalServerProxyRootURL(server)
+		protectedServer := server
+		parsedProxyRoot, _ := url.Parse(proxyRoot)
+		if strings.TrimSpace(protectedServer.TenantKey) == "" && tenantKeyFromURL(parsedProxyRoot) == "" {
+			// Force transport protection without allowing an arbitrary Claude
+			// credential to become a tenant route segment.
+			protectedServer.TenantKey = "protected-managed-credential"
+		}
+		secureBaseURL, err := secureTenantServerURLWithResolvers(context.Background(), proxyRoot, protectedServer, lookup, load)
+		if err != nil {
+			return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: %w", err)
+		}
+		return secureBaseURL, nil
+	}
+	parsed, _ := url.Parse(baseURL)
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) && transportCredential != "" {
+		return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: protected plaintext server is missing an exact durable identity; run 'sr claude push' to repair it")
+	}
+	secureBaseURL, err := secureTenantServerURLWithResolvers(
+		context.Background(), baseURL,
+		srServerConfig{URL: baseURL, TenantKey: transportCredential},
+		lookup, load,
+	)
 	if err != nil {
-		return fmt.Errorf("managed Claude profile has unsafe proxy transport: %w", err)
+		return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: %w", err)
 	}
-	if secureBaseURL == baseURL {
-		return nil
+	return secureBaseURL, nil
+}
+
+func managedClaudeProfileNeedsWrappedLaunch(configDir string) (bool, error) {
+	body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
 	}
-	if !pinForLaunch {
-		return nil
+	if err != nil {
+		return false, fmt.Errorf("read managed Claude settings: %w", err)
 	}
-	tenantToken := authToken
-	if tenantToken == "subrouter" {
-		tenantToken = ""
+	var settings struct {
+		Env map[string]string `json:"env"`
 	}
-	if err := writeClaudeProxyEnv(configDir, secureBaseURL, tenantToken); err != nil {
-		return fmt.Errorf("pin managed Claude proxy transport: %w", err)
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return false, fmt.Errorf("parse managed Claude settings: %w", err)
 	}
-	return nil
+	return strings.TrimSpace(settings.Env[managedClaudeServerURLEnv]) != "" || strings.TrimSpace(settings.Env[managedClaudeTailscaleNodeEnv]) != "", nil
+}
+
+func managedClaudeLaunchSettings(secureBaseURL string) (string, error) {
+	override, err := json.Marshal(map[string]any{"env": map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL}})
+	if err != nil {
+		return "", fmt.Errorf("encode managed Claude launch settings: %w", err)
+	}
+	file, err := os.CreateTemp("", "subrouter-claude-settings-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create managed Claude launch settings: %w", err)
+	}
+	path := file.Name()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if _, err := file.Write(override); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 // claudeAWS launches Claude Code in Amazon Bedrock gateway mode, routed through

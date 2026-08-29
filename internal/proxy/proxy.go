@@ -1157,7 +1157,6 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	activeClaude := r.claudeStore.ActiveProfile()
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
-		credential, _ := r.claudeStore.ReadCredential(ctx, r.claudeStore.ClaudeConfigDir(profile.Name))
 		status := AccountUsageStatus{
 			AccountStatus: AccountStatus{
 				ID:          profile.Name,
@@ -1168,7 +1167,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				AuthChecked: true,
 			},
 			Active:   profile.Name == activeClaude,
-			PlanType: credential.PlanType(),
+			PlanType: "unknown",
 		}
 		if failure, dead := r.terminalCredFailure(accounts.ProviderClaude, profile.Name); dead {
 			status.AuthValid = false
@@ -1182,7 +1181,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			defer wg.Done()
 			fetchCtx, cancel := context.WithTimeout(ctx, usageStatusFetchTimeout)
 			defer cancel()
-			account, didRefresh, err := r.claudeStore.RefreshCredentialIfExpired(fetchCtx, r.client, profile)
+			account, credential, didRefresh, err := r.claudeStore.RefreshCredentialDetailsIfExpired(fetchCtx, r.client, profile)
 			r.noteCredResult(accounts.ProviderClaude, profile.Name, err)
 			next := out[i]
 			next.Refreshed = didRefresh
@@ -1193,7 +1192,6 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			next.AuthValid = true
-			credential, _ := r.claudeStore.ReadCredential(fetchCtx, r.claudeStore.ClaudeConfigDir(profile.Name))
 			next.PlanType = credential.PlanType()
 			r.replace(account)
 			windows, fresh, err := r.FetchUsageWindowsCached(fetchCtx, r.client, account)

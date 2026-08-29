@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -75,6 +77,30 @@ func TestClaudeSwitchSupportsPartialProfile(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Active Claude profile: personal") {
 		t.Fatalf("switch output = %q", out.String())
+	}
+}
+
+func TestClaudeSwitchProtectedPlaintextPrintsWrappedLaunch(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir("work")
+	settings := `{"env":{"ANTHROPIC_BASE_URL":"` + managedClaudeBlockedBaseURL + `","ANTHROPIC_AUTH_TOKEN":"` + testTenantKey + `","` + managedClaudeServerURLEnv + `":"http://m3.example","` + managedClaudeTailscaleNodeEnv + `":"node-m3"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, out: &out, errOut: &out}
+	if err := runner.switchProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "sr claude run work [claude args...]") {
+		t.Fatalf("switch output omitted safe launch: %q", got)
+	}
+	if strings.Contains(got, "export CLAUDE_CONFIG_DIR") || strings.Contains(got, "sr claude env") {
+		t.Fatalf("switch output advertised unsafe plain-Claude launch: %q", got)
 	}
 }
 
@@ -179,6 +205,174 @@ func TestClaudeManagedProfileRejectsLegacyRemoteHTTPTenantBeforeLaunch(t *testin
 	}
 	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("Claude launched with a custom header over unsafe transport: %v", statErr)
+	}
+}
+
+func TestSecureManagedClaudeTransportDoesNotRewriteCredentialSettings(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	settingsPath := filepath.Join(dir, "settings.json")
+	body := []byte(`{"theme":"dark","env":{"ANTHROPIC_BASE_URL":"http://localhost:` + port + `","ANTHROPIC_AUTH_TOKEN":"custom-auth","ANTHROPIC_CUSTOM_HEADERS":"Authorization: Bearer custom-header","FOO":"bar"}}`)
+	if err := os.WriteFile(settingsPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secureBaseURL, err := secureManagedClaudeProfileTransport(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secureBaseURL != "http://127.0.0.1:"+port {
+		t.Fatalf("secure base URL = %q", secureBaseURL)
+	}
+	after, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(body) {
+		t.Fatalf("transport validation rewrote managed credentials:\nbefore: %s\nafter: %s", body, after)
+	}
+}
+
+func TestSecureManagedClaudeTransportNeverRoutesCredentialsAsTenantKeys(t *testing.T) {
+	load := func(context.Context) ([]byte, error) {
+		return []byte(`{"Self":{"ID":"self","Online":true},"Peer":{"node-m3":{"ID":"node-m3","DNSName":"m3.example.ts.net.","TailscaleIPs":["100.88.0.9"],"Online":true}}}`), nil
+	}
+	lookup := func(context.Context, string) ([]net.IPAddr, error) {
+		t.Fatal("exact node identity must avoid DNS")
+		return nil, nil
+	}
+	for _, tc := range []struct {
+		name string
+		env  string
+	}{
+		{name: "tokenless", env: `"ANTHROPIC_AUTH_TOKEN":"subrouter"`},
+		{name: "custom auth", env: `"ANTHROPIC_AUTH_TOKEN":"custom-secret"`},
+		{name: "api key", env: `"ANTHROPIC_API_KEY":"api-secret"`},
+		{name: "custom header", env: `"ANTHROPIC_AUTH_TOKEN":"subrouter","ANTHROPIC_CUSTOM_HEADERS":"Authorization: Bearer header-secret"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			settings := `{"env":{"ANTHROPIC_BASE_URL":"` + managedClaudeBlockedBaseURL + `",` + tc.env + `,"` + managedClaudeServerURLEnv + `":"http://m3.example.ts.net.:31415","` + managedClaudeTailscaleNodeEnv + `":"node-m3"}}`
+			if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(settings), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := secureManagedClaudeProfileTransportWithResolvers(dir, lookup, load)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != "http://100.88.0.9:31415" {
+				t.Fatalf("secured base URL = %q, credential became a tenant path", got)
+			}
+			for _, secret := range []string{"custom-secret", "api-secret", "header-secret", "protected-managed-credential"} {
+				if strings.Contains(got, secret) {
+					t.Fatalf("secured base URL leaked %q: %q", secret, got)
+				}
+			}
+		})
+	}
+}
+
+func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *testing.T) {
+	home := t.TempDir()
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir("work")
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := `{"theme":"dark","env":{"ANTHROPIC_BASE_URL":"http://localhost:` + port + `","ANTHROPIC_AUTH_TOKEN":"secret"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(home, "args")
+	overridePath := filepath.Join(home, "override")
+	modePath := filepath.Join(home, "mode")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\ncat \"$2\" > " + shellQuote(overridePath) + "\nstat -f '%Lp' \"$2\" > " + shellQuote(modePath) + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.runClaude(t.Context(), "work", []string{"--resume", "session-a"}); err != nil {
+		t.Fatal(err)
+	}
+	argsBody, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(argsBody)), "\n")
+	if len(args) != 4 || args[0] != "--settings" || args[2] != "--resume" || args[3] != "session-a" {
+		t.Fatalf("Claude args = %#v", args)
+	}
+	if strings.Contains(string(argsBody), "secret") {
+		t.Fatalf("credential leaked through Claude argv: %q", argsBody)
+	}
+	var override struct {
+		Env map[string]string `json:"env"`
+	}
+	overrideBody, err := os.ReadFile(overridePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(overrideBody, &override); err != nil {
+		t.Fatalf("settings override = %q: %v", overrideBody, err)
+	}
+	if _, ok := override.Env["ANTHROPIC_AUTH_TOKEN"]; ok {
+		t.Fatalf("settings override duplicated a credential: %+v", override)
+	}
+	if got := override.Env["ANTHROPIC_BASE_URL"]; got != "http://127.0.0.1:"+port {
+		t.Fatalf("settings override base URL = %q", got)
+	}
+	modeBody, err := os.ReadFile(modePath)
+	if err != nil || strings.TrimSpace(string(modeBody)) != "600" {
+		t.Fatalf("override mode = %q, %v", modeBody, err)
+	}
+	if _, err := os.Stat(args[1]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary settings file survived launch: %v", err)
+	}
+}
+
+func TestClaudeEnvRejectsProtectedPlaintextManagedServer(t *testing.T) {
+	store := claude.Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActiveProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir("work")
+	settings := `{"env":{"ANTHROPIC_BASE_URL":"` + managedClaudeBlockedBaseURL + `","ANTHROPIC_AUTH_TOKEN":"` + testTenantKey + `","` + managedClaudeServerURLEnv + `":"http://m3.example","` + managedClaudeTailscaleNodeEnv + `":"node-m3"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, out: &out, errOut: &out}
+	err := runner.env()
+	if err == nil || !strings.Contains(err.Error(), "sr claude run work") {
+		t.Fatalf("env error = %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("unsafe shell exports were printed: %q", out.String())
 	}
 }
 

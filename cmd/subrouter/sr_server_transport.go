@@ -59,6 +59,9 @@ func secureTenantServerURLWithResolvers(
 }
 
 func pinTenantURLToTailscaleNode(ctx context.Context, parsed *url.URL, server srServerConfig, load tailscaleStatusLoader) (string, error) {
+	if load == nil {
+		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
+	}
 	data, err := load(ctx)
 	if err != nil {
 		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
@@ -104,6 +107,9 @@ func pinTenantURLToVerifiedAddresses(ctx context.Context, parsed *url.URL, looku
 			}
 		}
 		return pinParsedURL(parsed, selected), nil
+	}
+	if load == nil {
+		return "", errors.New("could not verify Tailscale for plaintext tenant routing")
 	}
 	data, err := load(ctx)
 	if err != nil {
@@ -240,6 +246,9 @@ func validateTenantServerConfigWithLookup(ctx context.Context, server srServerCo
 		return errors.New(secureTenantTransportRequirement)
 	}
 	if strings.TrimSpace(server.TailscaleNodeID) != "" {
+		if ip := net.ParseIP(parsed.Hostname()); ip != nil && !safeAccountImportHTTPIP(ip) {
+			return errors.New(secureTenantTransportRequirement)
+		}
 		return nil
 	}
 	_, err = safeAddressesForTenantURL(ctx, parsed, lookup)
