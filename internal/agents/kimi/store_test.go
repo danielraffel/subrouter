@@ -338,7 +338,7 @@ func TestListAccountsRoutesOnlyCanonicalManagedFilename(t *testing.T) {
 		t.Fatal(err)
 	}
 	listed, err := store.ListAccounts(t.Context())
-	if err != nil || len(listed) != 1 || listed[0].ID != "kimi-subscription:work" {
+	if err == nil || len(listed) != 1 || listed[0].ID != "kimi-subscription:work" {
 		t.Fatalf("routed accounts = %+v, err = %v", listed, err)
 	}
 	ids, err := store.AccountInventoryIDs(t.Context())

@@ -77,7 +77,7 @@ func advanceAccountDiskGeneration(storeDir string) (err error) {
 
 func (r *AccountRef) advanceDiskGeneration() error {
 	publish := advanceAccountDiskGeneration
-	if r != nil && r.publishGenerationForTest != nil {
+	if r.publishGenerationForTest != nil {
 		publish = r.publishGenerationForTest
 	}
 	return publish(r.store.StoreDir())
@@ -166,5 +166,6 @@ func (r *AccountRef) reloadIfDiskGenerationChanged(ctx context.Context) (reloade
 	if err != nil {
 		return false, generation, err
 	}
+	r.InvalidateUsageStatusCache()
 	return true, generation, nil
 }

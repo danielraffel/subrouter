@@ -1162,6 +1162,7 @@ func TestCompletedImportIsObservedByAnotherWorkerGeneration(t *testing.T) {
 	}
 	newWorkerRef := NewAccountRef(codexStore, initial, nil)
 	newWorkerRef.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	newWorkerRef.usageStatusAt = time.Now()
 	newWorker := Server{AccountRef: newWorkerRef}
 	retiringWorkerRef := NewAccountRef(codexStore, initial, nil)
 	retiringWorkerRef.claudeStore = newWorkerRef.claudeStore
@@ -1183,12 +1184,18 @@ func TestCompletedImportIsObservedByAnotherWorkerGeneration(t *testing.T) {
 		t.Fatalf("import status = %d, want 200, body = %s", resp.Code, resp.Body.String())
 	}
 
+	found := false
 	for _, account := range newWorker.accountList() {
 		if account.ID == imported.Email {
-			return
+			found = true
 		}
 	}
-	t.Fatalf("active worker did not observe completed import: %+v", newWorker.accountList())
+	if !found {
+		t.Fatalf("active worker did not observe completed import: %+v", newWorker.accountList())
+	}
+	if !newWorkerRef.usageStatusAt.IsZero() {
+		t.Fatal("active worker retained usage cache after observing account generation")
+	}
 }
 
 func serveProtectedAccountImport(handler http.Handler, body []byte) *httptest.ResponseRecorder {

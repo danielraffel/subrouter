@@ -274,6 +274,56 @@ func TestTenantAccountRejectionDoesNotPublishGeneration(t *testing.T) {
 	})
 }
 
+func TestTenantAccountUploadReportsUnavailableInventoryWithoutDetails(t *testing.T) {
+	t.Run("Claude registry", func(t *testing.T) {
+		root := t.TempDir()
+		codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+		claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+		if err := os.MkdirAll(claudeStore.Dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(claudeStore.ProfilesPath(), []byte("{not-json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ref := NewAccountRef(codexStore, nil, nil)
+		ref.claudeStore = claudeStore
+		server := Server{AccountRef: ref}
+		response := serveTenantAccountUpload(&server, `{"provider":"openai-apikey","label":"work","apiKey":"sk-new"}`)
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "account inventory unavailable for claude") {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), claudeStore.ProfilesPath()) || strings.Contains(response.Body.String(), "profiles.json") {
+			t.Fatalf("tenant Claude inventory error leaked details: %s", response.Body.String())
+		}
+	})
+
+	t.Run("Kimi inventory", func(t *testing.T) {
+		root := t.TempDir()
+		codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+		claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+		kimiStore := agentkimi.Store{
+			Path: filepath.Join(root, "kimi", "cli.json"), ManagedDir: filepath.Join(root, "kimi", "managed"),
+		}
+		if err := os.MkdirAll(filepath.Dir(kimiStore.ManagedDir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(kimiStore.ManagedDir, []byte("not-a-directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ref := NewAccountRef(codexStore, nil, nil)
+		ref.claudeStore = claudeStore
+		ref.oauthSources = []OAuthAccountSource{kimiStore}
+		server := Server{AccountRef: ref}
+		response := serveTenantAccountUpload(&server, `{"provider":"openai-apikey","label":"work","apiKey":"sk-new"}`)
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "account inventory unavailable for kimi") {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), kimiStore.ManagedDir) {
+			t.Fatalf("tenant Kimi inventory error leaked details: %s", response.Body.String())
+		}
+	})
+}
+
 func TestMutationStageErrorReconcilesDurablePartialOutcome(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	oldAccount := accounts.StoredCodexAccount{

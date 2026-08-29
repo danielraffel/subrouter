@@ -392,7 +392,7 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 					t.Fatal(err)
 				}
 				logical, err := kimiStore.ListAccounts(t.Context())
-				if err != nil || len(logical) != 0 {
+				if err == nil || len(logical) != 0 {
 					t.Fatalf("logical alias fixture = %+v, err = %v", logical, err)
 				}
 				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
@@ -444,7 +444,7 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 					t.Fatal("alias conflict changed the original credential")
 				}
 				logical, err = kimiStore.ListAccounts(t.Context())
-				if err != nil || len(logical) != 0 {
+				if err == nil || len(logical) != 0 {
 					t.Fatalf("logical accounts after conflict = %+v, err = %v", logical, err)
 				}
 				routed := 0
@@ -514,7 +514,7 @@ func TestUnreadableKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 					t.Fatalf("durable alias IDs = %v, err = %v", ids, err)
 				}
 				logical, err := kimiStore.ListAccounts(t.Context())
-				if err != nil || len(logical) != 0 {
+				if err == nil || len(logical) != 0 {
 					t.Fatalf("unreadable alias accounts = %+v, err = %v", logical, err)
 				}
 				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {

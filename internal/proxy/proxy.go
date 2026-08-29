@@ -950,6 +950,9 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 }
 
 func (r *AccountRef) InvalidateUsageStatusCache() {
+	if r == nil {
+		return
+	}
 	r.usageStatusMu.Lock()
 	defer r.usageStatusMu.Unlock()
 	r.usageStatusAt = time.Time{}

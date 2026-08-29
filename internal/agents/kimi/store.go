@@ -355,6 +355,7 @@ func (s Store) ListAccounts(_ context.Context) ([]account.Account, error) {
 		}
 		canonicalName, err := managedFilename(managedID)
 		if err != nil || entry.Name() != canonicalName {
+			listErrors = append(listErrors, fmt.Errorf("ignore noncanonical managed Kimi credential for %s", managedID))
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())

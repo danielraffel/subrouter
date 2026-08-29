@@ -1129,6 +1129,14 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
 			return
 		}
+		var inventoryErr *accountImportInventoryUnavailableError
+		if errors.As(err, &inventoryErr) {
+			if server.Logger != nil {
+				server.Logger.Error("tenant account inventory unavailable", "source", inventoryErr.source, "error", inventoryErr.err)
+			}
+			http.Error(w, inventoryErr.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "save account", http.StatusInternalServerError)
 		return
 	}
