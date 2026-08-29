@@ -188,19 +188,22 @@ func TestAccountImportPublicationFailurePreservesCredentials(t *testing.T) {
 func TestTenantAccountPublicationFailurePreservesCredentials(t *testing.T) {
 	t.Run("Codex OAuth repair", func(t *testing.T) {
 		server, store, _, _, _ := publicationFailingAccountServer(t)
+		const email = "owner@example.com"
+		beforeToken := proxyTestCodexJWT(email, "before", time.Now().Add(time.Hour))
 		before := accounts.StoredCodexAccount{
-			Email: "codex-owner", Label: "work", Provider: accounts.ProviderCodex,
+			Email: email, Label: "work", Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
-				AccessToken: "before-access", RefreshToken: "before-refresh", IDToken: "before-id",
+				AccessToken: beforeToken, RefreshToken: "before-refresh", IDToken: beforeToken,
 			}},
 		}
 		if err := store.SaveStored(before); err != nil {
 			t.Fatal(err)
 		}
-		response := serveTenantAccountUpload(&server, `{
-			"provider":"codex","accountId":"codex-owner","label":"work",
-			"tokens":{"accessToken":"after-access","refreshToken":"after-refresh","idToken":"after-id","accountID":"owner"}
-		}`)
+		afterToken := proxyTestCodexJWT(email, "after", time.Now().Add(time.Hour))
+		response := serveTenantAccountUpload(&server, fmt.Sprintf(`{
+			"provider":"codex","accountId":%q,"targetAccountId":%q,"label":"work",
+			"tokens":{"accessToken":%q,"refreshToken":"after-refresh","idToken":%q,"accountID":"owner"}
+		}`, email, email, afterToken, afterToken))
 		if response.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 		}

@@ -75,6 +75,14 @@ func newMultiTenantFixtureWithAccountImportToken(
 	t *testing.T,
 	accountImportToken string,
 ) (*tenant.Registry, http.Handler, func() string) {
+	return newMultiTenantFixtureWithTransport(t, accountImportToken, nil)
+}
+
+func newMultiTenantFixtureWithTransport(
+	t *testing.T,
+	accountImportToken string,
+	transport http.RoundTripper,
+) (*tenant.Registry, http.Handler, func() string) {
 	t.Helper()
 	var lastAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +110,7 @@ func newMultiTenantFixtureWithAccountImportToken(
 		Scheduler:          selectacct.NewScheduler(nil),
 		MaxBodyBytes:       1024,
 		AccountImportToken: accountImportToken,
+		Transport:          transport,
 	}
 	registry := tenant.NewRegistry(t.TempDir())
 	multi := &MultiTenant{Base: base, Registry: registry}
@@ -161,6 +170,25 @@ func TestTenantServerScopesKimiProfilesToTenantState(t *testing.T) {
 	entries, err := os.ReadDir(wantDir)
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("tenant Kimi credential was not stored under tenant state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestMultiTenantServingStoreDoesNotSyncInteractiveCodexAuth(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, _, err := registry.Create("read-only-serving-store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi := &MultiTenant{Base: Server{}, Registry: registry}
+	server, err := multi.newTenantServer(context.Background(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !server.AccountRef.store.DisableActiveAuthSync {
+		t.Fatal("tenant serving store can rewrite interactive Codex auth")
+	}
+	if !server.AccountRef.store.RequireIsolatedOAuth {
+		t.Fatal("tenant serving store accepts OAuth credentials without isolated provenance")
 	}
 }
 
@@ -495,6 +523,54 @@ func TestMultiTenantAccountImportUsesTenantKeyAndStaysInTenantPool(t *testing.T)
 	handler.ServeHTTP(globalResponse, global)
 	if globalResponse.Code != http.StatusUnauthorized {
 		t.Fatalf("unscoped import status = %d, want 401", globalResponse.Code)
+	}
+}
+
+func TestMultiTenantOAuthAccountImportRotatesUntrustedCredential(t *testing.T) {
+	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return usageOKResponse(), nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT("owner@example.com", "access-token", time.Now().Add(time.Hour)), idToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := fmt.Sprintf(`{
+		"provider":"codex",
+		"codex":{
+			"email":"owner@example.com",
+			"provider":"codex",
+			"oauthCredentialOrigin":"interactive-import",
+			"auth":{"auth_mode":"chatgpt","tokens":{
+				"access_token":%q,"refresh_token":"caller-refresh","id_token":%q
+			}}
+		}
+	}`, proxyTestCodexJWT("owner@example.com", "caller-access", time.Now().Add(time.Hour)), idToken)
+	request := httptest.NewRequest(http.MethodPost, "/t/"+key+"/_subrouter/account-import", strings.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("tenant OAuth import status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := (accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested ||
+		stored[0].Auth.Tokens == nil || stored[0].Auth.Tokens.RefreshToken != "server-refresh" {
+		t.Fatalf("tenant import stored caller-declared provenance: %#v", stored)
 	}
 }
 
@@ -1499,16 +1575,11 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 	path := "/t/" + key + "/_subrouter/accounts"
 	for _, id := range []string{"legacy-account-a", "legacy-account-b"} {
 		body := fmt.Sprintf(`{
-			"provider":"codex",
+			"provider":"openai-apikey",
 			"accountId":%q,
 			"label":"Shared account",
-			"tokens":{
-				"accessToken":"access-%s",
-				"refreshToken":"refresh-%s",
-				"idToken":"id-%s",
-				"accountID":"provider-%s"
-			}
-		}`, id, id, id, id, id)
+			"apiKey":"sk-%s"
+		}`, id, id)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(
 			response,
@@ -1539,6 +1610,345 @@ func TestTenantAccountUploadPreservesDistinctMigrationIDsAndLabels(t *testing.T)
 		if accounts[i].ID != id || accounts[i].Label != "Shared account" {
 			t.Fatalf("account %d = %#v", i, accounts[i])
 		}
+	}
+}
+
+func TestTenantCodexOAuthUploadRequiresServerAttestedTransfer(t *testing.T) {
+	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"refresh","id_token":%q}`,
+				proxyTestCodexJWT("owner@example.com", "access-token", time.Now().Add(time.Hour)),
+				proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour)),
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(`{
+			"provider":"codex",
+			"accountId":"unproven-account",
+			"label":"Unproven",
+			"oauthCredentialOrigin":"interactive-import",
+			"tokens":{
+				"accessToken":"access",
+				"refreshToken":"refresh",
+				"idToken":"id",
+				"accountID":"provider"
+			}
+		}`),
+	))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestTenantCodexAccountListSeparatesRoutingIDFromOAuthIdentity(t *testing.T) {
+	idToken := proxyTestCodexJWT("owner@example.com", "id-token", time.Now().Add(time.Hour))
+	var submittedRefresh string
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return usageOKResponse(), nil
+		}
+		var payload struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		submittedRefresh = payload.RefreshToken
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT("owner@example.com", "access-token", time.Now().Add(time.Hour)), idToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex",
+			"accountId":"stable-routing-id",
+			"label":"Production Codex",
+			"oauthCredentialOrigin":"interactive-import",
+			"tokens":{
+				"accessToken":"access",
+				"refreshToken":"refresh",
+				"idToken":%q,
+				"accountID":"provider-account"
+			}
+		}`, idToken)),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet,
+		"/t/"+key+"/_subrouter/accounts",
+		nil,
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var listed []struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != "stable-routing-id" || listed[0].Label != "Production Codex" || listed[0].Email != "owner@example.com" {
+		t.Fatalf("listed accounts = %#v", listed)
+	}
+	if submittedRefresh != "refresh" {
+		t.Fatalf("server attestation used refresh token %q, want submitted chain", submittedRefresh)
+	}
+	tenants, err := registry.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantRecord := tenants[0]
+	store := accounts.CodexStore{Dir: filepath.Join(registry.Dir(tenantRecord.ID), "codex", "accounts")}
+	storedAccounts, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(storedAccounts) != 1 ||
+		storedAccounts[0].OAuthCredentialOrigin != accounts.CodexOAuthOriginServerAttested ||
+		storedAccounts[0].Auth.Tokens == nil || storedAccounts[0].Auth.Tokens.RefreshToken != "server-refresh" {
+		t.Fatalf("stored credential was not server-attested: %#v", storedAccounts)
+	}
+}
+
+func TestTenantCodexRepairPreservesOAuthIdentity(t *testing.T) {
+	var refreshedIdentity = "owner@example.com"
+	var refreshCalls atomic.Int32
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost {
+			refreshCalls.Add(1)
+		}
+		idToken := proxyTestCodexJWT(refreshedIdentity, "id-token", time.Now().Add(time.Hour))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT(refreshedIdentity, "access-token", time.Now().Add(time.Hour)), idToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/t/" + key + "/_subrouter/accounts"
+	upload := func(identity, refreshToken, target string) *httptest.ResponseRecorder {
+		t.Helper()
+		idToken := proxyTestCodexJWT(identity, "submitted-id", time.Now().Add(time.Hour))
+		body := fmt.Sprintf(`{
+			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
+			"targetAccountID":%q,
+			"tokens":{"accessToken":%q,"refreshToken":%q,"idToken":%q}
+		}`,
+			target,
+			proxyTestCodexJWT(identity, "submitted-access", time.Now().Add(time.Hour)),
+			refreshToken,
+			idToken,
+		)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		return response
+	}
+
+	if response := upload("owner@example.com", "owner-refresh", ""); response.Code != http.StatusOK {
+		t.Fatalf("initial upload status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("initial refresh calls = %d, want 1", refreshCalls.Load())
+	}
+	if response := upload("owner@example.com", "duplicate-refresh", ""); response.Code != http.StatusConflict {
+		t.Fatalf("duplicate add status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("duplicate add consumed refresh token: calls = %d, want 1", refreshCalls.Load())
+	}
+	refreshedIdentity = "other@example.com"
+	response := upload("other@example.com", "other-refresh", "stable-routing-id")
+	if response.Code != http.StatusConflict {
+		t.Fatalf("cross-identity repair status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("cross-identity repair consumed refresh token: calls = %d, want 1", refreshCalls.Load())
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}
+	stored, found, err := store.FindStored("stable-routing-id")
+	if err != nil || !found {
+		t.Fatalf("find original account: found=%v err=%v", found, err)
+	}
+	identity, err := accounts.ExtractEmailFromJWT(stored.Auth.Tokens.IDToken)
+	if err != nil || identity != "owner@example.com" {
+		t.Fatalf("cross-identity repair changed stored identity: identity=%q err=%v", identity, err)
+	}
+}
+
+func TestTenantCodexRepairUsesCanonicalStoredIDForPartialSelector(t *testing.T) {
+	const canonicalID = "owner@example.com"
+	identityToken := proxyTestCodexJWT(canonicalID, "id-token", time.Now().Add(time.Hour))
+	transport := proxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return usageOKResponse(), nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT(canonicalID, "access-token", time.Now().Add(time.Hour)), identityToken,
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts")}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: canonicalID, Provider: accounts.ProviderCodex,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginServerAttested,
+		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
+			AccessToken:  proxyTestCodexJWT(canonicalID, "old-access", time.Now().Add(time.Hour)),
+			RefreshToken: "old-refresh", IDToken: identityToken,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	submittedID := proxyTestCodexJWT(canonicalID, "submitted-id", time.Now().Add(time.Hour))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex","accountId":"owner","targetAccountID":"owner","label":"Owner",
+			"tokens":{"accessToken":"access","refreshToken":"replacement-refresh","idToken":%q}
+		}`, submittedID)),
+	))
+	if response.Code != http.StatusOK {
+		t.Fatalf("partial repair status = %d, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].Email != canonicalID ||
+		stored[0].Auth.Tokens == nil || stored[0].Auth.Tokens.RefreshToken != "server-refresh" {
+		t.Fatalf("partial repair did not update canonical account: %#v", stored)
+	}
+}
+
+func TestTenantCodexUploadRejectsMalformedRefreshedIdentity(t *testing.T) {
+	var refreshCalls atomic.Int32
+	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		refreshCalls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"access_token":"access","refresh_token":"server-refresh","id_token":"not-a-jwt"}`,
+			)),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
+			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":%q}
+		}`, proxyTestCodexJWT("owner@example.com", "submitted-id", time.Now().Add(time.Hour)))),
+	))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("malformed identity status = %d, want 400, body = %s", response.Code, response.Body.String())
+	}
+	if refreshCalls.Load() != 1 {
+		t.Fatalf("refresh calls = %d, want provider response validation", refreshCalls.Load())
+	}
+	stored, err := (accounts.CodexStore{
+		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),
+	}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("malformed refreshed identity stored an account: %#v", stored)
+	}
+}
+
+func TestTenantCodexUploadRejectsIdentityChangedByRefresh(t *testing.T) {
+	transport := proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"server-refresh","id_token":%q}`,
+				proxyTestCodexJWT("other@example.com", "access-token", time.Now().Add(time.Hour)),
+				proxyTestCodexJWT("other@example.com", "id-token", time.Now().Add(time.Hour)),
+			))),
+		}, nil
+	})
+	registry, handler, _ := newMultiTenantFixtureWithTransport(t, "", transport)
+	created, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	submittedID := proxyTestCodexJWT("owner@example.com", "submitted-id", time.Now().Add(time.Hour))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts",
+		strings.NewReader(fmt.Sprintf(`{
+			"provider":"codex","accountId":"stable-routing-id","label":"Production Codex",
+			"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":%q}
+		}`, submittedID)),
+	))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("changed identity status = %d, want 409, body = %s", response.Code, response.Body.String())
+	}
+	stored, err := (accounts.CodexStore{
+		Dir: filepath.Join(registry.Dir(created.ID), "codex", "accounts"),
+	}).ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("identity-changing refresh stored an account: %#v", stored)
 	}
 }
 
@@ -1626,15 +2036,10 @@ func TestTenantMigrationBatchStaysInactiveUntilAtomicActivation(t *testing.T) {
 	stage := request(basePath+"/migration/stage", `{
 		"migrationId":"legacy-team",
 		"accounts":[{
-			"provider":"codex",
+			"provider":"openai-apikey",
 			"accountId":"legacy-account",
 			"label":"Shared account",
-			"tokens":{
-				"accessToken":"access",
-				"refreshToken":"refresh",
-				"idToken":"id",
-				"accountID":"provider"
-			}
+			"apiKey":"sk-test"
 		}]
 	}`)
 	if stage.Code != http.StatusOK {
@@ -1670,6 +2075,30 @@ func TestTenantMigrationBatchStaysInactiveUntilAtomicActivation(t *testing.T) {
 	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, basePath, nil))
 	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
 		t.Fatalf("rolled-back account remained active: %d %s", list.Code, list.Body.String())
+	}
+}
+
+func TestTenantMigrationRejectsUnattestedCodexOAuth(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	_, key, err := registry.Create("team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(
+		http.MethodPost,
+		"/t/"+key+"/_subrouter/accounts/migration/stage",
+		strings.NewReader(`{
+			"migrationId":"legacy-team",
+			"accounts":[{
+				"provider":"codex","accountId":"legacy-account","label":"Legacy",
+			"oauthCredentialOrigin":"interactive-import",
+				"tokens":{"accessToken":"access","refreshToken":"refresh","idToken":"id"}
+			}]
+		}`),
+	))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "server-attested") {
+		t.Fatalf("migration OAuth stage = %d %s", response.Code, response.Body.String())
 	}
 }
 

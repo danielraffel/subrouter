@@ -1091,6 +1091,7 @@ func TestIsTerminalCredentialError(t *testing.T) {
 		{fmt.Errorf("Kimi credential for kimi-subscription:work was not found"), true},
 		{fmt.Errorf("Grok subscription credential was not found"), true},
 		{fmt.Errorf("Antigravity keychain credential is missing"), true},
+		{&accounts.CodexUnisolatedCredentialError{}, true},
 		{fmt.Errorf("dial tcp: connection refused"), false},
 		{context.Canceled, false},
 		{context.DeadlineExceeded, false},
@@ -1462,6 +1463,10 @@ func TestClaudeFailoverTriesRecoveredAccount(t *testing.T) {
 // shorten a header-derived expiry.
 func TestMarkTTLSelection(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
+	server.AccountRef = &AccountRef{accounts: []accounts.Account{
+		accounts.Account{ID: "dead@example.com", Provider: accounts.ProviderClaude, Token: "dead-token"},
+		accounts.Account{ID: "invalid@example.com", Provider: accounts.ProviderClaude, Token: "invalid-token"},
+	}}
 	resetEpoch := time.Now().Add(48 * time.Hour).Unix()
 	h := http.Header{}
 	h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
@@ -1489,12 +1494,18 @@ func TestMarkTTLSelection(t *testing.T) {
 	}
 
 	// Terminal refresh failure: credential TTL; transient: short default.
-	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "invalid@example.com", "", fmt.Errorf("400 Bad Request: invalid_grant"))
+	server.markAccountExhaustedRefreshFailure(
+		accounts.Account{ID: "invalid@example.com", Provider: accounts.ProviderClaude, Token: "invalid-token"},
+		fmt.Errorf("400 Bad Request: invalid_grant"),
+	)
 	invUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "invalid@example.com", "")
 	if time.Until(invUntil) < 50*time.Minute {
 		t.Fatalf("terminal refresh mark in %v, want ~1h", time.Until(invUntil))
 	}
-	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "blip@example.com", "", fmt.Errorf("dial tcp: connection refused"))
+	server.markAccountExhaustedRefreshFailure(
+		accounts.Account{ID: "blip@example.com", Provider: accounts.ProviderClaude},
+		fmt.Errorf("dial tcp: connection refused"),
+	)
 	blipUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "blip@example.com", "")
 	if time.Until(blipUntil) > 15*time.Minute {
 		t.Fatalf("transient refresh mark in %v, want ~10m default", time.Until(blipUntil))

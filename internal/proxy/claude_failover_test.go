@@ -130,6 +130,10 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	if _, err := io.Copy(io.Discard, response.Body); err != nil {
 		t.Fatal(err)
 	}
+	routed, ok := routedResponseAccount(response)
+	if !ok || routed.ID != "fresh@example.com" {
+		t.Fatalf("final response account = %+v, %t; want fresh account", routed, ok)
+	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (429 then retry)", stub.calls)
 	}

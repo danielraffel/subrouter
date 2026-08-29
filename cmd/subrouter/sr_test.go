@@ -1509,7 +1509,7 @@ func TestSRSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	}
 }
 
-func TestSRAddRestoresPreviouslyActiveAccount(t *testing.T) {
+func TestSRAddUsesIsolatedLoginAndLeavesActiveAccountUnchanged(t *testing.T) {
 	home := t.TempDir()
 	xdgData := t.TempDir()
 	piDir := filepath.Join(home, "pi-agent")
@@ -1554,13 +1554,17 @@ func TestSRAddRestoresPreviouslyActiveAccount(t *testing.T) {
 	if email != "alice@example.com" {
 		t.Fatalf("active email = %q, want alice@example.com", email)
 	}
-	if _, found, err := store.FindStored("founders@example.com"); err != nil {
+	added, found, err := store.FindStored("founders@example.com")
+	if err != nil {
 		t.Fatal(err)
 	} else if !found {
 		t.Fatal("newly logged-in account was not imported")
 	}
-	if !strings.Contains(out.String(), "Restored active account: alice@example.com") {
-		t.Fatalf("missing restore message:\n%s", out.String())
+	if added.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("OAuth origin = %q, want isolated server login", added.OAuthCredentialOrigin)
+	}
+	if !strings.Contains(out.String(), "Local Codex auth was left unchanged") {
+		t.Fatalf("missing isolation message:\n%s", out.String())
 	}
 }
 
@@ -2778,8 +2782,9 @@ func installFakeCodexLogin(t *testing.T, home string, auth accounts.CodexAuthFil
 	}
 	script := "#!/bin/sh\n" +
 		"test \"$1\" = login || exit 2\n" +
-		"mkdir -p \"$HOME/.codex\"\n" +
-		"cat > \"$HOME/.codex/auth.json\" <<'JSON'\n" +
+		"codex_home=${CODEX_HOME:-$HOME/.codex}\n" +
+		"mkdir -p \"$codex_home\"\n" +
+		"cat > \"$codex_home/auth.json\" <<'JSON'\n" +
 		string(body) + "\nJSON\n"
 	path := filepath.Join(binDir, "codex")
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {

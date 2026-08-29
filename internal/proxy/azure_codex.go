@@ -977,7 +977,7 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
-	return fallback, nil
+	return tagRoutedResponseAccount(fallback, accounts.Account{Provider: accounts.ProviderCodex}), nil
 }
 
 // azureCodexOverloadSniffBytes bounds how much of a pool SSE stream the

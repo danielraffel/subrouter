@@ -25,7 +25,10 @@ type srAutoSwitchConfig struct {
 	SchedulerRef         *selectacct.SchedulerRef
 	Logger               *slog.Logger
 	FetchScores          func(context.Context, []accounts.Account) ([]selectacct.Score, int)
-	SwitchActive         func(context.Context, string) error
+	// SwitchActive is an explicit account-manager hook used by callers and
+	// tests that intentionally synchronize interactive auth. Nil keeps the
+	// sweep read-only while still publishing fresh routing scores.
+	SwitchActive func(context.Context, string) error
 	// Lease keeps the sweep singleton across concurrently live workers.
 	Lease srAutoSwitchLease
 }
@@ -66,36 +69,6 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	if fetchScores == nil {
 		fetchScores = fetchCodexScoresWithSuccess
 	}
-	switchActive := cfg.SwitchActive
-	if switchActive == nil {
-		switchActive = func(ctx context.Context, accountID string) error {
-			store := accounts.DefaultCodexStore()
-			stored, ok, err := store.FindStored(accountID)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return fmt.Errorf("account %q not found", accountID)
-			}
-			refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr-auto-switch")
-			refreshed, _, err := store.RefreshStoredIfExpired(refreshCtx, nil, stored)
-			if err == nil {
-				stored = refreshed
-			} else {
-				logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch token refresh failed, using cached tokens", "account", accountID, "error", err)
-			}
-			if err := accounts.WriteActiveCodexAuth(stored.Auth); err != nil {
-				return err
-			}
-			for _, result := range syncCodexCompatibleAuth(stored) {
-				if result.Err != nil {
-					logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch compatible auth sync failed", "tool", result.Tool, "error", result.Err)
-				}
-			}
-			return nil
-		}
-	}
-
 	allAccounts := cfg.Accounts
 	accountGeneration := uint64(0)
 	if cfg.AccountsSnapshotFunc != nil {
@@ -136,8 +109,10 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 		}
 		logSRAutoSwitch(cfg.Logger, slog.LevelWarn, "sr auto-switch selected account below new-session headroom threshold", "account", picked.ID, "threshold", selectacct.MinNewSessionHeadroom)
 	}
-	if err := switchActive(ctx, picked.ID); err != nil {
-		return "", err
+	if cfg.SwitchActive != nil {
+		if err := cfg.SwitchActive(ctx, picked.ID); err != nil {
+			return "", err
+		}
 	}
 	return picked.ID, nil
 }

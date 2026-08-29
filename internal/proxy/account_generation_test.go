@@ -116,3 +116,59 @@ func TestOlderUsageRefreshCannotOverwriteNewerAccountReload(t *testing.T) {
 		t.Fatalf("older refresh overwrote reloaded scheduler: new-account headroom = %v, want 0.42", got.Headroom)
 	}
 }
+
+func TestGenericReloadPreservesUnchangedTerminalCredentialState(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	stored := proxyStoredOAuthAccount("dead@example.com", "dead", time.Now().Add(time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := loaded[0]
+	ref := NewAccountRef(store, loaded, nil)
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	ref.noteCredResult(account, errors.New("invalid_grant"))
+	scheduler.MarkExhaustedUntil(account.Provider, account.ID, "", time.Now().Add(time.Hour))
+	server := Server{AccountRef: ref, SchedulerRef: scheduler, CredentialBroker: &fakeCredentialBroker{}}
+
+	if _, _, err := server.reloadAccounts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, dead := ref.terminalCredFailure(account); !dead {
+		t.Fatal("generic reload cleared an unchanged terminal credential failure")
+	}
+	if _, exhausted := scheduler.ExhaustedUntilFor(account.Provider, account.ID, ""); !exhausted {
+		t.Fatal("generic reload cleared an unchanged credential exclusion")
+	}
+}
+
+func TestTerminalCredentialFailureIsScopedToCredentialToken(t *testing.T) {
+	old := accounts.Account{
+		ID: "repaired@example.com", Provider: accounts.ProviderCodex, Token: "same-access-token",
+		CredentialVersion: "old-refresh-chain",
+	}
+	replacement := old
+	replacement.CredentialVersion = "replacement-refresh-chain"
+	ref := &AccountRef{}
+
+	ref.noteCredResult(old, errors.New("invalid_grant"))
+	if _, dead := ref.terminalCredFailure(replacement); dead {
+		t.Fatal("replacement inherited the old credential's terminal failure")
+	}
+
+	// A late result from work that captured the old credential stays attached
+	// to that credential and cannot poison the replacement.
+	ref.noteCredResult(old, errors.New("invalid_grant"))
+	if _, dead := ref.terminalCredFailure(replacement); dead {
+		t.Fatal("late old-credential failure poisoned the replacement")
+	}
+
+	ref.noteCredResult(replacement, errors.New("invalid_grant"))
+	if _, dead := ref.terminalCredFailure(replacement); !dead {
+		t.Fatal("replacement's own terminal failure was not remembered")
+	}
+}

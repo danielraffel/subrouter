@@ -44,6 +44,7 @@ type SharedAccount struct {
 	ID        string `json:"id"`
 	Kind      string `json:"kind"`
 	Label     string `json:"label,omitempty"`
+	Email     string `json:"email,omitempty"`
 	CreatedAt string `json:"createdAt,omitempty"`
 	Health    *struct {
 		OK      bool   `json:"ok"`
@@ -70,6 +71,7 @@ type LeaseRequest struct {
 
 type Lease struct {
 	ID                   string
+	SessionToken         string
 	Account              account.Account
 	CredentialGeneration int
 	IssuedAt             time.Time
@@ -114,6 +116,7 @@ type leaseWire struct {
 	IssuedAt             string `json:"issuedAt"`
 	ExpiresAt            string `json:"expiresAt"`
 	CredentialExpiresAt  string `json:"credentialExpiresAt,omitempty"`
+	SessionToken         string `json:"sessionToken,omitempty"`
 }
 
 func (wire *leaseWire) UnmarshalJSON(data []byte) error {
@@ -152,10 +155,12 @@ type Client struct {
 	Config     Config
 	HTTPClient *http.Client
 
-	mu         sync.Mutex
-	cache      map[string]Lease
-	leaseToKey map[string]string
-	leaseRefs  map[string]leaseRef
+	mu             sync.Mutex
+	cache          map[string]Lease
+	leaseToKey     map[string]string
+	leaseRefs      map[string]leaseRef
+	sessionTokens  map[string]leaseSessionToken
+	sessionFlights map[string]chan struct{}
 }
 
 type UsageStatus struct {
@@ -190,15 +195,37 @@ type leaseRef struct {
 	ExpiresAt            time.Time
 }
 
+type leaseSessionToken struct {
+	value     string
+	expiresAt time.Time
+}
+
+// Session capabilities are cheap, process-local routing hints. Retaining one
+// for an hour comfortably spans lease renewal while bounding client memory.
+const cachedLeaseSessionTokenTTL = time.Hour
+
+// HTTPStatusError preserves retry metadata across the hosted broker boundary.
+type HTTPStatusError struct {
+	StatusCode int
+	RetryAfter string
+	Message    string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("hosted Subrouter request failed (%d): %s", e.StatusCode, e.Message)
+}
+
 func NewClient(config Config) *Client {
 	return &Client{
 		Config: config.Normalized(),
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		cache:      map[string]Lease{},
-		leaseToKey: map[string]string{},
-		leaseRefs:  map[string]leaseRef{},
+		cache:          map[string]Lease{},
+		leaseToKey:     map[string]string{},
+		leaseRefs:      map[string]leaseRef{},
+		sessionTokens:  map[string]leaseSessionToken{},
+		sessionFlights: map[string]chan struct{}{},
 	}
 }
 
@@ -259,7 +286,7 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 				label = item.ID
 			}
 			out = append(out, SharedAccount{
-				ID: item.ID, Kind: kind, Label: label, Health: item.Health,
+				ID: item.ID, Kind: kind, Label: label, Email: item.Email, Health: item.Health,
 			})
 		}
 		return out, nil
@@ -414,11 +441,11 @@ func (c *Client) doHostedJSON(
 		if message == "" {
 			message = "request failed"
 		}
-		return fmt.Errorf(
-			"hosted Subrouter request failed (%d): %s",
-			response.StatusCode,
-			message,
-		)
+		return &HTTPStatusError{
+			StatusCode: response.StatusCode,
+			RetryAfter: response.Header.Get("Retry-After"),
+			Message:    message,
+		}
 	}
 	if out == nil || len(data) == 0 {
 		return nil
@@ -431,31 +458,71 @@ func (c *Client) doHostedJSON(
 
 func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	key := leaseCacheKey(input)
-	now := time.Now()
-	c.mu.Lock()
-	for leaseID, ref := range c.leaseRefs {
-		if now.Before(ref.ExpiresAt) {
-			continue
+	sessionKey := leaseSessionKey(input)
+	var sessionToken string
+	var releaseSessionFlight func()
+	for {
+		now := time.Now()
+		c.mu.Lock()
+		for leaseID, ref := range c.leaseRefs {
+			if now.Before(ref.ExpiresAt) {
+				continue
+			}
+			delete(c.leaseRefs, leaseID)
+			delete(c.leaseToKey, leaseID)
 		}
-		delete(c.leaseRefs, leaseID)
-		delete(c.leaseToKey, leaseID)
-	}
-	for cacheKey, cached := range c.cache {
-		if now.Add(15 * time.Second).Before(cached.ExpiresAt) {
-			continue
+		for cacheKey, cached := range c.cache {
+			if now.Add(15 * time.Second).Before(cached.ExpiresAt) {
+				continue
+			}
+			delete(c.cache, cacheKey)
 		}
-		delete(c.cache, cacheKey)
-	}
-	if cached, ok := c.cache[key]; ok && now.Add(15*time.Second).Before(cached.ExpiresAt) {
+		for tokenKey, token := range c.sessionTokens {
+			if !now.Before(token.expiresAt) {
+				delete(c.sessionTokens, tokenKey)
+			}
+		}
+		if cached, ok := c.cache[key]; ok && now.Add(15*time.Second).Before(cached.ExpiresAt) {
+			c.mu.Unlock()
+			return cached, nil
+		}
+		sessionToken = c.sessionTokens[sessionKey].value
+		if sessionToken != "" {
+			c.mu.Unlock()
+			break
+		}
+		if flight := c.sessionFlights[sessionKey]; flight != nil {
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return Lease{}, ctx.Err()
+			case <-flight:
+				continue
+			}
+		}
+		flight := make(chan struct{})
+		c.sessionFlights[sessionKey] = flight
 		c.mu.Unlock()
-		return cached, nil
+		releaseSessionFlight = func() {
+			c.mu.Lock()
+			if c.sessionFlights[sessionKey] == flight {
+				delete(c.sessionFlights, sessionKey)
+				close(flight)
+			}
+			c.mu.Unlock()
+		}
+		break
 	}
-	c.mu.Unlock()
-
+	if releaseSessionFlight != nil {
+		defer releaseSessionFlight()
+	}
 	body := map[string]any{
 		"provider":  input.Provider,
 		"agentType": input.AgentType,
 		"sessionId": input.SessionID,
+	}
+	if sessionToken != "" {
+		body["sessionToken"] = sessionToken
 	}
 	if input.UserEmail != "" {
 		body["userEmail"] = input.UserEmail
@@ -490,6 +557,11 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 		)
 	}
 	c.mu.Lock()
+	if lease.SessionToken != "" {
+		c.sessionTokens[sessionKey] = leaseSessionToken{
+			value: lease.SessionToken, expiresAt: time.Now().Add(cachedLeaseSessionTokenTTL),
+		}
+	}
 	c.cache[key] = lease
 	c.leaseToKey[lease.ID] = key
 	c.leaseRefs[lease.ID] = leaseRef{
@@ -650,6 +722,9 @@ func parseLease(raw leaseWire) (Lease, error) {
 	if raw.LeaseID == "" || raw.AccountID == "" || raw.Token == "" {
 		return Lease{}, errors.New("cmux.com returned an incomplete credential lease")
 	}
+	if len(raw.SessionToken) > 128 {
+		return Lease{}, errors.New("cmux.com returned an invalid lease session token")
+	}
 	provider := account.Provider(raw.Provider)
 	if provider != account.ProviderCodex && provider != account.ProviderClaude &&
 		provider != account.ProviderQwenToken && provider != account.ProviderQwenAnthropic {
@@ -675,7 +750,7 @@ func parseLease(raw leaseWire) (Lease, error) {
 		}
 	}
 	return Lease{
-		ID: raw.LeaseID,
+		ID: raw.LeaseID, SessionToken: raw.SessionToken,
 		Account: account.Account{
 			ID:        raw.AccountID,
 			Provider:  provider,
@@ -702,6 +777,14 @@ func leaseCacheKey(input LeaseRequest) string {
 		input.UserEmail,
 		input.PreferAccountID,
 		input.Model,
+	}, "\x00")
+}
+
+func leaseSessionKey(input LeaseRequest) string {
+	return strings.Join([]string{
+		string(input.Provider),
+		input.AgentType,
+		input.SessionID,
 	}, "\x00")
 }
 

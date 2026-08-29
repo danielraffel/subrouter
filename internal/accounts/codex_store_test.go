@@ -8,6 +8,24 @@ import (
 	"time"
 )
 
+func TestStoredOAuthAccountKeepsRoutingIDSeparateFromLoginIdentity(t *testing.T) {
+	stored := StoredCodexAccount{
+		Email: "stable-routing-id",
+		Label: "Production Codex",
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "access", RefreshToken: "refresh",
+			IDToken: testJWT("owner@example.com", time.Now().Add(time.Hour)),
+		}},
+	}
+	account, ok := stored.Account("test")
+	if !ok {
+		t.Fatal("stored OAuth account was not usable")
+	}
+	if account.ID != "stable-routing-id" || account.Email != "owner@example.com" || account.Label != "Production Codex" {
+		t.Fatalf("account = %#v", account)
+	}
+}
+
 func TestCodexStoreMigrationBatchVisibilityIsAtomicForConcurrentReaders(t *testing.T) {
 	store := CodexStore{Dir: t.TempDir()}
 	const accountCount = 64
