@@ -72,6 +72,45 @@ func TestTailscaleServerURLPreservesURLShape(t *testing.T) {
 	}
 }
 
+func TestTailscaleServerURLParseErrorRedactsStoredURLAndTenantKey(t *testing.T) {
+	secret := "srt_super_secret"
+	storedURL := "http://user:" + secret + "@host.invalid/%zz/t/" + secret
+	_, err := tailscaleServerURLs(storedURL, tailscaleNodeStatus{ID: "node-1", DNSName: "current.example."})
+	if err == nil {
+		t.Fatal("malformed stored URL unexpectedly parsed")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "user:") || strings.Contains(err.Error(), "%zz") {
+		t.Fatalf("parse error leaked stored URL or key: %v", err)
+	}
+	if !strings.Contains(err.Error(), "value redacted") {
+		t.Fatalf("parse error = %v, want explicit redaction", err)
+	}
+}
+
+func TestHealTailscaleServerParseErrorRedactsStoredURLAndTenantKey(t *testing.T) {
+	secret := "srt_super_secret"
+	server := srServerConfig{
+		Name: "team", URL: "http://host.invalid/%zz/t/" + secret,
+		TenantKey: secret, TailscaleNodeID: "node-1",
+	}
+	status, err := json.Marshal(tailscaleStatusDocument{Peer: map[string]tailscaleNodeStatus{
+		"peer": {ID: "node-1", DNSName: "current.example."},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warnings bytes.Buffer
+	_, err = healTailscaleServer(t.Context(), srServerStore{}, server, &http.Client{}, &warnings,
+		func(context.Context) ([]byte, error) { return status, nil })
+	if err == nil {
+		t.Fatal("malformed stored URL unexpectedly healed")
+	}
+	combined := err.Error() + "\n" + warnings.String()
+	if strings.Contains(combined, secret) || strings.Contains(combined, "%zz") {
+		t.Fatalf("repair diagnostics leaked stored URL or key: %s", combined)
+	}
+}
+
 func TestHealTailscaleServerRepairsExactHealthyNode(t *testing.T) {
 	t.Parallel()
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

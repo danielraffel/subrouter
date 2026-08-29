@@ -479,15 +479,16 @@ func TestDirectOpenAIAPIKeyRepairRejectsAnthropicPrefix(t *testing.T) {
 	}
 }
 
-func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T) {
-	env := cloudClaudeEnvironment([]string{
+func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
+	env := claudeSettingsChildEnvironment([]string{
 		"PATH=/usr/bin",
 		"ANTHROPIC_BASE_URL=https://remote.example",
 		"ANTHROPIC_AUTH_TOKEN=old-token",
 		"ANTHROPIC_API_KEY=sk-ant-secret",
 		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK=1",
-	}, "http://127.0.0.1:31415/v1", "stack-local-token")
+		"CLAUDE_CONFIG_DIR=/personal/profile",
+	}, "http://127.0.0.1:31415/v1", "/isolated/profile")
 	joined := strings.Join(env, "\n")
 	for _, banned := range []string{
 		"https://remote.example",
@@ -495,18 +496,21 @@ func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T)
 		"sk-ant-secret",
 		"X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK",
+		"ANTHROPIC_BASE_URL=",
+		"ANTHROPIC_AUTH_TOKEN=",
+		"ANTHROPIC_CUSTOM_HEADERS=",
+		"/personal/profile",
 	} {
 		if strings.Contains(joined, banned) {
-			t.Fatalf("cloud Claude env retained %q:\n%s", banned, joined)
+			t.Fatalf("settings-routed Claude env retained %q:\n%s", banned, joined)
 		}
 	}
 	for _, want := range []string{
-		"ANTHROPIC_BASE_URL=http://127.0.0.1:31415",
-		"ANTHROPIC_AUTH_TOKEN=stack-local-token",
-		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: claude",
+		"PATH=/usr/bin",
+		"CLAUDE_CONFIG_DIR=/isolated/profile",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("cloud Claude env missing %q:\n%s", want, joined)
+			t.Fatalf("settings-routed Claude env missing %q:\n%s", want, joined)
 		}
 	}
 }

@@ -256,12 +256,7 @@ func (r srRunner) runProxyClaude(
 }
 
 func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir string) error {
-	settingsPath, err := proxyClaudeLaunchSettings(baseURL, proxyToken)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(settingsPath)
-	launchArgs, err := managedClaudeLaunchArgs(args, settingsPath)
+	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken)
 	if err != nil {
 		return err
 	}
@@ -269,21 +264,25 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd := exec.CommandContext(ctx, claudePath)
+	settingsArg, cleanupSettings, err := attachClaudeLaunchSettings(cmd, settingsBody)
+	if err != nil {
+		return err
+	}
+	defer cleanupSettings()
+	launchArgs, err := managedClaudeLaunchArgs(args, settingsArg)
+	if err != nil {
+		return err
+	}
+	cmd.Args = append([]string{claudePath}, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 
-	env := cloudClaudeEnvironment(
-		os.Environ(),
-		baseURL,
-		proxyToken,
-	)
-	env = directPlainHTTPEnvironment(env, baseURL)
-	if configDir != "" {
-		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
-	}
-	cmd.Env = env
+	// The authoritative private settings file carries every routing value. Keep the
+	// child environment credential-free so tenant URLs and keys cannot be read
+	// through process inspection or inherited by subprocesses.
+	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
 	return cmd.Run()
 }
 
@@ -332,17 +331,13 @@ func proxyClaudeInvocation(
 	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
 }
 
-func cloudClaudeEnvironment(
-	environ []string,
-	baseURL string,
-	proxyToken string,
-) []string {
-	baseURL = strings.TrimRight(baseURL, "/")
-	baseURL = strings.TrimSuffix(baseURL, "/v1")
+func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
 	env := envWithout(environ, claudeRoutingEnvKeys)
-	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
-	env = upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", proxyToken)
-	return upsertEnv(env, "ANTHROPIC_CUSTOM_HEADERS", "X-Subrouter-Agent: claude")
+	env = directPlainHTTPEnvironment(env, baseURL)
+	if configDir != "" {
+		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
+	}
+	return env
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -538,23 +533,15 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 				)
 			}
 			// A persistent generation-path failure would make the normal published
-			// rollback fail for the same reason as both completion attempts. Under
-			// the account transaction lock, remove the credential first, then publish
-			// its deletion; workers still hold only the credential-less generation.
+			// rollback fail for the same reason as both completion attempts. Journal
+			// the exact profile identity before removing it so a restarted worker can
+			// complete the deletion while every worker remains fail-closed.
 			rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
-			var cleanupErr error
-			rollbackErr := proxy.RollbackUnpublishedAccountDiskMutation(rollbackCtx, r.store.Dir, func() error {
-				removed, removeErr := r.removeUnpublishedProfile(rollbackCtx, name)
-				if removed {
-					// The registry removal committed. Let the publication helper expose
-					// that durable state, then surface any incomplete secret cleanup.
-					cleanupErr = removeErr
-					return nil
-				}
-				return removeErr
-			})
+			removed, rollbackErr := proxy.RollbackUnpublishedClaudeProfileDiskMutation(rollbackCtx, r.store.Dir, name)
 			rollbackCancel()
-			rollbackErr = errors.Join(cleanupErr, rollbackErr)
+			if !removed && rollbackErr == nil {
+				rollbackErr = fmt.Errorf("Claude profile %q was not present for unpublished rollback", name)
+			}
 			return errors.Join(
 				fmt.Errorf("publish completed Claude profile: %w", err),
 				fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
@@ -973,28 +960,31 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		}
 	}
 	launchArgs := extra
-	launchSettingsPath := ""
+	var launchSettingsBody []byte
 	if secureBaseURL != "" {
 		settingsOverride, settingsErr := managedClaudeLaunchSettings(secureBaseURL)
 		if settingsErr != nil {
 			return settingsErr
 		}
-		launchSettingsPath = settingsOverride
-		defer os.Remove(launchSettingsPath)
-		launchArgs, err = managedClaudeLaunchArgs(extra, settingsOverride)
+		launchSettingsBody = settingsOverride
+	}
+	cmd := exec.CommandContext(ctx, claudePath)
+	if len(launchSettingsBody) > 0 {
+		settingsArg, cleanupSettings, settingsErr := attachClaudeLaunchSettings(cmd, launchSettingsBody)
+		if settingsErr != nil {
+			return settingsErr
+		}
+		defer cleanupSettings()
+		launchArgs, err = managedClaudeLaunchArgs(extra, settingsArg)
 		if err != nil {
 			return err
 		}
 	}
-	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd.Args = append([]string{claudePath}, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	env := claude.EnvForConfigDir(configDir)
-	if secureBaseURL != "" {
-		env = upsertEnv(env, "ANTHROPIC_BASE_URL", secureBaseURL)
-	}
-	cmd.Env = directPlainHTTPEnvironment(env, secureBaseURL)
+	cmd.Env = claudeSettingsChildEnvironment(claude.EnvForConfigDir(configDir), secureBaseURL, configDir)
 	return cmd.Run()
 }
 
@@ -1145,44 +1135,25 @@ func managedClaudeProfileLaunchMode(configDir string) (managedClaudeLaunchMode, 
 	return managedClaudeLaunchDirect, nil
 }
 
-func managedClaudeLaunchSettings(secureBaseURL string) (string, error) {
-	return temporaryClaudeLaunchSettings(map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
+func managedClaudeLaunchSettings(secureBaseURL string) ([]byte, error) {
+	return claudeLaunchSettingsJSON(map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
 }
 
-func proxyClaudeLaunchSettings(baseURL, proxyToken string) (string, error) {
+func proxyClaudeLaunchSettings(baseURL, proxyToken string) ([]byte, error) {
 	baseURL = strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
-	return temporaryClaudeLaunchSettings(map[string]string{
+	return claudeLaunchSettingsJSON(map[string]string{
 		"ANTHROPIC_BASE_URL":       baseURL,
 		"ANTHROPIC_AUTH_TOKEN":     proxyToken,
 		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
 	})
 }
 
-func temporaryClaudeLaunchSettings(env map[string]string) (string, error) {
+func claudeLaunchSettingsJSON(env map[string]string) ([]byte, error) {
 	override, err := json.Marshal(map[string]any{"env": env})
 	if err != nil {
-		return "", fmt.Errorf("encode managed Claude launch settings: %w", err)
+		return nil, fmt.Errorf("encode managed Claude launch settings: %w", err)
 	}
-	file, err := os.CreateTemp("", "subrouter-claude-settings-*.json")
-	if err != nil {
-		return "", fmt.Errorf("create managed Claude launch settings: %w", err)
-	}
-	path := file.Name()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return "", err
-	}
-	if _, err := file.Write(override); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return "", err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	return path, nil
+	return override, nil
 }
 
 // claudeAWS launches Claude Code in Amazon Bedrock gateway mode, routed through

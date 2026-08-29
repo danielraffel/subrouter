@@ -206,6 +206,46 @@ func TestPollBacksOffOnSlowDown(t *testing.T) {
 	}
 }
 
+func TestPollHonoursRetryAfterAndSlowDownIncrementTogether(t *testing.T) {
+	reference := time.Unix(100, 0)
+	code := Code{DeviceCode: "device", Interval: 2 * time.Second, ExpiresAt: reference.Add(time.Minute)}
+	for _, test := range []struct {
+		name       string
+		retryAfter string
+		wantDelay  time.Duration
+	}{
+		{name: "server delay is longer", retryAfter: "30", wantDelay: 30 * time.Second},
+		{name: "RFC increment is longer", retryAfter: "3", wantDelay: 7 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				if calls == 1 {
+					w.Header().Set("Retry-After", test.retryAfter)
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":"slow_down"}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"access_token":"approved"}`))
+			}))
+			defer server.Close()
+			var delays []time.Duration
+			_, err := Poll(t.Context(), server.Client(), Config{ClientID: "client", TokenURL: server.URL}, code,
+				func(_ context.Context, delay time.Duration) error {
+					delays = append(delays, delay)
+					return nil
+				}, func() time.Time { return reference })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(delays) != 2 || delays[0] != 2*time.Second || delays[1] != test.wantDelay {
+				t.Fatalf("poll delays = %v, want [2s %s]", delays, test.wantDelay)
+			}
+		})
+	}
+}
+
 func TestPollRetriesTransientEndpointFailures(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

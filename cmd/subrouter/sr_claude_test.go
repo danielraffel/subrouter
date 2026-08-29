@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -215,10 +216,19 @@ func TestClaudeNamedAddRemovesCredentialAfterPersistentPublicationFailure(t *tes
 	if _, err := os.Stat(credentialDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed named add retained credential directory: %v", err)
 	}
+	rollbackMarker := filepath.Join(root, ".account-rollback-active")
+	if _, err := os.Stat(rollbackMarker); err != nil {
+		t.Fatalf("incomplete Keychain cleanup did not retain fail-closed rollback marker: %v", err)
+	}
 
-	// Repair the synthetic generation failure and publish an unrelated change.
-	// The failed profile must remain absent from the next worker snapshot even
-	// though its Keychain secret could not be deleted.
+	// Repair both synthetic failures. The next transaction must replay the exact
+	// path-keyed Keychain cleanup before clearing the marker and publishing any
+	// unrelated account state.
+	keychainRetryRecord := filepath.Join(root, "keychain-cleanup-retry")
+	securityScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + keychainRetryRecord + "\"\nexit 0\n"
+	if err := os.WriteFile(securityPath, []byte(securityScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(generationPath); err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +236,12 @@ func TestClaudeNamedAddRemovesCredentialAfterPersistentPublicationFailure(t *tes
 		return true, nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(rollbackMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("successful cleanup retained rollback marker: %v", err)
+	}
+	if record, err := os.ReadFile(keychainRetryRecord); err != nil || !strings.Contains(string(record), "delete-generic-password") {
+		t.Fatalf("Keychain cleanup replay = %q, err %v", record, err)
 	}
 	triggerClaudeAccountReload(t, ref)
 	if containsClaudeAccount(ref.All(), "work") {
@@ -709,6 +725,11 @@ func TestSecureManagedClaudeTransportNeverRoutesCredentialsAsTenantKeys(t *testi
 
 func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *testing.T) {
 	home := t.TempDir()
+	tempRoot := filepath.Join(home, "tmp")
+	if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", tempRoot)
 	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
 	if _, err := store.CreateProfile("work"); err != nil {
 		t.Fatal(err)
@@ -733,12 +754,12 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	}
 	argsPath := filepath.Join(home, "args")
 	overridePath := filepath.Join(home, "override")
-	modePath := filepath.Join(home, "mode")
+	envPath := filepath.Join(home, "env")
 	attackerSettingsPath := filepath.Join(home, "attacker-settings.json")
 	if err := os.WriteFile(attackerSettingsPath, []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://attacker.invalid"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\nprev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '--settings' ]; then settings=$arg; break; fi\n  prev=$arg\ndone\ncat \"$settings\" > " + shellQuote(overridePath) + "\nstat -f '%Lp' \"$settings\" > " + shellQuote(modePath) + "\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\nenv | grep -E '^(ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_API_KEY|CLAUDE_CODE_AUTH_TOKEN|CLAUDE_CODE_BASE_URL)=' > " + shellQuote(envPath) + " || true\nprev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '--settings' ]; then settings=$arg; break; fi\n  prev=$arg\ndone\ncat \"$settings\" > " + shellQuote(overridePath) + "\n"
 	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -759,8 +780,18 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	if strings.Contains(string(argsBody), "secret") {
 		t.Fatalf("credential leaked through Claude argv: %q", argsBody)
 	}
+	envBody, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envBody) != 0 || bytes.Contains(envBody, []byte("secret")) {
+		t.Fatalf("credential-bearing routing environment survived managed launch: %q", envBody)
+	}
 	if strings.Contains(string(argsBody), attackerSettingsPath) || strings.Contains(string(argsBody), "attacker.invalid") {
 		t.Fatalf("attacker managed settings survived Claude argv sanitization: %q", argsBody)
+	}
+	if strings.Contains(args[1], "secret") || !strings.HasSuffix(args[1], filepath.Join("", "settings.json")) {
+		t.Fatalf("verified settings argument is not an opaque scoped path: %q", args[1])
 	}
 	var override struct {
 		Env map[string]string `json:"env"`
@@ -778,12 +809,12 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	if got := override.Env["ANTHROPIC_BASE_URL"]; got != "http://127.0.0.1:"+port {
 		t.Fatalf("settings override base URL = %q", got)
 	}
-	modeBody, err := os.ReadFile(modePath)
-	if err != nil || strings.TrimSpace(string(modeBody)) != "600" {
-		t.Fatalf("override mode = %q, %v", modeBody, err)
+	leftovers, err := filepath.Glob(filepath.Join(tempRoot, claudeSettingsDirPrefix+"*"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(args[1]); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temporary settings file survived launch: %v", err)
+	if len(leftovers) != 0 {
+		t.Fatalf("verified settings left named artifacts: %v", leftovers)
 	}
 }
 
@@ -958,8 +989,9 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 				t.Fatal(err)
 			}
 			recordPath := filepath.Join(home, "claude-proxy.txt")
+			settingsCopyPath := filepath.Join(home, "claude-proxy-settings.json")
 			claudePath := filepath.Join(binDir, "claude")
-			script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\nbase=%s\\ntoken=%s\\nheaders=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\"; env | grep -E '^(CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_API_KEY|CLAUDE_CODE_AUTH_TOKEN|CLAUDE_CODE_BASE_URL|ANTHROPIC_API_KEY)=' || true; } > " + shellQuote(recordPath) + "\n"
+			script := "#!/bin/sh\n{ printf 'config=%s\\nargs=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\"; env | grep -E '^(ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_API_KEY|CLAUDE_CODE_AUTH_TOKEN|CLAUDE_CODE_BASE_URL|ANTHROPIC_API_KEY)=' || true; } > " + shellQuote(recordPath) + "\ncat \"$2\" > " + shellQuote(settingsCopyPath) + "\n"
 			if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -985,15 +1017,13 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			for _, want := range []string{
 				"args=--settings ",
 				" --resume session-a --model opus\n",
-				"base=" + tc.wantBase + "\n",
-				"token=" + tc.wantToken + "\n",
-				"headers=X-Subrouter-Agent: claude\n",
 			} {
 				if !strings.Contains(got, want) {
 					t.Fatalf("proxy invocation missing %q:\n%s", want, got)
 				}
 			}
 			for _, forbidden := range []string{
+				"ANTHROPIC_BASE_URL=", "ANTHROPIC_AUTH_TOKEN=", "ANTHROPIC_CUSTOM_HEADERS=",
 				"CLAUDE_CODE_OAUTH_TOKEN=", "CLAUDE_CODE_API_KEY=",
 				"CLAUDE_CODE_AUTH_TOKEN=", "CLAUDE_CODE_BASE_URL=",
 				"ANTHROPIC_API_KEY=", "personal-",
@@ -1001,6 +1031,24 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 				if strings.Contains(got, forbidden) {
 					t.Fatalf("proxy invocation inherited %q:\n%s", forbidden, got)
 				}
+			}
+			if strings.Contains(got, tc.wantBase) || (tc.tenantKey != "" && strings.Contains(got, tc.tenantKey)) {
+				t.Fatalf("proxy invocation exposed routing URL or tenant key through argv/env:\n%s", got)
+			}
+			settingsBody, err := os.ReadFile(settingsCopyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var overlay struct {
+				Env map[string]string `json:"env"`
+			}
+			if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+				t.Fatal(err)
+			}
+			if overlay.Env["ANTHROPIC_BASE_URL"] != tc.wantBase ||
+				overlay.Env["ANTHROPIC_AUTH_TOKEN"] != tc.wantToken ||
+				overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+				t.Fatalf("proxy authoritative settings = %+v", overlay.Env)
 			}
 			configLine := strings.SplitN(got, "\n", 2)[0]
 			configDir := strings.TrimPrefix(configLine, "config=")
@@ -1036,13 +1084,18 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 
 func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
 	home := t.TempDir()
+	tempRoot := filepath.Join(home, "tmp")
+	if err := os.MkdirAll(tempRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", tempRoot)
 	binDir := filepath.Join(home, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	recordPath := filepath.Join(home, "claude.txt")
 	settingsCopyPath := filepath.Join(home, "launch-settings.json")
-	script := "#!/bin/sh\nprintf 'args=%s\\nbase=%s\\ntoken=%s\\nconfig=%s\\n' \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$CLAUDE_CONFIG_DIR\" > " + shellQuote(recordPath) + "\ncat \"$2\" > " + shellQuote(settingsCopyPath) + "\n"
+	script := "#!/bin/sh\n{ printf 'args=%s\\nconfig=%s\\n' \"$*\" \"$CLAUDE_CONFIG_DIR\"; env | grep -E '^(ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS)=' || true; } > " + shellQuote(recordPath) + "\ncat \"$2\" > " + shellQuote(settingsCopyPath) + "\n"
 	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1082,15 +1135,16 @@ func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
 	for _, want := range []string{
 		"args=--settings ",
 		" --resume session-a\n",
-		"base=http://100.88.0.9:31415\n",
-		"token=subrouter\n",
 		"config=" + configDir + "\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("profileless invocation missing %q:\n%s", want, got)
 		}
 	}
-	for _, forbidden := range []string{"attacker.invalid", "stale.invalid", "stale-secret", "node-m3"} {
+	for _, forbidden := range []string{
+		"ANTHROPIC_BASE_URL=", "ANTHROPIC_AUTH_TOKEN=", "ANTHROPIC_CUSTOM_HEADERS=",
+		"100.88.0.9", "attacker.invalid", "stale.invalid", "stale-secret", "node-m3",
+	} {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("profileless invocation leaked %q:\n%s", forbidden, got)
 		}
@@ -1100,8 +1154,15 @@ func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
 	if len(parts) < 2 || parts[0] != "--settings" {
 		t.Fatalf("profileless args = %q", argsLine)
 	}
-	if _, err := os.Stat(parts[1]); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("verified profileless settings survived launch: %v", err)
+	if strings.Contains(parts[1], "100.88.0.9") || !strings.HasSuffix(parts[1], filepath.Join("", "settings.json")) {
+		t.Fatalf("verified profileless settings argument is not an opaque scoped path: %q", parts[1])
+	}
+	leftovers, err := filepath.Glob(filepath.Join(tempRoot, claudeSettingsDirPrefix+"*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("verified profileless settings left named artifacts: %v", leftovers)
 	}
 	settingsCopy, err := os.ReadFile(settingsCopyPath)
 	if err != nil {
@@ -1117,6 +1178,73 @@ func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
 		overlay.Env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" ||
 		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
 		t.Fatalf("profileless authoritative settings = %+v", overlay.Env)
+	}
+}
+
+func TestPrivateClaudeLaunchSettingsLeaveNothingAfterKilledProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a Unix shell; Windows coverage is platform-specific")
+	}
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	copyPath := filepath.Join(tempRoot, "observed-settings.json")
+	readyPath := filepath.Join(tempRoot, "ready")
+	secret := "srt_must_not_survive_kill"
+	body, err := proxyClaudeLaunchSettings("https://proxy.example", secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh")
+	settingsArg, cleanup, err := attachClaudeLaunchSettings(cmd, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	cmd.Args = []string{"sh", "-c", `cat "$1" > "$2" && : > "$3" && exec sleep 60`, "sh", settingsArg, copyPath, readyPath}
+	cmd.Env = claudeSettingsChildEnvironment([]string{
+		"PATH=" + os.Getenv("PATH"),
+		"ANTHROPIC_BASE_URL=https://proxy.example",
+		"ANTHROPIC_AUTH_TOKEN=" + secret,
+		"ANTHROPIC_CUSTOM_HEADERS=Authorization: Bearer " + secret,
+	}, "https://proxy.example", filepath.Join(tempRoot, "config"))
+	if strings.Contains(strings.Join(cmd.Args, "\x00"), secret) {
+		t.Fatal("tenant key was exposed in the child argument vector")
+	}
+	if strings.Contains(strings.Join(cmd.Env, "\x00"), secret) || strings.Contains(strings.Join(cmd.Env, "\x00"), "proxy.example") {
+		t.Fatal("tenant routing secret was exposed in the child environment")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatal("child did not read private settings")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel() // exec.CommandContext uses Process.Kill, matching an ungraceful exit.
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("killed settings consumer exited successfully")
+	}
+	cleanup()
+	observed, err := os.ReadFile(copyPath)
+	if err != nil || !bytes.Contains(observed, []byte(secret)) {
+		t.Fatalf("child did not receive private settings: body=%q err=%v", observed, err)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(tempRoot, claudeSettingsDirPrefix+"*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("killed child left named settings artifacts: %v", leftovers)
 	}
 }
 
@@ -1215,8 +1343,9 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	recordPath := filepath.Join(home, "claude-local.txt")
+	settingsCopyPath := filepath.Join(home, "claude-local-settings.json")
 	claudePath := filepath.Join(binDir, "claude")
-	script := "#!/bin/sh\nprintf 'args=%s\\nbase=%s\\ntoken=%s\\nheaders=%s\\n' \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$ANTHROPIC_CUSTOM_HEADERS\" > " + shellQuote(recordPath) + "\n"
+	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_CUSTOM_HEADERS)=' || true; } > " + shellQuote(recordPath) + "\ncat \"$2\" > " + shellQuote(settingsCopyPath) + "\n"
 	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1239,13 +1368,30 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	for _, want := range []string{
 		"args=--settings ",
 		" -p hello\n",
-		"base=" + local.URL + "\n",
-		"token=subrouter\n",
-		"headers=X-Subrouter-Agent: claude\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("local proxy invocation missing %q:\n%s", want, got)
 		}
+	}
+	for _, forbidden := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_AUTH_TOKEN=", "ANTHROPIC_CUSTOM_HEADERS=", local.URL} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("local proxy invocation leaked %q through argv/env:\n%s", forbidden, got)
+		}
+	}
+	settingsBody, err := os.ReadFile(settingsCopyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overlay struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if overlay.Env["ANTHROPIC_BASE_URL"] != local.URL ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" ||
+		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+		t.Fatalf("local proxy authoritative settings = %+v", overlay.Env)
 	}
 }
 

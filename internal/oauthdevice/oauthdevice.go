@@ -268,8 +268,18 @@ func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Val
 	}
 	switch parsed.Error {
 	case "authorization_pending":
+		if httpErr != nil {
+			return Token{}, true, errors.Join(errAuthorizationPending, httpErr)
+		}
 		return Token{}, true, errAuthorizationPending
 	case "slow_down":
+		// Providers sometimes combine RFC 8628's slow_down body with HTTP 429
+		// and Retry-After. Preserve both classifications: Poll must apply the
+		// mandatory five-second interval increase and also honour a longer
+		// server-requested delay.
+		if httpErr != nil {
+			return Token{}, true, errors.Join(errSlowDown, httpErr)
+		}
 		return Token{}, true, errSlowDown
 	case "access_denied":
 		return Token{}, false, ErrAuthorizationDeclined

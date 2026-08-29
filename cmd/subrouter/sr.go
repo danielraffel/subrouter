@@ -1433,7 +1433,10 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			row.err = refreshErr
 			row.score = selectacct.Score{AccountID: accountID}
 		} else {
-			row.providerHealth = "auth ok"
+			// RefreshAccount validates and rotates locally stored token material;
+			// it does not make a live Grok API request. Describe only what was
+			// observed instead of claiming that the credential is currently valid.
+			row.providerHealth = "stored"
 			if identity := strings.TrimSpace(refreshed.Email); identity != "" {
 				row.displayAccount = identity
 			}
@@ -1735,24 +1738,22 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
 	accountID := account.Email
+	isQwenToken := account.ProviderOrDefault() == accounts.ProviderQwenToken
 	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		if isQwenToken {
+			root := agentqwen.ConsoleRootForStore(r.store)
+			account, ok, err = removeQwenStoredAccount(
+				func() error { return agentqwen.RemoveConsoleCredentialIn(root, accountID) },
+				func() (accounts.StoredCodexAccount, bool, error) { return r.store.RemoveStored(accountID) },
+			)
+			return ok, err
+		}
 		var removeErr error
 		account, ok, removeErr = r.store.RemoveStored(accountID)
-		if removeErr != nil || !ok {
+		if removeErr != nil {
 			return false, removeErr
 		}
-		if account.ProviderOrDefault() != accounts.ProviderQwenToken {
-			return true, nil
-		}
-		root := agentqwen.ConsoleRootForStore(r.store)
-		if cleanupErr := agentqwen.RemoveConsoleCredentialIn(root, account.Email); cleanupErr != nil {
-			restoreErr := r.store.SaveStored(account)
-			return false, errors.Join(
-				fmt.Errorf("could not remove Qwen console credential: %w", cleanupErr),
-				restoreErr,
-			)
-		}
-		return true, nil
+		return ok, nil
 	})
 	if err != nil {
 		return err
@@ -1762,6 +1763,26 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 	}
 	fmt.Fprintf(r.out, "Removed account: %s\n", account.Email)
 	return nil
+}
+
+func removeQwenStoredAccount(
+	removeConsole func() error,
+	removeStored func() (accounts.StoredCodexAccount, bool, error),
+) (accounts.StoredCodexAccount, bool, error) {
+	if cleanupErr := removeConsole(); cleanupErr != nil {
+		// The routing account remains authoritative until its auxiliary console
+		// credential is gone. This ordering makes a failed removal safe to retry
+		// and cannot strand a secret after the selector disappears from status.
+		return accounts.StoredCodexAccount{}, false, fmt.Errorf(
+			"could not remove Qwen console credential; account remains and removal can be retried: %w",
+			cleanupErr,
+		)
+	}
+	removed, ok, removeErr := removeStored()
+	if removeErr != nil {
+		return removed, false, fmt.Errorf("Qwen console credential removed but account remains; retry removal: %w", removeErr)
+	}
+	return removed, ok, nil
 }
 
 func (r srRunner) addAdminKey(ctx context.Context) error {
@@ -2349,7 +2370,9 @@ func displayRecommendedForNewSession(row srUsageRow) bool {
 			!row.cooked && !row.tempCooked && usableForNewSession(row.score)
 	}
 	if usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth {
-		return row.err == nil && row.providerHealth == "auth ok"
+		// Grok currently exposes no live status/usage probe. A locally refreshable
+		// token is not enough evidence to recommend it for a new session.
+		return false
 	}
 	if isKeyedProviderSection(usageProvider(row)) {
 		return row.err == nil && row.authMode == accounts.AuthModeAPIKey &&
@@ -3086,7 +3109,22 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
-	if (usageProvider(row) == accounts.ProviderKimi || usageProvider(row) == accounts.ProviderGrok) && row.authMode == accounts.AuthModeOAuth {
+	if usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth {
+		var states []string
+		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
+			states = append(states, "active")
+		}
+		if row.err != nil {
+			states = append(states, "error")
+		} else if row.providerHealth != "" && !row.active {
+			states = append(states, row.providerHealth)
+		}
+		if len(states) == 0 {
+			return "stored"
+		}
+		return strings.Join(states, ", ")
+	}
+	if usageProvider(row) == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
 		var states []string
 		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
 			states = append(states, "active")
@@ -3187,6 +3225,8 @@ func usageGridStateColor(row srUsageRow) string {
 	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "error":
 		return ansiRed
 	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "live" && row.providerHealth == "":
+		return ansiDim
+	case usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth && row.providerHealth == "stored" && row.err == nil:
 		return ansiDim
 	case row.providerHealth != "" && row.providerHealth != "auth ok" && row.providerHealth != "ok" && row.providerHealth != "not checked":
 		return ansiRed

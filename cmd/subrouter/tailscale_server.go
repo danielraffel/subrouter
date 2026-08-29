@@ -135,7 +135,9 @@ func tailscaleServerURL(serverURL string, node tailscaleNodeStatus) (string, err
 func tailscaleServerURLs(serverURL string, node tailscaleNodeStatus) ([]string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(serverURL))
 	if err != nil {
-		return nil, fmt.Errorf("parse server URL: %w", err)
+		// url.Error includes the original input. A malformed stored URL may
+		// contain a tenant route key or userinfo, so never wrap that parser error.
+		return nil, errors.New("parse server URL: stored URL is invalid (value redacted)")
 	}
 	if parsed.Scheme == "" || parsed.Hostname() == "" {
 		return nil, fmt.Errorf("server URL %q is not absolute", redactedServerURL(serverURL))

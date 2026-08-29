@@ -946,15 +946,40 @@ func TestFetchUsageRowsIncludesAuthOnlyGrokSubscriptionActivity(t *testing.T) {
 		if row.email != "grok-subscription" || row.displayAccount != "person@example.com" || row.planType != "subscription" {
 			t.Fatalf("Grok row metadata = %+v", row)
 		}
-		if row.providerHealth != "auth ok" || row.err != nil || len(row.windows) != 0 {
-			t.Fatalf("Grok row should expose auth without invented quota: %+v", row)
+		if row.providerHealth != "stored" || row.err != nil || len(row.windows) != 0 {
+			t.Fatalf("Grok row should expose only stored auth without invented validation or quota: %+v", row)
 		}
 		if !row.sessionsKnown || row.assignedSessions != 1 || !row.active {
 			t.Fatalf("Grok activity = %+v", row)
 		}
+		rankUsageRows(rows)
+		if row.gtoRecommended || displayRecommendedForNewSession(row) {
+			t.Fatalf("unverified Grok credential was recommended: %+v", row)
+		}
+		if state := usageGridState(row); state != "active" {
+			t.Fatalf("Grok state = %q, want only observed active session", state)
+		}
 		return
 	}
 	t.Fatal("local Grok subscription row is missing")
+}
+
+func TestUnverifiedGrokStatusIsStoredAndNeverRecommended(t *testing.T) {
+	rows := []srUsageRow{{
+		email: "grok-subscription", provider: accounts.ProviderGrok,
+		authMode: accounts.AuthModeOAuth, providerHealth: "stored",
+		score: selectacct.Score{AccountID: "grok-subscription", Headroom: 1, ShortHeadroom: 1},
+	}}
+	rankUsageRows(rows)
+	if rows[0].gtoRecommended || displayRecommendedForNewSession(rows[0]) {
+		t.Fatalf("unverified Grok credential was recommended: %+v", rows[0])
+	}
+	if state := usageGridState(rows[0]); state != "stored" {
+		t.Fatalf("Grok state = %q, want stored", state)
+	}
+	if color := usageGridStateColor(rows[0]); color != ansiDim {
+		t.Fatalf("Grok stored state color = %q, want informational dim", color)
+	}
 }
 
 func TestFetchUsageRowsUsesOnlyConfiguredSessionStore(t *testing.T) {
@@ -1332,6 +1357,78 @@ func TestSRQwenKeyAccountsCanBeAddedListedAndRemoved(t *testing.T) {
 	}
 	if _, err := agentqwen.ExportConsoleCredentialIn(root, "qwen-token:large-plan"); err != nil {
 		t.Fatalf("unrelated Qwen console credential was removed: %v", err)
+	}
+}
+
+func TestSRQwenRemovalKeepsAccountWhenConsoleCredentialCannotBeRemoved(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	account, _, err := store.AddProviderAPIKey(accounts.ProviderQwenToken, "retry-safe", "sk-sp-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := agentqwen.ConsoleRootForStore(store)
+	consoleDir := agentqwen.ConsoleConfigDirIn(root, account.Email)
+	if err := os.MkdirAll(filepath.Dir(consoleDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(consoleDir, []byte("not a safe credential directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
+	err = runner.remove(t.Context(), account.Email)
+	if err == nil || !strings.Contains(err.Error(), "account remains and removal can be retried") {
+		t.Fatalf("remove error = %v, want retryable console-cleanup failure", err)
+	}
+	if _, ok, findErr := store.FindStored(account.Email); findErr != nil || !ok {
+		t.Fatalf("Qwen account disappeared before console cleanup: ok=%v err=%v", ok, findErr)
+	}
+	if body, readErr := os.ReadFile(consoleDir); readErr != nil || !strings.Contains(string(body), "credential") {
+		t.Fatalf("failed cleanup changed console artifact: body=%q err=%v", body, readErr)
+	}
+
+	if err := os.Remove(consoleDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.remove(t.Context(), account.Email); err != nil {
+		t.Fatalf("retry removal: %v", err)
+	}
+	if _, ok, findErr := store.FindStored(account.Email); findErr != nil || ok {
+		t.Fatalf("retried Qwen removal left account: ok=%v err=%v", ok, findErr)
+	}
+}
+
+func TestQwenRemovalRetriesAfterAccountDeleteFailsPostConsoleCleanup(t *testing.T) {
+	var calls []string
+	removeConsole := func() error {
+		calls = append(calls, "console")
+		return nil
+	}
+	removeAttempts := 0
+	removeStored := func() (accounts.StoredCodexAccount, bool, error) {
+		calls = append(calls, "account")
+		removeAttempts++
+		if removeAttempts == 1 {
+			return accounts.StoredCodexAccount{Email: "qwen-token:post-cleanup"}, false, errors.New("injected account delete failure")
+		}
+		return accounts.StoredCodexAccount{Email: "qwen-token:post-cleanup"}, true, nil
+	}
+
+	_, ok, err := removeQwenStoredAccount(removeConsole, removeStored)
+	if err == nil || ok || !strings.Contains(err.Error(), "console credential removed but account remains; retry removal") {
+		t.Fatalf("first removal = ok=%v err=%v, want retry guidance", ok, err)
+	}
+	if got := strings.Join(calls, ","); got != "console,account" {
+		t.Fatalf("removal order = %s, want console before account", got)
+	}
+	removed, ok, err := removeQwenStoredAccount(removeConsole, removeStored)
+	if err != nil || !ok || removed.Email != "qwen-token:post-cleanup" {
+		t.Fatalf("retried removal = %+v ok=%v err=%v", removed, ok, err)
+	}
+	if got := strings.Join(calls, ","); got != "console,account,console,account" {
+		t.Fatalf("retry order = %s", got)
 	}
 }
 
