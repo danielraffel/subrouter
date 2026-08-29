@@ -92,18 +92,30 @@ type mixedOAuthStatusSource struct {
 }
 
 type deadlineOAuthStatusSource struct {
-	deadline time.Time
+	listDeadline    time.Time
+	refreshDeadline time.Time
+	usageDeadline   time.Time
 }
 
 func (s *deadlineOAuthStatusSource) Provider() accounts.Provider { return accounts.ProviderKimi }
 
 func (s *deadlineOAuthStatusSource) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
-	s.deadline, _ = ctx.Deadline()
-	return nil, nil
+	s.listDeadline, _ = ctx.Deadline()
+	return []accounts.Account{{
+		ID:       "kimi-subscription:deadline",
+		Provider: accounts.ProviderKimi,
+		AuthMode: accounts.AuthModeOAuth,
+	}}, nil
 }
 
-func (s *deadlineOAuthStatusSource) RefreshAccount(_ context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
+func (s *deadlineOAuthStatusSource) RefreshAccount(ctx context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
+	s.refreshDeadline, _ = ctx.Deadline()
 	return account, nil
+}
+
+func (s *deadlineOAuthStatusSource) FetchUsage(ctx context.Context, _ *http.Client, _ accounts.Account) (string, []accounts.UsageWindow, error) {
+	s.usageDeadline, _ = ctx.Deadline()
+	return "subscription", nil, nil
 }
 
 func (s *mixedOAuthStatusSource) Provider() accounts.Provider { return accounts.ProviderKimi }
@@ -912,11 +924,18 @@ func TestUsageStatusesSharesOneDeadlineAcrossKeyedAndOAuthSources(t *testing.T) 
 	ref.oauthSources = []OAuthAccountSource{source}
 
 	ref.usageStatusesLive(context.Background())
-	if keyedDeadline.IsZero() || source.deadline.IsZero() {
-		t.Fatalf("status deadlines keyed=%v OAuth=%v, want both set", keyedDeadline, source.deadline)
+	if keyedDeadline.IsZero() || source.listDeadline.IsZero() || source.refreshDeadline.IsZero() || source.usageDeadline.IsZero() {
+		t.Fatalf(
+			"status deadlines keyed=%v list=%v refresh=%v usage=%v, want all set",
+			keyedDeadline, source.listDeadline, source.refreshDeadline, source.usageDeadline,
+		)
 	}
-	if !keyedDeadline.Equal(source.deadline) {
-		t.Fatalf("status deadlines keyed=%v OAuth=%v, want one shared deadline", keyedDeadline, source.deadline)
+	for phase, deadline := range map[string]time.Time{
+		"list": source.listDeadline, "refresh": source.refreshDeadline, "usage": source.usageDeadline,
+	} {
+		if !keyedDeadline.Equal(deadline) {
+			t.Fatalf("status deadlines keyed=%v OAuth %s=%v, want one shared deadline", keyedDeadline, phase, deadline)
+		}
 	}
 }
 
