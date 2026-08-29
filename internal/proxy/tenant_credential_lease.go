@@ -565,8 +565,13 @@ func normalizeTenantCredentialLeaseReport(
 		derivedScope = broker.LeaseCooldownAccount
 		if lease.provider == accounts.ProviderClaude {
 			// Header-derived Claude rejections, including 403, are accepted but
-			// remain within the issued model pool.
+			// default to the issued model pool. The trusted proxy client can
+			// preserve an account-wide header verdict explicitly; an absent scope
+			// remains conservative because hosted reports carry no headers.
 			derivedScope = broker.LeaseCooldownQuota
+			if report.Scope == broker.LeaseCooldownAccount {
+				derivedScope = broker.LeaseCooldownAccount
+			}
 		}
 	}
 	if report.Scope != "" && report.Scope != broker.LeaseCooldownQuota &&

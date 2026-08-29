@@ -1343,6 +1343,7 @@ func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
 			cookedCalls++
 			h := http.Header{}
 			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			h.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
 			return &http.Response{StatusCode: http.StatusInternalServerError, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error"}`))}
 		}
 		freshCalls++
@@ -1352,7 +1353,7 @@ func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
 	transport := usageLimitRetryTransport{
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-r5", account: "cooked@example.com",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		method: http.MethodPost, path: "/v1/messages", poolModel: "claude-opus-4", maxAttempts: 6,
 		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))

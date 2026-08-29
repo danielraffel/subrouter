@@ -68,6 +68,25 @@ func (r *SchedulerRef) Get() Scheduler {
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
 }
 
+// RefreshSeed returns the measured scheduler snapshot, including live routing
+// debits but excluding temporary exclusion overlays. A usage refresh carries
+// stale scores forward when an account cannot be fetched; seeding that work
+// from Get would bake an overlay's zero into the replacement snapshot if the
+// overlay expired between scoring and FinishRefresh. Routing reads must use
+// Get, while refresh construction must use this base-only view.
+func (r *SchedulerRef) RefreshSeed() Scheduler {
+	if r == nil {
+		return Scheduler{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	debits := make(map[string]int, len(r.routedSinceRefresh))
+	for key, count := range r.routedSinceRefresh {
+		debits[key] = count
+	}
+	return r.scheduler.WithLiveDebits(debits)
+}
+
 // RunIfAccountNotBlocked executes publish while the current scheduler state
 // remains read-locked. The caller may hold its own publication mutex, but
 // publish must not call back into this SchedulerRef.

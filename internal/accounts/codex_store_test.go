@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
@@ -22,6 +23,96 @@ func TestStoredOAuthAccountKeepsRoutingIDSeparateFromLoginIdentity(t *testing.T)
 	}
 	if account.ID != "stable-routing-id" || account.Email != "owner@example.com" || account.Label != "Production Codex" {
 		t.Fatalf("account = %#v", account)
+	}
+}
+
+func TestReplaceStoredOAuthWithIsolatedRejectsDifferentAccountID(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	const email = "owner@example.com"
+	stored := StoredCodexAccount{
+		Email:    email,
+		Provider: ProviderCodex,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "old-access", RefreshToken: "old-refresh",
+			IDToken: testJWT(email, time.Now().Add(time.Hour)), AccountID: "workspace-a",
+		}},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	incoming := CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+		AccessToken: "new-access", RefreshToken: "new-refresh",
+		IDToken: testJWT(email, time.Now().Add(time.Hour)), AccountID: "workspace-b",
+	}}
+	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), email, incoming); err == nil {
+		t.Fatal("different account ID was accepted for the same login email")
+	}
+	after, found, err := store.findStoredExact(email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("stored account disappeared after rejected replacement")
+	}
+	if after.Auth.Tokens.AccessToken != "old-access" || after.Auth.Tokens.AccountID != "workspace-a" {
+		t.Fatalf("rejected replacement mutated stored credential: %+v", after.Auth.Tokens)
+	}
+}
+
+func TestReplaceStoredOAuthWithIsolatedRejectsMissingAccountID(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	const email = "owner@example.com"
+	stored := StoredCodexAccount{
+		Email: email, Provider: ProviderCodex,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "old-access", RefreshToken: "old-refresh",
+			IDToken: testJWT(email, time.Now().Add(time.Hour)), AccountID: "workspace-a",
+		}},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	incoming := CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+		AccessToken: "new-access", RefreshToken: "new-refresh",
+		IDToken: testJWT(email, time.Now().Add(time.Hour)),
+	}}
+	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), email, incoming); err == nil {
+		t.Fatal("missing account ID was accepted for an account with a stored workspace identity")
+	}
+	after, found, err := store.findStoredExact(email)
+	if err != nil || !found {
+		t.Fatalf("stored account lookup: found=%v err=%v", found, err)
+	}
+	if after.Auth.Tokens.AccessToken != "old-access" || after.Auth.Tokens.AccountID != "workspace-a" {
+		t.Fatalf("rejected replacement mutated stored credential: %+v", after.Auth.Tokens)
+	}
+}
+
+func TestReplaceStoredOAuthWithIsolatedAcceptsAccountIDForLegacyStoredCredential(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	const email = "owner@example.com"
+	if err := store.SaveStored(StoredCodexAccount{
+		Email: email, Provider: ProviderCodex,
+		Auth: CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+			AccessToken: "old-access", RefreshToken: "old-refresh",
+			IDToken: testJWT(email, time.Now().Add(time.Hour)),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	incoming := CodexAuthFile{AuthMode: "chatgpt", Tokens: &CodexTokens{
+		AccessToken: "new-access", RefreshToken: "new-refresh",
+		IDToken: testJWT(email, time.Now().Add(time.Hour)), AccountID: "workspace-a",
+	}}
+	if err := store.ReplaceStoredOAuthWithIsolated(context.Background(), email, incoming); err != nil {
+		t.Fatalf("legacy stored credential rejected a newly proven account ID: %v", err)
+	}
+	after, found, err := store.findStoredExact(email)
+	if err != nil || !found {
+		t.Fatalf("stored account lookup: found=%v err=%v", found, err)
+	}
+	if after.Auth.Tokens.AccessToken != "new-access" || after.Auth.Tokens.AccountID != "workspace-a" {
+		t.Fatalf("replacement was not stored: %+v", after.Auth.Tokens)
 	}
 }
 

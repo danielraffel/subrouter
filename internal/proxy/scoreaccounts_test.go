@@ -54,6 +54,50 @@ func TestScoreAccountsPreservesHealthyScoreWhenUsageIsStale(t *testing.T) {
 	}
 }
 
+// Regression: request-time exhaustion is an expiring overlay, not measured
+// usage. If a refresh seeds its carried-forward score from that overlay and the
+// mark expires before FinishRefresh, the zero is stranded in the base scheduler
+// with no expiry. Simulate that ordering deterministically: score while marked,
+// prune the mark, then publish the stale refresh result.
+func TestScoreAccountsDoesNotBakeExpiringExhaustionOverlay(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usage429Response()}}
+	accountRef := cacheTestAccountRef(t, transport)
+	acct := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
+	key := acct.ID + "\x00" + string(acct.Provider)
+	accountRef.usageWindowsMu.Lock()
+	accountRef.usageWindows = map[string]usageWindowsEntry{
+		key: {
+			windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 100, LimitWindowSeconds: 5 * 60 * 60}},
+			at:      time.Now().Add(-usageWindowsTTL - time.Minute),
+		},
+	}
+	accountRef.usageWindowsMu.Unlock()
+
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: acct.ID, Provider: acct.Provider, Headroom: 0.75, ShortHeadroom: 0.75,
+	}}))
+	ref.MarkExhaustedUntil(acct.Provider, acct.ID, "", time.Now().Add(time.Hour))
+	server := Server{AccountRef: accountRef, SchedulerRef: ref}
+
+	scores, scored := server.scoreAccounts(context.Background(), []accounts.Account{acct})
+	if scored != 0 {
+		t.Fatalf("scored = %d, want stale carried-forward score", scored)
+	}
+	if scores[0].Headroom != 0.75 || scores[0].ShortHeadroom != 0.75 {
+		t.Fatalf("refresh seed included temporary exhaustion overlay: %+v", scores[0])
+	}
+
+	// Deterministically model the original mark expiring while scoring was in
+	// flight, before the resulting scheduler is published.
+	ref.MarkExhaustedUntil(acct.Provider, acct.ID, "", time.Now().Add(-time.Second))
+	_ = ref.Get() // prune the lapsed mark
+	ref.FinishRefresh(selectacct.NewScheduler(scores), true)
+	got := ref.Get().ScoreFor(acct.Provider, acct.ID)
+	if got.Headroom != 0.75 || got.ShortHeadroom != 0.75 || ref.Get().Exhausted(acct.Provider, acct.ID) {
+		t.Fatalf("expired overlay was baked into scheduler base: %+v", got)
+	}
+}
+
 // Regression: an account whose refresh token is dead (invalid_grant) only
 // recovers via human re-auth, so probing it again costs a doomed round trip on
 // a path that fronts proxy requests. With a fully expired Claude pool that made
