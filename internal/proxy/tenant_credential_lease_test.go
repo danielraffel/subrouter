@@ -95,6 +95,11 @@ func TestTenantCredentialLeaseReportStatusMatrix(t *testing.T) {
 		"Claude unified rejected 403": {
 			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
 			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusForbidden, Scope: broker.LeaseCooldownAccount},
+			wantScope: broker.LeaseCooldownAccount,
+		},
+		"Claude rate limit without scope stays model local": {
+			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusForbidden},
 			wantScope: broker.LeaseCooldownQuota,
 		},
 		"Codex 429": {
@@ -337,6 +342,11 @@ func TestTenantCredentialLeaseClaudeQuota403AndModelLessFailOver(t *testing.T) {
 		Scope: broker.LeaseCooldownAccount,
 	}, now); err != nil {
 		t.Fatalf("Claude unified rejected 403 was not accepted: %v", err)
+	}
+	if _, avoided := store.avoidanceUntil(tenantCredentialLeaseRequest{
+		AgentType: "claude", SessionID: "claude-session",
+	}, claudeA, tenantCredentialLeasePoolModel(accounts.ProviderClaude, "claude-sonnet-4"), now); !avoided {
+		t.Fatal("account-scoped Claude report did not block the same account across model pools")
 	}
 	picked, err := pickTenantCredentialLeaseAccount(store, server, []accounts.Account{claudeA, claudeB}, nil, tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderClaude), AgentType: "claude",
@@ -886,6 +896,11 @@ func TestTenantCredentialLeaseQuotaReportOnlyConsumesSamePoolSiblings(t *testing
 	}
 	if _, ok := store.get("sonnet", now); !ok {
 		t.Fatal("quota report consumed a different model-pool sibling")
+	}
+	if _, avoided := store.avoidanceUntil(tenantCredentialLeaseRequest{
+		AgentType: "claude", SessionID: "session-a", SessionToken: opus.sessionToken,
+	}, account, tenantCredentialLeasePoolModel(accounts.ProviderClaude, "claude-sonnet-4"), now); avoided {
+		t.Fatal("model-scoped Claude report blocked a different model pool")
 	}
 }
 

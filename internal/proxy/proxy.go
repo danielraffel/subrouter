@@ -1960,7 +1960,10 @@ func (s Server) updateSchedulerFromUsageStatusesContext(ctx context.Context, sta
 	if len(available) == 0 {
 		return
 	}
-	current := s.scheduler()
+	current := s.Scheduler
+	if s.SchedulerRef != nil {
+		current = s.SchedulerRef.RefreshSeed()
+	}
 	scores := make([]selectacct.Score, 0, len(available))
 	scoreByID := make(map[string]int, len(available))
 	for _, account := range available {
@@ -3000,7 +3003,10 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 	// (the upstream usage endpoint rate-limits under load), it clobbered
 	// healthy accounts to exhausted and the router then routed traffic to dead
 	// accounts. A score is only overwritten on confident, fresh evidence.
-	current := s.scheduler()
+	current := s.Scheduler
+	if s.SchedulerRef != nil {
+		current = s.SchedulerRef.RefreshSeed()
+	}
 	scores := make([]selectacct.Score, 0, len(available))
 	scoreByID := make(map[string]int, len(available))
 	for _, account := range available {
@@ -6789,6 +6795,26 @@ func claudeRejectionIsModelPoolScoped(header http.Header) bool {
 	return true
 }
 
+// claudeRejectionIsExplicitlyAccountWide distinguishes an authoritative
+// account-window rejection from a bare unified rejection. Bare rejections are
+// held to the request's model pool because Anthropic omits individual window
+// statuses on some Fable/Opus responses. Credential and organization failures
+// are intrinsically account-wide.
+func claudeRejectionIsExplicitlyAccountWide(status int, header http.Header) bool {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return true
+	}
+	for _, prefix := range []string{"5h", "7d"} {
+		windowStatus := strings.ToLower(strings.TrimSpace(claudeHeaderGet(
+			header, "anthropic-ratelimit-unified-"+prefix+"-status",
+		)))
+		if windowStatus == "rejected" {
+			return true
+		}
+	}
+	return false
+}
+
 // claudeUnifiedStatus returns the lowercased anthropic-ratelimit-unified-status
 // header ("allowed" | "allowed_warning" | "rejected"), or "" when absent.
 func claudeUnifiedStatus(header http.Header) string {
@@ -6965,6 +6991,15 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// runs, so without logging here the real message would be invisible
 			// whenever failover succeeds.
 			t.logClaudeUnusableResponse(response, accountID)
+			// Only poison the score on genuine quota exhaustion; a transient
+			// "allowed"/"allowed_warning" 429 still fails over for this request.
+			exhausted = claudeAccountExhaustedByResponse(response.StatusCode, response.Header)
+			if exhausted && claudeRejectionIsExplicitlyAccountWide(response.StatusCode, response.Header) {
+				// Account-wide Claude windows apply across every model pool. The
+				// direct retry path sees the headers before passive response
+				// inspection, so it must clear the request model's pool key here.
+				exhaustionPool = ""
+			}
 		}
 		var compatibilityNext accounts.Account
 		var compatibilityPickErr error

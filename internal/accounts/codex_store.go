@@ -319,6 +319,14 @@ func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifi
 	if account.IsAPIKey() || account.ProviderOrDefault() != ProviderCodex {
 		return fmt.Errorf("account %q is not a Codex OAuth account", identifier)
 	}
+	storedAccountID := ""
+	if account.Auth.Tokens != nil {
+		storedAccountID = strings.TrimSpace(account.Auth.Tokens.AccountID)
+	}
+	incomingAccountID := strings.TrimSpace(auth.Tokens.AccountID)
+	if storedAccountID != "" && storedAccountID != incomingAccountID {
+		return errors.New("isolated Codex login account does not match the stored account")
+	}
 	previous := account
 	account.Auth = auth
 	account.Auth.RefreshFailure = nil
