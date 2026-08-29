@@ -230,7 +230,7 @@ func TestTenantCredentialLeaseCallerChosenSessionCannotTargetAnotherCapability(t
 	}
 }
 
-func TestTenantCredentialLeaseIssueReportReissueUsesSessionCapability(t *testing.T) {
+func TestTenantCredentialLeaseIssueReportReissueUsesCanonicalPoolKey(t *testing.T) {
 	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderClaude)
 	accountB := tenantLeaseTestAccount("account-b", accounts.ProviderClaude)
 	server := tenantLeaseTestServer(accountA, accountB)
@@ -243,10 +243,10 @@ func TestTenantCredentialLeaseIssueReportReissueUsesSessionCapability(t *testing
 		AccountID    string `json:"accountId"`
 		SessionToken string `json:"sessionToken"`
 	} {
-		body := `{"provider":"claude","agentType":"claude","sessionId":"session-a","preferAccountId":"account-a","model":"claude-opus-4"}`
+		body := `{"provider":"claude","agentType":"claude","sessionId":"session-a","preferAccountId":"account-a","model":"op-us"}`
 		if sessionToken != "" {
 			body = fmt.Sprintf(
-				`{"provider":"claude","agentType":"claude","sessionId":"session-a","preferAccountId":"account-a","model":"claude-opus-4","sessionToken":%q}`,
+				`{"provider":"claude","agentType":"claude","sessionId":"session-a","preferAccountId":"account-a","model":"op-us","sessionToken":%q}`,
 				sessionToken,
 			)
 		}
@@ -355,6 +355,9 @@ func TestTenantCredentialLeaseClaudeQuota403AndModelLessFailOver(t *testing.T) {
 	modelLessServer := tenantLeaseTestServer(codexA, codexB)
 	modelLessStore := newTenantCredentialLeaseStore()
 	modelLessStore.put("model-less", tenantLeaseTestLease(codexA, "codex", "catalog-session", "", now), now)
+	if lease, ok := modelLessStore.get("model-less", now); !ok || lease.model != tenantCredentialLeaseUnspecifiedModelPool {
+		t.Fatalf("model-less lease pool=%q exists=%v, want sentinel %q", lease.model, ok, tenantCredentialLeaseUnspecifiedModelPool)
+	}
 	if _, err := modelLessStore.consumeReport("model-less", tenantCredentialLeaseReport{
 		Outcome: broker.LeaseForbidden, StatusCode: http.StatusForbidden,
 	}, now); err != nil {

@@ -214,11 +214,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		if retryAt.IsZero() {
 			retryAt = time.Now().Add(tenantCredentialLeaseReportDefaultCooldown)
 		}
-		seconds := int64((time.Until(retryAt) + time.Second - 1) / time.Second)
-		if seconds < 1 {
-			seconds = 1
-		}
-		w.Header().Set("Retry-After", fmt.Sprintf("%d", seconds))
+		setTenantCredentialLeaseRetryAfter(w, retryAt)
 		http.Error(w, "credential lease unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -624,7 +620,10 @@ func (s *tenantCredentialLeaseStore) consumeReport(
 		provider:     lease.provider, accountID: lease.accountID,
 	}
 	if normalized.Scope == broker.LeaseCooldownQuota {
-		key.poolModel = tenantCredentialLeasePoolModel(lease.provider, lease.model)
+		// lease.model is canonicalized once, when the lease is issued. Re-running
+		// provider normalization here is not idempotent for already-canonical
+		// Claude pool keys (for example, "opus" becomes "claudeopus").
+		key.poolModel = lease.model
 	}
 	if normalized.Outcome == broker.LeaseUnauthorized {
 		key.credential = tenantCredentialLeaseCredentialKey(lease.credentialIdentity)
@@ -785,9 +784,7 @@ func (s *tenantCredentialLeaseStore) putIfEligible(
 }
 
 func (s *tenantCredentialLeaseStore) putLocked(id string, lease tenantCredentialLease) {
-	if _, ok := s.leases[id]; ok {
-		delete(s.leases, id)
-	}
+	delete(s.leases, id)
 	if len(s.leases) >= tenantCredentialLeaseMax {
 		oldestID := ""
 		var oldestExpiry time.Time
