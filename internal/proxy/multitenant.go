@@ -373,6 +373,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 }
 
 func tenantFallbackScores(available []accounts.Account) []selectacct.Score {
+	available = SchedulerAccounts(available)
 	scores := make([]selectacct.Score, 0, len(available))
 	for _, account := range available {
 		headroom := 1.0

@@ -600,6 +600,7 @@ func serve(args []string) error {
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var credentialRevision uint64
+	var initialAccounts []accounts.Account
 	var codexAccounts, claudeAccounts []accounts.Account
 	if credentialBroker == nil {
 		accountRef, err = proxy.OpenAccountRefWithSources(context.Background(), codexStore, claudeStore, &http.Client{
@@ -609,7 +610,8 @@ func serve(args []string) error {
 		if err != nil {
 			return err
 		}
-		initialAccounts, generation, revision := accountRef.CredentialSnapshot()
+		var generation, revision uint64
+		initialAccounts, generation, revision = accountRef.CredentialSnapshot()
 		accountGeneration = generation
 		credentialRevision = revision
 		codexAccounts, claudeAccounts = schedulerAccountsByProvider(initialAccounts)
@@ -621,8 +623,7 @@ func serve(args []string) error {
 	// swapped in once ready. Per-request 401/429 failover covers the brief
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
-	allInitialAccounts := append(append([]accounts.Account(nil), codexAccounts...), claudeAccounts...)
-	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, proxy.SchedulerAccounts(allInitialAccounts))
+	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initialSchedulerCredentialAccounts(initialAccounts))
 	if *fetchUsage && credentialBroker == nil {
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithAccountRef(context.Background(), accountRef, codexAccounts)
@@ -894,6 +895,10 @@ func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accoun
 		}
 	}
 	return codex, claude
+}
+
+func initialSchedulerCredentialAccounts(all []accounts.Account) []accounts.Account {
+	return proxy.SchedulerAccounts(all)
 }
 
 func validatePublicSubrouterURL(raw string) error {

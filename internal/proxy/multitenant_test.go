@@ -34,6 +34,25 @@ type fakeStackVerifier struct {
 	err    error
 }
 
+func TestTenantFallbackScoresCanonicalizeQwenEndpointAliases(t *testing.T) {
+	available := []accounts.Account{
+		{ID: "qwen-token:direct", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "qwen-token:anthropic", Provider: accounts.ProviderQwenAnthropic, AuthMode: accounts.AuthModeAPIKey},
+	}
+	scores := tenantFallbackScores(available)
+	if len(scores) != len(available) {
+		t.Fatalf("fallback score count = %d, want %d", len(scores), len(available))
+	}
+	for _, score := range scores {
+		if score.Provider != accounts.ProviderQwenToken {
+			t.Fatalf("fallback score %q provider = %q, want shared Token Plan provider %q", score.AccountID, score.Provider, accounts.ProviderQwenToken)
+		}
+		if score.Headroom != 0.01 || score.ShortHeadroom != 0.01 {
+			t.Fatalf("fallback score %q headroom = %v/%v, want API-key fallback", score.AccountID, score.Headroom, score.ShortHeadroom)
+		}
+	}
+}
+
 func (f fakeStackVerifier) Verify(context.Context, string) (stackauth.Claims, error) {
 	return f.claims, f.err
 }

@@ -11,9 +11,12 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
 func TestSchedulerAccountsByProviderExcludesNonCodexPools(t *testing.T) {
@@ -38,6 +41,35 @@ func TestSchedulerAccountsByProviderExcludesNonCodexPools(t *testing.T) {
 	scores := fallbackScores(all)
 	if len(scores) != 1 || scores[0].AccountID != "codex" || scores[0].Provider != accounts.ProviderCodex {
 		t.Fatalf("Codex fallback scores = %+v", scores)
+	}
+}
+
+func TestInitialSchedulerCredentialSnapshotIncludesNonCodexProvidersAtSameRevision(t *testing.T) {
+	const (
+		generation = uint64(7)
+		revision   = uint64(11)
+	)
+	all := []accounts.Account{
+		{ID: "codex", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "codex-token"},
+		{ID: "qwen-token:work", Provider: accounts.ProviderQwenAnthropic, AuthMode: accounts.AuthModeAPIKey, Token: "qwen-key"},
+	}
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(all)))
+	initial := initialSchedulerCredentialAccounts(all)
+	ref.AdvanceAccountGenerationWithAccounts(generation, revision, initial)
+
+	// The first all-account refresh can legitimately carry the same revision as
+	// startup. Its no-op must be safe because startup already fingerprinted the
+	// non-Codex credential under its shared scheduler provider.
+	if !ref.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(all)) {
+		t.Fatal("same-revision credential sync was rejected")
+	}
+	qwen := all[1]
+	ref.MarkCredentialExhaustedForSnapshot(
+		accounts.ProviderQwenToken, qwen.ID, qwen.CredentialIdentity(), time.Now().Add(time.Hour),
+		generation, revision, proxy.SchedulerAccounts(all),
+	)
+	if _, blocked := ref.ExhaustedUntilFor(accounts.ProviderQwenToken, qwen.ID, ""); !blocked {
+		t.Fatal("startup snapshot omitted same-revision Qwen credential")
 	}
 }
 
