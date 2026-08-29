@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -144,6 +145,7 @@ func TestSRAutoSwitchPreservesOtherProviderScores(t *testing.T) {
 			{ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
 		},
 		SchedulerRef: schedulerRef,
+		SwitchActive: func(context.Context, string) error { return nil },
 		FetchScores: func(_ context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
 			if len(candidates) != 2 {
 				t.Fatalf("candidates = %#v, want only two Codex accounts", candidates)
@@ -175,6 +177,39 @@ func TestSRAutoSwitchPreservesOtherProviderScores(t *testing.T) {
 	}
 	if got := published.ScoreFor(accounts.ProviderCodex, "codex-a"); got.Headroom != 0.10 {
 		t.Errorf("published Codex score = %+v, want refreshed headroom 0.10", got)
+	}
+}
+
+func TestSRAutoSwitchRejectsScoresOlderThanConcurrentFullRefresh(t *testing.T) {
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.5, ShortHeadroom: 0.5,
+	}}))
+	_, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+		Accounts: []accounts.Account{{
+			ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
+		}},
+		SchedulerRef: schedulerRef,
+		SwitchActive: func(context.Context, string) error {
+			t.Fatal("stale auto-switch scores reached account activation")
+			return nil
+		},
+		FetchScores: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
+			revision := schedulerRef.ScoreRevision()
+			if !schedulerRef.SetForAccountGenerationAtScoreRevision(selectacct.NewScheduler([]selectacct.Score{{
+				AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8,
+			}}), 0, revision) {
+				t.Fatal("concurrent full refresh was rejected")
+			}
+			return []selectacct.Score{{
+				AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.2, ShortHeadroom: 0.2,
+			}}, 1
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "account pool changed") {
+		t.Fatalf("auto-switch error = %v, want stale publication rejection", err)
+	}
+	if got := schedulerRef.Get().ScoreFor(accounts.ProviderCodex, "codex-a").Headroom; got != 0.8 {
+		t.Fatalf("Codex headroom = %v, want concurrent full refresh value 0.8", got)
 	}
 }
 

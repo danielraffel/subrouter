@@ -509,16 +509,19 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		reconcileErr := r.publishProfileCompletion(reconcileCtx)
 		cancel()
 		if reconcileErr != nil {
-			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
-				return errors.Join(
-					fmt.Errorf("publish completed Claude profile: %w", err),
-					fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
-					fmt.Errorf("remove unpublished Claude profile: %w", rollbackErr),
-				)
-			}
+			// A persistent generation-path failure would make the normal published
+			// rollback fail for the same reason as both completion attempts. Under
+			// the account transaction lock, remove the credential first, then publish
+			// its deletion; workers still hold only the credential-less generation.
+			rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+			rollbackErr := proxy.RollbackUnpublishedAccountDiskMutation(rollbackCtx, r.store.Dir, func() error {
+				return r.removeUnpublishedProfile(rollbackCtx, name)
+			})
+			rollbackCancel()
 			return errors.Join(
 				fmt.Errorf("publish completed Claude profile: %w", err),
 				fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
+				wrapClaudeReconcileError("remove unpublished Claude profile", rollbackErr),
 			)
 		}
 	}
@@ -754,6 +757,24 @@ func (r claudeRunner) rollbackProfileInventory(ctx context.Context, name string)
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
 	defer cancel()
 	return r.removeProfileInventory(rollbackCtx, name)
+}
+
+func (r claudeRunner) removeUnpublishedProfile(ctx context.Context, name string) error {
+	removed, err := r.store.RemoveProfileContext(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !removed {
+		return fmt.Errorf("profile %q not found", name)
+	}
+	return nil
+}
+
+func wrapClaudeReconcileError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 func (r claudeRunner) publishProfileCompletion(ctx context.Context) error {

@@ -164,6 +164,43 @@ func TestClaudeNamedAddReconcilesCanceledCompletionPublication(t *testing.T) {
 	}
 }
 
+func TestClaudeNamedAddRemovesCredentialAfterPersistentPublicationFailure(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	installSuccessfulClaudeLoginCLI(t, root, "work@example.com")
+	generationPath := filepath.Join(root, ".account-generation")
+	credentialDir := ""
+
+	runner := claudeRunner{
+		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+		afterAuthVerified: func() {
+			profile, ok := store.FindProfile("work")
+			if !ok {
+				t.Fatal("named profile disappeared before completion publication")
+			}
+			credentialDir = store.PreferredInstancePath(filepath.Join(store.InstancesDir(), profile.Dir))
+			if err := os.Remove(generationPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(generationPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	if err := runner.run(t.Context(), []string{"add", "work"}); err == nil {
+		t.Fatal("named add unexpectedly succeeded with persistent publication failure")
+	}
+	if _, ok := store.FindProfile("work"); ok {
+		t.Fatal("failed named add retained its profile")
+	}
+	if credentialDir == "" {
+		t.Fatal("test did not capture the authenticated credential directory")
+	}
+	if _, err := os.Stat(credentialDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed named add retained credential directory: %v", err)
+	}
+}
+
 func TestClaudeUnnamedAddCleansAuthenticatedTempAfterCanceledPublication(t *testing.T) {
 	root := t.TempDir()
 	store := claude.Store{Dir: root}

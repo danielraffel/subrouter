@@ -204,7 +204,8 @@ func TestSchedulerRefCodexOverlayDoesNotClobberConcurrentProviderRefresh(t *test
 
 	t.Run("same account generation preserves concurrent provider refresh", func(t *testing.T) {
 		ref := newRef()
-		staleAutoSwitchSeed := ref.RefreshSeed()
+		seedRevision := ref.ScoreRevision()
+		staleAutoSwitchSeed := ref.Get()
 		if got := staleAutoSwitchSeed.ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.3 {
 			t.Fatalf("stale auto-switch seed = %v, want 0.3", got)
 		}
@@ -214,21 +215,39 @@ func TestSchedulerRefCodexOverlayDoesNotClobberConcurrentProviderRefresh(t *test
 		}), 1) {
 			t.Fatal("full-provider refresh was rejected")
 		}
-		merged, ok := ref.MergeScoresForAccountGeneration([]Score{{
+		if _, ok := ref.MergeScoresForAccountGenerationAtScoreRevision([]Score{{
 			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
-		}}, 1)
-		if !ok {
-			t.Fatal("Codex publication was rejected")
+		}}, 1, seedRevision); ok {
+			t.Fatal("older Codex measurement overwrote a concurrent full refresh")
 		}
-		if got := merged.ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.8 {
+		if got := ref.Get().ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.8 {
 			t.Fatalf("Claude headroom = %v, want concurrent refresh value 0.8", got)
 		}
-		if got := merged.ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.9 {
-			t.Fatalf("Codex headroom = %v, want overlay value 0.9", got)
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.4 {
+			t.Fatalf("Codex headroom = %v, want concurrent refresh value 0.4", got)
 		}
 	})
 
-	t.Run("in-progress full refresh retains publication ownership", func(t *testing.T) {
+	t.Run("older direct full refresh is rejected", func(t *testing.T) {
+		ref := newRef()
+		seedRevision := ref.ScoreRevision()
+		if _, ok := ref.MergeScoresForAccountGeneration([]Score{{
+			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+		}}, 1); !ok {
+			t.Fatal("Codex publication was rejected")
+		}
+		if ref.SetForAccountGenerationAtScoreRevision(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		}), 1, seedRevision) {
+			t.Fatal("older direct full refresh overwrote a newer score merge")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.9 {
+			t.Fatalf("Codex headroom = %v, want newer merged value 0.9", got)
+		}
+	})
+
+	t.Run("newer score merge invalidates older full refresh", func(t *testing.T) {
 		ref := newRef()
 		ref.SetUpdatedAt(time.Time{})
 		if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
@@ -239,19 +258,60 @@ func TestSchedulerRefCodexOverlayDoesNotClobberConcurrentProviderRefresh(t *test
 		}}, 1); !ok {
 			t.Fatal("Codex publication was rejected")
 		}
-		if !ref.FinishRefreshForAccountGeneration(NewScheduler([]Score{
+		if ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("replacement refresh started before the invalidated attempt was consumed")
+		}
+		if ref.FinishRefreshForAccountGeneration(NewScheduler([]Score{
 			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4},
 			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
 		}), true, 1) {
-			t.Fatal("concurrent full-provider refresh lost publication ownership")
+			t.Fatal("older full-provider refresh overwrote a newer score merge")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.9 {
+			t.Fatalf("Codex headroom = %v, want newer merged value 0.9", got)
+		}
+		if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("replacement full-provider refresh was not immediately eligible")
+		}
+		if !ref.FinishRefreshForAccountGeneration(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.85, ShortHeadroom: 0.85},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		}), true, 1) {
+			t.Fatal("replacement full-provider refresh was rejected")
 		}
 		if got := ref.Get().ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.8 {
-			t.Fatalf("Claude headroom = %v, want completed refresh value 0.8", got)
+			t.Fatalf("Claude headroom = %v, want replacement refresh value 0.8", got)
+		}
+	})
+
+	t.Run("newer direct publication invalidates older full refresh", func(t *testing.T) {
+		ref := newRef()
+		ref.SetUpdatedAt(time.Time{})
+		if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("full-provider refresh did not begin")
+		}
+		revision := ref.ScoreRevision()
+		if !ref.SetForAccountGenerationAtScoreRevision(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.7, ShortHeadroom: 0.7},
+		}), 1, revision) {
+			t.Fatal("newer direct publication was rejected")
+		}
+		if ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("replacement refresh started before the invalidated attempt was consumed")
+		}
+		if ref.FinishRefreshForAccountGeneration(NewScheduler([]Score{{
+			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4,
+		}}), true, 1) {
+			t.Fatal("older full-provider refresh overwrote the direct publication")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.9 {
+			t.Fatalf("Codex headroom = %v, want newer direct value 0.9", got)
 		}
 	})
 }
 
-func TestSchedulerRefScoreMergePreservesLiveDebitsAndExhaustionExpiry(t *testing.T) {
+func TestSchedulerRefScoreMergePreservesLiveDebitsExhaustionAndStaleness(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler([]Score{
 		{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.5, ShortHeadroom: 0.5},
 		{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
@@ -458,6 +518,73 @@ func TestTokenRotationRestoresBaseScoreAfterCredentialOverlayWasCarriedForward(t
 	}
 	if got := ref.Get().ScoreFor(replacement.Provider, replacement.ID).Headroom; got != 0.8 {
 		t.Fatalf("token rotation left carried credential zero in base score: got %v want 0.8", got)
+	}
+}
+
+func TestSchedulerRefScoreMergeReturnsActiveExhaustionOverlay(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7},
+		{AccountID: "blocked", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9},
+	}))
+	ref.AdvanceAccountGeneration(1)
+	ref.MarkExhaustedUntil(account.ProviderCodex, "blocked", "", time.Now().Add(time.Hour))
+
+	merged, ok := ref.MergeScoresForAccountGeneration([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7, Fresh: true},
+		{AccountID: "blocked", Provider: account.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+	}, 1)
+	if !ok {
+		t.Fatal("score merge was rejected")
+	}
+	if !merged.Exhausted(account.ProviderCodex, "blocked") {
+		t.Fatal("partial merge return omitted the active exhaustion overlay")
+	}
+	picked, err := merged.PickBest([]account.Account{
+		{ID: "healthy", Provider: account.ProviderCodex},
+		{ID: "blocked", Provider: account.ProviderCodex},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "healthy" {
+		t.Fatalf("picked = %q, want healthy account", picked.ID)
+	}
+}
+
+func TestSchedulerRefScoreMergeReturnsActiveCredentialExclusion(t *testing.T) {
+	credential := account.Account{
+		ID: "blocked", Provider: account.ProviderCodex, Token: "blocked-token",
+	}
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7},
+		{AccountID: credential.ID, Provider: credential.Provider, Headroom: 0.9, ShortHeadroom: 0.9},
+	}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{credential})
+	if !ref.MarkCredentialExhaustedUntil(
+		credential.Provider, credential.ID, credential.CredentialIdentity(), time.Now().Add(time.Hour), 1,
+	) {
+		t.Fatal("credential exclusion was rejected")
+	}
+
+	merged, ok := ref.MergeScoresForAccountGeneration([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7, Fresh: true},
+		{AccountID: credential.ID, Provider: credential.Provider, Headroom: 0.9, ShortHeadroom: 0.9, Fresh: true},
+	}, 1)
+	if !ok {
+		t.Fatal("score merge was rejected")
+	}
+	if !merged.Exhausted(credential.Provider, credential.ID) {
+		t.Fatal("partial merge return omitted the active credential exclusion")
+	}
+	picked, err := merged.PickBest([]account.Account{
+		{ID: "healthy", Provider: account.ProviderCodex},
+		credential,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "healthy" {
+		t.Fatalf("picked = %q, want healthy account", picked.ID)
 	}
 }
 

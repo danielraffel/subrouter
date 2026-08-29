@@ -105,6 +105,47 @@ func TestWithAccountDiskMutationPublicationRunsHookOnceBeforeMutation(t *testing
 	}
 }
 
+func TestRollbackUnpublishedAccountDiskMutationRemovesBeforePublication(t *testing.T) {
+	removed := false
+	err := rollbackUnpublishedAccountDiskMutation(
+		context.Background(),
+		t.TempDir(),
+		func(string) error {
+			if !removed {
+				t.Fatal("unpublished credential was not removed before rollback publication")
+			}
+			return nil
+		},
+		func() error {
+			removed = true
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRollbackUnpublishedAccountDiskMutationKeepsRemovalWhenPublicationFails(t *testing.T) {
+	removed := false
+	wantErr := errors.New("generation unavailable")
+	err := rollbackUnpublishedAccountDiskMutation(
+		context.Background(),
+		t.TempDir(),
+		func(string) error { return wantErr },
+		func() error {
+			removed = true
+			return nil
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want publication failure", err)
+	}
+	if !removed {
+		t.Fatal("publication failure prevented unpublished credential removal")
+	}
+}
+
 func TestAccountRefKeepsServingCompleteSnapshotDuringPublishedMutation(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	seed := accounts.StoredCodexAccount{
