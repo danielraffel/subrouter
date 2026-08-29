@@ -406,6 +406,30 @@ func TestClaudeMidMutationFailureDropsStaleLiveRoute(t *testing.T) {
 	}
 }
 
+func TestAccountMutationInvalidatesUsageCacheWhenReloadFails(t *testing.T) {
+	root := t.TempDir()
+	ref := NewAccountRef(accounts.CodexStore{Dir: filepath.Join(root, "accounts")}, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	ref.usageStatusAt = time.Now()
+	notDirectory := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(notDirectory, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{AccountRef: ref}
+	_, err := server.installAccountMutation(t.Context(), func() (string, func() error, error) {
+		return "test", func() error {
+			ref.store.Dir = notDirectory
+			return nil
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("forced snapshot reload failure succeeded")
+	}
+	if !ref.usageStatusAt.IsZero() {
+		t.Fatal("snapshot reload failure left the usage-status cache valid")
+	}
+}
+
 func serveTenantAccountUpload(server *Server, body string) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/_subrouter/accounts", strings.NewReader(body))

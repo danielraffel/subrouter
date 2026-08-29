@@ -2,6 +2,7 @@ package kimi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -313,6 +314,39 @@ func TestManagedAccountRemovalDeletesAnUnreadableCredential(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("unreadable credential remains after removal: %v", err)
+	}
+}
+
+func TestListAccountsRoutesOnlyCanonicalManagedFilename(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "unused-cli.json"), ManagedDir: t.TempDir()}
+	if _, err := store.SaveManagedCredential("work", CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	canonicalName, err := managedFilename("kimi-subscription:work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(store.ManagedDir, canonicalName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasName := base64.RawURLEncoding.EncodeToString([]byte("WORK")) + ".json"
+	aliasPath := filepath.Join(store.ManagedDir, aliasName)
+	if err := os.WriteFile(aliasPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := store.ListAccounts(t.Context())
+	if err != nil || len(listed) != 1 || listed[0].ID != "kimi-subscription:work" {
+		t.Fatalf("routed accounts = %+v, err = %v", listed, err)
+	}
+	ids, err := store.AccountInventoryIDs(t.Context())
+	if err != nil || len(ids) != 2 || ids[0] != "kimi-subscription:work" || ids[1] != "kimi-subscription:work" {
+		t.Fatalf("durable inventory = %v, err = %v", ids, err)
+	}
+	if _, err := os.Stat(aliasPath); err != nil {
+		t.Fatalf("noncanonical alias was not preserved: %v", err)
 	}
 }
 

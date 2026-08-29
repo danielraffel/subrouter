@@ -353,6 +353,10 @@ func (s Store) ListAccounts(_ context.Context) ([]account.Account, error) {
 		if entry.IsDir() || !valid {
 			continue
 		}
+		canonicalName, err := managedFilename(managedID)
+		if err != nil || entry.Name() != canonicalName {
+			continue
+		}
 		path := filepath.Join(dir, entry.Name())
 		managedCredential, present, readErr := readCredential(path, time.Now())
 		if readErr != nil {
@@ -679,11 +683,14 @@ func (s Store) ManagedAccountExists(label string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, err = os.Lstat(path)
+	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
 		return false, nil
 	}
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	return !info.IsDir(), nil
 }
 
 // RemoveManagedAccount removes one Subrouter-owned profile by its user-facing
@@ -716,10 +723,17 @@ func (s Store) removeManagedAccountID(id string) (account.Account, bool, error) 
 	if err != nil {
 		return account.Account{}, false, err
 	}
-	credential, ok, err := readCredential(path, time.Now())
-	if err == nil && !ok {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
 		return account.Account{}, false, nil
 	}
+	if err != nil {
+		return account.Account{}, false, err
+	}
+	if info.IsDir() {
+		return account.Account{}, false, nil
+	}
+	credential, _, readErr := readCredential(path, time.Now())
 	if removeErr := os.Remove(path); removeErr != nil {
 		if os.IsNotExist(removeErr) {
 			return account.Account{}, false, nil
@@ -729,7 +743,7 @@ func (s Store) removeManagedAccountID(id string) (account.Account, bool, error) 
 	// A malformed credential must remain removable through the supported CLI;
 	// parsing only enriches the confirmation row and is not authority to keep a
 	// broken profile installed forever.
-	if err == nil {
+	if readErr == nil {
 		if storedLabel := strings.TrimSpace(credential.AccountLabel); storedLabel != "" {
 			label = storedLabel
 		}

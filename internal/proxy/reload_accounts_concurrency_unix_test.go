@@ -392,7 +392,7 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 					t.Fatal(err)
 				}
 				logical, err := kimiStore.ListAccounts(t.Context())
-				if err != nil || len(logical) != 1 || logical[0].ID != "kimi-subscription:work" {
+				if err != nil || len(logical) != 0 {
 					t.Fatalf("logical alias fixture = %+v, err = %v", logical, err)
 				}
 				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
@@ -444,7 +444,7 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 					t.Fatal("alias conflict changed the original credential")
 				}
 				logical, err = kimiStore.ListAccounts(t.Context())
-				if err != nil || len(logical) != 1 || logical[0].ID != "kimi-subscription:work" {
+				if err != nil || len(logical) != 0 {
 					t.Fatalf("logical accounts after conflict = %+v, err = %v", logical, err)
 				}
 				routed := 0
@@ -453,8 +453,8 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 						routed++
 					}
 				}
-				if routed != 1 {
-					t.Fatalf("routed Kimi aliases after conflict = %d, want 1", routed)
+				if routed != 0 {
+					t.Fatalf("routed Kimi aliases after conflict = %d, want 0", routed)
 				}
 			})
 		}
@@ -514,7 +514,7 @@ func TestUnreadableKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 					t.Fatalf("durable alias IDs = %v, err = %v", ids, err)
 				}
 				logical, err := kimiStore.ListAccounts(t.Context())
-				if (!dangling && err == nil) || len(logical) != 0 {
+				if err != nil || len(logical) != 0 {
 					t.Fatalf("unreadable alias accounts = %+v, err = %v", logical, err)
 				}
 				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
@@ -584,6 +584,178 @@ func TestUnreadableKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestCanonicalDanglingKimiAccountRemovalReconcilesState(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	kimiStore := agentkimi.Store{
+		Path: filepath.Join(root, "kimi", "cli.json"), ManagedDir: filepath.Join(root, "kimi", "managed"),
+	}
+	credential := agentkimi.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", OAuthDeviceID: "device", ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if _, err := kimiStore.SaveManagedCredential("work", credential); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(kimiStore.ManagedDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("canonical fixture entries = %d, err = %v", len(entries), err)
+	}
+	canonicalPath := filepath.Join(kimiStore.ManagedDir, entries[0].Name())
+	if err := os.Remove(canonicalPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "missing.json"), canonicalPath); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := kimiStore.AccountInventoryCount(t.Context()); err != nil || count != 1 {
+		t.Fatalf("inventory before removal = %d, err = %v", count, err)
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	ref.oauthSources = []OAuthAccountSource{kimiStore}
+	if _, _, err := ref.ReloadSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	payload, err := json.Marshal(accountImportRequest{
+		Provider: accounts.ProviderKimi,
+		Kimi:     &kimiAccountImport{Label: "work", Remove: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeLiveGeneration := ref.Generation()
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", response.Code, response.Body.String())
+	}
+	if _, err := os.Lstat(canonicalPath); !os.IsNotExist(err) {
+		t.Fatalf("canonical dangling link remains after removal: %v", err)
+	}
+	if count, err := kimiStore.AccountInventoryCount(t.Context()); err != nil || count != 0 {
+		t.Fatalf("inventory after removal = %d, err = %v", count, err)
+	}
+	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGeneration == beforeGeneration || ref.Generation() <= beforeLiveGeneration {
+		t.Fatalf("generation after removal: disk=%q live=%d before_disk=%q before_live=%d", afterGeneration, ref.Generation(), beforeGeneration, beforeLiveGeneration)
+	}
+	for _, account := range ref.All() {
+		if account.Provider == accounts.ProviderKimi && account.ID == "kimi-subscription:work" {
+			t.Fatalf("removed dangling account remains routed: %+v", account)
+		}
+	}
+}
+
+func TestFullCapacityCanonicalKimiRepair(t *testing.T) {
+	for _, dangling := range []bool{false, true} {
+		name := "malformed file"
+		if dangling {
+			name = "dangling symlink"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+			for index := 0; index < maxAccountImportAccounts-1; index++ {
+				if err := codexStore.SaveStored(accounts.StoredCodexAccount{
+					Email: fmt.Sprintf("apikey:seed-%03d", index), Provider: accounts.ProviderCodex,
+					Auth: accounts.CodexAuthFile{
+						AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+					},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			kimiStore := agentkimi.Store{
+				Path: filepath.Join(root, "kimi", "cli.json"), ManagedDir: filepath.Join(root, "kimi", "managed"),
+			}
+			fixtureCredential := agentkimi.CredentialInfo{
+				AccessToken: "old", RefreshToken: "old-refresh", OAuthDeviceID: "old-device", ExpiresAt: time.Now().Add(time.Hour),
+			}
+			if _, err := kimiStore.SaveManagedCredential("work", fixtureCredential); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(kimiStore.ManagedDir)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("canonical fixture entries = %d, err = %v", len(entries), err)
+			}
+			canonicalPath := filepath.Join(kimiStore.ManagedDir, entries[0].Name())
+			if err := os.Remove(canonicalPath); err != nil {
+				t.Fatal(err)
+			}
+			if dangling {
+				if err := os.Symlink(filepath.Join(root, "missing.json"), canonicalPath); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(canonicalPath, []byte("{not-json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if count, err := kimiStore.AccountInventoryCount(t.Context()); err != nil || count != 1 {
+				t.Fatalf("Kimi inventory before repair = %d, err = %v", count, err)
+			}
+			ref := NewAccountRef(codexStore, nil, nil)
+			ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+			ref.oauthSources = []OAuthAccountSource{kimiStore}
+			if _, _, err := ref.ReloadSnapshot(); err != nil {
+				t.Fatal(err)
+			}
+			handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+			replacement := agentkimi.CredentialInfo{
+				AccessToken: "new", RefreshToken: "new-refresh", OAuthDeviceID: "new-device", ExpiresAt: time.Now().Add(time.Hour),
+			}
+			payload, err := json.Marshal(accountImportRequest{
+				Provider: accounts.ProviderKimi,
+				Kimi:     &kimiAccountImport{Label: "work", Credential: replacement},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeLiveGeneration := ref.Generation()
+			response := serveProtectedAccountImport(handler, payload)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200, body = %s", response.Code, response.Body.String())
+			}
+			stored, ok, err := kimiStore.ReadManagedCredential("work", time.Now())
+			if err != nil || !ok || stored.AccessToken != replacement.AccessToken {
+				t.Fatalf("repaired credential = %+v, ok=%v err=%v", stored, ok, err)
+			}
+			info, err := os.Lstat(canonicalPath)
+			if err != nil || info.Mode()&os.ModeSymlink != 0 {
+				t.Fatalf("canonical repair did not leave a regular credential: info=%v err=%v", info, err)
+			}
+			if count, err := kimiStore.AccountInventoryCount(t.Context()); err != nil || count != 1 {
+				t.Fatalf("Kimi inventory after repair = %d, err = %v", count, err)
+			}
+			afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if afterGeneration == beforeGeneration || ref.Generation() <= beforeLiveGeneration {
+				t.Fatalf("generation after repair: disk=%q live=%d before_disk=%q before_live=%d", afterGeneration, ref.Generation(), beforeGeneration, beforeLiveGeneration)
+			}
+			routed := 0
+			for _, account := range ref.All() {
+				if account.Provider == accounts.ProviderKimi && account.ID == "kimi-subscription:work" {
+					routed++
+				}
+			}
+			if routed != 1 {
+				t.Fatalf("routed repaired Kimi accounts = %d, want 1", routed)
+			}
+		})
 	}
 }
 

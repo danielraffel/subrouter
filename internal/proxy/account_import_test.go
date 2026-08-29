@@ -20,6 +20,15 @@ import (
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
 
+type failingAccountInventorySource struct {
+	stubOAuthSource
+	err error
+}
+
+func (s failingAccountInventorySource) AccountInventoryCount(context.Context) (int, error) {
+	return 0, s.err
+}
+
 func TestAccountImportPreflightRequiresProtectedRemoteAccess(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -651,6 +660,82 @@ func TestConcurrentClaudeAccountImportsDoNotLoseRegistryEntries(t *testing.T) {
 	}
 }
 
+func TestAccountImportReportsUnreadableClaudeRegistry(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	claudeStore := agentclaude.Store{Dir: t.TempDir()}
+	if err := os.MkdirAll(filepath.Dir(claudeStore.ProfilesPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registry := []byte("{not-json")
+	if err := os.WriteFile(claudeStore.ProfilesPath(), registry, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	payload, err := json.Marshal(map[string]any{
+		"provider": accounts.ProviderCodex,
+		"codex": accounts.StoredCodexAccount{
+			Email: "apikey:new", Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-new"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "account inventory unavailable for claude") {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), claudeStore.ProfilesPath()) || strings.Contains(response.Body.String(), "profiles.json") {
+		t.Fatalf("inventory error leaked registry details: %s", response.Body.String())
+	}
+	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGeneration != beforeGeneration {
+		t.Fatal("unreadable Claude registry rejection published a generation")
+	}
+	body, err := os.ReadFile(claudeStore.ProfilesPath())
+	if err != nil || !bytes.Equal(body, registry) {
+		t.Fatalf("Claude registry changed: body=%q err=%v", body, err)
+	}
+}
+
+func TestAccountImportReportsUnavailableOAuthInventoryWithoutDetails(t *testing.T) {
+	codexStore := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	secretDetail := filepath.Join(t.TempDir(), "private-inventory.json")
+	ref.oauthSources = []OAuthAccountSource{&failingAccountInventorySource{
+		stubOAuthSource: stubOAuthSource{provider: accounts.ProviderKimi},
+		err:             fmt.Errorf("read %s: denied", secretDetail),
+	}}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	payload, err := json.Marshal(map[string]any{
+		"provider": accounts.ProviderCodex,
+		"codex": accounts.StoredCodexAccount{
+			Email: "apikey:new", Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-new"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "account inventory unavailable for kimi") {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), secretDetail) || strings.Contains(response.Body.String(), "private-inventory.json") {
+		t.Fatalf("inventory error leaked source details: %s", response.Body.String())
+	}
+}
+
 func TestAccountImportBoundsAndStrictlyParsesCredentialBodies(t *testing.T) {
 	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
 	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
@@ -1002,8 +1087,11 @@ func TestUnreadableMultiAccountOAuthInventoryFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := serveProtectedAccountImport(handler, payload)
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503, body = %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), kimiStore.ManagedDir) {
+		t.Fatalf("Kimi inventory error leaked its path: %s", response.Body.String())
 	}
 	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
 	if err != nil {
@@ -1040,8 +1128,11 @@ func TestUnreadableClaudeRegistryInventoryFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := serveProtectedAccountImport(handler, payload)
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503, body = %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), claudeStore.ProfilesPath()) || strings.Contains(response.Body.String(), "profiles.json") {
+		t.Fatalf("Claude inventory error leaked registry details: %s", response.Body.String())
 	}
 	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
 	if err != nil {

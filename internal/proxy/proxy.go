@@ -950,9 +950,6 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 }
 
 func (r *AccountRef) InvalidateUsageStatusCache() {
-	if r == nil {
-		return
-	}
 	r.usageStatusMu.Lock()
 	defer r.usageStatusMu.Unlock()
 	r.usageStatusAt = time.Time{}
@@ -2050,6 +2047,14 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
 			return
 		}
+		var inventoryErr *accountImportInventoryUnavailableError
+		if errors.As(err, &inventoryErr) {
+			if s.Logger != nil {
+				s.Logger.Error("account import inventory unavailable", "source", inventoryErr.source, "error", inventoryErr.err)
+			}
+			http.Error(w, inventoryErr.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		var collisionErr *accounts.StorageKeyCollisionError
 		if errors.As(err, &collisionErr) {
 			http.Error(w, "account identifier conflicts with an existing account", http.StatusConflict)
@@ -2106,6 +2111,17 @@ type accountImportCapacityError struct{}
 func (*accountImportCapacityError) Error() string {
 	return "account import pool has reached its capacity"
 }
+
+type accountImportInventoryUnavailableError struct {
+	source string
+	err    error
+}
+
+func (e *accountImportInventoryUnavailableError) Error() string {
+	return fmt.Sprintf("account inventory unavailable for %s; repair that source before importing accounts", e.source)
+}
+
+func (e *accountImportInventoryUnavailableError) Unwrap() error { return e.err }
 
 func rejectTrailingJSON(decoder *json.Decoder) error {
 	var trailing any
@@ -2252,8 +2268,10 @@ func (s Server) installAccountMutation(
 		if s.SchedulerRef != nil {
 			s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
 		}
-		s.AccountRef.InvalidateUsageStatusCache()
 	}
+	// The durable mutation may have succeeded even when snapshot reload did
+	// not. Never let a previously cached usage view survive that uncertainty.
+	s.AccountRef.InvalidateUsageStatusCache()
 	closeErr := transactionLock.Close()
 	transactionLock = nil
 	var finishErr error
@@ -2356,7 +2374,7 @@ func (s Server) accountImportInventory(ctx context.Context) ([]accounts.Account,
 	}
 	profileCount, err := s.AccountRef.claudeStore.ProfileInventoryCount()
 	if err != nil {
-		return nil, 0, fmt.Errorf("count Claude profiles for import capacity: %w", err)
+		return nil, 0, &accountImportInventoryUnavailableError{source: "claude", err: err}
 	}
 	count := len(stored) + profileCount
 	claudeAccounts, _ := s.AccountRef.claudeStore.ListAccounts(ctx)
@@ -2371,7 +2389,7 @@ func (s Server) accountImportInventory(ctx context.Context) ([]accounts.Account,
 				// A multi-account store has an unbounded unknown size when its
 				// durable inventory cannot be read. New distinct imports must
 				// fail closed; callers establish in-place repairs before here.
-				return nil, 0, fmt.Errorf("count %s accounts for import capacity: %w", source.Provider(), countErr)
+				return nil, 0, &accountImportInventoryUnavailableError{source: string(source.Provider()), err: countErr}
 			}
 			if durableCount > sourceCount {
 				sourceCount = durableCount
