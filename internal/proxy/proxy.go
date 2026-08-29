@@ -2158,7 +2158,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 				return "", nil, err
 			}
 			if !exists {
-				if err := s.ensureNewOAuthSourceAccountImportCapacity(ctx); err != nil {
+				if err := s.ensureNewOAuthSourceAccountImportCapacity(ctx, accounts.ProviderKimi, id); err != nil {
 					return "", nil, err
 				}
 			}
@@ -2295,10 +2295,18 @@ func (s Server) ensureAccountImportCapacity(ctx context.Context, accountID strin
 	return accountID, nil
 }
 
-func (s Server) ensureNewOAuthSourceAccountImportCapacity(ctx context.Context) error {
-	_, count, err := s.accountImportInventory(ctx)
+func (s Server) ensureNewOAuthSourceAccountImportCapacity(ctx context.Context, provider accounts.Provider, accountID string) error {
+	all, count, err := s.accountImportInventory(ctx)
 	if err != nil {
 		return err
+	}
+	for _, account := range all {
+		if account.Provider == provider && strings.EqualFold(account.ID, accountID) {
+			return &accounts.StorageKeyCollisionError{
+				Identifier:         accountID,
+				ExistingIdentifier: account.ID,
+			}
+		}
 	}
 	if count >= maxAccountImportAccounts {
 		return &accountImportCapacityError{}

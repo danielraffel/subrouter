@@ -3,6 +3,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -326,96 +327,137 @@ func TestConcurrentWorkerKimiImportsShareFreshAllProviderCapacity(t *testing.T) 
 	}
 }
 
-func TestFullCapacityKimiLogicalAliasesCannotCreateCanonicalEntry(t *testing.T) {
-	for _, symlink := range []bool{false, true} {
-		name := "noncanonical filename"
-		if symlink {
-			name = "noncanonical symlink"
+func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		capacity := "below capacity"
+		if full {
+			capacity = "full capacity"
 		}
-		t.Run(name, func(t *testing.T) {
-			root := t.TempDir()
-			codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
-			for index := 0; index < maxAccountImportAccounts-1; index++ {
-				account := accounts.StoredCodexAccount{
-					Email:    fmt.Sprintf("apikey:seed-%03d", index),
-					Provider: accounts.ProviderCodex,
-					Auth: accounts.CodexAuthFile{
-						AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
-					},
-				}
-				if err := codexStore.SaveStored(account); err != nil {
-					t.Fatal(err)
-				}
-			}
-			claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
-			kimiStore := agentkimi.Store{
-				Path:       filepath.Join(root, "kimi", "cli.json"),
-				ManagedDir: filepath.Join(root, "kimi", "managed"),
-			}
-			credential := agentkimi.CredentialInfo{
-				AccessToken: "access", RefreshToken: "refresh",
-				OAuthDeviceID: "device", ExpiresAt: time.Now().Add(time.Hour),
-			}
-			if _, err := kimiStore.SaveManagedCredential("work", credential); err != nil {
-				t.Fatal(err)
-			}
-			entries, err := os.ReadDir(kimiStore.ManagedDir)
-			if err != nil || len(entries) != 1 {
-				t.Fatalf("canonical fixture entries = %d, err = %v", len(entries), err)
-			}
-			canonicalPath := filepath.Join(kimiStore.ManagedDir, entries[0].Name())
-			aliasName := base64.RawURLEncoding.EncodeToString([]byte("WORK")) + ".json"
-			aliasPath := filepath.Join(kimiStore.ManagedDir, aliasName)
+		for _, symlink := range []bool{false, true} {
+			aliasKind := "noncanonical filename"
 			if symlink {
-				target := filepath.Join(root, "credential-target.json")
-				if err := os.Rename(canonicalPath, target); err != nil {
+				aliasKind = "noncanonical symlink"
+			}
+			t.Run(capacity+"/"+aliasKind, func(t *testing.T) {
+				root := t.TempDir()
+				codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+				storedAccounts := 0
+				if full {
+					storedAccounts = maxAccountImportAccounts - 1
+				}
+				for index := 0; index < storedAccounts; index++ {
+					account := accounts.StoredCodexAccount{
+						Email:    fmt.Sprintf("apikey:seed-%03d", index),
+						Provider: accounts.ProviderCodex,
+						Auth: accounts.CodexAuthFile{
+							AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+						},
+					}
+					if err := codexStore.SaveStored(account); err != nil {
+						t.Fatal(err)
+					}
+				}
+				claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+				kimiStore := agentkimi.Store{
+					Path:       filepath.Join(root, "kimi", "cli.json"),
+					ManagedDir: filepath.Join(root, "kimi", "managed"),
+				}
+				credential := agentkimi.CredentialInfo{
+					AccessToken: "access", RefreshToken: "refresh",
+					OAuthDeviceID: "device", ExpiresAt: time.Now().Add(time.Hour),
+				}
+				if _, err := kimiStore.SaveManagedCredential("work", credential); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Symlink(target, aliasPath); err != nil {
+				entries, err := os.ReadDir(kimiStore.ManagedDir)
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("canonical fixture entries = %d, err = %v", len(entries), err)
+				}
+				canonicalPath := filepath.Join(kimiStore.ManagedDir, entries[0].Name())
+				aliasName := base64.RawURLEncoding.EncodeToString([]byte("WORK")) + ".json"
+				aliasPath := filepath.Join(kimiStore.ManagedDir, aliasName)
+				if symlink {
+					target := filepath.Join(root, "credential-target.json")
+					if err := os.Rename(canonicalPath, target); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(target, aliasPath); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Rename(canonicalPath, aliasPath); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := os.Rename(canonicalPath, aliasPath); err != nil {
-				t.Fatal(err)
-			}
-			logical, err := kimiStore.ListAccounts(t.Context())
-			if err != nil || len(logical) != 1 || logical[0].ID != "kimi-subscription:work" {
-				t.Fatalf("logical alias fixture = %+v, err = %v", logical, err)
-			}
-			if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
-				t.Fatalf("canonical path exists before import: exists=%v err=%v", exists, err)
-			}
-			ref := NewAccountRef(codexStore, nil, nil)
-			ref.claudeStore = claudeStore
-			ref.oauthSources = []OAuthAccountSource{kimiStore}
-			handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
-			payload, err := json.Marshal(accountImportRequest{
-				Provider: accounts.ProviderKimi,
-				Kimi: &kimiAccountImport{
-					Label: "work", Credential: credential,
-				},
+				originalCredential, err := os.ReadFile(aliasPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				logical, err := kimiStore.ListAccounts(t.Context())
+				if err != nil || len(logical) != 1 || logical[0].ID != "kimi-subscription:work" {
+					t.Fatalf("logical alias fixture = %+v, err = %v", logical, err)
+				}
+				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
+					t.Fatalf("canonical path exists before import: exists=%v err=%v", exists, err)
+				}
+				ref := NewAccountRef(codexStore, nil, nil)
+				ref.claudeStore = claudeStore
+				ref.oauthSources = []OAuthAccountSource{kimiStore}
+				if _, _, err := ref.ReloadSnapshot(); err != nil {
+					t.Fatal(err)
+				}
+				handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+				payload, err := json.Marshal(accountImportRequest{
+					Provider: accounts.ProviderKimi,
+					Kimi: &kimiAccountImport{
+						Label: "work", Credential: credential,
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				response := serveProtectedAccountImport(handler, payload)
+				if response.Code != http.StatusConflict {
+					t.Fatalf("status = %d, want 409, body = %s", response.Code, response.Body.String())
+				}
+				afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if afterGeneration != beforeGeneration {
+					t.Fatal("alias conflict published an account generation")
+				}
+				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
+					t.Fatalf("rejected import created canonical path: exists=%v err=%v", exists, err)
+				}
+				entries, err = os.ReadDir(kimiStore.ManagedDir)
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("managed entries after conflict = %d, err = %v", len(entries), err)
+				}
+				afterCredential, err := os.ReadFile(aliasPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(afterCredential, originalCredential) {
+					t.Fatal("alias conflict changed the original credential")
+				}
+				logical, err = kimiStore.ListAccounts(t.Context())
+				if err != nil || len(logical) != 1 || logical[0].ID != "kimi-subscription:work" {
+					t.Fatalf("logical accounts after conflict = %+v, err = %v", logical, err)
+				}
+				routed := 0
+				for _, account := range ref.All() {
+					if account.Provider == accounts.ProviderKimi && account.ID == "kimi-subscription:work" {
+						routed++
+					}
+				}
+				if routed != 1 {
+					t.Fatalf("routed Kimi aliases after conflict = %d, want 1", routed)
+				}
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			response := serveProtectedAccountImport(handler, payload)
-			if response.Code != http.StatusInsufficientStorage {
-				t.Fatalf("status = %d, want 507, body = %s", response.Code, response.Body.String())
-			}
-			afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if afterGeneration != beforeGeneration {
-				t.Fatal("alias capacity rejection published an account generation")
-			}
-			if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
-				t.Fatalf("rejected import created canonical path: exists=%v err=%v", exists, err)
-			}
-		})
+		}
 	}
 }
 
