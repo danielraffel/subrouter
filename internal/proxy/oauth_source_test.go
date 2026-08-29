@@ -50,6 +50,72 @@ type concurrentOAuthUsageSource struct {
 	sawUsageDeadline   int
 }
 
+type sharedStatusProbeGate struct {
+	mu      sync.Mutex
+	current int
+	maximum int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *sharedStatusProbeGate) run(ctx context.Context) error {
+	g.mu.Lock()
+	g.current++
+	if g.current > g.maximum {
+		g.maximum = g.current
+	}
+	g.mu.Unlock()
+	g.entered <- struct{}{}
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		g.mu.Lock()
+		g.current--
+		g.mu.Unlock()
+		return ctx.Err()
+	}
+	g.mu.Lock()
+	g.current--
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *sharedStatusProbeGate) max() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.maximum
+}
+
+type mixedOAuthStatusSource struct {
+	gate     *sharedStatusProbeGate
+	accounts []accounts.Account
+}
+
+type deadlineOAuthStatusSource struct {
+	deadline time.Time
+}
+
+func (s *deadlineOAuthStatusSource) Provider() accounts.Provider { return accounts.ProviderKimi }
+
+func (s *deadlineOAuthStatusSource) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
+	s.deadline, _ = ctx.Deadline()
+	return nil, nil
+}
+
+func (s *deadlineOAuthStatusSource) RefreshAccount(_ context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
+	return account, nil
+}
+
+func (s *mixedOAuthStatusSource) Provider() accounts.Provider { return accounts.ProviderKimi }
+
+func (s *mixedOAuthStatusSource) ListAccounts(context.Context) ([]accounts.Account, error) {
+	return s.accounts, nil
+}
+
+func (s *mixedOAuthStatusSource) RefreshAccount(ctx context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
+	return account, s.gate.run(ctx)
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -748,6 +814,109 @@ func TestUsageStatusesBoundsAndParallelizesOAuthSourceAccounts(t *testing.T) {
 	defer source.mu.Unlock()
 	if !source.sawListDeadline || source.sawRefreshDeadline != 2 || source.sawUsageDeadline != 2 {
 		t.Fatalf("deadline coverage: list=%v refresh=%d usage=%d", source.sawListDeadline, source.sawRefreshDeadline, source.sawUsageDeadline)
+	}
+}
+
+func TestUsageStatusesSharesOneConcurrencyBudgetAcrossKeyedAndOAuthSources(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	for i := 0; i < 3; i++ {
+		if _, _, err := store.AddAPIKeyForProvider(
+			"key-"+string(rune('a'+i)),
+			"secret-"+string(rune('a'+i)),
+			accounts.ProviderOpenRouter,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gate := &sharedStatusProbeGate{
+		entered: make(chan struct{}, 16),
+		release: make(chan struct{}),
+	}
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := gate.run(request.Context()); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    request,
+		}, nil
+	})
+	oauthAccounts := make([]accounts.Account, 8)
+	for i := range oauthAccounts {
+		oauthAccounts[i] = accounts.Account{
+			ID:       "kimi-subscription:" + string(rune('a'+i)),
+			Provider: accounts.ProviderKimi,
+			AuthMode: accounts.AuthModeOAuth,
+		}
+	}
+	ref := NewAccountRef(store, nil, &http.Client{Transport: transport})
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	ref.apiKeyUpstreams = map[accounts.Provider]string{
+		accounts.ProviderOpenRouter: "https://openrouter.test/api/v1",
+	}
+	ref.oauthSources = []OAuthAccountSource{&mixedOAuthStatusSource{gate: gate, accounts: oauthAccounts}}
+
+	result := make(chan []AccountUsageStatus, 1)
+	go func() { result <- ref.usageStatusesLive(context.Background()) }()
+	for range accountFetchConcurrency {
+		select {
+		case <-gate.entered:
+		case <-time.After(time.Second):
+			close(gate.release)
+			t.Fatal("shared status sweep did not fill its concurrency budget")
+		}
+	}
+	select {
+	case <-gate.entered:
+		close(gate.release)
+		t.Fatal("keyed and OAuth probes exceeded the shared concurrency budget")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(gate.release)
+	select {
+	case statuses := <-result:
+		if len(statuses) != 11 {
+			t.Fatalf("statuses = %d, want 11", len(statuses))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shared status sweep did not complete after release")
+	}
+	if maximum := gate.max(); maximum > accountFetchConcurrency {
+		t.Fatalf("maximum concurrent status probes = %d, want <= %d", maximum, accountFetchConcurrency)
+	}
+}
+
+func TestUsageStatusesSharesOneDeadlineAcrossKeyedAndOAuthSources(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	if _, _, err := store.AddAPIKeyForProvider("work", "secret", accounts.ProviderOpenRouter); err != nil {
+		t.Fatal(err)
+	}
+	var keyedDeadline time.Time
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		keyedDeadline, _ = request.Context().Deadline()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    request,
+		}, nil
+	})
+	source := &deadlineOAuthStatusSource{}
+	ref := NewAccountRef(store, nil, &http.Client{Transport: transport})
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	ref.apiKeyUpstreams = map[accounts.Provider]string{
+		accounts.ProviderOpenRouter: "https://openrouter.test/api/v1",
+	}
+	ref.oauthSources = []OAuthAccountSource{source}
+
+	ref.usageStatusesLive(context.Background())
+	if keyedDeadline.IsZero() || source.deadline.IsZero() {
+		t.Fatalf("status deadlines keyed=%v OAuth=%v, want both set", keyedDeadline, source.deadline)
+	}
+	if !keyedDeadline.Equal(source.deadline) {
+		t.Fatalf("status deadlines keyed=%v OAuth=%v, want one shared deadline", keyedDeadline, source.deadline)
 	}
 }
 
