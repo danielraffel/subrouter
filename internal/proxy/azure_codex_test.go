@@ -1338,6 +1338,51 @@ func TestAzureCodexStreamQuotaMarksAccountAndDiverts(t *testing.T) {
 	}
 }
 
+func TestAzureCodexStreamQuotaMarksTheAccountThatProducedTheResponse(t *testing.T) {
+	poolURL, err := url.Parse("https://pool.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 2)
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "initial-account", Provider: accounts.ProviderCodex, Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "routed-account", Provider: accounts.ProviderCodex, Headroom: 0.70, ShortHeadroom: 0.70},
+	}))
+	server.SchedulerRef = schedulerRef
+	body := []byte(`{"model":"gpt-5.6-codex","session_id":"session-routed-quota","stream":true,"input":[]}`)
+	request := httptest.NewRequest(http.MethodPost, "https://pool.invalid/responses", bytes.NewReader(body))
+	transport := azureCodexFallbackTransport{
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"usage_limit_reached\"}}}\n\n")),
+				Request:    request,
+			}
+			return tagRoutedResponseAccount(response, accounts.Account{ID: "routed-account", Provider: accounts.ProviderCodex}), nil
+		}),
+		server:     &server,
+		sessionKey: "codex\x00session-routed-quota",
+		accountID:  "initial-account",
+		replayBody: func() ([]byte, bool) { return body, true },
+	}
+
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, marked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "routed-account", ""); !marked {
+		t.Fatal("stream quota did not exhaust the account that produced the routed response")
+	}
+	if _, marked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "initial-account", ""); marked {
+		t.Fatal("stream quota incorrectly exhausted the request's initial account")
+	}
+}
+
 // A code the proxy has never seen ends the turn if forwarded, so it diverts.
 func TestAzureCodexStreamUnknownFailureDiverts(t *testing.T) {
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

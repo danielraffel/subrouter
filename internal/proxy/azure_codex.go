@@ -942,8 +942,14 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 			switch class {
 			case codexFailureQuota:
 				// The stream form of a 429: mark the account so the next pick
-				// avoids it, then let the fallback finish this turn.
-				t.server.markAccountExhausted(accounts.ProviderCodex, t.accountID, t.poolModel)
+				// avoids it, then let the fallback finish this turn. The retry
+				// transport beneath us may have routed the response through a
+				// different account than the request's initial pick.
+				accountID := t.accountID
+				if routed, ok := routedResponseAccount(response); ok && routed.ID != "" {
+					accountID = routed.ID
+				}
+				t.server.markAccountExhausted(accounts.ProviderCodex, accountID, t.poolModel)
 				reason = "pool_stream_quota"
 			case codexFailureServer:
 				reason = "pool_stream_failed"

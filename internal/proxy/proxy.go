@@ -415,6 +415,7 @@ const usageWindowsLastGoodTTL = 15 * time.Minute
 // slow account costs at most this timeout instead of adding to every other
 // account's latency.
 const usageStatusFetchTimeout = 5 * time.Second
+const keyedProviderStatusProbeConcurrency = 4
 
 const credFailureTTL = credentialExhaustionTTL
 
@@ -1076,7 +1077,15 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	claudeProfiles := r.claudeStore.ListProfiles()
 	claudeOffset := len(storedAccounts)
 	out := make([]AccountUsageStatus, claudeOffset+len(claudeProfiles))
+	// This is deliberately one wall-clock budget for the keyed pool, not five
+	// seconds per queued account. Status must return promptly as pools grow;
+	// accounts that do not acquire a slot keep their seeded identity and are
+	// retried by the next cached sweep instead of extending this request by
+	// another batch.
+	probeCtx, cancelProbes := context.WithTimeout(ctx, usageStatusFetchTimeout)
+	defer cancelProbes()
 	var wg sync.WaitGroup
+	probeSem := make(chan struct{}, keyedProviderStatusProbeConcurrency)
 	for i, stored := range storedAccounts {
 		i, stored := i, stored
 		provider := stored.ProviderOrDefault()
@@ -1103,7 +1112,16 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					out[i] = r.keyedAPIUsageStatus(ctx, stored, out[i])
+					select {
+					case probeSem <- struct{}{}:
+					case <-probeCtx.Done():
+						next := out[i]
+						next.Error = probeCtx.Err().Error()
+						out[i] = next
+						return
+					}
+					defer func() { <-probeSem }()
+					out[i] = r.keyedAPIUsageStatus(probeCtx, stored, out[i])
 				}()
 			}
 			continue
@@ -6265,6 +6283,28 @@ type usageLimitRetryTransport struct {
 	budget *attemptBudget
 }
 
+type routedResponseAccountKey struct{}
+
+func tagRoutedResponseAccount(response *http.Response, routed accounts.Account) *http.Response {
+	if response == nil {
+		return nil
+	}
+	request := response.Request
+	if request == nil {
+		request = &http.Request{}
+	}
+	response.Request = request.WithContext(context.WithValue(request.Context(), routedResponseAccountKey{}, routed))
+	return response
+}
+
+func routedResponseAccount(response *http.Response) (accounts.Account, bool) {
+	if response == nil || response.Request == nil {
+		return accounts.Account{}, false
+	}
+	routed, ok := response.Request.Context().Value(routedResponseAccountKey{}).(accounts.Account)
+	return routed, ok
+}
+
 // fableFallbackResponse swaps the pool's give-up response for one served by the
 // Fable fallback chain (Bedrock, then the dedicated API key). Returns false
 // when no chain is configured for this request or every stage failed, in which
@@ -6293,7 +6333,7 @@ func (t usageLimitRetryTransport) fableFallbackResponse(giveUp *http.Response, a
 	if giveUp != nil && giveUp.Body != nil {
 		_ = giveUp.Body.Close()
 	}
-	return fallback, true
+	return tagRoutedResponseAccount(fallback, accounts.Account{Provider: t.provider}), true
 }
 
 // providerOverloadMaxRetries bounds same-account overload retries for providers
@@ -6605,6 +6645,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
+		response = tagRoutedResponseAccount(response, accounts.Account{ID: accountID, Provider: t.provider})
 		if err != nil || req.GetBody == nil || req.Context().Err() != nil {
 			return response, err
 		}
@@ -6798,7 +6839,8 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logger.Warn("retrying replayable upstream request after usage limit", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "attempt", attempt+1, "max_attempts", maxAttempts)
 		}
 	}
-	return base.RoundTrip(req)
+	response, err := base.RoundTrip(req)
+	return tagRoutedResponseAccount(response, accounts.Account{ID: accountID, Provider: t.provider}), err
 }
 
 // commitSuccessfulFailover moves durable stickiness only after the replacement
