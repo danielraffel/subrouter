@@ -54,6 +54,57 @@ func TestPublishAccountDiskMutationPublishesBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestWithAccountDiskMutationPublicationSkipsNoOpGeneration(t *testing.T) {
+	published := 0
+	err := withAccountDiskMutationPublication(
+		context.Background(),
+		t.TempDir(),
+		func(string) error {
+			published++
+			return nil
+		},
+		func(func() error) error { return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published != 0 {
+		t.Fatalf("no-op refresh published %d account generations, want 0", published)
+	}
+}
+
+func TestWithAccountDiskMutationPublicationRunsHookOnceBeforeMutation(t *testing.T) {
+	published := 0
+	mutated := false
+	err := withAccountDiskMutationPublication(
+		context.Background(),
+		t.TempDir(),
+		func(string) error {
+			if mutated {
+				t.Fatal("account generation published after credential mutation")
+			}
+			published++
+			return nil
+		},
+		func(publish func() error) error {
+			if err := publish(); err != nil {
+				return err
+			}
+			if err := publish(); err != nil {
+				return err
+			}
+			mutated = true
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published != 1 || !mutated {
+		t.Fatalf("publication/mutation = %d/%v, want 1/true", published, mutated)
+	}
+}
+
 func TestAccountRefKeepsServingCompleteSnapshotDuringPublishedMutation(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	seed := accounts.StoredCodexAccount{

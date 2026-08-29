@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -348,6 +349,189 @@ func TestLocalProviderStatusDoesNotPublishFreshOAuthCredentials(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
 		t.Fatalf("fresh provider status published an account generation: %v", err)
 	}
+}
+
+func TestLocalClaudeStatusRefreshPublishesBeforeUsageAndReloadsAccount(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	profile := seedClaudeStatusCredential(t, claudeStore, "primary", agentclaude.CredentialInfo{
+		AccessToken: "stale-access", RefreshToken: "stale-refresh",
+		ExpiresAt: time.Now().Add(-time.Hour).UnixMilli(), SubscriptionType: "pro",
+	})
+
+	ref, err := proxy.OpenAccountRef(store, claudeStore, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := accountToken(ref.All(), accounts.ProviderClaude, profile.Name); got != "stale-access" {
+		t.Fatalf("initial Claude token = %q, want stale-access", got)
+	}
+
+	var refreshCalls, usageCalls atomic.Int32
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/v1/oauth/token":
+			refreshCalls.Add(1)
+			return srJSONResponse(req, http.StatusOK, `{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}`), nil
+		case "/api/oauth/usage":
+			usageCalls.Add(1)
+			if got := req.Header.Get("Authorization"); got != "Bearer fresh-access" {
+				return nil, fmt.Errorf("Claude usage authorization = %q, want refreshed access token", got)
+			}
+			if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+				return nil, fmt.Errorf("Claude refresh was not published before usage: %w", err)
+			}
+			lockCtx, cancel := context.WithTimeout(req.Context(), time.Second)
+			defer cancel()
+			if err := proxy.PublishAccountDiskMutation(lockCtx, store.StoreDir(), func() (bool, error) {
+				return false, nil
+			}); err != nil {
+				return nil, fmt.Errorf("Claude usage ran while account transaction remained locked: %w", err)
+			}
+			return srJSONResponse(req, http.StatusOK, `{"seven_day_oauth_apps":{"utilization":0.1,"resets_at":""}}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected Claude status request %s %s", req.Method, req.URL)
+		}
+	})}
+
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row := usageRowFor(rows, accounts.ProviderClaude, profile.Name); row == nil || row.err != nil {
+		t.Fatalf("refreshed Claude status row = %+v", row)
+	}
+	if refreshCalls.Load() != 1 || usageCalls.Load() != 1 {
+		t.Fatalf("Claude status calls refresh=%d usage=%d, want 1/1", refreshCalls.Load(), usageCalls.Load())
+	}
+	daemon := (proxy.Server{AccountRef: ref, AdminToken: "test-admin"}).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil)
+	request.Header.Set("Authorization", "Bearer test-admin")
+	response := httptest.NewRecorder()
+	daemon.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("daemon account lookup status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if got := accountToken(ref.All(), accounts.ProviderClaude, profile.Name); got != "fresh-access" {
+		t.Fatalf("generation-triggered daemon reload token = %q, want fresh-access", got)
+	}
+}
+
+func TestLocalClaudeStatusDoesNotPublishFreshCredential(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	profile := seedClaudeStatusCredential(t, claudeStore, "fresh", agentclaude.CredentialInfo{
+		AccessToken: "current-access", RefreshToken: "current-refresh",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), SubscriptionType: "max",
+	})
+
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/api/oauth/usage" {
+			return nil, fmt.Errorf("fresh Claude credential made unexpected request %s %s", req.Method, req.URL)
+		}
+		return srJSONResponse(req, http.StatusOK, `{"seven_day_oauth_apps":{"utilization":0.1,"resets_at":""}}`), nil
+	})}
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row := usageRowFor(rows, accounts.ProviderClaude, profile.Name); row == nil || row.err != nil {
+		t.Fatalf("fresh Claude status row = %+v", row)
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+		t.Fatalf("fresh Claude status published an account generation: %v", err)
+	}
+}
+
+func TestLocalClaudeStatusPublicationFailurePreventsRefresh(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	store := accounts.DefaultCodexStore()
+	claudeStore := agentclaude.DefaultStore()
+	profile := seedClaudeStatusCredential(t, claudeStore, "blocked", agentclaude.CredentialInfo{
+		AccessToken: "stale-access", RefreshToken: "stale-refresh",
+		ExpiresAt: time.Now().Add(-time.Hour).UnixMilli(),
+	})
+	if err := os.MkdirAll(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var requests atomic.Int32
+	client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, fmt.Errorf("credential request ran after publication failure: %s", req.URL)
+	})}
+	rows, err := (srRunner{store: store, client: client}).fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row := usageRowFor(rows, accounts.ProviderClaude, profile.Name); row == nil || row.err == nil {
+		t.Fatalf("Claude publication failure row = %+v", row)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("Claude publication failure made %d credential requests, want 0", requests.Load())
+	}
+	credential, err := claudeStore.ReadCredential(t.Context(), claudeStore.ClaudeConfigDir(profile.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "stale-access" || credential.RefreshToken != "stale-refresh" {
+		t.Fatalf("credential changed after publication failure: %+v", credential)
+	}
+}
+
+func seedClaudeStatusCredential(t *testing.T, store agentclaude.Store, name string, credential agentclaude.CredentialInfo) agentclaude.Profile {
+	t.Helper()
+	if _, err := store.CreateProfile(name); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir(name)
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteCredential(t.Context(), configDir, credential); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile(name)
+	if !ok {
+		t.Fatalf("Claude profile %q was not created", name)
+	}
+	return profile
+}
+
+func srJSONResponse(req *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+}
+
+func usageRowFor(rows []srUsageRow, provider accounts.Provider, accountID string) *srUsageRow {
+	for i := range rows {
+		if rows[i].provider == provider && rows[i].email == accountID {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+func accountToken(all []baseaccount.Account, provider accounts.Provider, accountID string) string {
+	for _, account := range all {
+		if account.Provider == provider && account.ID == accountID {
+			return account.Token
+		}
+	}
+	return ""
 }
 
 func TestLocalKimiStatusSeparatesPartialSourceErrorFromHealthyAccount(t *testing.T) {

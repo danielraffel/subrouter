@@ -1480,7 +1480,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			account, credential, _, err := claudeStore.RefreshCredentialDetailsIfExpired(ctx, r.client, profile)
+			account, credential, err := r.refreshStatusClaudeCredential(ctx, claudeStore, profile)
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
@@ -1537,6 +1537,31 @@ func (r srRunner) refreshStatusOAuthAccount(
 		return account, err
 	}
 	return refreshed, nil
+}
+
+func (r srRunner) refreshStatusClaudeCredential(
+	ctx context.Context,
+	store agentclaude.Store,
+	profile agentclaude.Profile,
+) (baseaccount.Account, *agentclaude.CredentialInfo, error) {
+	account, credential, needsRefresh, err := store.CredentialRefreshState(ctx, profile, time.Now())
+	if err != nil || !needsRefresh {
+		return account, credential, err
+	}
+
+	var refreshedAccount baseaccount.Account
+	var refreshedCredential *agentclaude.CredentialInfo
+	err = proxy.WithAccountDiskMutationPublication(ctx, r.store.StoreDir(), func(publish func() error) error {
+		var refreshErr error
+		refreshedAccount, refreshedCredential, _, refreshErr = store.RefreshCredentialDetailsIfExpiredBeforeRefresh(
+			ctx, r.client, profile, publish,
+		)
+		return refreshErr
+	})
+	if err != nil {
+		return account, credential, err
+	}
+	return refreshedAccount, refreshedCredential, nil
 }
 
 func (r srRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accounts.AdminKeyEntry) string {

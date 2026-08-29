@@ -1177,12 +1177,12 @@ func (s Store) readCredential(ctx context.Context, instancePath string) (*Creden
 }
 
 func (s Store) RefreshCredentialIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
-	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, false)
+	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, false, nil)
 	return account, didRefresh, err
 }
 
 func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, bool, error) {
-	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, true)
+	account, _, didRefresh, err := s.refreshProfileCredential(ctx, client, profile, true, nil)
 	return account, didRefresh, err
 }
 
@@ -1190,7 +1190,46 @@ func (s Store) ForceRefreshCredential(ctx context.Context, client *http.Client, 
 // build the account so status callers do not need a second serialized disk or
 // Keychain read merely to obtain subscription metadata.
 func (s Store) RefreshCredentialDetailsIfExpired(ctx context.Context, client *http.Client, profile Profile) (accounts.Account, *CredentialInfo, bool, error) {
-	return s.refreshProfileCredential(ctx, client, profile, false)
+	return s.refreshProfileCredential(ctx, client, profile, false, nil)
+}
+
+// RefreshCredentialDetailsIfExpiredBeforeRefresh calls beforeRefresh only
+// after the per-profile refresh lock has been acquired and the credential has
+// been re-read as expired. Callers can publish shared disk generation at that
+// exact point without publishing when another process already refreshed the
+// single-use token.
+func (s Store) RefreshCredentialDetailsIfExpiredBeforeRefresh(
+	ctx context.Context,
+	client *http.Client,
+	profile Profile,
+	beforeRefresh func() error,
+) (accounts.Account, *CredentialInfo, bool, error) {
+	return s.refreshProfileCredential(ctx, client, profile, false, beforeRefresh)
+}
+
+// CredentialRefreshState returns one current credential snapshot and whether
+// status should enter the account-disk publication transaction to refresh it.
+// The refresh path rechecks this state under its per-profile refresh lock, so a
+// concurrent rotation between this preflight and refresh remains harmless.
+func (s Store) CredentialRefreshState(ctx context.Context, profile Profile, now time.Time) (accounts.Account, *CredentialInfo, bool, error) {
+	configDir := s.ClaudeConfigDir(profile.Name)
+	current, ok := s.FindProfile(profile.Name)
+	if !ok || profileInstancePathKey(s.ClaudeConfigDir(current.Name)) != profileInstancePathKey(configDir) {
+		return accounts.Account{}, nil, false, fmt.Errorf("Claude profile %q is no longer current", profile.Name)
+	}
+	credential, err := s.ReadCredential(ctx, configDir)
+	if err != nil {
+		return accounts.Account{}, nil, false, err
+	}
+	if credential == nil || credential.AccessToken == "" {
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no access token", profile.Name)
+	}
+	account, ok := profileAccount(current, configDir, credential)
+	if !ok {
+		return accounts.Account{}, credential, false, fmt.Errorf("Claude profile %q has no usable credential", profile.Name)
+	}
+	needsRefresh := credential.RefreshToken != "" && credentialExpiredAt(credential, 60*time.Second, now)
+	return account, credential, needsRefresh, nil
 }
 
 // refreshProfileCredential serializes concurrent refreshes of the same
@@ -1205,7 +1244,7 @@ func (s Store) RefreshCredentialDetailsIfExpired(ctx context.Context, client *ht
 // unrelated ImportProfileCredential call for the same profile; each
 // individual disk read/write still takes the short-lived
 // lockProfileCredential via ReadCredential / writeRefreshedCredentialIfUnchanged.
-func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool) (account accounts.Account, credential *CredentialInfo, didRefresh bool, err error) {
+func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client, profile Profile, force bool, beforeRefresh func() error) (account accounts.Account, credential *CredentialInfo, didRefresh bool, err error) {
 	configDir := s.ClaudeConfigDir(profile.Name)
 	refreshLock, err := lockProfileRefresh(ctx, configDir)
 	if err != nil {
@@ -1244,6 +1283,11 @@ func (s Store) refreshProfileCredential(ctx context.Context, client *http.Client
 
 	credentialBeforeRefresh := *credential
 	profileBeforeRefresh := profile
+	if beforeRefresh != nil {
+		if err := beforeRefresh(); err != nil {
+			return accounts.Account{}, credential, false, err
+		}
+	}
 	refreshed, err := RefreshCredential(ctx, client, credentialBeforeRefresh)
 	if err != nil {
 		return accounts.Account{}, credential, false, err
@@ -1452,11 +1496,15 @@ func credentialPayload(credential CredentialInfo) ([]byte, error) {
 }
 
 func credentialExpired(credential *CredentialInfo, skew time.Duration) bool {
+	return credentialExpiredAt(credential, skew, time.Now())
+}
+
+func credentialExpiredAt(credential *CredentialInfo, skew time.Duration, now time.Time) bool {
 	if credential == nil || credential.ExpiresAt <= 0 {
 		return false
 	}
 	expiresAt := time.UnixMilli(credential.ExpiresAt)
-	return !time.Now().Add(skew).Before(expiresAt)
+	return !now.Add(skew).Before(expiresAt)
 }
 
 func RefreshCredential(ctx context.Context, client *http.Client, credential CredentialInfo) (CredentialInfo, error) {
