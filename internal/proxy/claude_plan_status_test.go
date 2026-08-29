@@ -48,6 +48,9 @@ func TestClaudeUsageStatusesRoundTripCredentialPlanTypes(t *testing.T) {
 		if status.Provider != accounts.ProviderClaude {
 			continue
 		}
+		if !status.AuthValid || !status.UsageFresh {
+			t.Errorf("credential-derived status for %q is not live: %+v", status.ID, status)
+		}
 		if got := status.PlanType; got != want[status.ID] {
 			t.Errorf("plan for %q = %q, want %q", status.ID, got, want[status.ID])
 		}
