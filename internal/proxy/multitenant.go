@@ -357,7 +357,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.Sessions = sessions
 	server.Scheduler = selectacct.Scheduler{}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
-	server.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initial)
+	server.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, SchedulerAccounts(initial))
 	server.ActiveSessions = NewActiveSessions()
 	server.CacheFlight = newSingleFlight()
 	// Reaching a tenant handler already proves possession of the tenant key,

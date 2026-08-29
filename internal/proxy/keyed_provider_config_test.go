@@ -479,7 +479,7 @@ func TestQwenAnthropicSchedulingUsesSharedTokenPlanSessionLoad(t *testing.T) {
 		{ID: "qwen-token:a-busy", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "busy"},
 		{ID: "qwen-token:z-idle", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "idle"},
 	}, accounts.ProviderQwenAnthropic)
-	picked, err := scheduler.PickBest(schedulerAccounts(candidates))
+	picked, err := scheduler.PickBest(SchedulerAccounts(candidates))
 	if err != nil {
 		t.Fatal(err)
 	}

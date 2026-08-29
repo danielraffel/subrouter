@@ -527,7 +527,9 @@ func schedulerAccount(account accounts.Account) accounts.Account {
 	return account
 }
 
-func schedulerAccounts(accountsIn []accounts.Account) []accounts.Account {
+// SchedulerAccounts returns a copy whose providers are normalized to the
+// credential owner used by quota scores and exhaustion state.
+func SchedulerAccounts(accountsIn []accounts.Account) []accounts.Account {
 	out := make([]accounts.Account, len(accountsIn))
 	for i, account := range accountsIn {
 		out[i] = schedulerAccount(account)
@@ -536,7 +538,7 @@ func schedulerAccounts(accountsIn []accounts.Account) []accounts.Account {
 }
 
 func pickRoutingAccount(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, error) {
-	picked, err := scheduler.Pick(schedulerAccounts(candidates))
+	picked, err := scheduler.Pick(SchedulerAccounts(candidates))
 	if err != nil {
 		return accounts.Account{}, err
 	}

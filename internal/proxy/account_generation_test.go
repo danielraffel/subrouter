@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -170,5 +171,55 @@ func TestTerminalCredentialFailureIsScopedToCredentialToken(t *testing.T) {
 	ref.noteCredResult(replacement, errors.New("invalid_grant"))
 	if _, dead := ref.terminalCredFailure(replacement); !dead {
 		t.Fatal("replacement's own terminal failure was not remembered")
+	}
+}
+
+func TestQwenAnthropicUnauthorizedMarksSharedTokenPlanCredential(t *testing.T) {
+	for _, storedProvider := range []accounts.Provider{
+		accounts.ProviderQwenToken,
+		accounts.ProviderQwenAnthropic,
+	} {
+		t.Run(string(storedProvider), func(t *testing.T) {
+			stored := accounts.Account{
+				ID: "qwen-token:work", Provider: storedProvider,
+				AuthMode: accounts.AuthModeAPIKey, Token: "shared-key",
+			}
+			requestAccount := stored
+			requestAccount.Provider = accounts.ProviderQwenAnthropic
+			ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{stored}, nil)
+			scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+				AccountID: stored.ID, Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1,
+			}}))
+			server := Server{AccountRef: ref, SchedulerRef: scheduler}
+			server.accountListSnapshotContext(context.Background())
+
+			server.markAccountExhaustedFromResponseForAccount(
+				requestAccount, "", http.StatusUnauthorized, http.Header{},
+			)
+			until, blocked := scheduler.ExhaustedUntilFor(accounts.ProviderQwenToken, stored.ID, "")
+			if !blocked || time.Until(until) < 50*time.Minute {
+				t.Fatalf("shared credential was not excluded after cross-protocol 401: blocked=%v until=%v", blocked, until)
+			}
+		})
+	}
+}
+
+func TestQwenAnthropicForbiddenMarksSharedTokenPlanAccount(t *testing.T) {
+	account := accounts.Account{
+		ID: "qwen-token:work", Provider: accounts.ProviderQwenAnthropic,
+		AuthMode: accounts.AuthModeAPIKey, Token: "shared-key",
+	}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: accounts.ProviderQwenToken,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	server := Server{SchedulerRef: scheduler}
+
+	server.markAccountExhaustedFromResponseForAccount(
+		account, "", http.StatusForbidden, http.Header{},
+	)
+	until, blocked := scheduler.ExhaustedUntilFor(accounts.ProviderQwenToken, account.ID, "")
+	if !blocked || time.Until(until) < 50*time.Minute {
+		t.Fatalf("shared account was not excluded after cross-protocol 403: blocked=%v until=%v", blocked, until)
 	}
 }

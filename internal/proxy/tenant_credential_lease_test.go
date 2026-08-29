@@ -1369,13 +1369,105 @@ func TestQwenAnthropicLeaseSelectionUsesSharedTokenPlanScores(t *testing.T) {
 	schedulerRef.MarkExhaustedUntil(accounts.ProviderQwenToken, "qwen-token:a-cooked", model, time.Now().Add(time.Hour))
 	server := &Server{SchedulerRef: schedulerRef}
 
-	picked, err := pickTenantCredentialLeaseAccount(nil, server, available, nil, tenantCredentialLeaseRequest{
-		Provider: string(accounts.ProviderQwenAnthropic), Model: model,
+	for _, testCase := range []struct {
+		name      string
+		configure func(*testing.T, *Server, *tenantCredentialLeaseRequest)
+	}{
+		{name: "scheduler"},
+		{
+			name: "preferred cooked account",
+			configure: func(_ *testing.T, _ *Server, input *tenantCredentialLeaseRequest) {
+				input.PreferAccountID = "qwen-token:a-cooked"
+			},
+		},
+		{
+			name: "sticky cooked account",
+			configure: func(t *testing.T, server *Server, input *tenantCredentialLeaseRequest) {
+				sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sessions.Put(string(accounts.ProviderQwenAnthropic), input.SessionID, "qwen-token:a-cooked", ""); err != nil {
+					t.Fatal(err)
+				}
+				server.Sessions = sessions
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			copyServer := *server
+			input := tenantCredentialLeaseRequest{
+				Provider:  string(accounts.ProviderQwenAnthropic),
+				SessionID: "session-a", Model: model,
+			}
+			if testCase.configure != nil {
+				testCase.configure(t, &copyServer, &input)
+			}
+			picked, err := pickTenantCredentialLeaseAccount(nil, &copyServer, available, nil, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if picked.ID != "qwen-token:z-healthy" {
+				t.Fatalf("picked %q, want healthy shared Token Plan account", picked.ID)
+			}
+		})
+	}
+}
+
+func TestQwenAnthropicLeasePublicationHonorsSharedTokenPlanCooldown(t *testing.T) {
+	const model = "qwen3.7-plus"
+	now := time.Now()
+	account := accounts.Account{
+		ID: "qwen-token:cooked", Provider: accounts.ProviderQwenAnthropic,
+		AuthMode: accounts.AuthModeAPIKey, Token: "key",
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: accounts.ProviderQwenToken,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	schedulerRef.MarkExhaustedUntil(accounts.ProviderQwenToken, account.ID, model, now.Add(time.Hour))
+	store := newTenantCredentialLeaseStore()
+	lease := tenantLeaseTestLease(account, string(accounts.ProviderQwenAnthropic), "session-a", model, now)
+	lease.authMode = accounts.AuthModeAPIKey
+	lease.model = model
+
+	until, avoided := store.putIfEligible("lease", lease, now, schedulerRef)
+	if !avoided || until.Before(now.Add(50*time.Minute)) {
+		t.Fatalf("publication guard: avoided=%v until=%v", avoided, until)
+	}
+	if _, ok := store.get("lease", now); ok {
+		t.Fatal("published a lease for a shared Token Plan account under cooldown")
+	}
+}
+
+func TestTenantCredentialLeaseSessionCountsAreProviderScoped(t *testing.T) {
+	const sharedID = "shared@example.com"
+	shared := accounts.Account{
+		ID: sharedID, Provider: accounts.ProviderCodex,
+		AuthMode: accounts.AuthModeAPIKey, Token: "shared-key",
+	}
+	other := accounts.Account{
+		ID: "z-other@example.com", Provider: accounts.ProviderCodex,
+		AuthMode: accounts.AuthModeAPIKey, Token: "other-key",
+	}
+	server := tenantLeaseTestServer(shared, other)
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "claude-session", sharedID, ""); err != nil {
+		t.Fatal(err)
+	}
+	server.Sessions = sessions
+
+	picked, err := pickTenantCredentialLeaseAccount(nil, server, []accounts.Account{shared, other}, nil, tenantCredentialLeaseRequest{
+		Provider: string(accounts.ProviderCodex), AgentType: "codex",
+		SessionID: "new-codex-session", Model: "gpt-5",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if picked.ID != "qwen-token:z-healthy" {
-		t.Fatalf("picked %q, want healthy shared Token Plan account", picked.ID)
+	if picked.ID != sharedID {
+		t.Fatalf("Claude session count damped same-ID Codex account: picked %q, want %q", picked.ID, sharedID)
 	}
 }

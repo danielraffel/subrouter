@@ -395,7 +395,7 @@ func pickTenantCredentialLeaseAccount(
 	model := tenantCredentialLeasePoolModel(provider, input.Model)
 	scheduler := server.scheduler().ForModel(model)
 	if server.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(server.Sessions.CountByAccount())
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
 	}
 	// Preferred and sticky routing are hints, not permission to reuse a cooled
 	// credential. Filtering must happen first; if every candidate is blocked,
@@ -455,19 +455,20 @@ func tenantCredentialLeaseTrustedBlockedUntil(
 	model string,
 	now time.Time,
 ) (time.Time, bool) {
+	schedulerProvider := schedulerAccountProvider(account.Provider)
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		if server.SchedulerRef == nil {
 			return time.Time{}, false
 		}
 		return server.SchedulerRef.ExplicitBlockedUntilFor(
-			account.Provider, account.ID, model, now,
+			schedulerProvider, account.ID, model, now,
 		)
 	}
-	if !server.scheduler().ForModel(model).Exhausted(account.Provider, account.ID) {
+	if !server.scheduler().ForModel(model).Exhausted(schedulerProvider, account.ID) {
 		return time.Time{}, false
 	}
 	return tenantCredentialLeaseSchedulerRetryAt(
-		server, account.Provider, account.ID, model, now,
+		server, schedulerProvider, account.ID, model, now,
 	), true
 }
 
@@ -493,7 +494,7 @@ func tenantCredentialLeaseSchedulerRetryAt(
 		return retryAt
 	}
 	if until, blocked := server.SchedulerRef.BlockedUntilFor(
-		provider, accountID, poolModel, now,
+		schedulerAccountProvider(provider), accountID, poolModel, now,
 	); blocked && until.After(retryAt) {
 		retryAt = until
 	}
@@ -765,15 +766,16 @@ func (s *tenantCredentialLeaseStore) putIfEligible(
 	}
 	if scheduler != nil {
 		publish := func() { s.putLocked(id, lease) }
+		schedulerProvider := schedulerAccountProvider(lease.provider)
 		var until time.Time
 		var published bool
 		if lease.authMode == accounts.AuthModeAPIKey {
 			until, published = scheduler.RunIfAccountNotExplicitlyBlocked(
-				lease.provider, lease.accountID, lease.model, now, publish,
+				schedulerProvider, lease.accountID, lease.model, now, publish,
 			)
 		} else {
 			until, published = scheduler.RunIfAccountNotBlocked(
-				lease.provider, lease.accountID, lease.model, now, publish,
+				schedulerProvider, lease.accountID, lease.model, now, publish,
 			)
 		}
 		if !published {
