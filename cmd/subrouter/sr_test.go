@@ -1991,6 +1991,93 @@ func TestSRSwitchDoesNotWriteActiveAuthOrDowngradeWhenPublicationFails(t *testin
 	}
 }
 
+func TestSRSwitchDoesNotSyncActiveAuthWhenPublicationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	account := accounts.StoredCodexAccount{
+		Email:                 "isolated@example.test",
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  testCodexAuth("isolated@example.test", "acct_isolated"),
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	interactive := testCodexAuth("isolated@example.test", "acct_interactive")
+	if err := accounts.WriteActiveCodexAuth(interactive); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.switchAccount(context.Background(), account.Email, srSwitchOptions{}); err == nil {
+		t.Fatal("switch unexpectedly succeeded when active-sync publication failed")
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored account found = %v, err = %v", ok, err)
+	}
+	if stored.OAuthCredentialOrigin != accounts.CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("stored OAuth origin = %q, want isolated server login", stored.OAuthCredentialOrigin)
+	}
+	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != account.Auth.Tokens.RefreshToken {
+		t.Fatal("active auth was imported despite publication failure")
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok || active.Tokens == nil || active.Tokens.RefreshToken != interactive.Tokens.RefreshToken {
+		t.Fatal("publication failure changed the pre-existing active auth")
+	}
+}
+
+func TestSRSwitchDoesNotRefreshStoredAuthWhenPublicationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("expired@example.test", "acct_expired")
+	auth.Tokens.AccessToken = testJWT(map[string]any{
+		"exp": time.Now().Add(-time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct_expired",
+		},
+	})
+	account := accounts.StoredCodexAccount{
+		Email:   "expired@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    auth,
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	refreshRequests := 0
+	client := &http.Client{Transport: srRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "auth.openai.com" && request.URL.Path == "/oauth/token" {
+			refreshRequests++
+		}
+		return nil, errors.New("refresh endpoint should not be called")
+	})}
+
+	runner := srRunner{store: store, client: client, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.switchAccount(context.Background(), account.Email, srSwitchOptions{}); err == nil {
+		t.Fatal("switch unexpectedly succeeded when refresh publication failed")
+	}
+	if refreshRequests != 0 {
+		t.Fatalf("refresh endpoint requests = %d, want zero", refreshRequests)
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored account found = %v, err = %v", ok, err)
+	}
+	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != account.Auth.Tokens.RefreshToken {
+		t.Fatal("stored credential changed despite publication failure")
+	}
+}
+
 func TestSRSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	home := t.TempDir()
 	xdgData := t.TempDir()

@@ -425,12 +425,22 @@ func (r *SchedulerRef) Set(scheduler Scheduler) {
 }
 
 func (r *SchedulerRef) setLocked(scheduler Scheduler) {
+	r.setLockedForScoreKeys(scheduler, nil, true)
+}
+
+func (r *SchedulerRef) setLockedForScoreKeys(scheduler Scheduler, scoreKeys map[string]struct{}, touchUpdatedAt bool) {
 	base := r.scheduler
 	r.scheduler = scheduler
-	r.retainExhaustedExpiriesLocked()
-	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
+	r.retainExhaustedExpiriesForScoreKeysLocked(scoreKeys)
+	r.scheduler = stripCarriedForwardExhaustionOverlaysForScoreKeys(r.scheduler, base, r.expiryMarksLocked(), scoreKeys)
 	now := time.Now()
 	for key := range r.recoveryProbeReady {
+		scoreKey, _, _, valid := exhaustionKeyParts(key)
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; valid && !included {
+				continue
+			}
+		}
 		score, ok := r.scoreForExhaustionKeyLocked(key)
 		if !ok || !score.exhausted() {
 			delete(r.recoveryProbeReady, key)
@@ -453,7 +463,9 @@ func (r *SchedulerRef) setLocked(scheduler Scheduler) {
 			r.exhaustedUntil[key] = until
 		}
 	}
-	r.updatedAt = time.Now()
+	if touchUpdatedAt {
+		r.updatedAt = time.Now()
+	}
 }
 
 // AdvanceAccountGeneration invalidates refresh work computed from an older
@@ -545,6 +557,36 @@ func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation u
 	return true
 }
 
+// MergeScoresForAccountGeneration atomically overlays measured scores onto the
+// current shared scheduler when they were computed from the current account
+// snapshot. Unlike SetForAccountGeneration, a partial provider refresh cannot
+// replace scores published concurrently for other providers, and it does not
+// cancel a full refresh already in progress for the same generation.
+func (r *SchedulerRef) MergeScoresForAccountGeneration(scores []Score, generation uint64) (Scheduler, bool) {
+	if r == nil {
+		return Scheduler{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration {
+		return Scheduler{}, false
+	}
+	merged := r.scheduler
+	scoreKeys := make(map[string]struct{}, len(scores))
+	for _, score := range scores {
+		merged = merged.WithScore(score)
+		scoreKeys[ScoreKey(score.Provider, score.AccountID)] = struct{}{}
+	}
+	// This is only a partial provider refresh, so it must not make the shared
+	// full-provider snapshot look fresh and suppress its next scheduled refresh.
+	r.setLockedForScoreKeys(merged, scoreKeys, false)
+	debits := make(map[string]int, len(r.routedSinceRefresh))
+	for key, count := range r.routedSinceRefresh {
+		debits[key] = count
+	}
+	return r.scheduler.WithLiveDebits(debits), true
+}
+
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
 // refresh, by evidence class:
 //   - A pool-scoped mark has no matching refreshed pool score: keep the expiry;
@@ -562,12 +604,21 @@ func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation u
 //     optimistic default. Expiries only extend here, never shorten, so an
 //     authoritative long reset from a rejected response still holds.
 func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
+	r.retainExhaustedExpiriesForScoreKeysLocked(nil)
+}
+
+func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[string]struct{}) {
 	now := time.Now()
 	for key := range r.exhaustedUntil {
 		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 		if !ok {
 			delete(r.exhaustedUntil, key)
 			continue
+		}
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; !included {
+				continue
+			}
 		}
 		score, ok := r.scheduler.scores[scoreKey]
 		if ok && poolKey != "" {
@@ -923,6 +974,10 @@ func copyModelScores(modelScores map[string]Score) map[string]Score {
 }
 
 func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUntil map[string]time.Time) Scheduler {
+	return stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base, exhaustedUntil, nil)
+}
+
+func stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base Scheduler, exhaustedUntil map[string]time.Time, scoreKeys map[string]struct{}) Scheduler {
 	if len(exhaustedUntil) == 0 {
 		return current
 	}
@@ -939,8 +994,18 @@ func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUnt
 		if !ok {
 			continue
 		}
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; !included {
+				continue
+			}
+		}
 		if poolKey != "" && !base.hasModelScore(poolKey) {
 			for candidateKey, candidate := range next.scores {
+				if scoreKeys != nil {
+					if _, included := scoreKeys[candidateKey]; !included {
+						continue
+					}
+				}
 				modelScore, modelOK := candidate.ModelScores[poolKey]
 				if !modelOK || modelScore.Fresh {
 					continue

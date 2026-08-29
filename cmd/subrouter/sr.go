@@ -1589,11 +1589,22 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
-	if err := r.store.SyncActiveToStore(); err != nil {
+	err = proxy.WithAccountDiskMutationPublication(ctx, r.store.StoreDir(), func(publish func() error) error {
+		return r.store.SyncActiveToStoreBeforeSave(publish)
+	})
+	if err != nil {
 		return err
 	}
 	refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr.switch")
-	refreshed, didRefresh, err := r.store.RefreshStoredIfExpired(refreshCtx, r.client, account)
+	var refreshed accounts.StoredCodexAccount
+	var didRefresh bool
+	err = proxy.WithAccountDiskMutationPublication(refreshCtx, r.store.StoreDir(), func(publish func() error) error {
+		var refreshErr error
+		refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpiredBeforeRefresh(
+			refreshCtx, r.client, account, publish,
+		)
+		return refreshErr
+	})
 	if err != nil {
 		fmt.Fprintf(r.errOut, "Warning: token refresh failed, using cached tokens: %s\n", err)
 		refreshed = account

@@ -88,7 +88,12 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 
 	scheduler := selectacct.NewScheduler(scores)
 	if cfg.SchedulerRef != nil {
-		if !cfg.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
+		// The auto-switch refresh is Codex-only, but SchedulerRef is shared by
+		// every provider. Atomically replace only the freshly fetched Codex scores
+		// so a concurrent full-provider refresh cannot be erased.
+		var published bool
+		scheduler, published = cfg.SchedulerRef.MergeScoresForAccountGeneration(scores, accountGeneration)
+		if !published {
 			return "", fmt.Errorf("account pool changed during sr auto-switch")
 		}
 	}

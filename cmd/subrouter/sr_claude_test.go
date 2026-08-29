@@ -129,6 +129,92 @@ func TestClaudeFailedAddPublishesRollbackToRunningAccountRef(t *testing.T) {
 	}
 }
 
+func TestClaudeNamedAddReconcilesCanceledCompletionPublication(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	accountStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	ref, err := proxy.OpenAccountRef(accountStore, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration := ref.Generation()
+	installSuccessfulClaudeLoginCLI(t, root, "work@example.com")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	runner := claudeRunner{
+		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+		afterAuthVerified: cancel,
+	}
+	if err := runner.run(ctx, []string{"add", "work"}); err != nil {
+		t.Fatalf("completed Claude login was not reconciled after cancellation: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("test did not cancel the original command context")
+	}
+	triggerClaudeAccountReload(t, ref)
+	if ref.Generation() <= beforeGeneration {
+		t.Fatalf("account generation = %d, want greater than %d", ref.Generation(), beforeGeneration)
+	}
+	if !containsClaudeAccount(ref.All(), "work") {
+		t.Fatalf("running account snapshot did not load reconciled Claude profile: %+v", ref.All())
+	}
+	credential, err := store.ReadCredential(t.Context(), store.ClaudeConfigDir("work"))
+	if err != nil || credential == nil || credential.AccessToken != "claude-access" {
+		t.Fatalf("reconciled credential = %+v, err = %v", credential, err)
+	}
+}
+
+func TestClaudeUnnamedAddCleansAuthenticatedTempAfterCanceledPublication(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	installSuccessfulClaudeLoginCLI(t, root, "work@example.com")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	runner := claudeRunner{
+		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+		afterAuthVerified: cancel,
+	}
+	if err := runner.run(ctx, []string{"add"}); err == nil {
+		t.Fatal("unnamed add unexpectedly succeeded with canceled publication")
+	}
+	if profiles := store.ListProfiles(); len(profiles) != 0 {
+		t.Fatalf("failed unnamed add registered profiles: %+v", profiles)
+	}
+	entries, err := os.ReadDir(store.InstancesDir())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			t.Fatalf("failed unnamed add retained authenticated temporary instance: %s", entry.Name())
+		}
+	}
+}
+
+func installSuccessfulClaudeLoginCLI(t *testing.T, root, email string) {
+	t.Helper()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(binDir, "claude")
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access","refreshToken":"claude-refresh","expiresAt":4102444800000}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"` + email + `","subscriptionType":"max"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func triggerClaudeAccountReload(t *testing.T, ref *proxy.AccountRef) {
 	t.Helper()
 	handler := proxy.Server{AccountRef: ref, MaxBodyBytes: 1 << 20}.Handler()

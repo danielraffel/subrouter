@@ -633,6 +633,68 @@ func TestSyncActiveToStoreDoesNotOverwriteNewerStoredToken(t *testing.T) {
 	}
 }
 
+func TestSyncActiveToStoreBeforeSaveStopsBeforeCredentialMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	stored := storedOAuthAccount("founders@example.com", "stored", time.Now().Add(time.Hour))
+	stored.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	interactive := storedOAuthAccount("founders@example.com", "interactive", time.Now().Add(time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteActiveCodexAuth(interactive.Auth); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("publish generation")
+	err := store.SyncActiveToStoreBeforeSave(func() error { return wantErr })
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("sync error = %v, want %v", err, wantErr)
+	}
+	got, found, err := store.FindStored(stored.Email)
+	if err != nil || !found {
+		t.Fatalf("stored account found = %v, err = %v", found, err)
+	}
+	if got.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("stored OAuth origin = %q, want isolated server login", got.OAuthCredentialOrigin)
+	}
+	if got.Auth.Tokens == nil || got.Auth.Tokens.RefreshToken != stored.Auth.Tokens.RefreshToken {
+		t.Fatal("stored credential changed before publication")
+	}
+}
+
+func TestRefreshStoredIfExpiredBeforeRefreshStopsBeforeTokenRedemption(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	account := storedOAuthAccount("founders@example.com", "expired", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return nil, errors.New("token endpoint should not be called")
+	})}
+	wantErr := errors.New("publish generation")
+	_, refreshed, err := store.RefreshStoredIfExpiredBeforeRefresh(
+		context.Background(), client, account, func() error { return wantErr },
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("refresh error = %v, want %v", err, wantErr)
+	}
+	if refreshed {
+		t.Fatal("refresh reported success despite publication failure")
+	}
+	if requests != 0 {
+		t.Fatalf("token endpoint requests = %d, want zero", requests)
+	}
+	got, found, err := store.FindStored(account.Email)
+	if err != nil || !found {
+		t.Fatalf("stored account found = %v, err = %v", found, err)
+	}
+	if got.Auth.Tokens == nil || got.Auth.Tokens.RefreshToken != account.Auth.Tokens.RefreshToken {
+		t.Fatal("stored credential changed before publication")
+	}
+}
+
 type codexRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f codexRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

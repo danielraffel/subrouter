@@ -750,6 +750,10 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 }
 
 func (s Store) CleanupInstance(dir string) error {
+	return s.CleanupInstanceContext(context.Background(), dir)
+}
+
+func (s Store) CleanupInstanceContext(ctx context.Context, dir string) error {
 	if dir == "" {
 		return nil
 	}
@@ -757,13 +761,13 @@ func (s Store) CleanupInstance(dir string) error {
 	if err != nil {
 		return err
 	}
-	credentialLocks, err := lockProfileCredentialPaths(context.Background(), instancePaths)
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
 	if err != nil {
 		return err
 	}
 	defer closeProfileCredentialLocks(credentialLocks)
 	for _, instancePath := range instancePaths {
-		if err := deleteKeychainCredential(instancePath); err != nil {
+		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
 			return err
 		}
 		if err := os.RemoveAll(instancePath); err != nil {
@@ -1416,6 +1420,10 @@ func (s Store) UpsertCredentialProfile(name string, credential CredentialInfo) (
 }
 
 func deleteKeychainCredential(instancePath string) error {
+	return deleteKeychainCredentialContext(context.Background(), instancePath)
+}
+
+func deleteKeychainCredentialContext(ctx context.Context, instancePath string) error {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
@@ -1424,7 +1432,7 @@ func deleteKeychainCredential(instancePath string) error {
 		return err
 	}
 	service := "Claude Code-credentials-" + keychainHash(instancePath)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(
 		ctx,
