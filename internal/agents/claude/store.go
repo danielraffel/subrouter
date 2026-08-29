@@ -1356,25 +1356,11 @@ func (s Store) writeCredential(ctx context.Context, instancePath string, credent
 // credentials so systemd services never depend on a login keychain.
 func (s Store) UpsertCredentialProfile(name string, credential CredentialInfo) (Profile, error) {
 	name = strings.TrimSpace(name)
-	if err := ValidateProfileNameAllowEmail(name); err != nil {
-		return Profile{}, err
-	}
-	dir := sanitizeName(name)
-	if dir == "" {
-		return Profile{}, errors.New("invalid Claude profile name")
-	}
-	instancePath := filepath.Join(s.InstancesDir(), dir)
-	if err := s.initInstanceDir(instancePath); err != nil {
-		return Profile{}, err
-	}
-	body, err := credentialPayload(credential)
-	if err != nil {
-		return Profile{}, err
-	}
-	if err := writePrivateFileAtomic(filepath.Join(instancePath, ".credentials.json"), body); err != nil {
-		return Profile{}, err
-	}
-	if err := s.RegisterProfile(name, dir); err != nil {
+	// Tenant uploads have the same storage and concurrency requirements as a
+	// local import: a collision-resistant directory for a new label, the
+	// existing registered directory for a repair, and the profile credential
+	// lock so a concurrent OAuth refresh cannot observe a partial replacement.
+	if err := s.ImportProfileCredential(name, credential); err != nil {
 		return Profile{}, err
 	}
 	profile, ok := s.FindProfile(name)

@@ -307,7 +307,7 @@ func TestImportProfileCredentialSerializesRegistryAcrossProcesses(t *testing.T) 
 	}
 }
 
-func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.T) {
+func TestRefreshCredentialDoesNotOverwriteNewerTenantUploadAcrossProcesses(t *testing.T) {
 	if os.Getenv("SUBROUTER_CLAUDE_REFRESH_HELPER") == "1" {
 		oauthTokenURL = os.Getenv("SUBROUTER_CLAUDE_REFRESH_URL")
 		store := Store{Dir: os.Getenv("SUBROUTER_CLAUDE_REFRESH_DIR")}
@@ -353,7 +353,7 @@ func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses$")
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshCredentialDoesNotOverwriteNewerTenantUploadAcrossProcesses$")
 	command.Env = append(os.Environ(),
 		"SUBROUTER_CLAUDE_REFRESH_HELPER=1",
 		"SUBROUTER_CLAUDE_REFRESH_DIR="+store.Dir,
@@ -370,16 +370,17 @@ func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.
 		t.Fatal("refresh helper did not reach OAuth endpoint")
 	}
 
-	importDone := make(chan error, 1)
+	uploadDone := make(chan error, 1)
 	go func() {
-		importDone <- store.ImportProfileCredential("founders@example.com", CredentialInfo{
+		_, err := store.UpsertCredentialProfile("founders@example.com", CredentialInfo{
 			AccessToken:  "new-import-access",
 			RefreshToken: "new-import-refresh",
 			ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
 		})
+		uploadDone <- err
 	}()
 	select {
-	case err := <-importDone:
+	case err := <-uploadDone:
 		if err != nil {
 			close(releaseRefresh)
 			_ = command.Wait()

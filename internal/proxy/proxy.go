@@ -3796,7 +3796,19 @@ func credentialLeaseReport(
 }
 
 func retryAfterExpiry(header http.Header, now time.Time) time.Time {
-	raw := strings.TrimSpace(header.Get("Retry-After"))
+	until := parseRetryAfter(strings.TrimSpace(header.Get("Retry-After")), now)
+	if until.IsZero() {
+		return time.Time{}
+	}
+	if maximum := now.Add(8 * 24 * time.Hour); until.After(maximum) {
+		return maximum
+	}
+	return until
+}
+
+// parseRetryAfter accepts both forms allowed by HTTP: positive delta-seconds
+// and an HTTP-date. Past dates and malformed values carry no retry deadline.
+func parseRetryAfter(raw string, now time.Time) time.Time {
 	if raw == "" {
 		return time.Time{}
 	}
@@ -3808,9 +3820,6 @@ func retryAfterExpiry(header http.Header, now time.Time) time.Time {
 	}
 	if !until.After(now) {
 		return time.Time{}
-	}
-	if maximum := now.Add(8 * 24 * time.Hour); until.After(maximum) {
-		return maximum
 	}
 	return until
 }
@@ -4573,7 +4582,8 @@ func (s Server) markAccountExhaustedRefreshFailure(provider accounts.Provider, a
 
 // claudeExhaustionExpiry picks when an exhaustion mark should lapse:
 // anthropic-ratelimit-unified-reset (epoch seconds, the authoritative window
-// reset) when present, else Retry-After seconds, else the scheduler default.
+// reset) when present, else Retry-After delta-seconds or HTTP-date, else the
+// scheduler default.
 // Clamped to [now+1m, now+8d]: the floor guards clock skew / already-passed
 // resets, the ceiling guards a nonsense far-future header pinning an account
 // out forever.
@@ -4583,10 +4593,8 @@ func claudeExhaustionExpiry(header http.Header, now time.Time) time.Time {
 		if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
 			until = time.Unix(epoch, 0)
 		}
-	} else if ra := strings.TrimSpace(claudeHeaderGet(header, "Retry-After")); ra != "" {
-		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-			until = now.Add(time.Duration(secs) * time.Second)
-		}
+	} else if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
+		until = retryAt
 	}
 	if min := now.Add(time.Minute); until.Before(min) {
 		return min
@@ -6309,14 +6317,16 @@ func claudeOverloadStatus(code int) bool {
 // providerOverloadBackoff picks the wait before an overload retry: Retry-After
 // when the upstream sent one (capped), else 1s << retry (1s, 2s, ...).
 func providerOverloadBackoff(header http.Header, retry int) time.Duration {
-	if ra := strings.TrimSpace(claudeHeaderGet(header, "Retry-After")); ra != "" {
-		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-			wait := time.Duration(secs) * time.Second
-			if wait > providerOverloadMaxWait {
-				return providerOverloadMaxWait
-			}
-			return wait
+	return providerOverloadBackoffAt(header, retry, time.Now())
+}
+
+func providerOverloadBackoffAt(header http.Header, retry int, now time.Time) time.Duration {
+	if retryAt := parseRetryAfter(strings.TrimSpace(claudeHeaderGet(header, "Retry-After")), now); !retryAt.IsZero() {
+		wait := retryAt.Sub(now)
+		if wait > providerOverloadMaxWait {
+			return providerOverloadMaxWait
 		}
+		return wait
 	}
 	wait := time.Second << retry
 	if wait > providerOverloadMaxWait {

@@ -28,6 +28,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
 
@@ -2736,7 +2737,7 @@ func shrinkUsageGridColumnsToFit(columns []usageGridColumn, termWidth int, prior
 			if columns[i].Key != key {
 				continue
 			}
-			minimum := max(1, len(columns[i].Title))
+			minimum := max(1, runewidth.StringWidth(columns[i].Title))
 			shrink := min(overflow, columns[i].Width-minimum)
 			columns[i].Width -= shrink
 			overflow -= shrink
@@ -2749,9 +2750,9 @@ func shrinkUsageGridColumnsToFit(columns []usageGridColumn, termWidth int, prior
 }
 
 func usageGridDesiredWidth(rows []srUsageRow, key, title string, capWidth int) int {
-	desired := len(title)
+	desired := runewidth.StringWidth(title)
 	for _, row := range rows {
-		desired = max(desired, len(usageGridValues(row, "")[key].Text))
+		desired = max(desired, runewidth.StringWidth(usageGridValues(row, "")[key].Text))
 	}
 	return min(desired, capWidth)
 }
@@ -2768,7 +2769,7 @@ func usageGridRowsHaveValue(rows []srUsageRow, key string) bool {
 func widenUsageGridColumnForRows(columns []usageGridColumn, rows []srUsageRow, key string, extra, capWidth int) int {
 	desired := 0
 	for _, row := range rows {
-		desired = max(desired, len(usageGridValues(row, "")[key].Text))
+		desired = max(desired, runewidth.StringWidth(usageGridValues(row, "")[key].Text))
 	}
 	desired = min(desired, capWidth)
 	return widenUsageGridColumn(columns, key, extra, desired)
@@ -3617,10 +3618,11 @@ func maskSecret(value string) string {
 }
 
 func pad(value string, width int) string {
-	if width <= len(value) {
+	valueWidth := runewidth.StringWidth(value)
+	if width <= valueWidth {
 		return value
 	}
-	return value + strings.Repeat(" ", width-len(value))
+	return value + strings.Repeat(" ", width-valueWidth)
 }
 
 func fitCell(value string, width int) string {
@@ -3628,13 +3630,13 @@ func fitCell(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if len(value) > width {
+	if runewidth.StringWidth(value) > width {
 		if width <= 3 {
-			return value[:width]
+			return pad(runewidth.Truncate(value, width, ""), width)
 		}
-		return value[:width-3] + "..."
+		return pad(runewidth.Truncate(value, width, "..."), width)
 	}
-	return value + strings.Repeat(" ", width-len(value))
+	return pad(value, width)
 }
 
 func firstNonEmpty(values ...string) string {
