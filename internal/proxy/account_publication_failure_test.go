@@ -19,6 +19,32 @@ import (
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
 
+type transactionLockingOAuthSource struct {
+	storeDir string
+	entered  chan struct{}
+	account  accounts.Account
+}
+
+func (s *transactionLockingOAuthSource) Provider() accounts.Provider {
+	return accounts.ProviderKimi
+}
+
+func (s *transactionLockingOAuthSource) ListAccounts(context.Context) ([]accounts.Account, error) {
+	return []accounts.Account{s.account}, nil
+}
+
+func (s *transactionLockingOAuthSource) RefreshAccount(ctx context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
+	close(s.entered)
+	lock, err := lockAccountImportTransaction(ctx, s.storeDir)
+	if err != nil {
+		return account, err
+	}
+	if err := lock.Close(); err != nil {
+		return account, err
+	}
+	return account, nil
+}
+
 func publicationFailingAccountServer(t *testing.T) (Server, accounts.CodexStore, agentclaude.Store, agentkimi.Store, error) {
 	t.Helper()
 	root := t.TempDir()
@@ -477,6 +503,64 @@ func TestAccountMutationInvalidatesUsageCacheWhenReloadFails(t *testing.T) {
 	}
 	if !ref.usageStatusAt.IsZero() {
 		t.Fatal("snapshot reload failure left the usage-status cache valid")
+	}
+}
+
+func TestAccountMutationReleasesTransactionBeforeUsageCacheInvalidation(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	ref := NewAccountRef(store, nil, http.DefaultClient)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	source := &transactionLockingOAuthSource{
+		storeDir: store.StoreDir(),
+		entered:  make(chan struct{}),
+		account: accounts.Account{
+			ID: "kimi-subscription:work", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth,
+		},
+	}
+	ref.oauthSources = []OAuthAccountSource{source}
+	server := Server{AccountRef: ref}
+	mutationHoldingLock := make(chan struct{})
+	allowMutation := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		_, err := server.installAccountMutation(t.Context(), func() (string, func() error, error) {
+			return "test", func() error {
+				close(mutationHoldingLock)
+				<-allowMutation
+				return nil
+			}, nil
+		})
+		mutationDone <- err
+	}()
+	select {
+	case <-mutationHoldingLock:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutation did not acquire the account transaction lock")
+	}
+	usageDone := make(chan []AccountUsageStatus, 1)
+	go func() { usageDone <- ref.UsageStatuses(t.Context()) }()
+	select {
+	case <-source.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage sweep did not reach transaction-locking refresh")
+	}
+	close(allowMutation)
+	select {
+	case err := <-mutationDone:
+		if err != nil {
+			t.Fatalf("mutation failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mutation deadlocked invalidating usage cache while holding the account transaction lock")
+	}
+	select {
+	case statuses := <-usageDone:
+		if len(statuses) != 1 || !statuses[0].AuthValid {
+			t.Fatalf("usage statuses = %+v", statuses)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage sweep did not finish after transaction release")
 	}
 }
 

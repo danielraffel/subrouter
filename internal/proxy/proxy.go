@@ -2272,11 +2272,12 @@ func (s Server) installAccountMutation(
 			s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
 		}
 	}
-	// The durable mutation may have succeeded even when snapshot reload did
-	// not. Never let a previously cached usage view survive that uncertainty.
-	s.AccountRef.InvalidateUsageStatusCache()
 	closeErr := transactionLock.Close()
 	transactionLock = nil
+	// The durable mutation may have succeeded even when snapshot reload did
+	// not. Invalidate only after releasing the cross-process transaction lock:
+	// a usage sweep holds this cache mutex while refresh may acquire that lock.
+	s.AccountRef.InvalidateUsageStatusCache()
 	var finishErr error
 	if reloadErr == nil {
 		_, _, finishErr = s.finishAccountReload(ctx, loaded, accountGeneration)
@@ -5979,6 +5980,12 @@ func (s Server) accountListSnapshotContext(ctx context.Context) ([]accounts.Acco
 		reloaded, accountGeneration, err := s.AccountRef.reloadIfDiskGenerationChanged(ctx)
 		if err != nil && s.Logger != nil {
 			s.Logger.Error("account state generation reload failed", "error", err)
+		}
+		if reloaded {
+			// reloadIfDiskGenerationChanged releases the cross-process lock
+			// before returning; cache invalidation must not invert that lock
+			// against a concurrent usage refresh.
+			s.AccountRef.InvalidateUsageStatusCache()
 		}
 		if reloaded && s.SchedulerRef != nil {
 			s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)

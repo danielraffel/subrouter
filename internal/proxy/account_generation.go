@@ -166,6 +166,5 @@ func (r *AccountRef) reloadIfDiskGenerationChanged(ctx context.Context) (reloade
 	if err != nil {
 		return false, generation, err
 	}
-	r.InvalidateUsageStatusCache()
 	return true, generation, nil
 }
