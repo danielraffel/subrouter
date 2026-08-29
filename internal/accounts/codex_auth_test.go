@@ -304,6 +304,52 @@ func TestRefreshStoredIfExpiredLeavesActiveAuthAloneWhenSyncDisabled(t *testing.
 	}
 }
 
+func TestRefreshStoredIfExpiredDoesNotSyncIsolatedCredentialToActiveAuth(t *testing.T) {
+	for _, origin := range []CodexOAuthCredentialOrigin{
+		CodexOAuthOriginIsolatedServerLogin,
+		CodexOAuthOriginServerAttested,
+	} {
+		t.Run(string(origin), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			store := CodexStore{Dir: t.TempDir()}
+			stale := storedOAuthAccount("founders@example.com", "stored-old", time.Now().Add(-time.Hour))
+			stale.OAuthCredentialOrigin = origin
+			if err := store.SaveStored(stale); err != nil {
+				t.Fatal(err)
+			}
+			interactive := storedOAuthAccount("founders@example.com", "interactive", time.Now().Add(time.Hour))
+			if err := WriteActiveCodexAuth(interactive.Auth); err != nil {
+				t.Fatal(err)
+			}
+			activePath := DefaultCodexAuthPath()
+			before, err := os.ReadFile(activePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return refreshResponse("stored-new", "founders@example.com", time.Now().Add(time.Hour)), nil
+			})}
+			refreshed, didRefresh, err := store.RefreshStoredIfExpired(context.Background(), client, stale)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !didRefresh || refreshed.Auth.Tokens.RefreshToken != "stored-new-refresh" {
+				t.Fatalf("stored credential was not refreshed: didRefresh=%v account=%#v", didRefresh, refreshed)
+			}
+
+			after, err := os.ReadFile(activePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatalf("active auth changed while refreshing %s credential\nbefore: %s\nafter:  %s", origin, before, after)
+			}
+		})
+	}
+}
+
 func TestRefreshStoredDoesNotRotateSharedInteractiveCredentialWhenSyncDisabled(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := CodexStore{Dir: t.TempDir(), DisableActiveAuthSync: true}
