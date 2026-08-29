@@ -5276,6 +5276,13 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 	if provider == "" {
 		provider = accounts.ProviderCodex
 	}
+	_, keyedProvider := keyedProviderFor(provider)
+	if keyedProvider && accountID != "" && response.StatusCode == http.StatusUnauthorized {
+		// Non-replayable requests cannot rotate accounts safely, but the rejected
+		// credential must still leave the routing pool immediately. Scope the mark
+		// to the exact response credential so a concurrent repair is not poisoned.
+		s.markAccountExhaustedCredentialForAccount(account)
+	}
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
 	// expired OAuth token with a plain 401, neither with a codex-style
 	// usage-limit body to inspect. Both mean this account can't serve the
@@ -5326,9 +5333,11 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 			}, claudeRateLimitHeaderFields(response.Header)...)...)
 	}
 	inspectUsageLimit := s.SchedulerRef != nil && accountID != "" && responseStatusCanExhaust(response.StatusCode)
+	inspectCredentialFailure := s.SchedulerRef != nil && keyedProvider && accountID != "" &&
+		(response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusForbidden)
 	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
 		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectModelCompatibility && !claudeUnusable) {
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !claudeUnusable) {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
@@ -5337,9 +5346,12 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		responseCtx = response.Request.Context()
 	}
 	var inspect func([]byte)
-	if inspectUsageLimit || inspectModelCompatibility || claudeUnusable {
+	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || claudeUnusable {
 		loggedBody := false
 		inspect = func(body []byte) {
+			if inspectCredentialFailure && credentialUnauthorizedJSON(body) {
+				s.markAccountExhaustedCredentialForAccount(account)
+			}
 			if inspectUsageLimit && usageLimitJSON(body) {
 				// Use the response's headers so a header-derived reset expiry set
 				// above is recomputed identically, not overwritten with the short
@@ -6710,10 +6722,10 @@ func (t usageLimitRetryTransport) sleepCtx(ctx context.Context, d time.Duration)
 // "hold this account out of later routing." Some providers reuse one status
 // for quota and transient capacity, so a single boolean silently cooks healthy
 // accounts.
-func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) (limited, exhausted bool, err error) {
+func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) (limited, exhausted, credentialFailure bool, err error) {
 	if t.provider == accounts.ProviderClaude {
 		if response == nil {
-			return false, false, nil
+			return false, false, false, nil
 		}
 		// Fail over on a hard status (429/401) OR on the authoritative
 		// out-of-quota header even when the upstream answered 200 via overage.
@@ -6722,10 +6734,17 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 		// and hard-blocks the user, so a 200 from a rejected account is unusable
 		// from the client's view and must be rerouted to a healthy account.
 		limited = claudeAccountUnusableStatus(response.StatusCode) || claudeResponseRejected(response.Header)
-		return limited, limited && claudeAccountExhaustedByResponse(response.StatusCode, response.Header), nil
+		return limited, limited && claudeAccountExhaustedByResponse(response.StatusCode, response.Header),
+			response.StatusCode == http.StatusUnauthorized, nil
 	}
 	if response == nil {
-		return false, false, nil
+		return false, false, false, nil
+	}
+	if _, keyedProvider := keyedProviderFor(t.provider); keyedProvider {
+		credentialFailure, err = responseKeyedCredentialFailure(response)
+		if err != nil || credentialFailure {
+			return credentialFailure, credentialFailure, credentialFailure, err
+		}
 	}
 	switch t.provider {
 	case accounts.ProviderDeepSeek:
@@ -6734,14 +6753,15 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 		// only 402 should poison later routing.
 		switch response.StatusCode {
 		case http.StatusPaymentRequired:
-			return true, true, nil
+			return true, true, false, nil
 		case http.StatusTooManyRequests:
-			return true, false, nil
+			return true, false, false, nil
 		default:
-			return false, false, nil
+			return false, false, false, nil
 		}
 	case accounts.ProviderKimi:
-		return responseKimiUsageLimit(response)
+		limited, exhausted, err = responseKimiUsageLimit(response)
+		return limited, exhausted, false, err
 	}
 	// API-key providers commonly use a plain 429 for either account credit
 	// exhaustion or a temporary key-specific allocation throttle. In both cases
@@ -6750,10 +6770,44 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	// after its short default TTL.
 	_, keyedProvider := keyedProviderFor(t.provider)
 	if keyedProvider && response.StatusCode == http.StatusTooManyRequests {
-		return true, true, nil
+		return true, true, false, nil
 	}
 	limited, err = responseUsageLimit(response)
-	return limited, limited, err
+	return limited, limited, false, err
+}
+
+// responseKeyedCredentialFailure identifies an upstream rejection of the exact
+// API credential used for this attempt. A 401 is authoritative by status.
+// Some OpenAI-compatible gateways instead return a structured auth error with
+// 400 or 403, so inspect only those statuses and preserve the body for either a
+// retry decision or the final client response. Quota/payment/model errors do
+// not match credentialUnauthorizedJSON and remain in their own classifiers.
+func responseKeyedCredentialFailure(response *http.Response) (bool, error) {
+	if response == nil {
+		return false, nil
+	}
+	if response.StatusCode == http.StatusUnauthorized {
+		return true, nil
+	}
+	if response.StatusCode != http.StatusBadRequest && response.StatusCode != http.StatusForbidden || response.Body == nil {
+		return false, nil
+	}
+	body := response.Body
+	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
+	if err != nil {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, err
+	}
+	if int64(len(prefix)) > usageLimitInspectMaxBytes {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, nil
+	}
+	closeErr := body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(prefix))
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return credentialUnauthorizedJSON(prefix), nil
 }
 
 func responseKimiUsageLimit(response *http.Response) (limited, exhausted bool, err error) {
@@ -7049,7 +7103,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return response, nil
 			}
 		}
-		usageLimited, exhausted, inspectErr := t.responseUsageLimited(response)
+		usageLimited, exhausted, credentialFailure, inspectErr := t.responseUsageLimited(response)
 		if inspectErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
@@ -7110,7 +7164,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
 			)
 		}
-		if t.server != nil && exhausted && !modelUnsupported {
+		if t.server != nil && credentialFailure && !modelUnsupported {
+			// Bind auth rejection to the exact credential identity captured for
+			// this attempt. A concurrent key rotation must make this late response
+			// harmless rather than cooking the repaired account generation.
+			t.server.markAccountExhaustedCredentialForAccount(accounts.Account{
+				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
+			})
+		} else if t.server != nil && exhausted && !modelUnsupported {
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers (codex responses lack these headers and fall back
 			// to the default TTL inside claudeExhaustionExpiry).
@@ -7270,14 +7331,12 @@ const sessionCommitSSEMaxLineBytes = 1 << 20
 
 type sessionCommitSSEReadCloser struct {
 	io.ReadCloser
-	commit        func() error
-	line          []byte
-	eventName     string
-	eventData     []byte
-	discardEvent  bool
-	terminal      bool
-	eventEnded    bool
-	eventObserved bool
+	commit       func() error
+	line         []byte
+	eventName    string
+	eventData    []byte
+	discardEvent bool
+	terminal     bool
 }
 
 func newSessionCommitSSEReadCloser(body io.ReadCloser, commit func() error) io.ReadCloser {
@@ -7315,7 +7374,7 @@ func (r *sessionCommitSSEReadCloser) Read(p []byte) (int, error) {
 	return n, readErr
 }
 
-func (r *sessionCommitSSEReadCloser) observe(chunk []byte, eof bool) (bool, bool) {
+func (r *sessionCommitSSEReadCloser) observe(chunk []byte, _ bool) (bool, bool) {
 	for _, b := range chunk {
 		if b != '\n' {
 			if len(r.line) < sessionCommitSSEMaxLineBytes {
@@ -7329,16 +7388,10 @@ func (r *sessionCommitSSEReadCloser) observe(chunk []byte, eof bool) (bool, bool
 			return terminal, success
 		}
 	}
-	if eof {
-		// Clean transport EOF is a successful terminal condition for providers
-		// that emit well-formed SSE events without a recognized terminal marker.
-		// Buffered line/event bytes mean the stream ended mid-event and must not
-		// commit. Explicit failure events return above before this fallback.
-		if len(r.line) == 0 && len(r.eventData) == 0 && r.eventName == "" &&
-			!r.eventObserved && !r.discardEvent && r.eventEnded {
-			return true, true
-		}
-	}
+	// EOF is deliberately not a success signal. A cleanly closed HTTP body can
+	// still be a provider-side truncation, and committing a provisional account
+	// on that ambiguity would pin the session to an account that never completed
+	// the turn. Only a recognized terminal success event may commit.
 	return false, false
 }
 
@@ -7352,14 +7405,12 @@ func (r *sessionCommitSSEReadCloser) finishLine() (bool, bool) {
 		return false, false
 	}
 	if bytes.HasPrefix(line, []byte("event:")) {
-		r.eventObserved = true
 		r.eventName = strings.ToLower(strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:")))))
 		return false, false
 	}
 	if !bytes.HasPrefix(line, []byte("data:")) {
 		return false, false
 	}
-	r.eventObserved = true
 	data := bytes.TrimPrefix(line, []byte("data:"))
 	data = bytes.TrimPrefix(data, []byte{' '})
 	if len(r.eventData) > 0 {
@@ -7375,10 +7426,6 @@ func (r *sessionCommitSSEReadCloser) finishLine() (bool, bool) {
 }
 
 func (r *sessionCommitSSEReadCloser) finishEvent() (bool, bool) {
-	if r.eventObserved {
-		r.eventEnded = true
-	}
-	r.eventObserved = false
 	if r.discardEvent {
 		r.discardEvent = false
 		r.eventData = r.eventData[:0]

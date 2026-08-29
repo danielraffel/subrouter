@@ -790,7 +790,7 @@ func TestStreamingFailoverCommitsOnlyOnSuccessfulTerminalEvent(t *testing.T) {
 		{name: "event field error", stream: "event: error\ndata: {}\n\n"},
 		{name: "codex failed", stream: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n"},
 		{name: "anthropic error", stream: "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n"},
-		{name: "clean eof without recognized terminal", stream: "data: {\"type\":\"response.in_progress\"}\n\n", wantCommit: true},
+		{name: "clean eof without recognized terminal", stream: "data: {\"type\":\"response.in_progress\"}\n\n"},
 		{name: "successful event without delimiter", stream: "data: {\"type\":\"response.completed\"}\n"},
 		{name: "complete event then truncated error event", stream: "data: {\"type\":\"response.in_progress\"}\n\nevent: error\n"},
 		{name: "transport truncation after complete event", stream: "data: {\"type\":\"response.in_progress\"}\n\n", truncate: true, wantReadErr: true},
@@ -1123,12 +1123,12 @@ func TestKimiUsageLimitClassificationMatchesOfficialErrors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			response := &http.Response{StatusCode: test.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(test.body))}
-			limited, exhausted, err := transport.responseUsageLimited(response)
+			limited, exhausted, credentialFailure, err := transport.responseUsageLimited(response)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if limited != test.limited || exhausted != test.exhausted {
-				t.Fatalf("classification = limited:%v exhausted:%v", limited, exhausted)
+			if limited != test.limited || exhausted != test.exhausted || credentialFailure {
+				t.Fatalf("classification = limited:%v exhausted:%v credential:%v", limited, exhausted, credentialFailure)
 			}
 			preserved, err := io.ReadAll(response.Body)
 			if err != nil || string(preserved) != test.body {

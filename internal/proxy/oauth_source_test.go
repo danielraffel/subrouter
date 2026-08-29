@@ -657,7 +657,7 @@ func TestNonReplayableStreamingRefreshFailoverWaitsForTerminalSuccess(t *testing
 	}{
 		{name: "completed", stream: "data: {\"type\":\"response.completed\"}\n\n", wantCommit: true},
 		{name: "failed", stream: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n"},
-		{name: "clean eof without terminal marker", stream: "data: {\"type\":\"response.in_progress\"}\n\n", wantCommit: true},
+		{name: "clean eof without terminal marker", stream: "data: {\"type\":\"response.in_progress\"}\n\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dead := accounts.Account{ID: "kimi-subscription:dead", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "stale"}
