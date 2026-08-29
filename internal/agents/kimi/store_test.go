@@ -944,6 +944,90 @@ func TestLocalCLIRefreshReportsCommittedRotationWhenLockReleaseFails(t *testing.
 	}
 }
 
+func TestManagedRefreshUsesProviderLifetimeWhenResponseOmitsExpiresIn(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "unused-cli.json"), ManagedDir: t.TempDir()}
+	wantExpiry := time.Now().Add(2 * time.Minute).Truncate(time.Second)
+	acct, err := store.SaveManagedCredential("work", CredentialInfo{
+		AccessToken: "stale", RefreshToken: "refresh", ExpiresAt: wantExpiry,
+		OAuthDeviceID: "authorized-device",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		// Deliberately omit expires_in: this response shape used to erase the
+		// stored absolute expiry and leave no usable expiry metadata.
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh"})
+	}))
+	defer server.Close()
+	stubOAuthConfig(t, server.URL)
+
+	if _, err := store.RefreshAccount(t.Context(), server.Client(), acct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RefreshAccount(t.Context(), server.Client(), acct); err != nil {
+		t.Fatal(err)
+	}
+	credential, ok, err := store.ReadManagedCredential("work", time.Now())
+	if err != nil || !ok {
+		t.Fatalf("read refreshed credential: ok=%v err=%v", ok, err)
+	}
+	if !credential.ExpiresAt.After(time.Now().Add(refreshLead)) {
+		t.Fatalf("ExpiresAt = %s, want fallback outside the refresh lead", credential.ExpiresAt)
+	}
+	if requests != 1 {
+		t.Fatalf("refresh requests = %d, want one across two calls", requests)
+	}
+	if got := refreshedExpiry(reference.Add(time.Hour), time.Time{}, reference); !got.Equal(reference.Add(time.Hour)) {
+		t.Fatalf("longer prior expiry = %s, want it preserved", got)
+	}
+}
+
+func TestManagedRefreshReportsCommittedCredentialWhenDirectorySyncFails(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "unused-cli.json"), ManagedDir: t.TempDir()}
+	acct, err := store.SaveManagedCredential("work", CredentialInfo{
+		AccessToken: "stale", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(-time.Hour),
+		OAuthDeviceID: "authorized-device",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, _, _, err := store.accountCredentialPath(acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncFailure := errors.New("injected directory sync failure")
+	originalSync := syncCredentialDirectory
+	syncCredentialDirectory = func(got string) error {
+		if want := filepath.Dir(path); got != want {
+			t.Fatalf("synced directory = %q, want %q", got, want)
+		}
+		return syncFailure
+	}
+	t.Cleanup(func() { syncCredentialDirectory = originalSync })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "fresh", "refresh_token": "rotated", "expires_in": 900,
+		})
+	}))
+	defer server.Close()
+	stubOAuthConfig(t, server.URL)
+
+	refreshed, didRefresh, err := store.RefreshAccountIfNeeded(t.Context(), server.Client(), acct)
+	if !errors.Is(err, syncFailure) {
+		t.Fatalf("refresh error = %v, want directory sync failure", err)
+	}
+	if !didRefresh || refreshed.Token != "fresh" {
+		t.Fatalf("refresh result = account:%+v didRefresh:%v, want committed fresh token", refreshed, didRefresh)
+	}
+	credential, ok, readErr := readCredential(path, time.Now())
+	if readErr != nil || !ok || credential.AccessToken != "fresh" || credential.RefreshToken != "rotated" {
+		t.Fatalf("renamed credential = %+v ok=%v err=%v", credential, ok, readErr)
+	}
+}
+
 func TestDefaultStoreHonorsKimiCodeHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("KIMI_CODE_HOME", home)

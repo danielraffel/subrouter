@@ -31,6 +31,10 @@ const (
 	oauthClientID  = "17e5f671-d194-4dfb-9706-5516cb48c098"
 	oauthDeviceURL = "https://auth.kimi.com/api/oauth/device_authorization"
 	oauthTokenURL  = "https://auth.kimi.com/api/oauth/token"
+	// Kimi Code access tokens live 900 seconds. If a successful refresh omits
+	// expires_in, retain that documented lifetime instead of persisting zero
+	// and consuming the refresh token again on every request.
+	refreshFallbackLifetime = 15 * time.Minute
 	// Keep managed OAuth identities disjoint from API-key account IDs, which
 	// already use the provider-derived "kimi:<label>" namespace.
 	managedIDPrefix      = "kimi-subscription:"
@@ -562,7 +566,8 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		if cliLock != nil {
 			refreshCtx = cliLock.Context()
 		}
-		token, tokenErr := oauthdevice.Refresh(refreshCtx, client, cfg, credential.RefreshToken, time.Now())
+		refreshTime := time.Now()
+		token, tokenErr := oauthdevice.Refresh(refreshCtx, client, cfg, credential.RefreshToken, refreshTime)
 		if tokenErr != nil {
 			if cliLock != nil {
 				if lockErr := cliLock.Check(); lockErr != nil {
@@ -581,16 +586,19 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		if strings.TrimSpace(token.Scope) != "" {
 			credential.Scope = token.Scope
 		}
-		credential.ExpiresAt = token.ExpiresAt
+		credential.ExpiresAt = refreshedExpiry(credential.ExpiresAt, token.ExpiresAt, refreshTime)
 		if cliLock != nil {
 			if lockErr := cliLock.Check(); lockErr != nil {
 				return lockErr
 			}
 		}
+		refreshed = credentialAccount(acct.ID, label, source, credential)
 		if writeErr := writeCredential(path, credential); writeErr != nil {
+			if isPostRenameSyncError(writeErr) {
+				didRefresh = true
+			}
 			return fmt.Errorf("refreshed the Kimi credential but could not write it back: %w", writeErr)
 		}
-		refreshed = credentialAccount(acct.ID, label, source, credential)
 		didRefresh = true
 		return nil
 	}
@@ -610,6 +618,17 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		return acct, false, err
 	}
 	return refreshed, didRefresh, nil
+}
+
+func refreshedExpiry(previous, returned, now time.Time) time.Time {
+	if !returned.IsZero() {
+		return returned
+	}
+	fallback := now.Add(refreshFallbackLifetime).UTC()
+	if previous.After(fallback) {
+		return previous
+	}
+	return fallback
 }
 
 func (s Store) accountCredentialPath(id string) (path, label, source string, err error) {
@@ -685,7 +704,40 @@ func writeCredential(path string, credential CredentialInfo) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	if err := syncCredentialDirectory(filepath.Dir(path)); err != nil {
+		return postRenameSyncError{err: fmt.Errorf("sync Kimi credential directory after rename: %w", err)}
+	}
+	return nil
+}
+
+type postRenameSyncError struct{ err error }
+
+func (e postRenameSyncError) Error() string { return e.err.Error() }
+func (e postRenameSyncError) Unwrap() error { return e.err }
+
+func isPostRenameSyncError(err error) bool {
+	var target postRenameSyncError
+	return errors.As(err, &target)
+}
+
+var syncCredentialDirectory = func(path string) error {
+	// Windows does not support syncing an opened directory through os.File.
+	// Rename remains atomic there; Unix platforms persist the directory entry.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 // SaveManagedCredential persists one Subrouter-owned OAuth profile without

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -345,6 +346,108 @@ func TestRefreshAccountKeepsAnUnrotatedRefreshToken(t *testing.T) {
 	}
 	if credential.RefreshToken != "rt" {
 		t.Fatalf("RefreshToken = %q, want the existing token preserved", credential.RefreshToken)
+	}
+}
+
+func TestRefreshAccountUsesProviderLifetimeWhenResponseOmitsExpiresIn(t *testing.T) {
+	wantExpiry := time.Now().Add(2 * time.Minute).Truncate(time.Second)
+	store := writeCredentialFile(t, credentialFileJSON("stale", "rt", wantExpiry))
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		// Deliberately omit expires_in: this is the provider response shape
+		// which previously erased the stored absolute expiry.
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh-access"})
+	}))
+	defer server.Close()
+	stubDiscovery(t, server.URL, server.URL)
+
+	if _, err := store.RefreshAccount(t.Context(), server.Client(), account.Account{ID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RefreshAccount(t.Context(), server.Client(), account.Account{ID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+	credential, ok, err := store.ReadLocalCredential(time.Now())
+	if err != nil || !ok {
+		t.Fatalf("read refreshed credential: ok=%v err=%v", ok, err)
+	}
+	if !credential.ExpiresAt.After(time.Now().Add(refreshLead)) {
+		t.Fatalf("ExpiresAt = %s, want fallback outside the refresh lead", credential.ExpiresAt)
+	}
+	if requests != 1 {
+		t.Fatalf("refresh requests = %d, want one across two calls", requests)
+	}
+	if got := refreshedExpiry(reference.Add(2*time.Hour), time.Time{}, reference); !got.Equal(reference.Add(2 * time.Hour)) {
+		t.Fatalf("longer prior expiry = %s, want it preserved", got)
+	}
+}
+
+func TestRefreshAccountReportsCommittedRotationWhenTransactionTeardownFails(t *testing.T) {
+	store := writeCredentialFile(t, credentialFileJSON("stale", "old-refresh", time.Now().Add(-time.Hour)))
+	teardownFailure := errors.New("injected transaction teardown failure")
+	store.RefreshTransaction = func(_ context.Context, mutate func() error) error {
+		if err := mutate(); err != nil {
+			return err
+		}
+		return teardownFailure
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "fresh", "refresh_token": "rotated", "expires_in": 3600,
+		})
+	}))
+	defer server.Close()
+	stubDiscovery(t, server.URL, server.URL)
+
+	refreshed, didRefresh, err := store.RefreshAccountIfNeeded(
+		t.Context(), server.Client(), account.Account{ID: accountID, Provider: account.ProviderGrok, Token: "stale"},
+	)
+	if !errors.Is(err, teardownFailure) {
+		t.Fatalf("refresh error = %v, want teardown failure", err)
+	}
+	if !didRefresh || refreshed.Token != "fresh" {
+		t.Fatalf("refresh result = account:%+v didRefresh:%v, want committed fresh token", refreshed, didRefresh)
+	}
+	stored, ok, readErr := store.ReadLocalCredential(time.Now())
+	if readErr != nil || !ok || stored.AccessToken != "fresh" || stored.RefreshToken != "rotated" {
+		t.Fatalf("durable credential = %+v ok=%v err=%v", stored, ok, readErr)
+	}
+}
+
+func TestRefreshReportsCommittedCredentialWhenDirectorySyncFails(t *testing.T) {
+	store := writeCredentialFile(t, credentialFileJSON("stale", "old-refresh", time.Now().Add(-time.Hour)))
+	syncFailure := errors.New("injected directory sync failure")
+	originalSync := syncCredentialDirectory
+	syncCredentialDirectory = func(path string) error {
+		if want := filepath.Dir(store.credentialPath()); path != want {
+			t.Fatalf("synced directory = %q, want %q", path, want)
+		}
+		return syncFailure
+	}
+	t.Cleanup(func() { syncCredentialDirectory = originalSync })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "fresh", "refresh_token": "rotated", "expires_in": 3600,
+		})
+	}))
+	defer server.Close()
+	stubDiscovery(t, server.URL, server.URL)
+
+	refreshed, didRefresh, err := store.RefreshAccountIfNeeded(
+		t.Context(), server.Client(), account.Account{ID: accountID, Provider: account.ProviderGrok, Token: "stale"},
+	)
+	if !errors.Is(err, syncFailure) {
+		t.Fatalf("refresh error = %v, want directory sync failure", err)
+	}
+	if !didRefresh || refreshed.Token != "fresh" {
+		t.Fatalf("refresh result = account:%+v didRefresh:%v, want committed fresh token", refreshed, didRefresh)
+	}
+	// Rename precedes directory fsync. Surface the durability failure without
+	// pretending the old pathname contents remain live in this process.
+	credential, ok, readErr := store.ReadLocalCredential(time.Now())
+	if readErr != nil || !ok || credential.AccessToken != "fresh" || credential.RefreshToken != "rotated" {
+		t.Fatalf("renamed credential = %+v ok=%v err=%v", credential, ok, readErr)
 	}
 }
 

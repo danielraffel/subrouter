@@ -3,11 +3,13 @@ package grok
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,11 @@ const (
 	oauthClientID     = "b1a00492-073a-47ea-816f-4c329264a828"
 	oauthScope        = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 	oauthDiscoveryURL = "https://auth.x.ai/.well-known/openid-configuration"
+	// xAI's access-token responses use a one-hour lifetime. If a successful
+	// refresh omits expires_in, this is safer than persisting zero (which burns
+	// the refresh token on every request) while matching the provider's normal
+	// token semantics.
+	refreshFallbackLifetime = time.Hour
 )
 
 // discoveryURL is a variable so tests can point discovery at a stub server.
@@ -146,7 +153,8 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		if discoverErr != nil {
 			return discoverErr
 		}
-		token, refreshErr := oauthdevice.Refresh(ctx, client, config, credential.RefreshToken, time.Now())
+		refreshTime := time.Now()
+		token, refreshErr := oauthdevice.Refresh(ctx, client, config, credential.RefreshToken, refreshTime)
 		if refreshErr != nil {
 			return refreshErr
 		}
@@ -166,11 +174,14 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		if strings.TrimSpace(token.Scope) != "" {
 			credential.Scope = token.Scope
 		}
-		credential.ExpiresAt = token.ExpiresAt
+		credential.ExpiresAt = refreshedExpiry(credential.ExpiresAt, token.ExpiresAt, refreshTime)
+		refreshed = credentialAccount(credential)
 		if writeErr := s.writeCredential(credential); writeErr != nil {
+			if isPostRenameSyncError(writeErr) {
+				didRefresh = true
+			}
 			return fmt.Errorf("refreshed the Grok credential but could not write it back: %w", writeErr)
 		}
-		refreshed = credentialAccount(credential)
 		didRefresh = true
 		return nil
 	}
@@ -180,9 +191,26 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		err = refresh()
 	}
 	if err != nil {
+		// RefreshTransaction teardown runs after the mutation callback. If the
+		// credential write already committed, preserve that account generation
+		// while still surfacing the teardown failure.
+		if didRefresh {
+			return refreshed, true, err
+		}
 		return acct, false, err
 	}
 	return refreshed, didRefresh, nil
+}
+
+func refreshedExpiry(previous, returned, now time.Time) time.Time {
+	if !returned.IsZero() {
+		return returned
+	}
+	fallback := now.Add(refreshFallbackLifetime).UTC()
+	if previous.After(fallback) {
+		return previous
+	}
+	return fallback
 }
 
 func credentialAccount(credential CredentialInfo) account.Account {
@@ -298,7 +326,40 @@ func (s Store) writeCredential(credential CredentialInfo) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	if err := syncCredentialDirectory(filepath.Dir(path)); err != nil {
+		return postRenameSyncError{err: fmt.Errorf("sync Grok credential directory after rename: %w", err)}
+	}
+	return nil
+}
+
+type postRenameSyncError struct{ err error }
+
+func (e postRenameSyncError) Error() string { return e.err.Error() }
+func (e postRenameSyncError) Unwrap() error { return e.err }
+
+func isPostRenameSyncError(err error) bool {
+	var target postRenameSyncError
+	return errors.As(err, &target)
+}
+
+var syncCredentialDirectory = func(path string) error {
+	// Windows does not support syncing an opened directory through os.File.
+	// Rename remains atomic there; Unix platforms persist the directory entry.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 // discovery holds the endpoints OIDC discovery returned, cached process-wide

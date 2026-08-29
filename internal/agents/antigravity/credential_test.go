@@ -160,6 +160,48 @@ func TestStoreCachesRefreshedCredentialUntilItExpires(t *testing.T) {
 	}
 }
 
+// Once an in-process refresh rotates the refresh token, the unchanged
+// keychain value is stale authority. ListAccounts must not resurrect it even
+// after the cached access token enters its refresh window.
+func TestListAccountsPreservesLocallyRotatedRefreshToken(t *testing.T) {
+	now := time.Now().UTC()
+	keychain := CredentialInfo{
+		AccessToken: "keychain-access", RefreshToken: "keychain-refresh",
+		ExpiresAt: now.Add(-time.Hour),
+	}
+	store := &Store{
+		readCredential: func(context.Context, time.Time) (CredentialInfo, bool, error) {
+			return keychain, true, nil
+		},
+		refreshCredential: func(_ context.Context, _ *http.Client, credential CredentialInfo, _ time.Time) (CredentialInfo, error) {
+			if credential.RefreshToken != "keychain-refresh" {
+				t.Fatalf("refresh input token = %q", credential.RefreshToken)
+			}
+			credential.AccessToken = "process-access"
+			credential.RefreshToken = "process-rotated-refresh"
+			// Keep the cached token inside the refresh window to prove that
+			// freshness cannot authorize restoring the stale keychain token.
+			credential.ExpiresAt = now.Add(time.Minute)
+			return credential, nil
+		},
+	}
+
+	refreshed, err := store.RefreshAccount(t.Context(), http.DefaultClient, account.Account{Token: "stale"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := store.ListAccounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || refreshed.Token != "process-access" || listed[0].Token != "process-access" {
+		t.Fatalf("refreshed=%+v listed=%+v, want locally refreshed access token", refreshed, listed)
+	}
+	if store.cached.RefreshToken != "process-rotated-refresh" {
+		t.Fatalf("cached refresh token = %q, stale keychain token was resurrected", store.cached.RefreshToken)
+	}
+}
+
 func TestStoreReplacesCachedCredentialWhenKeychainAccountChanges(t *testing.T) {
 	now := time.Now().UTC()
 	keychain := CredentialInfo{AccessToken: "account-a", RefreshToken: "refresh-a", ExpiresAt: now.Add(time.Hour)}

@@ -339,6 +339,9 @@ type Store struct {
 	mu                sync.Mutex
 	cached            CredentialInfo
 	sourceFingerprint string
+	// cachedFromRefresh records that cached may contain a rotated refresh token
+	// which the unchanged CLI keychain entry cannot replace safely.
+	cachedFromRefresh bool
 	readCredential    func(context.Context, time.Time) (CredentialInfo, bool, error)
 	refreshCredential func(context.Context, *http.Client, CredentialInfo, time.Time) (CredentialInfo, error)
 }
@@ -361,14 +364,17 @@ func (s *Store) ListAccounts(ctx context.Context) ([]account.Account, error) {
 	if !ok {
 		s.cached = CredentialInfo{}
 		s.sourceFingerprint = ""
+		s.cachedFromRefresh = false
 		return nil, nil
 	}
 	fingerprint := credentialFingerprint(credential)
-	if s.cached.AccessToken != "" && s.sourceFingerprint == fingerprint && !s.cached.NeedsRefresh(now) {
+	if s.cached.AccessToken != "" && s.sourceFingerprint == fingerprint &&
+		(s.cachedFromRefresh || !s.cached.NeedsRefresh(now)) {
 		return []account.Account{credentialAccount(s.cached)}, nil
 	}
 	s.cached = credential
 	s.sourceFingerprint = fingerprint
+	s.cachedFromRefresh = false
 	return []account.Account{credentialAccount(credential)}, nil
 }
 
@@ -387,6 +393,7 @@ func (s *Store) RefreshAccount(ctx context.Context, client *http.Client, acct ac
 	if !ok {
 		s.cached = CredentialInfo{}
 		s.sourceFingerprint = ""
+		s.cachedFromRefresh = false
 		return acct, fmt.Errorf("Antigravity keychain credential is missing")
 	}
 	fingerprint := credentialFingerprint(credential)
@@ -401,6 +408,7 @@ func (s *Store) RefreshAccount(ctx context.Context, client *http.Client, acct ac
 		credential = s.cached
 	} else {
 		s.sourceFingerprint = fingerprint
+		s.cachedFromRefresh = false
 	}
 	if !credential.NeedsRefresh(now) {
 		s.cached = credential
@@ -411,6 +419,7 @@ func (s *Store) RefreshAccount(ctx context.Context, client *http.Client, acct ac
 		return acct, err
 	}
 	s.cached = refreshed
+	s.cachedFromRefresh = true
 	return credentialAccount(refreshed), nil
 }
 
