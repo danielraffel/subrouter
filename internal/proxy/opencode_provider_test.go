@@ -560,6 +560,37 @@ func TestSessionLeaseInfersQwenFromModelPrefix(t *testing.T) {
 	}
 }
 
+func TestSessionLeaseInfersBareQwenFromAvailablePlanPool(t *testing.T) {
+	tokenPlan := accounts.Account{ID: "qwen-token:main", Provider: accounts.ProviderQwenToken}
+	codingPlan := accounts.Account{ID: "qwen:main", Provider: accounts.ProviderQwen}
+	sharedAnthropic := accounts.Account{ID: "qwen-token:anthropic", Provider: accounts.ProviderQwenAnthropic}
+
+	for _, test := range []struct {
+		name     string
+		provider string
+		pool     []accounts.Account
+		want     accounts.Provider
+	}{
+		{name: "token plan only", pool: []accounts.Account{tokenPlan}, want: accounts.ProviderQwenToken},
+		{name: "shared anthropic view only", pool: []accounts.Account{sharedAnthropic}, want: accounts.ProviderQwenToken},
+		{name: "coding plan only", pool: []accounts.Account{codingPlan}, want: accounts.ProviderQwen},
+		{name: "both prefer coding plan", pool: []accounts.Account{tokenPlan, codingPlan}, want: accounts.ProviderQwen},
+		{name: "explicit coding plan is not redirected", provider: "qwen", pool: []accounts.Account{tokenPlan}, want: accounts.ProviderQwen},
+		{name: "explicit token plan is preserved", provider: "qwen-token", pool: []accounts.Account{codingPlan}, want: accounts.ProviderQwenToken},
+		{name: "explicit anthropic protocol is preserved", provider: "qwen-anthropic", pool: []accounts.Account{codingPlan, tokenPlan}, want: accounts.ProviderQwenAnthropic},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider, model, err := sessionLeaseProviderForAccounts(test.provider, "qwen3-coder-plus", test.pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if provider != test.want || model != "qwen3-coder-plus" {
+				t.Fatalf("got (%q, %q), want (%q, qwen3-coder-plus)", provider, model, test.want)
+			}
+		})
+	}
+}
+
 // The Token Plan is a different subscription from the Coding Plan, with its own
 // key and its own host, so both must be able to serve at once rather than the
 // operator choosing one. The Token Plan base ends in /compatible-mode/v1, so a

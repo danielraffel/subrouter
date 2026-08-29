@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -907,6 +908,39 @@ func TestLocalCLIRefreshFailsClosedWhenLockOwnershipChanges(t *testing.T) {
 	}
 	if info, err := os.Stat(lockDir); err != nil || !info.IsDir() {
 		t.Fatalf("replacement owner's lock was removed: %v", err)
+	}
+}
+
+// Releasing the interoperability lock happens after the atomic credential
+// write. A release failure is important, but it must not make callers believe
+// the old token is still durable or that no rotation was committed.
+func TestLocalCLIRefreshReportsCommittedRotationWhenLockReleaseFails(t *testing.T) {
+	store := writeCredentialFile(t, credentialFileJSON("stale", "old-refresh", time.Now().Add(-time.Hour)))
+	releaseFailure := errors.New("injected post-write lock release failure")
+	store.lockLocalCLIRefreshForTest = func(ctx context.Context) (*cliRefreshLock, error) {
+		lockCtx, cancel := context.WithCancel(ctx)
+		return &cliRefreshLock{ctx: lockCtx, cancel: cancel, releaseErr: releaseFailure}, nil
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "fresh", "refresh_token": "rotated", "expires_in": 900,
+		})
+	}))
+	defer server.Close()
+	stubOAuthConfig(t, server.URL)
+
+	refreshed, didRefresh, err := store.RefreshAccountIfNeeded(
+		context.Background(), server.Client(), account.Account{ID: accountID, Provider: account.ProviderKimi, Token: "stale"},
+	)
+	if !errors.Is(err, releaseFailure) {
+		t.Fatalf("refresh error = %v, want release failure", err)
+	}
+	if !didRefresh || refreshed.Token != "fresh" {
+		t.Fatalf("refresh result = account:%+v didRefresh:%v, want committed fresh token", refreshed, didRefresh)
+	}
+	stored, ok, readErr := store.ReadLocalCredential(time.Now())
+	if readErr != nil || !ok || stored.AccessToken != "fresh" || stored.RefreshToken != "rotated" {
+		t.Fatalf("durable credential = %+v ok=%v err=%v", stored, ok, readErr)
 	}
 }
 

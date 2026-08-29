@@ -214,6 +214,15 @@ type refreshingKimiUsageStore struct {
 	preflightToken string
 }
 
+type committedRefreshErrorRefresher struct {
+	refreshed baseaccount.Account
+	err       error
+}
+
+func (s committedRefreshErrorRefresher) RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error) {
+	return s.refreshed, true, s.err
+}
+
 type partialKimiUsageStore struct{}
 
 func (partialKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {
@@ -320,6 +329,29 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("refreshed Kimi status row is missing")
+	}
+}
+
+func TestStatusRefreshPublishesAndReturnsCommittedAccountWithPostCommitError(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	original := baseaccount.Account{ID: "kimi-code", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth, Token: "stale"}
+	committed := original
+	committed.Token = "fresh"
+	postCommitErr := errors.New("post-commit lock release failed")
+	runner := srRunner{store: store, client: http.DefaultClient}
+
+	got, err := runner.refreshStatusOAuthAccount(t.Context(), original, committedRefreshErrorRefresher{
+		refreshed: committed,
+		err:       postCommitErr,
+	})
+	if !errors.Is(err, postCommitErr) {
+		t.Fatalf("status refresh error = %v, want post-commit error", err)
+	}
+	if got.Token != "fresh" {
+		t.Fatalf("status refresh returned token %q, want committed token", got.Token)
+	}
+	if _, statErr := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); statErr != nil {
+		t.Fatalf("committed refresh was not published: %v", statErr)
 	}
 }
 
@@ -2078,6 +2110,100 @@ func TestSRSwitchDoesNotRefreshStoredAuthWhenPublicationFails(t *testing.T) {
 	}
 }
 
+func TestSRSwitchDoesNotActivateStaleAuthAfterCommittedRefreshTeardownFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	activeAccount := accounts.StoredCodexAccount{
+		Email:   "active@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("active@example.test", "acct_active"),
+	}
+	if err := store.SaveStored(activeAccount); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.WriteActiveCodexAuth(activeAccount.Auth); err != nil {
+		t.Fatal(err)
+	}
+
+	staleAuth := testCodexAuth("target@example.test", "acct_target")
+	staleAuth.Tokens.AccessToken = testJWT(map[string]any{
+		"exp": time.Now().Add(-time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct_target",
+		},
+	})
+	target := accounts.StoredCodexAccount{
+		Email:   "target@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    staleAuth,
+	}
+	if err := store.SaveStored(target); err != nil {
+		t.Fatal(err)
+	}
+
+	freshAccess := testJWT(map[string]any{
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct_target",
+		},
+	})
+	freshID := testJWT(map[string]any{
+		"exp":   time.Now().Add(time.Hour).Unix(),
+		"email": target.Email,
+	})
+	client := &http.Client{Transport: srRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "auth.openai.com" && request.URL.Path == "/oauth/token" {
+			return srJSONResponse(request, http.StatusOK, fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":%q,"id_token":%q}`,
+				freshAccess, "fresh-refresh", freshID,
+			)), nil
+		}
+		return nil, errors.New("usage unavailable")
+	})}
+
+	teardownErr := errors.New("close account publication transaction")
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, client: client, in: strings.NewReader(""), out: &out, errOut: &out,
+		withCodexRefreshPublication: func(
+			ctx context.Context,
+			storeDir string,
+			mutate func(func() error) error,
+		) error {
+			if err := proxy.WithAccountDiskMutationPublication(ctx, storeDir, mutate); err != nil {
+				return err
+			}
+			return teardownErr
+		},
+	}
+
+	err := runner.switchAccount(context.Background(), target.Email, srSwitchOptions{})
+	if !errors.Is(err, teardownErr) {
+		t.Fatalf("switch error = %v, want committed-refresh teardown error", err)
+	}
+	stored, ok, err := store.FindStored(target.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored target found = %v, err = %v", ok, err)
+	}
+	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != "fresh-refresh" {
+		t.Fatalf("stored refresh token = %v, want committed fresh credential", stored.Auth.Tokens)
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok {
+		t.Fatalf("active auth found = %v, err = %v", ok, err)
+	}
+	if active.Tokens == nil || active.Tokens.RefreshToken != activeAccount.Auth.Tokens.RefreshToken {
+		t.Fatal("failed switch replaced active auth after refresh transaction teardown")
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("committed refresh generation was not published: %v", err)
+	}
+	if strings.Contains(out.String(), "Switched to") {
+		t.Fatalf("failed switch reported success:\n%s", out.String())
+	}
+}
 func TestSRSwitchSyncsOpenCodeAndPiAuth(t *testing.T) {
 	home := t.TempDir()
 	xdgData := t.TempDir()

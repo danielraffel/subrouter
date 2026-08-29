@@ -159,15 +159,16 @@ The subrouter cx <command> form is kept as a compatibility alias.
 `
 
 type srRunner struct {
-	program string
-	store   accounts.CodexStore
-	in      io.Reader
-	out     io.Writer
-	errOut  io.Writer
-	client  *http.Client
-	cmd     srCommandRunner
-	kimi    srKimiUsageStore
-	grok    srGrokStore
+	program                     string
+	store                       accounts.CodexStore
+	in                          io.Reader
+	out                         io.Writer
+	errOut                      io.Writer
+	client                      *http.Client
+	cmd                         srCommandRunner
+	kimi                        srKimiUsageStore
+	grok                        srGrokStore
+	withCodexRefreshPublication func(context.Context, string, func(func() error) error) error
 }
 
 type srGrokStore interface {
@@ -1533,13 +1534,16 @@ func (r srRunner) refreshStatusOAuthAccount(
 		}
 	}
 	var refreshed baseaccount.Account
+	var didRefresh bool
 	err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
-		var didRefresh bool
 		var refreshErr error
 		refreshed, didRefresh, refreshErr = refresher.RefreshAccountIfNeeded(ctx, r.client, account)
 		return didRefresh, refreshErr
 	})
 	if err != nil {
+		if didRefresh {
+			return refreshed, err
+		}
 		return account, err
 	}
 	return refreshed, nil
@@ -1598,7 +1602,11 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	refreshCtx := accounts.WithCodexRefreshReason(ctx, "sr.switch")
 	var refreshed accounts.StoredCodexAccount
 	var didRefresh bool
-	err = proxy.WithAccountDiskMutationPublication(refreshCtx, r.store.StoreDir(), func(publish func() error) error {
+	withRefreshPublication := proxy.WithAccountDiskMutationPublication
+	if r.withCodexRefreshPublication != nil {
+		withRefreshPublication = r.withCodexRefreshPublication
+	}
+	err = withRefreshPublication(refreshCtx, r.store.StoreDir(), func(publish func() error) error {
 		var refreshErr error
 		refreshed, didRefresh, refreshErr = r.store.RefreshStoredIfExpiredBeforeRefresh(
 			refreshCtx, r.client, account, publish,
@@ -1606,6 +1614,12 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 		return refreshErr
 	})
 	if err != nil {
+		if didRefresh {
+			// The provider may have rotated and persisted the refresh-token chain
+			// before transaction teardown reported an error. Do not fall back to
+			// the pre-refresh copy or activate anything after a partial failure.
+			return fmt.Errorf("token refresh committed but account transaction did not complete cleanly: %w", err)
+		}
 		fmt.Fprintf(r.errOut, "Warning: token refresh failed, using cached tokens: %s\n", err)
 		refreshed = account
 	} else if didRefresh {

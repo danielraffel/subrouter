@@ -64,6 +64,9 @@ type claudeRunner struct {
 	// afterAuthVerified is a test seam for cancellation and publication-failure
 	// races after Claude has durably written a credential.
 	afterAuthVerified func()
+	// mutateProfileInventoryForTest injects failures at the publication wrapper
+	// boundary, including errors returned after mutate has committed.
+	mutateProfileInventoryForTest func(context.Context, func() (bool, error)) error
 }
 
 const claudeProfileReconcileTimeout = 10 * time.Second
@@ -423,13 +426,17 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	var tempDir string
 	var err error
 	if name != "" {
-		err = r.mutateProfileInventory(ctx, func() (bool, error) {
+		created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
 			var createErr error
 			instancePath, createErr = r.store.CreateProfile(name)
 			return createErr == nil, createErr
 		})
-		if err != nil {
-			return err
+		if createErr != nil {
+			if created {
+				rollbackErr := r.rollbackProfileInventory(ctx, name)
+				return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
+			}
+			return createErr
 		}
 	} else {
 		instancePath, tempDir, err = r.store.CreateTempInstance()
@@ -487,37 +494,67 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		if profileName == "" {
 			profileName = "default"
 		}
-		if err := r.mutateProfileInventory(ctx, func() (bool, error) {
+		registered := false
+		_, registerErr := r.mutateProfileInventory(ctx, func() (bool, error) {
 			if _, ok := r.store.FindProfile(profileName); ok {
-				if _, removeErr := r.store.RemoveProfile(profileName); removeErr != nil {
-					return false, removeErr
+				removed, removeErr := r.store.RemoveProfile(profileName)
+				if removeErr != nil {
+					return removed, removeErr
 				}
 			}
-			registerErr := r.store.RegisterProfile(profileName, tempDir)
-			return registerErr == nil, registerErr
-		}); err != nil {
-			if cleanupErr := r.cleanupTemporaryInstance(ctx, tempDir); cleanupErr != nil {
-				return errors.Join(err, fmt.Errorf("clean up authenticated temporary Claude profile: %w", cleanupErr))
+			err := r.store.RegisterProfile(profileName, tempDir)
+			registered = err == nil
+			return registered, err
+		})
+		if registerErr != nil {
+			// The outer publication lock can report a teardown error after the
+			// registry write committed. Never delete a credential directory that
+			// the durable registry can still name. The explicit committed bit also
+			// fails closed if the registry cannot subsequently be read or changes
+			// concurrently after this transaction releases its lock.
+			if registered || r.profileInventoryReferencesDir(tempDir) {
+				return fmt.Errorf("register Claude profile committed before publication teardown failed: %w", registerErr)
 			}
-			return err
+			if cleanupErr := r.cleanupTemporaryInstance(ctx, tempDir); cleanupErr != nil {
+				return errors.Join(registerErr, fmt.Errorf("clean up authenticated temporary Claude profile: %w", cleanupErr))
+			}
+			return registerErr
 		}
-	} else if err := r.publishProfileCompletion(ctx); err != nil {
+	} else if published, err := r.publishProfileCompletion(ctx); err != nil {
 		// OAuth has already committed outside Subrouter's process. A cancellation
 		// at this boundary must not leave the profile usable on disk but invisible
 		// to a worker that consumed the earlier, credential-less generation.
 		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
-		reconcileErr := r.publishProfileCompletion(reconcileCtx)
+		retryPublished, reconcileErr := r.publishProfileCompletion(reconcileCtx)
 		cancel()
 		if reconcileErr != nil {
+			if published || retryPublished {
+				// At least one generation was durably written and its completion
+				// mutation ran. A teardown failure must not reclassify that credential
+				// as unpublished and delete a profile a worker can already observe.
+				return errors.Join(
+					fmt.Errorf("publish completed Claude profile: %w", err),
+					fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
+				)
+			}
 			// A persistent generation-path failure would make the normal published
 			// rollback fail for the same reason as both completion attempts. Under
 			// the account transaction lock, remove the credential first, then publish
 			// its deletion; workers still hold only the credential-less generation.
 			rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+			var cleanupErr error
 			rollbackErr := proxy.RollbackUnpublishedAccountDiskMutation(rollbackCtx, r.store.Dir, func() error {
-				return r.removeUnpublishedProfile(rollbackCtx, name)
+				removed, removeErr := r.removeUnpublishedProfile(rollbackCtx, name)
+				if removed {
+					// The registry removal committed. Let the publication helper expose
+					// that durable state, then surface any incomplete secret cleanup.
+					cleanupErr = removeErr
+					return nil
+				}
+				return removeErr
 			})
 			rollbackCancel()
+			rollbackErr = errors.Join(cleanupErr, rollbackErr)
 			return errors.Join(
 				fmt.Errorf("publish completed Claude profile: %w", err),
 				fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
@@ -732,25 +769,34 @@ func (r claudeRunner) remove(ctx context.Context, selector string) error {
 	return nil
 }
 
-func (r claudeRunner) mutateProfileInventory(ctx context.Context, mutate func() (bool, error)) error {
-	if r.ephemeral {
-		_, err := mutate()
-		return err
+func (r claudeRunner) mutateProfileInventory(ctx context.Context, mutate func() (bool, error)) (committed bool, err error) {
+	trackedMutate := func() (bool, error) {
+		committed, err = mutate()
+		return committed, err
 	}
-	return proxy.PublishAccountDiskMutation(ctx, r.store.Dir, mutate)
+	if r.mutateProfileInventoryForTest != nil {
+		err = r.mutateProfileInventoryForTest(ctx, trackedMutate)
+		return committed, err
+	}
+	if r.ephemeral {
+		return trackedMutate()
+	}
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.Dir, trackedMutate)
+	return committed, err
 }
 
 func (r claudeRunner) removeProfileInventory(ctx context.Context, name string) error {
-	return r.mutateProfileInventory(ctx, func() (bool, error) {
+	_, err := r.mutateProfileInventory(ctx, func() (bool, error) {
 		removed, err := r.store.RemoveProfile(name)
 		if err != nil {
-			return false, err
+			return removed, err
 		}
 		if !removed {
 			return false, fmt.Errorf("profile %q not found", name)
 		}
 		return true, nil
 	})
+	return err
 }
 
 func (r claudeRunner) rollbackProfileInventory(ctx context.Context, name string) error {
@@ -759,15 +805,15 @@ func (r claudeRunner) rollbackProfileInventory(ctx context.Context, name string)
 	return r.removeProfileInventory(rollbackCtx, name)
 }
 
-func (r claudeRunner) removeUnpublishedProfile(ctx context.Context, name string) error {
-	removed, err := r.store.RemoveProfileContext(ctx, name)
+func (r claudeRunner) removeUnpublishedProfile(ctx context.Context, name string) (bool, error) {
+	removed, err := r.store.RemoveUnpublishedProfileContext(ctx, name)
 	if err != nil {
-		return err
+		return removed, err
 	}
 	if !removed {
-		return fmt.Errorf("profile %q not found", name)
+		return false, fmt.Errorf("profile %q not found", name)
 	}
-	return nil
+	return true, nil
 }
 
 func wrapClaudeReconcileError(operation string, err error) error {
@@ -777,7 +823,7 @@ func wrapClaudeReconcileError(operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
-func (r claudeRunner) publishProfileCompletion(ctx context.Context) error {
+func (r claudeRunner) publishProfileCompletion(ctx context.Context) (bool, error) {
 	return r.mutateProfileInventory(ctx, func() (bool, error) {
 		// Claude writes the credential outside Subrouter's process during the
 		// interactive login. Publish a completion generation after verifying it
@@ -791,6 +837,15 @@ func (r claudeRunner) cleanupTemporaryInstance(ctx context.Context, dir string) 
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
 	defer cancel()
 	return r.store.CleanupInstanceContext(cleanupCtx, dir)
+}
+
+func (r claudeRunner) profileInventoryReferencesDir(dir string) bool {
+	for _, profile := range r.store.ListProfiles() {
+		if profile.Dir == dir {
+			return true
+		}
+	}
+	return false
 }
 
 func (r claudeRunner) env() error {

@@ -97,6 +97,21 @@ func TestTenantCredentialLeaseReportStatusMatrix(t *testing.T) {
 			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusForbidden, Scope: broker.LeaseCooldownAccount},
 			wantScope: broker.LeaseCooldownAccount,
 		},
+		"Claude rejected 500": {
+			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusInternalServerError},
+			wantScope: broker.LeaseCooldownQuota,
+		},
+		"Claude successful response cannot masquerade as rate limit": {
+			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusOK},
+			wantError: true,
+		},
+		"Claude redirect cannot masquerade as rate limit": {
+			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTemporaryRedirect},
+			wantError: true,
+		},
 		"Claude rate limit without scope stays model local": {
 			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
 			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusForbidden},

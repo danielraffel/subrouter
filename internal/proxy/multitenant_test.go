@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -2353,6 +2354,56 @@ func TestTenantQwenDeleteRestoresAccountWhenCredentialCleanupFails(t *testing.T)
 	}
 	if _, ok, err := store.FindStored(stored.Email); err != nil || !ok {
 		t.Fatalf("Qwen account was not restored after cleanup failure: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestTenantClaudeDeleteReloadsCommittedRemovalWhenCleanupFails(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	root := t.TempDir()
+	accountStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	instancePath, err := claudeStore.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := OpenAccountRef(accountStore, claudeStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accounts := ref.All(); len(accounts) != 1 || accounts[0].ID != "work" {
+		t.Fatalf("initial accounts = %+v, want Claude work profile", accounts)
+	}
+
+	fakeBin := t.TempDir()
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(
+		securityPath,
+		[]byte("#!/bin/sh\nrm -rf \"$SUBROUTER_TEST_INSTANCE_PARENT\"/.work.remove-*\necho 'forced cleanup and rollback failure' >&2\nexit 1\n"),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_TEST_INSTANCE_PARENT", filepath.Dir(instancePath))
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	response := httptest.NewRecorder()
+	handleTenantAccountDelete(
+		&Server{AccountRef: ref},
+		response,
+		httptest.NewRequest(http.MethodDelete, "/_subrouter/accounts/work", nil),
+	)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	if got := ref.All(); len(got) != 0 {
+		t.Fatalf("live accounts retained durably removed Claude profile: %+v", got)
 	}
 }
 

@@ -749,7 +749,7 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 			"cleanup_error", err,
 			"rollback_error", rollbackErr,
 		)
-		return false, errors.Join(err, fmt.Errorf("rollback Claude profile removal: %w", rollbackErr))
+		return true, errors.Join(err, fmt.Errorf("rollback Claude profile removal: %w", rollbackErr))
 	}
 	if err := deleteStagedProfileInstances(staged); err != nil {
 		slog.Warn(
@@ -757,6 +757,79 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 			"profile", name,
 			"error", err,
 		)
+	}
+	return true, nil
+}
+
+// RemoveUnpublishedProfileContext removes a profile whose credential was
+// authenticated after the last successfully published account generation.
+// Unlike ordinary profile removal, cleanup failure must never restore this
+// profile: a later unrelated generation could then publish a credential that
+// no worker was told existed. The registry and canonical instance paths are
+// removed first while their cross-process locks are held. Keychain and staged
+// directory cleanup are best effort after that commit and any failure is
+// returned with removed=true.
+//
+// Callers must hold the account-disk transaction across this removal and the
+// subsequent publication of the credential-less generation.
+func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string) (removed bool, err error) {
+	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	data := s.readProfiles()
+	profile, ok := data.Profiles[name]
+	if !ok {
+		return false, nil
+	}
+	dir := profile.Dir
+	if dir == "" {
+		dir = sanitizeName(name)
+	}
+	instancePaths, err := s.profileInstancePaths(dir)
+	if err != nil {
+		return false, err
+	}
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); err == nil {
+			err = closeErr
+		}
+	}()
+
+	staged, err := stageProfileInstancePaths(instancePaths)
+	if err != nil {
+		return false, err
+	}
+	delete(data.Profiles, name)
+	if data.Active == name {
+		data.Active = ""
+		for remaining := range data.Profiles {
+			data.Active = remaining
+			break
+		}
+	}
+	if err := s.writeProfiles(data); err != nil {
+		return false, errors.Join(err, rollbackStagedProfileInstances(staged))
+	}
+
+	// The removal is committed at this point. In particular, do not restore the
+	// registry or staged credential when Keychain cleanup fails.
+	cleanupErr := errors.Join(
+		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+		deleteStagedProfileInstances(staged),
+	)
+	if cleanupErr != nil {
+		return true, cleanupErr
 	}
 	return true, nil
 }

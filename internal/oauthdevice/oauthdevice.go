@@ -10,9 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -67,6 +70,10 @@ const (
 	slowDownIncrement = 5 * time.Second
 	// defaultExpiry applies when the provider omits expires_in on the device code.
 	defaultExpiry = 15 * time.Minute
+	// malformedTokenResponseRetries lets a transient intermediary response heal,
+	// but prevents a persistently broken 2xx endpoint from hiding the decode
+	// failure until the device code expires.
+	malformedTokenResponseRetries = 2
 )
 
 // ErrAuthorizationDeclined reports that the person refused the sign-in.
@@ -158,13 +165,23 @@ func Poll(ctx context.Context, client *http.Client, cfg Config, code Code, sleep
 	if interval <= 0 {
 		interval = defaultInterval
 	}
+	nextDelay := interval
+	malformedResponses := 0
 	for {
-		if !code.ExpiresAt.IsZero() && !now().Before(code.ExpiresAt) {
+		pollNow := now()
+		if !code.ExpiresAt.IsZero() && !pollNow.Before(code.ExpiresAt) {
 			return Token{}, ErrAuthorizationExpired
 		}
-		if err := sleep(ctx, interval); err != nil {
+		if !code.ExpiresAt.IsZero() {
+			remaining := code.ExpiresAt.Sub(pollNow)
+			if nextDelay > remaining {
+				nextDelay = remaining
+			}
+		}
+		if err := sleep(ctx, nextDelay); err != nil {
 			return Token{}, err
 		}
+		nextDelay = interval
 		if !code.ExpiresAt.IsZero() && !now().Before(code.ExpiresAt) {
 			return Token{}, ErrAuthorizationExpired
 		}
@@ -183,8 +200,21 @@ func Poll(ctx context.Context, client *http.Client, cfg Config, code Code, sleep
 		if !retry {
 			return Token{}, err
 		}
+		var malformedErr *malformedTokenResponseError
+		if errors.As(err, &malformedErr) {
+			malformedResponses++
+			if malformedResponses > malformedTokenResponseRetries {
+				return Token{}, err
+			}
+		} else {
+			malformedResponses = 0
+		}
 		if errors.Is(err, errSlowDown) {
 			interval += slowDownIncrement
+			nextDelay = interval
+		}
+		if retryAfter, ok := pollingRetryAfter(err, now()); ok && retryAfter > nextDelay {
+			nextDelay = retryAfter
 		}
 	}
 }
@@ -220,13 +250,21 @@ var errSlowDown = errors.New("slow_down")
 // errAuthorizationPending marks the ordinary "not approved yet" response.
 var errAuthorizationPending = errors.New("authorization_pending")
 
+type malformedTokenResponseError struct {
+	err error
+}
+
+func (err *malformedTokenResponseError) Error() string { return err.err.Error() }
+func (err *malformedTokenResponseError) Unwrap() error { return err.err }
+
 // exchange posts a token request and classifies the response. retry reports
 // whether Poll should keep waiting.
 func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Values, now time.Time) (token Token, retry bool, err error) {
 	body, httpErr := postForm(ctx, client, cfg.TokenURL, form, cfg.Headers)
 	var parsed tokenResponse
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &parsed)
+	parseErr := json.Unmarshal(body, &parsed)
+	if parseErr != nil {
+		parseErr = &malformedTokenResponseError{err: fmt.Errorf("device flow token endpoint returned an undecodable body: %w", parseErr)}
 	}
 	switch parsed.Error {
 	case "authorization_pending":
@@ -238,6 +276,9 @@ func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Val
 	case "expired_token":
 		return Token{}, false, ErrAuthorizationExpired
 	}
+	if httpErr != nil && retryablePollingEndpointError(ctx, httpErr) {
+		return Token{}, true, httpErr
+	}
 	if parsed.Error != "" {
 		if httpErr != nil {
 			return Token{}, false, fmt.Errorf("device flow token error %s: %w", parsed.Error, httpErr)
@@ -246,6 +287,9 @@ func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Val
 	}
 	if httpErr != nil {
 		return Token{}, false, httpErr
+	}
+	if parseErr != nil {
+		return Token{}, true, parseErr
 	}
 	if strings.TrimSpace(parsed.AccessToken) == "" {
 		return Token{}, false, errors.New("token response carried no access token")
@@ -261,6 +305,122 @@ func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Val
 		token.ExpiresAt = now.Add(time.Duration(parsed.ExpiresIn) * time.Second).UTC()
 	}
 	return token, false, nil
+}
+
+type endpointStatusError struct {
+	endpoint   string
+	status     string
+	statusCode int
+	retryAfter string
+}
+
+func (err *endpointStatusError) Error() string {
+	return fmt.Sprintf("device flow request to %s failed: %s", err.endpoint, err.status)
+}
+
+type endpointTransportError struct {
+	err error
+}
+
+func (err *endpointTransportError) Error() string { return err.err.Error() }
+func (err *endpointTransportError) Unwrap() error { return err.err }
+
+func retryablePollingEndpointError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var statusErr *endpointStatusError
+	if errors.As(err, &statusErr) {
+		return retryablePollingStatus(statusErr.statusCode)
+	}
+	var transportErr *endpointTransportError
+	if !errors.As(err, &transportErr) {
+		return false
+	}
+	return retryablePollingTransportError(transportErr.err)
+}
+
+func retryablePollingStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout,
+		http.StatusTooEarly,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func pollingRetryAfter(err error, now time.Time) (time.Duration, bool) {
+	var statusErr *endpointStatusError
+	if !errors.As(err, &statusErr) || statusErr.statusCode != http.StatusTooManyRequests {
+		return 0, false
+	}
+	value := strings.TrimSpace(statusErr.retryAfter)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil {
+		if seconds < 0 || seconds > int64((time.Duration(1<<63-1))/time.Second) {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	retryAt, parseErr := http.ParseTime(value)
+	if parseErr != nil {
+		return 0, false
+	}
+	delay := retryAt.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
+}
+
+// retryablePollingTransportError deliberately recognizes transient failures
+// rather than assuming every RoundTripper error will heal. TLS trust failures,
+// invalid proxy configuration, and permanent DNS errors otherwise turn an
+// actionable sign-in failure into a silent polling loop that lasts until the
+// device code expires.
+func retryablePollingTransportError(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	// An http.Client timeout has its own deadline even while the device-flow
+	// parent context and device code remain valid.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return dnsErr.Timeout() || dnsErr.Temporary()
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	for _, transient := range []error{
+		syscall.ECONNRESET,
+		syscall.ECONNABORTED,
+		syscall.ECONNREFUSED,
+		syscall.ENETDOWN,
+		syscall.ENETUNREACH,
+		syscall.EHOSTDOWN,
+		syscall.EHOSTUNREACH,
+		syscall.ETIMEDOUT,
+		syscall.EPIPE,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+	} {
+		if errors.Is(err, transient) {
+			return true
+		}
+	}
+	return false
 }
 
 func postForm(ctx context.Context, client *http.Client, endpoint string, form url.Values, headers map[string]string) ([]byte, error) {
@@ -284,17 +444,22 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 	}
 	res, err := requestClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &endpointTransportError{err: err}
 	}
 	defer func() { _ = res.Body.Close() }()
 	body, readErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if readErr != nil {
-		return nil, readErr
+		return nil, &endpointTransportError{err: readErr}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		// The body is returned alongside the error because RFC 8628 signals
 		// authorization_pending and slow_down with a 400.
-		return body, fmt.Errorf("device flow request to %s failed: %s", endpoint, res.Status)
+		return body, &endpointStatusError{
+			endpoint:   endpoint,
+			status:     res.Status,
+			statusCode: res.StatusCode,
+			retryAfter: res.Header.Get("Retry-After"),
+		}
 	}
 	return body, nil
 }

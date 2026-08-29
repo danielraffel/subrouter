@@ -200,6 +200,17 @@ func TestConsoleLoginConfigIsIsolatedAndStripsTemporaryKey(t *testing.T) {
 	}
 }
 
+func TestStripTemporaryLoginKeyDoesNotCreateMissingProfile(t *testing.T) {
+	root := t.TempDir()
+	accountID := "qwen-token:missing"
+	if err := StripTemporaryLoginKeyIn(root, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ConsoleConfigDirIn(root, accountID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing profile was created: %v", err)
+	}
+}
+
 func TestPrepareConsoleLoginCannotReuseStaleAccessToken(t *testing.T) {
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
 	accountID := "qwen-token:work"

@@ -687,6 +687,45 @@ func TestRemoveProfileContextUsesFreshDeadlineForRollback(t *testing.T) {
 	}
 }
 
+func TestRemoveProfileReportsCommittedRemovalWhenCleanupAndRollbackFail(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	home := t.TempDir()
+	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	instancePath, err := store.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ImportProfileCredential("work", CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := t.TempDir()
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(
+		securityPath,
+		[]byte("#!/bin/sh\nrm -rf \"$SUBROUTER_TEST_INSTANCE_PARENT\"/.work.remove-*\necho 'forced cleanup and rollback failure' >&2\nexit 1\n"),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_TEST_INSTANCE_PARENT", filepath.Dir(instancePath))
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	removed, removeErr := store.RemoveProfile("work")
+	if removeErr == nil {
+		t.Fatal("profile removal ignored cleanup and rollback failures")
+	}
+	if !removed {
+		t.Fatal("durably removed profile was not reported as committed")
+	}
+	if _, ok := store.FindProfile("work"); ok {
+		t.Fatal("failed rollback unexpectedly restored the profile registry")
+	}
+}
 func TestCleanupInstanceDeletesMacOSKeychainCredentialAliases(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS Keychain is only available on Darwin")

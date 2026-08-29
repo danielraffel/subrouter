@@ -514,11 +514,12 @@ func normalizeTenantCredentialLeaseReport(
 	case broker.LeaseForbidden:
 		validStatus = report.StatusCode == http.StatusForbidden
 	case broker.LeaseRateLimited:
-		// Claude can report quota rejection headers on a non-429 response. The
-		// hosted report intentionally carries no provider headers, so preserve
-		// that legitimate signal but constrain it to the issued model pool.
+		// Claude can report quota rejection headers on a non-429 error response.
+		// Hosted reports carry no provider headers, so require an HTTP error before
+		// honoring this untrusted signal and constrain it to the issued model pool.
 		validStatus = report.StatusCode == http.StatusTooManyRequests ||
 			(lease.provider == accounts.ProviderClaude &&
+				report.StatusCode >= http.StatusBadRequest &&
 				report.StatusCode != http.StatusUnauthorized)
 	case broker.LeaseProviderError:
 		validStatus = report.StatusCode >= http.StatusBadRequest &&

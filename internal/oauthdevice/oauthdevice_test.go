@@ -2,13 +2,24 @@ package oauthdevice
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+type oauthRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f oauthRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 var reference = time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
@@ -192,6 +203,332 @@ func TestPollBacksOffOnSlowDown(t *testing.T) {
 	}
 	if waited[1] != 10*time.Second {
 		t.Fatalf("second interval = %s, want 5s + the RFC's 5s increment", waited[1])
+	}
+}
+
+func TestPollRetriesTransientEndpointFailures(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		switch calls {
+		case 1:
+			http.Error(w, "upstream temporarily unavailable", http.StatusServiceUnavailable)
+		case 2:
+			_, _ = w.Write([]byte("temporary gateway response"))
+		default:
+			_, _ = w.Write([]byte(`{"access_token":"at"}`))
+		}
+	}))
+	defer server.Close()
+
+	token, err := Poll(context.Background(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Millisecond, ExpiresAt: reference.Add(time.Hour)},
+		noSleep, func() time.Time { return reference })
+	if err != nil {
+		t.Fatalf("poll failed after transient endpoint responses: %v", err)
+	}
+	if token.AccessToken != "at" || calls != 3 {
+		t.Fatalf("token = %+v, calls = %d; want success on the third poll", token, calls)
+	}
+}
+
+func TestPollHonoursRetryAfterOnTooManyRequests(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"at"}`))
+	}))
+	defer server.Close()
+
+	var waited []time.Duration
+	token, err := Poll(t.Context(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Second, ExpiresAt: reference.Add(time.Hour)},
+		func(_ context.Context, delay time.Duration) error {
+			waited = append(waited, delay)
+			return nil
+		}, func() time.Time { return reference })
+	if err != nil {
+		t.Fatalf("poll failed after Retry-After: %v", err)
+	}
+	if token.AccessToken != "at" || calls != 2 {
+		t.Fatalf("token = %+v, calls = %d; want success on the second poll", token, calls)
+	}
+	if len(waited) != 2 || waited[0] != time.Second || waited[1] != 30*time.Second {
+		t.Fatalf("waits = %v, want [1s 30s]", waited)
+	}
+}
+
+func TestPollingRetryAfterParsesSecondsAndHTTPDates(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{name: "seconds", value: "45", want: 45 * time.Second, ok: true},
+		{name: "http date", value: reference.Add(90 * time.Second).Format(http.TimeFormat), want: 90 * time.Second, ok: true},
+		{name: "past date", value: reference.Add(-time.Minute).Format(http.TimeFormat), want: 0, ok: true},
+		{name: "negative seconds", value: "-1"},
+		{name: "invalid", value: "later"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := pollingRetryAfter(&endpointStatusError{
+				statusCode: http.StatusTooManyRequests,
+				retryAfter: tc.value,
+			}, reference)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("pollingRetryAfter(%q) = (%s, %t), want (%s, %t)", tc.value, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestPollBoundsRetryAfterByDeviceCodeExpiry(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Retry-After", "300")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	now := reference
+	var waited []time.Duration
+	_, err := Poll(t.Context(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Second, ExpiresAt: reference.Add(10 * time.Second)},
+		func(_ context.Context, delay time.Duration) error {
+			waited = append(waited, delay)
+			now = now.Add(delay)
+			return nil
+		}, func() time.Time { return now })
+	if !errors.Is(err, ErrAuthorizationExpired) {
+		t.Fatalf("err = %v, want ErrAuthorizationExpired", err)
+	}
+	if calls != 1 || len(waited) != 2 || waited[0] != time.Second || waited[1] != 9*time.Second {
+		t.Fatalf("calls = %d, waits = %v; want one request and waits [1s 9s]", calls, waited)
+	}
+}
+
+func TestPollStopsAfterBoundedMalformedSuccessfulResponses(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":`))
+	}))
+	defer server.Close()
+
+	_, err := Poll(t.Context(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Second, ExpiresAt: reference.Add(time.Hour)},
+		noSleep, func() time.Time { return reference })
+	if err == nil || !strings.Contains(err.Error(), "undecodable body") || !strings.Contains(err.Error(), "unexpected end of JSON input") {
+		t.Fatalf("err = %v, want actionable token-response decode error", err)
+	}
+	if calls != 1+malformedTokenResponseRetries {
+		t.Fatalf("poll attempts = %d, want %d", calls, 1+malformedTokenResponseRetries)
+	}
+}
+
+func TestPollRetriesTransientTransportFailure(t *testing.T) {
+	var calls int
+	client := &http.Client{Transport: oauthRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		switch calls {
+		case 1:
+			return nil, &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+		case 2:
+			// A per-request client timeout is transient while the device-flow
+			// parent context and device code remain live.
+			return nil, context.DeadlineExceeded
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"access_token":"at"}`)),
+		}, nil
+	})}
+
+	token, err := Poll(context.Background(), client, Config{TokenURL: "https://oauth.example/token"},
+		Code{DeviceCode: "dc", Interval: time.Millisecond, ExpiresAt: reference.Add(time.Hour)},
+		noSleep, func() time.Time { return reference })
+	if err != nil {
+		t.Fatalf("poll failed after transient transport error: %v", err)
+	}
+	if token.AccessToken != "at" || calls != 3 {
+		t.Fatalf("token = %+v, calls = %d; want success on the third poll", token, calls)
+	}
+}
+
+func TestPollReturnsPermanentTransportFailuresPromptly(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want func(error) bool
+	}{
+		{
+			name: "unknown certificate authority",
+			err:  x509.UnknownAuthorityError{Cert: &x509.Certificate{}},
+			want: func(err error) bool {
+				var target x509.UnknownAuthorityError
+				return errors.As(err, &target)
+			},
+		},
+		{
+			name: "invalid proxy configuration",
+			err: &url.Error{
+				Op:  "proxyconnect",
+				URL: "https://oauth.example/token",
+				Err: url.InvalidHostError("invalid proxy host"),
+			},
+			want: func(err error) bool {
+				var target url.InvalidHostError
+				return errors.As(err, &target)
+			},
+		},
+		{
+			name: "non-temporary DNS failure",
+			err:  &net.DNSError{Err: "no such host", Name: "oauth.invalid", IsNotFound: true},
+			want: func(err error) bool {
+				var target *net.DNSError
+				return errors.As(err, &target) && target.IsNotFound
+			},
+		},
+		{
+			name: "unclassified transport failure",
+			err:  errors.New("transport configuration rejected"),
+			want: func(err error) bool {
+				return strings.Contains(err.Error(), "transport configuration rejected")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int
+			var waits int
+			stopRetry := errors.New("test stopped an unexpected retry")
+			client := &http.Client{Transport: oauthRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, tc.err
+			})}
+			sleep := func(context.Context, time.Duration) error {
+				waits++
+				if waits > 1 {
+					return stopRetry
+				}
+				return nil
+			}
+
+			_, err := Poll(t.Context(), client, Config{TokenURL: "https://oauth.example/token"},
+				Code{DeviceCode: "dc", Interval: time.Millisecond, ExpiresAt: reference.Add(time.Hour)},
+				sleep, func() time.Time { return reference })
+			if err == nil || !tc.want(err) {
+				t.Fatalf("err = %v, want original actionable transport failure", err)
+			}
+			if calls != 1 {
+				t.Fatalf("poll attempts = %d, want one for a permanent transport failure", calls)
+			}
+		})
+	}
+}
+
+func TestPollDoesNotRetryRejectedRedirect(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Redirect(w, r, "/different-token-endpoint", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	_, err := Poll(t.Context(), server.Client(), testConfig(server),
+		Code{DeviceCode: "dc", Interval: time.Millisecond, ExpiresAt: reference.Add(time.Hour)},
+		noSleep, func() time.Time { return reference })
+	if err == nil || !strings.Contains(err.Error(), "307 Temporary Redirect") {
+		t.Fatalf("err = %v, want the rejected redirect status", err)
+	}
+	if calls != 1 {
+		t.Fatalf("poll attempts = %d, want one for a rejected redirect", calls)
+	}
+}
+
+func TestPollStopsWhenTransportFailureCancelsTheFlow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	client := &http.Client{Transport: oauthRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		cancel()
+		return nil, context.Canceled
+	})}
+
+	_, err := Poll(ctx, client, Config{TokenURL: "https://oauth.example/token"},
+		Code{DeviceCode: "dc", Interval: time.Millisecond, ExpiresAt: reference.Add(time.Hour)},
+		noSleep, func() time.Time { return reference })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("poll attempts = %d, want one after parent cancellation", calls)
+	}
+}
+
+func TestPollTransientFailuresRemainBoundedByDeviceCodeExpiry(t *testing.T) {
+	var calls int
+	client := &http.Client{Transport: oauthRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+	})}
+	now := reference
+	advance := func(context.Context, time.Duration) error {
+		now = now.Add(time.Second)
+		return nil
+	}
+
+	_, err := Poll(context.Background(), client, Config{TokenURL: "https://oauth.example/token"},
+		Code{DeviceCode: "dc", Interval: time.Second, ExpiresAt: reference.Add(2 * time.Second)},
+		advance, func() time.Time { return now })
+	if !errors.Is(err, ErrAuthorizationExpired) {
+		t.Fatalf("err = %v, want ErrAuthorizationExpired", err)
+	}
+	if calls != 1 {
+		t.Fatalf("poll attempts = %d, want one attempt before local expiry", calls)
+	}
+}
+
+func TestPollDoesNotRetryNonTransientEndpointFailure(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotImplemented} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var calls int
+			var waits int
+			stopRetry := errors.New("test stopped an unexpected retry")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				http.Error(w, "non-retryable device request", status)
+			}))
+			defer server.Close()
+			sleep := func(context.Context, time.Duration) error {
+				waits++
+				if waits > 1 {
+					return stopRetry
+				}
+				return nil
+			}
+
+			_, err := Poll(t.Context(), server.Client(), testConfig(server),
+				Code{DeviceCode: "dc", Interval: time.Millisecond, ExpiresAt: reference.Add(time.Hour)},
+				sleep, func() time.Time { return reference })
+			if err == nil || !strings.Contains(err.Error(), http.StatusText(status)) {
+				t.Fatalf("err = %v, want terminal %d endpoint failure", err, status)
+			}
+			if calls != 1 {
+				t.Fatalf("poll attempts = %d, want one for a non-transient failure", calls)
+			}
+		})
 	}
 }
 
