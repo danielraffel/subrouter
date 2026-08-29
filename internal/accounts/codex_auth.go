@@ -308,7 +308,7 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, true, err
 	}
-	if !s.DisableActiveAuthSync {
+	if !s.DisableActiveAuthSync && codexCredentialOriginAllowsActiveAuthSync(account.OAuthCredentialOrigin) {
 		if err := syncActiveCodexAuthIfAccountActive(account); err != nil {
 			logCodexRefreshFailed(ctx, s, account, force, err)
 			return account, true, err
@@ -316,6 +316,11 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	}
 	logCodexRefreshSucceeded(ctx, s, previous, account, force)
 	return account, true, nil
+}
+
+func codexCredentialOriginAllowsActiveAuthSync(origin CodexOAuthCredentialOrigin) bool {
+	return origin != CodexOAuthOriginIsolatedServerLogin &&
+		origin != CodexOAuthOriginServerAttested
 }
 
 func (s CodexStore) validateServingCredentialIsolation(account StoredCodexAccount) (string, error) {

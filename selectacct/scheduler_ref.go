@@ -43,6 +43,10 @@ type SchedulerRef struct {
 	// entitlement errors. Usage refreshes cannot supersede these marks because
 	// quota headroom says nothing about whether an account supports a model.
 	incompatibleUntil map[string]time.Time
+	// recoveryProbeReady remembers that an authoritative exclusion expired while
+	// the measured snapshot still read zero. Routing may attempt exactly one
+	// optimistic probe; RunIfAccountNotBlocked consumes the allowance atomically.
+	recoveryProbeReady map[string]struct{}
 	// routedSinceRefresh counts requests the proxy routed per account (by
 	// ScoreKey) since the last successful usage refresh. Pick debits headroom
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
@@ -101,12 +105,12 @@ func (r *SchedulerRef) RunIfAccountNotBlocked(
 		publish()
 		return time.Time{}, true
 	}
-	r.pruneExpired(now)
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if until, blocked := r.blockedUntilLocked(provider, accountID, model, now); blocked {
 		return until, false
 	}
+	r.clearExpiredRouteMarksLocked(provider, accountID, model, now)
 	publish()
 	return time.Time{}, true
 }
@@ -122,7 +126,6 @@ func (r *SchedulerRef) BlockedUntilFor(
 	if r == nil {
 		return time.Time{}, false
 	}
-	r.pruneExpired(now)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.blockedUntilLocked(provider, accountID, model, now)
@@ -214,9 +217,63 @@ func (r *SchedulerRef) blockedUntilLocked(
 		}
 	}
 	if until.IsZero() {
+		if r.recoveryProbeReadyLocked(provider, accountID, model) {
+			return time.Time{}, false
+		}
 		until = now.Add(DefaultExhaustedTTL)
+	} else if !until.After(now) {
+		// An expired authoritative mark grants one optimistic probe even when
+		// the measured snapshot still says zero. The publication guard consumes
+		// that mark atomically so concurrent lease attempts cannot all probe.
+		return time.Time{}, false
 	}
 	return until, true
+}
+
+func (r *SchedulerRef) clearExpiredRouteMarksLocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) {
+	keys := []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	}
+	for _, key := range keys {
+		delete(r.recoveryProbeReady, key)
+	}
+	for _, marks := range []map[string]time.Time{
+		r.exhaustedUntil,
+		r.accountUnavailableUntil,
+		r.incompatibleUntil,
+	} {
+		for _, key := range keys {
+			if until := marks[key]; !until.IsZero() && !until.After(now) {
+				delete(marks, key)
+			}
+		}
+	}
+	// Credential exclusions include the credential fingerprint after the score
+	// key, so remove any expired entry for this route's account.
+	prefix := ScoreKey(provider, accountID) + "\x00"
+	for key, until := range r.credentialExhaustedUntil {
+		if strings.HasPrefix(key, prefix) && !until.After(now) {
+			delete(r.credentialExhaustedUntil, key)
+		}
+	}
+}
+
+func (r *SchedulerRef) recoveryProbeReadyLocked(provider account.Provider, accountID, model string) bool {
+	for _, key := range []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	} {
+		if _, ok := r.recoveryProbeReady[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneExpired drops exhaustion marks whose window has reset. The base snapshot
@@ -276,6 +333,15 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		if until.After(now) {
 			continue
 		}
+		probeKeys := r.recoveryProbeKeysForExpiredMarkLocked(key)
+		if len(probeKeys) > 0 {
+			if r.recoveryProbeReady == nil {
+				r.recoveryProbeReady = make(map[string]struct{})
+			}
+			for _, probeKey := range probeKeys {
+				r.recoveryProbeReady[probeKey] = struct{}{}
+			}
+		}
 		delete(r.exhaustedUntil, key)
 	}
 	for key, until := range r.credentialExhaustedUntil {
@@ -296,6 +362,58 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 	}
 }
 
+func (r *SchedulerRef) scoreForExhaustionKeyLocked(key string) (Score, bool) {
+	scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
+	if !ok {
+		return Score{}, false
+	}
+	score, ok := r.scheduler.scores[scoreKey]
+	if !ok {
+		return Score{}, false
+	}
+	if poolKey != "" {
+		modelScore, exists := score.ModelScores[poolKey]
+		if exists {
+			return modelScore, true
+		}
+		if r.scheduler.hasModelScore(poolKey) {
+			return Score{}, false
+		}
+	}
+	return score, true
+}
+
+func (r *SchedulerRef) recoveryProbeKeysForExpiredMarkLocked(key string) []string {
+	scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
+	if !ok {
+		return nil
+	}
+	score, ok := r.scheduler.scores[scoreKey]
+	if !ok {
+		return nil
+	}
+	if poolKey != "" {
+		modelScore, exists := score.ModelScores[poolKey]
+		if exists && modelScore.exhausted() {
+			return []string{key}
+		}
+		if !r.scheduler.hasModelScore(poolKey) && score.exhausted() {
+			return []string{key}
+		}
+		return nil
+	}
+	if score.exhausted() {
+		return []string{key}
+	}
+	keys := make([]string, 0, len(score.ModelScores))
+	for model, modelScore := range score.ModelScores {
+		if modelScore.exhausted() {
+			keys = append(keys, poolScopedExhaustionKey(provider, score.AccountID, model))
+		}
+	}
+	return keys
+}
+
 func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -311,6 +429,30 @@ func (r *SchedulerRef) setLocked(scheduler Scheduler) {
 	r.scheduler = scheduler
 	r.retainExhaustedExpiriesLocked()
 	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
+	now := time.Now()
+	for key := range r.recoveryProbeReady {
+		score, ok := r.scoreForExhaustionKeyLocked(key)
+		if !ok || !score.exhausted() {
+			delete(r.recoveryProbeReady, key)
+			continue
+		}
+		if score.Fresh {
+			delete(r.recoveryProbeReady, key)
+			if r.exhaustedUntil == nil {
+				r.exhaustedUntil = make(map[string]time.Time)
+			}
+			until := now.Add(DefaultExhaustedTTL)
+			if score.ShortResetAfterSeconds > 0 {
+				if fromReset := now.Add(time.Duration(score.ShortResetAfterSeconds) * time.Second); fromReset.After(until) {
+					until = fromReset
+				}
+			}
+			if cap := now.Add(8 * 24 * time.Hour); until.After(cap) {
+				until = cap
+			}
+			r.exhaustedUntil[key] = until
+		}
+	}
 	r.updatedAt = time.Now()
 }
 
@@ -479,7 +621,9 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, 
 	if r.exhaustedUntil == nil {
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
-	r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)] = until
+	key := poolScopedExhaustionKey(provider, accountID, poolKey)
+	r.exhaustedUntil[key] = until
+	delete(r.recoveryProbeReady, key)
 	r.updatedAt = time.Now()
 }
 

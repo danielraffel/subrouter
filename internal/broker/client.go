@@ -781,10 +781,18 @@ func leaseCacheKey(input LeaseRequest) string {
 }
 
 func leaseSessionKey(input LeaseRequest) string {
+	// UserEmail is optional self-reported metadata, not authentication. Use its
+	// normalized value as a routing namespace so distinct identified teammates
+	// do not accidentally share capability state in one client. Keep the empty
+	// value as one explicit anonymous namespace: changing its key between
+	// requests would discard the opaque capability that carries retry/failover
+	// state. This key does not establish an authorization boundary.
+	userEmail := strings.ToLower(strings.TrimSpace(input.UserEmail))
 	return strings.Join([]string{
 		string(input.Provider),
 		input.AgentType,
 		input.SessionID,
+		userEmail,
 	}, "\x00")
 }
 

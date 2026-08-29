@@ -79,6 +79,21 @@ and hands existing connections to their original worker, avoiding listener
 interruption and connection drops. Restarting the supervisor itself still
 closes the listener and uses the normal drain/restart behavior.
 
+## Credential-origin rollback boundary
+
+The rollback binary must understand the stored Codex
+`oauthCredentialOrigin` field once `sr codex migrate-isolation` has run. A
+binary from before that field existed ignores it while reading an account and
+can erase it the next time it refreshes and rewrites the credential. The next
+upgraded daemon then rejects that account as unisolated.
+
+Do not keep a pre-isolation binary as the post-migration rollback artifact;
+retain the last build that preserves credential origin instead. If an emergency
+rollback did run an older binary, stop it and rerun
+`sr codex migrate-isolation` before starting an isolation-enforcing build. That
+re-enrollment may require browser approval for every account the older binary
+rewrote.
+
 ## Supervised handoff
 
 On macOS, run Subrouter behind `subrouter supervise`. The supervisor owns the public listener, starts each worker on an inherited private socket, and pins accepted TCP connections to that worker generation. An upgrade starts and health-checks the replacement before switching new connections. Old WebSockets, SSE streams, HTTP requests, and keep-alive connections remain on the old worker. The old worker exits only after its connection count reaches zero.

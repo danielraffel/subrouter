@@ -144,12 +144,23 @@ func TestTeamModeRequiresHostedTenantConfiguration(t *testing.T) {
 func TestLeaseSessionKeySurvivesAuthModeVariation(t *testing.T) {
 	base := LeaseRequest{
 		Provider: account.ProviderCodex, RequiredAuthMode: account.AuthModeOAuth,
-		AgentType: "codex", SessionID: "session-1",
+		AgentType: "codex", SessionID: "session-1", UserEmail: "Alice@Example.COM ",
 	}
 	apiKey := base
 	apiKey.RequiredAuthMode = account.AuthModeAPIKey
+	apiKey.UserEmail = " alice@example.com"
 	if leaseSessionKey(base) != leaseSessionKey(apiKey) {
-		t.Fatal("auth mode variation split one server-issued session capability")
+		t.Fatal("auth mode or email presentation variation split one server-issued session capability")
+	}
+	otherUser := base
+	otherUser.UserEmail = "bob@example.com"
+	if leaseSessionKey(base) == leaseSessionKey(otherUser) {
+		t.Fatal("distinct users shared one server-issued session capability")
+	}
+	anonymous := base
+	anonymous.UserEmail = ""
+	if leaseSessionKey(anonymous) == leaseSessionKey(base) {
+		t.Fatal("anonymous and identified callers shared one server-issued session capability")
 	}
 }
 
@@ -198,7 +209,7 @@ func TestConcurrentFirstLeasesShareServerSessionCapability(t *testing.T) {
 	client.HTTPClient = server.Client()
 	base := LeaseRequest{
 		Provider: account.ProviderCodex, RequiredAuthMode: account.AuthModeOAuth,
-		AgentType: "codex", SessionID: "session-1",
+		AgentType: "codex", SessionID: "session-1", UserEmail: "alice@example.com",
 	}
 	first := base
 	first.Model = "gpt-5"
@@ -226,5 +237,81 @@ func TestConcurrentFirstLeasesShareServerSessionCapability(t *testing.T) {
 	mu.Unlock()
 	if len(tokens) != 2 || tokens[0] != "<nil>" || tokens[1] != "session_server_issued" {
 		t.Fatalf("request session tokens = %#v", tokens)
+	}
+}
+
+func TestConcurrentUsersWithSameSessionDoNotShareServerSessionCapability(t *testing.T) {
+	t.Parallel()
+	const key = "srt_0123456789abcdef0123456789abcdef"
+	var requests atomic.Int32
+	var mu sync.Mutex
+	requestTokens := make(map[string]string)
+	bothArrived := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		userEmail := fmt.Sprint(request["userEmail"])
+		mu.Lock()
+		requestTokens[userEmail] = fmt.Sprint(request["sessionToken"])
+		mu.Unlock()
+		if requests.Add(1) == 2 {
+			close(bothArrived)
+		}
+		<-release
+		now := time.Now().UTC()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"teamId": "team-1",
+			"lease": map[string]any{
+				"leaseId": "lease-" + userEmail, "accountId": userEmail,
+				"provider": "codex", "authMode": "oauth", "token": "access-only",
+				"label": userEmail, "email": userEmail, "credentialGeneration": 1,
+				"sessionToken": "session-" + userEmail,
+				"issuedAt":     now.Format(time.RFC3339Nano),
+				"expiresAt":    now.Add(5 * time.Minute).Format(time.RFC3339Nano),
+			},
+		})
+	}))
+	defer server.Close()
+	client := NewClient(Config{
+		Version: 1, BaseURL: DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team-1", CredentialSource: CredentialSourceTeam,
+		HostedURL: server.URL, TenantKey: key,
+	})
+	client.HTTPClient = server.Client()
+	base := LeaseRequest{
+		Provider: account.ProviderCodex, RequiredAuthMode: account.AuthModeOAuth,
+		AgentType: "codex", SessionID: "shared-session",
+	}
+	results := make(chan error, 2)
+	for _, email := range []string{"alice@example.com", "bob@example.com"} {
+		request := base
+		request.UserEmail = email
+		go func() { _, err := client.Lease(context.Background(), request); results <- err }()
+	}
+	select {
+	case <-bothArrived:
+		close(release)
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("distinct users were serialized behind one session capability flight")
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	tokens := make(map[string]string, len(requestTokens))
+	for email, token := range requestTokens {
+		tokens[email] = token
+	}
+	mu.Unlock()
+	if len(tokens) != 2 || tokens["alice@example.com"] != "<nil>" || tokens["bob@example.com"] != "<nil>" {
+		t.Fatalf("first request tokens = %#v, want independent empty capabilities", tokens)
 	}
 }
