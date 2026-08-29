@@ -583,7 +583,8 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 			got := string(body)
 			for _, want := range []string{
-				"args=--resume session-a --model opus\n",
+				"args=--settings ",
+				" --resume session-a --model opus\n",
 				"base=" + tc.wantBase + "\n",
 				"token=" + tc.wantToken + "\n",
 				"headers=X-Subrouter-Agent: claude\n",
@@ -628,6 +629,135 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 			}
 			if secondConfig := strings.TrimPrefix(strings.SplitN(string(secondBody), "\n", 2)[0], "config="); secondConfig != configDir {
 				t.Fatalf("proxy config changed across resume: first=%q second=%q", configDir, secondConfig)
+			}
+		})
+	}
+}
+
+func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(home, "claude.txt")
+	settingsCopyPath := filepath.Join(home, "launch-settings.json")
+	script := "#!/bin/sh\nprintf 'args=%s\\nbase=%s\\ntoken=%s\\nconfig=%s\\n' \"$*\" \"$ANTHROPIC_BASE_URL\" \"$ANTHROPIC_AUTH_TOKEN\" \"$CLAUDE_CONFIG_DIR\" > " + shellQuote(recordPath) + "\ncat \"$2\" > " + shellQuote(settingsCopyPath) + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ANTHROPIC_BASE_URL", "http://attacker.invalid")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/personal/config")
+	configDir := filepath.Join(home, "isolated")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://stale.invalid","ANTHROPIC_AUTH_TOKEN":"stale-secret","ANTHROPIC_CUSTOM_HEADERS":"Authorization: Bearer stale-secret"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := srServerConfig{
+		Name:            "m3",
+		URL:             "http://renamed.example.ts.net.:31415",
+		TailscaleNodeID: "node-m3",
+	}
+	lookup := func(context.Context, string) ([]net.IPAddr, error) {
+		t.Fatal("exact-node profileless launch performed a second DNS lookup")
+		return nil, nil
+	}
+	load := func(context.Context) ([]byte, error) {
+		return []byte(`{"Self":{"ID":"self","Online":true},"Peer":{"node-m3":{"ID":"node-m3","DNSName":"renamed.example.ts.net.","TailscaleIPs":["100.88.0.9"],"Online":true}}}`), nil
+	}
+	runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(home, "accounts")}, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.runProxyClaudeForServerWithResolvers(
+		t.Context(), []string{"--resume", "session-a"}, server, "subrouter", configDir, lookup, load,
+	); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	for _, want := range []string{
+		"args=--settings ",
+		" --resume session-a\n",
+		"base=http://100.88.0.9:31415\n",
+		"token=subrouter\n",
+		"config=" + configDir + "\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("profileless invocation missing %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{"attacker.invalid", "stale.invalid", "stale-secret", "node-m3"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("profileless invocation leaked %q:\n%s", forbidden, got)
+		}
+	}
+	argsLine := strings.TrimPrefix(strings.SplitN(got, "\n", 2)[0], "args=")
+	parts := strings.Fields(argsLine)
+	if len(parts) < 2 || parts[0] != "--settings" {
+		t.Fatalf("profileless args = %q", argsLine)
+	}
+	if _, err := os.Stat(parts[1]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("verified profileless settings survived launch: %v", err)
+	}
+	settingsCopy, err := os.ReadFile(settingsCopyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overlay struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(settingsCopy, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if overlay.Env["ANTHROPIC_BASE_URL"] != "http://100.88.0.9:31415" ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" ||
+		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+		t.Fatalf("profileless authoritative settings = %+v", overlay.Env)
+	}
+}
+
+func TestProfilelessClaudePlaintextServerFailsClosedOnNodeStatus(t *testing.T) {
+	server := srServerConfig{
+		Name:            "m3",
+		URL:             "http://m3.example.ts.net.:31415",
+		TailscaleNodeID: "node-m3",
+	}
+	for _, tc := range []struct {
+		name   string
+		status string
+	}{
+		{name: "offline", status: `{"Self":{"ID":"self","Online":false}}`},
+		{name: "wrong node", status: `{"Self":{"ID":"self","Online":true},"Peer":{"node-m3":{"ID":"node-m3","DNSName":"other.example.ts.net.","TailscaleIPs":["100.88.0.9"],"Online":true}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			marker := filepath.Join(home, "launched")
+			binDir := filepath.Join(home, "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(home, "accounts")}, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+			err := runner.runProxyClaudeForServerWithResolvers(
+				t.Context(), []string{"--resume", "session-a"}, server, "subrouter", filepath.Join(home, "isolated"),
+				func(context.Context, string) ([]net.IPAddr, error) {
+					t.Fatal("failed exact-node launch fell back to DNS")
+					return nil, nil
+				},
+				func(context.Context) ([]byte, error) { return []byte(tc.status), nil },
+			)
+			if err == nil {
+				t.Fatal("unsafe profileless launch succeeded")
+			}
+			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("Claude launched before exact-node verification: %v", statErr)
 			}
 		})
 	}
@@ -707,7 +837,8 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	}
 	got := string(body)
 	for _, want := range []string{
-		"args=-p hello\n",
+		"args=--settings ",
+		" -p hello\n",
 		"base=" + local.URL + "\n",
 		"token=subrouter\n",
 		"headers=X-Subrouter-Agent: claude\n",

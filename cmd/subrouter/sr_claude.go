@@ -109,17 +109,13 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string) 
 	if proxyToken == "" {
 		proxyToken = "subrouter"
 	}
-	proxyRoot, err := serverProxyRootURL(server)
-	if err != nil {
-		return err
-	}
 	scope := "server:" + strings.TrimSpace(server.Name)
 	if strings.TrimSpace(server.TenantKey) != "" {
 		scope = "tenant:" + strings.TrimSpace(server.TenantKey)
 	} else if strings.TrimSpace(server.TailscaleNodeID) != "" {
 		scope = "tailscale-node:" + strings.TrimSpace(server.TailscaleNodeID)
 	}
-	return r.proxyClaudeArgsTo(ctx, args, proxyRoot, proxyToken, scope)
+	return r.proxyClaudeArgsToServer(ctx, args, server, proxyToken, scope)
 }
 
 // cloudClaude launches Claude against the local proxy. The proxy leases an
@@ -182,6 +178,56 @@ func (r srRunner) proxyClaudeArgsTo(
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir)
 }
 
+func (r srRunner) proxyClaudeArgsToServer(
+	ctx context.Context,
+	args []string,
+	server srServerConfig,
+	proxyToken string,
+	scope string,
+) error {
+	scopeHash := sha256.Sum256([]byte(scope))
+	configDir := filepath.Join(r.store.StoreDir(), "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fmt.Errorf("create isolated Claude proxy config: %w", err)
+	}
+	if err := os.Chmod(configDir, 0o700); err != nil {
+		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
+	}
+	return r.runProxyClaudeForServer(ctx, args, server, proxyToken, configDir)
+}
+
+func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
+	return r.runProxyClaudeForServerWithResolvers(
+		ctx, args, server, proxyToken, configDir,
+		net.DefaultResolver.LookupIPAddr, defaultTailscaleStatusLoader,
+	)
+}
+
+func (r srRunner) runProxyClaudeForServerWithResolvers(
+	ctx context.Context,
+	args []string,
+	server srServerConfig,
+	proxyToken string,
+	configDir string,
+	lookup serverIPLookup,
+	load tailscaleStatusLoader,
+) error {
+	proxyRoot := canonicalServerProxyRootURL(server)
+	protectedServer := server
+	parsedProxyRoot, _ := url.Parse(proxyRoot)
+	if strings.TrimSpace(protectedServer.TenantKey) == "" && tenantKeyFromURL(parsedProxyRoot) == "" {
+		// Profileless traffic still contains prompts and responses even when
+		// the legacy compatibility token is non-secret. Force exact transport
+		// verification without manufacturing a tenant route segment.
+		protectedServer.TenantKey = "protected-profileless-claude"
+	}
+	secureBaseURL, err := secureTenantServerURLWithResolvers(ctx, proxyRoot, protectedServer, lookup, load)
+	if err != nil {
+		return err
+	}
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir)
+}
+
 func (r srRunner) runProxyClaude(
 	ctx context.Context,
 	args []string,
@@ -197,12 +243,24 @@ func (r srRunner) runProxyClaude(
 	if err != nil {
 		return err
 	}
-	baseURL = secureBaseURL
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir)
+}
+
+func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir string) error {
+	settingsPath, err := proxyClaudeLaunchSettings(baseURL, proxyToken)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(settingsPath)
+	launchArgs, err := managedClaudeLaunchArgs(args, settingsPath)
+	if err != nil {
+		return err
+	}
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, args...)
+	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
@@ -928,7 +986,20 @@ func managedClaudeProfileLaunchMode(configDir string) (managedClaudeLaunchMode, 
 }
 
 func managedClaudeLaunchSettings(secureBaseURL string) (string, error) {
-	override, err := json.Marshal(map[string]any{"env": map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL}})
+	return temporaryClaudeLaunchSettings(map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
+}
+
+func proxyClaudeLaunchSettings(baseURL, proxyToken string) (string, error) {
+	baseURL = strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
+	return temporaryClaudeLaunchSettings(map[string]string{
+		"ANTHROPIC_BASE_URL":       baseURL,
+		"ANTHROPIC_AUTH_TOKEN":     proxyToken,
+		"ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude",
+	})
+}
+
+func temporaryClaudeLaunchSettings(env map[string]string) (string, error) {
+	override, err := json.Marshal(map[string]any{"env": env})
 	if err != nil {
 		return "", fmt.Errorf("encode managed Claude launch settings: %w", err)
 	}
