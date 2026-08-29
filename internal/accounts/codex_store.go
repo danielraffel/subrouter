@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -282,6 +283,50 @@ func (s CodexStore) SaveStored(account StoredCodexAccount) error {
 		return err
 	}
 	defer lock.Close()
+	return s.saveStoredUnlocked(account)
+}
+
+// ReplaceStoredOAuthWithIsolated replaces one existing Codex OAuth credential
+// after an account-manager login whose identity has already been checked. The
+// read and write share the account lock so a concurrent repair, removal, or
+// refresh cannot be overwritten by a stale pre-login snapshot.
+func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifier string, auth CodexAuthFile) error {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return errors.New("account identifier is required")
+	}
+	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.AccessToken) == "" ||
+		strings.TrimSpace(auth.Tokens.RefreshToken) == "" || strings.TrimSpace(auth.Tokens.IDToken) == "" {
+		return errors.New("isolated Codex login did not produce complete OAuth auth")
+	}
+	email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(email), identifier) {
+		return errors.New("isolated Codex login identity does not match the stored account")
+	}
+
+	lock, err := s.lockStoredAccount(identifier)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	account, found, err := s.findStoredExact(identifier)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("account %q changed or was removed during migration", identifier)
+	}
+	if account.IsAPIKey() || account.ProviderOrDefault() != ProviderCodex {
+		return fmt.Errorf("account %q is not a Codex OAuth account", identifier)
+	}
+	previous := account
+	account.Auth = auth
+	account.Auth.RefreshFailure = nil
+	account.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	appendCodexAuthBreadcrumb(
+		ctx, s, &account, "credential_reenrolled_isolated", "account_manager", false,
+		&previous, &account, nil, nil,
+	)
 	return s.saveStoredUnlocked(account)
 }
 
