@@ -2322,7 +2322,7 @@ func TestTenantAccountDeleteReturnsUnavailableWithoutAccountStore(t *testing.T) 
 	}
 }
 
-func TestTenantQwenDeleteRestoresAccountWhenCredentialCleanupFails(t *testing.T) {
+func TestTenantQwenDeleteKeepsAccountWhenCredentialCleanupFails(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	stored := accounts.StoredCodexAccount{
 		Email:    "qwen-token:work",
@@ -2333,6 +2333,10 @@ func TestTenantQwenDeleteRestoresAccountWhenCredentialCleanupFails(t *testing.T)
 		},
 	}
 	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	stored, _, err := store.FindStored(stored.Email)
+	if err != nil {
 		t.Fatal(err)
 	}
 	ref := NewAccountRef(store, nil, nil)
@@ -2353,7 +2357,148 @@ func TestTenantQwenDeleteRestoresAccountWhenCredentialCleanupFails(t *testing.T)
 		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
 	}
 	if _, ok, err := store.FindStored(stored.Email); err != nil || !ok {
-		t.Fatalf("Qwen account was not restored after cleanup failure: ok=%v err=%v", ok, err)
+		t.Fatalf("Qwen account changed before failed cleanup: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestTenantQwenDeleteRemovesConsoleBeforeAccountAndRestoresOnFailure(t *testing.T) {
+	var operations []string
+	wantErr := errors.New("account store unavailable")
+	removed, err := removeTenantQwenAccountWithOps(
+		true,
+		func() error {
+			operations = append(operations, "remove console")
+			return nil
+		},
+		func() (bool, error) {
+			operations = append(operations, "remove account")
+			return false, wantErr
+		},
+		func() error {
+			operations = append(operations, "restore console")
+			return nil
+		},
+	)
+	if removed || !errors.Is(err, wantErr) {
+		t.Fatalf("result = removed %v, err %v", removed, err)
+	}
+	want := []string{"remove console", "remove account", "restore console"}
+	if !reflect.DeepEqual(operations, want) {
+		t.Fatalf("operations = %v, want %v", operations, want)
+	}
+}
+
+func TestTenantQwenConsoleRestoreSyncsProfileAndContainingDirectory(t *testing.T) {
+	root := t.TempDir()
+	accountID := "qwen-token:work"
+	credential := agentqwen.ConsoleCredential{AccessToken: "console-secret", Account: "owner@example.com"}
+	var synced []string
+	if err := restoreTenantQwenConsoleDurably(root, accountID, credential, func(path string) error {
+		synced = append(synced, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := agentqwen.ExportConsoleCredentialIn(root, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != credential.AccessToken || got.Account != credential.Account {
+		t.Fatalf("restored credential = %+v", got)
+	}
+	consoleDir := agentqwen.ConsoleConfigDirIn(root, accountID)
+	want := []string{consoleDir, filepath.Dir(consoleDir)}
+	if !reflect.DeepEqual(synced, want) {
+		t.Fatalf("directory sync boundary = %v, want %v", synced, want)
+	}
+}
+
+func TestTenantQwenDeleteWaitsForAccountMutationTransaction(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	stored, _, err := store.FindStored(stored.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	removed, removeErr := removeTenantQwenAccount(ctx, ref, stored)
+	if removed || !errors.Is(removeErr, context.DeadlineExceeded) {
+		t.Fatalf("blocked delete = removed %v, err %v", removed, removeErr)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || !found {
+		t.Fatalf("blocked delete changed account: found=%v err=%v", found, err)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), stored.Email); err != nil || !has {
+		t.Fatalf("blocked delete changed console credential: has=%v err=%v", has, err)
+	}
+	current, found, currentErr := store.FindStored(stored.Email)
+	if currentErr != nil || !found || current.Email != stored.Email ||
+		storedAccountMutationVersion(current) != storedAccountMutationVersion(stored) {
+		t.Fatalf("blocked delete changed durable version: found=%v err=%v current=%+v expected=%+v", found, currentErr, current, stored)
+	}
+	removed, removeErr = removeTenantQwenAccount(context.Background(), ref, stored)
+	if !removed || removeErr != nil {
+		t.Fatalf("delete after transaction release = removed %v, err %v", removed, removeErr)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || found {
+		t.Fatalf("released delete retained account: found=%v err=%v", found, err)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), stored.Email); err != nil || has {
+		t.Fatalf("released delete retained console credential: has=%v err=%v", has, err)
+	}
+}
+
+func TestTenantQwenDeleteRejectsCredentialVersionChangeBeforeMutation(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	original := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "old-model-secret"},
+	}
+	if err := store.SaveStored(original); err != nil {
+		t.Fatal(err)
+	}
+	original, _, err := store.FindStored(original.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), original.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original
+	replacement.Auth.OpenAIAPIKey = "replacement-model-secret"
+	if err := store.SaveStored(replacement); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := removeTenantQwenAccount(context.Background(), ref, original)
+	if removed || err == nil || !strings.Contains(err.Error(), "changed during removal") {
+		t.Fatalf("stale delete = removed %v, err %v", removed, err)
+	}
+	stored, found, err := store.FindStored(original.Email)
+	if err != nil || !found || stored.Auth.OpenAIAPIKey != replacement.Auth.OpenAIAPIKey {
+		t.Fatalf("stale delete changed replacement: found=%v err=%v account=%+v", found, err, stored)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), original.Email); err != nil || !has {
+		t.Fatalf("stale delete removed console credential: has=%v err=%v", has, err)
 	}
 }
 

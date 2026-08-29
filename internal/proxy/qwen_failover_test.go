@@ -779,6 +779,7 @@ func TestStreamingFailoverCommitsOnlyOnSuccessfulTerminalEvent(t *testing.T) {
 		wantCommit  bool
 		breakStore  bool
 		forceNewer  bool
+		truncate    bool
 		wantReadErr bool
 	}{
 		{name: "codex completed", stream: "data: {\"type\":\"response.completed\"}\n\n", wantCommit: true},
@@ -789,8 +790,10 @@ func TestStreamingFailoverCommitsOnlyOnSuccessfulTerminalEvent(t *testing.T) {
 		{name: "event field error", stream: "event: error\ndata: {}\n\n"},
 		{name: "codex failed", stream: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n"},
 		{name: "anthropic error", stream: "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n"},
-		{name: "unterminated", stream: "data: {\"type\":\"response.in_progress\"}\n\n"},
+		{name: "clean eof without recognized terminal", stream: "data: {\"type\":\"response.in_progress\"}\n\n", wantCommit: true},
 		{name: "successful event without delimiter", stream: "data: {\"type\":\"response.completed\"}\n"},
+		{name: "complete event then truncated error event", stream: "data: {\"type\":\"response.in_progress\"}\n\nevent: error\n"},
+		{name: "transport truncation after complete event", stream: "data: {\"type\":\"response.in_progress\"}\n\n", truncate: true, wantReadErr: true},
 		{name: "newer assignment wins", stream: "data: {\"type\":\"response.completed\"}\n\n", forceNewer: true},
 		{name: "persistence failure", stream: "data: {\"type\":\"response.done\"}\n\n", breakStore: true, wantReadErr: true},
 	} {
@@ -804,10 +807,14 @@ func TestStreamingFailoverCommitsOnlyOnSuccessfulTerminalEvent(t *testing.T) {
 				t.Fatal(err)
 			}
 			base := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				var body io.Reader = iotest.OneByteReader(strings.NewReader(test.stream))
+				if test.truncate {
+					body = io.MultiReader(body, iotest.ErrReader(errors.New("upstream reset")))
+				}
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"text/event-stream; charset=utf-8"}},
-					Body:       io.NopCloser(iotest.OneByteReader(strings.NewReader(test.stream))),
+					Body:       io.NopCloser(body),
 					Request:    request,
 				}, nil
 			})
@@ -936,6 +943,49 @@ func TestNonStreamingFailoverCommitsOnlyAfterCleanBodyEOF(t *testing.T) {
 			}
 		})
 	}
+}
+
+type progressiveReadCloser struct {
+	first   bool
+	blocked chan struct{}
+}
+
+func (r *progressiveReadCloser) Read(p []byte) (int, error) {
+	if !r.first {
+		r.first = true
+		return copy(p, "chunk"), nil
+	}
+	<-r.blocked
+	return 0, io.EOF
+}
+
+func (*progressiveReadCloser) Close() error { return nil }
+
+func TestNonStreamingCommitWrapperDoesNotReadAhead(t *testing.T) {
+	upstream := &progressiveReadCloser{blocked: make(chan struct{})}
+	body := newSessionCommitEOFReadCloser(upstream, func() error { return nil })
+	result := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		buffer := make([]byte, 16)
+		n, err := body.Read(buffer)
+		result <- struct {
+			n   int
+			err error
+		}{n: n, err: err}
+	}()
+	select {
+	case got := <-result:
+		if got.n != len("chunk") || got.err != nil {
+			t.Fatalf("first read = (%d, %v), want progressive chunk", got.n, got.err)
+		}
+	case <-time.After(time.Second):
+		close(upstream.blocked)
+		t.Fatal("first response chunk was withheld by a blocking lookahead")
+	}
+	close(upstream.blocked)
 }
 
 func TestHandlerFailsOverBetweenKimiSubscriptionAccounts(t *testing.T) {

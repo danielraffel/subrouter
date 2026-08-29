@@ -657,7 +657,7 @@ func TestNonReplayableStreamingRefreshFailoverWaitsForTerminalSuccess(t *testing
 	}{
 		{name: "completed", stream: "data: {\"type\":\"response.completed\"}\n\n", wantCommit: true},
 		{name: "failed", stream: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n"},
-		{name: "truncated", stream: "data: {\"type\":\"response.in_progress\"}\n\n"},
+		{name: "clean eof without terminal marker", stream: "data: {\"type\":\"response.in_progress\"}\n\n", wantCommit: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dead := accounts.Account{ID: "kimi-subscription:dead", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "stale"}
@@ -756,8 +756,8 @@ func TestReplayableRefreshFailoverRejectsSuccessWhenStickyAssignmentCannotPersis
 	request.Header.Set("X-Subrouter-Session", sessionID)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK || response.Body.String() == `{}` {
-		t.Fatalf("response status=%d body=%q, want a visibly truncated 200 when terminal persistence fails after headers", response.Code, response.Body.String())
+	if response.Code != http.StatusOK || response.Body.String() != `{}` {
+		t.Fatalf("response status=%d body=%q, want progressive body delivery before EOF persistence failure", response.Code, response.Body.String())
 	}
 	assignment, ok := sessions.Get("kimi", sessionID)
 	if !ok || assignment.AccountID != dead.ID {

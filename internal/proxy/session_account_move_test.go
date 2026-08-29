@@ -142,8 +142,8 @@ func TestHandlerRejectsSuccessfulRerouteWhenStickyAssignmentCannotPersist(t *tes
 	request.Header.Set("X-Subrouter-Session", sessionID)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK || response.Body.String() == `{}` {
-		t.Fatalf("response status=%d body=%q, want a visibly truncated 200 when terminal persistence fails after headers", response.Code, response.Body.String())
+	if response.Code != http.StatusOK || response.Body.String() != `{}` {
+		t.Fatalf("response status=%d body=%q, want progressive body delivery before EOF persistence failure", response.Code, response.Body.String())
 	}
 	assignment, ok := store.Get("codex", sessionID)
 	if !ok || assignment.AccountID != "spent@example.com" {

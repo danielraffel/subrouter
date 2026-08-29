@@ -354,6 +354,24 @@ func deleteStagedProfileInstances(
 	return cleanupErr
 }
 
+func deleteOrphanedStagedProfileInstances(instancePaths []string) error {
+	var cleanupErr error
+	for _, instancePath := range instancePaths {
+		matches, err := filepath.Glob(filepath.Join(
+			filepath.Dir(instancePath),
+			"."+filepath.Base(instancePath)+".remove-*",
+		))
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
+		for _, match := range matches {
+			cleanupErr = errors.Join(cleanupErr, os.RemoveAll(match))
+		}
+	}
+	return cleanupErr
+}
+
 type profileCredentialBackup struct {
 	path       string
 	credential CredentialInfo
@@ -544,6 +562,9 @@ func (s Store) CreateProfile(name string) (string, error) {
 		return "", fmt.Errorf("profile %q already exists", name)
 	}
 	dir := sanitizeName(name)
+	if err := s.ensureClaudeProfileInstanceDirAvailable(data, name, dir); err != nil {
+		return "", err
+	}
 	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	if err := s.initInstanceDir(instancePath); err != nil {
 		return "", err
@@ -578,6 +599,9 @@ func (s Store) RegisterProfile(name, dir string) error {
 	}
 	defer lock.Close()
 	data := s.readProfiles()
+	if err := s.ensureClaudeProfileInstanceDirAvailable(data, name, dir); err != nil {
+		return err
+	}
 	profile, ok := data.Profiles[name]
 	if ok {
 		profile.LastUsed = time.Now().UTC().Format(time.RFC3339)
@@ -629,6 +653,9 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 	}
 	if !safeProfileDir(dir) {
 		return errors.New("Claude profile directory is invalid")
+	}
+	if err := s.ensureClaudeProfileInstanceDirAvailable(data, name, dir); err != nil {
+		return err
 	}
 	instancePath := s.PreferredInstancePath(filepath.Join(s.InstancesDir(), dir))
 	if err := os.MkdirAll(instancePath, 0o700); err != nil {
@@ -834,6 +861,148 @@ func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string)
 	return true, nil
 }
 
+// PrepareUnpublishedProfileRemovalContext validates one profile under the
+// registry lock and invokes prepare with its immutable, normalized instance
+// directory. The callback is intended to durably journal that identity before
+// the registry lock is released.
+func (s Store) PrepareUnpublishedProfileRemovalContext(
+	ctx context.Context,
+	name string,
+	prepare func(instanceDir string) error,
+) (found bool, err error) {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
+		return false, err
+	}
+	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); closeErr != nil {
+			found = false
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	body, err := readFileForAtomicReplace(s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	var data profilesFile
+	if err := json.Unmarshal(body, &data); err != nil {
+		return false, fmt.Errorf("decode Claude profile registry: %w", err)
+	}
+	profile, found := data.Profiles[name]
+	if !found {
+		return false, nil
+	}
+	if profile.Name != name {
+		return false, fmt.Errorf("Claude profile %q has mismatched registry identity %q", name, profile.Name)
+	}
+	dir := profile.Dir
+	if dir == "" {
+		dir = sanitizeName(name)
+	}
+	if !safeProfileDir(dir) {
+		return false, errors.New("Claude profile directory is invalid")
+	}
+	return true, prepare(dir)
+}
+
+// CompleteUnpublishedProfileRemovalContext idempotently completes removal of
+// one exact journaled profile identity. It cleans the path-keyed Keychain
+// credential and every staged .remove-* directory even when registry removal
+// committed before a crash. A registry entry with the same name but a changed
+// instance directory is never removed.
+func (s Store) CompleteUnpublishedProfileRemovalContext(
+	ctx context.Context,
+	name string,
+	expectedInstanceDir string,
+) (completed bool, err error) {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
+		return false, err
+	}
+	if !safeProfileDir(expectedInstanceDir) {
+		return false, errors.New("Claude profile rollback instance directory is invalid")
+	}
+	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); closeErr != nil {
+			completed = false
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	body, err := readFileForAtomicReplace(s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	var data profilesFile
+	if err := json.Unmarshal(body, &data); err != nil {
+		return false, fmt.Errorf("decode Claude profile registry: %w", err)
+	}
+	if data.Profiles == nil {
+		return false, errors.New("Claude profile registry has no profiles map")
+	}
+	if err := s.ensureClaudeProfileInstanceDirAvailable(data, name, expectedInstanceDir); err != nil {
+		return false, fmt.Errorf("refuse Claude rollback cleanup: %w", err)
+	}
+	profile, found := data.Profiles[name]
+	if found {
+		if profile.Name != name {
+			return false, fmt.Errorf("Claude profile %q has mismatched registry identity %q", name, profile.Name)
+		}
+		actualDir := profile.Dir
+		if actualDir == "" {
+			actualDir = sanitizeName(name)
+		}
+		if actualDir != expectedInstanceDir {
+			return false, fmt.Errorf("Claude profile %q instance directory changed from %q to %q", name, expectedInstanceDir, actualDir)
+		}
+	}
+	instancePaths, err := s.profileInstancePaths(expectedInstanceDir)
+	if err != nil {
+		return false, err
+	}
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); closeErr != nil {
+			completed = false
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	staged, err := stageProfileInstancePaths(instancePaths)
+	if err != nil {
+		return false, err
+	}
+	if found {
+		delete(data.Profiles, name)
+		if data.Active == name {
+			data.Active = ""
+			for remaining := range data.Profiles {
+				data.Active = remaining
+				break
+			}
+		}
+		if err := s.writeProfiles(data); err != nil {
+			return false, errors.Join(err, rollbackStagedProfileInstances(staged))
+		}
+	}
+	cleanupErr := errors.Join(
+		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+		deleteStagedProfileInstances(staged),
+		deleteOrphanedStagedProfileInstances(instancePaths),
+	)
+	if cleanupErr != nil {
+		return false, cleanupErr
+	}
+	return true, nil
+}
+
 func (s Store) CleanupInstance(dir string) error {
 	return s.CleanupInstanceContext(context.Background(), dir)
 }
@@ -899,6 +1068,101 @@ func safeProfileDir(dir string) bool {
 		filepath.VolumeName(dir) == "" &&
 		filepath.Clean(dir) == dir &&
 		filepath.Base(dir) == dir
+}
+
+func resolvedClaudeProfileInstanceDir(name string, profile Profile) string {
+	if profile.Dir != "" {
+		return profile.Dir
+	}
+	return sanitizeName(name)
+}
+
+func (s Store) ensureClaudeProfileInstanceDirAvailable(data profilesFile, targetName, targetDir string) error {
+	targetPaths, err := s.profileInstancePaths(targetDir)
+	if err != nil {
+		return err
+	}
+	for name, profile := range data.Profiles {
+		if name == targetName {
+			continue
+		}
+		otherDir := resolvedClaudeProfileInstanceDir(name, profile)
+		otherPaths, err := s.profileInstancePaths(otherDir)
+		if err != nil {
+			return fmt.Errorf("resolve Claude profile %q instance directory: %w", name, err)
+		}
+		for _, targetPath := range targetPaths {
+			for _, otherPath := range otherPaths {
+				aliases, err := profileInstancePathsAliasForOS(runtime.GOOS, targetPath, otherPath)
+				if err != nil {
+					return fmt.Errorf("compare Claude profile instance directories %q and %q: %w", targetDir, otherDir, err)
+				}
+				if aliases {
+					return fmt.Errorf("Claude profile instance directory %q is already owned by profile %q", targetDir, name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func profileInstancePathsAliasForOS(goos, first, second string) (bool, error) {
+	firstAbs, err := filepath.Abs(filepath.Clean(first))
+	if err != nil {
+		return false, err
+	}
+	secondAbs, err := filepath.Abs(filepath.Clean(second))
+	if err != nil {
+		return false, err
+	}
+	if firstAbs == secondAbs {
+		return true, nil
+	}
+	firstInfo, firstStatErr := os.Stat(firstAbs)
+	secondInfo, secondStatErr := os.Stat(secondAbs)
+	if firstStatErr == nil && secondStatErr == nil && os.SameFile(firstInfo, secondInfo) {
+		return true, nil
+	}
+	for _, statErr := range []error{firstStatErr, secondStatErr} {
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return false, statErr
+		}
+	}
+	firstIdentity, err := profileInstancePhysicalIdentity(firstAbs)
+	if err != nil {
+		return false, err
+	}
+	secondIdentity, err := profileInstancePhysicalIdentity(secondAbs)
+	if err != nil {
+		return false, err
+	}
+	if firstIdentity == secondIdentity {
+		return true, nil
+	}
+	if goos == "darwin" || goos == "windows" {
+		return strings.EqualFold(firstIdentity, secondIdentity), nil
+	}
+	return false, nil
+}
+
+func profileInstancePhysicalIdentity(path string) (string, error) {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Abs(filepath.Clean(resolved))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("unresolved Claude profile instance symlink %q", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	parent := filepath.Dir(path)
+	if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil {
+		return filepath.Abs(filepath.Join(resolvedParent, filepath.Base(path)))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return filepath.Abs(filepath.Clean(path))
 }
 
 func writePrivateFileAtomic(path string, body []byte) error {

@@ -141,6 +141,58 @@ func TestRegisterProfileAllowsEmailName(t *testing.T) {
 	}
 }
 
+func TestProfileRegistrationRejectsSharedInstanceDirectory(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("Work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateProfile("work"); err == nil || !strings.Contains(err.Error(), "already owned by profile \"Work\"") {
+		t.Fatalf("case-colliding CreateProfile error = %v", err)
+	}
+	if err := store.RegisterProfile("other", "work"); err == nil || !strings.Contains(err.Error(), "already owned by profile \"Work\"") {
+		t.Fatalf("colliding RegisterProfile error = %v", err)
+	}
+	if profiles := store.ListProfiles(); len(profiles) != 1 || profiles[0].Name != "Work" {
+		t.Fatalf("collision attempts changed registry: %+v", profiles)
+	}
+}
+
+func TestProfileRegistrationRejectsSymlinkedInstanceDirectory(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	if err := os.MkdirAll(store.InstancesDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(store.InstancesDir(), "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, filepath.Join(store.InstancesDir(), "alias")); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	if err := store.RegisterProfile("first", "real"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegisterProfile("second", "alias"); err == nil || !strings.Contains(err.Error(), "already owned by profile \"first\"") {
+		t.Fatalf("symlink-colliding RegisterProfile error = %v", err)
+	}
+}
+
+func TestProfileInstancePathsAliasUsesPlatformCaseRulesForMissingPaths(t *testing.T) {
+	root := t.TempDir()
+	upper := filepath.Join(root, "CaseOnlyMissing")
+	lower := filepath.Join(root, "caseonlymissing")
+	for _, goos := range []string{"darwin", "windows"} {
+		aliases, err := profileInstancePathsAliasForOS(goos, upper, lower)
+		if err != nil || !aliases {
+			t.Fatalf("%s case-only aliases = %v, err %v", goos, aliases, err)
+		}
+	}
+	aliases, err := profileInstancePathsAliasForOS("linux", upper, lower)
+	if err != nil || aliases {
+		t.Fatalf("linux case-only aliases = %v, err %v", aliases, err)
+	}
+}
+
 func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "api-key")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")

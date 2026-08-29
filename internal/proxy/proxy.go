@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -692,9 +691,26 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 		return nil, err
 	}
 	defer transactionLock.Close()
-	loaded, err := loadAccountRefAccounts(store, claudeStore, configuredSources)
+	_, rollbackErr := reconcileCompletedAccountRollback(ctx, store.StoreDir(), advanceAccountDiskGeneration)
+	if rollbackErr != nil && !errors.Is(rollbackErr, errAccountRollbackIncomplete) {
+		return nil, rollbackErr
+	}
+	rollbackActive := rollbackErr != nil
+	if !rollbackActive {
+		if err := recoverPendingCodexAttestations(store); err != nil {
+			return nil, err
+		}
+	}
+	rollbackActive, err = accountRollbackActive(store.StoreDir())
 	if err != nil {
 		return nil, err
+	}
+	var loaded []accounts.Account
+	if !rollbackActive {
+		loaded, err = loadAccountRefAccounts(store, claudeStore, configuredSources)
+		if err != nil {
+			return nil, err
+		}
 	}
 	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
 	if err != nil {
@@ -773,9 +789,16 @@ func (r *AccountRef) ReloadSnapshot() ([]accounts.Account, uint64, error) {
 	if r == nil {
 		return nil, 0, nil
 	}
-	loaded, err := loadAccountRefAccounts(r.store, r.claudeStore, r.oauthSources)
+	rollbackActive, err := accountRollbackActive(r.store.StoreDir())
 	if err != nil {
 		return nil, 0, err
+	}
+	var loaded []accounts.Account
+	if !rollbackActive {
+		loaded, err = loadAccountRefAccounts(r.store, r.claudeStore, r.oauthSources)
+		if err != nil {
+			return nil, 0, err
+		}
 	}
 	diskGeneration, err := readAccountDiskGeneration(r.store.StoreDir())
 	if err != nil {
@@ -1883,9 +1906,11 @@ func (s Server) handleQwenConsoleImport(w http.ResponseWriter, r *http.Request) 
 	}
 	root := agentqwen.DefaultConsoleRoot()
 	if s.AccountRef != nil {
-		root = s.AccountRef.qwenRoot()
-	}
-	if err := agentqwen.SaveConsoleCredentialIn(root, accountID, input.Credential); err != nil {
+		if err := saveQwenConsoleCredentialMutation(r.Context(), s.AccountRef, accountID, input.Credential); err != nil {
+			http.Error(w, "could not save Qwen console credential", http.StatusBadRequest)
+			return
+		}
+	} else if err := agentqwen.SaveConsoleCredentialIn(root, accountID, input.Credential); err != nil {
 		http.Error(w, "could not save Qwen console credential", http.StatusBadRequest)
 		return
 	}
@@ -1893,6 +1918,37 @@ func (s Server) handleQwenConsoleImport(w http.ResponseWriter, r *http.Request) 
 		s.AccountRef.InvalidateUsageStatusCache()
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func saveQwenConsoleCredentialMutation(
+	ctx context.Context,
+	ref *AccountRef,
+	accountID string,
+	credential agentqwen.ConsoleCredential,
+) (err error) {
+	if err := lockMutexContext(ctx, &ref.installMu); err != nil {
+		return err
+	}
+	defer ref.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(ctx, ref.store.StoreDir())
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, transactionLock.Close()) }()
+	if _, err := reconcileCompletedAccountRollback(ctx, ref.store.StoreDir(), advanceAccountDiskGeneration); err != nil {
+		return err
+	}
+	stored, found, err := ref.store.FindStored(accountID)
+	if err != nil {
+		return err
+	}
+	if !found || stored.Email != accountID || stored.ProviderOrDefault() != accounts.ProviderQwenToken || stored.IsAPIKey() == false {
+		return errors.New("Qwen Token Plan account changed before console credential save")
+	}
+	if err := ref.advanceDiskGeneration(); err != nil {
+		return err
+	}
+	return restoreTenantQwenConsoleDurably(ref.qwenRoot(), accountID, credential, syncAccountStateDir)
 }
 
 func (s Server) withSessionCounts(statuses []AccountUsageStatus) []AccountUsageStatus {
@@ -2340,14 +2396,16 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			account.Email = canonicalID
 			return account.Email, func() error {
 				if remoteCodexOAuth {
-					account, err = attestTenantCodexOAuth(ctx, s.AccountRef.client, account)
-					if err != nil {
-						return err
-					}
-					account, err = validateStoredAccountImport(input.Provider, account)
-					if err != nil {
-						return err
-					}
+					return attestAndSaveTenantCodexOAuth(
+						ctx, s.AccountRef.client, s.AccountRef.store, account,
+						func(attested *accounts.StoredCodexAccount) error {
+							validated, validateErr := validateStoredAccountImport(input.Provider, *attested)
+							if validateErr == nil {
+								*attested = validated
+							}
+							return validateErr
+						},
+					)
 				}
 				return s.AccountRef.store.SaveStored(account)
 			}, nil
@@ -2407,6 +2465,9 @@ func (s Server) installAccountMutation(
 			}
 		}
 	}()
+	if _, err := reconcileCompletedAccountRollback(ctx, s.AccountRef.store.StoreDir(), advanceAccountDiskGeneration); err != nil {
+		return "", err
+	}
 	accountID, mutate, err := prepare()
 	if err != nil {
 		return "", err
@@ -2693,6 +2754,10 @@ func (s Server) reloadAccounts(ctx context.Context) (accountCount int, scoredCou
 	transactionLock, err := lockAccountImportTransaction(ctx, s.AccountRef.store.StoreDir())
 	if err != nil {
 		return 0, 0, err
+	}
+	if _, rollbackErr := reconcileCompletedAccountRollback(ctx, s.AccountRef.store.StoreDir(), advanceAccountDiskGeneration); rollbackErr != nil && !errors.Is(rollbackErr, errAccountRollbackIncomplete) {
+		_ = transactionLock.Close()
+		return 0, 0, rollbackErr
 	}
 	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()
 	if err != nil {
@@ -7171,14 +7236,14 @@ func (s Server) commitSuccessfulHTTPResponse(response *http.Response, agentType,
 }
 
 type sessionCommitEOFReadCloser struct {
-	reader   *bufio.Reader
+	reader   io.Reader
 	closer   io.Closer
 	commit   func() error
 	finished bool
 }
 
 func newSessionCommitEOFReadCloser(body io.ReadCloser, commit func() error) io.ReadCloser {
-	return &sessionCommitEOFReadCloser{reader: bufio.NewReader(body), closer: body, commit: commit}
+	return &sessionCommitEOFReadCloser{reader: body, closer: body, commit: commit}
 }
 
 func (r *sessionCommitEOFReadCloser) Read(p []byte) (int, error) {
@@ -7186,19 +7251,11 @@ func (r *sessionCommitEOFReadCloser) Read(p []byte) (int, error) {
 	if r.finished {
 		return n, err
 	}
-	cleanEnd := err == io.EOF
-	if n > 0 && err == nil {
-		// Hold the final chunk until a one-byte lookahead proves clean EOF. This
-		// keeps persistence failure from arriving only after the client already
-		// received a complete JSON body.
-		_, peekErr := r.reader.Peek(1)
-		cleanEnd = peekErr == io.EOF
-	}
-	if cleanEnd {
+	if err == io.EOF {
 		r.finished = true
 		if r.commit != nil {
 			if commitErr := r.commit(); commitErr != nil {
-				return 0, fmt.Errorf("persist successful response session reassignment: %w", commitErr)
+				return n, fmt.Errorf("persist successful response session reassignment: %w", commitErr)
 			}
 		}
 	}
@@ -7213,12 +7270,14 @@ const sessionCommitSSEMaxLineBytes = 1 << 20
 
 type sessionCommitSSEReadCloser struct {
 	io.ReadCloser
-	commit       func() error
-	line         []byte
-	eventName    string
-	eventData    []byte
-	discardEvent bool
-	terminal     bool
+	commit        func() error
+	line          []byte
+	eventName     string
+	eventData     []byte
+	discardEvent  bool
+	terminal      bool
+	eventEnded    bool
+	eventObserved bool
 }
 
 func newSessionCommitSSEReadCloser(body io.ReadCloser, commit func() error) io.ReadCloser {
@@ -7242,10 +7301,21 @@ func (r *sessionCommitSSEReadCloser) Read(p []byte) (int, error) {
 			}
 		}
 	}
+	if readErr == io.EOF && !r.terminal {
+		terminal, success := r.observe(nil, true)
+		if terminal {
+			r.terminal = true
+			if success && r.commit != nil {
+				if err := r.commit(); err != nil {
+					return n, fmt.Errorf("persist successful streamed session reassignment: %w", err)
+				}
+			}
+		}
+	}
 	return n, readErr
 }
 
-func (r *sessionCommitSSEReadCloser) observe(chunk []byte, _ bool) (bool, bool) {
+func (r *sessionCommitSSEReadCloser) observe(chunk []byte, eof bool) (bool, bool) {
 	for _, b := range chunk {
 		if b != '\n' {
 			if len(r.line) < sessionCommitSSEMaxLineBytes {
@@ -7257,6 +7327,16 @@ func (r *sessionCommitSSEReadCloser) observe(chunk []byte, _ bool) (bool, bool) 
 		}
 		if terminal, success := r.finishLine(); terminal {
 			return terminal, success
+		}
+	}
+	if eof {
+		// Clean transport EOF is a successful terminal condition for providers
+		// that emit well-formed SSE events without a recognized terminal marker.
+		// Buffered line/event bytes mean the stream ended mid-event and must not
+		// commit. Explicit failure events return above before this fallback.
+		if len(r.line) == 0 && len(r.eventData) == 0 && r.eventName == "" &&
+			!r.eventObserved && !r.discardEvent && r.eventEnded {
+			return true, true
 		}
 	}
 	return false, false
@@ -7272,12 +7352,14 @@ func (r *sessionCommitSSEReadCloser) finishLine() (bool, bool) {
 		return false, false
 	}
 	if bytes.HasPrefix(line, []byte("event:")) {
+		r.eventObserved = true
 		r.eventName = strings.ToLower(strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:")))))
 		return false, false
 	}
 	if !bytes.HasPrefix(line, []byte("data:")) {
 		return false, false
 	}
+	r.eventObserved = true
 	data := bytes.TrimPrefix(line, []byte("data:"))
 	data = bytes.TrimPrefix(data, []byte{' '})
 	if len(r.eventData) > 0 {
@@ -7293,6 +7375,10 @@ func (r *sessionCommitSSEReadCloser) finishLine() (bool, bool) {
 }
 
 func (r *sessionCommitSSEReadCloser) finishEvent() (bool, bool) {
+	if r.eventObserved {
+		r.eventEnded = true
+	}
+	r.eventObserved = false
 	if r.discardEvent {
 		r.discardEvent = false
 		r.eventData = r.eventData[:0]
