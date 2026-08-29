@@ -789,17 +789,19 @@ func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, erro
 			break
 		}
 		switch {
-		case arg == "--settings":
+		case arg == "--settings" || arg == "--managed-settings":
 			if i+1 >= len(args) || args[i+1] == "--" || strings.HasPrefix(args[i+1], "-") {
-				return nil, fmt.Errorf("--settings requires a value")
+				return nil, fmt.Errorf("%s requires a value", arg)
 			}
 			i++
-		case strings.HasPrefix(arg, "--settings="):
-			if strings.TrimSpace(strings.TrimPrefix(arg, "--settings=")) == "" {
-				return nil, fmt.Errorf("--settings requires a value")
+		case strings.HasPrefix(arg, "--settings=") || strings.HasPrefix(arg, "--managed-settings="):
+			_, value, _ := strings.Cut(arg, "=")
+			if strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("%s requires a value", strings.SplitN(arg, "=", 2)[0])
 			}
-			// Drop user-provided settings before the option terminator. The
-			// verified transport overlay is the only global settings source.
+			// Drop user-provided settings and higher-precedence managed settings
+			// before the option terminator. The verified transport overlay is the
+			// only global settings source that can affect the launch.
 		default:
 			clean = append(clean, arg)
 		}
