@@ -52,7 +52,11 @@ func serverControlBaseURLForResolvers(server srServerConfig, forceProtected bool
 	}
 	protectedServer := server
 	parsedBase, _ := url.Parse(base)
-	plainHTTPWithNodeIdentity := parsedBase != nil && strings.EqualFold(parsedBase.Scheme, "http") && strings.TrimSpace(server.TailscaleNodeID) != ""
+	loopbackHTTP := parsedBase != nil && strings.EqualFold(parsedBase.Scheme, "http") && isLoopbackServerHost(parsedBase.Hostname())
+	if loopbackHTTP {
+		protectedServer.TailscaleNodeID = ""
+	}
+	plainHTTPWithNodeIdentity := parsedBase != nil && strings.EqualFold(parsedBase.Scheme, "http") && !loopbackHTTP && strings.TrimSpace(server.TailscaleNodeID) != ""
 	if strings.TrimSpace(protectedServer.TenantKey) == "" && (forceProtected || plainHTTPWithNodeIdentity || strings.TrimSpace(server.AdminToken) != "" || strings.TrimSpace(server.AccountImportToken) != "") {
 		// Control requests may carry admin or account-import credentials even
 		// when the server itself is not tenant scoped. Apply the same transport

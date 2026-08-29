@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -101,6 +102,21 @@ func TestClaudeSwitchProtectedPlaintextPrintsWrappedLaunch(t *testing.T) {
 	}
 	if strings.Contains(got, "export CLAUDE_CONFIG_DIR") || strings.Contains(got, "sr claude env") {
 		t.Fatalf("switch output advertised unsafe plain-Claude launch: %q", got)
+	}
+	out.Reset()
+	legacy := `{"env":{"ANTHROPIC_BASE_URL":"http://legacy.example:31415","ANTHROPIC_AUTH_TOKEN":"subrouter"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.switchProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	got = out.String()
+	if !strings.Contains(got, "sr claude push work") || !strings.Contains(got, "sr claude run work") {
+		t.Fatalf("legacy switch output omitted migration guidance: %q", got)
+	}
+	if strings.Contains(got, "export CLAUDE_CONFIG_DIR") {
+		t.Fatalf("legacy switch output advertised unsafe plain-Claude launch: %q", got)
 	}
 }
 
@@ -206,6 +222,18 @@ func TestClaudeManagedProfileRejectsLegacyRemoteHTTPTenantBeforeLaunch(t *testin
 	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("Claude launched with a custom header over unsafe transport: %v", statErr)
 	}
+
+	tokenlessSettings := `{"env":{"ANTHROPIC_BASE_URL":"http://legacy.example:31415","ANTHROPIC_AUTH_TOKEN":"subrouter"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(tokenlessSettings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = runner.runClaude(t.Context(), "legacy", []string{"--resume", "session-a"})
+	if err == nil || !strings.Contains(err.Error(), "missing an exact durable identity") {
+		t.Fatalf("managed Claude tokenless legacy launch error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched tokenless legacy plaintext before migration: %v", statErr)
+	}
 }
 
 func TestSecureManagedClaudeTransportDoesNotRewriteCredentialSettings(t *testing.T) {
@@ -306,7 +334,7 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	argsPath := filepath.Join(home, "args")
 	overridePath := filepath.Join(home, "override")
 	modePath := filepath.Join(home, "mode")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\ncat \"$2\" > " + shellQuote(overridePath) + "\nstat -f '%Lp' \"$2\" > " + shellQuote(modePath) + "\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\nprev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '--settings' ]; then settings=$arg; break; fi\n  prev=$arg\ndone\ncat \"$settings\" > " + shellQuote(overridePath) + "\nstat -f '%Lp' \"$settings\" > " + shellQuote(modePath) + "\n"
 	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +380,39 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	}
 }
 
+func TestManagedClaudeLaunchArgsMakesVerifiedSettingsFinal(t *testing.T) {
+	got, err := managedClaudeLaunchArgs([]string{
+		"--settings", "user-a.json",
+		"--resume", "session-a",
+		"--settings=user-b.json",
+		"--", "--settings", "literal-prompt-text",
+	}, "/tmp/verified.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"--settings", "/tmp/verified.json",
+		"--resume", "session-a",
+		"--", "--settings", "literal-prompt-text",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("launch args = %#v, want %#v", got, want)
+	}
+	if _, err := managedClaudeLaunchArgs([]string{"--settings"}, "/tmp/verified.json"); err == nil {
+		t.Fatal("missing user --settings value was silently accepted")
+	}
+	if _, err := managedClaudeLaunchArgs([]string{"--settings", "--resume", "session-a"}, "/tmp/verified.json"); err == nil {
+		t.Fatal("option-looking --settings value consumed --resume")
+	}
+	if _, err := managedClaudeLaunchArgs([]string{"--settings="}, "/tmp/verified.json"); err == nil {
+		t.Fatal("empty --settings=value was silently accepted")
+	}
+	subcommand, err := managedClaudeLaunchArgs([]string{"mcp", "list"}, "/tmp/verified.json")
+	if err != nil || !slices.Equal(subcommand, []string{"--settings", "/tmp/verified.json", "mcp", "list"}) {
+		t.Fatalf("subcommand launch args = %#v, %v", subcommand, err)
+	}
+}
+
 func TestClaudeEnvRejectsProtectedPlaintextManagedServer(t *testing.T) {
 	store := claude.Store{Dir: t.TempDir()}
 	if _, err := store.CreateProfile("work"); err != nil {
@@ -373,6 +434,14 @@ func TestClaudeEnvRejectsProtectedPlaintextManagedServer(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Fatalf("unsafe shell exports were printed: %q", out.String())
+	}
+	legacy := `{"env":{"ANTHROPIC_BASE_URL":"http://legacy.example:31415","ANTHROPIC_AUTH_TOKEN":"subrouter"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = runner.env()
+	if err == nil || !strings.Contains(err.Error(), "sr claude push work") || !strings.Contains(err.Error(), "sr claude run work") {
+		t.Fatalf("legacy env error = %v", err)
 	}
 }
 

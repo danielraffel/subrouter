@@ -594,11 +594,15 @@ func (r claudeRunner) switchProfile(selector string) error {
 	}
 	fmt.Fprintf(r.out, "Active Claude profile: %s\n", profile.Name)
 	configDir := r.store.ClaudeConfigDir(profile.Name)
-	protectedRemote, err := managedClaudeProfileNeedsWrappedLaunch(configDir)
+	launchMode, err := managedClaudeProfileLaunchMode(configDir)
 	if err != nil {
 		return err
 	}
-	if protectedRemote {
+	if launchMode == managedClaudeLaunchNeedsMigration {
+		fmt.Fprintf(r.out, "\nThis legacy plaintext profile needs a durable server identity. Repair it first with:\n\n  sr claude push %s\n\nThen launch it with:\n\n  sr claude run %s [claude args...]\n", profile.Name, profile.Name)
+		return nil
+	}
+	if launchMode == managedClaudeLaunchWrapped {
 		fmt.Fprintf(r.out, "\nThis profile uses a protected plaintext server. Launch it with:\n\n  sr claude run %s [claude args...]\n", profile.Name)
 		return nil
 	}
@@ -632,11 +636,14 @@ func (r claudeRunner) env() error {
 		return nil
 	}
 	configDir := r.store.ClaudeConfigDir(active)
-	protectedRemote, err := managedClaudeProfileNeedsWrappedLaunch(configDir)
+	launchMode, err := managedClaudeProfileLaunchMode(configDir)
 	if err != nil {
 		return err
 	}
-	if protectedRemote {
+	if launchMode == managedClaudeLaunchNeedsMigration {
+		return fmt.Errorf("profile %q is a legacy plaintext remote profile; repair it with 'sr claude push %s', then launch it with 'sr claude run %s [claude args...]'", active, active, active)
+	}
+	if launchMode == managedClaudeLaunchWrapped {
 		return fmt.Errorf("profile %q uses a protected plaintext server; launch it with 'sr claude run %s [claude args...]' so Subrouter can verify the server for each run", active, active)
 	}
 	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", configDir)
@@ -756,7 +763,10 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		}
 		launchSettingsPath = settingsOverride
 		defer os.Remove(launchSettingsPath)
-		launchArgs = append([]string{"--settings", settingsOverride}, extra...)
+		launchArgs, err = managedClaudeLaunchArgs(extra, settingsOverride)
+		if err != nil {
+			return err
+		}
 	}
 	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
 	cmd.Stdin = r.in
@@ -768,6 +778,33 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	}
 	cmd.Env = directPlainHTTPEnvironment(env, secureBaseURL)
 	return cmd.Run()
+}
+
+func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, error) {
+	clean := make([]string, 0, len(args)+2)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			clean = append(clean, args[i:]...)
+			break
+		}
+		switch {
+		case arg == "--settings":
+			if i+1 >= len(args) || args[i+1] == "--" || strings.HasPrefix(args[i+1], "-") {
+				return nil, fmt.Errorf("--settings requires a value")
+			}
+			i++
+		case strings.HasPrefix(arg, "--settings="):
+			if strings.TrimSpace(strings.TrimPrefix(arg, "--settings=")) == "" {
+				return nil, fmt.Errorf("--settings requires a value")
+			}
+			// Drop user-provided settings before the option terminator. The
+			// verified transport overlay is the only global settings source.
+		default:
+			clean = append(clean, arg)
+		}
+	}
+	return append([]string{"--settings", settingsPath}, clean...), nil
 }
 
 func secureManagedClaudeProfileTransport(configDir string) (string, error) {
@@ -842,8 +879,8 @@ func secureManagedClaudeProfileTransportWithResolvers(configDir string, lookup s
 		return secureBaseURL, nil
 	}
 	parsed, _ := url.Parse(baseURL)
-	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) && transportCredential != "" {
-		return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: protected plaintext server is missing an exact durable identity; run 'sr claude push' to repair it")
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) {
+		return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: plaintext server is missing an exact durable identity; run 'sr claude push' to repair it")
 	}
 	secureBaseURL, err := secureTenantServerURLWithResolvers(
 		context.Background(), baseURL,
@@ -856,21 +893,36 @@ func secureManagedClaudeProfileTransportWithResolvers(configDir string, lookup s
 	return secureBaseURL, nil
 }
 
-func managedClaudeProfileNeedsWrappedLaunch(configDir string) (bool, error) {
+type managedClaudeLaunchMode uint8
+
+const (
+	managedClaudeLaunchDirect managedClaudeLaunchMode = iota
+	managedClaudeLaunchWrapped
+	managedClaudeLaunchNeedsMigration
+)
+
+func managedClaudeProfileLaunchMode(configDir string) (managedClaudeLaunchMode, error) {
 	body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return managedClaudeLaunchDirect, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read managed Claude settings: %w", err)
+		return managedClaudeLaunchDirect, fmt.Errorf("read managed Claude settings: %w", err)
 	}
 	var settings struct {
 		Env map[string]string `json:"env"`
 	}
 	if err := json.Unmarshal(body, &settings); err != nil {
-		return false, fmt.Errorf("parse managed Claude settings: %w", err)
+		return managedClaudeLaunchDirect, fmt.Errorf("parse managed Claude settings: %w", err)
 	}
-	return strings.TrimSpace(settings.Env[managedClaudeServerURLEnv]) != "" || strings.TrimSpace(settings.Env[managedClaudeTailscaleNodeEnv]) != "", nil
+	if strings.TrimSpace(settings.Env[managedClaudeServerURLEnv]) != "" || strings.TrimSpace(settings.Env[managedClaudeTailscaleNodeEnv]) != "" {
+		return managedClaudeLaunchWrapped, nil
+	}
+	parsed, _ := url.Parse(strings.TrimSpace(settings.Env["ANTHROPIC_BASE_URL"]))
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) {
+		return managedClaudeLaunchNeedsMigration, nil
+	}
+	return managedClaudeLaunchDirect, nil
 }
 
 func managedClaudeLaunchSettings(secureBaseURL string) (string, error) {

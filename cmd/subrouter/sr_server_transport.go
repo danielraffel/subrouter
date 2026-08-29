@@ -52,7 +52,7 @@ func secureTenantServerURLWithResolvers(
 		return "", errors.New(secureTenantTransportRequirement)
 	}
 
-	if strings.TrimSpace(server.TailscaleNodeID) != "" {
+	if strings.TrimSpace(server.TailscaleNodeID) != "" && !isLoopbackServerHost(parsed.Hostname()) {
 		return pinTenantURLToTailscaleNode(ctx, parsed, server, load)
 	}
 	return pinTenantURLToVerifiedAddresses(ctx, parsed, lookup, load)

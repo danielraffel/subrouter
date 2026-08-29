@@ -304,6 +304,30 @@ func TestTokenlessControlHTTPWithNodeIdentityIsPinned(t *testing.T) {
 	if err != nil || got != legacy.URL {
 		t.Fatalf("legacy tokenless LAN URL = %q, %v", got, err)
 	}
+
+	loopback := srServerConfig{URL: "http://127.0.0.1:31415", TailscaleNodeID: "stale-node"}
+	got, err = serverControlBaseURLForResolvers(
+		loopback, true, lookup,
+		func(context.Context) ([]byte, error) {
+			t.Fatal("loopback control must not consult a stale Tailscale identity")
+			return nil, nil
+		},
+	)
+	if err != nil || got != loopback.URL {
+		t.Fatalf("loopback control URL = %q, %v", got, err)
+	}
+	got, err = secureTenantServerURLWithResolvers(
+		t.Context(), loopback.URL+"/t/"+testTenantKey,
+		srServerConfig{URL: loopback.URL, TenantKey: testTenantKey, TailscaleNodeID: "stale-node"},
+		lookup,
+		func(context.Context) ([]byte, error) {
+			t.Fatal("loopback data-plane URL must not consult a stale Tailscale identity")
+			return nil, nil
+		},
+	)
+	if err != nil || got != loopback.URL+"/t/"+testTenantKey {
+		t.Fatalf("loopback data-plane URL = %q, %v", got, err)
+	}
 }
 
 func TestTenantTransportNilTailscaleLoaderFailsClosed(t *testing.T) {
