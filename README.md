@@ -187,7 +187,7 @@ When `SUBROUTER_ADMIN_TOKEN` or `--admin-token` is set, non-loopback requests to
 
 A server with neither credential configured rejects every account import, including `sr add`. That state is reported as `"account_import": "disabled"` by `/_subrouter/health` and logged as a warning at startup, and `sr doctor` runs the same preflight `sr add` runs against the selected server.
 
-Serving processes accept and refresh only Codex OAuth credentials created by an isolated Subrouter login. This keeps proxy refresh-token chains independent from interactive `~/.codex/auth.json`. After upgrading a store that contains older accounts without provenance metadata, re-enroll each local account with `sr add codex`, or each shared account with `sr server login <name>` / `sr account repair <account-id>`, before its current access token expires. Re-enrollment leaves the active Codex login unchanged.
+Serving processes accept and refresh only Codex OAuth credentials created by an isolated Subrouter login. This keeps proxy refresh-token chains independent from interactive `~/.codex/auth.json`. After upgrading a local store that contains older accounts without provenance metadata, run `sr codex migrate-isolation` (or add `--device-auth`) once; it enumerates the affected accounts, requires each login to match the expected identity, and leaves the active Codex login unchanged. For a shared server use `sr server sync <name> --all`, or repair an individual hosted credential with `sr account repair <account-id>`, before its current access token expires. `sr doctor` and `sr status` report the remaining local migration count without exposing credential material.
 
 ### Tailnet authentication for self-hosted servers
 

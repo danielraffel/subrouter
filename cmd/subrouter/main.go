@@ -137,6 +137,9 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
+	if program == "sr" && isCodexIsolationCommand(args) {
+		return srForProgram(program, args)
+	}
 	if program == "sr" &&
 		(isDirectSRCommand(args[0]) || strings.Contains(args[0], "@")) {
 		return srForProgram(program, args)
@@ -1440,6 +1443,8 @@ Usage:
   %[1]s reset [email]      Redeem a rate-limit reset credit (best candidate, or --all, or --dry-run)
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
+  %[1]s codex migrate-isolation [--device-auth]
+                           Re-enroll legacy Codex OAuth accounts without changing local Codex auth
 
   %[1]s remote -v          List local, cmux hosted, and self-hosted remotes
   %[1]s remote use local   Route agents through this computer

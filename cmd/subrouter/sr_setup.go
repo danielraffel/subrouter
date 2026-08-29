@@ -415,6 +415,11 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 		}
 
 		checks = append(checks, remoteAccountImportChecks(ctx, store, client)...)
+		if source == broker.CredentialSourceLocal {
+			checks = append(checks, codexIsolationDoctorCheck(store))
+		} else if source == broker.CredentialSourceLegacy && localCodexStoreServesLegacy(store) {
+			checks = append(checks, codexIsolationDoctorCheck(store))
+		}
 
 		list, listErr := store.List()
 		switch {

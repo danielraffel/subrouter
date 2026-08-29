@@ -63,6 +63,8 @@ Usage:
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
+  sr codex migrate-isolation [--device-auth]
+                        Re-enroll legacy OAuth accounts without changing local Codex auth
   sr az status          Show whether the Azure Codex fallback is armed
   sr az test [model]    Prove the Azure route with one forced request
   sr az codex [args]    Run Codex forced onto Azure
@@ -207,6 +209,10 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
+		case "codex":
+			if isCodexIsolationCommand(args) {
+				return r.codexAccount(ctx, args[1:])
+			}
 		}
 	}
 	if len(args) == 0 {
@@ -283,6 +289,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.remove(args[1])
 	case "status":
 		return r.status(ctx)
+	case "codex":
+		return r.codexAccount(ctx, args[1:])
 	case "pick":
 		return r.pick(ctx, srSwitchOptions{})
 	case "reset":
@@ -363,7 +371,7 @@ func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []st
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "remote", "remotes", "tenant", "tenants", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage":
@@ -738,14 +746,27 @@ func (r srRunner) status(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	switch config.EffectiveCredentialSource() {
+	source := config.EffectiveCredentialSource()
+	localStoreServing := source == broker.CredentialSourceLocal
+	switch source {
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
 		} else if ok {
+			if sameEndpoint(server.URL, localBaseURL()) {
+				if err := printCodexIsolationStatus(r.out, r.store); err != nil {
+					return err
+				}
+			}
 			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
+		localStoreServing = true
+	}
+	if localStoreServing {
+		if err := printCodexIsolationStatus(r.out, r.store); err != nil {
+			return err
 		}
 	}
 	if err := r.autoImportIfEmpty(); err != nil {
