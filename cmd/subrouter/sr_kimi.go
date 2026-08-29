@@ -20,7 +20,7 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		fmt.Fprintln(r.out, "Usage: sr kimi login <label>")
 		fmt.Fprintln(r.out, "       sr kimi list")
 		fmt.Fprintln(r.out, "       sr kimi remove <label>")
-		fmt.Fprintln(r.out, "Managed profiles are isolated from the Kimi CLI's single global login.")
+		fmt.Fprintln(r.out, "Only managed profiles are routed; the Kimi CLI's global login is listed as not routed.")
 		return nil
 	}
 	switch args[0] {
@@ -55,7 +55,7 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		for _, acct := range listed {
 			kind := "managed"
 			if acct.ID == "kimi-code" {
-				kind = "Kimi CLI"
+				kind = "Kimi CLI; not routed"
 			}
 			fmt.Fprintf(r.out, "%s (%s; %s)\n", acct.ID, kind, acct.Label)
 		}

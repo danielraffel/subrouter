@@ -599,7 +599,7 @@ func serve(args []string) error {
 	// stores, so serve fails closed until each legacy account is re-added.
 	codexStore.RequireIsolatedOAuth = true
 	claudeStore := agentclaude.DefaultStore()
-	oauthSources := []proxy.OAuthAccountSource{agentkimi.DefaultStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var credentialRevision uint64

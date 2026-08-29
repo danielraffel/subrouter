@@ -798,7 +798,7 @@ func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 	// fetchUsageRows will surface that error in its own provider section.
 	kimiStore := r.kimi
 	if kimiStore == nil {
-		kimiStore = agentkimi.DefaultStore()
+		kimiStore = agentkimi.ServingStore()
 	}
 	if providerAccounts, providerErr := kimiStore.ListAccounts(ctx); len(providerAccounts) > 0 || providerErr != nil {
 		return nil
@@ -1017,7 +1017,24 @@ func (r srRunner) status(ctx context.Context) error {
 		return err
 	}
 	displayUsageRows(r.out, rows, false)
+	printKimiCLIOnlyStatusHint(r.out, rows)
 	return nil
+}
+
+func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
+	if out == nil {
+		return
+	}
+	for _, row := range rows {
+		if row.provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth && strings.HasPrefix(row.email, "kimi-subscription:") {
+			return
+		}
+	}
+	_, ok, err := agentkimi.DefaultStore().ReadLocalCredential(time.Now())
+	if err != nil || !ok {
+		return
+	}
+	fmt.Fprintln(out, "Kimi CLI login is not routed. Run 'sr kimi login <label>' to add an isolated subscription account.")
 }
 
 func (r srRunner) statusOne(ctx context.Context, selector string) error {
@@ -1192,7 +1209,7 @@ func recommendedUsableUsageRow(rows []srUsageRow) *srUsageRow {
 func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	kimiStore := r.kimi
 	if kimiStore == nil {
-		kimiStore = agentkimi.DefaultStore()
+		kimiStore = agentkimi.ServingStore()
 	}
 	all, err := r.store.ListStored()
 	if err != nil {

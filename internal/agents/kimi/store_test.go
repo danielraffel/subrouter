@@ -1,6 +1,7 @@
 package kimi
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -606,6 +607,75 @@ func TestRefreshAccountRefreshesAndWritesBack(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(filepath.Dir(store.Path)), "device-id")); !os.IsNotExist(err) {
 		t.Fatalf("local CLI refresh created a managed device identity: %v", err)
+	}
+}
+
+func TestServingStoreNeverRefreshesInteractiveCredentialButPersistsManagedRefresh(t *testing.T) {
+	store := writeCredentialFile(t, credentialFileJSON("cli-stale", "cli-refresh", time.Now().Add(-time.Hour)))
+	store.ManagedDir = t.TempDir()
+	serving := store.ForServing()
+	managed, err := serving.SaveManagedCredential("work", CredentialInfo{
+		AccessToken: "managed-stale", RefreshToken: "managed-refresh", ExpiresAt: time.Now().Add(-time.Hour),
+		OAuthDeviceID: "managed-device",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := serving.ListAccounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != managed.ID {
+		t.Fatalf("serving accounts = %+v, want only managed profile %q", listed, managed.ID)
+	}
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("X-Msh-Device-Id") != "managed-device" {
+			http.Error(w, "wrong device", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "managed-fresh", "refresh_token": "managed-rotated", "expires_in": 900,
+		})
+	}))
+	defer server.Close()
+	stubOAuthConfig(t, server.URL)
+
+	_, err = serving.RefreshAccount(t.Context(), server.Client(), account.Account{
+		ID: accountID, Provider: account.ProviderKimi, AuthMode: account.AuthModeOAuth,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not routable") {
+		t.Fatalf("interactive serving refresh error = %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("interactive serving refresh made %d HTTP request(s)", requests)
+	}
+	after, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("serving refresh changed the interactive Kimi CLI credential bytes")
+	}
+
+	if _, err := serving.RefreshAccount(t.Context(), server.Client(), managed); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("managed refresh requests = %d, want 1", requests)
+	}
+	stored, ok, err := serving.ReadManagedCredential("work", time.Now())
+	if err != nil || !ok {
+		t.Fatalf("read managed credential: ok=%v err=%v", ok, err)
+	}
+	if stored.AccessToken != "managed-fresh" || stored.RefreshToken != "managed-rotated" {
+		t.Fatalf("managed credential did not persist rotation: %+v", stored)
 	}
 }
 

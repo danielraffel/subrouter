@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -247,6 +248,67 @@ func TestOpenAccountRefConfiguresKimiRefreshTransaction(t *testing.T) {
 	}
 	if ref.kimiStore().RefreshTransaction == nil {
 		t.Fatal("Kimi source refresh is not coordinated with account add/remove transactions")
+	}
+}
+
+func TestOpenAccountRefForcesSuppliedKimiStoresToManagedOnly(t *testing.T) {
+	for _, pointer := range []bool{false, true} {
+		name := "value"
+		if pointer {
+			name = "pointer"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			cliPath := filepath.Join(root, "credentials", "kimi-code.json")
+			if err := os.MkdirAll(filepath.Dir(cliPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			before := []byte(`{"access_token":"interactive","refresh_token":"interactive-refresh","expires_at":1}`)
+			if err := os.WriteFile(cliPath, before, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			kimiStore := agentkimi.Store{Path: cliPath, KimiHome: root, ManagedDir: filepath.Join(root, "managed")}
+			managed, err := kimiStore.SaveManagedCredential("work", agentkimi.CredentialInfo{
+				AccessToken: "managed", RefreshToken: "managed-refresh", ExpiresAt: time.Now().Add(time.Hour),
+				OAuthDeviceID: "managed-device",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var source OAuthAccountSource = kimiStore
+			if pointer {
+				source = &kimiStore
+			}
+			codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+			ref, err := OpenAccountRefWithSources(t.Context(), codexStore, agentclaude.Store{Dir: filepath.Join(root, "claude")}, http.DefaultClient, []OAuthAccountSource{source})
+			if err != nil {
+				t.Fatal(err)
+			}
+			all := ref.All()
+			if len(all) != 1 || all[0].ID != managed.ID {
+				t.Fatalf("serving snapshot = %+v, want only managed Kimi account %q", all, managed.ID)
+			}
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+			defer server.Close()
+			configured := ref.kimiStore()
+			_, err = configured.RefreshAccount(t.Context(), server.Client(), accounts.Account{
+				ID: "kimi-code", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth,
+			})
+			if err == nil || !strings.Contains(err.Error(), "not routable") {
+				t.Fatalf("interactive refresh error = %v", err)
+			}
+			if requests != 0 {
+				t.Fatalf("interactive refresh made %d HTTP request(s)", requests)
+			}
+			after, err := os.ReadFile(cliPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatal("serving AccountRef changed interactive Kimi credential bytes")
+			}
+		})
 	}
 }
 

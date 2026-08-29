@@ -578,8 +578,12 @@ authentication paths, not additional selectable OAuth profiles
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that
-global credential. Kimi does not expose the account email, so give each managed
-profile a recognizable local label:
+global credential. The global CLI login appears in `sr kimi list` as
+`not routed`; `sr status` shows only independently authorized profiles that the
+proxy can safely refresh. This prevents a serving daemon from redeeming the
+CLI's rotating refresh-token chain and silently signing the interactive client
+out. Kimi does not expose the account email, so give each managed profile a
+recognizable local label:
 
 ```bash
 sr kimi login work
