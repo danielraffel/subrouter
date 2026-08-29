@@ -24,6 +24,92 @@ func TestSchedulerRefAllowsOnlyOneStaleRefresh(t *testing.T) {
 	}
 }
 
+func TestSchedulerRefRunIfAccountNotBlocked(t *testing.T) {
+	accountA := account.Account{ID: "a", Provider: account.ProviderCodex}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: accountA.ID, Provider: accountA.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	called := false
+	_, published := ref.RunIfAccountNotBlocked(accountA.Provider, accountA.ID, "gpt-5", time.Now(), func() {
+		called = true
+	})
+	if !published || !called {
+		t.Fatal("eligible account did not publish")
+	}
+	ref.MarkExhaustedUntil(accountA.Provider, accountA.ID, "gpt-5", time.Now().Add(time.Hour))
+	called = false
+	_, published = ref.RunIfAccountNotBlocked(accountA.Provider, accountA.ID, "gpt-5", time.Now(), func() {
+		called = true
+	})
+	if published || called {
+		t.Fatal("exhausted account published")
+	}
+}
+
+func TestSchedulerRefBlockedUntilForUnionsAccountAndModelOverlays(t *testing.T) {
+	now := time.Now()
+	accountA := account.Account{ID: "a", Provider: account.ProviderClaude}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: accountA.ID, Provider: accountA.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	accountUntil := now.Add(2 * time.Hour)
+	modelUntil := now.Add(time.Hour)
+	ref.MarkAccountUnavailableUntil(accountA.Provider, accountA.ID, accountUntil)
+	ref.MarkModelIncompatibleUntil(accountA.Provider, accountA.ID, "claude-opus-4", modelUntil)
+	until, blocked := ref.BlockedUntilFor(
+		accountA.Provider, accountA.ID, "claude-opus-4", now,
+	)
+	if !blocked || !until.Equal(accountUntil) {
+		t.Fatalf("blocked=%v until=%v, want account reset %v", blocked, until, accountUntil)
+	}
+}
+
+func TestSchedulerRefBlockedUntilForPreservesShortExplicitExpiry(t *testing.T) {
+	now := time.Now()
+	accountA := account.Account{ID: "a", Provider: account.ProviderClaude}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: accountA.ID, Provider: accountA.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	want := now.Add(time.Minute)
+	ref.MarkModelIncompatibleUntil(accountA.Provider, accountA.ID, "claude-opus-4", want)
+	until, blocked := ref.BlockedUntilFor(accountA.Provider, accountA.ID, "claude-opus-4", now)
+	if !blocked || !until.Equal(want) {
+		t.Fatalf("blocked=%v until=%v, want explicit expiry %v", blocked, until, want)
+	}
+}
+
+func TestSchedulerRefExplicitGuardIgnoresMissingPoolScoreButHonorsMarks(t *testing.T) {
+	now := time.Now()
+	provider := account.ProviderClaude
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{
+			AccountID: "oauth", Provider: provider, Headroom: 1, ShortHeadroom: 1,
+			ModelScores: map[string]Score{
+				"claude-opus-4": {AccountID: "oauth", Provider: provider, Headroom: 1, ShortHeadroom: 1},
+			},
+		},
+		{AccountID: "api-key", Provider: provider, Headroom: 1, ShortHeadroom: 1},
+	}))
+	called := false
+	if _, published := ref.RunIfAccountNotExplicitlyBlocked(
+		provider, "api-key", "claude-opus-4", now, func() { called = true },
+	); !published || !called {
+		t.Fatal("missing subscription pool score blocked API-key publication")
+	}
+	want := now.Add(time.Hour)
+	ref.MarkAccountUnavailableUntil(provider, "api-key", want)
+	called = false
+	until, published := ref.RunIfAccountNotExplicitlyBlocked(
+		provider, "api-key", "claude-opus-4", now, func() { called = true },
+	)
+	if published || called || !until.Equal(want) {
+		t.Fatalf("explicit mark: published=%v called=%v until=%v want=%v", published, called, until, want)
+	}
+}
+
 func TestSchedulerRefRetryAfterSkippedRefreshWaitsForTTL(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.SetUpdatedAt(time.Now().Add(-time.Hour))

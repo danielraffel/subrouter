@@ -68,6 +68,138 @@ func (r *SchedulerRef) Get() Scheduler {
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
 }
 
+// RunIfAccountNotBlocked executes publish while the current scheduler state
+// remains read-locked. The caller may hold its own publication mutex, but
+// publish must not call back into this SchedulerRef.
+func (r *SchedulerRef) RunIfAccountNotBlocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+	publish func(),
+) (time.Time, bool) {
+	if r == nil {
+		publish()
+		return time.Time{}, true
+	}
+	r.pruneExpired(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if until, blocked := r.blockedUntilLocked(provider, accountID, model, now); blocked {
+		return until, false
+	}
+	publish()
+	return time.Time{}, true
+}
+
+// BlockedUntilFor reports the union of account-wide, credential, quota-pool,
+// account-state, and model-incompatibility exclusions for one route.
+func (r *SchedulerRef) BlockedUntilFor(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.pruneExpired(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.blockedUntilLocked(provider, accountID, model, now)
+}
+
+// ExplicitBlockedUntilFor reports only time-bounded exclusion marks, without
+// interpreting a missing model score as exhausted. API-key accounts do not
+// participate in subscription model-pool scoring, but still honor explicit
+// account, credential, and model-incompatibility state.
+func (r *SchedulerRef) ExplicitBlockedUntilFor(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.pruneExpired(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.explicitBlockedUntilLocked(provider, accountID, model, now)
+}
+
+func (r *SchedulerRef) explicitBlockedUntilLocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	marks := r.expiryMarksLocked()
+	var until time.Time
+	for _, key := range []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	} {
+		if candidate := marks[key]; candidate.After(until) {
+			until = candidate
+		}
+	}
+	return until, until.After(now)
+}
+
+// RunIfAccountNotExplicitlyBlocked is the API-key publication guard. It
+// ignores absent subscription pool scores while retaining explicit routing
+// exclusions and the same lock-order guarantee as RunIfAccountNotBlocked.
+func (r *SchedulerRef) RunIfAccountNotExplicitlyBlocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+	publish func(),
+) (time.Time, bool) {
+	if r == nil {
+		publish()
+		return time.Time{}, true
+	}
+	r.pruneExpired(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if until, blocked := r.explicitBlockedUntilLocked(provider, accountID, model, now); blocked {
+		return until, false
+	}
+	publish()
+	return time.Time{}, true
+}
+
+func (r *SchedulerRef) blockedUntilLocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
+	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
+	scheduler = applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
+	if !scheduler.ForModel(model).Exhausted(provider, accountID) {
+		return time.Time{}, false
+	}
+	var until time.Time
+	marks := r.expiryMarksLocked()
+	for _, key := range []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	} {
+		if candidate := marks[key]; candidate.After(until) {
+			until = candidate
+		}
+	}
+	if until.IsZero() {
+		until = now.Add(DefaultExhaustedTTL)
+	}
+	return until, true
+}
+
 // pruneExpired drops exhaustion marks whose window has reset. The base snapshot
 // is not mutated; once the overlay mark is gone, routing reads the snapshot (or
 // optimistic default) normally.

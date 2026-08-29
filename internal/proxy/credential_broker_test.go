@@ -774,3 +774,33 @@ func TestCredentialBrokerFailureNeverUsesLocalFableSecrets(t *testing.T) {
 		t.Fatalf("local fallback used %d times in team-vault mode", localFallbackCalls.Load())
 	}
 }
+
+func TestCredentialBrokerPreservesHostedRetryAfterToLocalClient(t *testing.T) {
+	const tenantKey = "srt_0123456789abcdef0123456789abcdef"
+	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/t/"+tenantKey+"/_subrouter/leases" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Retry-After", "137")
+		http.Error(w, "cooling down", http.StatusServiceUnavailable)
+	}))
+	defer hosted.Close()
+	client := broker.NewClient(broker.Config{
+		Version: 1, BaseURL: broker.DefaultBaseURL,
+		AccessToken: "access", RefreshToken: "refresh",
+		TeamID: "team", CredentialSource: broker.CredentialSourceTeam,
+		HostedURL: hosted.URL, TenantKey: tenantKey,
+	})
+	client.HTTPClient = hosted.Client()
+	handler := Server{CredentialBroker: client, MaxBodyBytes: 1 << 20}.Handler()
+	request := httptest.NewRequest(
+		http.MethodPost, "http://127.0.0.1:31415/v1/responses",
+		bytes.NewBufferString(`{"model":"gpt-5"}`),
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "137" {
+		t.Fatalf("status=%d Retry-After=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+	}
+}

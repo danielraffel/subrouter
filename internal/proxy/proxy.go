@@ -2707,6 +2707,10 @@ func (s Server) proxyHandler() http.Handler {
 				http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
 				return
 			}
+			var brokerHTTPError *broker.HTTPStatusError
+			if errors.As(err, &brokerHTTPError) && brokerHTTPError.RetryAfter != "" {
+				w.Header().Set("Retry-After", brokerHTTPError.RetryAfter)
+			}
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
