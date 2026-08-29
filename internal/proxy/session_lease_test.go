@@ -471,8 +471,11 @@ func TestSessionLeaseDoesNotOverwriteConcurrentAssignmentMove(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer service-admin-token")
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body = %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "retry") {
+		t.Fatalf("conflict response does not tell the client to retry: %q", recorder.Body.String())
 	}
 	assignment, ok := sessionStore.Get("pi", routingKey)
 	if !ok || assignment.AccountID != "forced@example.com" {

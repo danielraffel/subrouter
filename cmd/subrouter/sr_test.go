@@ -45,6 +45,8 @@ type fakeGrokStore struct {
 	saved      bool
 	removed    bool
 	refreshDid bool
+	refreshes  int
+	preflights int
 	credential agentgrok.CredentialInfo
 	account    baseaccount.Account
 }
@@ -82,6 +84,12 @@ func (s *fakeGrokStore) RefreshAccount(_ context.Context, _ *http.Client, accoun
 }
 
 func (s *fakeGrokStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, account baseaccount.Account) (baseaccount.Account, bool, error) {
+	s.refreshes++
+	return account, s.refreshDid, nil
+}
+
+func (s *fakeGrokStore) AccountRefreshState(account baseaccount.Account, _ time.Time) (baseaccount.Account, bool, error) {
+	s.preflights++
 	return account, s.refreshDid, nil
 }
 
@@ -198,7 +206,11 @@ func TestGrokRemoveRejectsEmailSharedWithStoredAccount(t *testing.T) {
 }
 
 type refreshingKimiUsageStore struct {
-	fetchedToken string
+	fetchedToken   string
+	needsRefresh   bool
+	refreshes      int
+	preflights     int
+	preflightToken string
 }
 
 type partialKimiUsageStore struct{}
@@ -219,9 +231,18 @@ func (*refreshingKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Ac
 	}}, nil
 }
 
-func (*refreshingKimiUsageStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, acct baseaccount.Account) (baseaccount.Account, bool, error) {
+func (s *refreshingKimiUsageStore) RefreshAccountIfNeeded(_ context.Context, _ *http.Client, acct baseaccount.Account) (baseaccount.Account, bool, error) {
+	s.refreshes++
 	acct.Token = "fresh"
 	return acct, true, nil
+}
+
+func (s *refreshingKimiUsageStore) AccountRefreshState(acct baseaccount.Account, _ time.Time) (baseaccount.Account, bool, error) {
+	s.preflights++
+	if s.preflightToken != "" {
+		acct.Token = s.preflightToken
+	}
+	return acct, s.needsRefresh, nil
 }
 
 func (s *refreshingKimiUsageStore) FetchUsage(_ context.Context, _ *http.Client, acct baseaccount.Account) (string, []accounts.UsageWindow, error) {
@@ -275,7 +296,7 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
-	store := &refreshingKimiUsageStore{}
+	store := &refreshingKimiUsageStore{needsRefresh: true}
 	runner := srRunner{
 		store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")},
 		kimi:  store,
@@ -287,6 +308,9 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	if store.fetchedToken != "fresh" {
 		t.Fatal("local Kimi status fetched usage with the stale access token")
 	}
+	if store.preflights != 1 || store.refreshes != 1 {
+		t.Fatalf("Kimi refresh preflights=%d refreshes=%d, want 1/1", store.preflights, store.refreshes)
+	}
 	found := false
 	for _, row := range rows {
 		if row.email == "kimi-subscription:work" && row.err == nil {
@@ -295,6 +319,34 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("refreshed Kimi status row is missing")
+	}
+}
+
+func TestLocalProviderStatusDoesNotPublishFreshOAuthCredentials(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+
+	kimi := &refreshingKimiUsageStore{preflightToken: "current-kimi"}
+	grok := &fakeGrokStore{account: baseaccount.Account{
+		ID: "grok-subscription", Provider: baseaccount.ProviderGrok,
+		AuthMode: baseaccount.AuthModeOAuth, Token: "fresh-grok",
+	}}
+	if _, err := (srRunner{store: store, kimi: kimi, grok: grok}).fetchUsageRows(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if kimi.preflights != 1 || kimi.refreshes != 0 {
+		t.Fatalf("Kimi preflights=%d refreshes=%d, want 1/0", kimi.preflights, kimi.refreshes)
+	}
+	if kimi.fetchedToken != "current-kimi" {
+		t.Fatalf("Kimi status used %q, want the credential returned by preflight", kimi.fetchedToken)
+	}
+	if grok.preflights != 1 || grok.refreshes != 0 {
+		t.Fatalf("Grok preflights=%d refreshes=%d, want 1/0", grok.preflights, grok.refreshes)
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); !os.IsNotExist(err) {
+		t.Fatalf("fresh provider status published an account generation: %v", err)
 	}
 }
 
@@ -2458,7 +2510,7 @@ func TestDisplayUsageRowsGridGroupsProviders(t *testing.T) {
 		},
 		{
 			email:    "claude@example.com",
-			planType: "claude",
+			planType: "max",
 			authMode: accounts.AuthModeOAuth,
 			provider: accounts.ProviderClaude,
 			score:    selectacct.Score{AccountID: "claude@example.com", Headroom: 0.8, ShortHeadroom: 0.8},
@@ -2483,7 +2535,7 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
 		{
-			email:    "lawrence@manaflow.ai",
+			email:    "primary@example.test",
 			planType: "claude",
 			authMode: accounts.AuthModeOAuth,
 			provider: accounts.ProviderClaude,
@@ -2512,23 +2564,77 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 
 func TestClaudeUsageGridPrioritizesPopulatedColumnsWithoutTruncatingCore(t *testing.T) {
 	t.Setenv("COLUMNS", "137")
-	reset := int64((4*time.Hour + 34*time.Minute) / time.Second)
 	rows := make([]srUsageRow, 3)
-	for i, email := range []string{"danraffel@example.com", "daniel.raffel@example.com", "mydonorkid"} {
+	profiles := []struct {
+		email        string
+		plan         string
+		headroom     float64
+		sessionUsed  float64
+		sessionReset time.Duration
+		weeklyUsed   float64
+		weeklyReset  time.Duration
+		fableUsed    float64
+		fableReset   time.Duration
+		wantUse      string
+		wantSession  string
+		wantWeekly   string
+		wantFable    string
+	}{
+		{
+			email: "primary.account@example.test", plan: "max", headroom: .74,
+			sessionReset: 4*time.Hour + 34*time.Minute, weeklyReset: 2*24*time.Hour + 6*time.Hour, fableReset: 24*time.Hour + 8*time.Hour,
+			wantUse: "74% left, session reset 4h34m", wantSession: "100%/4h34m", wantWeekly: "100%/2d6h", wantFable: "100%/1d8h",
+		},
+		{
+			email: "secondary.account@example.test", plan: "pro", headroom: .83,
+			sessionUsed: 11, sessionReset: 3*time.Hour + 21*time.Minute, weeklyUsed: 12, weeklyReset: 24*time.Hour + 5*time.Hour, fableUsed: 13, fableReset: 17 * time.Hour,
+			wantUse: "83% left, session reset 3h21m", wantSession: "89%/3h21m", wantWeekly: "88%/1d5h", wantFable: "87%/17h",
+		},
+		{
+			email: "lab-profile", plan: "free", headroom: .92,
+			sessionUsed: 22, sessionReset: 2*time.Hour + 8*time.Minute, weeklyUsed: 23, weeklyReset: 12 * time.Hour, fableUsed: 24, fableReset: 9 * time.Hour,
+			wantUse: "92% left, session reset 2h8m", wantSession: "78%/2h8m", wantWeekly: "77%/12h", wantFable: "76%/9h",
+		},
+	}
+	for i, profile := range profiles {
+		sessionReset := int64(profile.sessionReset / time.Second)
 		rows[i] = srUsageRow{
-			email: email, planType: "max", authMode: accounts.AuthModeOAuth, provider: accounts.ProviderClaude,
-			score: selectacct.Score{AccountID: email, Headroom: .74, ShortHeadroom: .74, ShortResetAfterSeconds: reset},
+			email: profile.email, planType: profile.plan, authMode: accounts.AuthModeOAuth, provider: accounts.ProviderClaude,
+			score: selectacct.Score{AccountID: profile.email, Headroom: profile.headroom, ShortHeadroom: profile.headroom, ShortResetAfterSeconds: sessionReset},
 			windows: []accounts.UsageWindow{
-				{Name: "5h", UsedPercent: 0, ResetAfterSeconds: reset},
-				{Name: "7d", UsedPercent: 0, ResetAfterSeconds: int64((2*24*time.Hour + 6*time.Hour) / time.Second)},
-				{Name: "oauth-apps-weekly", UsedPercent: 0, ResetAfterSeconds: int64((2*24*time.Hour + 6*time.Hour) / time.Second)},
+				{Name: "5h", UsedPercent: profile.sessionUsed, ResetAfterSeconds: sessionReset},
+				{Name: "7d", UsedPercent: profile.weeklyUsed, ResetAfterSeconds: int64(profile.weeklyReset / time.Second)},
+				{Name: "oauth-apps-weekly", UsedPercent: profile.fableUsed, ResetAfterSeconds: int64(profile.fableReset / time.Second)},
 			},
 		}
 	}
 	var out bytes.Buffer
 	displayUsageRows(&out, rows, false)
 	got := out.String()
-	for _, want := range []string{"Plan", "max", "74% left, session reset 4h34m", "100%/4h34m", "100%/2d6h", "Session", "Weekly", "Fable wk"} {
+	columns := usageGridColumnsForRows(&out, false, rows)
+	for _, profile := range profiles {
+		var line string
+		for _, candidate := range strings.Split(got, "\n") {
+			if strings.Contains(candidate, profile.email) {
+				line = candidate
+				break
+			}
+		}
+		wantCells := map[string]string{
+			"Account":  profile.email,
+			"Plan":     profile.plan,
+			"Pick":     profile.wantUse,
+			"Session":  profile.wantSession,
+			"Weekly":   profile.wantWeekly,
+			"Fable wk": profile.wantFable,
+		}
+		for key, want := range wantCells {
+			if cell := renderedUsageGridCell(line, columns, key); cell != want {
+				t.Fatalf("Claude grid row for %q rendered %s cell %q, want %q:\n%s", profile.email, key, cell, want, got)
+			}
+		}
+	}
+	for _, want := range []string{"Plan", "Session", "Weekly", "Fable wk"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Claude grid missing %q:\n%s", want, got)
 		}
@@ -2693,6 +2799,18 @@ func assertUsageGridLineWidths(t *testing.T, output string, width int) {
 			t.Fatalf("line width = %d, want <= %d:\n%s", lineWidth, width, line)
 		}
 	}
+}
+
+func renderedUsageGridCell(line string, columns []usageGridColumn, key string) string {
+	offset := 0
+	for _, column := range columns {
+		if column.Key == key {
+			prefix := runewidth.Truncate(line, offset, "")
+			return strings.TrimSpace(runewidth.Truncate(line[len(prefix):], column.Width, ""))
+		}
+		offset += column.Width + 2
+	}
+	return ""
 }
 
 func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {

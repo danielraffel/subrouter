@@ -252,6 +252,9 @@ func TestConfigureRejectsShadowingAnExistingProvider(t *testing.T) {
 		{name: "tenant outer route", declared: OpenAICompatibleProvider{Name: "t", BaseURL: "https://x.test/v1"}},
 		{name: "internal outer route", declared: OpenAICompatibleProvider{Name: "internal", BaseURL: "https://x.test/v1"}},
 		{name: "reserved path segment", declared: OpenAICompatibleProvider{Name: "v1", BaseURL: "https://x.test/v1"}},
+		{name: "chat completions route", declared: OpenAICompatibleProvider{Name: "chat", BaseURL: "https://x.test/v1"}},
+		{name: "legacy completions route", declared: OpenAICompatibleProvider{Name: "completions", BaseURL: "https://x.test/v1"}},
+		{name: "embeddings route", declared: OpenAICompatibleProvider{Name: "embeddings", BaseURL: "https://x.test/v1"}},
 		{name: "built-in name", declared: OpenAICompatibleProvider{Name: "kimi", BaseURL: "https://x.test/v1"}},
 		{name: "built-in alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"glm"}, BaseURL: "https://x.test/v1"}},
 		{name: "reserved alias", declared: OpenAICompatibleProvider{Name: "fine", Aliases: []string{"anthropic"}, BaseURL: "https://x.test/v1"}},
@@ -307,7 +310,7 @@ func TestConfigureRejectsMalformedDeclarations(t *testing.T) {
 func TestValidDeclaredProviderNameRejectsStorageAndRoutingNamespaces(t *testing.T) {
 	for _, value := range []string{
 		"apikey", "apikey:team", "codex", "anthropic", "qwen", "a/b", "a b",
-		"models", "alpha", "ps", "plugins",
+		"models", "alpha", "ps", "plugins", "chat", "completions", "embeddings",
 	} {
 		if ValidDeclaredProviderName(value) {
 			t.Fatalf("ValidDeclaredProviderName(%q) = true, want false", value)

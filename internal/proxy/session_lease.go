@@ -591,6 +591,10 @@ func (s Server) handleSessionLeases(w http.ResponseWriter, r *http.Request) {
 		lease, _, err = s.sessionLeases.putWithDisposition(template)
 	}
 	if err != nil {
+		if errors.Is(err, errSessionAssignmentChanged) {
+			http.Error(w, "session assignment changed; retry", http.StatusConflict)
+			return
+		}
 		http.Error(w, "create session lease", http.StatusInternalServerError)
 		return
 	}

@@ -188,7 +188,7 @@ func withLocalFallbackTo(ctx context.Context, client *http.Client, baseURL, loca
 		return baseURL
 	}
 	if warn != nil {
-		fmt.Fprintf(warn, "subrouter: %s is unreachable; falling back to the local daemon at %s\n", baseURL, local)
+		fmt.Fprintf(warn, "subrouter: %s is unreachable; falling back to the local daemon at %s\n", redactedServerURL(baseURL), redactedServerURL(local))
 	}
 	return local
 }

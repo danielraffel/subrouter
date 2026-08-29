@@ -1163,3 +1163,32 @@ func TestFetchUsageDoesNotRedirectBearerCredential(t *testing.T) {
 		t.Fatal("redirect target received the Kimi usage request or bearer credential")
 	}
 }
+
+func TestAccountRefreshStatePreflightsManagedCredentialWithoutMutation(t *testing.T) {
+	store := Store{ManagedDir: t.TempDir()}
+	for _, testCase := range []struct {
+		name      string
+		expiresAt time.Time
+		want      bool
+	}{
+		{name: "fresh", expiresAt: time.Now().Add(time.Hour), want: false},
+		{name: "expiring", expiresAt: time.Now().Add(time.Minute), want: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			account, err := store.SaveManagedCredential(testCase.name, CredentialInfo{
+				AccessToken: "access-" + testCase.name, RefreshToken: "refresh-" + testCase.name,
+				OAuthDeviceID: "0123456789abcdef", ExpiresAt: testCase.expiresAt,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, got, err := store.AccountRefreshState(account, time.Now())
+			if err != nil || got != testCase.want {
+				t.Fatalf("AccountRefreshState() = %v, %v, want %v, nil", got, err, testCase.want)
+			}
+			if current.Token != "access-"+testCase.name {
+				t.Fatalf("current token = %q", current.Token)
+			}
+		})
+	}
+}

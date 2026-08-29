@@ -1165,7 +1165,14 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					out[i] = r.keyedAPIUsageStatus(ctx, stored, out[i])
+					if !acquireAccountFetchSlot(sweepCtx, sem) {
+						next := out[i]
+						next.Error = sweepCtx.Err().Error()
+						out[i] = next
+						return
+					}
+					defer func() { <-sem }()
+					out[i] = r.keyedAPIUsageStatus(sweepCtx, stored, out[i])
 				}()
 			}
 			continue

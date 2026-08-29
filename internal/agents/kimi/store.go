@@ -456,6 +456,28 @@ func (s Store) RefreshAccount(ctx context.Context, client *http.Client, acct acc
 	return refreshed, err
 }
 
+// AccountRefreshState re-reads acct and reports whether refreshing it could
+// mutate its credential file. Returning the re-read account keeps a status
+// fast path from using a token another process already rotated.
+func (s Store) AccountRefreshState(acct account.Account, now time.Time) (account.Account, bool, error) {
+	path, label, source, err := s.accountCredentialPath(acct.ID)
+	if err != nil {
+		return acct, false, err
+	}
+	credential, ok, err := readCredential(path, now)
+	if err != nil {
+		return acct, false, err
+	}
+	if !ok {
+		return acct, false, fmt.Errorf("Kimi credential for %s was not found", acct.ID)
+	}
+	if storedLabel := strings.TrimSpace(credential.AccountLabel); storedLabel != "" {
+		label = storedLabel
+	}
+	current := credentialAccount(acct.ID, label, source, credential)
+	return current, credential.NeedsRefresh(now), nil
+}
+
 // RefreshAccountIfNeeded is RefreshAccount plus whether it committed a new
 // credential, allowing local CLI callers to publish the account generation
 // only when disk state actually changed.

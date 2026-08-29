@@ -183,6 +183,10 @@ type srGrokRefreshStore interface {
 	RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error)
 }
 
+type srOAuthRefreshPreflight interface {
+	AccountRefreshState(baseaccount.Account, time.Time) (baseaccount.Account, bool, error)
+}
+
 type srKimiUsageStore interface {
 	ListAccounts(context.Context) ([]baseaccount.Account, error)
 	FetchUsage(context.Context, *http.Client, baseaccount.Account) (string, []accounts.UsageWindow, error)
@@ -1364,13 +1368,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		go func(idx int, acct baseaccount.Account) {
 			defer wg.Done()
 			if refresher, ok := kimiStore.(srKimiRefreshStore); ok {
-				var refreshed baseaccount.Account
-				refreshErr := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
-					var didRefresh bool
-					var err error
-					refreshed, didRefresh, err = refresher.RefreshAccountIfNeeded(ctx, r.client, acct)
-					return didRefresh, err
-				})
+				refreshed, refreshErr := r.refreshStatusOAuthAccount(ctx, acct, refresher)
 				if refreshErr != nil {
 					rows[idx].err = refreshErr
 					rows[idx].score = selectacct.Score{AccountID: rows[idx].email}
@@ -1420,11 +1418,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		var refreshed baseaccount.Account
 		var refreshErr error
 		if refresher, ok := grokStore.(srGrokRefreshStore); ok {
-			refreshErr = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
-				var didRefresh bool
-				refreshed, didRefresh, refreshErr = refresher.RefreshAccountIfNeeded(ctx, r.client, account)
-				return didRefresh, refreshErr
-			})
+			refreshed, refreshErr = r.refreshStatusOAuthAccount(ctx, account, refresher)
 		} else {
 			refreshed, refreshErr = grokStore.RefreshAccount(ctx, r.client, account)
 		}
@@ -1506,6 +1500,43 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	wg.Wait()
 	rankUsageRows(rows)
 	return rows, nil
+}
+
+type srStatusOAuthRefresher interface {
+	RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error)
+}
+
+func (r srRunner) refreshStatusOAuthAccount(
+	ctx context.Context,
+	account baseaccount.Account,
+	refresher srStatusOAuthRefresher,
+) (baseaccount.Account, error) {
+	if preflight, ok := refresher.(srOAuthRefreshPreflight); ok {
+		// This re-read returns one complete atomic credential snapshot; it does
+		// not claim to pin that token through the later usage request. The old
+		// refresh path also released the account transaction before FetchUsage.
+		// Its purpose here is to avoid publishing unchanged state while still
+		// using a rotation that committed after ListAccounts.
+		current, needsRefresh, err := preflight.AccountRefreshState(account, time.Now())
+		if err != nil {
+			return account, err
+		}
+		account = current
+		if !needsRefresh {
+			return account, nil
+		}
+	}
+	var refreshed baseaccount.Account
+	err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+		var didRefresh bool
+		var refreshErr error
+		refreshed, didRefresh, refreshErr = refresher.RefreshAccountIfNeeded(ctx, r.client, account)
+		return didRefresh, refreshErr
+	})
+	if err != nil {
+		return account, err
+	}
+	return refreshed, nil
 }
 
 func (r srRunner) apiKeyHint(account accounts.StoredCodexAccount, admins []accounts.AdminKeyEntry) string {

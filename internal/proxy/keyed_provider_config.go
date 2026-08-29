@@ -46,6 +46,7 @@ var reservedProviderNames = map[string]bool{
 	"antigravity": true,
 	"internal":    true, "_subrouter": true, "t": true,
 	"v1": true, "backend-api": true, "messages": true, "responses": true,
+	"chat": true, "completions": true, "embeddings": true,
 	"models": true, "alpha": true, "ps": true, "plugins": true,
 }
 
