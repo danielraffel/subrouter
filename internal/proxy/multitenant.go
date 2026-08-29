@@ -1031,6 +1031,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 	}
 	var id string
 	var kind string
+	var prepare func() (string, func() error, error)
 	validateRepairTarget := func(candidate string) bool {
 		return input.TargetAccountID == "" || subtle.ConstantTimeCompare(
 			[]byte(input.TargetAccountID), []byte(candidate),
@@ -1050,7 +1051,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+		account := accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
@@ -1059,10 +1060,14 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
 				},
 			},
-		})
-		if err != nil {
-			http.Error(w, "save Codex account", http.StatusInternalServerError)
-			return
+		}
+		prepare = func() (string, func() error, error) {
+			canonicalID, err := server.ensureAccountImportCapacity(account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return canonicalID, func() error { return server.AccountRef.store.SaveStored(account) }, nil
 		}
 	case "openai-apikey", "anthropic-apikey":
 		if strings.TrimSpace(input.APIKey) == "" {
@@ -1081,12 +1086,17 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		if err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+		account := accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: provider,
 			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
-		}); err != nil {
-			http.Error(w, "save API key", http.StatusInternalServerError)
-			return
+		}
+		prepare = func() (string, func() error, error) {
+			canonicalID, err := server.ensureAccountImportCapacity(account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return canonicalID, func() error { return server.AccountRef.store.SaveStored(account) }, nil
 		}
 	case "claude":
 		if input.ClaudeAIOAuth == nil || input.ClaudeAIOAuth.AccessToken == "" || input.ClaudeAIOAuth.RefreshToken == "" {
@@ -1098,18 +1108,31 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		if _, err := server.AccountRef.claudeStore.UpsertCredentialProfile(input.Label, *input.ClaudeAIOAuth); err != nil {
-			http.Error(w, "save Claude account", http.StatusInternalServerError)
-			return
+		prepare = func() (string, func() error, error) {
+			canonicalID, err := server.ensureAccountImportCapacity(id, true)
+			if err != nil {
+				return "", nil, err
+			}
+			return canonicalID, func() error {
+				_, err := server.AccountRef.claudeStore.UpsertCredentialProfile(canonicalID, *input.ClaudeAIOAuth)
+				return err
+			}, nil
 		}
 	default:
 		http.Error(w, "unsupported provider", http.StatusBadRequest)
 		return
 	}
-	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
-		http.Error(w, "account saved but reload failed", http.StatusInternalServerError)
+	installedID, err := server.installAccountMutation(r.Context(), prepare)
+	if err != nil {
+		var capacityErr *accountImportCapacityError
+		if errors.As(err, &capacityErr) {
+			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
+			return
+		}
+		http.Error(w, "save account", http.StatusInternalServerError)
 		return
 	}
+	id = installedID
 	writeJSON(w, map[string]any{"account": map[string]any{
 		"id": id, "kind": kind, "label": input.Label,
 	}})

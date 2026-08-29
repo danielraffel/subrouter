@@ -287,17 +287,20 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu                sync.RWMutex
-	installMu         sync.Mutex
-	accounts          []accounts.Account
-	accountGeneration uint64
-	diskGeneration    string
-	store             accounts.CodexStore
-	claudeStore       agentclaude.Store
-	oauthSources      []OAuthAccountSource
-	client            *http.Client
-	qwenConsoleRoot   string
-	apiKeyUpstreams   map[accounts.Provider]string
+	mu        sync.RWMutex
+	installMu sync.Mutex
+	// publishGenerationForTest is immutable after AccountRef construction.
+	// Production constructors leave it nil and always use the durable publisher.
+	publishGenerationForTest func(string) error
+	accounts                 []accounts.Account
+	accountGeneration        uint64
+	diskGeneration           string
+	store                    accounts.CodexStore
+	claudeStore              agentclaude.Store
+	oauthSources             []OAuthAccountSource
+	client                   *http.Client
+	qwenConsoleRoot          string
+	apiKeyUpstreams          map[accounts.Provider]string
 
 	usageStatusMu    sync.Mutex
 	usageStatusCache []AccountUsageStatus
@@ -2116,6 +2119,102 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 }
 
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
+	return s.installAccountMutation(ctx, func() (string, func() error, error) {
+		switch {
+		case input.Provider == accounts.ProviderKimi && input.Kimi != nil:
+			if input.Codex != nil || input.Claude != nil {
+				return "", nil, invalidAccountImport("exactly one matching account payload is required")
+			}
+			label, credential, remove, err := validateKimiAccountImport(*input.Kimi)
+			if err != nil {
+				return "", nil, err
+			}
+			store := s.AccountRef.kimiStore()
+			id, err := agentkimi.ManagedAccountID(label)
+			if err != nil {
+				return "", nil, invalidAccountImport("Kimi account label is invalid")
+			}
+			if remove {
+				exists, err := store.ManagedAccountExists(label)
+				if err != nil {
+					return "", nil, err
+				}
+				if !exists {
+					return "", nil, invalidAccountImport("managed Kimi account was not found")
+				}
+				return id, func() error {
+					_, ok, err := store.RemoveManagedAccount(label)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return errors.New("managed Kimi account disappeared during removal")
+					}
+					return nil
+				}, nil
+			}
+			if err := s.ensureOAuthSourceAccountImportCapacity(accounts.ProviderKimi, id); err != nil {
+				return "", nil, err
+			}
+			return id, func() error {
+				_, err := store.SaveManagedCredential(label, credential)
+				return err
+			}, nil
+		case input.Provider == accounts.ProviderCodex || isKeyedProvider(input.Provider):
+			if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
+				return "", nil, invalidAccountImport("exactly one matching account payload is required")
+			}
+			account, err := validateStoredAccountImport(input.Provider, *input.Codex)
+			if err != nil {
+				return "", nil, err
+			}
+			canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return account.Email, func() error { return s.AccountRef.store.SaveStored(account) }, nil
+		case input.Provider == accounts.ProviderClaude:
+			if input.Claude != nil && input.Codex == nil && input.Kimi == nil {
+				name, credential, err := validateClaudeAccountImport(*input.Claude)
+				if err != nil {
+					return "", nil, err
+				}
+				canonicalName, err := s.ensureAccountImportCapacity(name, true)
+				if err != nil {
+					return "", nil, err
+				}
+				return canonicalName, func() error {
+					return s.AccountRef.claudeStore.ImportProfileCredential(canonicalName, credential)
+				}, nil
+			}
+			if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
+				return "", nil, invalidAccountImport("exactly one matching account payload is required")
+			}
+			account, err := validateStoredAccountImport(input.Provider, *input.Codex)
+			if err != nil {
+				return "", nil, err
+			}
+			canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return account.Email, func() error { return s.AccountRef.store.SaveStored(account) }, nil
+		default:
+			return "", nil, invalidAccountImport("unsupported account provider")
+		}
+	})
+}
+
+// installAccountMutation serializes validation and capacity checks with the
+// disk mutation, then publishes the generation marker before touching any
+// credential. Other workers that observe the marker block on the transaction
+// lock until the credential mutation is complete.
+func (s Server) installAccountMutation(
+	ctx context.Context,
+	prepare func() (accountID string, mutate func() error, err error),
+) (accountID string, err error) {
 	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
 		return "", err
 	}
@@ -2131,95 +2230,17 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			}
 		}
 	}()
-	switch {
-	case input.Provider == accounts.ProviderKimi && input.Kimi != nil:
-		if input.Codex != nil || input.Claude != nil {
-			return "", invalidAccountImport("exactly one matching account payload is required")
-		}
-		label, credential, remove, err := validateKimiAccountImport(*input.Kimi)
-		if err != nil {
-			return "", err
-		}
-		store := s.AccountRef.kimiStore()
-		if remove {
-			removed, ok, err := store.RemoveManagedAccount(label)
-			if err != nil {
-				return "", err
-			}
-			if !ok {
-				return "", invalidAccountImport("managed Kimi account was not found")
-			}
-			accountID = removed.ID
-			break
-		}
-		id, err := agentkimi.ManagedAccountID(label)
-		if err != nil {
-			return "", invalidAccountImport("Kimi account label is invalid")
-		}
-		if err := s.ensureOAuthSourceAccountImportCapacity(accounts.ProviderKimi, id); err != nil {
-			return "", err
-		}
-		installed, err := store.SaveManagedCredential(label, credential)
-		if err != nil {
-			return "", err
-		}
-		accountID = installed.ID
-	case input.Provider == accounts.ProviderCodex || isKeyedProvider(input.Provider):
-		if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
-			return "", invalidAccountImport("exactly one matching account payload is required")
-		}
-		account, err := validateStoredAccountImport(input.Provider, *input.Codex)
-		if err != nil {
-			return "", err
-		}
-		canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
-		if err != nil {
-			return "", err
-		}
-		account.Email = canonicalID
-		if err := s.AccountRef.store.SaveStored(account); err != nil {
-			return "", err
-		}
-		accountID = account.Email
-	case input.Provider == accounts.ProviderClaude:
-		if input.Claude != nil && input.Codex == nil && input.Kimi == nil {
-			name, credential, err := validateClaudeAccountImport(*input.Claude)
-			if err != nil {
-				return "", err
-			}
-			canonicalName, err := s.ensureAccountImportCapacity(name, true)
-			if err != nil {
-				return "", err
-			}
-			if err := s.AccountRef.claudeStore.ImportProfileCredential(canonicalName, credential); err != nil {
-				return "", err
-			}
-			accountID = canonicalName
-			break
-		}
-		if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
-			return "", invalidAccountImport("exactly one matching account payload is required")
-		}
-		account, err := validateStoredAccountImport(input.Provider, *input.Codex)
-		if err != nil {
-			return "", err
-		}
-		canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
-		if err != nil {
-			return "", err
-		}
-		account.Email = canonicalID
-		if err := s.AccountRef.store.SaveStored(account); err != nil {
-			return "", err
-		}
-		accountID = account.Email
-	default:
-		return "", invalidAccountImport("unsupported account provider")
+	accountID, mutate, err := prepare()
+	if err != nil {
+		return "", err
 	}
-	// The marker represents a committed credential mutation. Publishing it
-	// before validation or persistence made rejected imports invalidate every
-	// worker's in-flight scoring despite changing no account state.
-	if err := advanceAccountDiskGeneration(s.AccountRef.store.StoreDir()); err != nil {
+	if mutate == nil {
+		return "", errors.New("account mutation is not configured")
+	}
+	if err := s.AccountRef.advanceDiskGeneration(); err != nil {
+		return "", err
+	}
+	if err := mutate(); err != nil {
 		return "", err
 	}
 	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()

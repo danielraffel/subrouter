@@ -230,6 +230,10 @@ func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp := serveProtectedAccountImport(handler, payload)
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", resp.Code, resp.Body.String())
@@ -240,6 +244,13 @@ func TestAccountImportRejectsCodexIdentityMismatchWithoutWriting(t *testing.T) {
 	}
 	if len(stored) != 0 || len(ref.All()) != 0 {
 		t.Fatalf("identity mismatch mutated account state: stored=%d loaded=%d", len(stored), len(ref.All()))
+	}
+	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGeneration != beforeGeneration {
+		t.Fatal("identity attestation rejection published an account generation")
 	}
 }
 
@@ -706,8 +717,19 @@ func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	beforeRejectedGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if resp := serveProtectedAccountImport(handler, newPayload); resp.Code != http.StatusInsufficientStorage {
 		t.Fatalf("new account status = %d, want 507, body = %s", resp.Code, resp.Body.String())
+	}
+	afterRejectedGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRejectedGeneration != beforeRejectedGeneration {
+		t.Fatal("capacity rejection published an account generation")
 	}
 
 	existing := accounts.StoredCodexAccount{

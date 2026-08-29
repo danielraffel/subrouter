@@ -624,6 +624,26 @@ func (s Store) ReadManagedCredential(label string, now time.Time) (CredentialInf
 	return readCredential(path, now)
 }
 
+// ManagedAccountExists reports whether an isolated profile is present without
+// parsing its credential. Removal must remain possible for malformed profiles,
+// but callers still need a read-only existence check before publishing a disk
+// generation for that removal.
+func (s Store) ManagedAccountExists(label string) (bool, error) {
+	id, err := ManagedAccountID(label)
+	if err != nil {
+		return false, err
+	}
+	path, _, _, err := s.accountCredentialPath(id)
+	if err != nil {
+		return false, err
+	}
+	_, err = os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // RemoveManagedAccount removes one Subrouter-owned profile by its user-facing
 // label. The Kimi CLI credential is deliberately outside this command's
 // ownership.

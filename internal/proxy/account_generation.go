@@ -75,6 +75,14 @@ func advanceAccountDiskGeneration(storeDir string) (err error) {
 	return nil
 }
 
+func (r *AccountRef) advanceDiskGeneration() error {
+	publish := advanceAccountDiskGeneration
+	if r != nil && r.publishGenerationForTest != nil {
+		publish = r.publishGenerationForTest
+	}
+	return publish(r.store.StoreDir())
+}
+
 // PublishAccountDiskMutation serializes a local CLI credential mutation with
 // HTTP account imports. It publishes the new generation before invoking the
 // mutation while still holding the same cross-process lock workers acquire to
