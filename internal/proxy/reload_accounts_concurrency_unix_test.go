@@ -461,6 +461,132 @@ func TestKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestUnreadableKimiLogicalAliasesConflictBeforeMutation(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		capacity := "below capacity"
+		if full {
+			capacity = "full capacity"
+		}
+		for _, dangling := range []bool{false, true} {
+			aliasKind := "malformed file"
+			if dangling {
+				aliasKind = "dangling symlink"
+			}
+			t.Run(capacity+"/"+aliasKind, func(t *testing.T) {
+				root := t.TempDir()
+				codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+				storedAccounts := 0
+				if full {
+					storedAccounts = maxAccountImportAccounts - 1
+				}
+				for index := 0; index < storedAccounts; index++ {
+					if err := codexStore.SaveStored(accounts.StoredCodexAccount{
+						Email:    fmt.Sprintf("apikey:seed-%03d", index),
+						Provider: accounts.ProviderCodex,
+						Auth: accounts.CodexAuthFile{
+							AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+						},
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+				kimiStore := agentkimi.Store{
+					Path:       filepath.Join(root, "kimi", "cli.json"),
+					ManagedDir: filepath.Join(root, "kimi", "managed"),
+				}
+				if err := os.MkdirAll(kimiStore.ManagedDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				aliasName := base64.RawURLEncoding.EncodeToString([]byte("WORK")) + ".json"
+				aliasPath := filepath.Join(kimiStore.ManagedDir, aliasName)
+				malformed := []byte("{not-json")
+				danglingTarget := filepath.Join(root, "missing-credential.json")
+				if dangling {
+					if err := os.Symlink(danglingTarget, aliasPath); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(aliasPath, malformed, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				ids, err := kimiStore.AccountInventoryIDs(t.Context())
+				if err != nil || len(ids) != 1 || ids[0] != "kimi-subscription:work" {
+					t.Fatalf("durable alias IDs = %v, err = %v", ids, err)
+				}
+				logical, err := kimiStore.ListAccounts(t.Context())
+				if (!dangling && err == nil) || len(logical) != 0 {
+					t.Fatalf("unreadable alias accounts = %+v, err = %v", logical, err)
+				}
+				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
+					t.Fatalf("canonical path exists before import: exists=%v err=%v", exists, err)
+				}
+				ref := NewAccountRef(codexStore, nil, nil)
+				ref.claudeStore = claudeStore
+				ref.oauthSources = []OAuthAccountSource{kimiStore}
+				if _, _, err := ref.ReloadSnapshot(); err != nil {
+					t.Fatal(err)
+				}
+				handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+				payload, err := json.Marshal(accountImportRequest{
+					Provider: accounts.ProviderKimi,
+					Kimi: &kimiAccountImport{
+						Label: "work",
+						Credential: agentkimi.CredentialInfo{
+							AccessToken: "replacement", RefreshToken: "refresh",
+							OAuthDeviceID: "device", ExpiresAt: time.Now().Add(time.Hour),
+						},
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				response := serveProtectedAccountImport(handler, payload)
+				if response.Code != http.StatusConflict {
+					t.Fatalf("status = %d, want 409, body = %s", response.Code, response.Body.String())
+				}
+				afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if afterGeneration != beforeGeneration {
+					t.Fatal("unreadable alias conflict published an account generation")
+				}
+				if exists, err := kimiStore.ManagedAccountExists("work"); err != nil || exists {
+					t.Fatalf("conflict created canonical path: exists=%v err=%v", exists, err)
+				}
+				entries, err := os.ReadDir(kimiStore.ManagedDir)
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("managed entries after conflict = %d, err = %v", len(entries), err)
+				}
+				if dangling {
+					target, err := os.Readlink(aliasPath)
+					if err != nil || target != danglingTarget {
+						t.Fatalf("dangling alias changed: target=%q err=%v", target, err)
+					}
+				} else {
+					after, err := os.ReadFile(aliasPath)
+					if err != nil || !bytes.Equal(after, malformed) {
+						t.Fatalf("malformed alias changed: body=%q err=%v", after, err)
+					}
+				}
+				ids, err = kimiStore.AccountInventoryIDs(t.Context())
+				if err != nil || len(ids) != 1 || ids[0] != "kimi-subscription:work" {
+					t.Fatalf("durable alias IDs after conflict = %v, err = %v", ids, err)
+				}
+				for _, account := range ref.All() {
+					if account.Provider == accounts.ProviderKimi && account.ID == "kimi-subscription:work" {
+						t.Fatalf("unreadable alias became routable after conflict: %+v", account)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestAccountRefStartupSnapshotWaitsForImportTransaction(t *testing.T) {
 	codexStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	seed := accounts.StoredCodexAccount{

@@ -2296,6 +2296,25 @@ func (s Server) ensureAccountImportCapacity(ctx context.Context, accountID strin
 }
 
 func (s Server) ensureNewOAuthSourceAccountImportCapacity(ctx context.Context, provider accounts.Provider, accountID string) error {
+	for _, source := range s.AccountRef.oauthSources {
+		if source.Provider() != provider {
+			continue
+		}
+		if inventory, ok := source.(oauthAccountDurableInventory); ok {
+			ids, err := inventory.AccountInventoryIDs(ctx)
+			if err != nil {
+				return err
+			}
+			for _, existingID := range ids {
+				if strings.EqualFold(existingID, accountID) {
+					return &accounts.StorageKeyCollisionError{
+						Identifier:         accountID,
+						ExistingIdentifier: existingID,
+					}
+				}
+			}
+		}
+	}
 	all, count, err := s.accountImportInventory(ctx)
 	if err != nil {
 		return err
@@ -2320,6 +2339,10 @@ func (s Server) ensureNewOAuthSourceAccountImportCapacity(ctx context.Context, p
 // or an OAuth-source account, disappear from the capacity decision.
 type oauthAccountInventoryCounter interface {
 	AccountInventoryCount(context.Context) (int, error)
+}
+
+type oauthAccountDurableInventory interface {
+	AccountInventoryIDs(context.Context) ([]string, error)
 }
 
 func (s Server) accountImportInventory(ctx context.Context) ([]accounts.Account, int, error) {

@@ -371,38 +371,46 @@ func (s Store) ListAccounts(_ context.Context) ([]account.Account, error) {
 	return result, errors.Join(listErrors...)
 }
 
-// AccountInventoryCount counts durable Kimi credential entries without
-// parsing them. Capacity checks must include malformed credentials too: they
-// still occupy managed state and must remain repairable in place.
-func (s Store) AccountInventoryCount(_ context.Context) (int, error) {
-	count := 0
+// AccountInventoryIDs returns durable Kimi credential identifiers without
+// parsing their contents. Import collision checks must see malformed files and
+// dangling symlinks that ListAccounts cannot route.
+func (s Store) AccountInventoryIDs(_ context.Context) ([]string, error) {
+	var ids []string
 	if path := s.credentialPath(); path != "" {
 		if _, err := os.Lstat(path); err == nil {
-			count++
+			ids = append(ids, accountID)
 		} else if !os.IsNotExist(err) {
-			return 0, err
+			return nil, err
 		}
 	}
 	dir := s.managedDir()
 	if dir == "" {
-		return count, nil
+		return ids, nil
 	}
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return count, nil
+		return ids, nil
 	}
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		if _, valid := managedAccountID(entry.Name()); valid {
-			count++
+		if id, valid := managedAccountID(entry.Name()); valid {
+			ids = append(ids, id)
 		}
 	}
-	return count, nil
+	return ids, nil
+}
+
+// AccountInventoryCount counts durable Kimi credential entries without
+// parsing them. Capacity checks must include malformed credentials too: they
+// still occupy managed state and must remain repairable in place.
+func (s Store) AccountInventoryCount(ctx context.Context) (int, error) {
+	ids, err := s.AccountInventoryIDs(ctx)
+	return len(ids), err
 }
 
 // refreshMu serializes refreshes process-wide. Whether Kimi's refresh token is
