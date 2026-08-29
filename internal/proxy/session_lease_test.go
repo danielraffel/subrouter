@@ -1675,6 +1675,30 @@ func TestSessionLeaseProviderRejectsConflictingModelPrefix(t *testing.T) {
 	}
 }
 
+func TestBareQwenSessionLeaseUsesTokenPlanOnlyPool(t *testing.T) {
+	handler := Server{
+		Accounts: []accounts.Account{{
+			ID:       "qwen-token:only",
+			Provider: accounts.ProviderQwenToken,
+			AuthMode: accounts.AuthModeAPIKey,
+			Token:    "token-plan-key",
+		}},
+		Sessions:      newSessionStore(t),
+		Scheduler:     selectacct.NewScheduler(nil),
+		sessionLeases: newSessionLeaseStore(),
+		AdminToken:    "service-admin-token",
+		MaxBodyBytes:  1024,
+	}.Handler()
+
+	lease, _ := issueSessionLease(t, handler, "", "qwen3-coder-plus")
+	if lease.Assignment.Provider != string(accounts.ProviderQwenToken) || lease.Assignment.AccountID != "qwen-token:only" {
+		t.Fatalf("assignment = %+v, want the available Token Plan account", lease.Assignment)
+	}
+	if lease.Pi.BaseURL != "http://subrouter:31415/qwen-token" || lease.Pi.API != "openai-completions" {
+		t.Fatalf("Pi config = %+v, want qwen-token OpenAI endpoint", lease.Pi)
+	}
+}
+
 func TestPresentedSessionLeaseTokenIgnoresOrdinaryJWT(t *testing.T) {
 	header := base64.RawStdEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
 	payload := base64.RawStdEncoding.EncodeToString([]byte(`{"cloudmux_session_lease":true}`))

@@ -107,6 +107,10 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	if len(candidates) == 0 {
 		return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
 	}
+	scoreRevision := uint64(0)
+	if cfg.SchedulerRef != nil {
+		scoreRevision = cfg.SchedulerRef.ScoreRevision()
+	}
 
 	scores, successful := fetchScores(ctx, candidates)
 	if successful == 0 {
@@ -115,7 +119,14 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 
 	scheduler := selectacct.NewScheduler(scores)
 	if cfg.SchedulerRef != nil {
-		if !cfg.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
+		// The auto-switch refresh is Codex-only, but SchedulerRef is shared by
+		// every provider. Atomically replace only the freshly fetched Codex scores
+		// so a concurrent full-provider refresh cannot be erased.
+		var published bool
+		scheduler, published = cfg.SchedulerRef.MergeScoresForAccountGenerationAtScoreRevision(
+			scores, accountGeneration, scoreRevision,
+		)
+		if !published {
 			return "", fmt.Errorf("account pool changed during sr auto-switch")
 		}
 	}

@@ -65,6 +65,9 @@ type Store struct {
 	// account pool. Its rotating refresh-token chain belongs to the CLI; a
 	// daemon that redeems it can silently sign the interactive client out.
 	managedOnly bool
+	// lockLocalCLIRefreshForTest injects failures at the official CLI lock
+	// boundary without weakening the production filesystem lock.
+	lockLocalCLIRefreshForTest func(context.Context) (*cliRefreshLock, error)
 }
 
 var deviceIDMu sync.Mutex
@@ -506,7 +509,11 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		var cliLock *cliRefreshLock
 		if acct.ID == accountID {
 			var lockErr error
-			cliLock, lockErr = s.lockLocalCLIRefresh(ctx)
+			if s.lockLocalCLIRefreshForTest != nil {
+				cliLock, lockErr = s.lockLocalCLIRefreshForTest(ctx)
+			} else {
+				cliLock, lockErr = s.lockLocalCLIRefresh(ctx)
+			}
 			if lockErr != nil {
 				return lockErr
 			}
@@ -593,6 +600,13 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		err = refresh()
 	}
 	if err != nil {
+		// The CLI lock is released after writeCredential commits. A release
+		// failure must remain visible because lock ownership is uncertain, but
+		// it cannot turn a durable token rotation back into the stale input
+		// account or claim that no mutation occurred.
+		if didRefresh {
+			return refreshed, true, err
+		}
 		return acct, false, err
 	}
 	return refreshed, didRefresh, nil

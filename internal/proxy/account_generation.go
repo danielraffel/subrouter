@@ -108,6 +108,35 @@ func WithAccountDiskMutationPublication(
 	return withAccountDiskMutationPublication(ctx, storeDir, advanceAccountDiskGeneration, mutate)
 }
 
+// RollbackUnpublishedAccountDiskMutation removes a credential that was written
+// after the last successfully published generation. The rollback holds the
+// same cross-process transaction lock as imports, removes first, and publishes
+// afterward. This ordering is safe only for unpublished additions: existing
+// workers still hold the preceding credential-less snapshot, so a crash after
+// removal cannot leave a usable secret cached, while the lock prevents another
+// publisher from exposing the credential between removal and publication.
+func RollbackUnpublishedAccountDiskMutation(
+	ctx context.Context,
+	storeDir string,
+	rollback func() error,
+) error {
+	return rollbackUnpublishedAccountDiskMutation(ctx, storeDir, advanceAccountDiskGeneration, rollback)
+}
+
+func rollbackUnpublishedAccountDiskMutation(
+	ctx context.Context,
+	storeDir string,
+	publishGeneration func(string) error,
+	rollback func() error,
+) error {
+	return withAccountDiskTransaction(ctx, storeDir, func() error {
+		if err := rollback(); err != nil {
+			return err
+		}
+		return publishGeneration(storeDir)
+	})
+}
+
 func withAccountDiskMutationPublication(
 	ctx context.Context,
 	storeDir string,

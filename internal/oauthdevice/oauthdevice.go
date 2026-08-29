@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -225,8 +227,9 @@ var errAuthorizationPending = errors.New("authorization_pending")
 func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Values, now time.Time) (token Token, retry bool, err error) {
 	body, httpErr := postForm(ctx, client, cfg.TokenURL, form, cfg.Headers)
 	var parsed tokenResponse
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &parsed)
+	parseErr := json.Unmarshal(body, &parsed)
+	if parseErr != nil && len(body) > 0 {
+		parseErr = fmt.Errorf("device flow token endpoint returned an undecodable body: %w", parseErr)
 	}
 	switch parsed.Error {
 	case "authorization_pending":
@@ -238,6 +241,9 @@ func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Val
 	case "expired_token":
 		return Token{}, false, ErrAuthorizationExpired
 	}
+	if httpErr != nil && retryablePollingEndpointError(ctx, httpErr) {
+		return Token{}, true, httpErr
+	}
 	if parsed.Error != "" {
 		if httpErr != nil {
 			return Token{}, false, fmt.Errorf("device flow token error %s: %w", parsed.Error, httpErr)
@@ -246,6 +252,9 @@ func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Val
 	}
 	if httpErr != nil {
 		return Token{}, false, httpErr
+	}
+	if parseErr != nil {
+		return Token{}, true, parseErr
 	}
 	if strings.TrimSpace(parsed.AccessToken) == "" {
 		return Token{}, false, errors.New("token response carried no access token")
@@ -261,6 +270,95 @@ func exchange(ctx context.Context, client *http.Client, cfg Config, form url.Val
 		token.ExpiresAt = now.Add(time.Duration(parsed.ExpiresIn) * time.Second).UTC()
 	}
 	return token, false, nil
+}
+
+type endpointStatusError struct {
+	endpoint   string
+	status     string
+	statusCode int
+}
+
+func (err *endpointStatusError) Error() string {
+	return fmt.Sprintf("device flow request to %s failed: %s", err.endpoint, err.status)
+}
+
+type endpointTransportError struct {
+	err error
+}
+
+func (err *endpointTransportError) Error() string { return err.err.Error() }
+func (err *endpointTransportError) Unwrap() error { return err.err }
+
+func retryablePollingEndpointError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var statusErr *endpointStatusError
+	if errors.As(err, &statusErr) {
+		return retryablePollingStatus(statusErr.statusCode)
+	}
+	var transportErr *endpointTransportError
+	if !errors.As(err, &transportErr) {
+		return false
+	}
+	return retryablePollingTransportError(transportErr.err)
+}
+
+func retryablePollingStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout,
+		http.StatusTooEarly,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// retryablePollingTransportError deliberately recognizes transient failures
+// rather than assuming every RoundTripper error will heal. TLS trust failures,
+// invalid proxy configuration, and permanent DNS errors otherwise turn an
+// actionable sign-in failure into a silent polling loop that lasts until the
+// device code expires.
+func retryablePollingTransportError(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	// An http.Client timeout has its own deadline even while the device-flow
+	// parent context and device code remain valid.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return dnsErr.Timeout() || dnsErr.Temporary()
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	for _, transient := range []error{
+		syscall.ECONNRESET,
+		syscall.ECONNABORTED,
+		syscall.ECONNREFUSED,
+		syscall.ENETDOWN,
+		syscall.ENETUNREACH,
+		syscall.EHOSTDOWN,
+		syscall.EHOSTUNREACH,
+		syscall.ETIMEDOUT,
+		syscall.EPIPE,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+	} {
+		if errors.Is(err, transient) {
+			return true
+		}
+	}
+	return false
 }
 
 func postForm(ctx context.Context, client *http.Client, endpoint string, form url.Values, headers map[string]string) ([]byte, error) {
@@ -284,17 +382,21 @@ func postForm(ctx context.Context, client *http.Client, endpoint string, form ur
 	}
 	res, err := requestClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &endpointTransportError{err: err}
 	}
 	defer func() { _ = res.Body.Close() }()
 	body, readErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if readErr != nil {
-		return nil, readErr
+		return nil, &endpointTransportError{err: readErr}
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		// The body is returned alongside the error because RFC 8628 signals
 		// authorization_pending and slow_down with a 400.
-		return body, fmt.Errorf("device flow request to %s failed: %s", endpoint, res.Status)
+		return body, &endpointStatusError{
+			endpoint:   endpoint,
+			status:     res.Status,
+			statusCode: res.StatusCode,
+		}
 	}
 	return body, nil
 }

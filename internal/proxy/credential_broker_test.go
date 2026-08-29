@@ -232,6 +232,13 @@ func TestClaudeLeaseOutcomesHonorUnifiedQuotaHeaders(t *testing.T) {
 			wantOutcome:      broker.LeaseRateLimited,
 			wantInvalidation: true,
 		},
+		{
+			name:             "rejected server error remains quota exhaustion",
+			status:           http.StatusInternalServerError,
+			unifiedStatus:    "rejected",
+			wantOutcome:      broker.LeaseRateLimited,
+			wantInvalidation: true,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(

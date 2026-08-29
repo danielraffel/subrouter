@@ -1182,11 +1182,13 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 			}
 		}
 	}
-	if ok, err := server.AccountRef.claudeStore.RemoveProfile(id); err != nil {
+	claudeRemoved, claudeRemoveErr := server.AccountRef.claudeStore.RemoveProfile(id)
+	if claudeRemoved {
+		removed = true
+	}
+	if claudeRemoveErr != nil && !claudeRemoved {
 		http.Error(w, "remove account", http.StatusInternalServerError)
 		return
-	} else if ok {
-		removed = true
 	}
 	if !removed {
 		http.Error(w, "account not found", http.StatusNotFound)
@@ -1194,6 +1196,10 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 	}
 	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
 		http.Error(w, "account removed but reload failed", http.StatusInternalServerError)
+		return
+	}
+	if claudeRemoveErr != nil {
+		http.Error(w, "account removed but credential cleanup failed", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})

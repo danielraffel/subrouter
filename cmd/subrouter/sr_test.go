@@ -214,6 +214,15 @@ type refreshingKimiUsageStore struct {
 	preflightToken string
 }
 
+type committedRefreshErrorRefresher struct {
+	refreshed baseaccount.Account
+	err       error
+}
+
+func (s committedRefreshErrorRefresher) RefreshAccountIfNeeded(context.Context, *http.Client, baseaccount.Account) (baseaccount.Account, bool, error) {
+	return s.refreshed, true, s.err
+}
+
 type partialKimiUsageStore struct{}
 
 func (partialKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {
@@ -320,6 +329,29 @@ func TestLocalKimiStatusRefreshesBeforeFetchingUsage(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("refreshed Kimi status row is missing")
+	}
+}
+
+func TestStatusRefreshPublishesAndReturnsCommittedAccountWithPostCommitError(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	original := baseaccount.Account{ID: "kimi-code", Provider: baseaccount.ProviderKimi, AuthMode: baseaccount.AuthModeOAuth, Token: "stale"}
+	committed := original
+	committed.Token = "fresh"
+	postCommitErr := errors.New("post-commit lock release failed")
+	runner := srRunner{store: store, client: http.DefaultClient}
+
+	got, err := runner.refreshStatusOAuthAccount(t.Context(), original, committedRefreshErrorRefresher{
+		refreshed: committed,
+		err:       postCommitErr,
+	})
+	if !errors.Is(err, postCommitErr) {
+		t.Fatalf("status refresh error = %v, want post-commit error", err)
+	}
+	if got.Token != "fresh" {
+		t.Fatalf("status refresh returned token %q, want committed token", got.Token)
+	}
+	if _, statErr := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); statErr != nil {
+		t.Fatalf("committed refresh was not published: %v", statErr)
 	}
 }
 
@@ -1932,6 +1964,184 @@ func TestSRSwitchDoesNotWriteActiveAuthWhenPublicationFails(t *testing.T) {
 	}
 	if _, err := os.Stat(accounts.DefaultCodexAuthPath()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("active auth was written despite publication failure: %v", err)
+	}
+}
+
+func TestSRSwitchDoesNotSyncActiveAuthWhenPublicationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	account := accounts.StoredCodexAccount{
+		Email:   "isolated@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("isolated@example.test", "acct_isolated"),
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	interactive := testCodexAuth("isolated@example.test", "acct_interactive")
+	if err := accounts.WriteActiveCodexAuth(interactive); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.switchAccount(context.Background(), account.Email, srSwitchOptions{}); err == nil {
+		t.Fatal("switch unexpectedly succeeded when active-sync publication failed")
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored account found = %v, err = %v", ok, err)
+	}
+	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != account.Auth.Tokens.RefreshToken {
+		t.Fatal("active auth was imported despite publication failure")
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok || active.Tokens == nil || active.Tokens.RefreshToken != interactive.Tokens.RefreshToken {
+		t.Fatal("publication failure changed the pre-existing active auth")
+	}
+}
+
+func TestSRSwitchDoesNotRefreshStoredAuthWhenPublicationFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("expired@example.test", "acct_expired")
+	auth.Tokens.AccessToken = testJWT(map[string]any{
+		"exp": time.Now().Add(-time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct_expired",
+		},
+	})
+	account := accounts.StoredCodexAccount{
+		Email:   "expired@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    auth,
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(store.StoreDir(), ".account-generation"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	refreshRequests := 0
+	client := &http.Client{Transport: srRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "auth.openai.com" && request.URL.Path == "/oauth/token" {
+			refreshRequests++
+		}
+		return nil, errors.New("refresh endpoint should not be called")
+	})}
+
+	runner := srRunner{store: store, client: client, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.switchAccount(context.Background(), account.Email, srSwitchOptions{}); err == nil {
+		t.Fatal("switch unexpectedly succeeded when refresh publication failed")
+	}
+	if refreshRequests != 0 {
+		t.Fatalf("refresh endpoint requests = %d, want zero", refreshRequests)
+	}
+	stored, ok, err := store.FindStored(account.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored account found = %v, err = %v", ok, err)
+	}
+	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != account.Auth.Tokens.RefreshToken {
+		t.Fatal("stored credential changed despite publication failure")
+	}
+}
+
+func TestSRSwitchDoesNotActivateStaleAuthAfterCommittedRefreshTeardownFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+
+	activeAccount := accounts.StoredCodexAccount{
+		Email:   "active@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    testCodexAuth("active@example.test", "acct_active"),
+	}
+	if err := store.SaveStored(activeAccount); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.WriteActiveCodexAuth(activeAccount.Auth); err != nil {
+		t.Fatal(err)
+	}
+
+	staleAuth := testCodexAuth("target@example.test", "acct_target")
+	staleAuth.Tokens.AccessToken = testJWT(map[string]any{
+		"exp": time.Now().Add(-time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct_target",
+		},
+	})
+	target := accounts.StoredCodexAccount{
+		Email:   "target@example.test",
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth:    staleAuth,
+	}
+	if err := store.SaveStored(target); err != nil {
+		t.Fatal(err)
+	}
+
+	freshAccess := testJWT(map[string]any{
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct_target",
+		},
+	})
+	freshID := testJWT(map[string]any{
+		"exp":   time.Now().Add(time.Hour).Unix(),
+		"email": target.Email,
+	})
+	client := &http.Client{Transport: srRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host == "auth.openai.com" && request.URL.Path == "/oauth/token" {
+			return srJSONResponse(request, http.StatusOK, fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":%q,"id_token":%q}`,
+				freshAccess, "fresh-refresh", freshID,
+			)), nil
+		}
+		return nil, errors.New("usage unavailable")
+	})}
+
+	teardownErr := errors.New("close account publication transaction")
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, client: client, in: strings.NewReader(""), out: &out, errOut: &out,
+		withCodexRefreshPublication: func(
+			ctx context.Context,
+			storeDir string,
+			mutate func(func() error) error,
+		) error {
+			if err := proxy.WithAccountDiskMutationPublication(ctx, storeDir, mutate); err != nil {
+				return err
+			}
+			return teardownErr
+		},
+	}
+
+	err := runner.switchAccount(context.Background(), target.Email, srSwitchOptions{})
+	if !errors.Is(err, teardownErr) {
+		t.Fatalf("switch error = %v, want committed-refresh teardown error", err)
+	}
+	stored, ok, err := store.FindStored(target.Email)
+	if err != nil || !ok {
+		t.Fatalf("stored target found = %v, err = %v", ok, err)
+	}
+	if stored.Auth.Tokens == nil || stored.Auth.Tokens.RefreshToken != "fresh-refresh" {
+		t.Fatalf("stored refresh token = %v, want committed fresh credential", stored.Auth.Tokens)
+	}
+	active, ok, err := accounts.ReadActiveCodexAuth()
+	if err != nil || !ok {
+		t.Fatalf("active auth found = %v, err = %v", ok, err)
+	}
+	if active.Tokens == nil || active.Tokens.RefreshToken != activeAccount.Auth.Tokens.RefreshToken {
+		t.Fatal("failed switch replaced active auth after refresh transaction teardown")
+	}
+	if _, err := os.Stat(filepath.Join(store.StoreDir(), ".account-generation")); err != nil {
+		t.Fatalf("committed refresh generation was not published: %v", err)
+	}
+	if strings.Contains(out.String(), "Switched to") {
+		t.Fatalf("failed switch reported success:\n%s", out.String())
 	}
 }
 

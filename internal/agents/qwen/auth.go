@@ -74,7 +74,7 @@ func StripTemporaryLoginKey(accountID string) error {
 }
 
 func StripTemporaryLoginKeyIn(root, accountID string) error {
-	config, err := readRawConsoleConfigIn(root, accountID)
+	config, err := readExistingRawConsoleConfigIn(root, accountID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -206,10 +206,15 @@ func readRawConsoleConfig(accountID string) (map[string]any, error) {
 }
 
 func readRawConsoleConfigIn(root, accountID string) (map[string]any, error) {
-	body, err := os.ReadFile(ConsoleConfigPathIn(root, accountID))
+	config, err := readExistingRawConsoleConfigIn(root, accountID)
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]any{}, nil
 	}
+	return config, err
+}
+
+func readExistingRawConsoleConfigIn(root, accountID string) (map[string]any, error) {
+	body, err := os.ReadFile(ConsoleConfigPathIn(root, accountID))
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +253,10 @@ func writeRawConsoleConfigIn(root, accountID string, config map[string]any) erro
 		return err
 	}
 	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err
 	}

@@ -382,8 +382,12 @@ func (s Store) profileCredentialBackups(
 }
 
 func deleteProfileKeychainCredentials(instancePaths []string) error {
+	return deleteProfileKeychainCredentialsContext(context.Background(), instancePaths)
+}
+
+func deleteProfileKeychainCredentialsContext(ctx context.Context, instancePaths []string) error {
 	for _, instancePath := range instancePaths {
-		if err := deleteKeychainCredential(instancePath); err != nil {
+		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
 			return err
 		}
 	}
@@ -673,7 +677,11 @@ func (s Store) ImportProfileCredential(name string, credential CredentialInfo) (
 }
 
 func (s Store) RemoveProfile(name string) (removed bool, err error) {
-	lock, err := lockProfileRegistry(s.ProfilesPath())
+	return s.RemoveProfileContext(context.Background(), name)
+}
+
+func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed bool, err error) {
+	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
 	if err != nil {
 		return false, err
 	}
@@ -696,7 +704,6 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 		return false, err
 	}
 	original := cloneProfilesFile(data)
-	ctx := context.Background()
 	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
 	if err != nil {
 		return false, err
@@ -725,8 +732,13 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	if err := s.writeProfiles(data); err != nil {
 		return false, errors.Join(err, rollbackStagedProfileInstances(staged))
 	}
-	if err := deleteProfileKeychainCredentials(instancePaths); err != nil {
-		rollbackErr := s.rollbackProfileRemoval(ctx, original, staged, credentialBackups)
+	if err := deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
+		// The caller's deadline may be the reason cleanup failed. Rollback must
+		// have its own bounded lifetime so it can restore the credential and
+		// registry atomically instead of reusing an already-canceled context.
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		rollbackErr := s.rollbackProfileRemoval(rollbackCtx, original, staged, credentialBackups)
+		rollbackCancel()
 		if rollbackErr == nil {
 			return false, err
 		}
@@ -736,7 +748,7 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 			"cleanup_error", err,
 			"rollback_error", rollbackErr,
 		)
-		return true, nil
+		return true, errors.Join(err, fmt.Errorf("rollback Claude profile removal: %w", rollbackErr))
 	}
 	if err := deleteStagedProfileInstances(staged); err != nil {
 		slog.Warn(
@@ -748,7 +760,84 @@ func (s Store) RemoveProfile(name string) (removed bool, err error) {
 	return true, nil
 }
 
+// RemoveUnpublishedProfileContext removes a profile whose credential was
+// authenticated after the last successfully published account generation.
+// Unlike ordinary profile removal, cleanup failure must never restore this
+// profile: a later unrelated generation could then publish a credential that
+// no worker was told existed. The registry and canonical instance paths are
+// removed first while their cross-process locks are held. Keychain and staged
+// directory cleanup are best effort after that commit and any failure is
+// returned with removed=true.
+//
+// Callers must hold the account-disk transaction across this removal and the
+// subsequent publication of the credential-less generation.
+func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string) (removed bool, err error) {
+	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	data := s.readProfiles()
+	profile, ok := data.Profiles[name]
+	if !ok {
+		return false, nil
+	}
+	dir := profile.Dir
+	if dir == "" {
+		dir = sanitizeName(name)
+	}
+	instancePaths, err := s.profileInstancePaths(dir)
+	if err != nil {
+		return false, err
+	}
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); err == nil {
+			err = closeErr
+		}
+	}()
+
+	staged, err := stageProfileInstancePaths(instancePaths)
+	if err != nil {
+		return false, err
+	}
+	delete(data.Profiles, name)
+	if data.Active == name {
+		data.Active = ""
+		for remaining := range data.Profiles {
+			data.Active = remaining
+			break
+		}
+	}
+	if err := s.writeProfiles(data); err != nil {
+		return false, errors.Join(err, rollbackStagedProfileInstances(staged))
+	}
+
+	// The removal is committed at this point. In particular, do not restore the
+	// registry or staged credential when Keychain cleanup fails.
+	cleanupErr := errors.Join(
+		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+		deleteStagedProfileInstances(staged),
+	)
+	if cleanupErr != nil {
+		return true, cleanupErr
+	}
+	return true, nil
+}
+
 func (s Store) CleanupInstance(dir string) error {
+	return s.CleanupInstanceContext(context.Background(), dir)
+}
+
+func (s Store) CleanupInstanceContext(ctx context.Context, dir string) error {
 	if dir == "" {
 		return nil
 	}
@@ -756,13 +845,13 @@ func (s Store) CleanupInstance(dir string) error {
 	if err != nil {
 		return err
 	}
-	credentialLocks, err := lockProfileCredentialPaths(context.Background(), instancePaths)
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
 	if err != nil {
 		return err
 	}
 	defer closeProfileCredentialLocks(credentialLocks)
 	for _, instancePath := range instancePaths {
-		if err := deleteKeychainCredential(instancePath); err != nil {
+		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
 			return err
 		}
 		if err := os.RemoveAll(instancePath); err != nil {
@@ -1415,6 +1504,10 @@ func (s Store) UpsertCredentialProfile(name string, credential CredentialInfo) (
 }
 
 func deleteKeychainCredential(instancePath string) error {
+	return deleteKeychainCredentialContext(context.Background(), instancePath)
+}
+
+func deleteKeychainCredentialContext(ctx context.Context, instancePath string) error {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
@@ -1423,7 +1516,7 @@ func deleteKeychainCredential(instancePath string) error {
 		return err
 	}
 	service := "Claude Code-credentials-" + keychainHash(instancePath)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(
 		ctx,

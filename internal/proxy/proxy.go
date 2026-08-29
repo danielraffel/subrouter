@@ -1726,8 +1726,12 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
+		scoreRevision := uint64(0)
+		if s.SchedulerRef != nil {
+			scoreRevision = s.SchedulerRef.ScoreRevision()
+		}
 		statuses := s.AccountRef.UsageStatuses(r.Context())
-		s.updateSchedulerFromUsageStatusesContext(r.Context(), statuses)
+		s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		writeJSON(w, s.withSessionCounts(s.withRequestTimeExhaustionWindows(statuses)))
 		return
 	}
@@ -1872,6 +1876,18 @@ func (s Server) updateSchedulerFromUsageStatuses(statuses []AccountUsageStatus) 
 }
 
 func (s Server) updateSchedulerFromUsageStatusesContext(ctx context.Context, statuses []AccountUsageStatus) {
+	scoreRevision := uint64(0)
+	if s.SchedulerRef != nil {
+		scoreRevision = s.SchedulerRef.ScoreRevision()
+	}
+	s.updateSchedulerFromUsageStatusesAtScoreRevision(ctx, statuses, scoreRevision)
+}
+
+func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
+	ctx context.Context,
+	statuses []AccountUsageStatus,
+	scoreRevision uint64,
+) {
 	if s.SchedulerRef == nil {
 		return
 	}
@@ -1912,7 +1928,7 @@ func (s Server) updateSchedulerFromUsageStatusesContext(ctx context.Context, sta
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	}
-	s.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration)
+	s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
 }
 
 func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) []AccountUsageStatus {
@@ -2557,6 +2573,7 @@ func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Accou
 	if s.CredentialBroker != nil {
 		return len(loaded), 0, nil
 	}
+	scoreRevision := s.SchedulerRef.ScoreRevision()
 	scoreAccounts := s.ScoreAccounts
 	if scoreAccounts == nil {
 		scoreAccounts = s.scoreAccounts
@@ -2572,7 +2589,7 @@ func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Accou
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	}
-	if !s.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
+	if !s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision) {
 		if s.Logger != nil {
 			s.Logger.Debug("account reload usage score update discarded after a newer account reload")
 		}
