@@ -587,7 +587,7 @@ func serve(args []string) error {
 
 	codexStore := accounts.DefaultCodexStore()
 	claudeStore := agentclaude.DefaultStore()
-	oauthSources := []proxy.OAuthAccountSource{agentkimi.DefaultStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var codexAccounts, claudeAccounts []accounts.Account

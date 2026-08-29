@@ -149,6 +149,11 @@ func TestTenantServerScopesKimiProfilesToTenantState(t *testing.T) {
 	if store.ManagedDir != wantDir || filepath.Dir(store.Path) != wantDir {
 		t.Fatalf("tenant Kimi store = path %q managed %q, want root %q", store.Path, store.ManagedDir, wantDir)
 	}
+	if _, err := store.RefreshAccount(t.Context(), http.DefaultClient, accounts.Account{
+		ID: "kimi-code", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth,
+	}); err == nil || !strings.Contains(err.Error(), "not routable") {
+		t.Fatalf("tenant singleton Kimi refresh error = %v", err)
+	}
 	installed, err := store.SaveManagedCredential("work", agentkimi.CredentialInfo{
 		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
 	})

@@ -356,6 +356,81 @@ func TestKimiListPrintsHealthyProfilesAlongsidePartialWarning(t *testing.T) {
 	}
 }
 
+func TestKimiListMarksInteractiveCLICredentialNotRouted(t *testing.T) {
+	root := t.TempDir()
+	kimiHome := filepath.Join(root, "kimi-home")
+	t.Setenv("KIMI_CODE_HOME", kimiHome)
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	path := filepath.Join(kimiHome, "credentials", "kimi-code.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"access_token":"cli-access","refresh_token":"cli-refresh","expires_at":4102444800}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}, out: &out}
+	if err := runner.kimiCommand(t.Context(), []string{"list"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "kimi-code (Kimi CLI; not routed; Kimi Code)") {
+		t.Fatalf("Kimi list did not mark the interactive credential CLI-only:\n%s", out.String())
+	}
+}
+
+func TestFetchUsageRowsExcludesKimiCLICredentialWithoutRefreshingIt(t *testing.T) {
+	root := t.TempDir()
+	kimiHome := filepath.Join(root, "kimi-home")
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("KIMI_CODE_HOME", kimiHome)
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
+	path := filepath.Join(kimiHome, "credentials", "kimi-code.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before := []byte(`{"access_token":"cli-stale","refresh_token":"cli-refresh","expires_at":1}`)
+	if err := os.WriteFile(path, before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	client := &http.Client{Transport: srRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return nil, errors.New("unexpected network request")
+	})}
+	runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}, client: client}
+	rows, err := runner.fetchUsageRows(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.provider == accounts.ProviderKimi && row.email == "kimi-code" {
+			t.Fatalf("status exposed non-routable interactive Kimi credential: %+v", row)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("status made %d request(s) for the CLI-only credential", requests)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("status changed the interactive Kimi CLI credential bytes")
+	}
+	var out bytes.Buffer
+	printKimiCLIOnlyStatusHint(&out, nil)
+	if !strings.Contains(out.String(), "sr kimi login <label>") {
+		t.Fatalf("status hint is not actionable: %q", out.String())
+	}
+	out.Reset()
+	printKimiCLIOnlyStatusHint(&out, []srUsageRow{{
+		email: "kimi-subscription:work", provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth,
+	}})
+	if out.Len() != 0 {
+		t.Fatalf("status showed CLI-only hint alongside a routable managed profile: %q", out.String())
+	}
+}
+
 func (f fakeKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {
 	return f.accounts, f.err
 }

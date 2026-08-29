@@ -1002,6 +1002,55 @@ func TestHandlerFailsOverBetweenKimiSubscriptionAccounts(t *testing.T) {
 	}
 }
 
+func TestKimiStickySessionOnFormerCLIAccountHealsToManagedProfile(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer managed-token" {
+			t.Fatalf("upstream Authorization = %q, want managed profile", got)
+		}
+		_, _ = io.WriteString(w, `{"id":"msg_ok","content":[]}`)
+	}))
+	defer upstream.Close()
+
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "former-kimi-cli-session"
+	if _, err := sessions.Put("kimi", sessionID, "kimi-code", ""); err != nil {
+		t.Fatal(err)
+	}
+	managed := accounts.Account{
+		ID: "kimi-subscription:work", Provider: accounts.ProviderKimi,
+		AuthMode: accounts.AuthModeOAuth, Token: "managed-token",
+	}
+	server := Server{
+		Accounts: []accounts.Account{managed}, Sessions: sessions,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		KimiUpstream: mustParseURL(t, upstream.URL+"/coding/v1"), MaxBodyBytes: 1024,
+		ScoreAccounts: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
+			return []selectacct.Score{{
+				AccountID: managed.ID, Provider: accounts.ProviderKimi,
+				Headroom: 1, ShortHeadroom: 1, Fresh: true,
+			}}, 1
+		},
+		RefreshAccountFn: func(_ context.Context, acct accounts.Account) (accounts.Account, error) {
+			return acct, nil
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/kimi/v1/messages", strings.NewReader(`{"model":"kimi-for-coding","messages":[]}`))
+	request.Header.Set("X-Subrouter-Agent", "kimi")
+	request.Header.Set("X-Subrouter-Session", sessionID)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	assignment, ok := sessions.Get("kimi", sessionID)
+	if !ok || assignment.AccountID != managed.ID {
+		t.Fatalf("sticky assignment = %+v, want managed profile", assignment)
+	}
+}
+
 func TestKimiUsageLimitClassificationMatchesOfficialErrors(t *testing.T) {
 	tests := []struct {
 		name      string

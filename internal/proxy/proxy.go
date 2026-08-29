@@ -367,7 +367,7 @@ func (r *AccountRef) kimiStore() agentkimi.Store {
 			}
 		}
 	}
-	return agentkimi.DefaultStore()
+	return agentkimi.ServingStore()
 }
 
 // OAuthAccountSource is one provider's OAuth credential store. Claude and
@@ -642,11 +642,12 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 	for i, source := range configuredSources {
 		switch store := source.(type) {
 		case agentkimi.Store:
+			store = store.ForServing()
 			store.RefreshTransaction = refreshTransaction
 			configuredSources[i] = store
 		case *agentkimi.Store:
 			if store != nil {
-				clone := *store
+				clone := store.ForServing()
 				clone.RefreshTransaction = refreshTransaction
 				configuredSources[i] = &clone
 			}

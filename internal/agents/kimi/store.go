@@ -61,6 +61,10 @@ type Store struct {
 	// RefreshTransaction serializes a refresh write with account add/remove
 	// transactions. The proxy supplies its cross-process account-state lock.
 	RefreshTransaction func(context.Context, func() error) error
+	// managedOnly keeps the interactive Kimi CLI credential outside a serving
+	// account pool. Its rotating refresh-token chain belongs to the CLI; a
+	// daemon that redeems it can silently sign the interactive client out.
+	managedOnly bool
 }
 
 var deviceIDMu sync.Mutex
@@ -166,6 +170,20 @@ func (s Store) deviceID() (string, error) {
 
 func DefaultStore() Store {
 	return Store{}
+}
+
+// ServingStore returns the durable Subrouter-owned account source used by the
+// proxy and status surfaces. The official CLI's one global login is deliberately
+// excluded; users enroll an independent routable profile with `sr kimi login`.
+func ServingStore() Store {
+	return DefaultStore().ForServing()
+}
+
+// ForServing preserves custom paths while applying the managed-only serving
+// boundary. It is primarily useful for tenant stores and regression tests.
+func (s Store) ForServing() Store {
+	s.managedOnly = true
+	return s
 }
 
 func (s Store) cliHome() (string, error) {
@@ -323,17 +341,20 @@ func (s Store) Provider() account.Provider {
 	return account.ProviderKimi
 }
 
-// ListAccounts surfaces the CLI credential as one account, or none when the
-// CLI is not signed in. An unreadable credential is an error: silently
-// dropping it would look identical to being signed out.
+// ListAccounts surfaces managed profiles and, for account-manager callers,
+// the CLI credential. Serving stores never inspect or return that singleton.
+// An unreadable included credential is an error: silently dropping it would
+// look identical to being signed out.
 func (s Store) ListAccounts(_ context.Context) ([]account.Account, error) {
-	credential, ok, err := s.ReadLocalCredential(time.Now())
 	result := make([]account.Account, 0, 1)
 	var listErrors []error
-	if err != nil {
-		listErrors = append(listErrors, fmt.Errorf("read Kimi CLI credential: %w", err))
-	} else if ok {
-		result = append(result, credentialAccount(accountID, "Kimi Code", "kimi-code credentials file", credential))
+	if !s.managedOnly {
+		credential, ok, err := s.ReadLocalCredential(time.Now())
+		if err != nil {
+			listErrors = append(listErrors, fmt.Errorf("read Kimi CLI credential: %w", err))
+		} else if ok {
+			result = append(result, credentialAccount(accountID, "Kimi Code", "kimi-code credentials file", credential))
+		}
 	}
 	dir := s.managedDir()
 	if dir == "" {
@@ -381,11 +402,13 @@ func (s Store) ListAccounts(_ context.Context) ([]account.Account, error) {
 // dangling symlinks that ListAccounts cannot route.
 func (s Store) AccountInventoryIDs(_ context.Context) ([]string, error) {
 	var ids []string
-	if path := s.credentialPath(); path != "" {
-		if _, err := os.Lstat(path); err == nil {
-			ids = append(ids, accountID)
-		} else if !os.IsNotExist(err) {
-			return nil, err
+	if !s.managedOnly {
+		if path := s.credentialPath(); path != "" {
+			if _, err := os.Lstat(path); err == nil {
+				ids = append(ids, accountID)
+			} else if !os.IsNotExist(err) {
+				return nil, err
+			}
 		}
 	}
 	dir := s.managedDir()
@@ -556,6 +579,9 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 func (s Store) accountCredentialPath(id string) (path, label, source string, err error) {
 	id = strings.TrimSpace(id)
 	if id == "" || id == accountID {
+		if s.managedOnly {
+			return "", "", "", fmt.Errorf("Kimi CLI credential is not routable; add an isolated profile with sr kimi login <label>")
+		}
 		return s.credentialPath(), "Kimi Code", "kimi-code credentials file", nil
 	}
 	filename, err := managedFilename(id)
