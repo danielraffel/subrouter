@@ -371,6 +371,40 @@ func (s Store) ListAccounts(_ context.Context) ([]account.Account, error) {
 	return result, errors.Join(listErrors...)
 }
 
+// AccountInventoryCount counts durable Kimi credential entries without
+// parsing them. Capacity checks must include malformed credentials too: they
+// still occupy managed state and must remain repairable in place.
+func (s Store) AccountInventoryCount(_ context.Context) (int, error) {
+	count := 0
+	if path := s.credentialPath(); path != "" {
+		if _, err := os.Lstat(path); err == nil {
+			count++
+		} else if !os.IsNotExist(err) {
+			return 0, err
+		}
+	}
+	dir := s.managedDir()
+	if dir == "" {
+		return count, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return count, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if _, valid := managedAccountID(entry.Name()); valid {
+			count++
+		}
+	}
+	return count, nil
+}
+
 // refreshMu serializes refreshes process-wide. Whether Kimi's refresh token is
 // single-use is unproven, but Claude's is, and a concurrent double-redemption
 // of a single-use token invalidates the credential for both the proxy and the

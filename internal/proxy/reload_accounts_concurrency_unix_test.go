@@ -19,6 +19,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
@@ -224,6 +225,103 @@ func TestConcurrentWorkerGenerationImportsShareCapacityLimit(t *testing.T) {
 	}
 	if len(stored) != maxAccountImportAccounts {
 		t.Fatalf("concurrent imports stored %d accounts, want %d", len(stored), maxAccountImportAccounts)
+	}
+}
+
+func TestConcurrentWorkerKimiImportsShareFreshAllProviderCapacity(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	for index := 0; index < maxAccountImportAccounts-1; index++ {
+		account := accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}
+		if err := codexStore.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	kimiStore := agentkimi.Store{
+		Path:       filepath.Join(root, "kimi", "cli.json"),
+		ManagedDir: filepath.Join(root, "kimi", "managed"),
+	}
+	refs := []*AccountRef{
+		NewAccountRef(codexStore, nil, nil),
+		NewAccountRef(codexStore, nil, nil),
+	}
+	handlers := make([]http.Handler, 0, len(refs))
+	for _, ref := range refs {
+		ref.claudeStore = claudeStore
+		ref.oauthSources = []OAuthAccountSource{kimiStore}
+		handlers = append(handlers, Server{AccountRef: ref, AdminToken: "secret"}.Handler())
+	}
+
+	lockPath := filepath.Join(codexStore.StoreDir(), ".account-import.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := make(chan int, len(handlers))
+	for index, handler := range handlers {
+		input := accountImportRequest{
+			Provider: accounts.ProviderKimi,
+			Kimi: &kimiAccountImport{
+				Label: fmt.Sprintf("kimi-%d", index),
+				Credential: agentkimi.CredentialInfo{
+					AccessToken: "access", RefreshToken: "refresh",
+					OAuthDeviceID: fmt.Sprintf("device-%d", index), ExpiresAt: time.Now().Add(time.Hour),
+				},
+			},
+		}
+		payload, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			responses <- serveProtectedAccountImport(handler, payload).Code
+		}()
+	}
+	select {
+	case status := <-responses:
+		t.Fatalf("worker import bypassed the shared transaction lock with status %d", status)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := make([]int, 0, len(handlers))
+	for range handlers {
+		select {
+		case status := <-responses:
+			statuses = append(statuses, status)
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker Kimi import remained blocked after transaction unlock")
+		}
+	}
+	sort.Ints(statuses)
+	want := []int{http.StatusOK, http.StatusInsufficientStorage}
+	sort.Ints(want)
+	if !slices.Equal(statuses, want) {
+		t.Fatalf("concurrent Kimi import statuses = %v, want %v", statuses, want)
+	}
+	managed, err := kimiStore.ListAccounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(managed) != 1 {
+		t.Fatalf("concurrent imports stored %d Kimi accounts, want 1", len(managed))
 	}
 }
 

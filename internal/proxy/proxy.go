@@ -2153,8 +2153,14 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 					return nil
 				}, nil
 			}
-			if err := s.ensureOAuthSourceAccountImportCapacity(accounts.ProviderKimi, id); err != nil {
+			exists, err := store.ManagedAccountExists(label)
+			if err != nil {
 				return "", nil, err
+			}
+			if !exists {
+				if err := s.ensureOAuthSourceAccountImportCapacity(ctx, accounts.ProviderKimi, id); err != nil {
+					return "", nil, err
+				}
 			}
 			return id, func() error {
 				_, err := store.SaveManagedCredential(label, credential)
@@ -2168,7 +2174,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			if err != nil {
 				return "", nil, err
 			}
-			canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+			canonicalID, err := s.ensureAccountImportCapacity(ctx, account.Email, false)
 			if err != nil {
 				return "", nil, err
 			}
@@ -2180,7 +2186,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 				if err != nil {
 					return "", nil, err
 				}
-				canonicalName, err := s.ensureAccountImportCapacity(name, true)
+				canonicalName, err := s.ensureAccountImportCapacity(ctx, name, true)
 				if err != nil {
 					return "", nil, err
 				}
@@ -2195,7 +2201,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 			if err != nil {
 				return "", nil, err
 			}
-			canonicalID, err := s.ensureAccountImportCapacity(account.Email, false)
+			canonicalID, err := s.ensureAccountImportCapacity(ctx, account.Email, false)
 			if err != nil {
 				return "", nil, err
 			}
@@ -2240,28 +2246,27 @@ func (s Server) installAccountMutation(
 	if err := s.AccountRef.advanceDiskGeneration(); err != nil {
 		return "", err
 	}
-	if err := mutate(); err != nil {
-		return "", err
+	mutationErr := mutate()
+	loaded, accountGeneration, reloadErr := s.AccountRef.ReloadSnapshot()
+	if reloadErr == nil {
+		if s.SchedulerRef != nil {
+			s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+		}
+		s.AccountRef.InvalidateUsageStatusCache()
 	}
-	loaded, accountGeneration, err := s.AccountRef.ReloadSnapshot()
-	if err != nil {
-		return "", err
-	}
-	if s.SchedulerRef != nil {
-		s.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
-	}
-	if closeErr := transactionLock.Close(); closeErr != nil {
-		return "", closeErr
-	}
+	closeErr := transactionLock.Close()
 	transactionLock = nil
-	if _, _, err := s.finishAccountReload(ctx, loaded, accountGeneration); err != nil {
+	var finishErr error
+	if reloadErr == nil {
+		_, _, finishErr = s.finishAccountReload(ctx, loaded, accountGeneration)
+	}
+	if err := errors.Join(mutationErr, reloadErr, closeErr, finishErr); err != nil {
 		return "", err
 	}
-	s.AccountRef.InvalidateUsageStatusCache()
 	return accountID, nil
 }
 
-func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool) (string, error) {
+func (s Server) ensureAccountImportCapacity(ctx context.Context, accountID string, claudeProfile bool) (string, error) {
 	stored, err := s.AccountRef.store.ListStored()
 	if err != nil {
 		return "", err
@@ -2280,23 +2285,79 @@ func (s Server) ensureAccountImportCapacity(accountID string, claudeProfile bool
 			}
 		}
 	}
-	if len(stored)+len(profiles) >= maxAccountImportAccounts {
+	_, count, err := s.accountImportInventory(ctx)
+	if err != nil {
+		return "", err
+	}
+	if count >= maxAccountImportAccounts {
 		return "", &accountImportCapacityError{}
 	}
 	return accountID, nil
 }
 
-func (s Server) ensureOAuthSourceAccountImportCapacity(provider accounts.Provider, accountID string) error {
-	all := s.AccountRef.All()
+func (s Server) ensureOAuthSourceAccountImportCapacity(ctx context.Context, provider accounts.Provider, accountID string) error {
+	all, count, err := s.accountImportInventory(ctx)
+	if err != nil {
+		return err
+	}
 	for _, acct := range all {
 		if acct.Provider == provider && strings.EqualFold(acct.ID, accountID) {
 			return nil
 		}
 	}
-	if len(all) >= maxAccountImportAccounts {
+	if count >= maxAccountImportAccounts {
 		return &accountImportCapacityError{}
 	}
 	return nil
+}
+
+// accountImportInventory reads every credential source while the caller holds
+// the cross-process import transaction. Counting the in-memory snapshot here
+// makes the limit order-dependent and lets another worker's completed import,
+// or an OAuth-source account, disappear from the capacity decision.
+type oauthAccountInventoryCounter interface {
+	AccountInventoryCount(context.Context) (int, error)
+}
+
+func (s Server) accountImportInventory(ctx context.Context) ([]accounts.Account, int, error) {
+	stored, err := s.AccountRef.store.ListStored()
+	if err != nil {
+		return nil, 0, err
+	}
+	all, err := s.AccountRef.store.List()
+	if err != nil {
+		return nil, 0, err
+	}
+	profileCount, err := s.AccountRef.claudeStore.ProfileInventoryCount()
+	if err != nil {
+		return nil, 0, fmt.Errorf("count Claude profiles for import capacity: %w", err)
+	}
+	count := len(stored) + profileCount
+	claudeAccounts, _ := s.AccountRef.claudeStore.ListAccounts(ctx)
+	all = append(all, claudeAccounts...)
+	for _, source := range s.AccountRef.oauthSources {
+		sourceAccounts, sourceErr := source.ListAccounts(ctx)
+		all = append(all, sourceAccounts...)
+		sourceCount := len(sourceAccounts)
+		if counter, ok := source.(oauthAccountInventoryCounter); ok {
+			durableCount, countErr := counter.AccountInventoryCount(ctx)
+			if countErr != nil {
+				// A multi-account store has an unbounded unknown size when its
+				// durable inventory cannot be read. New distinct imports must
+				// fail closed; callers establish in-place repairs before here.
+				return nil, 0, fmt.Errorf("count %s accounts for import capacity: %w", source.Provider(), countErr)
+			}
+			if durableCount > sourceCount {
+				sourceCount = durableCount
+			}
+		} else if sourceErr != nil {
+			// Single-credential sources (Grok and Antigravity) return no
+			// account when their credential is unreadable. Reserve its slot.
+			sourceCount++
+		}
+		count += sourceCount
+	}
+	return all, count, nil
 }
 
 func validateStoredAccountImport(provider accounts.Provider, account accounts.StoredCodexAccount) (accounts.StoredCodexAccount, error) {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
 
 func TestAccountImportPreflightRequiresProtectedRemoteAccess(t *testing.T) {
@@ -772,6 +774,281 @@ func TestAccountImportCapsDistinctAccountsButAllowsCredentialRotation(t *testing
 	}
 	if len(stored) != accountLimit {
 		t.Fatalf("case-variant rotation created a distinct pool entry: got %d accounts, want %d", len(stored), accountLimit)
+	}
+}
+
+func TestAccountImportCapacityCountsEveryProviderFromDisk(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	for index := 0; index < maxAccountImportAccounts-2; index++ {
+		account := accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}
+		if err := codexStore.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if _, err := claudeStore.UpsertCredentialProfile("claude-work", agentclaude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	kimiStore := agentkimi.Store{
+		Path:       filepath.Join(root, "kimi", "cli.json"),
+		ManagedDir: filepath.Join(root, "kimi", "managed"),
+	}
+	if _, err := kimiStore.SaveManagedCredential("kimi-work", agentkimi.CredentialInfo{
+		AccessToken: "kimi-access", RefreshToken: "kimi-refresh",
+		OAuthDeviceID: "device-kimi-work", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	ref.oauthSources = []OAuthAccountSource{kimiStore}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	newAccount := accounts.StoredCodexAccount{
+		Email:    "apikey:over-mixed-limit",
+		Provider: accounts.ProviderCodex,
+		Auth:     accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-over-mixed-limit"},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": newAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want 507, body = %s", response.Code, response.Body.String())
+	}
+	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGeneration != beforeGeneration {
+		t.Fatal("mixed-provider capacity rejection published an account generation")
+	}
+}
+
+func TestAccountImportCapacityCountsUnreadableClaudeProfiles(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	for index := 0; index < maxAccountImportAccounts-1; index++ {
+		account := accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}
+		if err := codexStore.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.RegisterProfile("unreadable", "unreadable"); err != nil {
+		t.Fatal(err)
+	}
+	if accounts, err := claudeStore.ListAccounts(t.Context()); err != nil || len(accounts) != 0 {
+		t.Fatalf("unreadable Claude fixture accounts = %d, err = %v", len(accounts), err)
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	newAccount := accounts.StoredCodexAccount{
+		Email: "apikey:over-unreadable-limit", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-over-unreadable-limit"},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": newAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want 507, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAccountImportCapacityCountsUnroutableStoredAccounts(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	for index := 0; index < maxAccountImportAccounts-1; index++ {
+		account := accounts.StoredCodexAccount{
+			Email:    fmt.Sprintf("apikey:seed-%03d", index),
+			Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{
+				AuthMode: "apikey", OpenAIAPIKey: fmt.Sprintf("sk-seed-%03d", index),
+			},
+		}
+		if err := store.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unroutable := accounts.StoredCodexAccount{
+		Email:    "apikey:unroutable",
+		Provider: accounts.ProviderCodex,
+		Auth:     accounts.CodexAuthFile{AuthMode: "apikey"},
+	}
+	if err := store.SaveStored(unroutable); err != nil {
+		t.Fatal(err)
+	}
+	routable, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routable) != maxAccountImportAccounts-1 {
+		t.Fatalf("routable fixture count = %d, want %d", len(routable), maxAccountImportAccounts-1)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	newAccount := accounts.StoredCodexAccount{
+		Email: "apikey:over-unroutable-limit", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-over-unroutable-limit"},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": newAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want 507, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPartialOAuthInventoryErrorDoesNotBlockOtherProviderImport(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	kimiStore := agentkimi.Store{
+		Path:       filepath.Join(root, "kimi", "cli.json"),
+		ManagedDir: filepath.Join(root, "kimi", "managed"),
+	}
+	credential := agentkimi.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh",
+		OAuthDeviceID: "device", ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if _, err := kimiStore.SaveManagedCredential("broken", credential); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(kimiStore.ManagedDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("broken Kimi fixture entries = %d, err = %v", len(entries), err)
+	}
+	brokenPath := filepath.Join(kimiStore.ManagedDir, entries[0].Name())
+	if _, err := kimiStore.SaveManagedCredential("healthy", credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(brokenPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	partial, listErr := kimiStore.ListAccounts(t.Context())
+	if listErr == nil || len(partial) != 1 {
+		t.Fatalf("partial Kimi fixture accounts = %d, err = %v", len(partial), listErr)
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	ref.oauthSources = []OAuthAccountSource{kimiStore}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	newAccount := accounts.StoredCodexAccount{
+		Email: "apikey:new", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-new"},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": newAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusOK {
+		t.Fatalf("partial OAuth inventory blocked Codex import: status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestUnreadableMultiAccountOAuthInventoryFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	kimiStore := agentkimi.Store{
+		Path:       filepath.Join(root, "kimi", "cli.json"),
+		ManagedDir: filepath.Join(root, "kimi", "managed"),
+	}
+	if err := os.MkdirAll(filepath.Dir(kimiStore.ManagedDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kimiStore.ManagedDir, []byte("not-a-directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	ref.oauthSources = []OAuthAccountSource{kimiStore}
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	newAccount := accounts.StoredCodexAccount{
+		Email: "apikey:new", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-new"},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": newAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+	}
+	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGeneration != beforeGeneration {
+		t.Fatal("unreadable durable inventory published an account generation")
+	}
+}
+
+func TestUnreadableClaudeRegistryInventoryFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := os.MkdirAll(claudeStore.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(claudeStore.ProfilesPath(), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.claudeStore = claudeStore
+	handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+	newAccount := accounts.StoredCodexAccount{
+		Email: "apikey:new", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sk-new"},
+	}
+	payload, err := json.Marshal(map[string]any{"provider": "codex", "codex": newAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveProtectedAccountImport(handler, payload)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500, body = %s", response.Code, response.Body.String())
+	}
+	afterGeneration, err := readAccountDiskGeneration(codexStore.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGeneration != beforeGeneration {
+		t.Fatal("unreadable Claude registry published an account generation")
 	}
 }
 

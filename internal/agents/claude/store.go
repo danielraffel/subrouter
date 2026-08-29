@@ -402,6 +402,25 @@ func (s Store) ListProfiles() []Profile {
 	return out
 }
 
+// ProfileInventoryCount returns the durable number of registered profiles and
+// reports malformed or unreadable registry state. Routing can skip one broken
+// credential, but capacity enforcement must not silently erase every profile
+// when the registry itself cannot be inspected.
+func (s Store) ProfileInventoryCount() (int, error) {
+	body, err := readFileForAtomicReplace(s.ProfilesPath())
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var data profilesFile
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, err
+	}
+	return len(data.Profiles), nil
+}
+
 func (s Store) ListAccounts(ctx context.Context) ([]accounts.Account, error) {
 	profiles := s.ListProfiles()
 	out := make([]accounts.Account, 0, len(profiles))

@@ -1062,7 +1062,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			},
 		}
 		prepare = func() (string, func() error, error) {
-			canonicalID, err := server.ensureAccountImportCapacity(account.Email, false)
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), account.Email, false)
 			if err != nil {
 				return "", nil, err
 			}
@@ -1091,7 +1091,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
 		}
 		prepare = func() (string, func() error, error) {
-			canonicalID, err := server.ensureAccountImportCapacity(account.Email, false)
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), account.Email, false)
 			if err != nil {
 				return "", nil, err
 			}
@@ -1109,7 +1109,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			return
 		}
 		prepare = func() (string, func() error, error) {
-			canonicalID, err := server.ensureAccountImportCapacity(id, true)
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), id, true)
 			if err != nil {
 				return "", nil, err
 			}
