@@ -72,6 +72,7 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "api-key")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
 	t.Setenv("ANTHROPIC_BASE_URL", "http://stale-proxy:31415")
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: Bearer stale")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
 
@@ -86,6 +87,7 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_CUSTOM_HEADERS",
 		"CLAUDE_CODE_OAUTH_TOKEN",
 	} {
 		if _, ok := seen[key]; ok {

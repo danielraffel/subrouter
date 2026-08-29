@@ -220,7 +220,7 @@ func (s Store) localCLIDeviceID() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read Kimi Code device identity: %w; run kimi login again", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	body, err := io.ReadAll(io.LimitReader(file, 130))
 	if err != nil {
 		return "", fmt.Errorf("read Kimi Code device identity: %w; run kimi login again", err)
@@ -577,17 +577,6 @@ func credentialAccount(id, label, source string, credential CredentialInfo) acco
 		Token:    credential.AccessToken,
 		Source:   source,
 	}
-}
-
-// writeCredential persists the refreshed credential over the CLI's file,
-// atomically and private, so a crash mid-write cannot truncate the only copy
-// of the refresh token.
-func (s Store) writeCredential(credential CredentialInfo) error {
-	path := s.credentialPath()
-	if path == "" {
-		return fmt.Errorf("no Kimi credential path")
-	}
-	return writeCredential(path, credential)
 }
 
 func writeCredential(path string, credential CredentialInfo) error {

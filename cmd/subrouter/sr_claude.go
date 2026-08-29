@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,13 +107,32 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string) 
 	if proxyToken == "" {
 		proxyToken = "subrouter"
 	}
+	proxyRoot := serverProxyRootURL(server)
+	if err := validateTenantProxyTransport(proxyRoot, server.TenantKey); err != nil {
+		return err
+	}
 	scope := "server:" + strings.TrimSpace(server.Name)
 	if strings.TrimSpace(server.TenantKey) != "" {
 		scope = "tenant:" + strings.TrimSpace(server.TenantKey)
 	} else if strings.TrimSpace(server.TailscaleNodeID) != "" {
 		scope = "tailscale-node:" + strings.TrimSpace(server.TailscaleNodeID)
 	}
-	return r.proxyClaudeArgsTo(ctx, args, serverProxyRootURL(server), proxyToken, scope)
+	return r.proxyClaudeArgsTo(ctx, args, proxyRoot, proxyToken, scope)
+}
+
+func validateTenantProxyTransport(baseURL, tenantKey string) error {
+	if strings.TrimSpace(tenantKey) == "" {
+		return nil
+	}
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Hostname() == "" {
+		return errors.New("tenant-scoped server URL must be absolute")
+	}
+	if strings.EqualFold(parsed.Scheme, "https") ||
+		(strings.EqualFold(parsed.Scheme, "http") && loopbackEndpoint(baseURL)) {
+		return nil
+	}
+	return errors.New("tenant-scoped server URL must use HTTPS, except HTTP on loopback")
 }
 
 // cloudClaude launches Claude against the local proxy. The proxy leases an

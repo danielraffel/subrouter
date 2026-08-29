@@ -289,7 +289,7 @@ func TestRefreshCredentialExchangesTheRefreshToken(t *testing.T) {
 	}
 	for _, want := range []string{"grant_type=refresh_token", "refresh_token=rt", "client_id="} {
 		if !strings.Contains(gotForm, want) {
-			t.Fatalf("request form %q is missing %q", gotForm, want)
+			t.Fatal("refresh request form is missing an expected field")
 		}
 	}
 }
@@ -302,10 +302,14 @@ func TestRefreshCredentialDoesNotReplaySecretsAcrossRedirects(t *testing.T) {
 	defer sink.Close()
 	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if err := request.ParseForm(); err != nil {
-			t.Fatal(err)
+			t.Error("refresh request form could not be parsed")
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
 		}
 		if request.Form.Get("refresh_token") != "refresh-secret" || request.Form.Get("client_secret") != "client-secret" {
-			t.Fatalf("source form = %q", request.Form.Encode())
+			t.Error("refresh request omitted an expected credential field")
+			http.Error(w, "invalid credentials", http.StatusBadRequest)
+			return
 		}
 		http.Redirect(w, request, sink.URL, http.StatusPermanentRedirect)
 	}))

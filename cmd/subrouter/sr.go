@@ -620,7 +620,7 @@ func (r srRunner) grokSignIn(ctx context.Context) error {
 	store := r.grokStore()
 	credential, err := store.Authorize(ctx, r.client, r.out)
 	if err != nil {
-		return fmt.Errorf("Grok login failed: %w", err)
+		return fmt.Errorf("grok login failed: %w", err)
 	}
 	err = proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
 		_, saveErr := store.SaveCredential(credential)

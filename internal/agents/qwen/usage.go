@@ -297,10 +297,6 @@ func shellQuoteArgument(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func readConsoleConfig(accountID string) (consoleConfig, error) {
-	return readConsoleConfigIn(DefaultConsoleRoot(), accountID)
-}
-
 func readConsoleConfigIn(root, accountID string) (consoleConfig, error) {
 	body, err := os.ReadFile(ConsoleConfigPathIn(root, accountID))
 	if err != nil {
@@ -469,11 +465,4 @@ func safeFilename(value string) string {
 	}
 	sum := sha256.Sum256([]byte(value))
 	return out.String() + "-" + fmt.Sprintf("%x", sum[:6])
-}
-
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

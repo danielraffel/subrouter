@@ -489,6 +489,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	if _, err := url.ParseRequestURI(*serverURL); err != nil || *serverURL == "" {
 		return fmt.Errorf("--url must be a valid URL")
 	}
+	if err := validateTenantProxyTransport(*serverURL, *tenantKey); err != nil {
+		return err
+	}
 	if (*gcpInstance == "") != (*gcpZone == "") {
 		return fmt.Errorf("--gcp-instance and --gcp-zone must be set together")
 	}
@@ -523,6 +526,9 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 				}
 				if !tailscaleNodeIDSet && next.URL == previousURL {
 					next.TailscaleNodeID = file.Servers[i].TailscaleNodeID
+				}
+				if err := validateTenantProxyTransport(next.URL, next.TenantKey); err != nil {
+					return err
 				}
 				file.Servers[i] = next
 				replaced = true
@@ -1310,7 +1316,6 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		if status.ProviderModels != nil {
 			row.providerModels = *status.ProviderModels
 		}
-		row.providerHealth = status.ProviderHealth
 		if status.AuthMode == accounts.AuthModeOAuth && status.Provider == accounts.ProviderGrok && status.AuthChecked {
 			row.providerHealth = "auth error"
 			if status.AuthValid {

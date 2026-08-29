@@ -82,6 +82,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	provider := accounts.Provider(input.Provider)
 	if keyedProvider, ok := APIKeyProviderForName(input.Provider); ok {
 		provider = keyedProvider
+		input.Provider = string(keyedProvider)
 	}
 	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude &&
 		provider != accounts.ProviderQwenToken && provider != accounts.ProviderQwenAnthropic {

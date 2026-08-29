@@ -170,7 +170,9 @@ func TestGrokFailoverRetargetsBetweenAPIAndSubscriptionUpstreams(t *testing.T) {
 	apiUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiCalls++
 		if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer api-key" {
-			t.Fatalf("API attempt path=%q authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
+			t.Error("Grok API attempt used an unexpected path or credential")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"message":"quota exceeded"}}`)
@@ -181,7 +183,9 @@ func TestGrokFailoverRetargetsBetweenAPIAndSubscriptionUpstreams(t *testing.T) {
 	subscriptionUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		subscriptionCalls++
 		if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer oauth-token" || r.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
-			t.Fatalf("subscription attempt path=%q authorization=%q marker=%q", r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("X-XAI-Token-Auth"))
+			t.Error("Grok subscription attempt used an unexpected path or credential")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))
@@ -228,7 +232,9 @@ func TestGrokFailoverRetargetsFromSubscriptionToAPIUpstream(t *testing.T) {
 	subscriptionUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		subscriptionCalls++
 		if request.Header.Get("Authorization") != "Bearer oauth-token" || request.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
-			t.Fatalf("subscription authorization=%q marker=%q", request.Header.Get("Authorization"), request.Header.Get("X-XAI-Token-Auth"))
+			t.Error("Grok subscription attempt used an unexpected credential")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"message":"Rate limit exceeded"}}`)
@@ -239,7 +245,9 @@ func TestGrokFailoverRetargetsFromSubscriptionToAPIUpstream(t *testing.T) {
 	apiUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		apiCalls++
 		if request.Header.Get("Authorization") != "Bearer api-key" || request.Header.Get("X-XAI-Token-Auth") != "" {
-			t.Fatalf("API authorization=%q marker=%q", request.Header.Get("Authorization"), request.Header.Get("X-XAI-Token-Auth"))
+			t.Error("Grok API attempt used an unexpected credential")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))
@@ -293,7 +301,9 @@ func TestHandlerFailsOverBetweenDeepSeekAPIKeys(t *testing.T) {
 			return
 		}
 		if auth != "Bearer key-secondary" {
-			t.Fatal("upstream received an unexpected Authorization header")
+			t.Error("upstream received an unexpected credential")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
 	}))

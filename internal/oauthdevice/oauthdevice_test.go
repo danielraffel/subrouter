@@ -48,31 +48,39 @@ func TestRequestCodeParsesTheDeviceAuthorization(t *testing.T) {
 		t.Fatalf("ExpiresAt = %s, want %s", code.ExpiresAt, want)
 	}
 	for _, want := range []string{"client_id=client", "scope=openid", "client_secret=secret"} {
-		if !contains(gotForm, want) {
-			t.Fatalf("device request form %q is missing %q", gotForm, want)
+		if !strings.Contains(gotForm, want) {
+			t.Fatal("device request form is missing an expected field")
 		}
 	}
 }
 
 func TestPostFormDoesNotReplayCredentialsAcrossRedirects(t *testing.T) {
 	var sinkCalls int
+	var parseErr error
+	var gotRefreshToken string
 	sink := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		sinkCalls++
 	}))
 	defer sink.Close()
 	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if err := request.ParseForm(); err != nil {
-			t.Fatal(err)
+			parseErr = err
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
 		}
-		if request.Form.Get("refresh_token") != "refresh-secret" {
-			t.Fatalf("source refresh token = %q", request.Form.Get("refresh_token"))
-		}
+		gotRefreshToken = request.Form.Get("refresh_token")
 		http.Redirect(w, request, sink.URL, http.StatusTemporaryRedirect)
 	}))
 	defer redirector.Close()
 
 	_, err := postForm(t.Context(), redirector.Client(), redirector.URL,
 		map[string][]string{"refresh_token": {"refresh-secret"}}, nil)
+	if parseErr != nil {
+		t.Fatalf("source request form could not be parsed: %v", parseErr)
+	}
+	if gotRefreshToken != "refresh-secret" {
+		t.Fatal("source request omitted the refresh token")
+	}
 	if err == nil || !strings.Contains(err.Error(), "307") {
 		t.Fatalf("postForm error = %v, want rejected redirect", err)
 	}
@@ -376,7 +384,7 @@ func TestRefreshSurfacesInvalidGrant(t *testing.T) {
 	if err == nil {
 		t.Fatal("a revoked refresh token must be an error")
 	}
-	if !contains(err.Error(), "invalid_grant") {
+	if !strings.Contains(err.Error(), "invalid_grant") {
 		t.Fatalf("error %q must carry invalid_grant so the proxy marks the account for re-auth", err)
 	}
 }
@@ -388,15 +396,3 @@ func TestRefreshRejectsAnEmptyToken(t *testing.T) {
 }
 
 func noSleep(context.Context, time.Duration) error { return nil }
-
-func contains(haystack, needle string) bool {
-	return len(haystack) >= len(needle) && (haystack == needle || len(needle) == 0 ||
-		func() bool {
-			for i := 0; i+len(needle) <= len(haystack); i++ {
-				if haystack[i:i+len(needle)] == needle {
-					return true
-				}
-			}
-			return false
-		}())
-}

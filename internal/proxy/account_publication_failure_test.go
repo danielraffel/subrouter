@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 type transactionLockingOAuthSource struct {
 	storeDir string
 	entered  chan struct{}
+	once     sync.Once
 	account  accounts.Account
 }
 
@@ -34,7 +36,7 @@ func (s *transactionLockingOAuthSource) ListAccounts(context.Context) ([]account
 }
 
 func (s *transactionLockingOAuthSource) RefreshAccount(ctx context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
-	close(s.entered)
+	s.once.Do(func() { close(s.entered) })
 	lock, err := lockAccountImportTransaction(ctx, s.storeDir)
 	if err != nil {
 		return account, err

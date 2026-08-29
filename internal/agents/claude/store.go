@@ -1065,6 +1065,7 @@ func EnvForConfigDir(instancePath string) []string {
 		"ANTHROPIC_API_KEY":        true,
 		"ANTHROPIC_AUTH_TOKEN":     true,
 		"ANTHROPIC_BASE_URL":       true,
+		"ANTHROPIC_CUSTOM_HEADERS": true,
 		"CLAUDE_CODE_OAUTH_TOKEN":  true,
 		"CLAUDE_CONFIG_DIR":        true,
 		"CLAUDE_CODE_API_KEY":      true,

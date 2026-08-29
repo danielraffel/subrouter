@@ -197,6 +197,53 @@ func TestTenantCredentialLeaseUsesTokenPlanAccountWithoutLosingQwenAnthropicTran
 	}
 }
 
+func TestTenantCredentialLeaseCanonicalizesProviderAliasForStickySession(t *testing.T) {
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put(string(accounts.ProviderQwenToken), "session-1", "qwen-token:z-sticky", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "qwen-token:a-other", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "other"},
+			{ID: "qwen-token:z-sticky", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "sticky"},
+		},
+		Sessions:  sessions,
+		Scheduler: selectacct.NewScheduler(nil),
+	}
+	request := httptest.NewRequest(http.MethodPost, "/_subrouter/leases", strings.NewReader(`{
+		"provider":"tokenplan",
+		"sessionId":"session-1",
+		"requiredAuthMode":"apikey"
+	}`))
+	response := httptest.NewRecorder()
+	newTenantCredentialLeaseStore().handleIssue(&server, tenant.Tenant{ID: "team"}, response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Lease struct {
+			AccountID string `json:"accountId"`
+			Provider  string `json:"provider"`
+		} `json:"lease"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Lease.AccountID != "qwen-token:z-sticky" || envelope.Lease.Provider != string(accounts.ProviderQwenToken) {
+		t.Fatalf("canonical sticky lease = %+v", envelope.Lease)
+	}
+	assignment, ok := sessions.Get(string(accounts.ProviderQwenToken), "session-1")
+	if !ok || assignment.AccountID != "qwen-token:z-sticky" {
+		t.Fatalf("canonical sticky assignment = %+v, ok=%v", assignment, ok)
+	}
+	if _, ok := sessions.Get("tokenplan", "session-1"); ok {
+		t.Fatal("provider alias created a second sticky-session namespace")
+	}
+}
+
 func TestTenantCredentialLeaseRejectsUnknownOrMalformedRequests(t *testing.T) {
 	t.Parallel()
 

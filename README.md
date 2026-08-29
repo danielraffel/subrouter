@@ -470,10 +470,25 @@ single-tenant server accepts the non-secret placeholder `subrouter`:
 }
 ```
 
-For a tenant-scoped shared server, use its `/t/<key>` URL and the same tenant
-key as `ANTHROPIC_AUTH_TOKEN`. The `X-Subrouter-Agent: claude` marker is required
-because the unprefixed `/v1/messages` path alone does not identify the agent.
-`sr claude proxy` sets all three values correctly from the selected server.
+For a tenant-scoped shared server, put the tenant key in the URL path and use
+the same key as the auth token:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://router.example/t/srt_REDACTED",
+    "ANTHROPIC_AUTH_TOKEN": "srt_REDACTED",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude"
+  }
+}
+```
+
+Non-loopback tenant servers must use HTTPS; plain HTTP is allowed only on
+loopback for local development. Because `/t/<key>` contains a credential, URL
+logs and diagnostics must redact that path segment. The
+`X-Subrouter-Agent: claude` marker remains required as the agent discriminator;
+it does not replace the tenant path or token. `sr claude proxy` sets all three
+values correctly from the selected server.
 Subrouter then selects a Claude OAuth account from its own store, strips client
 auth before forwarding, and adds the OAuth beta header. Claude Code prompt
 caching does not require Subrouter-specific cache settings: Subrouter keeps the

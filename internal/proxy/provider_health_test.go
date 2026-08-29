@@ -22,7 +22,7 @@ func TestProbeProviderKeyDoesNotForwardCredentialsAcrossRedirects(t *testing.T) 
 
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer test-secret" {
-			t.Fatal("provider probe omitted its credential")
+			t.Error("provider probe omitted its credential")
 		}
 		http.Redirect(w, request, redirectTarget.URL, http.StatusFound)
 	}))

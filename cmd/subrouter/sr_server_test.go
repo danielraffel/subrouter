@@ -51,6 +51,50 @@ func TestSRServerAddStoresGCPServer(t *testing.T) {
 	}
 }
 
+func TestSRServerAddRejectsTenantKeyOverRemoteHTTP(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
+	err := runner.run(context.Background(), []string{
+		"server", "add", "insecure",
+		"--url", "http://router.example:31415",
+		"--tenant-key", testTenantKey,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("server add error = %v, want HTTPS requirement", err)
+	}
+	if _, ok, findErr := defaultSRServerStore(store).find("insecure"); findErr != nil || ok {
+		t.Fatalf("insecure tenant server was stored: ok=%v err=%v", ok, findErr)
+	}
+}
+
+func TestSRServerAddRejectsRemoteHTTPWhenPreservingTenantKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	runner := srRunner{store: store, out: io.Discard, errOut: io.Discard}
+	if err := runner.run(context.Background(), []string{
+		"server", "add", "hosted", "--url", "https://router.example", "--tenant-key", testTenantKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runner.run(context.Background(), []string{
+		"server", "add", "hosted", "--url", "http://100.64.0.1:31415",
+	})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("err = %v", err)
+	}
+	server, ok, findErr := defaultSRServerStore(store).find("hosted")
+	if findErr != nil || !ok {
+		t.Fatalf("server missing after rejected update: %v", findErr)
+	}
+	if server.URL != "https://router.example" || server.TenantKey != testTenantKey {
+		t.Fatalf("server changed after rejected update: %+v", server)
+	}
+}
+
 func TestSRServerStoreUpdateSerializesConcurrentMutations(t *testing.T) {
 	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
 	const writers = 24

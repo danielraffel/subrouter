@@ -295,6 +295,46 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 	}
 }
 
+func TestTenantProxyTransportRequiresHTTPSOffLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		baseURL   string
+		tenantKey string
+		wantErr   bool
+	}{
+		{name: "remote HTTPS", baseURL: "https://router.example/t/srt_team", tenantKey: "srt_team"},
+		{name: "loopback IPv4 HTTP", baseURL: "http://127.0.0.1:31415/t/srt_team", tenantKey: "srt_team"},
+		{name: "loopback localhost HTTP", baseURL: "http://localhost:31415/t/srt_team", tenantKey: "srt_team"},
+		{name: "remote HTTP", baseURL: "http://router.example/t/srt_team", tenantKey: "srt_team", wantErr: true},
+		{name: "remote HTTP without secret", baseURL: "http://router.example", tenantKey: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTenantProxyTransport(tc.baseURL, tc.tenantKey)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateTenantProxyTransport() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSRClaudeProxyRejectsPreviouslyStoredRemoteHTTPTenant(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "insecure",
+		Servers: []srServerConfig{{
+			Name: "insecure", URL: "http://router.example:31415", TenantKey: testTenantKey,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	err := runner.claude(context.Background(), []string{"proxy", "--print", "hello"})
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("Claude proxy error = %v, want HTTPS requirement", err)
+	}
+}
+
 func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	home := t.TempDir()
 	local := healthServer(t, http.StatusOK)

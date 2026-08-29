@@ -66,6 +66,9 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 		}
 		return fmt.Errorf("no default Subrouter server configured; run '%s server use <name>'", r.programOrSubrouter())
 	}
+	if err := validateTenantProxyTransport(serverProxyRootURL(server), server.TenantKey); err != nil {
+		return err
+	}
 	store := claude.DefaultStore()
 	profile, ok, err := store.MatchProfile(name)
 	if err != nil {
@@ -102,6 +105,9 @@ func (r srRunner) uploadServerClaudeProfile(ctx context.Context, server srServer
 // it with pooled credentials; with a tenant key, the key itself is the auth
 // token so the server can scope the request to the tenant's pool.
 func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
+	if err := validateTenantProxyTransport(baseURL, tenantKey); err != nil {
+		return err
+	}
 	settingsPath := filepath.Join(configDir, "settings.json")
 	settings := map[string]any{}
 	if body, err := os.ReadFile(settingsPath); err == nil {

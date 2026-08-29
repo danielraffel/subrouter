@@ -224,7 +224,8 @@ func TestSaveCredentialRejectsIncompleteOrExpiredCredentials(t *testing.T) {
 func TestRefreshAccountKeepsAFreshCredential(t *testing.T) {
 	store := writeCredentialFile(t, credentialFileJSON("at", "rt", time.Now().Add(time.Hour)))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("a credential with life left must not be refreshed")
+		t.Error("a credential with life left must not be refreshed")
+		http.Error(w, "unexpected refresh", http.StatusInternalServerError)
 	}))
 	defer server.Close()
 	stubDiscovery(t, server.URL, server.URL)
@@ -250,7 +251,9 @@ func TestRefreshAccountRefreshesAndWritesBack(t *testing.T) {
 	var gotForm string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			t.Error("refresh request form could not be parsed")
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
 		}
 		gotForm = r.Form.Encode()
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -276,7 +279,7 @@ func TestRefreshAccountRefreshesAndWritesBack(t *testing.T) {
 	}
 	for _, want := range []string{"grant_type=refresh_token", "refresh_token=rt", "client_id=" + oauthClientID} {
 		if !strings.Contains(gotForm, want) {
-			t.Fatalf("request form %q is missing %q", gotForm, want)
+			t.Fatal("refresh request form is missing an expected field")
 		}
 	}
 
@@ -448,16 +451,22 @@ func TestSignInWritesTheCredentialFile(t *testing.T) {
 	var sawDeviceRequest, sawPoll bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
-			t.Fatal(err)
+			t.Error("sign-in request form could not be parsed")
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
 		}
 		switch r.Form.Get("grant_type") {
 		case "": // device-code request carries no grant_type
 			sawDeviceRequest = true
 			if r.Form.Get("client_id") != oauthClientID {
-				t.Fatalf("device request client_id = %q", r.Form.Get("client_id"))
+				t.Error("device request used an unexpected client ID")
+				http.Error(w, "invalid client", http.StatusBadRequest)
+				return
 			}
 			if r.Form.Get("scope") != oauthScope {
-				t.Fatalf("device request scope = %q", r.Form.Get("scope"))
+				t.Error("device request used an unexpected scope")
+				http.Error(w, "invalid scope", http.StatusBadRequest)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"device_code":      "dc",
@@ -469,7 +478,9 @@ func TestSignInWritesTheCredentialFile(t *testing.T) {
 		case "urn:ietf:params:oauth:grant-type:device_code":
 			sawPoll = true
 			if r.Form.Get("device_code") != "dc" {
-				t.Fatalf("poll device_code = %q", r.Form.Get("device_code"))
+				t.Error("device poll used an unexpected device code")
+				http.Error(w, "invalid device code", http.StatusBadRequest)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"access_token":  "signed-in-access",
@@ -479,7 +490,8 @@ func TestSignInWritesTheCredentialFile(t *testing.T) {
 				"expires_in":    3600,
 			})
 		default:
-			t.Fatalf("unexpected grant_type %q", r.Form.Get("grant_type"))
+			t.Error("sign-in request used an unexpected grant type")
+			http.Error(w, "invalid grant", http.StatusBadRequest)
 		}
 	}))
 	defer server.Close()

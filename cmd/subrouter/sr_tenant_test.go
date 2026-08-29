@@ -24,7 +24,7 @@ func TestSRServerAddStoresTenantKey(t *testing.T) {
 	runner := srRunner{store: store, out: &out, errOut: &out}
 	err := runner.run(context.Background(), []string{
 		"server", "add", "hosted",
-		"--url", "http://100.64.0.1:31415",
+		"--url", "https://router.example",
 		"--tenant-key", testTenantKey,
 	})
 	if err != nil {
@@ -41,7 +41,7 @@ func TestSRServerAddStoresTenantKey(t *testing.T) {
 	// Updating other metadata without --tenant-key preserves the stored key.
 	err = runner.run(context.Background(), []string{
 		"server", "add", "hosted",
-		"--url", "http://100.64.0.1:31415",
+		"--url", "https://router.example",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestTenantScopedBaseURLs(t *testing.T) {
 
 func TestWriteClaudeProxyEnvTenantKeySetsAuthToken(t *testing.T) {
 	dir := t.TempDir()
-	if err := writeClaudeProxyEnv(dir, "http://host:31415/t/"+testTenantKey, testTenantKey); err != nil {
+	if err := writeClaudeProxyEnv(dir, "https://host.example/t/"+testTenantKey, testTenantKey); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(filepath.Join(dir, "settings.json"))
@@ -111,7 +111,7 @@ func TestWriteClaudeProxyEnvTenantKeySetsAuthToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := settings["env"].(map[string]any)
-	if env["ANTHROPIC_BASE_URL"] != "http://host:31415/t/"+testTenantKey {
+	if env["ANTHROPIC_BASE_URL"] != "https://host.example/t/"+testTenantKey {
 		t.Fatalf("base url = %v", env["ANTHROPIC_BASE_URL"])
 	}
 	if env["ANTHROPIC_AUTH_TOKEN"] != testTenantKey {
@@ -162,7 +162,7 @@ func TestSRTenantLocalCreateListRevoke(t *testing.T) {
 func TestWriteClaudeProxyEnvClearsStaleTenantKey(t *testing.T) {
 	dir := t.TempDir()
 	// Profile previously pointed at a tenant-scoped server.
-	if err := writeClaudeProxyEnv(dir, "http://host:31415/t/"+testTenantKey, testTenantKey); err != nil {
+	if err := writeClaudeProxyEnv(dir, "https://host.example/t/"+testTenantKey, testTenantKey); err != nil {
 		t.Fatal(err)
 	}
 	// Switching back to a non-tenant server must not keep sending the old key.
