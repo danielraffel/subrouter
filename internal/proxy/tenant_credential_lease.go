@@ -196,7 +196,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 			return
 		}
 		lease := tenantCredentialLease{
-			accountID: account.ID, provider: provider, authMode: account.AuthMode,
+			accountID: account.ID, provider: schedulerAccountProvider(provider), authMode: account.AuthMode,
 			credentialIdentity: account.CredentialIdentity(),
 			agentType:          tenantCredentialLeaseAgentType(input, provider),
 			sessionID:          input.SessionID,
@@ -359,10 +359,7 @@ func selectTenantCredentialLeaseAccount(
 			}
 		}
 		if server.Sessions != nil {
-			agentType := input.AgentType
-			if agentType == "" {
-				agentType = string(provider)
-			}
+			agentType := tenantCredentialLeaseAgentType(input, provider)
 			if _, err := server.Sessions.Put(agentType, input.SessionID, refreshed.ID, input.UserEmail); err != nil {
 				return accounts.Account{}, 0, &tenantCredentialLeasePersistenceError{err: err}
 			}
@@ -436,10 +433,7 @@ func pickTenantCredentialLeaseAccount(
 		}
 	}
 	if server.Sessions != nil {
-		agentType := input.AgentType
-		if agentType == "" {
-			agentType = input.Provider
-		}
+		agentType := tenantCredentialLeaseAgentType(input, provider)
 		if assignment, ok := server.Sessions.Get(agentType, input.SessionID); ok {
 			if sticky, found := findAccount(candidates, assignment.AccountID); found {
 				return sticky, nil
@@ -479,7 +473,7 @@ func tenantCredentialLeaseAgentType(
 	if agentType := session.NormalizeAgentType(input.AgentType); agentType != "" {
 		return agentType
 	}
-	return string(provider)
+	return string(schedulerAccountProvider(provider))
 }
 
 func tenantCredentialLeaseSchedulerRetryAt(
@@ -628,7 +622,7 @@ func (s *tenantCredentialLeaseStore) consumeReport(
 	key := tenantCredentialLeaseAvoidanceKey{
 		agentType: lease.agentType, sessionID: lease.sessionID,
 		sessionToken: lease.sessionToken,
-		provider:     lease.provider, accountID: lease.accountID,
+		provider:     schedulerAccountProvider(lease.provider), accountID: lease.accountID,
 	}
 	if normalized.Scope == broker.LeaseCooldownQuota {
 		// lease.model is canonicalized once, when the lease is issued. Re-running
@@ -653,7 +647,7 @@ func (s *tenantCredentialLeaseStore) consumeReport(
 		if candidate.agentType == lease.agentType &&
 			candidate.sessionID == lease.sessionID &&
 			candidate.sessionToken == lease.sessionToken &&
-			candidate.provider == lease.provider &&
+			schedulerAccountProvider(candidate.provider) == schedulerAccountProvider(lease.provider) &&
 			candidate.accountID == lease.accountID &&
 			(normalized.Scope != broker.LeaseCooldownQuota || candidate.model == lease.model) {
 			delete(s.leases, candidateID)
@@ -718,6 +712,7 @@ func (s *tenantCredentialLeaseStore) resolveSessionToken(
 	defer s.mu.Unlock()
 	s.pruneLocked(now)
 	agentType := tenantCredentialLeaseAgentType(input, provider)
+	provider = schedulerAccountProvider(provider)
 	if existing, ok := s.sessions[input.SessionToken]; ok &&
 		existing.agentType == agentType && existing.sessionID == input.SessionID &&
 		existing.provider == provider {
@@ -817,7 +812,7 @@ func (s *tenantCredentialLeaseStore) putLocked(id string, lease tenantCredential
 		}
 		session = tenantCredentialLeaseSession{
 			agentType: lease.agentType, sessionID: lease.sessionID,
-			provider: lease.provider,
+			provider: schedulerAccountProvider(lease.provider),
 		}
 	}
 	if lease.sessionToken != "" {
@@ -899,7 +894,7 @@ func (s *tenantCredentialLeaseStore) avoidanceUntilLeaseKeysLocked(
 	base := tenantCredentialLeaseAvoidanceKey{
 		agentType: lease.agentType, sessionID: lease.sessionID,
 		sessionToken: lease.sessionToken,
-		provider:     lease.provider, accountID: lease.accountID,
+		provider:     schedulerAccountProvider(lease.provider), accountID: lease.accountID,
 	}
 	keys := []tenantCredentialLeaseAvoidanceKey{
 		base,

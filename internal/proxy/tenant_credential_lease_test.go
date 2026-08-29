@@ -1455,6 +1455,60 @@ func TestQwenAnthropicLeasePublicationHonorsSharedTokenPlanCooldown(t *testing.T
 	}
 }
 
+func TestQwenLeaseAvoidanceUsesSharedTokenPlanIdentityAcrossProtocols(t *testing.T) {
+	now := time.Now()
+	store := newTenantCredentialLeaseStore()
+	input := tenantCredentialLeaseRequest{
+		Provider:  string(accounts.ProviderQwenAnthropic),
+		SessionID: "session-a",
+		Model:     "qwen3.7-plus",
+	}
+	token, err := store.resolveSessionToken(input, accounts.ProviderQwenAnthropic, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.SessionToken = token
+	account := accounts.Account{
+		ID: "qwen-token:shared", Provider: accounts.ProviderQwenToken,
+		AuthMode: accounts.AuthModeAPIKey, Token: "key",
+	}
+	lease := tenantLeaseTestLease(account, tenantCredentialLeaseAgentType(input, accounts.ProviderQwenAnthropic), input.SessionID, input.Model, now)
+	// Model the requested transport alias exactly as the issue path receives it;
+	// internal quota identity must canonicalize it before report and lookup.
+	lease.provider = accounts.ProviderQwenAnthropic
+	lease.sessionToken = token
+	store.put("lease", lease, now)
+	if _, err := store.consumeReport("lease", tenantCredentialLeaseReport{
+		Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTooManyRequests,
+		Scope: broker.LeaseCooldownQuota,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	pool := tenantCredentialLeasePoolModel(accounts.ProviderQwenToken, input.Model)
+	if _, avoided := store.avoidanceUntil(input, account, pool, now); !avoided {
+		t.Fatal("Qwen Anthropic report did not cool the shared Token Plan account")
+	}
+
+	canonical := input
+	canonical.Provider = string(accounts.ProviderQwenToken)
+	canonicalToken, err := store.resolveSessionToken(canonical, accounts.ProviderQwenToken, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonicalToken != token {
+		t.Fatal("Qwen protocol alias did not retain the session capability")
+	}
+	canonical.SessionToken = canonicalToken
+	if _, avoided := store.avoidanceUntil(canonical, account, pool, now); !avoided {
+		t.Fatal("Qwen Token report lookup did not share the alias cooldown")
+	}
+	other := account
+	other.ID = "qwen-token:other"
+	if _, avoided := store.avoidanceUntil(canonical, other, pool, now); avoided {
+		t.Fatal("shared-provider cooldown leaked to another account")
+	}
+}
+
 func TestTenantCredentialLeaseSessionCountsAreProviderScoped(t *testing.T) {
 	const sharedID = "shared@example.com"
 	shared := accounts.Account{
