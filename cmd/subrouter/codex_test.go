@@ -128,10 +128,23 @@ func TestCodexArgsWorksWithoutSubcommand(t *testing.T) {
 }
 
 func TestCodexArgsPassesThroughCodexFlags(t *testing.T) {
-	got := codexArgs([]string{"--version"}, "http://127.0.0.1:31415/v1", "", "")
-	want := append([]string{"--version"}, defaultSubrouterCodexConfigArgs("http://127.0.0.1:31415/v1")...)
-	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("args = %#v, want %#v", got, want)
+	for _, args := range [][]string{
+		{"--help"},
+		{"-h"},
+		{"--version"},
+		{"-V"},
+	} {
+		got := codexArgs(args, "http://127.0.0.1:31415/v1", "", "")
+		if strings.Join(got, "\x00") != strings.Join(args, "\x00") {
+			t.Fatalf("args = %#v, want pass-through %#v", got, args)
+		}
+	}
+}
+
+func TestCodexArgsDoesNotTreatUtilityTextAfterTerminatorAsAFlag(t *testing.T) {
+	got := codexArgs([]string{"--", "--help"}, "http://127.0.0.1:31415/v1", "", "")
+	if !contains(got, `model_provider="subrouter"`) {
+		t.Fatalf("positional utility text bypassed Subrouter routing: %#v", got)
 	}
 }
 
@@ -220,6 +233,33 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	}
 	if got := string(body); got != "login --help\n" {
 		t.Fatalf("utility launch record = %q", got)
+	}
+}
+
+func TestCodexCommandlessUtilityFlagsRunWithoutResolvingProxy(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, "codex-fake")
+	record := filepath.Join(home, "record")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_BIN", bin)
+	t.Setenv("SUBROUTER_CODEX_SERVER", "missing-server-that-must-not-be-resolved")
+
+	for _, arg := range []string{"--help", "-h", "--version", "-V"} {
+		t.Run(arg, func(t *testing.T) {
+			if err := codex([]string{arg}); err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := string(body), arg+"\n"; got != want {
+				t.Fatalf("utility launch record = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

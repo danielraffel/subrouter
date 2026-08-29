@@ -561,6 +561,9 @@ func isSubrouterRoutedCodexCommand(command string) bool {
 }
 
 func codexInvocationUsesSubrouter(args []string) bool {
+	if codexUtilityFlagBeforeTerminator(args) {
+		return false
+	}
 	command, commandIndex := codexSubcommandAt(args)
 	if command == "" {
 		return true
@@ -582,6 +585,19 @@ func codexInvocationUsesSubrouter(args []string) bool {
 		}
 		if !strings.HasPrefix(arg, "-") {
 			return arg == "start"
+		}
+	}
+	return false
+}
+
+func codexUtilityFlagBeforeTerminator(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		switch arg {
+		case "--help", "-h", "--version", "-V":
+			return true
 		}
 	}
 	return false
