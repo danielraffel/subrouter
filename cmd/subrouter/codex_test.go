@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -77,7 +78,7 @@ func TestCodexBaseURLUsesServerEnvOverride(t *testing.T) {
 }
 
 func TestCodexBaseURLUsesExplicitURLBeforeServerDefault(t *testing.T) {
-	t.Setenv("SUBROUTER_CODEX_BASE_URL", "http://explicit.example/v1")
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "https://explicit.example/v1")
 	t.Setenv("SUBROUTER_CODEX_SERVER", "other")
 	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
 
@@ -85,8 +86,36 @@ func TestCodexBaseURLUsesExplicitURLBeforeServerDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "http://explicit.example/v1" {
+	if got != "https://explicit.example/v1" {
 		t.Fatalf("base URL = %q", got)
+	}
+}
+
+func TestCodexBaseURLRejectsExplicitRemoteHTTPWithoutTenantPath(t *testing.T) {
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "http://explicit.example/v1")
+	got, err := codexBaseURL(srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")})
+	if err == nil || got != "" || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("explicit plaintext base URL = %q, err = %v", got, err)
+	}
+}
+
+func TestDirectPlainHTTPEnvironmentStripsAmbientProxies(t *testing.T) {
+	env := []string{"HTTP_PROXY=http://proxy", "https_proxy=http://proxy", "ALL_PROXY=socks5://proxy", "no_proxy=localhost", "KEEP=value"}
+	got := directPlainHTTPEnvironment(env, "http://100.88.0.9:31415/v1")
+	joined := strings.Join(got, "\n")
+	if strings.Contains(strings.ToLower(joined), "proxy=") || !strings.Contains(joined, "KEEP=value") {
+		t.Fatalf("direct plaintext environment = %v", got)
+	}
+	if gotHTTPS := directPlainHTTPEnvironment(env, "https://router.example/v1"); !slices.Equal(gotHTTPS, env) {
+		t.Fatalf("HTTPS environment changed: %v", gotHTTPS)
+	}
+}
+
+func TestCodexBaseURLRejectsExplicitRemoteHTTPTenantPath(t *testing.T) {
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", "http://192.168.1.10:31415/t/"+testTenantKey+"/v1")
+	got, err := codexBaseURL(srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")})
+	if err == nil || got != "" || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("explicit tenant base URL = %q, err = %v", got, err)
 	}
 }
 

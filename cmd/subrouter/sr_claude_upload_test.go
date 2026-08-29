@@ -91,7 +91,7 @@ func TestUploadServerClaudeProfileUsesProtectedHTTPOnly(t *testing.T) {
 func TestWriteClaudeProxyEnvMergesSettings(t *testing.T) {
 	dir := t.TempDir()
 	settingsPath := filepath.Join(dir, "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark","env":{"FOO":"bar"}}`), 0o600); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark","env":{"FOO":"bar","ANTHROPIC_CUSTOM_HEADERS":"Authorization: stale-secret"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeClaudeProxyEnv(dir, "http://subrouter-team:31415/", ""); err != nil {
@@ -117,6 +117,9 @@ func TestWriteClaudeProxyEnvMergesSettings(t *testing.T) {
 	}
 	if env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" {
 		t.Fatalf("auth token = %v", env["ANTHROPIC_AUTH_TOKEN"])
+	}
+	if env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
+		t.Fatalf("stale custom headers survived: %v", env["ANTHROPIC_CUSTOM_HEADERS"])
 	}
 
 	// Second write is idempotent and keeps a custom token if one exists.

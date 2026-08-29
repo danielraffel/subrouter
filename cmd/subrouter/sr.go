@@ -564,7 +564,7 @@ func parseRemoteAddArgs(command string, args []string) (bool, error) {
 }
 
 func (r srRunner) unsupportedRemoteCommand(command string, server srServerConfig, detail string) error {
-	return fmt.Errorf("%s is configured to use server %s (%s), so %s will not edit local Codex state; %s", r.programOrSubrouter(), server.Name, server.URL, r.programOrSubrouter()+" "+command, detail)
+	return fmt.Errorf("%s is configured to use server %s (%s), so %s will not edit local Codex state; %s", r.programOrSubrouter(), server.Name, redactedServerURL(server.URL), r.programOrSubrouter()+" "+command, detail)
 }
 
 // addProvider is the one command a new user runs to attach a credential.
@@ -1451,10 +1451,11 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	activeClaude := claudeStore.ActiveProfile()
 	for i, profile := range claudeProfiles {
 		i, profile := claudeOffset+i, profile
+		credential, _ := claudeStore.ReadCredential(ctx, claudeStore.ClaudeConfigDir(profile.Name))
 		rows[i] = srUsageRow{
 			email:    profile.Name,
 			active:   profile.Name == activeClaude,
-			planType: "claude",
+			planType: credential.PlanType(),
 			authMode: accounts.AuthModeOAuth,
 			provider: accounts.ProviderClaude,
 			score:    selectacct.Score{AccountID: profile.Name, Headroom: 1, ShortHeadroom: 1},
@@ -1468,6 +1469,8 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
+			credential, _ := claudeStore.ReadCredential(ctx, claudeStore.ClaudeConfigDir(profile.Name))
+			rows[i].planType = credential.PlanType()
 			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
 			if err != nil {
 				rows[i].err = err
@@ -2439,38 +2442,47 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 	identityCounts := map[string]int{}
 	qwenShortWindow := map[string]bool{}
 	qwenLongWindow := map[string]bool{}
-	for _, row := range rows {
-		if usageProvider(row) != accounts.ProviderQwenToken {
+	for i := range rows {
+		row := &rows[i]
+		if usageProvider(*row) != accounts.ProviderQwenToken {
 			continue
 		}
-		group := usageProviderLabel(row)
+		group := usageProviderLabel(*row)
 		if row.accountIdentity != "" {
 			identityCounts[group+"\x00"+row.accountIdentity]++
 		}
-		if usageGridShortWindowCell(row).Text != "" {
+		if usageGridShortWindowCell(*row).Text != "" {
 			qwenShortWindow[group] = true
 		}
 		if usageGridWindowCell(row.windows, isLongQuotaWindow).Text != "" {
 			qwenLongWindow[group] = true
 		}
 	}
+	for i := range rows {
+		if usageProvider(rows[i]) == accounts.ProviderQwenToken {
+			group := usageProviderLabel(rows[i])
+			rows[i].showShortWindow = qwenShortWindow[group]
+			rows[i].showLongWindow = qwenLongWindow[group]
+			if rows[i].accountIdentity != "" {
+				rows[i].displayAccount = rows[i].accountIdentity
+				if identityCounts[group+"\x00"+rows[i].accountIdentity] > 1 {
+					rows[i].displayAccount += " (" + displayUsageSavedAccountName(rows[i]) + ")"
+				}
+			}
+		}
+	}
 	currentGroup := ""
+	var columns []usageGridColumn
 	accountRowIndex := 0
 	groupRowIndex := 0
 	for i, row := range rows {
 		group := usageProviderLabel(row)
-		if usageProvider(row) == accounts.ProviderQwenToken {
-			row.showShortWindow = qwenShortWindow[group]
-			row.showLongWindow = qwenLongWindow[group]
-			if row.accountIdentity != "" {
-				row.displayAccount = row.accountIdentity
-				if identityCounts[group+"\x00"+row.accountIdentity] > 1 {
-					row.displayAccount += " (" + displayUsageSavedAccountName(row) + ")"
-				}
-			}
-		}
-		columns := usageGridColumns(out, numbered, row)
 		if group != currentGroup {
+			end := i + 1
+			for end < len(rows) && usageProviderLabel(rows[end]) == group {
+				end++
+			}
+			columns = usageGridColumnsForRows(out, numbered, rows[i:end])
 			if currentGroup != "" {
 				fmt.Fprintln(out)
 			}
@@ -2584,8 +2596,19 @@ func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string,
 }
 
 func usageGridColumns(out io.Writer, numbered bool, row srUsageRow) []usageGridColumn {
+	return usageGridColumnsForRows(out, numbered, []srUsageRow{row})
+}
+
+func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []usageGridColumn {
+	if len(rows) == 0 {
+		return nil
+	}
+	row := rows[0]
 	provider := usageProvider(row)
 	termWidth := terminalColumns(out)
+	if provider == accounts.ProviderClaude {
+		return claudeUsageGridColumns(rows, numbered, termWidth)
+	}
 	accountWidth := 22
 	planWidth := 8
 	stateWidth := 10
@@ -2611,16 +2634,7 @@ func usageGridColumns(out io.Writer, numbered bool, row srUsageRow) []usageGridC
 		usageGridColumn{Key: "State", Title: "State", Width: stateWidth},
 		usageGridColumn{Key: "Pick", Title: "Use", Width: pickWidth},
 	)
-	if provider == accounts.ProviderClaude {
-		columns = append(columns,
-			usageGridColumn{Key: "Session", Title: "Session", Width: windowWidth},
-			usageGridColumn{Key: "Weekly", Title: "Weekly", Width: windowWidth},
-		)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Fable wk", Title: "Fable wk", Width: sparkWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Opus wk", Title: "Opus wk", Width: sparkWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Sonnet wk", Title: "Sonnet wk", Width: 9}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Extra", Title: "Extra", Width: sparkWidth}, termWidth)
-	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+	if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
 		columns = dropUsageGridColumn(columns, "Pick")
 		columns = dropUsageGridColumn(columns, "Plan")
 		columns = append(columns,
@@ -2669,15 +2683,97 @@ func usageGridColumns(out io.Writer, numbered bool, row srUsageRow) []usageGridC
 	if extra <= 0 {
 		return columns
 	}
-	extra = widenUsageGridColumn(columns, "Account", extra, 36)
-	extra = widenUsageGridColumn(columns, "Pick", extra, 34)
-	extra = widenUsageGridColumn(columns, "State", extra, 14)
-	extra = widenUsageGridColumn(columns, "Fable wk", extra, 10)
-	extra = widenUsageGridColumn(columns, "Sonnet wk", extra, 10)
+	extra = widenUsageGridColumnForRows(columns, rows, "Account", extra, 36)
+	extra = widenUsageGridColumnForRows(columns, rows, "Pick", extra, 34)
+	extra = widenUsageGridColumnForRows(columns, rows, "Session", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Weekly", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Fable wk", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "State", extra, 20)
+	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
+	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
 	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
-	extra = widenUsageGridColumn(columns, "Weekly", extra, 12)
 	_ = widenUsageGridColumn(columns, "7d", extra, 12)
 	return columns
+}
+
+func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []usageGridColumn {
+	columns := make([]usageGridColumn, 0, 11)
+	if numbered {
+		columns = append(columns, usageGridColumn{Key: "#", Title: "#", Width: 3})
+	}
+	for _, column := range []usageGridColumn{
+		{Key: "Account", Title: "Account", Width: usageGridDesiredWidth(rows, "Account", "Account", 36)},
+		{Key: "Plan", Title: "Plan", Width: usageGridDesiredWidth(rows, "Plan", "Plan", 16)},
+		{Key: "State", Title: "State", Width: usageGridDesiredWidth(rows, "State", "State", 20)},
+		{Key: "Pick", Title: "Use", Width: usageGridDesiredWidth(rows, "Pick", "Use", 34)},
+	} {
+		columns = append(columns, column)
+	}
+	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
+	for _, candidate := range []usageGridColumn{
+		{Key: "Session", Title: "Session"},
+		{Key: "Weekly", Title: "Weekly"},
+		{Key: "Fable wk", Title: "Fable wk"},
+		{Key: "Opus wk", Title: "Opus wk"},
+		{Key: "Sonnet wk", Title: "Sonnet wk"},
+		{Key: "Extra", Title: "Extra"},
+	} {
+		if !usageGridRowsHaveValue(rows, candidate.Key) {
+			continue
+		}
+		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, 12)
+		columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
+	}
+	return columns
+}
+
+func shrinkUsageGridColumnsToFit(columns []usageGridColumn, termWidth int, priority []string) {
+	overflow := usageGridWidth(columns) - termWidth
+	if termWidth <= 0 || overflow <= 0 {
+		return
+	}
+	for _, key := range priority {
+		for i := range columns {
+			if columns[i].Key != key {
+				continue
+			}
+			minimum := max(1, len(columns[i].Title))
+			shrink := min(overflow, columns[i].Width-minimum)
+			columns[i].Width -= shrink
+			overflow -= shrink
+			break
+		}
+		if overflow == 0 {
+			return
+		}
+	}
+}
+
+func usageGridDesiredWidth(rows []srUsageRow, key, title string, capWidth int) int {
+	desired := len(title)
+	for _, row := range rows {
+		desired = max(desired, len(usageGridValues(row, "")[key].Text))
+	}
+	return min(desired, capWidth)
+}
+
+func usageGridRowsHaveValue(rows []srUsageRow, key string) bool {
+	for _, row := range rows {
+		if usageGridValues(row, "")[key].Text != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func widenUsageGridColumnForRows(columns []usageGridColumn, rows []srUsageRow, key string, extra, capWidth int) int {
+	desired := 0
+	for _, row := range rows {
+		desired = max(desired, len(usageGridValues(row, "")[key].Text))
+	}
+	desired = min(desired, capWidth)
+	return widenUsageGridColumn(columns, key, extra, desired)
 }
 
 func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
@@ -3047,7 +3143,8 @@ func compactPickReason(row srUsageRow) string {
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {
-			return fmt.Sprintf("%s, session reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
+			reset := strings.ReplaceAll(formatDuration(row.score.ShortResetAfterSeconds), " ", "")
+			return fmt.Sprintf("%s, session reset %s%s", left, reset, suffix)
 		}
 		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}

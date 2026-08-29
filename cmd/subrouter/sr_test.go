@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1144,17 +1145,23 @@ func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	received := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/_subrouter/qwen-console" || req.Header.Get("Authorization") != "Bearer admin-secret" {
-			t.Fatalf("unexpected Qwen sync request: %s auth=%q", req.URL.Path, req.Header.Get("Authorization"))
+			t.Error("Qwen sync used an unexpected path or credential")
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
 		}
 		var payload struct {
 			AccountID  string                      `json:"account_id"`
 			Credential agentqwen.ConsoleCredential `json:"credential"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-			t.Fatal(err)
+			t.Error("Qwen sync payload could not be decoded")
+			http.Error(w, "invalid payload", http.StatusBadRequest)
+			return
 		}
 		if payload.AccountID != "qwen-token:work" || payload.Credential.AccessToken != "console-secret" {
-			t.Fatalf("payload = %+v", payload)
+			t.Error("Qwen sync payload omitted expected account data")
+			http.Error(w, "invalid payload", http.StatusBadRequest)
+			return
 		}
 		received = true
 		w.WriteHeader(http.StatusNoContent)
@@ -1171,6 +1178,35 @@ func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	}
 	if !received || !strings.Contains(out.String(), "Synced Qwen quota authorization to server: test") {
 		t.Fatalf("sync output = %q received=%v", out.String(), received)
+	}
+}
+
+func TestQwenConsoleCredentialSyncNeverFollowsRedirects(t *testing.T) {
+	root := t.TempDir()
+	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var redirected atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected.Add(1)
+	}))
+	defer destination.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", destination.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	runner := srRunner{client: source.Client(), out: io.Discard}
+	err := runner.syncQwenConsoleToServer(t.Context(), root, srServerConfig{
+		Name: "team", URL: source.URL, AdminToken: "admin-secret",
+	}, "qwen-token:work")
+	if err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("Qwen redirect error = %v", err)
+	}
+	if redirected.Load() != 0 {
+		t.Fatalf("Qwen credential request followed redirect %d time(s)", redirected.Load())
 	}
 }
 
@@ -2338,6 +2374,135 @@ func TestDisplayUsageRowsGridUsesClaudeLimitLabels(t *testing.T) {
 	}
 	if !strings.Contains(got, "session reset") {
 		t.Fatalf("Claude pick reason should use session terminology:\n%s", got)
+	}
+}
+
+func TestClaudeUsageGridPrioritizesPopulatedColumnsWithoutTruncatingCore(t *testing.T) {
+	t.Setenv("COLUMNS", "137")
+	reset := int64((4*time.Hour + 34*time.Minute) / time.Second)
+	rows := make([]srUsageRow, 3)
+	for i, email := range []string{"danraffel@example.com", "daniel.raffel@example.com", "mydonorkid"} {
+		rows[i] = srUsageRow{
+			email: email, planType: "max", authMode: accounts.AuthModeOAuth, provider: accounts.ProviderClaude,
+			score: selectacct.Score{AccountID: email, Headroom: .74, ShortHeadroom: .74, ShortResetAfterSeconds: reset},
+			windows: []accounts.UsageWindow{
+				{Name: "5h", UsedPercent: 0, ResetAfterSeconds: reset},
+				{Name: "7d", UsedPercent: 0, ResetAfterSeconds: int64((2*24*time.Hour + 6*time.Hour) / time.Second)},
+				{Name: "oauth-apps-weekly", UsedPercent: 0, ResetAfterSeconds: int64((2*24*time.Hour + 6*time.Hour) / time.Second)},
+			},
+		}
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	got := out.String()
+	for _, want := range []string{"Plan", "max", "74% left, session reset 4h34m", "100%/4h34m", "100%/2d6h", "Session", "Weekly", "Fable wk"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Claude grid missing %q:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"Opus wk", "Sonnet wk", "Extra", "..."} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("Claude grid unexpectedly contains %q:\n%s", unwanted, got)
+		}
+	}
+	assertUsageGridLineWidths(t, got, 137)
+}
+
+func TestClaudeUsageGridNarrowSchemaIsDeterministicAndOmitsEmptyColumns(t *testing.T) {
+	t.Setenv("COLUMNS", "80")
+	rows := []srUsageRow{{
+		email: "long-claude-account@example.com", planType: "max", authMode: accounts.AuthModeOAuth, provider: accounts.ProviderClaude,
+		score:   selectacct.Score{AccountID: "long-claude-account@example.com", Headroom: .74, ShortHeadroom: .74, ShortResetAfterSeconds: 3600},
+		windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 10, ResetAfterSeconds: 3600}, {Name: "7d", UsedPercent: 20, ResetAfterSeconds: 86400}},
+	}}
+	var first, second bytes.Buffer
+	displayUsageRows(&first, rows, false)
+	displayUsageRows(&second, rows, false)
+	if first.String() != second.String() {
+		t.Fatalf("narrow schema is not deterministic:\nfirst:\n%s\nsecond:\n%s", first.String(), second.String())
+	}
+	for _, unwanted := range []string{"Fable wk", "Opus wk", "Sonnet wk", "Extra"} {
+		if strings.Contains(first.String(), unwanted) {
+			t.Fatalf("narrow grid unexpectedly contains empty %q column:\n%s", unwanted, first.String())
+		}
+	}
+	assertUsageGridLineWidths(t, first.String(), 80)
+
+	shortRows := []srUsageRow{{
+		email: "work", planType: "max", provider: accounts.ProviderClaude,
+		score:   selectacct.Score{AccountID: "work", Headroom: .74, ShortHeadroom: .74, ShortResetAfterSeconds: 3600},
+		windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 0, ResetAfterSeconds: 3600}, {Name: "7d", UsedPercent: 0, ResetAfterSeconds: 86400}},
+	}}
+	var shortOut bytes.Buffer
+	displayUsageRows(&shortOut, shortRows, false)
+	for _, want := range []string{"74% left, session reset 1h", "100%/1h", "100%/1d"} {
+		if !strings.Contains(shortOut.String(), want) {
+			t.Fatalf("narrow short-account grid truncated %q:\n%s", want, shortOut.String())
+		}
+	}
+	assertUsageGridLineWidths(t, shortOut.String(), 80)
+
+	var worstOut bytes.Buffer
+	displayUsageRows(&worstOut, []srUsageRow{{
+		email: strings.Repeat("a", 36), planType: "enterprise", provider: accounts.ProviderClaude,
+		active: true, err: errors.New("usage unavailable"),
+	}}, false)
+	if !strings.Contains(worstOut.String(), "enterprise") || !strings.Contains(worstOut.String(), "usage unavailable") {
+		t.Fatalf("narrow worst-case grid lost higher-priority values:\n%s", worstOut.String())
+	}
+	assertUsageGridLineWidths(t, worstOut.String(), 80)
+}
+
+func TestClaudeUsageGridDropsLowerPriorityPopulatedWindowsBeforeTruncatingCore(t *testing.T) {
+	t.Setenv("COLUMNS", "137")
+	reset := int64((4*time.Hour + 34*time.Minute) / time.Second)
+	row := srUsageRow{
+		email: "claude@example.com", planType: "max", provider: accounts.ProviderClaude,
+		score: selectacct.Score{AccountID: "claude@example.com", Headroom: .74, ShortHeadroom: .74, ShortResetAfterSeconds: reset},
+		windows: []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 0, ResetAfterSeconds: reset},
+			{Name: "7d", UsedPercent: 0, ResetAfterSeconds: 86400},
+			{Name: "oauth-apps-weekly", UsedPercent: 0, ResetAfterSeconds: 86400},
+			{Name: "opus-weekly", UsedPercent: 0, ResetAfterSeconds: 86400},
+			{Name: "sonnet-weekly", UsedPercent: 0, ResetAfterSeconds: 86400},
+			{Name: "extra", UsedPercent: 0, ResetAfterSeconds: 86400},
+		},
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{row}, false)
+	got := out.String()
+	for _, want := range []string{"74% left, session reset 4h34m", "100%/4h34m", "100%/1d", "Session", "Weekly", "Fable wk"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("all-window Claude grid truncated priority value %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "...") {
+		t.Fatalf("all-window Claude grid truncated a retained value:\n%s", got)
+	}
+	assertUsageGridLineWidths(t, got, 137)
+}
+
+func TestClaudeUsageGridUsesOneSchemaForMixedRows(t *testing.T) {
+	t.Setenv("COLUMNS", "137")
+	rows := []srUsageRow{
+		{email: "session@example.com", planType: "pro", provider: accounts.ProviderClaude, windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 10, ResetAfterSeconds: 3600}}},
+		{email: "fable@example.com", planType: "free", provider: accounts.ProviderClaude, windows: []accounts.UsageWindow{{Name: "oauth-apps-weekly", UsedPercent: 20, ResetAfterSeconds: 86400}}},
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	got := out.String()
+	if strings.Count(got, "Session") != 1 || strings.Count(got, "Fable wk") != 1 {
+		t.Fatalf("mixed Claude rows did not share one populated schema:\n%s", got)
+	}
+	assertUsageGridLineWidths(t, got, 137)
+}
+
+func assertUsageGridLineWidths(t *testing.T, output string, width int) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+		if utf8.RuneCountInString(line) > width {
+			t.Fatalf("line width = %d, want <= %d:\n%s", utf8.RuneCountInString(line), width, line)
+		}
 	}
 }
 

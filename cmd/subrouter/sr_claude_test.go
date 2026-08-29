@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -122,6 +123,62 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 		if strings.Contains(got, needle) {
 			t.Fatalf("Claude inherited %s env:\n%s", needle, got)
 		}
+	}
+}
+
+func TestClaudeManagedProfileRejectsLegacyRemoteHTTPTenantBeforeLaunch(t *testing.T) {
+	home := t.TempDir()
+	store := claude.Store{Dir: filepath.Join(home, ".subrouter", "codex")}
+	if _, err := store.CreateProfile("legacy"); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir("legacy")
+	settings := `{"env":{"ANTHROPIC_BASE_URL":"http://192.168.1.10:31415/t/` + testTenantKey + `","ANTHROPIC_AUTH_TOKEN":"` + testTenantKey + `"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "launched")
+	script := "#!/bin/sh\ntouch " + shellQuote(marker) + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	err := runner.runClaude(t.Context(), "legacy", []string{"--print", "hello"})
+	if err == nil || !strings.Contains(err.Error(), "unsafe proxy transport") {
+		t.Fatalf("managed Claude launch error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched before transport rejection: %v", statErr)
+	}
+
+	apiKeySettings := `{"env":{"ANTHROPIC_BASE_URL":"http://192.168.1.10:31415","ANTHROPIC_API_KEY":"api-secret"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(apiKeySettings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = runner.runClaude(t.Context(), "legacy", []string{"--print", "hello"})
+	if err == nil || !strings.Contains(err.Error(), "unsafe proxy transport") {
+		t.Fatalf("managed Claude API-key launch error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched with an API key over unsafe transport: %v", statErr)
+	}
+
+	customHeaderSettings := `{"env":{"ANTHROPIC_BASE_URL":"http://192.168.1.10:31415","ANTHROPIC_AUTH_TOKEN":"subrouter","ANTHROPIC_CUSTOM_HEADERS":"Authorization: Bearer secret"}}`
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(customHeaderSettings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = runner.runClaude(t.Context(), "legacy", []string{"--print", "hello"})
+	if err == nil || !strings.Contains(err.Error(), "unsafe proxy transport") {
+		t.Fatalf("managed Claude custom-header launch error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched with a custom header over unsafe transport: %v", statErr)
 	}
 }
 
@@ -309,7 +366,7 @@ func TestTenantProxyTransportRequiresHTTPSOffLoopback(t *testing.T) {
 		{name: "remote HTTP without secret", baseURL: "http://router.example", tenantKey: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateTenantProxyTransport(tc.baseURL, tc.tenantKey)
+			_, err := secureTenantProxyURL(t.Context(), tc.baseURL, tc.tenantKey)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("validateTenantProxyTransport() error = %v, wantErr %v", err, tc.wantErr)
 			}

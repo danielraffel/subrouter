@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,8 +106,8 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string) 
 	if proxyToken == "" {
 		proxyToken = "subrouter"
 	}
-	proxyRoot := serverProxyRootURL(server)
-	if err := validateTenantProxyTransport(proxyRoot, server.TenantKey); err != nil {
+	proxyRoot, err := serverProxyRootURL(server)
+	if err != nil {
 		return err
 	}
 	scope := "server:" + strings.TrimSpace(server.Name)
@@ -118,21 +117,6 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string) 
 		scope = "tailscale-node:" + strings.TrimSpace(server.TailscaleNodeID)
 	}
 	return r.proxyClaudeArgsTo(ctx, args, proxyRoot, proxyToken, scope)
-}
-
-func validateTenantProxyTransport(baseURL, tenantKey string) error {
-	if strings.TrimSpace(tenantKey) == "" {
-		return nil
-	}
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil || parsed.Hostname() == "" {
-		return errors.New("tenant-scoped server URL must be absolute")
-	}
-	if strings.EqualFold(parsed.Scheme, "https") ||
-		(strings.EqualFold(parsed.Scheme, "http") && loopbackEndpoint(baseURL)) {
-		return nil
-	}
-	return errors.New("tenant-scoped server URL must use HTTPS, except HTTP on loopback")
 }
 
 // cloudClaude launches Claude against the local proxy. The proxy leases an
@@ -202,6 +186,15 @@ func (r srRunner) runProxyClaude(
 	proxyToken string,
 	configDir string,
 ) error {
+	credential := strings.TrimSpace(proxyToken)
+	if credential == "subrouter" {
+		credential = ""
+	}
+	secureBaseURL, err := secureTenantProxyURL(ctx, baseURL, credential)
+	if err != nil {
+		return err
+	}
+	baseURL = secureBaseURL
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
@@ -216,6 +209,7 @@ func (r srRunner) runProxyClaude(
 		baseURL,
 		proxyToken,
 	)
+	env = directPlainHTTPEnvironment(env, baseURL)
 	if configDir != "" {
 		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
 	}
@@ -544,6 +538,10 @@ func (r claudeRunner) fetchInfos(ctx context.Context) []claude.ProfileInfo {
 		go func() {
 			defer wg.Done()
 			claudeConfigDir := r.store.ClaudeConfigDir(profile.Name)
+			if err := secureManagedClaudeProfileTransport(claudeConfigDir, false); err != nil {
+				infos[i].Error = err
+				return
+			}
 			var auth *claude.AuthStatus
 			var credential *claude.CredentialInfo
 			var authErr, credentialErr error
@@ -709,6 +707,10 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	if !ok {
 		return fmt.Errorf("profile %q not found", name)
 	}
+	configDir := r.store.ClaudeConfigDir(profile.Name)
+	if err := secureManagedClaudeProfileTransport(configDir, true); err != nil {
+		return err
+	}
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
@@ -728,8 +730,82 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = claude.EnvForConfigDir(r.store.ClaudeConfigDir(profile.Name))
+	cmd.Env = directPlainHTTPEnvironment(claude.EnvForConfigDir(configDir), managedClaudeBaseURL(configDir))
 	return cmd.Run()
+}
+
+func managedClaudeBaseURL(configDir string) string {
+	body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+	if err != nil {
+		return ""
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if json.Unmarshal(body, &settings) != nil {
+		return ""
+	}
+	return strings.TrimSpace(settings.Env["ANTHROPIC_BASE_URL"])
+}
+
+func secureManagedClaudeProfileTransport(configDir string, pinForLaunch bool) error {
+	settingsPath := filepath.Join(configDir, "settings.json")
+	body, err := os.ReadFile(settingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read managed Claude settings: %w", err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return fmt.Errorf("parse managed Claude settings: %w", err)
+	}
+	baseURL := strings.TrimSpace(settings.Env["ANTHROPIC_BASE_URL"])
+	if baseURL == "" {
+		return nil
+	}
+	authToken := strings.TrimSpace(settings.Env["ANTHROPIC_AUTH_TOKEN"])
+	transportCredential := authToken
+	if transportCredential == "subrouter" {
+		transportCredential = ""
+	}
+	if transportCredential == "" {
+		for _, key := range []string{
+			"ANTHROPIC_API_KEY",
+			"CLAUDE_CODE_OAUTH_TOKEN",
+			"CLAUDE_CODE_API_KEY",
+			"CLAUDE_CODE_AUTH_TOKEN",
+		} {
+			if strings.TrimSpace(settings.Env[key]) != "" {
+				transportCredential = "protected-managed-credential"
+				break
+			}
+		}
+	}
+	if transportCredential == "" && strings.TrimSpace(settings.Env["ANTHROPIC_CUSTOM_HEADERS"]) != "" {
+		transportCredential = "protected-managed-custom-header"
+	}
+	secureBaseURL, err := secureTenantProxyURL(context.Background(), baseURL, transportCredential)
+	if err != nil {
+		return fmt.Errorf("managed Claude profile has unsafe proxy transport: %w", err)
+	}
+	if secureBaseURL == baseURL {
+		return nil
+	}
+	if !pinForLaunch {
+		return nil
+	}
+	tenantToken := authToken
+	if tenantToken == "subrouter" {
+		tenantToken = ""
+	}
+	if err := writeClaudeProxyEnv(configDir, secureBaseURL, tenantToken); err != nil {
+		return fmt.Errorf("pin managed Claude proxy transport: %w", err)
+	}
+	return nil
 }
 
 // claudeAWS launches Claude Code in Amazon Bedrock gateway mode, routed through
@@ -746,7 +822,15 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	if !ok {
 		return fmt.Errorf("sr claude-aws needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
 	}
-	baseURL := strings.TrimRight(server.URL, "/") + "/bedrock"
+	protectedServer := server
+	if strings.TrimSpace(protectedServer.TenantKey) == "" {
+		protectedServer.TenantKey = "protected-bedrock-request"
+	}
+	secureRoot, err := secureTenantServerURL(ctx, server.URL, protectedServer)
+	if err != nil {
+		return err
+	}
+	baseURL := strings.TrimRight(secureRoot, "/") + "/bedrock"
 
 	model := "fable"
 	region := "us-east-1"
@@ -790,7 +874,7 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	if token := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN")); token != "" {
 		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
 	}
-	cmd.Env = env
+	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
 	return cmd.Run()
 }
 

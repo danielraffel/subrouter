@@ -719,7 +719,7 @@ func TestCodexPinnedTailscaleDiscoveryFailureDoesNotFallBackLocally(t *testing.T
 }
 
 func TestTailscaleRepairDiagnosticsRedactURLUserinfo(t *testing.T) {
-	if got := redactedServerURL("http://user:secret@example.invalid:31415/t/team?api_key=query-secret#fragment-secret"); strings.Contains(got, "secret") || strings.Contains(got, "api_key") || !strings.Contains(got, "xxxxx") {
+	if got := redactedServerURL("http://user:secret@example.invalid:31415/t/team?api_key=query-secret#fragment-secret"); strings.Contains(got, "secret") || strings.Contains(got, "api_key") || strings.Contains(got, "/team") || !strings.Contains(got, "xxxxx") || !strings.Contains(got, "redacted") {
 		t.Fatalf("redacted URL = %q", got)
 	}
 	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}

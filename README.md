@@ -483,9 +483,11 @@ the same key as the auth token:
 }
 ```
 
-Non-loopback tenant servers must use HTTPS; plain HTTP is allowed only on
-loopback for local development. Because `/t/<key>` contains a credential, URL
-logs and diagnostics must redact that path segment. The
+Remote tenant servers must use HTTPS unless they are reached over a verified
+Tailscale address. Plain HTTP is allowed only on loopback or after Subrouter
+verifies and pins the destination to a loopback or tailnet IP; a `*.ts.net`
+name alone is not trusted. Because `/t/<key>` contains a credential, URL logs
+and diagnostics must redact that path segment. The
 `X-Subrouter-Agent: claude` marker remains required as the agent discriminator;
 it does not replace the tenant path or token. `sr claude proxy` sets all three
 values correctly from the selected server.

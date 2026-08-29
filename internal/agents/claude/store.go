@@ -94,6 +94,34 @@ type CredentialInfo struct {
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
 }
 
+// PlanType returns the subscription label explicitly carried by a Claude
+// credential. It never guesses a plan from token contents or observed usage.
+func (credential *CredentialInfo) PlanType() string {
+	if credential == nil {
+		return "unknown"
+	}
+	plan := strings.TrimSpace(credential.SubscriptionType)
+	if plan == "" {
+		plan = strings.TrimSpace(credential.RateLimitTier)
+	}
+	if plan == "" {
+		return "unknown"
+	}
+	lower := strings.ToLower(plan)
+	for _, part := range strings.FieldsFunc(lower, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		switch part {
+		case "max", "pro", "free":
+			return part
+		}
+	}
+	if len(plan) > 32 || strings.IndexFunc(plan, func(r rune) bool {
+		return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == ' ' || r == '-' || r == '_' || r == '.' || r == '+')
+	}) >= 0 {
+		return "unknown"
+	}
+	return plan
+}
+
 type RateLimit struct {
 	Utilization *float64 `json:"utilization"`
 	ResetsAt    string   `json:"resets_at"`

@@ -294,9 +294,17 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, codexProxyRootURL(server.URL)+path, reader)
+	protectedServer := server
+	if strings.TrimSpace(protectedServer.TenantKey) == "" {
+		protectedServer.TenantKey = "protected-tenant-admin-request"
+	}
+	baseURL, err := secureTenantServerURL(ctx, codexProxyRootURL(server.URL), protectedServer)
 	if err != nil {
 		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, reader)
+	if err != nil {
+		return redactServerRequestError(err, server)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -306,14 +314,18 @@ func (r srRunner) tenantAdminRequest(ctx context.Context, server srServerConfig,
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	res, err := client.Do(req)
+	secured, err := securedServerRequestClient(client, baseURL)
 	if err != nil {
 		return err
+	}
+	res, err := secured.Do(req)
+	if err != nil {
+		return redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
-		return fmt.Errorf("tenant admin request failed: %s: %s", res.Status, strings.TrimSpace(string(message)))
+		return redactServerRequestError(fmt.Errorf("tenant admin request failed: %s: %s", res.Status, strings.TrimSpace(string(message))), server)
 	}
 	if out == nil {
 		_, _ = io.Copy(io.Discard, res.Body)

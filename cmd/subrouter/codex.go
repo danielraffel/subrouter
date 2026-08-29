@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -63,8 +64,16 @@ func codex(args []string) error {
 			accountID,
 			localProxyToken,
 		),
-		codexChildEnv(os.Environ(), localProxyToken, programBase()),
+		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), localProxyToken, programBase()), baseURL),
 	)
+}
+
+func directPlainHTTPEnvironment(environ []string, baseURL string) []string {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || !strings.EqualFold(parsed.Scheme, "http") {
+		return environ
+	}
+	return envWithout(environ, []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
 }
 
 func runCodexCommand(bin string, args, env []string) error {
@@ -105,7 +114,7 @@ func trustedCodexLauncher(launcher string) string {
 
 func codexBaseURL(store srServerStore) (string, error) {
 	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
-		return baseURL, nil
+		return secureTenantProxyURL(context.Background(), baseURL, "protected-codex-credential")
 	}
 	if serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); serverName != "" {
 		return codexBaseURLForNamedServer(store, serverName)
@@ -125,12 +134,12 @@ func defaultCodexBaseURLFor(store srServerStore) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("default Subrouter server %q not found; run sr server use <name> or sr server clear-default", file.Default)
 	}
-	return codexBaseURLForServer(server), nil
+	return codexBaseURLForServer(server)
 }
 
 func codexBaseURLWithTailscaleHealing(store srServerStore, warn io.Writer) (string, error) {
 	if baseURL := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")); baseURL != "" {
-		return baseURL, nil
+		return secureTenantProxyURL(context.Background(), baseURL, "protected-codex-credential")
 	}
 	serverName := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
 	if serverName == "local" || serverName == "localhost" {
@@ -150,7 +159,7 @@ func codexBaseURLWithTailscaleHealing(store srServerStore, warn io.Writer) (stri
 		if err != nil {
 			return "", err
 		}
-		return codexBaseURLForServer(server), nil
+		return codexBaseURLForServer(server)
 	}
 	file, err := store.load()
 	if err != nil {
@@ -169,7 +178,7 @@ func codexBaseURLWithTailscaleHealing(store srServerStore, warn io.Writer) (stri
 	if err != nil {
 		return "", err
 	}
-	return codexBaseURLForServer(server), nil
+	return codexBaseURLForServer(server)
 }
 
 // codexBaseURLWithFallback resolves the base URL for launching codex, then
@@ -278,21 +287,25 @@ func codexBaseURLForNamedServer(store srServerStore, name string) (string, error
 	if !ok {
 		return "", fmt.Errorf("Subrouter server %q not found", name)
 	}
-	return codexBaseURLForServer(server), nil
+	return codexBaseURLForServer(server)
 }
 
-func codexBaseURLForServer(server srServerConfig) string {
-	return serverProxyRootURL(server) + "/v1"
+func codexBaseURLForServer(server srServerConfig) (string, error) {
+	root, err := serverProxyRootURL(server)
+	if err != nil {
+		return "", err
+	}
+	return root + "/v1", nil
 }
 
 // serverProxyRootURL is the data-plane root for a server entry: the bare URL,
 // or the tenant-scoped /t/<key> root when the entry carries a tenant key.
-func serverProxyRootURL(server srServerConfig) string {
+func serverProxyRootURL(server srServerConfig) (string, error) {
 	root := codexProxyRootURL(server.URL)
 	if key := strings.TrimSpace(server.TenantKey); key != "" {
 		root += "/t/" + key
 	}
-	return root
+	return secureTenantServerURL(context.Background(), root, server)
 }
 
 func codexArgs(args []string, baseURL, userEmail, accountID string) []string {

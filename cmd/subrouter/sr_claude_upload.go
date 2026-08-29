@@ -66,7 +66,8 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 		}
 		return fmt.Errorf("no default Subrouter server configured; run '%s server use <name>'", r.programOrSubrouter())
 	}
-	if err := validateTenantProxyTransport(serverProxyRootURL(server), server.TenantKey); err != nil {
+	proxyRoot, err := serverProxyRootURL(server)
+	if err != nil {
 		return err
 	}
 	store := claude.DefaultStore()
@@ -88,7 +89,7 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 	if err := r.uploadServerClaudeProfile(ctx, server, store, profile, *credential); err != nil {
 		return err
 	}
-	if err := writeClaudeProxyEnv(configDir, serverProxyRootURL(server), strings.TrimSpace(server.TenantKey)); err != nil {
+	if err := writeClaudeProxyEnv(configDir, proxyRoot, strings.TrimSpace(server.TenantKey)); err != nil {
 		return fmt.Errorf("profile uploaded, but writing proxy env to settings.json failed: %w", err)
 	}
 	fmt.Fprintf(r.out, "Uploaded Claude profile %s to server %s and switched local runs to the server pool.\n", profile.Name, server.Name)
@@ -105,9 +106,11 @@ func (r srRunner) uploadServerClaudeProfile(ctx context.Context, server srServer
 // it with pooled credentials; with a tenant key, the key itself is the auth
 // token so the server can scope the request to the tenant's pool.
 func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
-	if err := validateTenantProxyTransport(baseURL, tenantKey); err != nil {
+	secureBaseURL, err := secureTenantProxyURL(context.Background(), baseURL, tenantKey)
+	if err != nil {
 		return err
 	}
+	baseURL = secureBaseURL
 	settingsPath := filepath.Join(configDir, "settings.json")
 	settings := map[string]any{}
 	if body, err := os.ReadFile(settingsPath); err == nil {
@@ -120,6 +123,7 @@ func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
 		env = map[string]any{}
 	}
 	env["ANTHROPIC_BASE_URL"] = strings.TrimRight(baseURL, "/")
+	env["ANTHROPIC_CUSTOM_HEADERS"] = "X-Subrouter-Agent: claude"
 	if tenantKey != "" {
 		env["ANTHROPIC_AUTH_TOKEN"] = tenantKey
 	} else if existing, ok := env["ANTHROPIC_AUTH_TOKEN"].(string); !ok || tenant.ValidKeyFormat(existing) {

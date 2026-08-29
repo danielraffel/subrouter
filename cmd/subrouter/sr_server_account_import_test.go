@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,30 +18,6 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
-
-func TestValidateServerAccountImportURLRestrictsPlaintextToTailnetOrLoopback(t *testing.T) {
-	for _, tc := range []struct {
-		url     string
-		wantErr bool
-	}{
-		{url: "http://127.0.0.1:31415/_subrouter/account-import"},
-		{url: "http://100.64.0.1:31415/_subrouter/account-import"},
-		{url: "http://100.127.255.254:31415/_subrouter/account-import"},
-		{url: "http://[fd7a:115c:a1e0::1]:31415/_subrouter/account-import"},
-		{url: "https://subrouter.example.com/_subrouter/account-import"},
-		{url: "http://100.128.0.1:31415/_subrouter/account-import", wantErr: true},
-		{url: "http://192.168.1.10:31415/_subrouter/account-import", wantErr: true},
-		{url: "https://credential@subrouter.example.com/_subrouter/account-import", wantErr: true},
-		{url: "file:///tmp/account-import", wantErr: true},
-	} {
-		t.Run(tc.url, func(t *testing.T) {
-			err := validateServerAccountImportURL(t.Context(), tc.url)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("error = %v, wantErr = %v", err, tc.wantErr)
-			}
-		})
-	}
-}
 
 func TestServerAccountImportNeverFollowsRedirects(t *testing.T) {
 	var redirected atomic.Int32
@@ -70,17 +47,15 @@ func TestServerAccountImportNeverFollowsRedirects(t *testing.T) {
 
 func TestServerAccountImportUsesScopedTokenInsteadOfAdminToken(t *testing.T) {
 	var authorization string
-	runner := srRunner{client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		authorization = req.Header.Get("Authorization")
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
-		}, nil
-	})}}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer serverHTTP.Close()
+	runner := srRunner{client: serverHTTP.Client()}
 	server := srServerConfig{
 		Name:               "team",
-		URL:                "https://subrouter.example.com",
+		URL:                serverHTTP.URL,
 		AdminToken:         "admin-secret",
 		AccountImportToken: "import-secret",
 	}
@@ -178,18 +153,16 @@ func TestUploadAndRemoveServerKimiAccountUseProtectedImport(t *testing.T) {
 
 func TestRemoteKimiLoginPreflightsProviderBeforeDeviceAuthorization(t *testing.T) {
 	var requests atomic.Int32
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = io.WriteString(w, `{"ok":true,"providers":["codex"]}`)
+	}))
+	defer serverHTTP.Close()
 	runner := srRunner{
-		client: &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-			requests.Add(1)
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"providers":["codex"]}`)),
-			}, nil
-		})},
-		out: io.Discard,
+		client: serverHTTP.Client(),
+		out:    io.Discard,
 	}
-	err := runner.kimiRemoteLogin(t.Context(), srServerConfig{Name: "old-server", URL: "https://subrouter.example.com"}, "work")
+	err := runner.kimiRemoteLogin(t.Context(), srServerConfig{Name: "old-server", URL: serverHTTP.URL}, "work")
 	if err == nil || !strings.Contains(err.Error(), "does not advertise kimi account import") {
 		t.Fatalf("remote Kimi preflight error = %v", err)
 	}
@@ -258,6 +231,32 @@ func TestPlainHTTPAccountImportBypassesConfiguredProxy(t *testing.T) {
 	}
 }
 
+func TestSecuredServerRequestClientDisablesHTTPSProxy(t *testing.T) {
+	configured := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	secured, err := securedServerRequestClient(&http.Client{Transport: configured}, "https://subrouter.example.com/t/secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := secured.Transport.(*http.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Fatalf("secured HTTPS transport retained a proxy: %#v", secured.Transport)
+	}
+	if configured.Proxy == nil {
+		t.Fatal("secured client mutated the caller's transport")
+	}
+}
+
+func TestSecuredServerRequestClientRejectsCustomTransport(t *testing.T) {
+	client := &http.Client{Transport: srRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("must not run")
+	})}
+	for _, rawURL := range []string{"http://127.0.0.1:31415/t/secret", "http://100.64.0.10/t/secret", "https://subrouter.example.com/t/secret"} {
+		if _, err := securedServerRequestClient(client, rawURL); err == nil || !strings.Contains(err.Error(), "pinnable") {
+			t.Errorf("custom transport error for %s = %v, want fail-closed", rawURL, err)
+		}
+	}
+}
+
 func TestUnsafeHTTPServerFailsBeforeCodexOAuth(t *testing.T) {
 	fake := &recordingSRCommandRunner{loginAuth: testCodexAuth("founders@manaflow.ai", "fresh")}
 	var output bytes.Buffer
@@ -268,7 +267,7 @@ func TestUnsafeHTTPServerFailsBeforeCodexOAuth(t *testing.T) {
 		URL:        "http://192.168.1.10:31415",
 		AdminToken: "secret",
 	}, false, "")
-	if err == nil || !strings.Contains(err.Error(), "restricted to Tailscale or loopback") {
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
 		t.Fatalf("error = %v, want unsafe plaintext rejection", err)
 	}
 	if fake.hasCommandPrefix("codex", "login") {

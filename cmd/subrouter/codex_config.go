@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -27,7 +28,11 @@ func defaultCodexConfigPath() (string, error) {
 }
 
 func writeCodexConfigForServer(server srServerConfig) (string, error) {
-	return writeCodexConfigForBaseURL(codexBaseURLForServer(server))
+	baseURL, err := codexBaseURLForServer(server)
+	if err != nil {
+		return "", err
+	}
+	return writeCodexConfigForBaseURL(baseURL)
 }
 
 func writeCodexConfigForLocal() (string, error) {
@@ -35,6 +40,11 @@ func writeCodexConfigForLocal() (string, error) {
 }
 
 func writeCodexConfigForBaseURL(baseURL string) (string, error) {
+	secureBaseURL, err := secureTenantProxyURL(context.Background(), baseURL, "protected-codex-credential")
+	if err != nil {
+		return "", err
+	}
+	baseURL = secureBaseURL
 	path, err := defaultCodexConfigPath()
 	if err != nil {
 		return "", err

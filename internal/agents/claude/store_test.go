@@ -21,6 +21,31 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
+func TestCredentialPlanTypeUsesOnlyCredentialMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		credential *CredentialInfo
+		want       string
+	}{
+		{name: "nil", want: "unknown"},
+		{name: "absent", credential: &CredentialInfo{AccessToken: "secret"}, want: "unknown"},
+		{name: "max normalized", credential: &CredentialInfo{SubscriptionType: " MAX "}, want: "max"},
+		{name: "pro normalized", credential: &CredentialInfo{SubscriptionType: "Pro"}, want: "pro"},
+		{name: "free from tier", credential: &CredentialInfo{RateLimitTier: "FREE"}, want: "free"},
+		{name: "max vendor tier", credential: &CredentialInfo{RateLimitTier: "default_claude_max_20x"}, want: "max"},
+		{name: "subscription wins", credential: &CredentialInfo{SubscriptionType: "max", RateLimitTier: "pro"}, want: "max"},
+		{name: "vendor label", credential: &CredentialInfo{RateLimitTier: "enterprise"}, want: "enterprise"},
+		{name: "unsafe vendor label", credential: &CredentialInfo{RateLimitTier: "enterprise\x1b[31m"}, want: "unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.credential.PlanType(); got != test.want {
+				t.Fatalf("PlanType() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
 	instancePath, err := store.CreateProfile("work")

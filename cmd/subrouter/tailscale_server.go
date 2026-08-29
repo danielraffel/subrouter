@@ -302,6 +302,14 @@ func redactedServerURL(raw string) string {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	parsed.RawFragment = ""
+	parts := strings.Split(parsed.Path, "/")
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == "t" && parts[i+1] != "" {
+			parts[i+1] = "[redacted]"
+		}
+	}
+	parsed.Path = strings.Join(parts, "/")
+	parsed.RawPath = ""
 	return parsed.Redacted()
 }
 
