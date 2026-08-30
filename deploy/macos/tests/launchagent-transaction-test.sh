@@ -131,13 +131,20 @@ fi
 case "${1:-}" in
   help) echo ' subrouter supervise --worker-bin PATH ' ;;
   doctor) echo '{"status":"ok"}' ;;
-  codex) echo '{"comparison":{"ok":true}}' ;;
+  codex)
+    if [ "${FAKE_ISOLATION_FAIL:-0}" = 1 ]; then
+      echo '{"comparison":{"ok":false}}'
+      exit 77
+    fi
+    echo '{"comparison":{"ok":true}}'
+    ;;
 esac
 exit 0
 SH
 chmod +x "$legacy" "$legacy_dependency" "$worker"
 cat >"$TMP/preflight" <<'SH'
 #!/bin/sh
+[ -z "${FAKE_PREFLIGHT_LOG:-}" ] || printf 'invoked\n' >>"$FAKE_PREFLIGHT_LOG"
 exit 0
 SH
 cat >"$TMP/canary-fail" <<'SH'
@@ -418,6 +425,40 @@ grep -Fq "$SUBROUTER_STATE_DIR|codex isolation-check --json --retiring-state-dir
 [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
 unset FAKE_WORKER_LOG
 echo "PASS default preflight compared candidate and retiring state roots without shell evaluation"
+
+reset_legacy
+export FAKE_WORKER_LOG="$TMP/additive-worker.log"
+export FAKE_PREFLIGHT_LOG="$TMP/additive-preflight.log"
+SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+  "$MIGRATE" --activate >"$TMP/additive-preflight.out" 2>"$TMP/additive-preflight.err"
+grep -Fq "$SUBROUTER_STATE_DIR|codex isolation-check --json --retiring-state-dir $TMP/home/.subrouter-retiring|" "$FAKE_WORKER_LOG"
+grep -q '^invoked$' "$FAKE_PREFLIGHT_LOG"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+unset FAKE_WORKER_LOG FAKE_PREFLIGHT_LOG
+echo "PASS deployment preflight was additive to mandatory credential isolation"
+
+reset_legacy
+rollback_bundles_before="$(find "$(dirname "$plist")" -maxdepth 1 -type d -name "$(basename "$plist").rollback-bundle-*" | wc -l | tr -d ' ')"
+export FAKE_PREFLIGHT_LOG="$TMP/rejected-preflight.log"
+if FAKE_ISOLATION_FAIL=1 SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" "$MIGRATE" --activate \
+  >"$TMP/isolation-before-callback.out" 2>"$TMP/isolation-before-callback.err"; then
+  echo "failed credential isolation unexpectedly reached activation" >&2
+  exit 1
+fi
+grep -q 'Codex isolation preflight failed' "$TMP/isolation-before-callback.err"
+[ ! -e "$FAKE_PREFLIGHT_LOG" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+[ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$legacy" ]
+[ ! -e "${plist}.supervisor-transaction" ]
+rollback_bundles_after="$(find "$(dirname "$plist")" -maxdepth 1 -type d -name "$(basename "$plist").rollback-bundle-*" | wc -l | tr -d ' ')"
+[ "$rollback_bundles_after" = "$rollback_bundles_before" ]
+if find "$SUBROUTER_STATE_DIR" -maxdepth 1 -name '.codex.migrate-*' -print -quit | grep -q .; then
+  echo "credential preflight failure created a migration directory" >&2
+  exit 1
+fi
+unset FAKE_PREFLIGHT_LOG
+echo "PASS failed credential isolation stopped before callback, bundle, or live mutation"
 
 reset_legacy
 if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \

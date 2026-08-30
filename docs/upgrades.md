@@ -164,7 +164,8 @@ candidate store or with the retiring store. The retiring root is read from the
 preserved plist's explicit `SUBROUTER_STATE_DIR`; use `--retiring-state-dir
 PATH` only when migrating a plist that predates that declaration. Missing,
 ambiguous, or equal roots fail before live mutation. `--preflight-callback
-PATH` can replace that check for a deployment-specific executable.
+PATH` adds a deployment-specific executable after the mandatory isolation
+comparison; it cannot replace or bypass the credential gate.
 
 `SUBROUTER_STATE_DIR` selects the candidate state root and is written into the
 prepared LaunchAgent explicitly; launchd does not inherit the activating

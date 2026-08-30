@@ -361,14 +361,13 @@ fi
   || die "candidate and retiring state roots must be different"
 
 echo "running bounded preflight"
+run_bounded_argv "credential isolation preflight" "$PREFLIGHT_TIMEOUT" \
+  "$WORKER_BIN" codex isolation-check --json \
+    --retiring-state-dir "$RETIRING_STATE_DIR" \
+  || die "Codex isolation preflight failed"
 if [ -n "$PREFLIGHT_CALLBACK" ]; then
-  run_bounded_argv "preflight" "$PREFLIGHT_TIMEOUT" "$PREFLIGHT_CALLBACK" \
+  run_bounded_argv "deployment preflight" "$PREFLIGHT_TIMEOUT" "$PREFLIGHT_CALLBACK" \
     || die "preflight callback failed"
-else
-  run_bounded_argv "preflight" "$PREFLIGHT_TIMEOUT" \
-    "$WORKER_BIN" codex isolation-check --json \
-      --retiring-state-dir "$RETIRING_STATE_DIR" \
-    || die "Codex isolation preflight failed"
 fi
 
 bundle="${PLIST}.rollback-bundle-$(date +%Y%m%d-%H%M%S)-$$"
