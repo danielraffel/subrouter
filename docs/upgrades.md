@@ -424,8 +424,9 @@ endpoints, account/session selectors, and credential file references only in
 the private leg configs; never put raw credentials in the manifest, arguments,
 filenames, output, or source.
 
-The authenticated and sticky gates use two tiny provider turns total, each
-bounded to 64 output tokens. The authenticated gate proves both responses used
+The authenticated and sticky gates use two tiny provider turns total. Each is
+bounded by the configured request timeout and response-byte cap, and must
+return only the exact challenge marker. The authenticated gate proves both responses used
 one candidate assignment, deletes its temporary session and cleanup journal,
 and passes only salted hashes to the zero-traffic sticky gate. An interrupted
 run recovers its private cleanup journal before creating another canary session.

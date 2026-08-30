@@ -771,7 +771,7 @@ func TestQuotaFailureResponseRequiresStructuredQuotaEvidence(t *testing.T) {
 	}
 }
 
-func TestEveryCanaryTurnHasSmallOutputBound(t *testing.T) {
+func TestCodexCanaryUsesBackendCompatibleRequestShape(t *testing.T) {
 	body, err := responseRequest("model", "MARK")
 	if err != nil {
 		t.Fatal(err)
@@ -780,8 +780,14 @@ func TestEveryCanaryTurnHasSmallOutputBound(t *testing.T) {
 	if err := json.Unmarshal(body, &request); err != nil {
 		t.Fatal(err)
 	}
-	if request["max_output_tokens"] != float64(64) {
-		t.Fatalf("max_output_tokens=%v", request["max_output_tokens"])
+	if _, present := request["max_output_tokens"]; present {
+		t.Fatalf("unsupported max_output_tokens present: %v", request["max_output_tokens"])
+	}
+	if store, ok := request["store"].(bool); !ok || store {
+		t.Fatalf("store=%v, want false", request["store"])
+	}
+	if stream, ok := request["stream"].(bool); !ok || !stream {
+		t.Fatalf("stream=%v, want true", request["stream"])
 	}
 	input, ok := request["input"].([]any)
 	if !ok || len(input) != 1 {
@@ -908,14 +914,14 @@ func TestSameSourceIsolatedFailoverAttemptCaps(t *testing.T) {
 }
 
 type failoverFixture struct {
-	server      *httptest.Server
-	mu          sync.Mutex
-	assignments map[string]string
-	routes      []string
-	noRetries   []bool
-	deleted     bool
-	failTurn    int
-	badBounds   bool
+	server          *httptest.Server
+	mu              sync.Mutex
+	assignments     map[string]string
+	routes          []string
+	noRetries       []bool
+	deleted         bool
+	failTurn        int
+	badRequestShape bool
 }
 
 func newFailoverFixture(t *testing.T, failTurn int) *failoverFixture {
@@ -946,8 +952,8 @@ func newFailoverFixture(t *testing.T, failTurn int) *failoverFixture {
 		case "/v1/responses":
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["max_output_tokens"] != float64(64) {
-				fixture.badBounds = true
+			if _, present := body["max_output_tokens"]; present {
+				fixture.badRequestShape = true
 			}
 			marker := strings.TrimPrefix(canaryResponsePrompt(body), "Reply with exactly ")
 			sessionID := r.Header.Get("X-Subrouter-Session")
@@ -1005,8 +1011,8 @@ func TestLiveFailoverProvesExactRouteAndReuse(t *testing.T) {
 	if !fixture.deleted || len(fixture.assignments) != 0 {
 		t.Fatal("synthetic failover session not cleaned")
 	}
-	if fixture.badBounds {
-		t.Fatal("real canary request lacked max_output_tokens bound")
+	if fixture.badRequestShape {
+		t.Fatal("real canary request included unsupported max_output_tokens")
 	}
 }
 

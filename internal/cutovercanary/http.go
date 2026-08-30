@@ -329,7 +329,9 @@ func requestMarkerHash(marker string) string {
 
 func responseRequest(model, marker string) ([]byte, error) {
 	return json.Marshal(map[string]any{
-		"model": model,
+		"model":  model,
+		"store":  false,
+		"stream": true,
 		"input": []map[string]any{{
 			"type": "message",
 			"role": "user",
@@ -338,7 +340,6 @@ func responseRequest(model, marker string) ([]byte, error) {
 				"text": "Reply with exactly " + marker,
 			}},
 		}},
-		"max_output_tokens": 64,
 	})
 }
 
