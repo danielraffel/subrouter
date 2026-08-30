@@ -33,13 +33,24 @@ type srAutoSwitchConfig struct {
 	SwitchActive func(context.Context, string) error
 	// Lease keeps the sweep singleton across concurrently live workers.
 	Lease srAutoSwitchLease
+	// DelayFirstSweep is used by serving workers whose startup score coordinator
+	// already owns the immediate shared sweep. Periodic refreshes begin after one
+	// interval instead of duplicating startup work.
+	DelayFirstSweep bool
+	// ScoreSnapshots publishes successful periodic refreshes for successor
+	// workers. Nil leaves one-shot and test callers unchanged.
+	ScoreSnapshots *srUsageScoreStore
 }
 
 func runSRAutoSwitch(ctx context.Context, cfg srAutoSwitchConfig) {
 	if cfg.Interval <= 0 {
 		return
 	}
-	timer := time.NewTimer(0)
+	firstDelay := time.Duration(0)
+	if cfg.DelayFirstSweep {
+		firstDelay = cfg.Interval
+	}
+	timer := time.NewTimer(firstDelay)
 	defer timer.Stop()
 	for {
 		select {
@@ -73,6 +84,9 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	}
 	var scheduler selectacct.Scheduler
 	var candidates []accounts.Account
+	var scores []selectacct.Score
+	var successful int
+	var fetchedGenerationKey string
 	lastConflict := "scheduler score snapshot changed"
 	for attempt := 1; attempt <= srAutoSwitchPublishAttempts; attempt++ {
 		allAccounts := cfg.Accounts
@@ -86,14 +100,42 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 		if len(candidates) == 0 {
 			return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
 		}
+		generationKey := codexScoreGenerationKey(accountGeneration, candidates)
 		scoreRevision := uint64(0)
 		if cfg.SchedulerRef != nil {
 			scoreRevision = cfg.SchedulerRef.ScoreRevision()
 		}
 
-		scores, successful := fetchScores(ctx, candidates)
-		if successful == 0 {
-			return "", fmt.Errorf("no fresh OAuth usage scores available")
+		// Score-revision conflicts do not invalidate provider measurements. Keep
+		// the fetched scores and retry only the atomic publication. A changed
+		// account or credential generation is the sole reason to re-fetch.
+		if fetchedGenerationKey != generationKey {
+			scores, successful = fetchScores(ctx, candidates)
+			if successful == 0 {
+				return "", fmt.Errorf("no fresh OAuth usage scores available")
+			}
+			// OAuth refresh may rotate the credential used by the successful
+			// measurement. The scores describe that post-refresh credential, so
+			// adopt its key without issuing the same usage requests again. A real
+			// account-set change invalidates the batch and is re-fetched.
+			if cfg.AccountsSnapshotFunc != nil {
+				currentAccounts, currentGeneration := cfg.AccountsSnapshotFunc()
+				currentCandidates := codexOAuthAccounts(currentAccounts)
+				if !sameCodexScoreAccounts(candidates, currentCandidates) {
+					fetchedGenerationKey = ""
+					if attempt == srAutoSwitchPublishAttempts {
+						return "", fmt.Errorf("sr auto-switch account pool changed during usage fetch")
+					}
+					continue
+				}
+				candidates = currentCandidates
+				accountGeneration = currentGeneration
+				generationKey = codexScoreGenerationKey(accountGeneration, candidates)
+				if cfg.SchedulerRef != nil {
+					scoreRevision = cfg.SchedulerRef.ScoreRevision()
+				}
+			}
+			fetchedGenerationKey = generationKey
 		}
 
 		scheduler = selectacct.NewScheduler(scores)
@@ -111,11 +153,15 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 			break
 		}
 		if cfg.AccountsSnapshotFunc != nil {
-			_, currentGeneration := cfg.AccountsSnapshotFunc()
-			if currentGeneration != accountGeneration {
+			currentAccounts, currentGeneration := cfg.AccountsSnapshotFunc()
+			currentKey := codexScoreGenerationKey(currentGeneration, codexOAuthAccounts(currentAccounts))
+			if currentKey != generationKey {
 				lastConflict = "account pool changed"
 			} else {
 				lastConflict = "scheduler score snapshot changed"
+			}
+			if currentKey != generationKey {
+				fetchedGenerationKey = ""
 			}
 		}
 		if attempt == srAutoSwitchPublishAttempts {
@@ -126,6 +172,16 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 		}
 		if err := ctx.Err(); err != nil {
 			return "", err
+		}
+	}
+	if cfg.ScoreSnapshots != nil && fetchedGenerationKey != "" {
+		if err := cfg.ScoreSnapshots.write(srUsageScoreSnapshot{
+			SchemaVersion: scoreSnapshotSchemaVersion,
+			GenerationKey: fetchedGenerationKey,
+			FetchedAt:     time.Now().UTC(),
+			Scores:        scores,
+		}); err != nil {
+			return "", fmt.Errorf("publish shared usage score snapshot: %w", err)
 		}
 	}
 	if cfg.Sessions != nil {

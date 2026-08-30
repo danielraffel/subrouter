@@ -214,9 +214,13 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	req.Header.Set("X-Subrouter-Preferred-Account-ID", "preferred")
 	req.Header.Set("X-Subrouter-Model", "GPT-5.3-Codex-Spark")
 	req.Header.Set("X-Model", "GPT-5.3-Codex-Spark")
+	req.Header.Set("X-Subrouter-No-Retry", "1")
 	req.Header.Set("X-Other", "keep")
 
 	StripSubrouterHeaders(req.Header)
+	if got := req.Header.Get("X-Subrouter-No-Retry"); got != "" {
+		t.Fatalf("X-Subrouter-No-Retry = %q, want empty", got)
+	}
 
 	if got := req.Header.Get("X-Subrouter-Lease"); got != "" {
 		t.Fatalf("X-Subrouter-Lease = %q, want empty", got)

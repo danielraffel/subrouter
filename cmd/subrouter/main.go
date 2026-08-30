@@ -65,7 +65,8 @@ func configureDefaultLogger(program string, args []string) {
 }
 
 func shouldUseProcessLogger(_ string, args []string) bool {
-	return len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front" || args[0] == "listener-transfer")
+	return isCodexIsolationCheckCommand(args) ||
+		(len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front" || args[0] == "listener-transfer"))
 }
 
 func newCLIFileLogHandler(path string) slog.Handler {
@@ -140,7 +141,7 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
-	if isCodexIsolationCommand(args) {
+	if isCodexAccountCommand(args) {
 		return srForProgram(program, args)
 	}
 	if program == "sr" &&
@@ -627,7 +628,19 @@ func serve(args []string) error {
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
 	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initialSchedulerCredentialAccounts(initialAccounts))
-	if *fetchUsage && credentialBroker == nil {
+	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
+	defer stopActiveGenerationTasks()
+	autoSwitchScoresEnabled := srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil
+	startupScores := &startupScoreReadiness{required: autoSwitchScoresEnabled}
+	var sharedScoreStore *srUsageScoreStore
+	if autoSwitchScoresEnabled {
+		sharedScoreStore = newSRUsageScoreStore(storepath.StateDir())
+	}
+	// With auto-switch enabled its immediate, leased sweep is the startup fetch.
+	// Running this standalone fetch too would duplicate every usage request and,
+	// during a supervisor overlap, bypass the cross-worker lease entirely. Keep
+	// the standalone path for interval=0, where auto-switch is intentionally off.
+	if shouldStartStandaloneUsageFetch(*fetchUsage, credentialBroker != nil, srSwitchInterval) {
 		scoreRevision := schedulerRef.ScoreRevision()
 		go func() {
 			fetchedScores, successful := fetchCodexScoresWithAccountRef(context.Background(), accountRef, codexAccounts)
@@ -727,6 +740,7 @@ func serve(args []string) error {
 		Sessions:                 store,
 		SchedulerRef:             schedulerRef,
 		UsageScoreTTL:            usageScoreTTLForServe(*fetchUsage, *usageScoreTTL),
+		ReadyCheck:               startupScores.check,
 		Transport:                outboundTransport,
 		Logger:                   slog.Default(),
 		Lifecycle:                proxy.NewLifecycle(),
@@ -798,22 +812,49 @@ func serve(args []string) error {
 			"destination", transcriptAzureDestination,
 			"fix", "set SUBROUTER_TRANSCRIPT_AZURE_KEY_FILE (or SUBROUTER_TRANSCRIPT_AZURE_SAS) and check the container URL")
 	}
-	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
-	defer stopActiveGenerationTasks()
-	if srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil {
+	if autoSwitchScoresEnabled {
+		fetchScores := func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+			scores, successful := fetchCodexScoresWithAccountRef(ctx, accountRef, candidates)
+			loaded, generation, revision := accountRef.CredentialSnapshot()
+			schedulerRef.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(loaded))
+			return scores, successful
+		}
+		go func() {
+			if err := ensureStartupScores(activeGenerationCtx, startupScoreConfig{
+				Interval:         srSwitchInterval,
+				AccountsSnapshot: accountRef.Snapshot,
+				RefreshAccounts: func() error {
+					loaded, generation, err := accountRef.ReloadSnapshot()
+					if err != nil {
+						return err
+					}
+					_, _, revision := accountRef.CredentialSnapshot()
+					schedulerRef.AdvanceAccountGenerationWithAccounts(
+						generation, revision, proxy.SchedulerAccounts(loaded),
+					)
+					return nil
+				},
+				SchedulerRef: schedulerRef,
+				FetchScores:  fetchScores,
+				Store:        sharedScoreStore,
+			}); err != nil && activeGenerationCtx.Err() == nil {
+				slog.Error("startup Codex usage scores unavailable", "error", err)
+				return
+			}
+			if activeGenerationCtx.Err() == nil {
+				startupScores.ready.Store(true)
+			}
+		}()
 		go runSRAutoSwitch(activeGenerationCtx, srAutoSwitchConfig{
 			Interval:             srSwitchInterval,
 			AccountsSnapshotFunc: accountRef.Snapshot,
 			Sessions:             store,
 			SchedulerRef:         schedulerRef,
 			Logger:               slog.Default(),
-			FetchScores: func(ctx context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
-				scores, successful := fetchCodexScoresWithAccountRef(ctx, accountRef, candidates)
-				loaded, generation, revision := accountRef.CredentialSnapshot()
-				schedulerRef.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(loaded))
-				return scores, successful
-			},
-			Lease: newSRAutoSwitchLease(storepath.StateDir()),
+			FetchScores:          fetchScores,
+			Lease:                newSRAutoSwitchLease(storepath.StateDir()),
+			DelayFirstSweep:      true,
+			ScoreSnapshots:       sharedScoreStore,
 		})
 	} else if srSwitchInterval > 0 && credentialBroker == nil {
 		slog.Info("sr auto-switch disabled because usage fetching is disabled", "interval", srSwitchInterval.String())
@@ -1384,6 +1425,12 @@ func fetchCodexScoresWithAccountRef(ctx context.Context, ref *proxy.AccountRef, 
 	})
 }
 
+func shouldStartStandaloneUsageFetch(fetchUsage, credentialBrokerConfigured bool, switchInterval time.Duration) bool {
+	return fetchUsage && !credentialBrokerConfigured && switchInterval <= 0
+}
+
+const codexUsageFetchConcurrency = 4
+
 func fetchCodexScoresWithRefresh(
 	ctx context.Context,
 	codexAccounts []accounts.Account,
@@ -1403,53 +1450,64 @@ func fetchCodexScoresWithRefresh(
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	successful := 0
+	oauthAccounts := make([]accounts.Account, 0, len(codexAccounts))
 	for _, account := range codexAccounts {
-		if account.AuthMode != accounts.AuthModeOAuth {
-			continue
+		if account.AuthMode == accounts.AuthModeOAuth {
+			oauthAccounts = append(oauthAccounts, account)
 		}
+	}
+	jobs := make(chan accounts.Account, len(oauthAccounts))
+	for _, account := range oauthAccounts {
+		jobs <- account
+	}
+	close(jobs)
+	workers := min(codexUsageFetchConcurrency, len(oauthAccounts))
+	for range workers {
 		wg.Add(1)
-		go func(account accounts.Account) {
+		go func() {
 			defer wg.Done()
-			refreshed, err := refresh(ctx, client, account)
-			if err != nil {
-				slog.Warn("account refresh failed", "account", account.ID, "error", err)
+			for account := range jobs {
+				refreshed, err := refresh(ctx, client, account)
+				if err != nil {
+					slog.Warn("account refresh failed", "account", account.ID, "error", err)
+					mu.Lock()
+					if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+						scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0}
+					}
+					mu.Unlock()
+					continue
+				}
+				account = refreshed
+				windows, err := accounts.FetchCodexUsage(ctx, client, account)
+				if err != nil {
+					slog.Warn("usage fetch failed", "account", account.ID, "error", err)
+					mu.Lock()
+					if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
+						scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0}
+					}
+					mu.Unlock()
+					continue
+				}
+				limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
+				for _, window := range windows {
+					limitWindows = append(limitWindows, selectacct.LimitWindow{
+						Name:               window.Name,
+						UsedPercent:        window.UsedPercent,
+						LimitWindowSeconds: window.LimitWindowSeconds,
+						ResetAfterSeconds:  window.ResetAfterSeconds,
+						Feature:            window.Feature,
+					})
+				}
+				score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
+				score.Provider = account.Provider
 				mu.Lock()
 				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0}
+					scores[idx] = score
+					successful++
 				}
 				mu.Unlock()
-				return
 			}
-			account = refreshed
-			windows, err := accounts.FetchCodexUsage(ctx, client, account)
-			if err != nil {
-				slog.Warn("usage fetch failed", "account", account.ID, "error", err)
-				mu.Lock()
-				if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-					scores[idx] = selectacct.Score{AccountID: account.ID, Provider: account.Provider, Headroom: 0}
-				}
-				mu.Unlock()
-				return
-			}
-			limitWindows := make([]selectacct.LimitWindow, 0, len(windows))
-			for _, window := range windows {
-				limitWindows = append(limitWindows, selectacct.LimitWindow{
-					Name:               window.Name,
-					UsedPercent:        window.UsedPercent,
-					LimitWindowSeconds: window.LimitWindowSeconds,
-					ResetAfterSeconds:  window.ResetAfterSeconds,
-					Feature:            window.Feature,
-				})
-			}
-			score := selectacct.ScoreFromLimitWindows(account.ID, 0, limitWindows)
-			score.Provider = account.Provider
-			mu.Lock()
-			if idx, ok := scoreByID[selectacct.ScoreKey(account.Provider, account.ID)]; ok {
-				scores[idx] = score
-				successful++
-			}
-			mu.Unlock()
-		}(account)
+		}()
 	}
 	wg.Wait()
 
@@ -1555,6 +1613,8 @@ Usage:
   %[1]s reset [email]      Redeem a rate-limit reset credit (best candidate, or --all, or --dry-run)
   %[1]s usage [days]       Refresh and show API-key spend
   %[1]s trace <email>      Show OAuth refresh breadcrumbs for an account
+  %[1]s codex isolation-check [--json] [--retiring-state-dir PATH]
+                           Check serving credential isolation without changing credentials
   %[1]s codex migrate-isolation [--device-auth]
                            Re-enroll legacy Codex OAuth accounts without changing local Codex auth
 

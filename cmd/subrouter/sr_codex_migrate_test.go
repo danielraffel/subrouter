@@ -3,7 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -36,20 +41,129 @@ func (r *recordingSRCommandRunner) commandCount(parts ...string) int {
 	return count
 }
 
-func TestCodexMigrateIsolationIsReservedWithoutHijackingCodexLauncher(t *testing.T) {
+func TestCodexAccountCommandsAreReservedWithoutHijackingCodexLauncher(t *testing.T) {
 	for _, test := range []struct {
 		args []string
 		want bool
 	}{
 		{[]string{"codex", "migrate-isolation"}, true},
 		{[]string{"codex", "migrate-isolation", "--device-auth"}, true},
+		{[]string{"codex", "isolation-check"}, true},
+		{[]string{"codex", "isolation-check", "--json"}, true},
 		{[]string{"codex"}, false},
 		{[]string{"codex", "resume", "thread-id"}, false},
 		{[]string{"status"}, false},
 	} {
-		if got := isCodexIsolationCommand(test.args); got != test.want {
-			t.Fatalf("isCodexIsolationCommand(%q) = %v, want %v", test.args, got, test.want)
+		if got := isCodexAccountCommand(test.args); got != test.want {
+			t.Fatalf("isCodexAccountCommand(%q) = %v, want %v", test.args, got, test.want)
 		}
+	}
+}
+
+func runCodexIsolationJSONCheck(t *testing.T, store accounts.CodexStore) (codexIsolationCheckResult, error) {
+	t.Helper()
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	err := runner.codexAccount(context.Background(), []string{"isolation-check", "--json"})
+	var result codexIsolationCheckResult
+	if decodeErr := json.Unmarshal(out.Bytes(), &result); decodeErr != nil {
+		t.Fatalf("decode isolation check %q: %v", out.String(), decodeErr)
+	}
+	return result, err
+}
+
+func TestCodexIsolationJSONCheckRejectsMissingOriginWithoutMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.DefaultCodexStore()
+	saveLegacyCodexAccount(t, store, "legacy@example.com", "acct-legacy", "legacy-refresh")
+	path := filepath.Join(store.Dir, "legacy@example.com.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, checkErr := runCodexIsolationJSONCheck(t, store)
+	if !errors.Is(checkErr, errCodexIsolationCheckFailed) {
+		t.Fatalf("check error = %v, want isolation failure", checkErr)
+	}
+	if result.SchemaVersion != 1 || result.OK || result.AccountsRequiringMigration != 1 || result.Remediation != codexIsolationRemediation {
+		t.Fatalf("check result = %#v", result)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("isolation check mutated the stored credential")
+	}
+}
+
+func TestCodexIsolationJSONCheckAcceptsTrustedOrigin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("isolated@example.com", "acct-isolated")
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "isolated@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runCodexIsolationJSONCheck(t, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SchemaVersion != 1 || !result.OK || result.AccountsRequiringMigration != 0 || result.Remediation != "" {
+		t.Fatalf("check result = %#v", result)
+	}
+}
+
+func TestCodexIsolationJSONCheckRejectsTrustedOriginSharingInteractiveChain(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := accounts.DefaultCodexStore()
+	auth := testCodexAuth("shared@example.com", "acct-shared")
+	auth.Tokens.RefreshToken = "shared-refresh"
+	if err := accounts.WriteActiveCodexAuth(auth); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "shared@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginServerAttested,
+		Auth:                  auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runCodexIsolationJSONCheck(t, store)
+	if !errors.Is(err, errCodexIsolationCheckFailed) {
+		t.Fatalf("check error = %v, want isolation failure", err)
+	}
+	if result.OK || result.AccountsRequiringMigration != 1 || result.Remediation != codexIsolationRemediation {
+		t.Fatalf("check result = %#v", result)
+	}
+}
+
+func TestCodexIsolationJSONCheckRemainsAvailableWithMalformedRoutingConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := os.WriteFile(configPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runner := srRunner{
+		store: accounts.DefaultCodexStore(), in: strings.NewReader(""), out: &out, errOut: &out,
+	}
+	if err := runner.run(context.Background(), []string{"codex", "isolation-check", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var result codexIsolationCheckResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK || result.AccountsRequiringMigration != 0 {
+		t.Fatalf("check result = %#v", result)
 	}
 }
 
@@ -59,6 +173,407 @@ func TestSubrouterProgramDispatchesDocumentedCodexIsolationCommand(t *testing.T)
 	if err := runForProgram("subrouter", []string{"codex", "migrate-isolation"}); err != nil {
 		t.Fatalf("documented subrouter migration command: %v", err)
 	}
+}
+
+func TestCodexIsolationCheckEmptyStateDoesNotImportLegacyArchive(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	legacy := filepath.Join(home, ".codex-accounts")
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "login.log"), []byte("synthetic legacy login log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+
+	if err := runForProgram("subrouter", []string{"codex", "isolation-check", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("isolation check created or migrated state: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(legacy, "login.log")); err != nil || string(body) != "synthetic legacy login log\n" {
+		t.Fatalf("legacy archive changed: body=%q err=%v", body, err)
+	}
+}
+
+func TestCodexIsolationCheckRejectsUntrustedLegacySourceWithoutMutation(t *testing.T) {
+	home, stateDir, legacyStore := isolationLegacyTestState(t)
+	saveLegacyCodexAccount(t, legacyStore, "legacy@example.com", "acct-legacy", "legacy-refresh")
+	before := snapshotTestTree(t, home)
+
+	store := accounts.DefaultCodexStoreForReadOnlyInspection()
+	if store.Dir != legacyStore.Dir {
+		t.Fatalf("inspection store = %q, want effective legacy source %q", store.Dir, legacyStore.Dir)
+	}
+	result, err := runCodexIsolationJSONCheck(t, store)
+	if !errors.Is(err, errCodexIsolationCheckFailed) || result.OK || result.AccountsRequiringMigration != 1 {
+		t.Fatalf("legacy isolation result=%#v err=%v, want one migration", result, err)
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("isolation check created candidate state: %v", err)
+	}
+	if after := snapshotTestTree(t, home); !reflect.DeepEqual(after, before) {
+		t.Fatalf("legacy source changed: before=%v after=%v", before, after)
+	}
+}
+
+func TestCodexIsolationCheckAcceptsTrustedLegacySourceWithoutMutation(t *testing.T) {
+	home, stateDir, legacyStore := isolationLegacyTestState(t)
+	auth := testCodexAuth("trusted@example.com", "acct-trusted")
+	if err := legacyStore.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "trusted@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTestTree(t, home)
+
+	result, err := runCodexIsolationJSONCheck(t, accounts.DefaultCodexStoreForReadOnlyInspection())
+	if err != nil || !result.OK || result.AccountsRequiringMigration != 0 {
+		t.Fatalf("trusted legacy isolation result=%#v err=%v", result, err)
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("isolation check created candidate state: %v", err)
+	}
+	if after := snapshotTestTree(t, home); !reflect.DeepEqual(after, before) {
+		t.Fatalf("legacy source changed: before=%v after=%v", before, after)
+	}
+}
+
+func TestCodexIsolationCheckNonemptyCandidateWinsOverLegacy(t *testing.T) {
+	home, stateDir, legacyStore := isolationLegacyTestState(t)
+	saveLegacyCodexAccount(t, legacyStore, "legacy@example.com", "acct-legacy", "legacy-refresh")
+	targetStore := accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")}
+	auth := testCodexAuth("target@example.com", "acct-target")
+	if err := targetStore.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "target@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTestTree(t, filepath.Dir(home))
+
+	store := accounts.DefaultCodexStoreForReadOnlyInspection()
+	if store.Dir != targetStore.Dir {
+		t.Fatalf("inspection store = %q, want nonempty candidate %q", store.Dir, targetStore.Dir)
+	}
+	result, err := runCodexIsolationJSONCheck(t, store)
+	if err != nil || !result.OK || result.AccountsRequiringMigration != 0 {
+		t.Fatalf("candidate isolation result=%#v err=%v", result, err)
+	}
+	if after := snapshotTestTree(t, filepath.Dir(home)); !reflect.DeepEqual(after, before) {
+		t.Fatalf("credential sources changed: before=%v after=%v", before, after)
+	}
+}
+
+func TestCodexIsolationComparisonFailsClosedAndDoesNotMutate(t *testing.T) {
+	tests := []struct {
+		name                            string
+		setup                           func(*testing.T, accounts.CodexStore, accounts.CodexStore)
+		sameRoot                        bool
+		legacyAPIKey                    bool
+		wantOK                          bool
+		wantCandidate                   int
+		wantRetiring                    int
+		wantInventory                   bool
+		wantRootsDistinct               bool
+		wantStoreAnchored               bool
+		wantStoresDistinct              bool
+		wantShared                      int
+		wantOriginsTrusted              bool
+		wantMissingRefresh              int
+		wantDuplicateChains             int
+		wantCandidateDuplicateSelectors int
+		wantRetiringDuplicateSelectors  int
+	}{
+		{name: "zero inventory", wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true},
+		{
+			name: "incomplete candidate", wantCandidate: 1, wantRetiring: 2, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-a", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+				saveComparisonCodexAccount(t, retiring, "account-b", "retiring-b", "")
+			},
+		},
+		{
+			name: "extra candidate", wantCandidate: 2, wantRetiring: 1, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-a", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccount(t, candidate, "account-b", "candidate-b", accounts.CodexOAuthOriginServerAttested)
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+			},
+		},
+		{
+			name: "same root", sameRoot: true, wantCandidate: 1, wantRetiring: 1, wantInventory: true, wantStoreAnchored: true, wantShared: 1, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, _ accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "same-chain", accounts.CodexOAuthOriginIsolatedServerLogin)
+			},
+		},
+		{
+			name: "shared refresh chain", wantCandidate: 1, wantRetiring: 1, wantInventory: true, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantShared: 1, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "shared-chain", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccount(t, retiring, "account-a", "shared-chain", "")
+			},
+		},
+		{
+			name: "untrusted candidate origin", wantCandidate: 1, wantRetiring: 1, wantInventory: true, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-a", "")
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+			},
+		},
+		{
+			name: "duplicate candidate refresh chain", wantCandidate: 2, wantRetiring: 2, wantInventory: true, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true, wantDuplicateChains: 1,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-shared", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccount(t, candidate, "account-b", "candidate-shared", accounts.CodexOAuthOriginServerAttested)
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+				saveComparisonCodexAccount(t, retiring, "account-b", "retiring-b", "")
+			},
+		},
+		{
+			name: "missing candidate refresh token", wantCandidate: 1, wantRetiring: 1, wantInventory: true, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true, wantMissingRefresh: 1,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+			},
+		},
+		{
+			name: "api key legacy fallback is not candidate", legacyAPIKey: true, wantCandidate: 1, wantRetiring: 1, wantInventory: true, wantRootsDistinct: true, wantStoresDistinct: true, wantOriginsTrusted: true,
+		},
+		{
+			name: "oauth substituted by api key", wantCandidate: 1, wantRetiring: 1, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-a", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonAPIKeyAccount(t, retiring, "account-a", "sk-retiring")
+			},
+		},
+		{
+			name: "same selector different immutable account", wantCandidate: 1, wantRetiring: 1, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccountWithIdentity(t, candidate, "account-a", "immutable-candidate", "candidate-a", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccountWithIdentity(t, retiring, "account-a", "immutable-retiring", "retiring-a", "")
+			},
+		},
+		{
+			name: "duplicate normalized selector in candidate", wantCandidate: 2, wantRetiring: 1, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true, wantCandidateDuplicateSelectors: 1,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-a", accounts.CodexOAuthOriginIsolatedServerLogin)
+				writeComparisonCodexAccountFile(t, candidate, "duplicate-case.json", "ACCOUNT-A", "acct-account-a", "candidate-b", accounts.CodexOAuthOriginServerAttested)
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+			},
+		},
+		{
+			name: "duplicate normalized selector in retiring", wantCandidate: 1, wantRetiring: 2, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true, wantRetiringDuplicateSelectors: 1,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-a", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+				writeComparisonCodexAccountFile(t, retiring, "duplicate-case.json", "ACCOUNT-A", "acct-account-a", "retiring-b", "")
+			},
+		},
+		{
+			name: "isolated exact match", wantOK: true, wantCandidate: 1, wantRetiring: 1, wantInventory: true, wantRootsDistinct: true, wantStoreAnchored: true, wantStoresDistinct: true, wantOriginsTrusted: true,
+			setup: func(t *testing.T, candidate, retiring accounts.CodexStore) {
+				saveComparisonCodexAccount(t, candidate, "account-a", "candidate-a", accounts.CodexOAuthOriginIsolatedServerLogin)
+				saveComparisonCodexAccount(t, retiring, "account-a", "retiring-a", "")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			candidateRoot := filepath.Join(root, "candidate")
+			retiringRoot := filepath.Join(root, "retiring")
+			if test.sameRoot {
+				alias := filepath.Join(root, "root-alias")
+				if err := os.Symlink(root, alias); err != nil {
+					t.Fatal(err)
+				}
+				retiringRoot = filepath.Join(alias, "candidate")
+			}
+			t.Setenv("HOME", home)
+			t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+			t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+			if test.legacyAPIKey {
+				legacy := accounts.CodexStore{Dir: filepath.Join(home, ".codex-accounts", "accounts")}
+				saveComparisonAPIKeyAccount(t, legacy, "apikey:paid", "sk-legacy")
+				retiring := accounts.CodexStore{Dir: filepath.Join(retiringRoot, "codex", "accounts")}
+				saveComparisonAPIKeyAccount(t, retiring, "apikey:paid", "sk-retiring")
+			}
+			candidateStore := accounts.CodexStoreForStateRootReadOnlyInspection(candidateRoot)
+			retiringStore := accounts.CodexStoreForStateRootReadOnlyInspection(retiringRoot)
+			if test.setup != nil {
+				test.setup(t, candidateStore, retiringStore)
+			}
+			before := snapshotTestTree(t, root)
+
+			var output bytes.Buffer
+			runner := srRunner{store: candidateStore, out: &output, errOut: &output}
+			err := runner.codexAccount(context.Background(), []string{
+				"isolation-check", "--json", "--retiring-state-dir", retiringRoot,
+			})
+			var result codexIsolationCheckResult
+			if decodeErr := json.Unmarshal(output.Bytes(), &result); decodeErr != nil {
+				t.Fatalf("decode comparison %q: %v", output.String(), decodeErr)
+			}
+			if test.wantOK && err != nil {
+				t.Fatalf("comparison error = %v", err)
+			}
+			if !test.wantOK && !errors.Is(err, errCodexIsolationCheckFailed) {
+				t.Fatalf("comparison error = %v, want preflight failure", err)
+			}
+			comparison := result.Comparison
+			if comparison == nil {
+				t.Fatal("comparison result missing")
+			}
+			if result.OK != test.wantOK || comparison.OK != test.wantOK ||
+				comparison.CandidateAccountCount != test.wantCandidate ||
+				comparison.RetiringAccountCount != test.wantRetiring ||
+				comparison.AccountInventoryMatch != test.wantInventory ||
+				comparison.RootsDistinct != test.wantRootsDistinct ||
+				comparison.CandidateStoreAnchored != test.wantStoreAnchored ||
+				comparison.EffectiveStoresDistinct != test.wantStoresDistinct ||
+				comparison.SharedOAuthRefreshTokenCount != test.wantShared ||
+				comparison.CandidateOAuthOriginsTrusted != test.wantOriginsTrusted ||
+				comparison.CandidateMissingRefreshCount != test.wantMissingRefresh ||
+				comparison.CandidateDuplicateChainCount != test.wantDuplicateChains ||
+				comparison.CandidateDuplicateSelectorCount != test.wantCandidateDuplicateSelectors ||
+				comparison.RetiringDuplicateSelectorCount != test.wantRetiringDuplicateSelectors ||
+				comparison.NormalizedSelectorsUnique != (test.wantCandidateDuplicateSelectors == 0 && test.wantRetiringDuplicateSelectors == 0) {
+				t.Fatalf("comparison result = %#v, top-level ok=%v", comparison, result.OK)
+			}
+			if after := snapshotTestTree(t, root); !reflect.DeepEqual(after, before) {
+				t.Fatalf("comparison mutated state: before=%v after=%v", before, after)
+			}
+			for _, secret := range []string{"account-a", "account-b", "candidate-a", "candidate-b", "retiring-a", "retiring-b", "shared-chain", "candidate-shared", "immutable-candidate", "immutable-retiring", "sk-legacy", "sk-retiring", candidateRoot, retiringRoot} {
+				if secret != "" && strings.Contains(output.String(), secret) {
+					t.Fatalf("comparison JSON leaked %q: %s", secret, output.String())
+				}
+			}
+		})
+	}
+}
+
+func saveComparisonCodexAccount(
+	t *testing.T,
+	store accounts.CodexStore,
+	id, refreshToken string,
+	origin accounts.CodexOAuthCredentialOrigin,
+) {
+	t.Helper()
+	saveComparisonCodexAccountWithIdentity(t, store, id, "acct-"+id, refreshToken, origin)
+}
+
+func saveComparisonCodexAccountWithIdentity(
+	t *testing.T,
+	store accounts.CodexStore,
+	id, immutableAccountID, refreshToken string,
+	origin accounts.CodexOAuthCredentialOrigin,
+) {
+	t.Helper()
+	auth := testCodexAuth(id, immutableAccountID)
+	auth.Tokens.AccountID = immutableAccountID
+	auth.Tokens.RefreshToken = refreshToken
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: id, OAuthCredentialOrigin: origin, Auth: auth,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func saveComparisonAPIKeyAccount(t *testing.T, store accounts.CodexStore, id, key string) {
+	t.Helper()
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: id,
+		Auth:  accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: key},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeComparisonCodexAccountFile(
+	t *testing.T,
+	store accounts.CodexStore,
+	filename, id, immutableAccountID, refreshToken string,
+	origin accounts.CodexOAuthCredentialOrigin,
+) {
+	t.Helper()
+	auth := testCodexAuth(id, immutableAccountID)
+	auth.Tokens.AccountID = immutableAccountID
+	auth.Tokens.RefreshToken = refreshToken
+	body, err := json.Marshal(accounts.StoredCodexAccount{
+		Email: id, OAuthCredentialOrigin: origin, Auth: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Dir, filename), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func isolationLegacyTestState(t *testing.T) (home, stateDir string, legacyStore accounts.CodexStore) {
+	t.Helper()
+	root := t.TempDir()
+	home = filepath.Join(root, "home")
+	stateDir = filepath.Join(root, "state")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+	legacyStore = accounts.CodexStore{Dir: filepath.Join(home, ".codex-accounts", "accounts")}
+	return home, stateDir, legacyStore
+}
+
+func snapshotTestTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snapshot := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			snapshot[rel] = "<dir>"
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			snapshot[rel] = "<symlink>" + target
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		snapshot[rel] = string(body)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func TestCodexMigrateIsolationRemainsAvailableWithMalformedRoutingConfig(t *testing.T) {

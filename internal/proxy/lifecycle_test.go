@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -55,6 +56,31 @@ func TestLifecycleDrainAndReadyEndpoints(t *testing.T) {
 	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/_subrouter/ready", nil))
 	if ready.Code != http.StatusServiceUnavailable {
 		t.Fatalf("ready status after drain = %d, body = %s", ready.Code, ready.Body.String())
+	}
+}
+
+func TestReadyEndpointWaitsForStartupState(t *testing.T) {
+	ready := false
+	handler := Server{
+		ReadyCheck: func() error {
+			if !ready {
+				return errors.New("startup score snapshot missing")
+			}
+			return nil
+		},
+	}.Handler()
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/ready", nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"startup_ready"`) {
+		t.Fatalf("unready response = %d %s", response.Code, response.Body.String())
+	}
+
+	ready = true
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_subrouter/ready", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("ready response = %d %s", response.Code, response.Body.String())
 	}
 }
 

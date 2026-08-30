@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -180,7 +179,7 @@ func TestSRAutoSwitchPreservesOtherProviderScores(t *testing.T) {
 	}
 }
 
-func TestSRAutoSwitchRetriesScoresOlderThanConcurrentFullRefresh(t *testing.T) {
+func TestSRAutoSwitchRetriesPublicationWithoutRefetchingAfterConcurrentFullRefresh(t *testing.T) {
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
 		AccountID: "codex-a", Provider: accounts.ProviderCodex, Headroom: 0.5, ShortHeadroom: 0.5,
 	}}))
@@ -209,18 +208,18 @@ func TestSRAutoSwitchRetriesScoresOlderThanConcurrentFullRefresh(t *testing.T) {
 	if err != nil || picked != "codex-a" {
 		t.Fatalf("auto-switch picked %q with error %v", picked, err)
 	}
-	if fetches != 2 {
-		t.Fatalf("score fetches = %d, want immediate bounded retry", fetches)
+	if fetches != 1 {
+		t.Fatalf("score fetches = %d, want one fetch with publication retry", fetches)
 	}
 	if got := schedulerRef.Get().ScoreFor(accounts.ProviderCodex, "codex-a").Headroom; got != 0.2 {
 		t.Fatalf("Codex headroom = %v, want retried fresh value 0.2", got)
 	}
 }
 
-func TestSRAutoSwitchReportsRepeatedRevisionConflictAccurately(t *testing.T) {
+func TestSRAutoSwitchScoreRevisionConflictDoesNotRepeatUsageSweep(t *testing.T) {
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
 	fetches := 0
-	_, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
 		Accounts: []accounts.Account{{
 			ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
 		}},
@@ -236,19 +235,19 @@ func TestSRAutoSwitchReportsRepeatedRevisionConflictAccurately(t *testing.T) {
 			}}, 1
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "scheduler score snapshot changed") {
-		t.Fatalf("auto-switch error = %v, want score-revision conflict", err)
+	if err != nil || picked != "codex-a" {
+		t.Fatalf("auto-switch picked %q with error %v", picked, err)
 	}
-	if fetches != srAutoSwitchPublishAttempts {
-		t.Fatalf("score fetches = %d, want %d bounded attempts", fetches, srAutoSwitchPublishAttempts)
+	if fetches != 1 {
+		t.Fatalf("score fetches = %d, want one fetch across CAS retry", fetches)
 	}
 }
 
-func TestSRAutoSwitchReportsRepeatedAccountPoolConflictAccurately(t *testing.T) {
+func TestSRAutoSwitchLocalGenerationConflictDoesNotRepeatStableAccountSweep(t *testing.T) {
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
 	generation := uint64(0)
 	fetches := 0
-	_, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
 		AccountsSnapshotFunc: func() ([]accounts.Account, uint64) {
 			return []accounts.Account{{
 				ID: "codex-a", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
@@ -264,11 +263,44 @@ func TestSRAutoSwitchReportsRepeatedAccountPoolConflictAccurately(t *testing.T) 
 			}}, 1
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "account pool changed") {
-		t.Fatalf("auto-switch error = %v, want account-generation conflict", err)
+	if err != nil || picked != "codex-a" {
+		t.Fatalf("auto-switch picked %q with error %v", picked, err)
 	}
-	if fetches != srAutoSwitchPublishAttempts {
-		t.Fatalf("score fetches = %d, want %d bounded attempts", fetches, srAutoSwitchPublishAttempts)
+	if fetches != 1 {
+		t.Fatalf("score fetches = %d, want one stable account-set fetch", fetches)
+	}
+}
+
+func TestSRAutoSwitchRefetchesAfterAccountSetChanges(t *testing.T) {
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	generation := uint64(0)
+	accountID := "codex-a"
+	fetches := 0
+	picked, err := srAutoSwitchOnce(context.Background(), srAutoSwitchConfig{
+		AccountsSnapshotFunc: func() ([]accounts.Account, uint64) {
+			return []accounts.Account{{
+				ID: accountID, Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
+			}}, generation
+		},
+		SchedulerRef: schedulerRef,
+		FetchScores: func(_ context.Context, candidates []accounts.Account) ([]selectacct.Score, int) {
+			fetches++
+			measured := candidates[0].ID
+			if fetches == 1 {
+				accountID = "codex-b"
+				generation++
+				schedulerRef.AdvanceAccountGeneration(generation)
+			}
+			return []selectacct.Score{{
+				AccountID: measured, Provider: accounts.ProviderCodex, Headroom: .8, ShortHeadroom: .8,
+			}}, 1
+		},
+	})
+	if err != nil || picked != "codex-b" {
+		t.Fatalf("auto-switch picked %q with error %v", picked, err)
+	}
+	if fetches != 2 {
+		t.Fatalf("score fetches = %d, want one fetch per account-set generation", fetches)
 	}
 }
 

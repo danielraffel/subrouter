@@ -187,6 +187,18 @@ func DefaultCodexStore() CodexStore {
 	return CodexStore{Dir: filepath.Join(storepath.CodexDir(), "accounts")}
 }
 
+// DefaultCodexStoreForReadOnlyInspection resolves the same effective source as
+// DefaultCodexStore's best-effort legacy migration without copying any state.
+func DefaultCodexStoreForReadOnlyInspection() CodexStore {
+	return CodexStoreForStateRootReadOnlyInspection(storepath.StateDir())
+}
+
+// CodexStoreForStateRootReadOnlyInspection resolves the effective account
+// source for an explicit state root without performing legacy migration.
+func CodexStoreForStateRootReadOnlyInspection(stateRoot string) CodexStore {
+	return CodexStore{Dir: filepath.Join(storepath.CodexDirForStateRootReadOnlyInspection(stateRoot), "accounts")}
+}
+
 func (s CodexStore) StoreDir() string {
 	return filepath.Dir(s.Dir)
 }
@@ -215,6 +227,14 @@ func (s CodexStore) ListStored() ([]StoredCodexAccount, error) {
 		return nil, err
 	}
 	defer lock.Close()
+	return s.listStored(false)
+}
+
+// ListStoredReadOnly reads the durable snapshot without creating a lock file.
+// Writers publish account files atomically, so diagnostics can safely inspect
+// individual files; unlike ListStored, this does not promise one transactionally
+// locked view across a concurrent migration batch.
+func (s CodexStore) ListStoredReadOnly() ([]StoredCodexAccount, error) {
 	return s.listStored(false)
 }
 

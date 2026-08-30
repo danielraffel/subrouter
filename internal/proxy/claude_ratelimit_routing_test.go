@@ -209,6 +209,124 @@ func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 	}
 }
 
+func TestReplayablePostRetryBudgetIsAggregateWithoutFallback(t *testing.T) {
+	const accountCount = replayablePostMaxAttempts * 2
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		if upstreamHits%replayablePostMaxAttempts == 0 {
+			http.Error(w, "request timeout", http.StatusRequestTimeout)
+			return
+		}
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed_warning")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, realisticAnthropic429Body)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := make([]accounts.Account, 0, accountCount)
+	scores := make([]selectacct.Score, 0, accountCount)
+	for index := range accountCount {
+		id := fmt.Sprintf("account-%d@example.com", index)
+		pool = append(pool, accounts.Account{
+			ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-" + id,
+		})
+		scores = append(scores, selectacct.Score{
+			AccountID: id, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+		})
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts:       pool,
+		Sessions:       store,
+		SchedulerRef:   selectacct.NewSchedulerRef(selectacct.NewScheduler(scores)),
+		MaxBodyBytes:   1 << 20,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "aggregate-retry-budget")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, req)
+
+	if response.Code != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want final upstream 408; body=%s", response.Code, response.Body.String())
+	}
+	if upstreamHits != replayablePostMaxAttempts {
+		t.Fatalf("upstream hits = %d, want aggregate cap %d across account failover and POST replay", upstreamHits, replayablePostMaxAttempts)
+	}
+}
+
+func TestForcedAccountTimeoutRetrySemantics(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		noRetry      bool
+		wantAttempts int
+	}{
+		{name: "ordinary forced traffic keeps bounded replay", wantAttempts: replayablePostMaxAttempts},
+		{name: "explicit no-retry canary is exactly once", noRetry: true, wantAttempts: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			upstreamHits := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHits++
+				if got := r.Header.Get(subrouterNoRetryHeader); got != "" {
+					t.Fatalf("%s leaked upstream: %q", subrouterNoRetryHeader, got)
+				}
+				http.Error(w, "request timeout", http.StatusRequestTimeout)
+			}))
+			defer upstream.Close()
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			forced := accounts.Account{
+				ID: "forced@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "forced-token",
+			}
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := Server{
+				ClaudeUpstream: upstreamURL,
+				Accounts:       []accounts.Account{forced},
+				Sessions:       store,
+				Scheduler: selectacct.NewScheduler([]selectacct.Score{{
+					AccountID: forced.ID, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+				}}),
+				MaxBodyBytes: 1 << 20,
+			}.Handler()
+			req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Subrouter-Agent", "claude")
+			req.Header.Set("X-Subrouter-Session", "forced-retry-semantics")
+			req.Header.Set("X-Subrouter-Account-ID", forced.ID)
+			if testCase.noRetry {
+				req.Header.Set(subrouterNoRetryHeader, "1")
+			}
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, req)
+
+			if response.Code != http.StatusRequestTimeout {
+				t.Fatalf("status = %d, want forced account's 408; body=%s", response.Code, response.Body.String())
+			}
+			if upstreamHits != testCase.wantAttempts {
+				t.Fatalf("forced account upstream hits = %d, want %d", upstreamHits, testCase.wantAttempts)
+			}
+		})
+	}
+}
+
 func TestClaudeInvalidForcedAccountSelectorIsRejectedBeforeFallback(t *testing.T) {
 	var upstreamHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -428,7 +546,7 @@ func TestHTTPProxyDoesNotForwardClientIPHeaders(t *testing.T) {
 	}
 }
 
-func TestClaude429FailoverTriesPastDefaultAttemptBudget(t *testing.T) {
+func TestClaude429FailoverRespectsSharedAttemptBudget(t *testing.T) {
 	var hits []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -501,14 +619,14 @@ func TestClaude429FailoverTriesPastDefaultAttemptBudget(t *testing.T) {
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(response.Body)
-	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_fresh") {
-		t.Fatalf("status=%d body=%s hits=%v, want failover to reach the eighth account", response.StatusCode, string(body), hits)
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d body=%s hits=%v, want final rate limit after the shared attempt budget", response.StatusCode, string(body), hits)
 	}
-	if len(hits) != 8 {
-		t.Fatalf("hits=%v, want all 8 accounts tried before success", hits)
+	if len(hits) != replayablePostMaxAttempts {
+		t.Fatalf("hits=%v, want aggregate cap %d", hits, replayablePostMaxAttempts)
 	}
-	if hits[len(hits)-1] != "fresh-7@example.com" {
-		t.Fatalf("last hit=%q, want fresh-7@example.com; hits=%v", hits[len(hits)-1], hits)
+	if hits[len(hits)-1] != "cooked-5@example.com" {
+		t.Fatalf("last hit=%q, want sixth account; hits=%v", hits[len(hits)-1], hits)
 	}
 }
 

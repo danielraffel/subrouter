@@ -116,6 +116,99 @@ sudo ./deploy/macos/migrate-launchdaemon-to-supervisor.sh --activate
 
 The one-time transition cannot preserve connections accepted by an older, unsupervised process because that process owns their file descriptors. Perform it in a maintenance window. All later worker upgrades preserve connections.
 
+### Transactional per-user LaunchAgent migration
+
+The per-user migration does not accept health alone as cutover proof. Preparation
+is non-disruptive, while activation requires a bounded preflight and an explicit
+functional canary command:
+
+```bash
+deploy/macos/migrate-launchagent-to-supervisor.sh
+deploy/macos/migrate-launchagent-to-supervisor.sh --activate \
+  --canary-callback /path/to/real-routed-canary
+```
+
+The default preflight directly executes the candidate as `subrouter codex
+isolation-check --json --retiring-state-dir PATH`; it is read-only and compares
+the complete candidate and retiring account inventories. It fails unless the
+candidate uses its exact isolated store, every served Codex OAuth credential
+has trusted provenance, and no refresh-token chain is shared within the
+candidate store or with the retiring store. The retiring root is read from the
+preserved plist's explicit `SUBROUTER_STATE_DIR`; use `--retiring-state-dir
+PATH` only when migrating a plist that predates that declaration. Missing,
+ambiguous, or equal roots fail before live mutation. `--preflight-callback
+PATH` can replace that check for a deployment-specific executable.
+
+`SUBROUTER_STATE_DIR` selects the candidate state root and is written into the
+prepared LaunchAgent explicitly; launchd does not inherit the activating
+shell's environment. During migration from a binary that predates credential
+provenance, point the candidate at a separately migrated state root. The
+retained rollback plist must keep using the untouched legacy state root so the
+old binary cannot erase provenance from candidate credentials.
+
+The canary callback must be an executable file that exercises ordinary routed
+traffic and returns nonzero unless the expected response is observed. Callback
+paths are executed directly with no shell evaluation or command-string parsing.
+Do not put credentials in filenames or arguments; have the callback read any
+required file-backed credential through its normal consumer.
+`SUBROUTER_PREFLIGHT_TIMEOUT` and `SUBROUTER_CANARY_TIMEOUT` bound the callbacks
+(120 and 300 seconds by default); timeout terminates and waits for the callback
+process group.
+
+The migration itself checks local health and readiness. The functional canary
+owns every deployment-specific acceptance leg: remote health/readiness probes,
+sticky or existing-session continuity, and a real routed provider response.
+Keep those checks in the callback so the generic migration contains no machine
+names, tailnet addresses, account identifiers, or credentials.
+
+Activation records a single launchd identity snapshot plus a PID, executable
+hash, start-time, and command fingerprint. A mode-`0700` transaction journal is
+armed before the first live mutation. It waits for two observations of complete
+label/PID/listener absence, atomically installs the candidate plist, and proves
+that the candidate or its descendants are the sole listener owners. The
+supervisor control socket must be a mode-`0600` Unix socket owned by the
+expected uid and report one accepting, non-retiring backend. Candidate identity,
+socket status, health, and readiness must remain stable through the functional
+canary. Bootstrap, structural acceptance, timeout, signal, or canary failure
+invokes the standalone rollback command automatically; a hard interruption is
+recovered from the phase journal before a later activation may proceed.
+
+The successful activation output prints the exact retained backup. To roll back
+later, use that path and the installed supervisor path:
+
+```bash
+deploy/macos/rollback-launchagent-supervisor.sh \
+  --backup '<printed-backup-path>' \
+  --backup-sha256 '<printed-plist-sha256>' \
+  --rollback-artifact '<rollback-program-destination>' '<bundle-artifact>' \
+    '<printed-program-sha256>' '<mode>' \
+  --expected-program "$HOME/bin/subrouter-supervisor"
+```
+
+Use the complete copy-pasteable command printed by successful activation; it
+contains one `--rollback-artifact DEST ARTIFACT SHA MODE` entry for the rollback
+program and each literal executable dependency discoverable from its plist or
+shell wrapper. The mode-`0700` bundle contains immutable copies named by their
+SHA-256; activation also writes the same identities to the printed mode-`0600`
+manifest beside the retained plist. Preserve the complete bundle, not only the
+plist path.
+
+Standalone rollback refuses a mismatched installed plist, loaded program, or
+changed PID. Before requesting bootout, it verifies the retained plist and all
+bundle artifacts against the activation hashes. The installed rollback-program
+destinations may have received ordinary upgrades since activation; after exact
+loaded-service identity and full launchd-label, captured-PID, and listener
+absence are proven, rollback atomically restores the byte-checked artifact
+copies over those destinations. It then requires the restored program identity,
+health, and readiness. The script is host-neutral; customize
+non-default installations with `SUBROUTER_LABEL`, `SUBROUTER_PLIST`,
+`SUBROUTER_LAUNCHD_DOMAIN`, `SUBROUTER_HEALTH_URL`, and `SUBROUTER_READY_URL`.
+`--expected-running-program` is reserved for transaction recovery when launchd
+is still removing the captured legacy process; normal standalone rollback does
+not need it.
+If the installed plist is already absent, rollback proceeds only after proving
+the launchd label and listener are absent, then restores the retained backup.
+
 ### Worker upgrade
 
 Replace the worker binary atomically, then ask the stable supervisor to create a generation:

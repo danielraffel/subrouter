@@ -79,7 +79,10 @@ type Server struct {
 	Scheduler           selectacct.Scheduler
 	SchedulerRef        *selectacct.SchedulerRef
 	UsageScoreTTL       time.Duration
-	ScoreAccounts       func(context.Context, []accounts.Account) ([]selectacct.Score, int)
+	// ReadyCheck gates supervisor readiness on asynchronous startup state that
+	// must be coherent before this worker may receive traffic.
+	ReadyCheck    func() error
+	ScoreAccounts func(context.Context, []accounts.Account) ([]selectacct.Score, int)
 	// RefreshAccountFn, when set, replaces the default OAuth refresh path. Test
 	// seam for simulating dead/expired refresh tokens; nil in production.
 	RefreshAccountFn func(context.Context, accounts.Account) (accounts.Account, error)
@@ -1739,6 +1742,13 @@ func (s Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		writeJSON(w, map[string]any{"ok": false, "draining": true})
 		return
+	}
+	if s.ReadyCheck != nil {
+		if err := s.ReadyCheck(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeJSON(w, map[string]any{"ok": false, "draining": false, "startup_ready": false})
+			return
+		}
 	}
 	writeJSON(w, map[string]any{"ok": true, "draining": false})
 }
@@ -3546,6 +3556,7 @@ func (s Server) proxyHandler() http.Handler {
 		// caller routing.
 		forcedAccountID := ""
 		forcedAccountSelection := false
+		noRetry := subrouterNoRetryRequest(routingRequest)
 		if boundLease == nil {
 			var err error
 			forcedAccountID, forcedAccountSelection, err = session.ExtractAccountIDWithPresence(routingRequest)
@@ -3585,7 +3596,7 @@ func (s Server) proxyHandler() http.Handler {
 		if requestProvider == accounts.ProviderClaude {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
-			fableFallbackConfigured = !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
+			fableFallbackConfigured = !noRetry && !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
@@ -3625,9 +3636,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		if azureCodexConfigured {
 			azureCodexSessionKey = azureCodexSessionKeyFor(sessionAgentType, sessionID)
-			if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
-				if s.serveAzureCodex(w, r, azureCodexSessionKey, pinned, "sticky_session", true) {
-					return
+			if !noRetry {
+				if pinned, found := s.azureCodexSessions.lookup(azureCodexSessionKey); found {
+					if s.serveAzureCodex(w, r, azureCodexSessionKey, pinned, "sticky_session", true) {
+						return
+					}
 				}
 			}
 		}
@@ -3697,7 +3710,7 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
+			if !noRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
 				return
 			}
 			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
@@ -3725,7 +3738,7 @@ func (s Server) proxyHandler() http.Handler {
 			if fableFallbackConfigured && s.serveClaudeFableFallback(w, r) {
 				return
 			}
-			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
+			if !noRetry && azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
 				return
 			}
 			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
@@ -3803,22 +3816,28 @@ func (s Server) proxyHandler() http.Handler {
 			},
 		}
 		transport := s.transport()
-		// One retry budget per client request, shared by both retry layers, so
-		// the Azure fallback runs after 5 pool retries in total rather than 5
-		// per layer.
-		var azureCodexBudget *attemptBudget
-		azureCodexFallbackReady := azureCodexConfigured && retryPost && postReplayable
-		if azureCodexFallbackReady {
-			azureCodexBudget = newAttemptBudget(azureCodexPoolRetryBudget)
-		}
+		azureCodexFallbackReady := !noRetry && azureCodexConfigured && retryPost && postReplayable
 		_, keyedRequestProvider := keyedProviderFor(requestProvider)
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude || keyedRequestProvider)
 		localUsageFailover = localUsageFailover ||
 			(account.AuthMode == accounts.AuthModeAPIKey && keyedRequestProvider)
+		usageRetryMaxAttempts := 0
+		installUsageFailover := !noRetry && !forcedAccountSelection && boundLease == nil && retryPost &&
+			postReplayable && localUsageFailover && s.CredentialBroker == nil
+		if installUsageFailover {
+			usageRetryMaxAttempts = s.usageLimitRetryMaxAttempts(r.Context(), requestProvider)
+		}
+		// One retry budget per client request, shared by both retry layers. It is
+		// required even without a fallback: otherwise each outer POST replay gets
+		// a fresh account-failover allowance and six attempts multiply into 36.
+		requestMaxAttempts := replayablePostMaxAttempts
+		var requestRetryBudget *attemptBudget
+		if retryPost && postReplayable {
+			requestRetryBudget = newAttemptBudget(requestMaxAttempts - 1)
+		}
 		usageFailoverInstalled := false
-		if !forcedAccountSelection && boundLease == nil && retryPost && postReplayable && localUsageFailover &&
-			s.CredentialBroker == nil {
+		if installUsageFailover {
 			var fableFallback func() (*http.Response, bool)
 			if fableFallbackConfigured {
 				fableFallback = func() (*http.Response, bool) {
@@ -3849,16 +3868,23 @@ func (s Server) proxyHandler() http.Handler {
 				// auth-mode rewrite, so a mixed-auth retry can derive its own path.
 				path:               r.URL.Path,
 				upstream:           upstream.Host,
-				maxAttempts:        s.usageLimitRetryMaxAttempts(r.Context(), requestProvider),
+				maxAttempts:        usageRetryMaxAttempts,
 				poolModel:          retryPoolModel,
 				fableFallback:      fableFallback,
-				budget:             azureCodexBudget,
+				budget:             requestRetryBudget,
 				commitFirstSuccess: pendingSessionCommit,
 				expectedAccount:    pendingSessionExpectedAccount,
 			}
 			usageFailoverInstalled = true
 		}
 		if retryPost && postReplayable {
+			postMaxAttempts := replayablePostMaxAttempts
+			if noRetry {
+				// Deployment canaries need one observable upstream attempt. This is
+				// independent of forced-account routing, whose ordinary traffic keeps
+				// bounded same-account transport recovery.
+				postMaxAttempts = 1
+			}
 			transport = replayablePostRetryTransport{
 				base:        transport,
 				logger:      s.Logger,
@@ -3868,9 +3894,9 @@ func (s Server) proxyHandler() http.Handler {
 				method:      r.Method,
 				path:        proxyRequest.URL.Path,
 				upstream:    upstream.Host,
-				maxAttempts: replayablePostMaxAttempts,
+				maxAttempts: postMaxAttempts,
 				limiter:     replayablePostUploadLimiter,
-				budget:      azureCodexBudget,
+				budget:      requestRetryBudget,
 			}
 		}
 		if azureCodexFallbackReady {
@@ -6507,11 +6533,23 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 const replayablePostMaxBodyBytes = 128 << 20
 const replayablePostMaxAttempts = 6
 
-func (s Server) usageLimitRetryMaxAttempts(ctx context.Context, provider accounts.Provider) int {
-	count := len(filterAccountsForProvider(s.accountListContext(ctx), provider))
-	if count > replayablePostMaxAttempts {
-		return count
+const subrouterNoRetryHeader = "X-Subrouter-No-Retry"
+
+func subrouterNoRetryRequest(r *http.Request) bool {
+	if r == nil {
+		return false
 	}
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get(subrouterNoRetryHeader))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s Server) usageLimitRetryMaxAttempts(_ context.Context, _ accounts.Provider) int {
+	// The budget is request-wide, not pool-sized. A large account pool must not
+	// turn one client request into one provider call per account.
 	return replayablePostMaxAttempts
 }
 
@@ -6622,11 +6660,9 @@ type replayablePostRetryTransport struct {
 	upstream    string
 	maxAttempts int
 	limiter     chan struct{}
-	// budget is the request's shared pool-retry allowance. It is set only when
-	// a fallback route is waiting behind the pool, and it is shared with the
-	// usage-limit transport below so nested retry loops cannot multiply into
-	// one full budget per layer. Nil means unbounded, the behaviour when there
-	// is nothing to fall back to.
+	// budget is the request's shared retry allowance. It is shared with the
+	// usage-limit transport below so nested retry loops cannot multiply into one
+	// full budget per layer. Nil is reserved for standalone/unbounded use.
 	budget *attemptBudget
 }
 
@@ -7122,6 +7158,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				return response, nil
 			}
+			if !t.budget.consume() {
+				return response, nil
+			}
 			wait := providerOverloadBackoff(response.Header, overloadRetries)
 			overloadRetries++
 			if t.logger != nil {
@@ -7146,7 +7185,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.GetBody = req.GetBody
 			attemptReq.ContentLength = req.ContentLength
 			attemptReq.Header = currentHeader
-			attempt-- // overload retries do not consume the account-failover budget
+			attempt-- // retry the same account without spending a failover slot
 			continue
 		}
 		// A conversation that came back from another provider carries reasoning
@@ -7154,13 +7193,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		// Azure could read OpenAI's. The client sees a hard 400 unless the
 		// sealed items are dropped here, which is the same repair the Azure
 		// route already performs in the other direction. It is not an account
-		// problem, so it retries the same account and spends no failover budget.
+		// problem, so it retries the same account without spending a failover
+		// slot. It still spends the request-wide retry budget.
 		if t.provider == accounts.ProviderCodex && !sealedStripped &&
 			response.StatusCode == http.StatusBadRequest && req.GetBody != nil {
 			stripped, retryReq, handled := t.retryWithoutSealedReasoning(req, attemptReq, response)
 			if handled {
 				sealedStripped = true
 				if stripped {
+					if !t.budget.consume() {
+						return response, nil
+					}
 					attemptReq = retryReq
 					attempt--
 					continue

@@ -470,6 +470,65 @@ func TestAzureCodexFallbackCapsPoolRetries(t *testing.T) {
 	}
 }
 
+func TestNoRetryRequestDoesNotFallThroughToAzure(t *testing.T) {
+	var poolCalls atomic.Int32
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolCalls.Add(1)
+		if got := r.Header.Get(subrouterNoRetryHeader); got != "" {
+			t.Fatalf("%s leaked to the pool upstream: %q", subrouterNoRetryHeader, got)
+		}
+		http.Error(w, "request timeout", http.StatusRequestTimeout)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	now := time.Now()
+	sticky := newAzureCodexSticky()
+	sticky.now = func() time.Time { return now }
+	stickyKey := azureCodexSessionKeyFor("codex", "no-retry-azure")
+	sticky.pin(stickyKey, 0)
+	beforeExpiry := sticky.entries[stickyKey].expiresAt
+	server.azureCodexSessions = sticky
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"no-retry-azure"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(subrouterNoRetryHeader, "1")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusRequestTimeout {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d, body = %s, want the pool's single 408", response.StatusCode, body)
+	}
+	if got := poolCalls.Load(); got != 1 {
+		t.Fatalf("pool calls = %d, want exactly one", got)
+	}
+	if got := azureCalls.Load(); got != 0 {
+		t.Fatalf("azure calls = %d, want none for an explicit no-retry request", got)
+	}
+	if afterExpiry := sticky.entries[stickyKey].expiresAt; !afterExpiry.Equal(beforeExpiry) {
+		t.Fatalf("no-retry request renewed Azure stickiness: before=%v after=%v", beforeExpiry, afterExpiry)
+	}
+}
+
 // Codex compresses large request bodies with zstd. Azure takes plain JSON, so a
 // compressed body must be decoded before it is rewritten; otherwise the whole
 // fallback silently stops working on exactly the long conversations that hit

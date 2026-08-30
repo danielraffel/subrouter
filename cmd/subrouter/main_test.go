@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +21,82 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 )
+
+func TestStandaloneUsageFetchOnlyRunsWhenAutoSwitchIsDisabled(t *testing.T) {
+	tests := []struct {
+		name             string
+		fetchUsage       bool
+		brokerConfigured bool
+		interval         time.Duration
+		want             bool
+	}{
+		{name: "interval zero", fetchUsage: true, want: true},
+		{name: "negative interval", fetchUsage: true, interval: -time.Second, want: true},
+		{name: "leased auto switch owns startup sweep", fetchUsage: true, interval: time.Minute},
+		{name: "usage disabled", interval: 0},
+		{name: "credential broker", fetchUsage: true, brokerConfigured: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldStartStandaloneUsageFetch(test.fetchUsage, test.brokerConfigured, test.interval); got != test.want {
+				t.Fatalf("shouldStartStandaloneUsageFetch() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexUsageFetchConcurrencyIsBounded(t *testing.T) {
+	accountsToFetch := make([]accounts.Account, codexUsageFetchConcurrency*3)
+	for i := range accountsToFetch {
+		accountsToFetch[i] = accounts.Account{
+			ID:       fmt.Sprintf("account-%d", i),
+			Provider: accounts.ProviderCodex,
+			AuthMode: accounts.AuthModeOAuth,
+		}
+	}
+	started := make(chan struct{}, len(accountsToFetch))
+	release := make(chan struct{})
+	done := make(chan struct{})
+	var active atomic.Int32
+	var peak atomic.Int32
+	go func() {
+		defer close(done)
+		_, _ = fetchCodexScoresWithRefresh(context.Background(), accountsToFetch, func(_ context.Context, _ *http.Client, account accounts.Account) (accounts.Account, error) {
+			current := active.Add(1)
+			for {
+				old := peak.Load()
+				if current <= old || peak.CompareAndSwap(old, current) {
+					break
+				}
+			}
+			started <- struct{}{}
+			<-release
+			active.Add(-1)
+			return account, errors.New("test stops before the usage request")
+		})
+	}()
+	for range codexUsageFetchConcurrency {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("bounded workers did not start")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatalf("more than %d usage workers started concurrently", codexUsageFetchConcurrency)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bounded usage fetch did not finish")
+	}
+	if got := peak.Load(); got != codexUsageFetchConcurrency {
+		t.Fatalf("peak concurrent usage fetches = %d, want %d", got, codexUsageFetchConcurrency)
+	}
+}
 
 func TestSchedulerAccountsByProviderExcludesNonCodexPools(t *testing.T) {
 	all := []accounts.Account{
@@ -133,6 +212,25 @@ func TestConfigureDefaultLoggerLeavesSupervisorLoggerAlone(t *testing.T) {
 	configureDefaultLogger("subrouter", []string{"supervise"})
 	if slog.Default() != sentinel {
 		t.Fatal("supervise should keep the process logger")
+	}
+}
+
+func TestConfigureDefaultLoggerLeavesIsolationCheckReadOnly(t *testing.T) {
+	previous := slog.Default()
+	defer slog.SetDefault(previous)
+
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+	sentinel := slog.New(slog.NewTextHandler(io.Discard, nil))
+	slog.SetDefault(sentinel)
+
+	configureDefaultLogger("subrouter", []string{"codex", "isolation-check", "--json"})
+	if slog.Default() != sentinel {
+		t.Fatal("isolation check should keep the process logger")
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("isolation check logger created state: %v", err)
 	}
 }
 

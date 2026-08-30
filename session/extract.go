@@ -235,6 +235,7 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-Subrouter-Model")
 	headers.Del("X-Model")
 	headers.Del("X-Subrouter-Azure")
+	headers.Del("X-Subrouter-No-Retry")
 }
 
 func ExtractID(r *http.Request, maxBodyBytes int64) string {

@@ -83,6 +83,8 @@ Usage:
   sr reset [email]      Redeem a rate-limit reset credit (pick best, or --all, or --dry-run)
   sr usage [days]       Refresh and show API-key spend
   sr trace <email>      Show OAuth refresh breadcrumbs for an account
+  sr codex isolation-check [--json] [--retiring-state-dir PATH]
+                        Check serving credential isolation without changing credentials
   sr codex migrate-isolation [--device-auth]
                         Re-enroll legacy OAuth accounts without changing local Codex auth
   sr az status          Show whether the Azure Codex fallback is armed
@@ -249,9 +251,15 @@ func cxAlias(args []string) error {
 }
 
 func srForProgram(program string, args []string) error {
+	var store accounts.CodexStore
+	if isCodexIsolationCheckCommand(args) {
+		store = accounts.DefaultCodexStoreForReadOnlyInspection()
+	} else {
+		store = accounts.DefaultCodexStore()
+	}
 	runner := srRunner{
 		program: program,
-		store:   accounts.DefaultCodexStore(),
+		store:   store,
 		in:      os.Stdin,
 		out:     os.Stdout,
 		errOut:  os.Stderr,
@@ -282,7 +290,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
 		case "codex":
-			if isCodexIsolationCommand(args) {
+			if isCodexAccountCommand(args) {
 				return r.codexAccount(ctx, args[1:])
 			}
 		}
