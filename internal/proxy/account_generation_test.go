@@ -671,6 +671,48 @@ func TestPreparedTenantClaudeDeleteJournalCompletesAcrossCrash(t *testing.T) {
 	}
 }
 
+func TestTenantDeleteJournalPreservesDistinctSelectorAndStoredIdentity(t *testing.T) {
+	root := t.TempDir()
+	journalDir := filepath.Join(root, "accounts")
+	storedStore := accounts.CodexStore{Dir: filepath.Join(root, "stored")}
+	stored := accounts.StoredCodexAccount{
+		Email: "work@example.com", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := storedStore.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	stored, found, err := storedStore.FindStored(stored.Email)
+	if err != nil || !found {
+		t.Fatalf("stored account = found %v, err %v", found, err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if _, err := claudeStore.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, found, err := claudeStore.SnapshotProfileRemovalContext(t.Context(), "work")
+	if err != nil || !found {
+		t.Fatalf("Claude snapshot = found %v, err %v", found, err)
+	}
+	journal, found, err := prepareTenantAccountDelete(
+		t.Context(), journalDir, "work", claudeStore, snapshot,
+		stored, storedStore.StoreDir(), tenantQwenConsoleVersion{}, "",
+	)
+	if err != nil || !found {
+		t.Fatalf("prepare tenant delete = found %v, err %v", found, err)
+	}
+	if journal.TargetID != "work" || journal.StoredTargetID != "work@example.com" {
+		t.Fatalf("journal identities = selector %q stored %q", journal.TargetID, journal.StoredTargetID)
+	}
+	loaded, active, err := readAccountRollbackJournal(journalDir)
+	if err != nil || !active {
+		t.Fatalf("read tenant journal = active %v, err %v", active, err)
+	}
+	if loaded.TargetID != journal.TargetID || loaded.StoredTargetID != journal.StoredTargetID {
+		t.Fatalf("loaded identities = selector %q stored %q", loaded.TargetID, loaded.StoredTargetID)
+	}
+}
+
 func TestPreparedTenantClaudeDeleteJournalAbortsSameDirectoryReplacement(t *testing.T) {
 	root := t.TempDir()
 	journalDir := filepath.Join(root, "accounts")
@@ -856,6 +898,23 @@ func TestSyncAccountStateDirUnixUsesProvidedDirectory(t *testing.T) {
 	}
 	if opened != dirPath {
 		t.Fatalf("opened directory = %q, want %q", opened, dirPath)
+	}
+}
+
+func TestAdvanceAccountDiskGenerationReportsDirectorySyncFailure(t *testing.T) {
+	storeDir := t.TempDir()
+	want := errors.New("generation directory sync unavailable")
+	err := advanceAccountDiskGenerationWithSync(storeDir, func(path string) error {
+		if path != storeDir {
+			t.Fatalf("sync path = %q, want %q", path, storeDir)
+		}
+		return want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("generation sync failure = %v, want %v", err, want)
+	}
+	if generation, readErr := readAccountDiskGeneration(storeDir); readErr != nil || generation == "" {
+		t.Fatalf("visible generation = %q, err %v", generation, readErr)
 	}
 }
 

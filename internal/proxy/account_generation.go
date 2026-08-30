@@ -253,8 +253,8 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 			return journal, true, errors.New("unpublished Claude rollback journal unexpectedly names a store directory")
 		}
 		if journal.Target == accountRollbackTargetTenantDelete {
-			if journal.StoredTargetID == "" || journal.StoredTargetID != journal.TargetID {
-				return journal, true, errors.New("tenant deletion journal stored target does not match Claude target")
+			if journal.StoredTargetID == "" {
+				return journal, true, errors.New("tenant deletion journal stored target is missing")
 			}
 			if !filepath.IsAbs(journal.StoredStoreDir) || filepath.Clean(journal.StoredStoreDir) != journal.StoredStoreDir || journal.StoredStoreDir == string(filepath.Separator) {
 				return journal, true, errors.New("tenant deletion journal stored account directory is invalid")
@@ -750,7 +750,11 @@ func readAccountDiskGeneration(storeDir string) (string, error) {
 // advanceAccountDiskGeneration publishes one completed disk mutation to every
 // overlapping supervisor worker. Callers hold the cross-process import lock,
 // so truncation cannot expose a partial generation to another reload.
-func advanceAccountDiskGeneration(storeDir string) (err error) {
+func advanceAccountDiskGeneration(storeDir string) error {
+	return advanceAccountDiskGenerationWithSync(storeDir, syncAccountStateDir)
+}
+
+func advanceAccountDiskGenerationWithSync(storeDir string, syncDir func(string) error) (err error) {
 	value := make([]byte, 16)
 	if _, err := rand.Read(value); err != nil {
 		return fmt.Errorf("generate account state generation: %w", err)
@@ -788,11 +792,7 @@ func advanceAccountDiskGeneration(storeDir string) (err error) {
 	if err := os.Rename(tempPath, accountDiskGenerationPath(storeDir)); err != nil {
 		return err
 	}
-	if dir, openErr := os.Open(storeDir); openErr == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
+	return syncDir(storeDir)
 }
 
 func (r *AccountRef) advanceDiskGeneration() error {

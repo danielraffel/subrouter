@@ -2673,6 +2673,57 @@ func TestImportProfileCredentialReportsVisibleCommitOnRegistrySyncFailure(t *tes
 	}
 }
 
+func TestProfileRegistryMutationsReportVisibleCommitOnDirectorySyncFailure(t *testing.T) {
+	want := errors.New("registry directory sync unavailable")
+	assertCommitted := func(t *testing.T, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrProfileRegistryWriteCommitted) || !errors.Is(err, want) {
+			t.Fatalf("registry sync failure = %v", err)
+		}
+	}
+
+	t.Run("create", func(t *testing.T) {
+		store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
+		store.syncDirectoryForTest = func(string) error { return want }
+		instancePath, err := store.CreateProfile("work")
+		assertCommitted(t, err)
+		if instancePath == "" {
+			t.Fatal("committed create did not return its instance path")
+		}
+		if _, found := store.FindProfile("work"); !found {
+			t.Fatal("committed create is invisible in the registry")
+		}
+	})
+
+	t.Run("register", func(t *testing.T) {
+		store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
+		_, dir, err := store.CreateTempInstance()
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.syncDirectoryForTest = func(string) error { return want }
+		assertCommitted(t, store.RegisterProfile("work", dir))
+		if _, found := store.FindProfile("work"); !found {
+			t.Fatal("committed registration is invisible in the registry")
+		}
+	})
+
+	t.Run("set-active", func(t *testing.T) {
+		store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
+		if _, err := store.CreateProfile("first"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateProfile("second"); err != nil {
+			t.Fatal(err)
+		}
+		store.syncDirectoryForTest = func(string) error { return want }
+		assertCommitted(t, store.SetActiveProfile("second"))
+		if active := store.ActiveProfile(); active != "second" {
+			t.Fatalf("visible active profile = %q, want second", active)
+		}
+	})
+}
+
 func TestRemoveProfileRollsForwardOnRegistrySyncFailure(t *testing.T) {
 	store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
 	installSuccessfulSecurityCommand(t)

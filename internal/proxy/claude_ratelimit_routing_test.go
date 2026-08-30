@@ -145,6 +145,11 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 	var cookedHits, alternateHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Fatalf("%s leaked upstream: %q", header, got)
+			}
+		}
 		_, _ = io.Copy(io.Discard, r.Body)
 		switch r.Header.Get("Authorization") {
 		case "Bearer tok-cooked":
@@ -188,6 +193,7 @@ func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-Session", "session-forced")
 	req.Header.Set("X-Subrouter-Account-ID", "cooked@example.com")
+	req.Header.Set("X-Subrouter-Account", "cooked@example.com")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
 
@@ -200,6 +206,58 @@ func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
 	assignment, ok := store.Get("claude", "session-forced")
 	if !ok || assignment.AccountID != "cooked@example.com" {
 		t.Fatalf("forced assignment = %+v, %t; want cooked@example.com", assignment, ok)
+	}
+}
+
+func TestClaudeInvalidForcedAccountSelectorIsRejectedBeforeFallback(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream:    upstreamURL,
+		ClaudeFableAPIKey: "must-not-fallback",
+		Sessions:          store,
+		Scheduler:         selectacct.NewScheduler(nil),
+		MaxBodyBytes:      1 << 20,
+	}.Handler()
+
+	tests := []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{name: "primary oversize", header: "X-Subrouter-Account-ID", value: strings.Repeat("a", 257)},
+		{name: "alias oversize", header: "X-Subrouter-Account", value: strings.Repeat("a", 257)},
+		{name: "primary whitespace", header: "X-Subrouter-Account-ID", value: " \t "},
+		{name: "alias control", header: "X-Subrouter-Account", value: "bad\x7fselector"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-fable-5","messages":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Subrouter-Agent", "claude")
+			req.Header.Set(test.header, test.value)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("fallback upstream hits = %d, want 0", upstreamHits)
 	}
 }
 

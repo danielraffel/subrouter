@@ -138,12 +138,12 @@ func profileRegistryWriteCommitted(err error) bool {
 	return errors.Is(err, ErrProfileRegistryWriteCommitted)
 }
 
-func acceptCommittedProfileRegistryWrite(operation string, err error) error {
+func reportCommittedProfileRegistryWrite(operation string, err error) error {
 	if !profileRegistryWriteCommitted(err) {
 		return err
 	}
 	slog.Warn("Claude profile registry mutation is visible but directory durability is uncertain", "operation", operation, "error", err)
-	return nil
+	return err
 }
 
 // PlanType returns the subscription label explicitly carried by a Claude
@@ -1471,7 +1471,7 @@ func (s Store) SetActiveProfile(name string) error {
 	data.Active = name
 	profile.LastUsed = time.Now().UTC().Format(time.RFC3339)
 	data.Profiles[name] = profile
-	return acceptCommittedProfileRegistryWrite("set active profile", s.writeProfiles(data))
+	return reportCommittedProfileRegistryWrite("set active profile", s.writeProfiles(data))
 }
 
 func (s Store) CreateProfile(name string) (string, error) {
@@ -1503,7 +1503,7 @@ func (s Store) CreateProfile(name string) (string, error) {
 	if data.Active == "" {
 		data.Active = name
 	}
-	return instancePath, acceptCommittedProfileRegistryWrite("create profile", s.writeProfiles(data))
+	return instancePath, reportCommittedProfileRegistryWrite("create profile", s.writeProfiles(data))
 }
 
 func (s Store) CreateTempInstance() (string, string, error) {
@@ -1543,7 +1543,7 @@ func (s Store) RegisterProfile(name, dir string) error {
 	if data.Active == "" {
 		data.Active = name
 	}
-	return acceptCommittedProfileRegistryWrite("register profile", s.writeProfiles(data))
+	return reportCommittedProfileRegistryWrite("register profile", s.writeProfiles(data))
 }
 
 // ImportProfileCredential installs one server-owned OAuth credential without
