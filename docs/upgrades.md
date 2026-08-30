@@ -128,6 +128,33 @@ deploy/macos/migrate-launchagent-to-supervisor.sh --activate \
   --canary-callback /path/to/real-routed-canary
 ```
 
+If the existing LaunchAgent invokes only a service wrapper and therefore does
+not expose the worker's `serve --addr ...` arguments in its plist, supply the
+public listener and worker arguments explicitly on both preparation and
+activation:
+
+```bash
+deploy/macos/migrate-launchagent-to-supervisor.sh \
+  --public-addr 127.0.0.1:8080 \
+  --worker-serve-args-json /path/to/worker-serve-args.json \
+  --candidate-env-json /path/to/candidate-environment.json
+```
+
+`SUBROUTER_PUBLIC_ADDR`, `SUBROUTER_WORKER_SERVE_ARGS_JSON`, and
+`SUBROUTER_CANDIDATE_ENV_JSON` are equivalent environment inputs. Public address
+and worker-argument JSON must be supplied together. The worker file is a JSON
+array of argument strings after the `serve` subcommand; it must not include the
+binary, `serve`, or any `--addr` form. The optional environment file is a JSON
+object restricted to file references: every key must match
+`SUBROUTER_*_FILE`, and every value must be an absolute path to an existing
+regular non-symlink file owned by the current uid with no group or other
+permissions. Referenced files are opened with `O_NOFOLLOW` for validation.
+Raw secret values, `SUBROUTER_ADMIN_TOKEN`, relative or missing paths, symlinks,
+and group/world-accessible files are rejected. The JSON inputs themselves must
+also be regular non-symlink files. They are decoded as JSON and never evaluated
+by a shell. Validated file-reference entries are merged only into the prepared
+supervisor plist; the retained legacy plist remains byte-for-byte unchanged.
+
 The default preflight directly executes the candidate as `subrouter codex
 isolation-check --json --retiring-state-dir PATH`; it is read-only and compares
 the complete candidate and retiring account inventories. It fails unless the

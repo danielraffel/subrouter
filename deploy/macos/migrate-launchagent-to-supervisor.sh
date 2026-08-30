@@ -32,6 +32,9 @@ DOMAIN="gui/$(id -u)"
 PREFLIGHT_CALLBACK="${SUBROUTER_PREFLIGHT_CALLBACK:-}"
 CANARY_CALLBACK="${SUBROUTER_CANARY_CALLBACK:-}"
 RETIRING_STATE_DIR="${SUBROUTER_RETIRING_STATE_DIR:-}"
+PUBLIC_ADDR_OVERRIDE="${SUBROUTER_PUBLIC_ADDR:-}"
+WORKER_SERVE_ARGS_JSON="${SUBROUTER_WORKER_SERVE_ARGS_JSON:-}"
+CANDIDATE_ENV_JSON="${SUBROUTER_CANDIDATE_ENV_JSON:-}"
 PREFLIGHT_TIMEOUT="${SUBROUTER_PREFLIGHT_TIMEOUT:-120}"
 CANARY_TIMEOUT="${SUBROUTER_CANARY_TIMEOUT:-300}"
 
@@ -62,11 +65,29 @@ while [ "$#" -gt 0 ]; do
     --retiring-state-dir)
       [ "$#" -ge 2 ] || die "--retiring-state-dir requires a path"
       RETIRING_STATE_DIR="$2"; shift 2 ;;
+    --public-addr)
+      [ "$#" -ge 2 ] || die "--public-addr requires HOST:PORT"
+      PUBLIC_ADDR_OVERRIDE="$2"; shift 2 ;;
+    --worker-serve-args-json)
+      [ "$#" -ge 2 ] || die "--worker-serve-args-json requires a file path"
+      WORKER_SERVE_ARGS_JSON="$2"; shift 2 ;;
+    --candidate-env-json)
+      [ "$#" -ge 2 ] || die "--candidate-env-json requires a file path"
+      CANDIDATE_ENV_JSON="$2"; shift 2 ;;
     -h|--help)
-      echo "usage: $0 [--activate] [--preflight-callback PATH] [--canary-callback PATH] [--retiring-state-dir PATH]"
+      echo "usage: $0 [--activate] [--preflight-callback PATH] [--canary-callback PATH] [--retiring-state-dir PATH] [--public-addr HOST:PORT --worker-serve-args-json FILE] [--candidate-env-json FILE]"
       exit 0 ;;
     *) die "unknown argument $1" ;;
   esac
+done
+
+if [ -n "$PUBLIC_ADDR_OVERRIDE" ] || [ -n "$WORKER_SERVE_ARGS_JSON" ]; then
+  [ -n "$PUBLIC_ADDR_OVERRIDE" ] && [ -n "$WORKER_SERVE_ARGS_JSON" ] \
+    || die "--public-addr and --worker-serve-args-json must be provided together"
+fi
+for json_input in "$WORKER_SERVE_ARGS_JSON" "$CANDIDATE_ENV_JSON"; do
+  [ -z "$json_input" ] || { [ -f "$json_input" ] && [ ! -L "$json_input" ]; } \
+    || die "JSON input $json_input must be a regular non-symlink file"
 done
 
 export SUBROUTER_TRANSITION_NAME="migrate-launchagent-to-supervisor"
@@ -139,11 +160,56 @@ mv -f "${SUPERVISOR_BIN}.new" "$SUPERVISOR_BIN"
 codesign -s - -f "$SUPERVISOR_BIN" >/dev/null 2>&1 || true
 
 prepared="${PLIST}.supervised"
-python3 - "$PLIST" "$prepared" "$SUPERVISOR_BIN" "$WORKER_BIN" "$CONTROL_SOCKET" "$STATE_DIR" <<'PY'
+python3 - "$PLIST" "$prepared" "$SUPERVISOR_BIN" "$WORKER_BIN" "$CONTROL_SOCKET" "$STATE_DIR" \
+  "$PUBLIC_ADDR_OVERRIDE" "$WORKER_SERVE_ARGS_JSON" "$CANDIDATE_ENV_JSON" <<'PY'
+import json
+import os
 import plistlib
+import re
+import stat
 import sys
 
-source, destination, supervisor_bin, worker_bin, control_socket, state_dir = sys.argv[1:7]
+(
+    source,
+    destination,
+    supervisor_bin,
+    worker_bin,
+    control_socket,
+    state_dir,
+    public_addr_override,
+    worker_args_path,
+    candidate_env_path,
+) = sys.argv[1:10]
+
+
+def load_json_file(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"JSON input {path} is not a regular file")
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
+            return json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid JSON input {path}: {error}") from error
+    finally:
+        os.close(fd)
+
+
+def validate_public_addr(value):
+    host, separator, port_text = value.rpartition(":")
+    if not separator or not host or not port_text.isdigit():
+        raise SystemExit("public address must be HOST:PORT or [IPv6]:PORT")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise SystemExit("public address port must be between 1 and 65535")
+    if (host.startswith("[") or host.endswith("]")) and not (
+        host.startswith("[") and host.endswith("]")
+    ):
+        raise SystemExit("IPv6 public address must use [IPv6]:PORT form")
+
+
 with open(source, "rb") as handle:
     plist = plistlib.load(handle)
 
@@ -153,28 +219,46 @@ if not arguments:
 
 # The supervisor owns the public address and supplies `serve` plus the worker's
 # private socket itself, so strip both from the inherited arguments.
-public_addr = None
-filtered = []
-index = 1 if len(arguments) > 1 and arguments[1] == "serve" else 1
-filtered_source = arguments[index:]
-i = 0
-while i < len(filtered_source):
-    argument = filtered_source[i]
-    if argument == "--addr":
-        if i + 1 >= len(filtered_source):
-            raise SystemExit("existing --addr has no value")
-        public_addr = filtered_source[i + 1]
-        i += 2
-        continue
-    if argument.startswith("--addr="):
-        public_addr = argument.split("=", 1)[1]
+if worker_args_path:
+    filtered = load_json_file(worker_args_path)
+    if not isinstance(filtered, list) or not all(isinstance(item, str) for item in filtered):
+        raise SystemExit("worker serve args JSON must be an array of strings")
+    if any("\x00" in item for item in filtered):
+        raise SystemExit("worker serve args must not contain NUL bytes")
+    for argument in filtered:
+        if argument == "serve":
+            raise SystemExit("worker serve args must not embed the serve subcommand")
+        if argument == "--addr" or argument.startswith("--addr="):
+            raise SystemExit("worker serve args must not embed --addr")
+    public_addr = public_addr_override
+else:
+    public_addr = None
+    filtered = []
+    filtered_source = arguments[1:]
+    if filtered_source and filtered_source[0] == "serve":
+        filtered_source = filtered_source[1:]
+    i = 0
+    while i < len(filtered_source):
+        argument = filtered_source[i]
+        if argument == "--addr":
+            if i + 1 >= len(filtered_source):
+                raise SystemExit("existing --addr has no value")
+            public_addr = filtered_source[i + 1]
+            i += 2
+            continue
+        if argument.startswith("--addr="):
+            public_addr = argument.split("=", 1)[1]
+            i += 1
+            continue
+        filtered.append(argument)
         i += 1
-        continue
-    filtered.append(argument)
-    i += 1
+    if not public_addr:
+        raise SystemExit(
+            "could not find --addr in the existing plist; wrapper-backed services require "
+            "--public-addr and --worker-serve-args-json"
+        )
 
-if not public_addr:
-    raise SystemExit("could not find --addr in the existing plist")
+validate_public_addr(public_addr)
 
 plist["Program"] = supervisor_bin
 plist["ProgramArguments"] = [
@@ -190,6 +274,37 @@ plist["ProgramArguments"] = [
 # launchd does not inherit the activating shell's environment, and a legacy
 # rollback may intentionally continue using a separate untouched store.
 environment = dict(plist.get("EnvironmentVariables") or {})
+if candidate_env_path:
+    overrides = load_json_file(candidate_env_path)
+    if not isinstance(overrides, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in overrides.items()
+    ):
+        raise SystemExit("candidate environment JSON must be an object of string values")
+    for key, value in overrides.items():
+        if not re.fullmatch(r"SUBROUTER_[A-Z0-9_]+_FILE", key):
+            raise SystemExit(
+                "candidate environment keys must match SUBROUTER_*_FILE; "
+                "raw secrets and non-file overrides are forbidden"
+            )
+        if "\x00" in value or not os.path.isabs(value):
+            raise SystemExit(f"candidate environment file for {key} must be an absolute path")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            file_fd = os.open(value, flags)
+        except OSError as error:
+            raise SystemExit(f"candidate environment file for {key} is not safely openable: {error}") from error
+        try:
+            info = os.fstat(file_fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SystemExit(f"candidate environment file for {key} is not regular")
+            if info.st_uid != os.getuid():
+                raise SystemExit(f"candidate environment file for {key} is not owned by the current uid")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise SystemExit(f"candidate environment file for {key} has group or other permissions")
+        finally:
+            os.close(file_fd)
+    environment.update(overrides)
 environment["SUBROUTER_STATE_DIR"] = state_dir
 plist["EnvironmentVariables"] = environment
 # The supervisor must outlive its draining workers.

@@ -166,6 +166,22 @@ write_plist() {
 EOF
 }
 
+write_wrapper_plist() {
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$label</string>
+<key>Program</key><string>$legacy</string>
+<key>ProgramArguments</key><array><string>$legacy</string></array>
+<key>EnvironmentVariables</key><dict>
+  <key>SUBROUTER_STATE_DIR</key><string>$TMP/home/.subrouter-retiring</string>
+  <key>LEGACY_ONLY</key><string>preserved</string>
+</dict>
+</dict></plist>
+EOF
+}
+
 stop_fake_job() {
   if [ -f "$FAKE_LAUNCHD_STATE" ]; then
     kill "$(cut -d '|' -f 2 "$FAKE_LAUNCHD_STATE")" 2>/dev/null || true
@@ -413,3 +429,106 @@ fi
 grep -q 'candidate and retiring state roots must be different' "$TMP/equal-root.err"
 [ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$legacy" ]
 echo "PASS equal candidate and retiring state roots failed before live mutation"
+
+worker_args_json="$TMP/worker-serve-args.json"
+candidate_env_json="$TMP/candidate-env.json"
+private_token_file="$TMP/private-token-file"
+printf '%s\n' 'test-only-placeholder' >"$private_token_file"
+chmod 0600 "$private_token_file"
+cat >"$worker_args_json" <<EOF
+["--quota-mode", "safe", "--token-file", "$private_token_file"]
+EOF
+cat >"$candidate_env_json" <<EOF
+{"SUBROUTER_TOKEN_FILE": "$private_token_file"}
+EOF
+ln -s "$worker_args_json" "$TMP/worker-args-link.json"
+reset_legacy
+write_wrapper_plist
+if "$MIGRATE" --public-addr 127.0.0.1:43199 \
+  --worker-serve-args-json "$TMP/worker-args-link.json" \
+  >"$TMP/wrapper-symlink.out" 2>"$TMP/wrapper-symlink.err"; then
+  echo "symlink JSON input unexpectedly accepted" >&2
+  exit 1
+fi
+grep -q 'must be a regular non-symlink file' "$TMP/wrapper-symlink.err"
+
+cat >"$TMP/worker-args-duplicate.json" <<'EOF'
+["serve", "--addr=127.0.0.1:1"]
+EOF
+if "$MIGRATE" --public-addr 127.0.0.1:43199 \
+  --worker-serve-args-json "$TMP/worker-args-duplicate.json" \
+  >"$TMP/wrapper-duplicate.out" 2>"$TMP/wrapper-duplicate.err"; then
+  echo "embedded serve/addr arguments unexpectedly accepted" >&2
+  exit 1
+fi
+grep -Eq 'must not embed (the serve subcommand|--addr)' "$TMP/wrapper-duplicate.err"
+
+assert_candidate_env_rejected() {
+  local name="$1" input="$2" pattern="$3"
+  if "$MIGRATE" --public-addr 127.0.0.1:43199 \
+    --worker-serve-args-json "$worker_args_json" --candidate-env-json "$input" \
+    >"$TMP/env-$name.out" 2>"$TMP/env-$name.err"; then
+    echo "unsafe candidate environment $name unexpectedly accepted" >&2
+    exit 1
+  fi
+  grep -Eq "$pattern" "$TMP/env-$name.err"
+}
+
+cat >"$TMP/env-raw-secret.json" <<'EOF'
+{"SUBROUTER_ADMIN_TOKEN": "raw-secret-value"}
+EOF
+assert_candidate_env_rejected raw-secret "$TMP/env-raw-secret.json" 'raw secrets and non-file overrides are forbidden'
+cat >"$TMP/env-non-file-key.json" <<'EOF'
+{"CANDIDATE_MODE": "isolated"}
+EOF
+assert_candidate_env_rejected non-file-key "$TMP/env-non-file-key.json" 'keys must match SUBROUTER_.*_FILE'
+cat >"$TMP/env-relative.json" <<'EOF'
+{"SUBROUTER_TOKEN_FILE": "relative/token"}
+EOF
+assert_candidate_env_rejected relative "$TMP/env-relative.json" 'must be an absolute path'
+cat >"$TMP/env-missing.json" <<EOF
+{"SUBROUTER_TOKEN_FILE": "$TMP/missing-token-file"}
+EOF
+assert_candidate_env_rejected missing "$TMP/env-missing.json" 'is not safely openable'
+ln -s "$private_token_file" "$TMP/token-file-link"
+cat >"$TMP/env-value-symlink.json" <<EOF
+{"SUBROUTER_TOKEN_FILE": "$TMP/token-file-link"}
+EOF
+assert_candidate_env_rejected symlink "$TMP/env-value-symlink.json" 'is not safely openable'
+unsafe_token_file="$TMP/unsafe-token-file"
+printf '%s\n' 'test-only-placeholder' >"$unsafe_token_file"
+chmod 0644 "$unsafe_token_file"
+cat >"$TMP/env-unsafe-mode.json" <<EOF
+{"SUBROUTER_TOKEN_FILE": "$unsafe_token_file"}
+EOF
+assert_candidate_env_rejected unsafe-mode "$TMP/env-unsafe-mode.json" 'has group or other permissions'
+
+"$MIGRATE" --public-addr 127.0.0.1:43199 \
+  --worker-serve-args-json "$worker_args_json" \
+  --candidate-env-json "$candidate_env_json" \
+  >"$TMP/wrapper-prepare.out" 2>"$TMP/wrapper-prepare.err"
+wrapper_prepared="${plist}.supervised"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$wrapper_prepared")" = "$supervisor" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$wrapper_prepared")" = supervise ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$wrapper_prepared")" = 127.0.0.1:43199 ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:9' "$wrapper_prepared")" = --quota-mode ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_TOKEN_FILE' "$wrapper_prepared")" = "$private_token_file" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:LEGACY_ONLY' "$wrapper_prepared")" = preserved ]
+if /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_TOKEN_FILE' "$plist" >/dev/null 2>&1; then
+  echo "candidate environment override leaked into retiring plist" >&2
+  exit 1
+fi
+
+if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
+  "$MIGRATE" --activate --public-addr 127.0.0.1:43199 \
+  --worker-serve-args-json "$worker_args_json" \
+  --candidate-env-json "$candidate_env_json" \
+  >"$TMP/wrapper-activate.out" 2>"$TMP/wrapper-activate.err"; then
+  echo "wrapper-backed failing canary unexpectedly accepted" >&2
+  exit 1
+fi
+grep -q 'functional canary failed; legacy LaunchAgent restored' "$TMP/wrapper-activate.err"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist")" = "$legacy" ]
+[ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$legacy" ]
+echo "PASS wrapper-only plist prepared safely and canary failure restored exact legacy"
