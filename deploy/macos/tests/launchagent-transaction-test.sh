@@ -51,7 +51,18 @@ case "$1" in
     [ -f "$FAKE_LAUNCHD_STATE" ] || exit 113
     IFS='|' read -r program pid <"$FAKE_LAUNCHD_STATE"
     kill -0 "$pid" 2>/dev/null || exit 113
-    printf 'program = %s\npid = %s\n' "$program" "$pid"
+    printf 'program = %s\n' "$program"
+    if [ "$program" = "$SUBROUTER_SUPERVISOR_BIN" ] \
+      && [ -n "${FAKE_SUPERVISOR_EMPTY_PID_COUNT:-}" ]; then
+      attempt=0
+      [ ! -s "$FAKE_SUPERVISOR_PRINT_ATTEMPT_FILE" ] \
+        || attempt="$(tr -d '[:space:]' <"$FAKE_SUPERVISOR_PRINT_ATTEMPT_FILE")"
+      if [ "$attempt" -lt "$FAKE_SUPERVISOR_EMPTY_PID_COUNT" ]; then
+        printf '%s\n' "$((attempt + 1))" >"$FAKE_SUPERVISOR_PRINT_ATTEMPT_FILE"
+        exit 0
+      fi
+    fi
+    printf 'pid = %s\n' "$pid"
     ;;
   bootout)
     [ -f "$FAKE_LAUNCHD_STATE" ] || exit 113
@@ -64,6 +75,7 @@ case "$1" in
     else
       rm -f "$FAKE_LAUNCHD_STATE"
     fi
+    [ "$program" != "$SUBROUTER_SUPERVISOR_BIN" ] || rm -f "$SUBROUTER_CONTROL_SOCKET"
     ;;
   bootstrap)
     if [ "${FAKE_BOOTSTRAP_FAIL_ONCE:-0}" = 1 ] && [ ! -f "${FAKE_LAUNCHD_STATE}.bootstrap-failed" ]; then
@@ -83,19 +95,49 @@ case "$1" in
     fi
     sleep 300 9>&- &
     printf '%s|%s\n' "$program" "$!" >"$FAKE_LAUNCHD_STATE"
+    [ "$program" != "$SUBROUTER_SUPERVISOR_BIN" ] || : >"$SUBROUTER_CONTROL_SOCKET"
     ;;
   *) exit 2 ;;
 esac
 SH
 cat >"$TMP/bin/curl" <<'SH'
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
 case " $* " in
   *" --unix-socket "*)
+    if [ -n "${FAKE_CONTROL_SOCKET_FAIL_COUNT:-}" ]; then
+      attempt=0
+      [ ! -s "$FAKE_CONTROL_SOCKET_ATTEMPT_FILE" ] \
+        || attempt="$(tr -d '[:space:]' <"$FAKE_CONTROL_SOCKET_ATTEMPT_FILE")"
+      if [ "$attempt" -lt "$FAKE_CONTROL_SOCKET_FAIL_COUNT" ]; then
+        printf '%s\n' "$((attempt + 1))" >"$FAKE_CONTROL_SOCKET_ATTEMPT_FILE"
+        exit 7
+      fi
+    fi
     worker_pid="${FAKE_ACTIVE_WORKER_PID:-4242}"
     if [ -n "${FAKE_ACTIVE_WORKER_PID_FILE:-}" ] && [ -s "$FAKE_ACTIVE_WORKER_PID_FILE" ]; then
       worker_pid="$(tr -d '[:space:]' <"$FAKE_ACTIVE_WORKER_PID_FILE")"
     fi
     printf '{"accepting":true,"retiring":false,"active":{"id":"candidate"},"active_worker":{"id":"candidate","pid":%s,"process_start_identity":"darwin:100:%s","identity_kind":"darwin-cdhash-sha256","executable_identity":"%s"},"backends":[{}]}\n' "$worker_pid" "$worker_pid" "${FAKE_ACTIVE_WORKER_CDHASH:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+    ;;
+  *)
+    if [ -n "${FAKE_RESTART_DURING_HTTP_AFTER_CALLS:-}" ]; then
+      http_attempt=0
+      [ ! -s "$FAKE_RESTART_DURING_HTTP_ATTEMPT_FILE" ] \
+        || http_attempt="$(tr -d '[:space:]' <"$FAKE_RESTART_DURING_HTTP_ATTEMPT_FILE")"
+      http_attempt=$((http_attempt + 1))
+      printf '%s\n' "$http_attempt" >"$FAKE_RESTART_DURING_HTTP_ATTEMPT_FILE"
+    fi
+    if [ -n "${FAKE_RESTART_DURING_HTTP_AFTER_CALLS:-}" ] \
+      && [ "$http_attempt" -gt "$FAKE_RESTART_DURING_HTTP_AFTER_CALLS" ] \
+      && [ ! -e "$FAKE_RESTART_DURING_HTTP_SENTINEL" ]; then
+      : >"$FAKE_RESTART_DURING_HTTP_SENTINEL"
+      IFS='|' read -r program old_pid <"$FAKE_LAUNCHD_STATE"
+      sleep 300 9>&- &
+      new_pid=$!
+      printf '%s|%s\n' "$program" "$new_pid" >"$FAKE_LAUNCHD_STATE"
+      kill "$old_pid" 2>/dev/null || true
+    fi
     ;;
 esac
 exit 0
@@ -690,6 +732,60 @@ fi
 grep -q 'supervised agent failed structural acceptance' "$TMP/worker-identity-mismatch.err"
 echo "PASS active worker kernel identity mismatch restored exact legacy before canary"
 
+reset_legacy
+control_attempt_file="$TMP/control-socket-attempts"
+FAKE_CONTROL_SOCKET_FAIL_COUNT=2 FAKE_CONTROL_SOCKET_ATTEMPT_FILE="$control_attempt_file" \
+  SUBROUTER_HEALTH_ATTEMPTS=5 SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" "$MIGRATE" --activate \
+  >"$TMP/control-socket-convergence.out" 2>"$TMP/control-socket-convergence.err"
+[ "$(cat "$control_attempt_file")" = 2 ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+echo "PASS supervisor control socket readiness converged before structural acceptance"
+
+reset_legacy
+supervisor_print_attempt_file="$TMP/supervisor-print-attempts"
+FAKE_SUPERVISOR_EMPTY_PID_COUNT=2 FAKE_SUPERVISOR_PRINT_ATTEMPT_FILE="$supervisor_print_attempt_file" \
+  SUBROUTER_HEALTH_ATTEMPTS=5 SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" "$MIGRATE" --activate \
+  >"$TMP/delayed-supervisor-pid.out" 2>"$TMP/delayed-supervisor-pid.err"
+[ "$(cat "$supervisor_print_attempt_file")" = 2 ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+echo "PASS delayed launchd supervisor PID visibility converged before structural acceptance"
+
+reset_legacy
+restart_sentinel="$TMP/restart-during-http"
+restart_http_attempt_file="$TMP/restart-during-http-attempts"
+if FAKE_RESTART_DURING_HTTP_AFTER_CALLS=0 \
+  FAKE_RESTART_DURING_HTTP_ATTEMPT_FILE="$restart_http_attempt_file" \
+  FAKE_RESTART_DURING_HTTP_SENTINEL="$restart_sentinel" \
+  SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+  "$MIGRATE" --activate >"$TMP/restart-during-http.out" 2>"$TMP/restart-during-http.err"; then
+  echo "supervisor restart during HTTP acceptance unexpectedly succeeded" >&2
+  exit 1
+fi
+[ -e "$restart_sentinel" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+grep -q 'supervised agent failed structural acceptance' "$TMP/restart-during-http.err"
+echo "PASS supervisor restart during HTTP acceptance restored exact legacy"
+
+reset_legacy
+post_restart_sentinel="$TMP/restart-during-post-canary-http"
+post_restart_attempt_file="$TMP/restart-during-post-canary-http-attempts"
+if FAKE_RESTART_DURING_HTTP_AFTER_CALLS=2 \
+  FAKE_RESTART_DURING_HTTP_ATTEMPT_FILE="$post_restart_attempt_file" \
+  FAKE_RESTART_DURING_HTTP_SENTINEL="$post_restart_sentinel" \
+  SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+  "$MIGRATE" --activate >"$TMP/restart-during-post-canary-http.out" \
+  2>"$TMP/restart-during-post-canary-http.err"; then
+  echo "supervisor restart during post-canary HTTP acceptance unexpectedly succeeded" >&2
+  exit 1
+fi
+[ -e "$post_restart_sentinel" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+grep -q 'candidate acceptance changed during canary' "$TMP/restart-during-post-canary-http.err"
+echo "PASS supervisor restart during post-canary HTTP acceptance restored exact legacy"
+
+reset_legacy
 worker_pid_file="$TMP/active-worker.pid"
 printf '%s\n' 4242 >"$worker_pid_file"
 if FAKE_ACTIVE_WORKER_PID_FILE="$worker_pid_file" \

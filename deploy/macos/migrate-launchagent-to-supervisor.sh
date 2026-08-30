@@ -54,7 +54,7 @@ trap release_subrouter_mutation_lease EXIT
 die() { echo "migrate-launchagent-to-supervisor: $*" >&2; exit 1; }
 active_worker_fingerprint() {
   local socket="$1" expected_cdhash="$2" status
-  status="$(curl -fsS --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 1
+  status="$(curl -fsS --max-time 2 --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 1
   STATUS_JSON="$status" python3 - "$expected_cdhash" <<'PY'
 import json
 import os
@@ -83,6 +83,89 @@ print(json.dumps({
     "executable_identity": worker["executable_identity"],
 }, sort_keys=True, separators=(",", ":")))
 PY
+}
+supervisor_acceptance_fingerprint() {
+  local socket="$1" expected_uid="$2" expected_cdhash="$3" status
+  [ -e "$socket" ] || return 2
+  [ "$(stat -f '%HT' "$socket" 2>/dev/null)" = "Socket" ] || return 1
+  [ "$(stat -f '%u' "$socket" 2>/dev/null)" = "$expected_uid" ] || return 1
+  status="$(curl -fsS --max-time 2 --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 2
+  [ "$(stat -f '%Lp' "$socket" 2>/dev/null)" = "600" ] || return 1
+  STATUS_JSON="$status" python3 - "$expected_cdhash" <<'PY'
+import json
+import os
+import sys
+
+expected = sys.argv[1]
+document = json.loads(os.environ["STATUS_JSON"])
+active = document.get("active") or {}
+worker = document.get("active_worker") or {}
+valid = (
+    document.get("accepting") is True
+    and document.get("retiring") is False
+    and len(document.get("backends") or []) == 1
+    and worker.get("id") == active.get("id")
+    and isinstance(worker.get("pid"), int)
+    and worker["pid"] > 1
+    and isinstance(worker.get("process_start_identity"), str)
+    and bool(worker["process_start_identity"])
+    and worker.get("identity_kind") == "darwin-cdhash-sha256"
+    and worker.get("executable_identity") == expected
+)
+if not valid:
+    raise SystemExit("supervisor lifecycle or active worker identity did not match the candidate")
+print(json.dumps({
+    "id": worker["id"],
+    "pid": worker["pid"],
+    "process_start_identity": worker["process_start_identity"],
+    "identity_kind": worker["identity_kind"],
+    "executable_identity": worker["executable_identity"],
+}, sort_keys=True, separators=(",", ":")))
+PY
+}
+wait_for_supervisor_readiness() {
+  local socket="$1" expected_uid="$2" expected_cdhash="$3"
+  local attempts="${SUBROUTER_HEALTH_ATTEMPTS:-60}"
+  local interval="${SUBROUTER_HEALTH_INTERVAL:-1}"
+  local fingerprint status i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if fingerprint="$(supervisor_acceptance_fingerprint "$socket" "$expected_uid" "$expected_cdhash")"; then
+      printf '%s\n' "$fingerprint"
+      return 0
+    else
+      status=$?
+      [ "$status" -eq 2 ] || return "$status"
+    fi
+    i=$((i + 1))
+    sleep "$interval"
+  done
+  return 1
+}
+wait_for_candidate_process_fingerprint() {
+  local service="$1" snapshot="$2" expected_program="$3"
+  local attempts="${SUBROUTER_HEALTH_ATTEMPTS:-60}"
+  local interval="${SUBROUTER_HEALTH_INTERVAL:-1}"
+  local program pid fingerprint i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if capture_launchctl_snapshot "$service" "$snapshot"; then
+      program="$(launchctl_snapshot_field "$snapshot" program)"
+      [ -z "$program" ] || [ "$program" = "$expected_program" ] || return 1
+      pid="$(launchctl_snapshot_field "$snapshot" pid)"
+      case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+          fingerprint="$(process_fingerprint "$pid" "$expected_program" || true)"
+          if [ -n "$fingerprint" ]; then
+            printf '%s\n' "$fingerprint"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+    i=$((i + 1))
+    sleep "$interval"
+  done
+  return 1
 }
 run_verified_recovery() {
   local recovery recovery_sha_file recovery_sha
@@ -659,26 +742,38 @@ inject_hard_fault_after_mutation candidate_bootstrap
 set_phase candidate_bootstrapped
 
 ready_url="${health_url%/_subrouter/health}/_subrouter/ready"
+candidate_active_worker_fingerprint="$(wait_for_supervisor_readiness "$CONTROL_SOCKET" "$(id -u)" "$candidate_worker_cdhash" || true)"
 candidate_snapshot="$TRANSACTION_DIR/candidate.launchctl"
-candidate_pid=""
-if capture_launchctl_snapshot "$service" "$candidate_snapshot"; then
-  candidate_program="$(launchctl_snapshot_field "$candidate_snapshot" program)"
-  candidate_pid="$(launchctl_snapshot_field "$candidate_snapshot" pid)"
-  [ "$candidate_program" = "$SUPERVISOR_BIN" ] || candidate_pid=""
-fi
-candidate_fingerprint=""
-[ -n "$candidate_pid" ] && candidate_fingerprint="$(process_fingerprint "$candidate_pid" "$SUPERVISOR_BIN" || true)"
+candidate_fingerprint="$(wait_for_candidate_process_fingerprint "$service" "$candidate_snapshot" "$SUPERVISOR_BIN" || true)"
+candidate_pid="${candidate_fingerprint%%|*}"
 printf 'candidate-process  %s\n' "$candidate_fingerprint" >>"$identity_manifest"
-candidate_active_worker_fingerprint="$(active_worker_fingerprint "$CONTROL_SOCKET" "$candidate_worker_cdhash" || true)"
-if [ -z "$candidate_fingerprint" ] \
-  || [ -z "$candidate_active_worker_fingerprint" ] \
-  || ! verify_file_sha256 "$PLIST" "$candidate_plist_sha" \
-  || ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha" \
-  || ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha" \
-  || ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN" \
-  || ! require_sole_listener_owner "$public_addr" "$candidate_pid" \
-  || ! require_control_socket_status "$CONTROL_SOCKET" "$(id -u)" \
-  || ! wait_for_http_acceptance "$health_url" "$ready_url"; then
+structural_active_worker_fingerprint=""
+structural_failure=""
+if [ -z "$candidate_active_worker_fingerprint" ]; then
+  structural_failure="supervisor readiness or active worker identity"
+elif [ -z "$candidate_fingerprint" ]; then
+  structural_failure="launchd supervisor process identity"
+elif ! verify_file_sha256 "$PLIST" "$candidate_plist_sha"; then
+  structural_failure="installed plist identity"
+elif ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha"; then
+  structural_failure="supervisor executable identity"
+elif ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha"; then
+  structural_failure="worker executable identity"
+elif ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN"; then
+  structural_failure="supervisor process continuity before listener acceptance"
+elif ! require_sole_listener_owner "$public_addr" "$candidate_pid"; then
+  structural_failure="listener ownership"
+elif ! wait_for_http_acceptance "$health_url" "$ready_url"; then
+  structural_failure="HTTP health and readiness"
+elif ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN"; then
+  structural_failure="supervisor process continuity after HTTP acceptance"
+else
+  structural_active_worker_fingerprint="$(supervisor_acceptance_fingerprint "$CONTROL_SOCKET" "$(id -u)" "$candidate_worker_cdhash" || true)"
+  [ "$structural_active_worker_fingerprint" = "$candidate_active_worker_fingerprint" ] \
+    || structural_failure="supervisor lifecycle or active worker continuity after HTTP acceptance"
+fi
+if [ -n "$structural_failure" ]; then
+  echo "structural acceptance failed: $structural_failure" >&2
   rollback
   die "supervised agent failed structural acceptance"
 fi
@@ -699,16 +794,31 @@ if ! SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$WORKER_BIN" \
   die "functional canary failed; legacy LaunchAgent restored"
 fi
 set_phase canary_completed
-post_canary_active_worker_fingerprint="$(active_worker_fingerprint "$CONTROL_SOCKET" "$candidate_worker_cdhash" || true)"
-if [ -z "$post_canary_active_worker_fingerprint" ] \
-  || [ "$post_canary_active_worker_fingerprint" != "$candidate_active_worker_fingerprint" ] \
-  || ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN" \
-  || ! verify_file_sha256 "$PLIST" "$candidate_plist_sha" \
-  || ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha" \
-  || ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha" \
-  || ! require_sole_listener_owner "$public_addr" "$candidate_pid" \
-  || ! require_control_socket_status "$CONTROL_SOCKET" "$(id -u)" \
-  || ! wait_for_http_acceptance "$health_url" "$ready_url"; then
+post_canary_failure=""
+post_canary_active_worker_fingerprint=""
+if ! verify_file_sha256 "$PLIST" "$candidate_plist_sha"; then
+  post_canary_failure="installed plist identity"
+elif ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha"; then
+  post_canary_failure="supervisor executable identity"
+elif ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha"; then
+  post_canary_failure="worker executable identity"
+elif ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN"; then
+  post_canary_failure="supervisor process continuity before final HTTP acceptance"
+elif ! require_sole_listener_owner "$public_addr" "$candidate_pid"; then
+  post_canary_failure="listener ownership before final HTTP acceptance"
+elif ! wait_for_http_acceptance "$health_url" "$ready_url"; then
+  post_canary_failure="final HTTP health and readiness"
+elif ! require_sole_listener_owner "$public_addr" "$candidate_pid"; then
+  post_canary_failure="listener ownership after final HTTP acceptance"
+elif ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN"; then
+  post_canary_failure="supervisor process continuity after final HTTP acceptance"
+else
+  post_canary_active_worker_fingerprint="$(supervisor_acceptance_fingerprint "$CONTROL_SOCKET" "$(id -u)" "$candidate_worker_cdhash" || true)"
+  [ "$post_canary_active_worker_fingerprint" = "$candidate_active_worker_fingerprint" ] \
+    || post_canary_failure="supervisor lifecycle or active worker continuity after final HTTP acceptance"
+fi
+if [ -n "$post_canary_failure" ]; then
+  echo "post-canary acceptance failed: $post_canary_failure" >&2
   rollback
   die "candidate acceptance changed during canary; legacy LaunchAgent restored"
 fi

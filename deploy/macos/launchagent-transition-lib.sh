@@ -284,7 +284,7 @@ require_control_socket_status() {
   [ "$(stat -f '%HT' "$socket" 2>/dev/null)" = "Socket" ] || return 1
   [ "$(stat -f '%Lp' "$socket" 2>/dev/null)" = "600" ] || return 1
   [ "$(stat -f '%u' "$socket" 2>/dev/null)" = "$expected_uid" ] || return 1
-  status="$(curl -fsS --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 1
+  status="$(curl -fsS --max-time 2 --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 1
   printf '%s' "$status" | python3 -c 'import json,sys; d=json.load(sys.stdin); valid=d.get("accepting") is True and d.get("retiring") is False and bool(d.get("active",{}).get("id")) and len(d.get("backends",[])) == 1; sys.exit(0 if valid else 1)'
 }
 
