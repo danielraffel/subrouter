@@ -19,6 +19,7 @@ BACKUP="${SUBROUTER_ROLLBACK_PLIST:-}"
 EXPECTED_PROGRAM="${SUBROUTER_EXPECTED_PROGRAM:-}"
 EXPECTED_RUNNING_PROGRAM="${SUBROUTER_EXPECTED_RUNNING_PROGRAM:-}"
 BACKUP_SHA256="${SUBROUTER_ROLLBACK_PLIST_SHA256:-}"
+PUBLIC_ADDR_OVERRIDE="${SUBROUTER_PUBLIC_ADDR:-}"
 EXPECTED_FILES=()
 EXPECTED_FILE_SHAS=()
 ROLLBACK_DESTINATIONS=()
@@ -27,7 +28,7 @@ ROLLBACK_ARTIFACT_SHAS=()
 ROLLBACK_ARTIFACT_MODES=()
 
 usage() {
-  echo "usage: $0 --backup PLIST --backup-sha256 SHA --rollback-artifact DEST ARTIFACT SHA MODE [--expected-program PATH] [--expected-running-program PATH]" >&2
+  echo "usage: $0 --backup PLIST --backup-sha256 SHA --rollback-artifact DEST ARTIFACT SHA MODE [--public-addr HOST:PORT] [--expected-program PATH] [--expected-running-program PATH]" >&2
   exit 2
 }
 
@@ -43,6 +44,7 @@ while [ "$#" -gt 0 ]; do
       ROLLBACK_DESTINATIONS+=("$2"); ROLLBACK_ARTIFACTS+=("$3")
       ROLLBACK_ARTIFACT_SHAS+=("$4"); ROLLBACK_ARTIFACT_MODES+=("$5"); shift 5 ;;
     --expected-program) [ "$#" -ge 2 ] || usage; EXPECTED_PROGRAM="$2"; shift 2 ;;
+    --public-addr) [ "$#" -ge 2 ] || usage; PUBLIC_ADDR_OVERRIDE="$2"; shift 2 ;;
     --expected-running-program)
       [ "$#" -ge 2 ] || usage; EXPECTED_RUNNING_PROGRAM="$2"; shift 2 ;;
     -h|--help) usage ;;
@@ -53,6 +55,28 @@ done
 [ -n "$BACKUP" ] || usage
 [ -n "$BACKUP_SHA256" ] || usage
 [ "${#ROLLBACK_ARTIFACTS[@]}" -gt 0 ] || usage
+
+validate_public_addr() {
+  python3 - "$1" <<'PY'
+import sys
+
+value = sys.argv[1]
+host, separator, port_text = value.rpartition(":")
+if not separator or not host or not port_text.isdigit():
+    raise SystemExit("public address must be HOST:PORT or [IPv6]:PORT")
+port = int(port_text)
+if not 1 <= port <= 65535:
+    raise SystemExit("public address port must be between 1 and 65535")
+if (host.startswith("[") or host.endswith("]")) and not (
+    host.startswith("[") and host.endswith("]")
+):
+    raise SystemExit("IPv6 public address must use [IPv6]:PORT form")
+if ":" in host and not (host.startswith("[") and host.endswith("]")):
+    raise SystemExit("IPv6 public address must use [IPv6]:PORT form")
+PY
+}
+
+[ -z "$PUBLIC_ADDR_OVERRIDE" ] || validate_public_addr "$PUBLIC_ADDR_OVERRIDE"
 
 # Adopt the migration's kernel lease (or acquire it for a standalone rollback)
 # before hashing or parsing any rollback input. If the migration is killed
@@ -120,7 +144,17 @@ if [ -e "$PLIST" ]; then
   fi
   require_plist_identity "$PLIST" "$LABEL" "$EXPECTED_PROGRAM"
   [ -n "$EXPECTED_RUNNING_PROGRAM" ] || EXPECTED_RUNNING_PROGRAM="$EXPECTED_PROGRAM"
-  public_addr="$(plist_public_addr "$PLIST")"
+  installed_public_addr="$(plist_public_addr "$PLIST" 2>/dev/null || true)"
+  if [ -n "$installed_public_addr" ]; then
+    validate_public_addr "$installed_public_addr"
+  elif [ -z "$PUBLIC_ADDR_OVERRIDE" ]; then
+    launchagent_die "installed plist has no --addr; pass --public-addr"
+  fi
+  if [ -n "$installed_public_addr" ] && [ -n "$PUBLIC_ADDR_OVERRIDE" ] \
+    && [ "$PUBLIC_ADDR_OVERRIDE" != "$installed_public_addr" ]; then
+    launchagent_die "public address override does not match installed plist"
+  fi
+  public_addr="${installed_public_addr:-$PUBLIC_ADDR_OVERRIDE}"
   if launchagent_job_loaded "$service"; then
     captured_pid="$(capture_loaded_identity "$service" "$EXPECTED_RUNNING_PROGRAM")"
     launchctl bootout "$service"
@@ -128,8 +162,13 @@ if [ -e "$PLIST" ]; then
 else
   launchagent_job_loaded "$service" \
     && launchagent_die "installed plist is absent but $service is still loaded"
-  public_addr="$(plist_public_addr "$BACKUP")"
+  if [ -n "$PUBLIC_ADDR_OVERRIDE" ]; then
+    public_addr="$PUBLIC_ADDR_OVERRIDE"
+  else
+    public_addr="$(plist_public_addr "$BACKUP")"
+  fi
 fi
+validate_public_addr "$public_addr"
 wait_for_full_absence "$service" "$captured_pid" "$public_addr"
 
 restore_next="${PLIST}.rollback-next.$$"

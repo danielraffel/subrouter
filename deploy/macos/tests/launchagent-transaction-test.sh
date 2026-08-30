@@ -1546,6 +1546,16 @@ if "$MIGRATE" --public-addr 127.0.0.1:43199 \
 fi
 grep -Eq 'must not embed (the serve subcommand|--addr)' "$TMP/wrapper-duplicate.err"
 
+if "$MIGRATE" --public-addr ::1:43199 \
+  --worker-serve-args-json "$worker_args_json" \
+  >"$TMP/wrapper-unbracketed-ipv6.out" 2>"$TMP/wrapper-unbracketed-ipv6.err"; then
+  echo "unbracketed IPv6 public address unexpectedly accepted" >&2
+  exit 1
+fi
+grep -q 'IPv6 public address must use \[IPv6\]:PORT form' \
+  "$TMP/wrapper-unbracketed-ipv6.err"
+echo "PASS migration rejected an unbracketed IPv6 public address"
+
 assert_candidate_env_rejected() {
   local name="$1" input="$2" pattern="$3"
   if "$MIGRATE" --public-addr 127.0.0.1:43199 \
@@ -1586,6 +1596,31 @@ cat >"$TMP/env-unsafe-mode.json" <<EOF
 EOF
 assert_candidate_env_rejected unsafe-mode "$TMP/env-unsafe-mode.json" 'has group or other permissions'
 
+if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+  SUBROUTER_FAULT_INJECT_HARD_PHASE=candidate_plist_installing \
+  "$MIGRATE" --activate --public-addr 127.0.0.1:43199 \
+  --worker-serve-args-json "$worker_args_json" \
+  --candidate-env-json "$candidate_env_json" \
+  >"$TMP/wrapper-hard-fault.out" 2>"$TMP/wrapper-hard-fault.err"; then
+  echo "wrapper-backed hard fault unexpectedly succeeded" >&2
+  exit 1
+fi
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+  "$MIGRATE" --activate --public-addr 127.0.0.1:43199 \
+  --worker-serve-args-json "$worker_args_json" \
+  --candidate-env-json "$candidate_env_json" \
+  >"$TMP/wrapper-hard-fault-reentry.out" 2>"$TMP/wrapper-hard-fault-reentry.err"; then
+  echo "wrapper-backed hard-fault reentry unexpectedly continued activation" >&2
+  exit 1
+fi
+grep -q 'recovered interrupted transaction phase candidate_plist_installing to legacy' \
+  "$TMP/wrapper-hard-fault-reentry.err"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+[ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$legacy" ]
+[ ! -e "${plist}.supervisor-transaction" ]
+echo "PASS wrapper-backed pre-install SIGKILL recovered exact legacy on reentry"
+
 "$MIGRATE" --public-addr 127.0.0.1:43199 \
   --worker-serve-args-json "$worker_args_json" \
   --candidate-env-json "$candidate_env_json" \
@@ -1617,3 +1652,43 @@ grep -q 'functional canary failed; legacy LaunchAgent restored' "$TMP/wrapper-ac
 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist")" = "$legacy" ]
 [ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$legacy" ]
 echo "PASS wrapper-only plist prepared safely and canary failure restored exact legacy"
+
+wrapper_backup="$TMP/wrapper-backup.plist"
+cp -p "$plist" "$wrapper_backup"
+wrapper_backup_sha="$(shasum -a 256 "$wrapper_backup" | awk '{print $1}')"
+launchctl bootout "gui/$(id -u)/$label"
+rm -f "$plist"
+"$ROLLBACK" --backup "$wrapper_backup" --backup-sha256 "$wrapper_backup_sha" \
+  --rollback-artifact "$legacy" "$legacy_artifact" "$legacy_sha" 755 \
+  --rollback-artifact "$legacy_dependency" "$dependency_artifact" "$legacy_dependency_sha" 755 \
+  --public-addr 127.0.0.1:43199 \
+  >"$TMP/wrapper-missing-plist.out" 2>"$TMP/wrapper-missing-plist.err"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+grep -q 'rollback LaunchAgent healthy and ready' "$TMP/wrapper-missing-plist.out"
+echo "PASS wrapper-backed standalone rollback recovered after installed plist absence"
+
+launchctl bootout "gui/$(id -u)/$label"
+write_plist "$supervisor" supervise
+launchctl bootstrap "gui/$(id -u)" "$plist"
+if "$ROLLBACK" --backup "$wrapper_backup" --backup-sha256 "$wrapper_backup_sha" \
+  --rollback-artifact "$legacy" "$legacy_artifact" "$legacy_sha" 755 \
+  --rollback-artifact "$legacy_dependency" "$dependency_artifact" "$legacy_dependency_sha" 755 \
+  --public-addr ::1:43199 \
+  >"$TMP/wrapper-invalid-address.out" 2>"$TMP/wrapper-invalid-address.err"; then
+  echo "unbracketed IPv6 rollback address unexpectedly accepted" >&2
+  exit 1
+fi
+grep -q 'IPv6 public address must use \[IPv6\]:PORT form' "$TMP/wrapper-invalid-address.err"
+launchctl print "gui/$(id -u)/$label" >/dev/null
+echo "PASS standalone rollback rejected an invalid address before bootout"
+
+if "$ROLLBACK" --backup "$wrapper_backup" --backup-sha256 "$wrapper_backup_sha" \
+  --rollback-artifact "$legacy" "$legacy_artifact" "$legacy_sha" 755 \
+  --rollback-artifact "$legacy_dependency" "$dependency_artifact" "$legacy_dependency_sha" 755 \
+  --public-addr 127.0.0.1:43200 \
+  >"$TMP/wrapper-address-mismatch.out" 2>"$TMP/wrapper-address-mismatch.err"; then
+  echo "mismatched public address override unexpectedly accepted" >&2
+  exit 1
+fi
+grep -q 'public address override does not match installed plist' "$TMP/wrapper-address-mismatch.err"
+echo "PASS standalone rollback rejected a public address override mismatch"

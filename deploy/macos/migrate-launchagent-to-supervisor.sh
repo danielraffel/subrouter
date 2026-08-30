@@ -266,6 +266,8 @@ def validate_public_addr(value):
         host.startswith("[") and host.endswith("]")
     ):
         raise SystemExit("IPv6 public address must use [IPv6]:PORT form")
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        raise SystemExit("IPv6 public address must use [IPv6]:PORT form")
 
 
 with open(source, "rb") as handle:
@@ -490,6 +492,7 @@ rollback() {
       --backup "$backup" \
       --backup-sha256 "$backup_sha256" \
       "${rollback_identity_args[@]}" \
+      --public-addr "$public_addr" \
       --expected-program "$SUPERVISOR_BIN" \
       --expected-running-program "$expected_running"; then
     transaction_active=0
@@ -509,7 +512,8 @@ write_recovery_script() {
       "$LABEL" "$PLIST" "$DOMAIN" "$CONTROL_SOCKET"
     printf 'exec %q' "$SCRIPT_DIR/rollback-launchagent-supervisor.sh"
     printf ' %q' --backup "$backup" --backup-sha256 "$backup_sha256" \
-      "${rollback_identity_args[@]}" --expected-program "$expected_installed" \
+      "${rollback_identity_args[@]}" --public-addr "$public_addr" \
+      --expected-program "$expected_installed" \
       --expected-running-program "$expected_running"
     printf '\n'
   } >"$destination"
@@ -722,7 +726,8 @@ echo "rollback identity manifest: $identity_manifest"
 echo "standalone rollback:"
 printf '  %q' "$SCRIPT_DIR/rollback-launchagent-supervisor.sh" \
   --backup "$backup" --backup-sha256 "$backup_sha256" \
-  "${rollback_identity_args[@]}" --expected-program "$SUPERVISOR_BIN"
+  "${rollback_identity_args[@]}" --public-addr "$public_addr" \
+  --expected-program "$SUPERVISOR_BIN"
 printf '\n'
 echo
 echo "Upgrades are now non-disruptive:"
