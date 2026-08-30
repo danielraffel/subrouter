@@ -122,8 +122,11 @@ Advanced setup:
 
 Running agents:
   sr codex [args]       Run codex through Subrouter
-  sr claude proxy [args]
-                        Run Claude profilelessly through the selected server
+  sr claude             Pick a preferred account, then run pooled with failover
+  sr claude proxy [options] [args...]
+                        Run pooled using the server's current recommendation
+  sr claude proxy --account [profile]
+                        Run pinned to one Claude profile with no account failover
   sr gemini [args]      Run gemini through Subrouter
 
   sr server             Legacy form of sr remote
@@ -144,7 +147,7 @@ Running agents:
   sr remove-admin-key <label>
   sr attach-project <api-key-label> [--project-id <id-or-name>]
 
-  sr claude             Manage Claude Code profiles
+  sr claude             Interactively launch pooled Claude through Subrouter
   sr claude-aws [--model fable] [claude args...]
                         Launch Claude Code on AWS Bedrock via the server (Fable 5)
   sr claude-direct [claude args...]

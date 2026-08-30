@@ -1533,7 +1533,7 @@ Usage:
   %[1]s remove-admin-key <label>
   %[1]s attach-project <api-key-label> [--project-id <id-or-name>]
 
-  %[1]s claude             Manage Claude Code profiles
+  %[1]s claude             Interactively launch pooled Claude through Subrouter
   %[1]s claude-aws [--model fable] [claude args...]
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]
@@ -1556,6 +1556,7 @@ Session stickiness:
   Send X-Subrouter-Agent when the client is not Codex.
   Send X-Subrouter-User-Email for teammate-level observability.
   Send X-Subrouter-Account-ID to force a specific account, including an API-key account.
+  Send X-Subrouter-Preferred-Account-ID to prefer an initial account while retaining failover.
   Subrouter switches the active sr account every 10m by default; set --sr-switch-interval=0 to disable.
   For %[1]s codex, set SUBROUTER_CODEX_USER_EMAIL and/or SUBROUTER_CODEX_ACCOUNT_ID instead.
   The proxy also checks common session headers, query params, and small JSON bodies.
