@@ -328,7 +328,18 @@ func requestMarkerHash(marker string) string {
 }
 
 func responseRequest(model, marker string) ([]byte, error) {
-	return json.Marshal(map[string]any{"model": model, "input": "Reply with exactly " + marker, "max_output_tokens": 64})
+	return json.Marshal(map[string]any{
+		"model": model,
+		"input": []map[string]any{{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "input_text",
+				"text": "Reply with exactly " + marker,
+			}},
+		}},
+		"max_output_tokens": 64,
+	})
 }
 
 func (c *apiClient) routedTurn(ctx context.Context, sessionID, model, marker string) (int, error) {

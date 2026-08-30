@@ -86,8 +86,7 @@ func liveServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 			}
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
-			input, _ := body["input"].(string)
-			marker := strings.TrimPrefix(input, "Reply with exactly ")
+			marker := strings.TrimPrefix(canaryResponsePrompt(body), "Reply with exactly ")
 			mu.Lock()
 			assignments[r.Header.Get("X-Subrouter-Session")] = "account-secret"
 			turns.Add(1)
@@ -99,6 +98,27 @@ func liveServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 		}
 	}))
 	return server, &turns
+}
+
+func canaryResponsePrompt(body map[string]any) string {
+	input, ok := body["input"].([]any)
+	if !ok || len(input) != 1 {
+		return ""
+	}
+	message, ok := input[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 1 {
+		return ""
+	}
+	text, ok := content[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	value, _ := text["text"].(string)
+	return value
 }
 
 func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
@@ -763,6 +783,22 @@ func TestEveryCanaryTurnHasSmallOutputBound(t *testing.T) {
 	if request["max_output_tokens"] != float64(64) {
 		t.Fatalf("max_output_tokens=%v", request["max_output_tokens"])
 	}
+	input, ok := request["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("input=%#v, want one-item Responses API input list", request["input"])
+	}
+	message, ok := input[0].(map[string]any)
+	if !ok || message["type"] != "message" || message["role"] != "user" {
+		t.Fatalf("input message=%#v", input[0])
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("input content=%#v", message["content"])
+	}
+	text, ok := content[0].(map[string]any)
+	if !ok || text["type"] != "input_text" || text["text"] != "Reply with exactly MARK" {
+		t.Fatalf("input text=%#v", content[0])
+	}
 }
 
 func TestFailedSessionCleanupPreservesJournal(t *testing.T) {
@@ -913,7 +949,7 @@ func newFailoverFixture(t *testing.T, failTurn int) *failoverFixture {
 			if body["max_output_tokens"] != float64(64) {
 				fixture.badBounds = true
 			}
-			marker := strings.TrimPrefix(body["input"].(string), "Reply with exactly ")
+			marker := strings.TrimPrefix(canaryResponsePrompt(body), "Reply with exactly ")
 			sessionID := r.Header.Get("X-Subrouter-Session")
 			fixture.mu.Lock()
 			defer fixture.mu.Unlock()
@@ -1082,7 +1118,7 @@ func existingSessionServer(t *testing.T, sessionID, logPath string, explicitActi
 				http.Error(w, "bad request", http.StatusBadRequest)
 				return
 			}
-			marker := strings.TrimPrefix(fmt.Sprint(body["input"]), "Reply with exactly ")
+			marker := strings.TrimPrefix(canaryResponsePrompt(body), "Reply with exactly ")
 			if logPath != "" {
 				logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
 				if err != nil {
