@@ -137,7 +137,7 @@ func runForProgram(program string, args []string) error {
 		usage(program)
 		return nil
 	}
-	if program == "sr" && isCodexIsolationCommand(args) {
+	if isCodexIsolationCommand(args) {
 		return srForProgram(program, args)
 	}
 	if program == "sr" &&

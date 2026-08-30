@@ -1318,7 +1318,9 @@ func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (remo
 }
 
 func snapshotTenantClaudeProfile(ctx context.Context, ref *AccountRef, id string) (agentclaude.ProfileRemovalSnapshot, bool, error) {
-	if err := agentclaude.ValidateProfileNameAllowEmail(id); err != nil {
+	// Stored-only selectors such as "apikey:work" cannot name a Claude profile.
+	// Treat them as having no Claude component instead of failing the deletion.
+	if agentclaude.ValidateProfileNameAllowEmail(id) != nil {
 		return agentclaude.ProfileRemovalSnapshot{}, false, nil
 	}
 	return ref.claudeStore.SnapshotProfileRemovalContext(ctx, id)

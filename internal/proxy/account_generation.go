@@ -392,19 +392,6 @@ func replayPreparedClaudeProfileRollback(ctx context.Context, storeDir string, j
 	return true, err
 }
 
-func replayPreparedTenantStoredRemoval(_ string, journal accountRollbackJournal) (removed bool, err error) {
-	store := accounts.CodexStore{Dir: journal.StoredStoreDir}
-	if err := store.ReconcileStoredRemovalStages(syncAccountStateDir); err != nil {
-		return false, err
-	}
-	lease, err := store.AcquireStoredAccountLease(journal.StoredTargetID)
-	if err != nil {
-		return false, err
-	}
-	defer func() { err = errors.Join(err, lease.Close()) }()
-	return replayPreparedTenantStoredRemovalWithLease(journal, lease)
-}
-
 func replayPreparedTenantStoredRemovalWithLease(journal accountRollbackJournal, lease *accounts.StoredAccountLease) (bool, error) {
 	current, found, err := lease.FindExact()
 	if err != nil {
@@ -1030,15 +1017,6 @@ func (r *AccountRef) reconcileOrEvictAccountRollback(ctx context.Context, marker
 		return true, reloaded, generation, markerErr
 	}
 	return false, false, r.Generation(), nil
-}
-
-func (r *AccountRef) evictSnapshotForAccountRollback(ctx context.Context) (bool, uint64, error) {
-	if err := lockMutexContext(ctx, &r.installMu); err != nil {
-		return false, 0, err
-	}
-	defer r.installMu.Unlock()
-	reloaded, generation := r.evictSnapshotForAccountRollbackLocked()
-	return reloaded, generation, nil
 }
 
 func (r *AccountRef) evictSnapshotForAccountRollbackLocked() (bool, uint64) {

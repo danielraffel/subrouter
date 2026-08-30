@@ -53,6 +53,14 @@ func TestCodexMigrateIsolationIsReservedWithoutHijackingCodexLauncher(t *testing
 	}
 }
 
+func TestSubrouterProgramDispatchesDocumentedCodexIsolationCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	if err := runForProgram("subrouter", []string{"codex", "migrate-isolation"}); err != nil {
+		t.Fatalf("documented subrouter migration command: %v", err)
+	}
+}
+
 func TestCodexMigrateIsolationRemainsAvailableWithMalformedRoutingConfig(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	configPath := t.TempDir() + "/cloud.json"

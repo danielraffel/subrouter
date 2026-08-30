@@ -1302,10 +1302,6 @@ func (s Store) profileCredentialBackups(
 	return backups, nil
 }
 
-func deleteProfileKeychainCredentials(instancePaths []string) error {
-	return deleteProfileKeychainCredentialsContext(context.Background(), instancePaths)
-}
-
 func deleteProfileKeychainCredentialsContext(ctx context.Context, instancePaths []string) error {
 	for _, instancePath := range instancePaths {
 		if err := deleteKeychainCredentialContext(ctx, instancePath); err != nil {
