@@ -28,13 +28,13 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
-const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
+const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled Claude
 
 Usage:
   sr claude                     Interactively launch pooled Claude (chosen account is a preference)
-  sr claude add [name]          Add account (opens OAuth login, infers email)
-  sr claude list                List all profiles with auth status
-  sr claude switch [name]       Switch active profile
+  sr claude add [name]          Add local profile (opens OAuth login, infers email)
+  sr claude list                List local managed profiles with auth status
+  sr claude switch [name]       Switch active local profile
   sr claude remove <name>       Remove a profile
   sr claude env                 Print CLAUDE_CONFIG_DIR for local/HTTPS profiles
   sr claude push [name]         Upload a profile to the default Subrouter server pool
@@ -45,7 +45,7 @@ Usage:
     --sr-expect-scope SCOPE --  Atomically bind launch to an opaque proxy scope (must be last option)
                                 Wrapper options must precede Claude args; args at/after -- are literal
   sr claude proxy-scope         Print the opaque selected proxy session scope
-  sr claude run [name] [...]    Launch safely (required for plaintext remote profiles)
+  sr claude run [name] [...]    Launch one authenticated local managed profile safely
   sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
@@ -57,6 +57,9 @@ type claudeRunner struct {
 	out    io.Writer
 	errOut io.Writer
 	client *http.Client
+	// authStatus is a test seam for the read-only local-login preflight.
+	// Production uses claude.AuthStatusForPath.
+	authStatus func(context.Context, string, string) (*claude.AuthStatus, error)
 	// pushToServer uploads a profile to the default Subrouter server, when
 	// one is configured. nil when the claude runner is built without server
 	// support (tests). pushAfterAdd is the same upload but no-ops silently
@@ -1283,14 +1286,31 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	if !ok {
 		return fmt.Errorf("profile %q not found", name)
 	}
-	configDir := r.store.ClaudeConfigDir(profile.Name)
-	secureBaseURL, err := secureManagedClaudeProfileTransport(configDir)
-	if err != nil {
-		return err
-	}
+	// Resolve the existing instance without ClaudeConfigDir: ClaudeConfigDir
+	// prepares shared-history links and therefore writes to disk. A rejected
+	// local login must leave the profile tree byte-for-byte untouched.
+	configDir := r.store.PreferredInstancePath(r.store.InstancePath(profile.Name))
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	authStatus := r.authStatus
+	if authStatus == nil {
+		authStatus = claude.AuthStatusForPath
+	}
+	auth, err := authStatus(ctx, claudePath, configDir)
+	if err != nil {
+		return fmt.Errorf("check local Claude profile %q login: %w", profile.Name, err)
+	}
+	if auth == nil || !auth.LoggedIn {
+		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Use sr claude proxy --account %s for the server-pool account, or 'sr claude add <new-name>' to create a logged-in local profile", profile.Name, shellQuote(profile.Name))
+	}
+	// Login is accepted; profile preparation and the remaining launch mutations
+	// are now allowed.
+	configDir = r.store.ClaudeConfigDir(profile.Name)
+	secureBaseURL, err := secureManagedClaudeProfileTransport(configDir)
+	if err != nil {
+		return err
 	}
 	if err := r.store.SetActiveProfile(profile.Name); err != nil {
 		return err

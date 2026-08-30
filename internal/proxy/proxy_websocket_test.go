@@ -45,6 +45,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 		if got := r.Header.Get("x-codex-window-id"); got != "window-1" {
 			t.Fatalf("x-codex-window-id = %q, want window-1", got)
 		}
+		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Fatalf("%s leaked upstream: %q", header, got)
+			}
+		}
 
 		conn, err := upgrader.Upgrade(w, r, http.Header{"x-codex-turn-state": []string{"turn-1"}})
 		if err != nil {
@@ -81,7 +86,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
-	header := http.Header{"x-codex-window-id": []string{"window-1"}}
+	header := http.Header{
+		"x-codex-window-id":      []string{"window-1"},
+		"X-Subrouter-Account-ID": []string{"a@example.com"},
+		"X-Subrouter-Account":    []string{"a@example.com"},
+	}
 	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -4684,6 +4693,78 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 // event, pin the session to the Azure fallback, close with 1012 so the client
 // reconnects, refuse the reconnect's upgrade with 426 so the client switches
 // to the HTTP transport, and then serve the HTTP turn from Azure.
+func TestHandlerForcedCodexWebSocketSelectionErrorDoesNotOfferAzure(t *testing.T) {
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("forced websocket selection failure reached Azure")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{
+		"Session-Id":             []string{"forced-ws-missing"},
+		"X-Subrouter-Account-ID": []string{"missing-account"},
+	}
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("forced websocket selection unexpectedly upgraded")
+	}
+	if response == nil {
+		t.Fatalf("forced websocket selection error had no HTTP response: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("forced websocket selection status = %d, want 503 (never Azure 426)", response.StatusCode)
+	}
+}
+
+func TestHandlerInvalidForcedCodexWebSocketSelectorDoesNotOfferAzure(t *testing.T) {
+	var azureHits atomic.Int32
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		azureHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	for _, headerName := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+		t.Run(headerName, func(t *testing.T) {
+			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+			header := http.Header{
+				"Session-Id": []string{"invalid-forced-ws"},
+				headerName:   []string{strings.Repeat("a", 257)},
+			}
+			_, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+			if err == nil {
+				t.Fatal("invalid forced websocket selector unexpectedly upgraded")
+			}
+			if response == nil {
+				t.Fatalf("invalid forced websocket selector had no HTTP response: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", response.StatusCode)
+			}
+		})
+	}
+	if got := azureHits.Load(); got != 0 {
+		t.Fatalf("Azure hits = %d, want 0", got)
+	}
+}
+
 func TestHandlerDivertsOverloadedCodexWebSocketToAzure(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

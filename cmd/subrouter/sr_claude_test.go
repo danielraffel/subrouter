@@ -565,7 +565,12 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
 
 	var out bytes.Buffer
-	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	runner := claudeRunner{
+		store: store, in: strings.NewReader(""), out: &out, errOut: &out,
+		authStatus: func(context.Context, string, string) (*claude.AuthStatus, error) {
+			return &claude.AuthStatus{LoggedIn: true}, nil
+		},
+	}
 	err := runner.run(context.Background(), []string{"--dangerously-skip-permissions", "--resume", "1721c0ce-b3bd-4d73-8b33-b3d02b677074"})
 	if err != nil {
 		t.Fatal(err)
@@ -586,6 +591,91 @@ func TestClaudeFlagsRunActiveProfile(t *testing.T) {
 		if strings.Contains(got, needle) {
 			t.Fatalf("Claude inherited %s env:\n%s", needle, got)
 		}
+	}
+}
+
+func TestClaudeRunRejectsLoggedOutLocalProfileBeforeAnyFilesystemMutation(t *testing.T) {
+	home := t.TempDir()
+	store := claude.Store{
+		Dir:            filepath.Join(home, ".subrouter", "codex"),
+		SharedStateDir: filepath.Join(home, ".subrouter", "claude-shared"),
+	}
+	if _, err := store.CreateProfile("ready"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateProfile("mydonorkid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActiveProfile("ready"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leave one shared-state link absent. ClaudeConfigDir would recreate it,
+	// giving the test a concrete write to detect before login acceptance.
+	profileDir := store.PreferredInstancePath(store.InstancePath("mydonorkid"))
+	missingLink := filepath.Join(profileDir, "projects")
+	if err := os.Remove(missingLink); err != nil {
+		t.Fatal(err)
+	}
+	profilesBefore, err := os.ReadFile(store.ProfilesPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launchMarker := filepath.Join(home, "claude-launched")
+	script := "#!/bin/sh\ntouch " + shellQuote(launchMarker) + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	authChecked := false
+	runner := claudeRunner{
+		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+		authStatus: func(_ context.Context, claudePath, configDir string) (*claude.AuthStatus, error) {
+			authChecked = true
+			if filepath.Base(claudePath) != "claude" {
+				t.Fatalf("auth preflight CLI = %q", claudePath)
+			}
+			if configDir != profileDir {
+				t.Fatalf("auth preflight config dir = %q, want %q", configDir, profileDir)
+			}
+			return &claude.AuthStatus{LoggedIn: false}, nil
+		},
+	}
+	err = runner.runClaude(t.Context(), "mydonorkid", []string{"--resume", "session-a"})
+	if err == nil {
+		t.Fatal("logged-out local profile launched Claude")
+	}
+	for _, want := range []string{
+		`local managed Claude profile "mydonorkid" is not logged in`,
+		"server-pool availability is separate",
+		"sr claude proxy --account 'mydonorkid'",
+		"sr claude add <new-name>",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("launch error missing %q: %v", want, err)
+		}
+	}
+	if !authChecked {
+		t.Fatal("local auth readiness was not checked")
+	}
+	if _, statErr := os.Lstat(missingLink); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("login rejection recreated shared-state link: %v", statErr)
+	}
+	profilesAfter, readErr := os.ReadFile(store.ProfilesPath())
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(profilesAfter, profilesBefore) {
+		t.Fatalf("login rejection mutated profile registry:\nbefore: %s\nafter: %s", profilesBefore, profilesAfter)
+	}
+	if _, statErr := os.Stat(launchMarker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched before readiness rejection: %v", statErr)
 	}
 }
 
@@ -611,7 +701,12 @@ func TestClaudeManagedProfileRejectsLegacyRemoteHTTPTenantBeforeLaunch(t *testin
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	runner := claudeRunner{
+		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+		authStatus: func(context.Context, string, string) (*claude.AuthStatus, error) {
+			return &claude.AuthStatus{LoggedIn: true}, nil
+		},
+	}
 	err := runner.runClaude(t.Context(), "legacy", []string{"--print", "hello"})
 	if err == nil || !strings.Contains(err.Error(), "unsafe proxy transport") {
 		t.Fatalf("managed Claude launch error = %v", err)
@@ -770,7 +865,12 @@ func TestRunClaudeUsesAuthoritativeSettingsOverrideAndPreservesResumeArgs(t *tes
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	runner := claudeRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	runner := claudeRunner{
+		store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+		authStatus: func(context.Context, string, string) (*claude.AuthStatus, error) {
+			return &claude.AuthStatus{LoggedIn: true}, nil
+		},
+	}
 	if err := runner.runClaude(t.Context(), "work", []string{"--managed-settings", attackerSettingsPath, "--resume", "session-a"}); err != nil {
 		t.Fatal(err)
 	}

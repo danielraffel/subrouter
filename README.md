@@ -451,12 +451,18 @@ sr claude run <profile>
 sr claude proxy [claude args...]
 ```
 
-Bare `sr claude` opens the local profile manager, and `sr claude run <profile>`
-launches one managed local profile directly. `sr claude proxy [claude args...]`
-instead launches Claude profilelessly through the selected Subrouter server's
-pooled Claude accounts. When the selected server is remote, this needs neither
-local Claude profiles nor a local Subrouter daemon; Claude arguments such as
-`--resume <session-id>` pass through unchanged.
+`sr claude list` reports only isolated local managed profiles and their local
+login state. `sr claude run <profile>` launches one of those profiles directly
+and refuses to start Claude when its local login is unavailable. Bare
+`sr claude` chooses an initial account preference and launches through the
+selected Subrouter server's pooled Claude accounts; `sr claude proxy` does the
+same without the picker, and `sr claude proxy --account <profile>` pins one
+server-pool account with no failover. Server-pool availability is separate from
+local managed-profile login state, so the same label can be usable in
+`sr status` while `sr claude list` says its local profile is not logged in.
+Remote server-pool launches need neither local Claude profiles nor a local
+Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
+unchanged.
 
 For manual client configuration, authenticate to the Subrouter proxy rather
 than exposing an upstream Claude OAuth token. A trusted local or legacy
