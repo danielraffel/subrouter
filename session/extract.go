@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/mail"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -127,12 +129,49 @@ func ExtractUserEmail(r *http.Request) string {
 }
 
 func ExtractAccountID(r *http.Request) string {
-	for _, header := range accountIDHeaderCandidates {
-		if accountID := NormalizeAccountID(r.Header.Get(header)); accountID != "" {
-			return accountID
+	accountID, _, err := ExtractAccountIDWithPresence(r)
+	if err != nil {
+		return ""
+	}
+	return accountID
+}
+
+// ExtractAccountIDWithPresence keeps header presence separate from account ID
+// normalization. Callers that treat the account header as a hard routing pin
+// must reject a present but invalid selector instead of silently entering the
+// unpinned pool.
+func ExtractAccountIDWithPresence(r *http.Request) (accountID string, present bool, err error) {
+	if r == nil {
+		return "", false, nil
+	}
+	for _, candidate := range accountIDHeaderCandidates {
+		var values []string
+		candidatePresent := false
+		for name, headerValues := range r.Header {
+			if strings.EqualFold(name, candidate) {
+				candidatePresent = true
+				values = append(values, headerValues...)
+			}
+		}
+		if !candidatePresent {
+			continue
+		}
+		present = true
+		if len(values) == 0 {
+			return "", true, fmt.Errorf("invalid %s account selector", candidate)
+		}
+		for _, value := range values {
+			normalized := NormalizeAccountID(value)
+			if normalized == "" {
+				return "", true, fmt.Errorf("invalid %s account selector", candidate)
+			}
+			if accountID != "" && accountID != normalized {
+				return "", true, fmt.Errorf("conflicting forced account selectors")
+			}
+			accountID = normalized
 		}
 	}
-	return ""
+	return accountID, present, nil
 }
 
 func ExtractModel(r *http.Request, maxBodyBytes int64) string {
@@ -168,8 +207,16 @@ func NormalizeUserEmail(value string) string {
 }
 
 func NormalizeAccountID(value string) string {
+	if len(value) > 256 {
+		return ""
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return ""
+		}
+	}
 	trimmed := strings.TrimSpace(value)
-	if trimmed == "" || len(trimmed) > 256 {
+	if trimmed == "" {
 		return ""
 	}
 	return trimmed

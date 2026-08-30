@@ -3290,10 +3290,15 @@ func (s Server) proxyHandler() http.Handler {
 		// already exact-bound by their lease, so keep this flag scoped to ordinary
 		// caller routing.
 		forcedAccountID := ""
+		forcedAccountSelection := false
 		if boundLease == nil {
-			forcedAccountID = session.ExtractAccountID(routingRequest)
+			var err error
+			forcedAccountID, forcedAccountSelection, err = session.ExtractAccountIDWithPresence(routingRequest)
+			if err != nil {
+				http.Error(w, "invalid forced account selector", http.StatusBadRequest)
+				return
+			}
 		}
-		forcedAccountSelection := forcedAccountID != ""
 		preferredAccountID := ""
 		if !forcedAccountSelection {
 			preferredAccountID = session.NormalizeAccountID(routingRequest.Header.Get("X-Subrouter-Preferred-Account-ID"))
@@ -5462,7 +5467,11 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	userEmail := session.ExtractUserEmail(r)
 	forcedAccountID := ""
 	if !options.ignoreForcedAccount {
-		forcedAccountID = session.ExtractAccountID(r)
+		var err error
+		forcedAccountID, _, err = session.ExtractAccountIDWithPresence(r)
+		if err != nil {
+			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("invalid forced account selector: %w", err)
+		}
 	}
 	model := session.ExtractModel(r, s.MaxBodyBytes)
 	availableAccounts := filterAccountsForProvider(s.accountListContext(r.Context()), provider)
