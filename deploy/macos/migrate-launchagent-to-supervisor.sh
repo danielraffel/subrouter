@@ -20,6 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/launchagent-transition-lib.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/mutation-lease-lib.sh"
 
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter}"
 PLIST="${SUBROUTER_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
@@ -37,8 +39,51 @@ WORKER_SERVE_ARGS_JSON="${SUBROUTER_WORKER_SERVE_ARGS_JSON:-}"
 CANDIDATE_ENV_JSON="${SUBROUTER_CANDIDATE_ENV_JSON:-}"
 PREFLIGHT_TIMEOUT="${SUBROUTER_PREFLIGHT_TIMEOUT:-120}"
 CANARY_TIMEOUT="${SUBROUTER_CANARY_TIMEOUT:-300}"
+MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
+
+# Serialize every worker-path mutation and activation with the routine updater.
+# A dedicated helper owns the kernel descriptor and releases it on parent exit
+# or crash; callback descendants never inherit the lease.
+acquire_subrouter_mutation_lease "$MUTATION_LOCK_FILE" \
+  || { status=$?; echo "migrate-launchagent-to-supervisor: another deployment or worker update holds $MUTATION_LOCK_FILE" >&2; exit "$status"; }
+export SUBROUTER_MUTATION_LEASE_OWNER_PID="$$"
+export SUBROUTER_MUTATION_LEASE_HELPER_PID="$SUBROUTER_MUTATION_LEASE_PID"
+export SUBROUTER_MUTATION_LEASE_CONTROL_DIR
+trap release_subrouter_mutation_lease EXIT
 
 die() { echo "migrate-launchagent-to-supervisor: $*" >&2; exit 1; }
+active_worker_fingerprint() {
+  local socket="$1" expected_cdhash="$2" status
+  status="$(curl -fsS --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 1
+  STATUS_JSON="$status" python3 - "$expected_cdhash" <<'PY'
+import json
+import os
+import sys
+
+expected = sys.argv[1]
+document = json.loads(os.environ["STATUS_JSON"])
+active = document.get("active") or {}
+worker = document.get("active_worker") or {}
+valid = (
+    worker.get("id") == active.get("id")
+    and isinstance(worker.get("pid"), int)
+    and worker["pid"] > 1
+    and isinstance(worker.get("process_start_identity"), str)
+    and bool(worker["process_start_identity"])
+    and worker.get("identity_kind") == "darwin-cdhash-sha256"
+    and worker.get("executable_identity") == expected
+)
+if not valid:
+    raise SystemExit("active worker process identity did not match the candidate")
+print(json.dumps({
+    "id": worker["id"],
+    "pid": worker["pid"],
+    "process_start_identity": worker["process_start_identity"],
+    "identity_kind": worker["identity_kind"],
+    "executable_identity": worker["executable_identity"],
+}, sort_keys=True, separators=(",", ":")))
+PY
+}
 run_verified_recovery() {
   local recovery recovery_sha_file recovery_sha
   for recovery in "$@"; do
@@ -101,8 +146,17 @@ if [ "$activate" -eq 1 ]; then
 fi
 
 TRANSACTION_DIR="${PLIST}.supervisor-transaction"
+UPGRADE_INHIBIT_FILE="${TRANSACTION_DIR}/upgrade-inhibited"
 if [ "$activate" -eq 1 ]; then
   if ! mkdir -m 0700 "$TRANSACTION_DIR" 2>/dev/null; then
+    interrupted_canary_state_dir="$TRANSACTION_DIR/functional-canary-process-group"
+    if [ -d "$interrupted_canary_state_dir" ]; then
+      drain_bounded_process_group "interrupted functional canary" \
+        "$interrupted_canary_state_dir/process-group" \
+        || die "interrupted functional canary termination is unverified; rollback withheld"
+      rm -f "$interrupted_canary_state_dir/process-group"
+      rmdir "$interrupted_canary_state_dir"
+    fi
     phase="$(cat "$TRANSACTION_DIR/phase" 2>/dev/null || true)"
     case "$phase" in
       ''|prelive)
@@ -132,9 +186,12 @@ if [ "$activate" -eq 1 ]; then
     die "recovered interrupted transaction phase $phase to legacy; rerun activation"
   fi
   printf 'prelive\n' >"$TRANSACTION_DIR/phase"
+  printf 'subrouter supervisor activation in progress\n' >"$UPGRADE_INHIBIT_FILE"
+  chmod 0600 "$UPGRADE_INHIBIT_FILE"
   transaction_active=1
   prelive_transaction_exit() {
     local status=$?
+    release_subrouter_mutation_lease
     trap - EXIT INT TERM
     [ -d "$TRANSACTION_DIR" ] && rm -rf "$TRANSACTION_DIR"
     [ "$status" -ne 0 ] || status=1
@@ -161,7 +218,7 @@ codesign -s - -f "$SUPERVISOR_BIN" >/dev/null 2>&1 || true
 
 prepared="${PLIST}.supervised"
 python3 - "$PLIST" "$prepared" "$SUPERVISOR_BIN" "$WORKER_BIN" "$CONTROL_SOCKET" "$STATE_DIR" \
-  "$PUBLIC_ADDR_OVERRIDE" "$WORKER_SERVE_ARGS_JSON" "$CANDIDATE_ENV_JSON" <<'PY'
+  "$PUBLIC_ADDR_OVERRIDE" "$WORKER_SERVE_ARGS_JSON" "$CANDIDATE_ENV_JSON" "$UPGRADE_INHIBIT_FILE" <<'PY'
 import json
 import os
 import plistlib
@@ -179,7 +236,8 @@ import sys
     public_addr_override,
     worker_args_path,
     candidate_env_path,
-) = sys.argv[1:10]
+    upgrade_inhibit_file,
+) = sys.argv[1:11]
 
 
 def load_json_file(path):
@@ -267,6 +325,7 @@ plist["ProgramArguments"] = [
     "--addr", public_addr,
     "--control-socket", control_socket,
     "--worker-bin", worker_bin,
+    "--upgrade-inhibit-file", upgrade_inhibit_file,
     "--",
     *filtered,
 ]
@@ -405,11 +464,20 @@ legacy_fingerprint="$(process_fingerprint "$captured_pid" "$old_program")" \
 candidate_plist_sha="$(sha256_file "$prepared")"
 candidate_supervisor_sha="$(sha256_file "$SUPERVISOR_BIN")"
 candidate_worker_sha="$(sha256_file "$WORKER_BIN")"
-printf '%s  %s\n%s  %s\n%s  %s\n' \
-  "$candidate_plist_sha" "$prepared" \
-  "$candidate_supervisor_sha" "$SUPERVISOR_BIN" \
-  "$candidate_worker_sha" "$WORKER_BIN" >>"$identity_manifest"
-printf 'legacy-process  %s\n' "$legacy_fingerprint" >>"$identity_manifest"
+candidate_worker_cdhash="$(codesign -d --verbose=4 "$WORKER_BIN" 2>&1 | sed -n 's/^CDHash=\([0-9A-Fa-f][0-9A-Fa-f]*\)$/\1/p' | tr '[:upper:]' '[:lower:]' | head -n 1)"
+case "$candidate_worker_cdhash" in
+  ????????????????????????????????????????) ;;
+  *) die "could not capture candidate worker code-directory hash" ;;
+esac
+case "$candidate_worker_cdhash" in *[!0-9a-f]*) die "candidate worker code-directory hash is invalid" ;; esac
+{
+  printf '%s  %s\n%s  %s\n%s  %s\n' \
+    "$candidate_plist_sha" "$prepared" \
+    "$candidate_supervisor_sha" "$SUPERVISOR_BIN" \
+    "$candidate_worker_sha" "$WORKER_BIN"
+  printf 'candidate-worker-cdhash  %s\n' "$candidate_worker_cdhash"
+  printf 'legacy-process  %s\n' "$legacy_fingerprint"
+} >>"$identity_manifest"
 
 rollback() {
   local expected_running="${1:-$SUPERVISOR_BIN}"
@@ -425,6 +493,7 @@ rollback() {
       --expected-program "$SUPERVISOR_BIN" \
       --expected-running-program "$expected_running"; then
     transaction_active=0
+    release_subrouter_mutation_lease
     trap - EXIT INT TERM
     rm -rf "$TRANSACTION_DIR"
     return 0
@@ -499,12 +568,29 @@ recover_transaction_on_exit() {
     esac
     [ "$recovered" -eq 0 ] || rm -rf "$TRANSACTION_DIR"
   fi
+  release_subrouter_mutation_lease
   [ "$status" -ne 0 ] || status=1
   exit "$status"
 }
 trap recover_transaction_on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+transition_signal_exit() {
+  local status="$1" signal_name="$2"
+  trap - INT TERM
+  if [ -n "${RUN_BOUNDED_GROUP_STATE_FILE:-}" ] \
+    && [ -f "$RUN_BOUNDED_GROUP_STATE_FILE" ]; then
+    if ! drain_bounded_process_group "interrupted functional canary" \
+      "$RUN_BOUNDED_GROUP_STATE_FILE"; then
+      release_subrouter_mutation_lease
+      trap - EXIT
+      transaction_active=0
+      die "$signal_name interrupted functional canary termination is unverified; rollback withheld and transaction journal retained (group state: $RUN_BOUNDED_GROUP_STATE_FILE)"
+    fi
+    RUN_BOUNDED_CLEANUP_CONFIRMED=1
+  fi
+  exit "$status"
+}
+trap 'transition_signal_exit 130 SIGINT' INT
+trap 'transition_signal_exit 143 SIGTERM' TERM
 
 set_phase() {
   python3 - "$TRANSACTION_DIR" "$1" <<'PY'
@@ -579,7 +665,9 @@ fi
 candidate_fingerprint=""
 [ -n "$candidate_pid" ] && candidate_fingerprint="$(process_fingerprint "$candidate_pid" "$SUPERVISOR_BIN" || true)"
 printf 'candidate-process  %s\n' "$candidate_fingerprint" >>"$identity_manifest"
+candidate_active_worker_fingerprint="$(active_worker_fingerprint "$CONTROL_SOCKET" "$candidate_worker_cdhash" || true)"
 if [ -z "$candidate_fingerprint" ] \
+  || [ -z "$candidate_active_worker_fingerprint" ] \
   || ! verify_file_sha256 "$PLIST" "$candidate_plist_sha" \
   || ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha" \
   || ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha" \
@@ -593,12 +681,24 @@ fi
 set_phase structural_accepted
 
 echo "running bounded functional canary"
-if ! run_bounded_argv "functional canary" "$CANARY_TIMEOUT" "$CANARY_CALLBACK"; then
+if ! SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$WORKER_BIN" \
+  SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256="$candidate_worker_sha" \
+  SUBROUTER_BOUNDED_STATE_DIRECTORY="$TRANSACTION_DIR/functional-canary-process-group" \
+  run_bounded_argv "functional canary" "$CANARY_TIMEOUT" "$CANARY_CALLBACK"; then
+  if [ "${RUN_BOUNDED_CLEANUP_CONFIRMED:-0}" -ne 1 ]; then
+    release_subrouter_mutation_lease
+    trap - EXIT INT TERM
+    transaction_active=0
+    die "functional canary termination is unverified; rollback withheld and transaction journal retained (group state: ${RUN_BOUNDED_GROUP_STATE_FILE:-unavailable})"
+  fi
   rollback
   die "functional canary failed; legacy LaunchAgent restored"
 fi
 set_phase canary_completed
-if ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN" \
+post_canary_active_worker_fingerprint="$(active_worker_fingerprint "$CONTROL_SOCKET" "$candidate_worker_cdhash" || true)"
+if [ -z "$post_canary_active_worker_fingerprint" ] \
+  || [ "$post_canary_active_worker_fingerprint" != "$candidate_active_worker_fingerprint" ] \
+  || ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN" \
   || ! verify_file_sha256 "$PLIST" "$candidate_plist_sha" \
   || ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha" \
   || ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha" \
@@ -609,7 +709,9 @@ if ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN" \
   die "candidate acceptance changed during canary; legacy LaunchAgent restored"
 fi
 set_phase accepted
+rm -f "$UPGRADE_INHIBIT_FILE"
 transaction_active=0
+release_subrouter_mutation_lease
 trap - EXIT INT TERM
 rm -rf "$TRANSACTION_DIR"
 

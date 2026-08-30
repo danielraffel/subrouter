@@ -4,8 +4,42 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)"
 MIGRATE="$ROOT/deploy/macos/migrate-launchagent-to-supervisor.sh"
 ROLLBACK="$ROOT/deploy/macos/rollback-launchagent-supervisor.sh"
+TRANSITION_LIB="$ROOT/deploy/macos/launchagent-transition-lib.sh"
+MUTATION_LIB="$ROOT/deploy/macos/mutation-lease-lib.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-launchagent-test.XXXXXX")"
-trap 'if [ -f "$TMP/state" ]; then kill "$(cut -d "|" -f 2 "$TMP/state")" 2>/dev/null || true; fi; if [ "${KEEP_SUBROUTER_TEST_TMP:-0}" = 1 ]; then echo "kept $TMP" >&2; else rm -rf "$TMP"; fi' EXIT INT TERM
+cleanup_launchagent_test() {
+  local pid_file pid command
+  if [ -f "$TMP/state" ]; then
+    kill "$(cut -d "|" -f 2 "$TMP/state")" 2>/dev/null || true
+  fi
+  for pid_file in "$TMP/stale-group.pid" "$TMP/pgid-reuse-group.pid" \
+    "$TMP/pgid-reuse-token.pid"; do
+    [ -s "$pid_file" ] || continue
+    kill -KILL "$(cat "$pid_file")" 2>/dev/null || true
+  done
+  for pid_file in "$TMP/watchdog-kill-callback.pid" "$TMP/leader-exit-child.pid" \
+    "$TMP/session-escape-child.pid" "$TMP/mutation-lease-adopt-child.pid"; do
+    [ -s "$pid_file" ] || continue
+    kill -KILL "$(cat "$pid_file")" 2>/dev/null || true
+  done
+  for pid_file in "$TMP"/functional-canary/*.pid; do
+    [ -f "$pid_file" ] || continue
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    command="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command" in
+      *"$TMP/functional-canary"*|*subrouter-functional-canary-test-timeout*)
+        kill -KILL "$pid" 2>/dev/null || true
+        ;;
+    esac
+  done
+  if [ "${KEEP_SUBROUTER_TEST_TMP:-0}" = 1 ]; then
+    echo "kept $TMP" >&2
+  else
+    rm -rf "$TMP"
+  fi
+}
+trap cleanup_launchagent_test EXIT INT TERM
 
 mkdir -p "$TMP/bin" "$TMP/home/Library/LaunchAgents" "$TMP/home/.subrouter" "$TMP/home/.subrouter-retiring"
 
@@ -25,7 +59,7 @@ case "$1" in
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     if [ "${FAKE_BOOTOUT_REPLACE_PID:-0}" = 1 ]; then
-      sleep 300 &
+      sleep 300 9>&- &
       printf '%s|%s\n' "$program" "$!" >"$FAKE_LAUNCHD_STATE"
     else
       rm -f "$FAKE_LAUNCHD_STATE"
@@ -37,7 +71,17 @@ case "$1" in
       exit 5
     fi
     program="$(/usr/libexec/PlistBuddy -c 'Print :Program' "$3")"
-    sleep 300 &
+    if [ -n "${FAKE_ROLLBACK_TRAFFIC_FILE:-}" ] \
+      && [ -n "${FAKE_ROLLBACK_OVERLAP_SENTINEL:-}" ] \
+      && [ "$program" != "$SUBROUTER_SUPERVISOR_BIN" ]; then
+      before_size="$(wc -c <"$FAKE_ROLLBACK_TRAFFIC_FILE" 2>/dev/null || echo 0)"
+      sleep 0.15
+      after_size="$(wc -c <"$FAKE_ROLLBACK_TRAFFIC_FILE" 2>/dev/null || echo 0)"
+      if [ "$before_size" != "$after_size" ]; then
+        printf 'callback traffic overlapped rollback\n' >"$FAKE_ROLLBACK_OVERLAP_SENTINEL"
+      fi
+    fi
+    sleep 300 9>&- &
     printf '%s|%s\n' "$program" "$!" >"$FAKE_LAUNCHD_STATE"
     ;;
   *) exit 2 ;;
@@ -47,13 +91,20 @@ cat >"$TMP/bin/curl" <<'SH'
 #!/bin/sh
 case " $* " in
   *" --unix-socket "*)
-    printf '%s\n' '{"accepting":true,"retiring":false,"active":{"id":"candidate"},"backends":[{}]}'
+    worker_pid="${FAKE_ACTIVE_WORKER_PID:-4242}"
+    if [ -n "${FAKE_ACTIVE_WORKER_PID_FILE:-}" ] && [ -s "$FAKE_ACTIVE_WORKER_PID_FILE" ]; then
+      worker_pid="$(tr -d '[:space:]' <"$FAKE_ACTIVE_WORKER_PID_FILE")"
+    fi
+    printf '{"accepting":true,"retiring":false,"active":{"id":"candidate"},"active_worker":{"id":"candidate","pid":%s,"process_start_identity":"darwin:100:%s","identity_kind":"darwin-cdhash-sha256","executable_identity":"%s"},"backends":[{}]}\n' "$worker_pid" "$worker_pid" "${FAKE_ACTIVE_WORKER_CDHASH:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
     ;;
 esac
 exit 0
 SH
 cat >"$TMP/bin/codesign" <<'SH'
 #!/bin/sh
+case " $* " in
+  *" -d "*) printf '%s\n' 'CDHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' >&2 ;;
+esac
 exit 0
 SH
 cat >"$TMP/bin/lsof" <<'SH'
@@ -155,7 +206,64 @@ cat >"$TMP/canary-ok" <<'SH'
 #!/bin/sh
 exit 0
 SH
-chmod +x "$TMP/preflight" "$TMP/canary-fail" "$TMP/canary-ok"
+cat >"$TMP/canary-switch-worker" <<'SH'
+#!/bin/sh
+printf '%s\n' 4343 >"$FAKE_ACTIVE_WORKER_PID_FILE"
+SH
+cat >"$TMP/canary-wait" <<'SH'
+#!/bin/sh
+exec sleep 300
+SH
+cat >"$TMP/canary-traffic" <<'SH'
+#!/bin/sh
+trap '' TERM
+printf '%s\n' "$$" >"$FAKE_CANARY_TRAFFIC_PID_FILE"
+while :; do
+  printf 'traffic\n' >>"$FAKE_CANARY_TRAFFIC_FILE"
+  sleep 0.02
+done
+SH
+cat >"$TMP/canary-leader-exits" <<'SH'
+#!/bin/sh
+(
+  trap '' TERM
+  while :; do
+    printf 'traffic\n' >>"$FAKE_CANARY_TRAFFIC_FILE"
+    sleep 0.02
+  done
+) &
+printf '%s\n' "$!" >"$FAKE_CANARY_TRAFFIC_PID_FILE"
+exit 0
+SH
+cat >"$TMP/canary-session-escape.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+import time
+
+child_code = """
+import os
+import signal
+import time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(os.environ['FAKE_CANARY_TRAFFIC_FILE'], 'a', encoding='ascii') as output:
+    while True:
+        output.write('traffic\\n')
+        output.flush()
+        os.fsync(output.fileno())
+        time.sleep(0.02)
+"""
+child = subprocess.Popen([sys.executable, "-c", child_code], start_new_session=True)
+with open(os.environ["FAKE_CANARY_TRAFFIC_PID_FILE"], "w", encoding="ascii") as output:
+    output.write(f"{child.pid}\n")
+    output.flush()
+    os.fsync(output.fileno())
+PY
+chmod +x "$TMP/preflight" "$TMP/canary-fail" "$TMP/canary-ok" "$TMP/canary-switch-worker" \
+  "$TMP/canary-wait" "$TMP/canary-traffic" "$TMP/canary-leader-exits" \
+  "$TMP/canary-session-escape.py"
 
 label="test.subrouter.launchagent"
 plist="$TMP/home/Library/LaunchAgents/$label.plist"
@@ -196,6 +304,18 @@ stop_fake_job() {
   fi
 }
 
+find_functional_canary_watchdog() {
+  local parent_pid="$1" child_pid command
+  while IFS= read -r child_pid; do
+    case "$child_pid" in ''|*[!0-9]*) continue ;; esac
+    command="$(/bin/ps -p "$child_pid" -o command= 2>/dev/null || true)"
+    case "$command" in
+      *functional-canary-process-group/process-group*) printf '%s\n' "$child_pid"; return 0 ;;
+    esac
+  done < <(/usr/bin/pgrep -P "$parent_pid" 2>/dev/null || true)
+  return 1
+}
+
 reset_legacy() {
   stop_fake_job
   rm -rf "${plist}.supervisor-transaction"
@@ -203,6 +323,243 @@ reset_legacy() {
   write_plist "$legacy" serve
   launchctl bootstrap "gui/$(id -u)" "$plist"
   "$MIGRATE" >/dev/null
+}
+
+functional_canary_root="$TMP/functional-canary"
+functional_canary_runner="$ROOT/deploy/macos/run-functional-canary.py"
+functional_canary_leg="$functional_canary_root/fixture-leg.py"
+functional_canary_manifest="$functional_canary_root/manifest.json"
+functional_canary_evidence="$functional_canary_root/evidence.json"
+functional_canary_order="$functional_canary_root/order"
+functional_canary_leader_pid="$functional_canary_root/leader.pid"
+functional_canary_descendant_pid="$functional_canary_root/descendant.pid"
+functional_canary_ready="$functional_canary_root/descendant.ready"
+functional_canary_secret='synthetic-functional-canary-secret-that-must-not-escape'
+mkdir -m 0700 "$functional_canary_root"
+cat >"$functional_canary_leg" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+LEG_SCHEMA = "subrouter.launchagent-functional-canary-leg/v1"
+
+
+def write_private(path, value):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(descriptor, value.encode())
+    finally:
+        os.close(descriptor)
+
+
+name = os.environ["SUBROUTER_CANARY_LEG_NAME"]
+with open(os.environ["SUBROUTER_CANARY_LEG_CONFIG_FILE"], encoding="utf-8") as source:
+    config = json.load(source)
+if config["expected_leg"] != name:
+    raise SystemExit(91)
+with open(config["order_file"], "a", encoding="utf-8") as order:
+    order.write(name + "\n")
+
+mode = config["mode"]
+if mode == "semantic-failure":
+    print(config["secret"], file=sys.stderr)
+    print(json.dumps({"schema": LEG_SCHEMA, "leg": name, "ok": False}, separators=(",", ":")))
+    raise SystemExit(0)
+if mode == "timeout":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child_code = (
+        "import signal,sys,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "open(sys.argv[1], 'w').write('ready\\n'); "
+        "time.sleep(30)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, config["ready_file"],
+         "subrouter-functional-canary-test-timeout"],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 2
+    while not os.path.exists(config["ready_file"]) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not os.path.exists(config["ready_file"]):
+        child.kill()
+        child.wait()
+        raise SystemExit(92)
+    write_private(config["leader_pid_file"], str(os.getpid()) + "\n")
+    write_private(config["descendant_pid_file"], str(child.pid) + "\n")
+    time.sleep(30)
+
+print(json.dumps({"schema": LEG_SCHEMA, "leg": name, "ok": True}, separators=(",", ":")))
+PY
+chmod 0700 "$functional_canary_leg" "$worker"
+
+prepare_functional_canary() {
+  local scenario="$1"
+  rm -f "$functional_canary_root"/config-*.json \
+    "$functional_canary_manifest" "$functional_canary_evidence" \
+    "$functional_canary_order" "$functional_canary_leader_pid" \
+    "$functional_canary_descendant_pid" "$functional_canary_ready"
+  python3 - "$scenario" "$functional_canary_root" "$functional_canary_leg" \
+    "$worker" "$functional_canary_secret" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+scenario, root, executable, worker, secret = sys.argv[1:]
+legs = (
+    "peer-health-readiness",
+    "authenticated-routed-codex",
+    "sticky-reuse",
+    "safe-failover-reuse",
+    "existing-session-next-turn",
+)
+
+
+def digest(path):
+    with open(path, "rb") as source:
+        return hashlib.sha256(source.read()).hexdigest()
+
+
+def write_private(path, document):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(descriptor, (json.dumps(document, separators=(",", ":")) + "\n").encode())
+    finally:
+        os.close(descriptor)
+
+
+order_file = os.path.join(root, "order")
+descriptor = os.open(order_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.close(descriptor)
+timeout = 30 if scenario == "timeout" else 5
+manifest_legs = []
+for index, name in enumerate(legs):
+    mode = "success"
+    if scenario == "semantic-failure" and name == "sticky-reuse":
+        mode = "semantic-failure"
+    elif scenario == "timeout" and index == 0:
+        mode = "timeout"
+    config = {
+        "expected_leg": name,
+        "mode": mode,
+        "order_file": order_file,
+    }
+    if mode == "semantic-failure":
+        config["secret"] = secret
+    if mode == "timeout":
+        config.update({
+            "leader_pid_file": os.path.join(root, "leader.pid"),
+            "descendant_pid_file": os.path.join(root, "descendant.pid"),
+            "ready_file": os.path.join(root, "descendant.ready"),
+        })
+    config_path = os.path.join(root, f"config-{index}.json")
+    write_private(config_path, config)
+    manifest_legs.append({
+        "name": name,
+        "executable": executable,
+        "executable_sha256": digest(executable),
+        "config_file": config_path,
+        "config_sha256": digest(config_path),
+        "timeout_seconds": timeout,
+    })
+
+manifest = {
+    "schema": "subrouter.launchagent-functional-canary/v1",
+    "source_git_oid_unverified": "a" * 40,
+    "candidate_worker": {"path": worker, "sha256": digest(worker)},
+    "evidence_file": os.path.join(root, "evidence.json"),
+    "total_timeout_seconds": timeout * len(legs),
+    "legs": manifest_legs,
+}
+write_private(os.path.join(root, "manifest.json"), manifest)
+PY
+}
+
+assert_functional_canary_order() {
+  python3 - "$functional_canary_order" "$@" <<'PY'
+import pathlib
+import sys
+
+observed = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+expected = sys.argv[2:]
+if observed != expected:
+    raise SystemExit(f"functional canary order {observed!r}, expected {expected!r}")
+PY
+}
+
+assert_functional_canary_evidence() {
+  local expected_status="$1"
+  shift
+  python3 - "$functional_canary_evidence" "$functional_canary_manifest" \
+    "$worker" "$functional_canary_leg" "$functional_canary_root" \
+    "$expected_status" "$@" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+evidence_path, manifest_path, worker, executable, root, expected_status, *expected_legs = sys.argv[1:]
+with open(evidence_path, encoding="utf-8") as source:
+    evidence = json.load(source)
+
+
+def digest(path):
+    with open(path, "rb") as source:
+        return hashlib.sha256(source.read()).hexdigest()
+
+
+assert evidence["schema"] == "subrouter.launchagent-functional-canary/v1"
+assert evidence["status"] == expected_status
+assert evidence["manifest_sha256"] == digest(manifest_path)
+assert evidence["candidate_worker_sha256"] == digest(worker)
+assert evidence["source_git_oid_unverified"] == "a" * 40
+assert len(evidence["run_id"]) == 64
+assert [leg["name"] for leg in evidence["legs"]] == expected_legs
+for name, leg in zip(expected_legs, evidence["legs"]):
+    index = (
+        "peer-health-readiness",
+        "authenticated-routed-codex",
+        "sticky-reuse",
+        "safe-failover-reuse",
+        "existing-session-next-turn",
+    ).index(name)
+    assert leg["ok"] is True
+    assert leg["executable_sha256"] == digest(executable)
+    assert leg["config_sha256"] == digest(os.path.join(root, f"config-{index}.json"))
+PY
+}
+
+rollback_bundle_count() {
+  find "$(dirname "$plist")" -maxdepth 1 -type d \
+    -name "$(basename "$plist").rollback-bundle-*" | wc -l | tr -d ' '
+}
+
+rollback_identity_count() {
+  find "$(dirname "$plist")" -maxdepth 2 -type f -name 'legacy.plist.identity' \
+    | wc -l | tr -d ' '
+}
+
+assert_exact_legacy_rollback() {
+  local snapshot="$1"
+  cmp -s "$snapshot" "$plist"
+  [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+  [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist")" = "$legacy" ]
+  [ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$legacy" ]
+  [ ! -e "${plist}.supervisor-transaction" ]
+}
+
+wait_for_pid_gone() {
+  local pid="$1" attempts=0
+  while kill -0 "$pid" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || return 1
+    sleep 0.05
+  done
 }
 
 export PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -218,10 +575,85 @@ export SUBROUTER_ABSENCE_ATTEMPTS=10 SUBROUTER_ABSENCE_INTERVAL=0.01
 export SUBROUTER_BOOTSTRAP_ATTEMPTS=2 SUBROUTER_BOOTSTRAP_INTERVAL=0.01
 export SUBROUTER_HEALTH_ATTEMPTS=2 SUBROUTER_HEALTH_INTERVAL=0.01
 
+cat >"$TMP/mutation-lease-adopt-child" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$SUBROUTER_MUTATION_LEASE_LIB"
+subrouter_mutation_lease_is_held_by_parent "$SUBROUTER_MUTATION_LOCK_FILE"
+printf '%s\n' "$$" >"$SUBROUTER_MUTATION_ADOPT_READY_FILE"
+while [ ! -e "$SUBROUTER_MUTATION_ADOPT_RELEASE_FILE" ]; do sleep 0.01; done
+SH
+chmod 0700 "$TMP/mutation-lease-adopt-child"
+
 write_plist "$legacy" serve
 launchctl bootstrap "gui/$(id -u)" "$plist"
 "$MIGRATE" >"$TMP/prepare.out" 2>"$TMP/prepare.err"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_STATE_DIR' "${plist}.supervised")" = "$SUBROUTER_STATE_DIR" ]
+mutation_lock="${plist}.supervisor-mutation.lock"
+adopt_lock="$TMP/adopted-mutation.lock"
+adopt_ready="$TMP/adopted-mutation.ready"
+adopt_release="$TMP/adopted-mutation.release"
+SUBROUTER_MUTATION_LEASE_LIB="$MUTATION_LIB" \
+SUBROUTER_MUTATION_LOCK_FILE="$adopt_lock" \
+SUBROUTER_MUTATION_ADOPT_READY_FILE="$adopt_ready" \
+SUBROUTER_MUTATION_ADOPT_RELEASE_FILE="$adopt_release" \
+bash -c '
+  set -euo pipefail
+  . "$SUBROUTER_MUTATION_LEASE_LIB"
+  acquire_subrouter_mutation_lease "$SUBROUTER_MUTATION_LOCK_FILE"
+  export SUBROUTER_MUTATION_LEASE_OWNER_PID="$$"
+  export SUBROUTER_MUTATION_LEASE_HELPER_PID="$SUBROUTER_MUTATION_LEASE_PID"
+  export SUBROUTER_MUTATION_LEASE_CONTROL_DIR
+  "$1"
+  : # Keep this owner shell alive; do not let bash tail-exec the adopted child.
+' bash "$TMP/mutation-lease-adopt-child" &
+adopt_owner_pid=$!
+for _ in $(seq 1 1000); do [ -s "$adopt_ready" ] && break; sleep 0.01; done
+[ -s "$adopt_ready" ] || { echo "mutation lease adoption did not become ready" >&2; exit 1; }
+adopt_child_pid="$(cat "$adopt_ready")"
+if /usr/bin/lockf -s -k -t 0 "$adopt_lock" /usr/bin/true; then
+  echo "mutation lease was not held before owner death" >&2
+  exit 1
+fi
+kill -KILL "$adopt_owner_pid"
+wait "$adopt_owner_pid" 2>/dev/null || true
+kill -0 "$adopt_child_pid"
+sleep 0.1
+if /usr/bin/lockf -s -k -t 0 "$adopt_lock" /usr/bin/true; then
+  echo "adopted mutation lease was released while rollback child remained live" >&2
+  exit 1
+fi
+: >"$adopt_release"
+wait_for_pid_gone "$adopt_child_pid"
+adopt_release_observed=0
+for _ in $(seq 1 200); do
+  if /usr/bin/lockf -s -k -t 0 "$adopt_lock" /usr/bin/true; then
+    adopt_release_observed=1
+    break
+  fi
+  sleep 0.01
+done
+[ "$adopt_release_observed" -eq 1 ] || { echo "adopted mutation lease did not release after rollback child exit" >&2; exit 1; }
+echo "PASS rollback child retained the mutation lease across migration owner death"
+
+/usr/bin/lockf -k "$mutation_lock" /bin/sleep 30 &
+mutation_lock_holder=$!
+for _ in $(seq 1 100); do
+  if ! /usr/bin/lockf -s -k -t 0 "$mutation_lock" /usr/bin/true; then
+    break
+  fi
+  sleep 0.01
+done
+if "$MIGRATE" >"$TMP/mutation-lock.out" 2>"$TMP/mutation-lock.err"; then
+  echo "migration unexpectedly ran while updater mutation lease was held" >&2
+  kill "$mutation_lock_holder" 2>/dev/null || true
+  exit 1
+fi
+kill "$mutation_lock_holder" 2>/dev/null || true
+wait "$mutation_lock_holder" 2>/dev/null || true
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+echo "PASS updater mutation lease excluded migration before any file change"
+
 if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
   SUBROUTER_CANARY_TIMEOUT=0 "$MIGRATE" --activate \
   >"$TMP/invalid-timeout.out" 2>"$TMP/invalid-timeout.err"; then
@@ -245,6 +677,29 @@ identity_manifest="$(find "$(dirname "$plist")" -maxdepth 2 -name 'legacy.plist.
 grep -Fq "  $legacy_dependency  " "$identity_manifest"
 echo "PASS canary failure automatically restored the exact legacy plist"
 
+if PYTHONOPTIMIZE=1 \
+  FAKE_ACTIVE_WORKER_CDHASH=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+  "$MIGRATE" --activate >"$TMP/worker-identity-mismatch.out" 2>"$TMP/worker-identity-mismatch.err"; then
+  echo "mismatched active worker process unexpectedly accepted" >&2
+  exit 1
+fi
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+grep -q 'supervised agent failed structural acceptance' "$TMP/worker-identity-mismatch.err"
+echo "PASS active worker kernel identity mismatch restored exact legacy before canary"
+
+worker_pid_file="$TMP/active-worker.pid"
+printf '%s\n' 4242 >"$worker_pid_file"
+if FAKE_ACTIVE_WORKER_PID_FILE="$worker_pid_file" \
+  SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-switch-worker" \
+  "$MIGRATE" --activate >"$TMP/worker-continuity.out" 2>"$TMP/worker-continuity.err"; then
+  echo "active worker replacement during canary unexpectedly accepted" >&2
+  exit 1
+fi
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+grep -q 'candidate acceptance changed during canary' "$TMP/worker-continuity.err"
+echo "PASS active worker PID/start continuity change restored exact legacy after canary"
+
 backup="$TMP/manual-backup.plist"
 cp -p "$plist" "$backup"
 backup_sha="$(shasum -a 256 "$backup" | awk '{print $1}')"
@@ -262,6 +717,27 @@ rollback_identity=(--backup "$backup" --backup-sha256 "$backup_sha" \
 launchctl bootout "gui/$(id -u)/$label"
 write_plist "$supervisor" supervise
 launchctl bootstrap "gui/$(id -u)" "$plist"
+mutation_lock_holder=""
+/usr/bin/lockf -k "$mutation_lock" /bin/sleep 30 &
+mutation_lock_holder=$!
+for _ in $(seq 1 100); do
+  if ! /usr/bin/lockf -s -k -t 0 "$mutation_lock" /usr/bin/true; then
+    break
+  fi
+  sleep 0.01
+done
+if "$ROLLBACK" "${rollback_identity[@]}" --expected-program "$supervisor" \
+  >"$TMP/rollback-mutation-lock.out" 2>"$TMP/rollback-mutation-lock.err"; then
+  echo "standalone rollback unexpectedly ran while the mutation lease was held" >&2
+  kill "$mutation_lock_holder" 2>/dev/null || true
+  exit 1
+fi
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+[ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$supervisor" ]
+kill "$mutation_lock_holder" 2>/dev/null || true
+wait "$mutation_lock_holder" 2>/dev/null || true
+grep -q 'another deployment or worker update holds' "$TMP/rollback-mutation-lock.err"
+echo "PASS standalone rollback mutation lease refused concurrent updater or deployment"
 "$ROLLBACK" "${rollback_identity[@]}" --expected-program "$supervisor" \
   >"$TMP/rollback.out" 2>"$TMP/rollback.err"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
@@ -461,6 +937,568 @@ unset FAKE_PREFLIGHT_LOG
 echo "PASS failed credential isolation stopped before callback, bundle, or live mutation"
 
 reset_legacy
+prepare_functional_canary success
+SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
+  SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
+  "$MIGRATE" --activate \
+  >"$TMP/functional-canary-success.out" 2>"$TMP/functional-canary-success.err"
+assert_functional_canary_order \
+  peer-health-readiness \
+  authenticated-routed-codex \
+  sticky-reuse \
+  safe-failover-reuse \
+  existing-session-next-turn
+assert_functional_canary_evidence passed \
+  peer-health-readiness \
+  authenticated-routed-codex \
+  sticky-reuse \
+  safe-failover-reuse \
+  existing-session-next-turn
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+[ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$supervisor" ]
+[ ! -e "${plist}.supervisor-transaction" ]
+python3 - "$plist" "${plist}.supervised" <<'PY'
+import plistlib
+import sys
+
+for path in sys.argv[1:]:
+    with open(path, "rb") as source:
+        environment = plistlib.load(source).get("EnvironmentVariables", {})
+    leaked = sorted(key for key in environment if key.startswith("SUBROUTER_CANARY_"))
+    if leaked:
+        raise SystemExit(f"canary environment leaked into {path}: {leaked}")
+PY
+echo "PASS real functional canary runner executed every private fixture leg in order without plist environment leakage"
+
+reset_legacy
+prepare_functional_canary semantic-failure
+semantic_legacy_snapshot="$TMP/functional-canary-semantic-legacy.plist"
+cp -p "$plist" "$semantic_legacy_snapshot"
+semantic_bundles_before="$(rollback_bundle_count)"
+semantic_identities_before="$(rollback_identity_count)"
+if SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
+  SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
+  "$MIGRATE" --activate \
+  >"$TMP/functional-canary-semantic.out" 2>"$TMP/functional-canary-semantic.err"; then
+  echo "semantic functional canary failure unexpectedly accepted" >&2
+  exit 1
+fi
+assert_exact_legacy_rollback "$semantic_legacy_snapshot"
+semantic_bundles_after="$(rollback_bundle_count)"
+semantic_identities_after="$(rollback_identity_count)"
+[ "$semantic_bundles_after" -eq "$((semantic_bundles_before + 1))" ]
+[ "$semantic_identities_after" -eq "$((semantic_identities_before + 1))" ]
+assert_functional_canary_order \
+  peer-health-readiness \
+  authenticated-routed-codex \
+  sticky-reuse
+assert_functional_canary_evidence failed \
+  peer-health-readiness \
+  authenticated-routed-codex
+grep -q 'leg sticky-reuse did not return its exact success record' \
+  "$TMP/functional-canary-semantic.err"
+grep -q 'functional canary failed; legacy LaunchAgent restored' \
+  "$TMP/functional-canary-semantic.err"
+if grep -Fq "$functional_canary_secret" \
+  "$TMP/functional-canary-semantic.out" \
+  "$TMP/functional-canary-semantic.err" \
+  "$functional_canary_evidence"; then
+  echo "functional canary child output leaked its synthetic secret" >&2
+  exit 1
+fi
+echo "PASS semantic functional canary failure was redacted, skipped later legs, and retained one exact rollback bundle"
+
+reset_legacy
+prepare_functional_canary timeout
+timeout_legacy_snapshot="$TMP/functional-canary-timeout-legacy.plist"
+cp -p "$plist" "$timeout_legacy_snapshot"
+timeout_bundles_before="$(rollback_bundle_count)"
+timeout_identities_before="$(rollback_identity_count)"
+if SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
+  SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
+  SUBROUTER_CANARY_TIMEOUT=10 \
+  "$MIGRATE" --activate \
+  >"$TMP/functional-canary-timeout.out" 2>"$TMP/functional-canary-timeout.err"; then
+  echo "timed-out functional canary unexpectedly accepted" >&2
+  exit 1
+fi
+assert_exact_legacy_rollback "$timeout_legacy_snapshot"
+timeout_bundles_after="$(rollback_bundle_count)"
+timeout_identities_after="$(rollback_identity_count)"
+[ "$timeout_bundles_after" -eq "$((timeout_bundles_before + 1))" ]
+[ "$timeout_identities_after" -eq "$((timeout_identities_before + 1))" ]
+[ -s "$functional_canary_leader_pid" ]
+[ -s "$functional_canary_descendant_pid" ]
+timeout_leader_pid="$(tr -d '[:space:]' <"$functional_canary_leader_pid")"
+timeout_descendant_pid="$(tr -d '[:space:]' <"$functional_canary_descendant_pid")"
+wait_for_pid_gone "$timeout_leader_pid"
+wait_for_pid_gone "$timeout_descendant_pid"
+rm -f "$functional_canary_leader_pid" "$functional_canary_descendant_pid"
+assert_functional_canary_order peer-health-readiness
+assert_functional_canary_evidence failed
+grep -q 'functional canary timed out after 10s' "$TMP/functional-canary-timeout.err"
+grep -q 'functional canary failed; legacy LaunchAgent restored' \
+  "$TMP/functional-canary-timeout.err"
+echo "PASS outer functional canary timeout killed its TERM-ignoring process tree and restored exact legacy"
+
+reset_legacy
+prepare_functional_canary timeout
+nested_escape_legacy_snapshot="$TMP/nested-escape-legacy.plist"
+cp -p "$plist" "$nested_escape_legacy_snapshot"
+SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
+  SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  "$MIGRATE" --activate \
+  >"$TMP/nested-escape.out" 2>"$TMP/nested-escape.err" &
+nested_escape_migration_pid=$!
+nested_escape_attempts=0
+while [ ! -s "$functional_canary_descendant_pid" ]; do
+  nested_escape_attempts=$((nested_escape_attempts + 1))
+  [ "$nested_escape_attempts" -lt 200 ] \
+    || { echo "nested runner escape fixture did not start" >&2; kill -KILL "$nested_escape_migration_pid"; exit 1; }
+  sleep 0.05
+done
+nested_escape_watchdog_pid="$(find_functional_canary_watchdog "$nested_escape_migration_pid" || true)"
+case "$nested_escape_watchdog_pid" in ''|*[!0-9]*)
+  echo "nested runner escape watchdog was not found" >&2
+  kill -KILL "$nested_escape_migration_pid" 2>/dev/null || true
+  exit 1
+  ;;
+esac
+nested_escape_leader_pid="$(cat "$functional_canary_leader_pid")"
+nested_escape_descendant_pid="$(cat "$functional_canary_descendant_pid")"
+kill -KILL "$nested_escape_watchdog_pid"
+if wait "$nested_escape_migration_pid"; then
+  echo "nested runner watchdog SIGKILL unexpectedly accepted" >&2
+  exit 1
+fi
+wait_for_pid_gone "$nested_escape_leader_pid"
+wait_for_pid_gone "$nested_escape_descendant_pid"
+assert_exact_legacy_rollback "$nested_escape_legacy_snapshot"
+rm -f "$functional_canary_leader_pid" "$functional_canary_descendant_pid"
+echo "PASS watchdog SIGKILL drained functional runner's session-escaped leg before rollback"
+
+reset_legacy
+immediate_signal_legacy_snapshot="$TMP/immediate-signal-legacy.plist"
+immediate_signal_child_pid_file="$TMP/immediate-signal-child.pid"
+cp -p "$plist" "$immediate_signal_legacy_snapshot"
+immediate_signal_bundles_before="$(rollback_bundle_count)"
+immediate_signal_identities_before="$(rollback_identity_count)"
+if SUBROUTER_CANARY_CALLBACK="$TMP/canary-wait" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  SUBROUTER_FAULT_INJECT_BOUNDED_NAME='functional canary' \
+  SUBROUTER_FAULT_INJECT_BOUNDED_SIGNAL=TERM \
+  SUBROUTER_FAULT_INJECT_BOUNDED_CHILD_PID_FILE="$immediate_signal_child_pid_file" \
+  "$MIGRATE" --activate \
+  >"$TMP/immediate-signal.out" 2>"$TMP/immediate-signal.err"; then
+  echo "immediately signaled functional canary unexpectedly accepted" >&2
+  exit 1
+fi
+[ -s "$immediate_signal_child_pid_file" ]
+immediate_signal_child_pid="$(tr -d '[:space:]' <"$immediate_signal_child_pid_file")"
+case "$immediate_signal_child_pid" in
+  ''|*[!0-9]*)
+    echo "immediate-signal callback pid was not numeric" >&2
+    exit 1
+    ;;
+esac
+wait_for_pid_gone "$immediate_signal_child_pid"
+assert_exact_legacy_rollback "$immediate_signal_legacy_snapshot"
+immediate_signal_bundles_after="$(rollback_bundle_count)"
+immediate_signal_identities_after="$(rollback_identity_count)"
+[ "$immediate_signal_bundles_after" -eq "$((immediate_signal_bundles_before + 1))" ]
+[ "$immediate_signal_identities_after" -eq "$((immediate_signal_identities_before + 1))" ]
+grep -q 'functional canary failed; legacy LaunchAgent restored' \
+  "$TMP/immediate-signal.err"
+echo "PASS signal pending at callback spawn killed the child before exact legacy rollback"
+
+reset_legacy
+prepublish_kill_legacy_snapshot="$TMP/prepublish-kill-legacy.plist"
+prepublish_kill_callback_pid_file="$TMP/prepublish-kill-callback.pid"
+prepublish_kill_traffic_file="$TMP/prepublish-kill-traffic.log"
+prepublish_kill_overlap_sentinel="$TMP/prepublish-kill-rollback-overlap"
+cp -p "$plist" "$prepublish_kill_legacy_snapshot"
+: >"$prepublish_kill_traffic_file"
+if FAKE_CANARY_TRAFFIC_PID_FILE="$prepublish_kill_callback_pid_file" \
+  FAKE_CANARY_TRAFFIC_FILE="$prepublish_kill_traffic_file" \
+  FAKE_ROLLBACK_TRAFFIC_FILE="$prepublish_kill_traffic_file" \
+  FAKE_ROLLBACK_OVERLAP_SENTINEL="$prepublish_kill_overlap_sentinel" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-traffic" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  SUBROUTER_FAULT_INJECT_BOUNDED_WATCHDOG_SIGKILL_BEFORE_PUBLISH='functional canary' \
+  "$MIGRATE" --activate \
+  >"$TMP/prepublish-kill.out" 2>"$TMP/prepublish-kill.err"; then
+  echo "pre-publication watchdog SIGKILL unexpectedly accepted" >&2
+  exit 1
+fi
+[ ! -e "$prepublish_kill_callback_pid_file" ]
+[ ! -s "$prepublish_kill_traffic_file" ]
+[ ! -e "$prepublish_kill_overlap_sentinel" ]
+assert_exact_legacy_rollback "$prepublish_kill_legacy_snapshot"
+grep -q 'functional canary failed; legacy LaunchAgent restored' "$TMP/prepublish-kill.err"
+echo "PASS pre-publication watchdog SIGKILL released no callback traffic before exact legacy rollback"
+
+reset_legacy
+watchdog_kill_legacy_snapshot="$TMP/watchdog-kill-legacy.plist"
+watchdog_kill_callback_pid_file="$TMP/watchdog-kill-callback.pid"
+watchdog_kill_traffic_file="$TMP/watchdog-kill-traffic.log"
+watchdog_kill_overlap_sentinel="$TMP/watchdog-kill-rollback-overlap"
+cp -p "$plist" "$watchdog_kill_legacy_snapshot"
+: >"$watchdog_kill_traffic_file"
+FAKE_CANARY_TRAFFIC_PID_FILE="$watchdog_kill_callback_pid_file" \
+  FAKE_CANARY_TRAFFIC_FILE="$watchdog_kill_traffic_file" \
+  FAKE_ROLLBACK_TRAFFIC_FILE="$watchdog_kill_traffic_file" \
+  FAKE_ROLLBACK_OVERLAP_SENTINEL="$watchdog_kill_overlap_sentinel" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-traffic" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  "$MIGRATE" --activate \
+  >"$TMP/watchdog-kill.out" 2>"$TMP/watchdog-kill.err" &
+watchdog_kill_migration_pid=$!
+watchdog_kill_attempts=0
+while [ ! -s "$watchdog_kill_callback_pid_file" ]; do
+  watchdog_kill_attempts=$((watchdog_kill_attempts + 1))
+  if [ "$watchdog_kill_attempts" -ge 200 ]; then
+    echo "functional canary did not reach watchdog SIGKILL fixture" >&2
+    kill -KILL "$watchdog_kill_migration_pid" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 0.05
+done
+watchdog_kill_watchdog_pid="$(find_functional_canary_watchdog "$watchdog_kill_migration_pid" || true)"
+case "$watchdog_kill_watchdog_pid" in ''|*[!0-9]*)
+  echo "functional canary watchdog was not found for SIGKILL fixture" >&2
+  kill -KILL "$watchdog_kill_migration_pid" 2>/dev/null || true
+  exit 1
+  ;;
+esac
+watchdog_kill_callback_pid="$(tr -d '[:space:]' <"$watchdog_kill_callback_pid_file")"
+kill -KILL "$watchdog_kill_watchdog_pid"
+if wait "$watchdog_kill_migration_pid"; then
+  echo "watchdog-only SIGKILL unexpectedly accepted" >&2
+  exit 1
+fi
+wait_for_pid_gone "$watchdog_kill_watchdog_pid"
+wait_for_pid_gone "$watchdog_kill_callback_pid"
+assert_exact_legacy_rollback "$watchdog_kill_legacy_snapshot"
+[ ! -e "$watchdog_kill_overlap_sentinel" ]
+watchdog_kill_traffic_size="$(wc -c <"$watchdog_kill_traffic_file")"
+sleep 0.2
+[ "$(wc -c <"$watchdog_kill_traffic_file")" = "$watchdog_kill_traffic_size" ]
+grep -q 'functional canary failed; legacy LaunchAgent restored' "$TMP/watchdog-kill.err"
+echo "PASS watchdog-only SIGKILL drained callback traffic before exact legacy rollback"
+
+reset_legacy
+leader_exit_legacy_snapshot="$TMP/leader-exit-legacy.plist"
+leader_exit_child_pid_file="$TMP/leader-exit-child.pid"
+leader_exit_traffic_file="$TMP/leader-exit-traffic.log"
+leader_exit_overlap_sentinel="$TMP/leader-exit-rollback-overlap"
+cp -p "$plist" "$leader_exit_legacy_snapshot"
+: >"$leader_exit_traffic_file"
+FAKE_CANARY_TRAFFIC_PID_FILE="$leader_exit_child_pid_file" \
+  FAKE_CANARY_TRAFFIC_FILE="$leader_exit_traffic_file" \
+  FAKE_ROLLBACK_TRAFFIC_FILE="$leader_exit_traffic_file" \
+  FAKE_ROLLBACK_OVERLAP_SENTINEL="$leader_exit_overlap_sentinel" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-leader-exits" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  "$MIGRATE" --activate \
+  >"$TMP/leader-exit.out" 2>"$TMP/leader-exit.err" &
+leader_exit_migration_pid=$!
+leader_exit_attempts=0
+while [ ! -s "$leader_exit_child_pid_file" ]; do
+  leader_exit_attempts=$((leader_exit_attempts + 1))
+  [ "$leader_exit_attempts" -lt 200 ] \
+    || { echo "leader-exit fixture did not start" >&2; kill -KILL "$leader_exit_migration_pid"; exit 1; }
+  sleep 0.05
+done
+leader_exit_watchdog_pid="$(find_functional_canary_watchdog "$leader_exit_migration_pid" || true)"
+case "$leader_exit_watchdog_pid" in ''|*[!0-9]*)
+  echo "leader-exit watchdog was not found" >&2
+  kill -KILL "$leader_exit_migration_pid" 2>/dev/null || true
+  exit 1
+  ;;
+esac
+leader_exit_child_pid="$(cat "$leader_exit_child_pid_file")"
+kill -KILL "$leader_exit_watchdog_pid"
+if wait "$leader_exit_migration_pid"; then
+  echo "leader-exit watchdog SIGKILL unexpectedly accepted" >&2
+  exit 1
+fi
+wait_for_pid_gone "$leader_exit_child_pid"
+assert_exact_legacy_rollback "$leader_exit_legacy_snapshot"
+[ ! -e "$leader_exit_overlap_sentinel" ]
+leader_exit_traffic_size="$(wc -c <"$leader_exit_traffic_file")"
+sleep 0.2
+[ "$(wc -c <"$leader_exit_traffic_file")" = "$leader_exit_traffic_size" ]
+echo "PASS stable group anchor drained descendants after callback leader exit before rollback"
+
+reset_legacy
+session_escape_legacy_snapshot="$TMP/session-escape-legacy.plist"
+session_escape_child_pid_file="$TMP/session-escape-child.pid"
+session_escape_traffic_file="$TMP/session-escape-traffic.log"
+session_escape_overlap_sentinel="$TMP/session-escape-rollback-overlap"
+cp -p "$plist" "$session_escape_legacy_snapshot"
+: >"$session_escape_traffic_file"
+FAKE_CANARY_TRAFFIC_PID_FILE="$session_escape_child_pid_file" \
+  FAKE_CANARY_TRAFFIC_FILE="$session_escape_traffic_file" \
+  FAKE_ROLLBACK_TRAFFIC_FILE="$session_escape_traffic_file" \
+  FAKE_ROLLBACK_OVERLAP_SENTINEL="$session_escape_overlap_sentinel" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-session-escape.py" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  "$MIGRATE" --activate \
+  >"$TMP/session-escape.out" 2>"$TMP/session-escape.err" &
+session_escape_migration_pid=$!
+session_escape_attempts=0
+while [ ! -s "$session_escape_child_pid_file" ]; do
+  session_escape_attempts=$((session_escape_attempts + 1))
+  [ "$session_escape_attempts" -lt 200 ] \
+    || { echo "session-escape fixture did not start" >&2; kill -KILL "$session_escape_migration_pid"; exit 1; }
+  sleep 0.05
+done
+session_escape_watchdog_pid="$(find_functional_canary_watchdog "$session_escape_migration_pid" || true)"
+case "$session_escape_watchdog_pid" in ''|*[!0-9]*)
+  echo "session-escape watchdog was not found" >&2
+  kill -KILL "$session_escape_migration_pid" 2>/dev/null || true
+  exit 1
+  ;;
+esac
+session_escape_child_pid="$(cat "$session_escape_child_pid_file")"
+kill -KILL "$session_escape_watchdog_pid"
+if wait "$session_escape_migration_pid"; then
+  echo "session-escape watchdog SIGKILL unexpectedly accepted" >&2
+  exit 1
+fi
+wait_for_pid_gone "$session_escape_child_pid"
+assert_exact_legacy_rollback "$session_escape_legacy_snapshot"
+[ ! -e "$session_escape_overlap_sentinel" ]
+session_escape_traffic_size="$(wc -c <"$session_escape_traffic_file")"
+sleep 0.2
+[ "$(wc -c <"$session_escape_traffic_file")" = "$session_escape_traffic_size" ]
+echo "PASS watchdog SIGKILL drained session-escaped callback descendant before rollback"
+
+reset_legacy
+session_escape_timeout_legacy_snapshot="$TMP/session-escape-timeout-legacy.plist"
+session_escape_timeout_child_pid_file="$TMP/session-escape-timeout-child.pid"
+session_escape_timeout_traffic_file="$TMP/session-escape-timeout-traffic.log"
+session_escape_timeout_overlap_sentinel="$TMP/session-escape-timeout-rollback-overlap"
+cp -p "$plist" "$session_escape_timeout_legacy_snapshot"
+: >"$session_escape_timeout_traffic_file"
+if FAKE_CANARY_TRAFFIC_PID_FILE="$session_escape_timeout_child_pid_file" \
+  FAKE_CANARY_TRAFFIC_FILE="$session_escape_timeout_traffic_file" \
+  FAKE_ROLLBACK_TRAFFIC_FILE="$session_escape_timeout_traffic_file" \
+  FAKE_ROLLBACK_OVERLAP_SENTINEL="$session_escape_timeout_overlap_sentinel" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-session-escape.py" \
+  SUBROUTER_CANARY_TIMEOUT=1 \
+  "$MIGRATE" --activate \
+  >"$TMP/session-escape-timeout.out" 2>"$TMP/session-escape-timeout.err"; then
+  echo "session-escape timeout unexpectedly accepted" >&2
+  exit 1
+fi
+[ -s "$session_escape_timeout_child_pid_file" ]
+session_escape_timeout_child_pid="$(cat "$session_escape_timeout_child_pid_file")"
+wait_for_pid_gone "$session_escape_timeout_child_pid"
+assert_exact_legacy_rollback "$session_escape_timeout_legacy_snapshot"
+[ ! -e "$session_escape_timeout_overlap_sentinel" ]
+session_escape_timeout_traffic_size="$(wc -c <"$session_escape_timeout_traffic_file")"
+sleep 0.2
+[ "$(wc -c <"$session_escape_timeout_traffic_file")" = "$session_escape_timeout_traffic_size" ]
+grep -q 'functional canary timed out after 1s' "$TMP/session-escape-timeout.err"
+echo "PASS watchdog timeout cleanup drained token-marked session escape after anchor death before rollback"
+
+stale_group_state="$TMP/stale-group-state.json"
+python3 - "$TMP/stale-group.pid" <<'PY' &
+import os
+import sys
+import time
+
+os.setsid()
+with open(sys.argv[1], "w", encoding="ascii") as output:
+    output.write(f"{os.getpid()}\n")
+    output.flush()
+    os.fsync(output.fileno())
+time.sleep(300)
+PY
+stale_group_launcher_pid=$!
+stale_group_attempts=0
+while [ ! -s "$TMP/stale-group.pid" ]; do
+  stale_group_attempts=$((stale_group_attempts + 1))
+  [ "$stale_group_attempts" -lt 100 ] || { echo "stale group fixture did not start" >&2; exit 1; }
+  sleep 0.02
+done
+stale_group_pid="$(cat "$TMP/stale-group.pid")"
+printf '{"callback_token":"%s","leader_start":"darwin:stale:identity","pgid":%s}\n' \
+  "$(printf '0%.0s' {1..64})" \
+  "$stale_group_pid" >"$stale_group_state"
+bash -c '. "$1"; drain_bounded_process_group "stale identity test" "$2"' \
+  bash "$TRANSITION_LIB" "$stale_group_state"
+kill -0 "$stale_group_pid"
+kill -KILL "$stale_group_pid"
+wait "$stale_group_launcher_pid" 2>/dev/null || true
+rm -f "$TMP/stale-group.pid"
+echo "PASS stale persisted process-group identity never signaled a live replacement"
+
+pgid_reuse_state="$TMP/pgid-reuse-state.json"
+pgid_reuse_identity="$TMP/pgid-reuse-leader-start"
+pgid_reuse_token="$(printf '1%.0s' {1..64})"
+python3 - "$TMP/pgid-reuse-group.pid" "$pgid_reuse_identity" <<'PY' &
+import ctypes
+import os
+import sys
+import time
+
+pid_file, identity_file = sys.argv[1:]
+os.setsid()
+
+if sys.platform == "darwin":
+    class DarwinBSDInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    proc_pidinfo = libproc.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_void_p, ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    info = DarwinBSDInfo()
+    size = ctypes.sizeof(info)
+    if proc_pidinfo(os.getpid(), 3, 0, ctypes.byref(info), size) != size:
+        raise SystemExit("PGID reuse fixture could not read its start identity")
+    leader_start = f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+elif sys.platform.startswith("linux"):
+    fields = open(f"/proc/{os.getpid()}/stat", encoding="ascii").read().rsplit(")", 1)[1].split()
+    leader_start = f"linux:{fields[19]}"
+else:
+    raise SystemExit("PGID reuse fixture requires Darwin or Linux")
+
+with open(pid_file, "w", encoding="ascii") as output:
+    output.write(f"{os.getpid()}\n")
+    output.flush()
+    os.fsync(output.fileno())
+with open(identity_file, "w", encoding="ascii") as output:
+    output.write(f"{leader_start}\n")
+    output.flush()
+    os.fsync(output.fileno())
+time.sleep(300)
+PY
+pgid_reuse_group_launcher_pid=$!
+pgid_reuse_attempts=0
+while [ ! -s "$pgid_reuse_identity" ]; do
+  pgid_reuse_attempts=$((pgid_reuse_attempts + 1))
+  [ "$pgid_reuse_attempts" -lt 100 ] \
+    || { echo "PGID reuse fixture did not start" >&2; exit 1; }
+  sleep 0.02
+done
+pgid_reuse_group_pid="$(cat "$TMP/pgid-reuse-group.pid")"
+pgid_reuse_leader_start="$(cat "$pgid_reuse_identity")"
+printf '{"callback_token":"%s","leader_start":"%s","pgid":%s}\n' \
+  "$pgid_reuse_token" "$pgid_reuse_leader_start" "$pgid_reuse_group_pid" \
+  >"$pgid_reuse_state"
+SUBROUTER_BOUNDED_CALLBACK_TOKEN="$pgid_reuse_token" \
+  python3 -c 'import time; time.sleep(300)' &
+pgid_reuse_token_pid=$!
+printf '%s\n' "$pgid_reuse_token_pid" >"$TMP/pgid-reuse-token.pid"
+SUBROUTER_FAULT_INJECT_BOUNDED_DRAIN_PGID_REUSE_AFTER_SAMPLE="pgid reuse simulation" \
+  bash -c '. "$1"; drain_bounded_process_group "pgid reuse simulation" "$2"' \
+  bash "$TRANSITION_LIB" "$pgid_reuse_state"
+kill -0 "$pgid_reuse_group_pid"
+wait_for_pid_gone "$pgid_reuse_token_pid"
+kill -KILL "$pgid_reuse_group_pid"
+wait "$pgid_reuse_group_launcher_pid" 2>/dev/null || true
+rm -f "$TMP/pgid-reuse-group.pid" "$TMP/pgid-reuse-token.pid"
+echo "PASS simulated PID/PGID reuse never signaled the unrelated group while token descendants drained"
+
+reset_legacy
+prepare_functional_canary timeout
+orphan_legacy_snapshot="$TMP/functional-canary-orphan-legacy.plist"
+cp -p "$plist" "$orphan_legacy_snapshot"
+SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
+  SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  "$MIGRATE" --activate \
+  >"$TMP/functional-canary-orphan.out" 2>"$TMP/functional-canary-orphan.err" &
+orphan_migration_pid=$!
+orphan_attempts=0
+while [ ! -s "$functional_canary_descendant_pid" ]; do
+  orphan_attempts=$((orphan_attempts + 1))
+  if [ "$orphan_attempts" -ge 200 ]; then
+    echo "functional canary did not reach its orphan fixture" >&2
+    kill -KILL "$orphan_migration_pid" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 0.05
+done
+orphan_leader_pid="$(tr -d '[:space:]' <"$functional_canary_leader_pid")"
+orphan_descendant_pid="$(tr -d '[:space:]' <"$functional_canary_descendant_pid")"
+kill -KILL "$orphan_migration_pid"
+wait "$orphan_migration_pid" 2>/dev/null || true
+wait_for_pid_gone "$orphan_leader_pid"
+wait_for_pid_gone "$orphan_descendant_pid"
+if SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
+  SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
+  "$MIGRATE" --activate \
+  >"$TMP/functional-canary-orphan-recovery.out" \
+  2>"$TMP/functional-canary-orphan-recovery.err"; then
+  echo "interrupted functional canary recovery unexpectedly activated" >&2
+  exit 1
+fi
+assert_exact_legacy_rollback "$orphan_legacy_snapshot"
+grep -q 'recovered interrupted transaction phase structural_accepted to legacy; rerun activation' \
+  "$TMP/functional-canary-orphan-recovery.err"
+rm -f "$functional_canary_leader_pid" "$functional_canary_descendant_pid"
+echo "PASS migration death orphaned no functional-canary process and reentry restored exact legacy"
+
+reset_legacy
+prepare_functional_canary timeout
+signal_legacy_snapshot="$TMP/functional-canary-signal-legacy.plist"
+cp -p "$plist" "$signal_legacy_snapshot"
+SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
+  SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
+  SUBROUTER_CANARY_TIMEOUT=60 \
+  "$MIGRATE" --activate \
+  >"$TMP/functional-canary-signal.out" 2>"$TMP/functional-canary-signal.err" &
+signal_migration_pid=$!
+signal_attempts=0
+while [ ! -s "$functional_canary_descendant_pid" ]; do
+  signal_attempts=$((signal_attempts + 1))
+  if [ "$signal_attempts" -ge 200 ]; then
+    echo "functional canary did not reach its signal fixture" >&2
+    kill -KILL "$signal_migration_pid" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 0.05
+done
+signal_watchdog_pid="$(find_functional_canary_watchdog "$signal_migration_pid" || true)"
+case "$signal_watchdog_pid" in ''|*[!0-9]*)
+  echo "functional canary watchdog was not found" >&2
+  kill -KILL "$signal_migration_pid" 2>/dev/null || true
+  exit 1
+  ;;
+esac
+signal_leader_pid="$(tr -d '[:space:]' <"$functional_canary_leader_pid")"
+signal_descendant_pid="$(tr -d '[:space:]' <"$functional_canary_descendant_pid")"
+kill -INT "$signal_watchdog_pid" "$signal_migration_pid"
+wait "$signal_migration_pid" 2>/dev/null || true
+wait_for_pid_gone "$signal_watchdog_pid"
+wait_for_pid_gone "$signal_leader_pid"
+wait_for_pid_gone "$signal_descendant_pid"
+assert_exact_legacy_rollback "$signal_legacy_snapshot"
+rm -f "$functional_canary_leader_pid" "$functional_canary_descendant_pid"
+echo "PASS simultaneous migration/watchdog interrupt killed the isolated canary group before rollback completed"
+
+reset_legacy
 if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
   "$MIGRATE" --activate --retiring-state-dir "$SUBROUTER_STATE_DIR" \
   >"$TMP/equal-root.out" 2>"$TMP/equal-root.err"; then
@@ -552,7 +1590,9 @@ wrapper_prepared="${plist}.supervised"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$wrapper_prepared")" = "$supervisor" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$wrapper_prepared")" = supervise ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$wrapper_prepared")" = 127.0.0.1:43199 ]
-[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:9' "$wrapper_prepared")" = --quota-mode ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:8' "$wrapper_prepared")" = --upgrade-inhibit-file ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:9' "$wrapper_prepared")" = "${plist}.supervisor-transaction/upgrade-inhibited" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:11' "$wrapper_prepared")" = --quota-mode ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_TOKEN_FILE' "$wrapper_prepared")" = "$private_token_file" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:LEGACY_ONLY' "$wrapper_prepared")" = preserved ]
 if /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_TOKEN_FILE' "$plist" >/dev/null 2>&1; then

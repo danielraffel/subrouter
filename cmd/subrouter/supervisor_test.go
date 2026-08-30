@@ -113,6 +113,47 @@ func TestParseSupervisorConfigIncludesBoundedWorkerStopGrace(t *testing.T) {
 	}
 }
 
+func TestParseSupervisorConfigRequiresAbsoluteUpgradeInhibitFile(t *testing.T) {
+	_, err := parseSupervisorConfig([]string{
+		"--control-socket", "/var/run/subrouter-test.sock",
+		"--worker-bin", "/usr/local/bin/subrouter",
+		"--upgrade-inhibit-file", "relative/marker",
+	})
+	if err != nil {
+		// Parsing accepts values; validation owns filesystem invariants.
+		t.Fatal(err)
+	}
+	config, _ := parseSupervisorConfig([]string{
+		"--control-socket", "/var/run/subrouter-test.sock",
+		"--worker-bin", "/usr/local/bin/subrouter",
+		"--upgrade-inhibit-file", "relative/marker",
+	})
+	if err := validateSupervisorConfig(config); err == nil || !strings.Contains(err.Error(), "must be an absolute path") {
+		t.Fatalf("relative upgrade inhibit path validation = %v", err)
+	}
+}
+
+func TestUpgradeInhibitMarkerBlocksGenerationChange(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "upgrade-inhibited")
+	if err := os.WriteFile(marker, []byte("transaction\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	router, err := front.NewRouter(front.Backend{ID: "initial", Network: "unix", Address: "/tmp/initial.sock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &supervisor{
+		config: supervisorConfig{UpgradeInhibitFile: marker},
+		router: router,
+	}
+	if err := s.upgradeLocked(); err == nil || !strings.Contains(err.Error(), "inhibited") {
+		t.Fatalf("upgrade with active transaction marker = %v", err)
+	}
+	if active := router.Active().ID; active != "initial" {
+		t.Fatalf("upgrade inhibitor changed active generation to %q", active)
+	}
+}
+
 func TestParseSupervisorConfigCanRequireProxyProtocol(t *testing.T) {
 	config, err := parseSupervisorConfig([]string{
 		"--control-socket", "/var/run/subrouter-test.sock",
@@ -444,6 +485,11 @@ func TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit(t *testing.T) {
 	if beforeRetire.Active.ID != initial.id {
 		t.Fatalf("active generation before retirement = %q, want %q", beforeRetire.Active.ID, initial.id)
 	}
+	if beforeRetire.Worker.ID != initial.id || beforeRetire.Worker.PID != initial.command.Process.Pid ||
+		beforeRetire.Worker.ProcessStart == "" || beforeRetire.Worker.IdentityKind == "" ||
+		beforeRetire.Worker.ExecutableIdentity == "" {
+		t.Fatalf("active worker process identity was not kernel-bound in status: %+v", beforeRetire.Worker)
+	}
 	pinned, err := net.DialTimeout("tcp", publicAddress, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -566,10 +612,11 @@ func unixHTTPClient(socket string) *http.Client {
 }
 
 type supervisorControlStatus struct {
-	Accepting bool                  `json:"accepting"`
-	Retiring  bool                  `json:"retiring"`
-	Active    front.Backend         `json:"active"`
-	Backends  []front.BackendStatus `json:"backends"`
+	Accepting bool                      `json:"accepting"`
+	Retiring  bool                      `json:"retiring"`
+	Active    front.Backend             `json:"active"`
+	Backends  []front.BackendStatus     `json:"backends"`
+	Worker    activeWorkerProcessStatus `json:"active_worker"`
 }
 
 func waitForSupervisorStatus(t *testing.T, client *http.Client, runDone <-chan error) supervisorControlStatus {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -406,6 +407,318 @@ func findJSONModel(value any) string {
 }
 
 var jsonModelFieldPattern = regexp.MustCompile(`"model"\s*:\s*"((?:\\.|[^"\\])*)"`)
+
+const cutoverCanaryDecodedMaxBodyBytes = int64(16 << 20)
+
+var errCutoverCanaryBodyLimit = errors.New("cutover canary body limit exceeded")
+
+// ExtractResponsesCurrentUserInputHash parses only the Responses API input
+// surface and returns the SHA-256 digest of its unique current-user text leaf.
+// The parser streams a bounded decoded body; it never materializes the complete
+// request or treats marker-shaped text in metadata, keys, or prior messages as
+// the current turn.
+func ExtractResponsesCurrentUserInputHash(r *http.Request, maxWireBytes int64) (string, bool) {
+	if r == nil || r.Body == nil || maxWireBytes <= 0 || r.ContentLength < 0 || r.ContentLength > maxWireBytes {
+		return "", false
+	}
+	if contentType := strings.ToLower(r.Header.Get("Content-Type")); !strings.Contains(contentType, "json") {
+		return "", false
+	}
+
+	decoded, closeDecoded, err := cutoverCanaryDecodedReader(r.Body, r.Header.Get("Content-Encoding"), maxWireBytes)
+	if err != nil {
+		return "", false
+	}
+	defer closeDecoded()
+	decoder := json.NewDecoder(&cutoverCanaryLimitReader{reader: decoded, remaining: cutoverCanaryDecodedMaxBodyBytes})
+	digest, ok := responsesCurrentUserInputHash(decoder)
+	if !ok {
+		return "", false
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return "", false
+	}
+	return hex.EncodeToString(digest[:]), true
+}
+
+func cutoverCanaryDecodedReader(body io.Reader, contentEncoding string, maxWireBytes int64) (io.Reader, func(), error) {
+	wire := &cutoverCanaryLimitReader{reader: body, remaining: maxWireBytes}
+	switch strings.ToLower(strings.TrimSpace(contentEncoding)) {
+	case "", "identity":
+		return wire, func() {}, nil
+	case "gzip":
+		reader, err := gzip.NewReader(wire)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return reader, func() { _ = reader.Close() }, nil
+	case "zstd":
+		reader, err := zstd.NewReader(wire, zstd.WithDecoderMaxMemory(uint64(cutoverCanaryDecodedMaxBodyBytes)))
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return reader, reader.Close, nil
+	default:
+		return nil, func() {}, fmt.Errorf("unsupported content encoding")
+	}
+}
+
+type cutoverCanaryLimitReader struct {
+	reader    io.Reader
+	remaining int64
+}
+
+func (r *cutoverCanaryLimitReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		var probe [1]byte
+		n, err := r.reader.Read(probe[:])
+		if n > 0 {
+			return 0, errCutoverCanaryBodyLimit
+		}
+		return 0, err
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.reader.Read(p)
+	r.remaining -= int64(n)
+	return n, err
+}
+
+type responsesInputLeaf struct {
+	digest [sha256.Size]byte
+	count  int
+}
+
+func responsesCurrentUserInputHash(decoder *json.Decoder) ([sha256.Size]byte, bool) {
+	if delim, ok := nextJSONDelimiter(decoder, '{'); !ok || delim != '{' {
+		return [sha256.Size]byte{}, false
+	}
+	var current responsesInputLeaf
+	seenInput := false
+	for decoder.More() {
+		key, ok := nextJSONString(decoder)
+		if !ok {
+			return [sha256.Size]byte{}, false
+		}
+		if key != "input" {
+			if !skipJSONValue(decoder) {
+				return [sha256.Size]byte{}, false
+			}
+			continue
+		}
+		if seenInput {
+			return [sha256.Size]byte{}, false
+		}
+		seenInput = true
+		current, ok = responsesInput(decoder)
+		if !ok {
+			return [sha256.Size]byte{}, false
+		}
+	}
+	if delim, ok := nextJSONDelimiter(decoder, '}'); !ok || delim != '}' || !seenInput || current.count != 1 {
+		return [sha256.Size]byte{}, false
+	}
+	return current.digest, true
+}
+
+func responsesInput(decoder *json.Decoder) (responsesInputLeaf, bool) {
+	token, err := decoder.Token()
+	if err != nil {
+		return responsesInputLeaf{}, false
+	}
+	switch value := token.(type) {
+	case string:
+		return responsesInputLeaf{digest: sha256.Sum256([]byte(value)), count: 1}, true
+	case json.Delim:
+		if value != '[' {
+			return responsesInputLeaf{}, false
+		}
+		current := responsesInputLeaf{}
+		seenUser := false
+		lastWasUser := false
+		for decoder.More() {
+			message, user, ok := responsesInputMessage(decoder)
+			if !ok {
+				return responsesInputLeaf{}, false
+			}
+			if user {
+				current = message
+				seenUser = true
+			}
+			lastWasUser = user
+		}
+		if delim, ok := nextJSONDelimiter(decoder, ']'); !ok || delim != ']' || !seenUser || !lastWasUser {
+			return responsesInputLeaf{}, false
+		}
+		return current, true
+	default:
+		return responsesInputLeaf{}, false
+	}
+}
+
+func responsesInputMessage(decoder *json.Decoder) (responsesInputLeaf, bool, bool) {
+	if delim, ok := nextJSONDelimiter(decoder, '{'); !ok || delim != '{' {
+		return responsesInputLeaf{}, false, false
+	}
+	role := ""
+	typeName := ""
+	content := responsesInputLeaf{}
+	seenRole, seenType, seenContent := false, false, false
+	for decoder.More() {
+		key, ok := nextJSONString(decoder)
+		if !ok {
+			return responsesInputLeaf{}, false, false
+		}
+		switch key {
+		case "role":
+			if seenRole {
+				return responsesInputLeaf{}, false, false
+			}
+			seenRole = true
+			role, ok = nextJSONString(decoder)
+		case "type":
+			if seenType {
+				return responsesInputLeaf{}, false, false
+			}
+			seenType = true
+			typeName, ok = nextJSONString(decoder)
+		case "content":
+			if seenContent {
+				return responsesInputLeaf{}, false, false
+			}
+			seenContent = true
+			content, ok = responsesMessageContent(decoder)
+		default:
+			ok = skipJSONValue(decoder)
+		}
+		if !ok {
+			return responsesInputLeaf{}, false, false
+		}
+	}
+	if delim, ok := nextJSONDelimiter(decoder, '}'); !ok || delim != '}' {
+		return responsesInputLeaf{}, false, false
+	}
+	user := role == "user" && (typeName == "" || typeName == "message")
+	return content, user, true
+}
+
+func responsesMessageContent(decoder *json.Decoder) (responsesInputLeaf, bool) {
+	token, err := decoder.Token()
+	if err != nil {
+		return responsesInputLeaf{}, false
+	}
+	if value, ok := token.(string); ok {
+		return responsesInputLeaf{digest: sha256.Sum256([]byte(value)), count: 1}, true
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '[' {
+		return responsesInputLeaf{}, false
+	}
+	content := responsesInputLeaf{}
+	for decoder.More() {
+		leaf, isText, ok := responsesContentPart(decoder)
+		if !ok {
+			return responsesInputLeaf{}, false
+		}
+		if isText {
+			content.digest = leaf.digest
+			content.count++
+		}
+	}
+	if delim, ok := nextJSONDelimiter(decoder, ']'); !ok || delim != ']' {
+		return responsesInputLeaf{}, false
+	}
+	return content, true
+}
+
+func responsesContentPart(decoder *json.Decoder) (responsesInputLeaf, bool, bool) {
+	if delim, ok := nextJSONDelimiter(decoder, '{'); !ok || delim != '{' {
+		return responsesInputLeaf{}, false, false
+	}
+	typeName := ""
+	text := ""
+	seenType, seenText := false, false
+	for decoder.More() {
+		key, ok := nextJSONString(decoder)
+		if !ok {
+			return responsesInputLeaf{}, false, false
+		}
+		switch key {
+		case "type":
+			if seenType {
+				return responsesInputLeaf{}, false, false
+			}
+			seenType = true
+			typeName, ok = nextJSONString(decoder)
+		case "text":
+			if seenText {
+				return responsesInputLeaf{}, false, false
+			}
+			seenText = true
+			text, ok = nextJSONString(decoder)
+		default:
+			ok = skipJSONValue(decoder)
+		}
+		if !ok {
+			return responsesInputLeaf{}, false, false
+		}
+	}
+	if delim, ok := nextJSONDelimiter(decoder, '}'); !ok || delim != '}' {
+		return responsesInputLeaf{}, false, false
+	}
+	if typeName != "input_text" {
+		return responsesInputLeaf{}, false, true
+	}
+	if !seenText {
+		return responsesInputLeaf{}, false, false
+	}
+	return responsesInputLeaf{digest: sha256.Sum256([]byte(text))}, true, true
+}
+
+func nextJSONString(decoder *json.Decoder) (string, bool) {
+	token, err := decoder.Token()
+	value, ok := token.(string)
+	return value, err == nil && ok
+}
+
+func nextJSONDelimiter(decoder *json.Decoder, want json.Delim) (json.Delim, bool) {
+	token, err := decoder.Token()
+	value, ok := token.(json.Delim)
+	return value, err == nil && ok && value == want
+}
+
+func skipJSONValue(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return true
+	}
+	var close json.Delim
+	switch delim {
+	case '{':
+		close = '}'
+	case '[':
+		close = ']'
+	default:
+		return false
+	}
+	for decoder.More() {
+		if delim == '{' {
+			if _, ok := nextJSONString(decoder); !ok {
+				return false
+			}
+		}
+		if !skipJSONValue(decoder) {
+			return false
+		}
+	}
+	got, ok := nextJSONDelimiter(decoder, close)
+	return ok && got == close
+}
 
 const modelScanMaxBodyBytes = int64(8 << 20)
 

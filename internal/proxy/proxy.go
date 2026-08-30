@@ -98,6 +98,7 @@ type Server struct {
 	// explicitly configured Subrouter-to-Subrouter delegation hop.
 	ForwardSessionHeaders bool
 	sessionLeases         *sessionLeaseStore
+	cutoverChallenges     *cutoverChallengeRegistry
 	// StreamDrops counts dropped response streams by which side ended them,
 	// so the expected client-hangup case is countable without a log line each.
 	StreamDrops *StreamDropStats
@@ -1648,6 +1649,9 @@ func (s Server) Handler() http.Handler {
 	if s.sessionLeases == nil {
 		s.sessionLeases = newSessionLeaseStore()
 	}
+	if s.cutoverChallenges == nil {
+		s.cutoverChallenges = newCutoverChallengeRegistry()
+	}
 	if s.CacheFlight == nil {
 		s.CacheFlight = newSingleFlight()
 	}
@@ -1680,6 +1684,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
+	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
 	mux.HandleFunc("/_subrouter/transcripts/", s.requireAdmin(s.handleTranscriptDetail))
@@ -3456,7 +3461,15 @@ func (s Server) authorizeAdmin(r *http.Request) bool {
 func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, s.Sessions.All())
+		assignments := s.Sessions.All()
+		views := make([]sessionAdminView, 0, len(assignments))
+		for _, assignment := range assignments {
+			views = append(views, sessionAdminView{
+				Assignment: assignment,
+				Active:     s.activeSession(assignment.AgentType, assignment.SessionID),
+			})
+		}
+		writeJSON(w, views)
 	case http.MethodDelete:
 		agentType := strings.TrimSpace(r.URL.Query().Get("agent_type"))
 		sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
@@ -3983,7 +3996,14 @@ func (s Server) proxyHandler() http.Handler {
 			// device / client type). Without them a concurrency spike is an
 			// anonymous wall of user="" sessions that cannot be traced to whatever
 			// fired it (a load-test loader, an agent fleet, etc.).
-			s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user_hash", userEmailHash(userEmail), "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent())
+			if markerHash, armed := cutoverCanaryRequestEvidence(proxyRequest, sessionAgentType, sessionID, s.activeSession(sessionAgentType, sessionID), s.cutoverChallenges, time.Now().UTC()); armed {
+				// Gate-5 evidence must bind the exact challenged request without
+				// publishing the selected account identity. The normal non-canary log
+				// shape below remains unchanged for operational compatibility.
+				s.Logger.Info("proxy request", privacySafeCutoverRequestLogAttrs(sessionAgentType, sessionID, userEmailHash(userEmail), r.Method, r.URL.Path, upstream.Host, clientRemoteIP(r), r.UserAgent(), markerHash)...)
+			} else {
+				s.Logger.Info("proxy request", "agent", sessionAgentType, "session", sessionID, "user_hash", userEmailHash(userEmail), "account", account.ID, "method", r.Method, "path", r.URL.Path, "upstream", upstream.Host, "remote_addr", clientRemoteIP(r), "user_agent", r.UserAgent())
+			}
 		}
 
 		// Read-heavy polling endpoints: identical concurrent requests share
@@ -4045,6 +4065,20 @@ func (s Server) proxyHandler() http.Handler {
 
 		rp.ServeHTTP(w, proxyRequest)
 	})
+}
+
+func privacySafeCutoverRequestLogAttrs(agent, sessionID, userHash, method, path, upstream, remoteAddr, userAgent, markerHash string) []any {
+	return []any{
+		"agent", agent,
+		"session", sessionID,
+		"user_hash", userHash,
+		"method", method,
+		"path", path,
+		"upstream", upstream,
+		"remote_addr", remoteAddr,
+		"user_agent", userAgent,
+		"cutover_marker_hash", markerHash,
+	}
 }
 
 // azureCodexUpgradeShouldFallBack reports whether a Codex websocket upgrade

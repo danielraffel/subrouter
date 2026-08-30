@@ -189,6 +189,211 @@ sticky or existing-session continuity, and a real routed provider response.
 Keep those checks in the callback so the generic migration contains no machine
 names, tailnet addresses, account identifiers, or credentials.
 
+`deploy/macos/run-functional-canary.py` is the reusable fail-closed callback
+runner for deployments that need all of those legs. It reads the absolute
+private manifest path from `SUBROUTER_CANARY_MANIFEST_FILE` (or `--manifest`
+when validating it directly). The manifest and every leg config must be
+current-user-owned regular non-symlink files with no group or other access.
+Each leg executable must be a current-user-owned, non-privileged regular file
+that is not group/other-writable; normal mode `0755` binaries are accepted.
+Executables are invoked directly, never through a shell, and receive their
+private config path only through `SUBROUTER_CANARY_LEG_CONFIG_FILE`. The
+manifest records the reviewed source Git OID explicitly as unverified context,
+and pins the candidate-worker path and SHA-256,
+evidence path, total timeout, and each leg's executable/config paths, hashes,
+and timeout. The migration passes its actual `WORKER_BIN` path and captured
+SHA-256 to the runner; the runner requires an exact manifest match before it
+acquires leases or starts any leg. The runner rechecks file identities
+immediately before execution.
+Use the same reviewed `subrouter-cutover-canary` binary for all five legs; its
+configs use schema `subrouter.cutover-canary-config/v1` and keep host-, account-,
+and session-specific values outside the repository.
+
+Build the deployment helper from the same reviewed source checkout as the
+candidate, sign it on macOS, and record its exact hash in every leg entry:
+
+```bash
+install -d -m 0700 /private/deployment/path
+umask 077
+go build -trimpath -o /private/deployment/path/subrouter-cutover-canary \
+  ./cmd/subrouter-cutover-canary
+chmod 0755 /private/deployment/path/subrouter-cutover-canary
+codesign -s - -f /private/deployment/path/subrouter-cutover-canary
+shasum -a 256 /private/deployment/path/subrouter-cutover-canary
+```
+
+The helper is a one-time deployment artifact, not a normal end-user command or
+release binary. Stage it, its private configs, and the Python runner together;
+do not assume installing `subrouter` also installs the helper.
+
+Create the mode-`0600` leg configs with the following exact shapes. Every
+`http` object contains `base_url`, optional `admin_token_file`,
+`timeout_seconds`, and `max_response_bytes`. Values below are placeholders, not
+literal filenames or account/session IDs to copy:
+
+```json
+{"schema":"subrouter.cutover-canary-config/v1","proof_file":"/private/peer-proof.json","peers":[{"name":"peer-a","ssh_host":"peer-alias","remote_executable":"/private/subrouter-cutover-canary","remote_config_file":"/private/peer-a.json","expected_identity_kind":"darwin-cdhash-sha256","expected_executable_identity":"CDHASH","timeout_seconds":30}]}
+{"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/auth-proof.json","state_file":"/private/auth-state.json","cleanup_journal":"/private/auth-journal.json","model":"MODEL"}
+{"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/sticky-proof.json","state_file":"/private/auth-state.json","cleanup_journal":"/private/auth-journal.json","model":"MODEL"}
+{"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/failover-proof.json","cleanup_journal":"/private/failover-journal.json","model":"MODEL","unavailable_account_id":"ACCOUNT_ALREADY_AT_100_PERCENT"}
+{"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/existing-proof.json","selection_file":"/private/existing-selection.json","challenge_file":"/private/existing-challenge.json","witness_file":"/private/existing-witness.json","wait_seconds":90,"candidate_log_files":["/private/candidate.log"],"max_log_append_bytes":1048576}
+```
+
+On macOS, obtain `CDHASH` from the staged, signed helper with
+`codesign -dvvv /private/subrouter-cutover-canary 2>&1` and copy its lowercase
+`CDHash=` value. The peer reports the kernel-bound code-directory hash of its
+running process image via `csops`; it never reopens the executable pathname, so
+replacing that pathname after `exec` cannot make an older process attest newer
+bytes. Non-macOS validation uses the explicit `go-build-info-sha256` identity
+kind, which hashes build metadata embedded in the running image.
+
+All five manifest legs must name the same reviewed helper path and SHA-256; the
+runner rejects a mix of otherwise-valid executables. The peer's referenced probe config is
+`{"schema":"subrouter.cutover-canary-config/v1","http":{...}}`. The peer leg
+does not execute arbitrary local argv: it invokes `/usr/bin/ssh` with fixed
+non-forwarding, non-interactive, no-backgrounding options, ignores SSH config,
+and runs only the declared absolute remote helper as `peer-probe --config
+REMOTE_CONFIG`. Consequently `ssh_host` must be a directly resolvable host,
+address, or `user@host`, not an SSH-config-only alias. Acceptance also requires
+the remote helper to report the configured kernel-bound CDHash captured from
+its running process image before any peer network probe. The existing
+selection file is
+`{"schema":"subrouter.cutover-canary-selection/v1","agent_type":"codex","session_id":"IDLE_EXISTING_SESSION"}`.
+Use separate proof files for the authenticated and sticky legs, but the same
+state and cleanup-journal paths so their sanitized handoff is continuous.
+
+The private mode-`0600` manifest has this exact top-level shape; include all
+five leg objects in the order below and pin every path by SHA-256:
+
+```json
+{"schema":"subrouter.launchagent-functional-canary/v1","source_git_oid_unverified":"FULL_40_CHARACTER_OID","candidate_worker":{"path":"/private/subrouter","sha256":"SHA256"},"evidence_file":"/private/evidence.json","total_timeout_seconds":240,"legs":[{"name":"peer-health-readiness","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/peer-leg.json","config_sha256":"SHA256","timeout_seconds":30},{"name":"authenticated-routed-codex","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/auth-leg.json","config_sha256":"SHA256","timeout_seconds":45},{"name":"sticky-reuse","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/sticky-leg.json","config_sha256":"SHA256","timeout_seconds":10},{"name":"safe-failover-reuse","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/failover-leg.json","config_sha256":"SHA256","timeout_seconds":60},{"name":"existing-session-next-turn","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/existing-leg.json","config_sha256":"SHA256","timeout_seconds":95}]}
+```
+
+`source_git_oid_unverified` is an operator-supplied review reference, not a
+claim that the candidate bytes authenticate that source revision. Keep this
+name until the release binary carries independently readable, enforced source
+metadata; do not relabel it as verified provenance based only on the manifest.
+
+Validate those exact files before the maintenance window, then pass the runner
+as the migration callback:
+
+```bash
+candidate_worker=/private/subrouter
+candidate_worker_sha256="$(shasum -a 256 "$candidate_worker" | awk '{print $1}')"
+SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$candidate_worker" \
+  SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256="$candidate_worker_sha256" \
+  SUBROUTER_CANARY_MANIFEST_FILE=/private/manifest.json \
+  deploy/macos/run-functional-canary.py --validate-only
+SUBROUTER_CANARY_MANIFEST_FILE=/private/manifest.json \
+  deploy/macos/migrate-launchagent-to-supervisor.sh --activate \
+  --canary-callback /absolute/path/run-functional-canary.py
+```
+
+For gate 5, wait for `existing-challenge.json`, send its exact `prompt` through
+the already-idle selected Codex session, and pass only that session's exact
+one-line response to the witness command after the challenge's `not_before`:
+
+```bash
+printf '%s\n' 'EXACT_OBSERVED_MARKER' | \
+  /private/subrouter-cutover-canary witness \
+  --challenge /private/existing-challenge.json \
+  --witness /private/existing-witness.json
+```
+
+The witness command records evidence; it does not send the Codex turn itself.
+An early, extra, or mismatched response fails closed.
+
+The manifest schema `subrouter.launchagent-functional-canary/v1` requires these
+legs exactly once and in this order:
+
+1. `peer-health-readiness`
+2. `authenticated-routed-codex`
+3. `sticky-reuse`
+4. `safe-failover-reuse`
+5. `existing-session-next-turn`
+
+Every leg must emit only this bounded JSON record, with its own exact name:
+
+```json
+{"schema":"subrouter.launchagent-functional-canary-leg/v1","leg":"peer-health-readiness","ok":true}
+```
+
+The runner rejects unknown fields, wrong order, duplicate or missing legs,
+unsafe paths, timeout budgets above 240 seconds, malformed or oversized output,
+nonzero exits, and mismatched evidence. It terminates the complete child process
+group on timeout or signal. Each leg inherits the callback's isolated process
+group so the migration's outer timeout cannot leave a nested leg running after
+rollback. The migration shell owns the callback process-group identity and
+synchronously drains it after any watchdog outcome, including watchdog crash
+or SIGKILL, before rollback can begin. Process inspection is retried with
+rollback withheld; if the recorded group identity is invalid and termination
+cannot be established, migration fail-stops with the candidate and transaction
+journal retained instead of risking overlapping rollback traffic. The durable
+record binds the numeric process group to its leader's kernel start identity,
+which is revalidated before every numeric group sample and signal. Once the
+leader is absent or its identity differs, group signaling stays permanently
+disabled so delayed reentry cannot signal an unrelated group after PID/PGID
+reuse; cleanup continues only for token-bound descendants whose individual
+kernel start identities still match. A stable signal-ignoring group anchor
+remains until same-group descendants are gone, while an inherited random
+callback token lets the drain find and identity-check descendants that create a
+new session. It additionally tags the reviewed helper's inherited child environment
+and detects a rapid reparent/session escape after the helper exits. This is a
+defense for the audited helper and fixed SSH tree, not a claim that an
+unprivileged Python process can contain arbitrary hostile macOS code. The
+runner executes private pinned copies whose bytes are rehashed
+while copying, closing the hash-to-exec/config-open replacement window. It
+never repeats child stdout or stderr, and atomically writes a mode-`0600`
+evidence record containing source/run identity, timestamps, hashes, leg names,
+durations, status, and a redacted failure reason. Run
+`--validate-only` before the maintenance window. Put deployment
+endpoints, account/session selectors, and credential file references only in
+the private leg configs; never put raw credentials in the manifest, arguments,
+filenames, output, or source.
+
+The authenticated and sticky gates use two tiny provider turns total, each
+bounded to 64 output tokens. The authenticated gate proves both responses used
+one candidate assignment, deletes its temporary session and cleanup journal,
+and passes only salted hashes to the zero-traffic sticky gate. An interrupted
+run recovers its private cleanup journal before creating another canary session.
+Kernel leases serialize both the journal and authenticated handoff state. A
+valid handoff is bound to the run and the routing-relevant config hash and
+blocks a second authenticated coordinator for at most ten minutes; sticky holds
+the state lease while consuming it. This prevents the process gap between the
+two legs from letting another manifest overwrite or delete the pending handoff.
+
+The failover gate first exercises the candidate's in-process failover logic
+without external traffic. Live acceptance then requires a configured Codex
+OAuth account whose valid credential and account-wide 100%-used window are
+visible in candidate usage status. One forced no-retry request reconfirms that
+already-unavailable account's structured quota rejection; an ordinary request
+must succeed through a different account, and a final no-retry request must
+reuse the replacement. The gate therefore costs two tiny successful provider
+turns and one rejection against quota that was already exhausted. It never
+manufactures exhaustion or edits the assignment ledger directly, and its
+private cleanup journal makes an interrupted attempt recoverable.
+The authenticated and failover journal leases are acquired before recovery and
+held through final cleanup. A concurrent coordinator therefore fails without
+touching the live journal or session; SIGKILL releases the kernel lease so the
+next coordinator can validate and recover the stale exact run/session record.
+
+The existing-session gate must observe the next turn of a session selected as
+idle during the maintenance window. Candidate session inventory must explicitly
+report that selected session as inactive; a missing activity field fails closed.
+Before publishing its one-time challenge, the gate snapshots the configured
+candidate proxy logs and sets a short future `not_before` boundary. The witness
+command rejects an early response. Acceptance requires both an exact response
+witness and a newly appended proxy-request record whose candidate log timestamp
+is at or after that boundary for the selected agent/session and whose
+`cutover_marker_hash` is the SHA-256 digest derived from the actual challenged
+request body. The marker and request body are never logged. A kernel-held
+challenge lease prevents a concurrent coordinator from replacing a live
+challenge; after a crash or SIGKILL releases that lease, the next coordinator
+can remove the stale artifacts and publish a replacement. Old or
+pre-publication lines, changed files, partial or oversized appends, an unrelated
+request on the selected session, a synthetic new session, or a second ephemeral
+request are not continuity proof.
+
 Activation records a single launchd identity snapshot plus a PID, executable
 hash, start-time, and command fingerprint. A mode-`0700` transaction journal is
 armed before the first live mutation. It waits for two observations of complete
@@ -197,7 +402,9 @@ that the candidate or its descendants are the sole listener owners. The
 supervisor control socket must be a mode-`0600` Unix socket owned by the
 expected uid and report one accepting, non-retiring backend. Candidate identity,
 socket status, health, and readiness must remain stable through the functional
-canary. Bootstrap, structural acceptance, timeout, signal, or canary failure
+canary; before and after it, supervisor status must report the same live active
+worker PID and kernel-bound CDHash. Bootstrap, structural acceptance, timeout,
+signal, or canary failure
 invokes the standalone rollback command automatically; a hard interruption is
 recovered from the phase journal before a later activation may proceed.
 

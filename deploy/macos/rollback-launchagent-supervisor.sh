@@ -7,10 +7,13 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/launchagent-transition-lib.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/mutation-lease-lib.sh"
 
 export SUBROUTER_TRANSITION_NAME="rollback-launchagent-supervisor"
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter}"
 PLIST="${SUBROUTER_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
+MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
 DOMAIN="${SUBROUTER_LAUNCHD_DOMAIN:-gui/$(id -u)}"
 BACKUP="${SUBROUTER_ROLLBACK_PLIST:-}"
 EXPECTED_PROGRAM="${SUBROUTER_EXPECTED_PROGRAM:-}"
@@ -50,6 +53,24 @@ done
 [ -n "$BACKUP" ] || usage
 [ -n "$BACKUP_SHA256" ] || usage
 [ "${#ROLLBACK_ARTIFACTS[@]}" -gt 0 ] || usage
+
+# Adopt the migration's kernel lease (or acquire it for a standalone rollback)
+# before hashing or parsing any rollback input. If the migration is killed
+# while this child validates a large bundle, the helper must already know this
+# exact child generation so no updater can interpose before live restoration.
+owns_mutation_lease=0
+if ! subrouter_mutation_lease_is_held_by_parent "$MUTATION_LOCK_FILE"; then
+  acquire_subrouter_mutation_lease "$MUTATION_LOCK_FILE" \
+    || { status=$?; echo "rollback-launchagent-supervisor: another deployment or worker update holds $MUTATION_LOCK_FILE" >&2; exit "$status"; }
+  owns_mutation_lease=1
+fi
+restore_next=""
+cleanup() {
+  [ -z "$restore_next" ] || rm -f "$restore_next"
+  [ "$owns_mutation_lease" -eq 0 ] || release_subrouter_mutation_lease
+}
+trap cleanup EXIT
+
 [ -f "$BACKUP" ] || launchagent_die "rollback plist $BACKUP not found"
 [ ! -L "$BACKUP" ] || launchagent_die "rollback plist must not be a symlink"
 verify_file_sha256 "$BACKUP" "$BACKUP_SHA256" \
@@ -112,8 +133,6 @@ fi
 wait_for_full_absence "$service" "$captured_pid" "$public_addr"
 
 restore_next="${PLIST}.rollback-next.$$"
-cleanup() { rm -f "$restore_next"; }
-trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 for index in "${!ROLLBACK_ARTIFACTS[@]}"; do
