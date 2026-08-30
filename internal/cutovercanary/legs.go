@@ -85,6 +85,16 @@ func RunLeg(ctx context.Context, leg, configPath, runID string) error {
 		if len(cfg.Peers) == 0 || len(cfg.Peers) > 32 {
 			return errors.New("peer list must contain 1..32 entries")
 		}
+		for _, peer := range cfg.Peers {
+			if peer.SSHIdentityFile != "" {
+				// Validate each identity against the writable proof and the
+				// config independently. Multiple peers may intentionally share
+				// the same read-only identity file.
+				if err := validateArtifactPaths([]string{cfg.ProofFile}, []string{cfg.configPath, peer.SSHIdentityFile}); err != nil {
+					return err
+				}
+			}
+		}
 		names := map[string]bool{}
 		for _, peer := range cfg.Peers {
 			if names[peer.Name] {
@@ -165,17 +175,29 @@ func runPeer(ctx context.Context, peer PeerTarget) error {
 		!safeRemotePath(peer.RemoteConfigFile) || !validExecutableIdentity(peer.ExpectedIdentityKind, peer.ExpectedExecutableIdentity) {
 		return errors.New("invalid peer command")
 	}
+	if peer.SSHIdentityFile != "" {
+		if !safeRemotePath(peer.SSHIdentityFile) {
+			return errors.New("invalid peer SSH identity file")
+		}
+		if _, err := readPrivateFile(peer.SSHIdentityFile, 1<<20); err != nil {
+			return errors.New("invalid peer SSH identity file")
+		}
+	}
 	if peer.TimeoutSeconds < 1 || peer.TimeoutSeconds > 120 {
 		return errors.New("invalid peer timeout")
 	}
 	deadline, cancel := context.WithTimeout(ctx, time.Duration(peer.TimeoutSeconds)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(deadline, sshCommandPath,
+	args := []string{
 		"-T", "-F", "none", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
 		"-o", "PermitLocalCommand=no", "-o", "ControlMaster=no", "-o", "ControlPersist=no",
 		"-o", "ForkAfterAuthentication=no", "-o", "ProxyCommand=none", "-o", "ProxyJump=none",
-		"--", peer.SSHHost,
-		peer.RemoteExecutable, "peer-probe", "--config", peer.RemoteConfigFile)
+	}
+	if peer.SSHIdentityFile != "" {
+		args = append(args, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-i", peer.SSHIdentityFile)
+	}
+	args = append(args, "--", peer.SSHHost, peer.RemoteExecutable, "peer-probe", "--config", peer.RemoteConfigFile)
+	cmd := exec.CommandContext(deadline, sshCommandPath, args...)
 	cmd.Env = canaryEnvironment()
 	var out strings.Builder
 	cmd.Stdout = &limitedWriter{w: &out, remaining: 4096}

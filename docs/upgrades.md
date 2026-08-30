@@ -232,7 +232,7 @@ Create the mode-`0600` leg configs with the following exact shapes. Every
 literal filenames or account/session IDs to copy:
 
 ```json
-{"schema":"subrouter.cutover-canary-config/v1","proof_file":"/private/peer-proof.json","peers":[{"name":"peer-a","ssh_host":"peer-alias","remote_executable":"/private/subrouter-cutover-canary","remote_config_file":"/private/peer-a.json","expected_identity_kind":"darwin-cdhash-sha256","expected_executable_identity":"CDHASH","timeout_seconds":30}]}
+{"schema":"subrouter.cutover-canary-config/v1","proof_file":"/private/peer-proof.json","peers":[{"name":"peer-a","ssh_host":"user@direct-host-or-address","ssh_identity_file":"/private/owner-only-ssh-key","remote_executable":"/private/subrouter-cutover-canary","remote_config_file":"/private/peer-a.json","expected_identity_kind":"darwin-cdhash-sha256","expected_executable_identity":"CDHASH","timeout_seconds":30}]}
 {"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/auth-proof.json","state_file":"/private/auth-state.json","cleanup_journal":"/private/auth-journal.json","model":"MODEL"}
 {"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/sticky-proof.json","state_file":"/private/auth-state.json","cleanup_journal":"/private/auth-journal.json","model":"MODEL"}
 {"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/failover-proof.json","cleanup_journal":"/private/failover-journal.json","model":"MODEL","unavailable_account_id":"ACCOUNT_ALREADY_AT_100_PERCENT"}
@@ -256,8 +256,13 @@ and runs only the declared absolute remote helper as `peer-probe --config
 REMOTE_CONFIG`. Consequently `ssh_host` must be a directly resolvable host,
 address, or `user@host`, not an SSH-config-only alias. Acceptance also requires
 the remote helper to report the configured kernel-bound CDHash captured from
-its running process image before any peer network probe. The existing
-selection file is
+its running process image before any peer network probe. The optional
+`ssh_identity_file` is an absolute, owner-only key path on the
+activating machine. When present, the helper passes it with `-i` and forces
+`IdentitiesOnly=yes` plus `IdentityAgent=none`; the key path is validated as a
+private regular non-symlink and may not alias any writable canary artifact.
+This preserves the ignored-SSH-config boundary for hosts that do not accept a
+default key or agent identity. The existing selection file is
 `{"schema":"subrouter.cutover-canary-selection/v1","agent_type":"codex","session_id":"IDLE_EXISTING_SESSION"}`.
 Use separate proof files for the authenticated and sticky legs, but the same
 state and cleanup-journal paths so their sanitized handoff is continuous.

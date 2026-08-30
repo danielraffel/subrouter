@@ -397,6 +397,10 @@ func TestProbeFailsClosedOnDraining(t *testing.T) {
 func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 	dir := privateDir(t)
 	digest := strings.Repeat("a", 64)
+	identityFile := filepath.Join(dir, "identity")
+	if err := os.WriteFile(identityFile, []byte("test identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	fakeSSH := filepath.Join(dir, "ssh")
 	argvFile := filepath.Join(dir, "argv")
 	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" >%q\ncase \"$*\" in *draining) draining=true ;; *) draining=false ;; esac\nprintf '{\"schema\":\"%s\",\"ok\":true,\"health_ok\":true,\"ready_ok\":true,\"draining\":%%s,\"identity_kind\":\"%s\",\"executable_identity\":\"%s\"}\\n' \"$draining\"\n", argvFile, PeerProbeSchema, goBuildInfoIdentityKind, digest)
@@ -406,7 +410,7 @@ func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 	previousSSH := sshCommandPath
 	sshCommandPath = fakeSSH
 	defer func() { sshCommandPath = previousSSH }()
-	peer := PeerTarget{Name: "peer-a", SSHHost: "peer.example", RemoteExecutable: "/private/subrouter-cutover-canary", RemoteConfigFile: "/private/healthy", ExpectedIdentityKind: goBuildInfoIdentityKind, ExpectedExecutableIdentity: digest, TimeoutSeconds: 10}
+	peer := PeerTarget{Name: "peer-a", SSHHost: "peer.example", SSHIdentityFile: identityFile, RemoteExecutable: "/private/subrouter-cutover-canary", RemoteConfigFile: "/private/healthy", ExpectedIdentityKind: goBuildInfoIdentityKind, ExpectedExecutableIdentity: digest, TimeoutSeconds: 10}
 	if err := runPeer(context.Background(), peer); err != nil {
 		t.Fatal(err)
 	}
@@ -414,10 +418,18 @@ func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"-F\nnone\n", "ControlMaster=no", "ControlPersist=no", "ForkAfterAuthentication=no", "ProxyCommand=none", "ProxyJump=none"} {
+	for _, required := range []string{"-F\nnone\n", "ControlMaster=no", "ControlPersist=no", "ForkAfterAuthentication=no", "ProxyCommand=none", "ProxyJump=none", "IdentitiesOnly=yes", "IdentityAgent=none", "-i\n" + identityFile + "\n"} {
 		if !strings.Contains(string(argv), required) {
 			t.Fatalf("peer ssh argv omitted %q: %s", required, argv)
 		}
+	}
+	peerB := peer
+	peerB.Name = "peer-b"
+	configPath := writeConfig(t, dir, "shared-identity.json", PeerLegConfig{
+		Schema: ConfigSchema, ProofFile: filepath.Join(dir, "shared-identity-proof.json"), Peers: []PeerTarget{peer, peerB},
+	})
+	if err := RunLeg(t.Context(), "peer-health-readiness", configPath, "shared-identity"); err != nil {
+		t.Fatalf("two peers sharing one SSH identity rejected: %v", err)
 	}
 	peer.RemoteConfigFile = "/private/draining"
 	if err := runPeer(context.Background(), peer); err == nil {
@@ -432,6 +444,13 @@ func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 	peer.RemoteExecutable = "/private/helper with spaces"
 	if err := runPeer(context.Background(), peer); err == nil {
 		t.Fatal("shell-bearing remote path accepted")
+	}
+	peer.RemoteExecutable = "/private/subrouter-cutover-canary"
+	if err := os.Chmod(identityFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runPeer(context.Background(), peer); err == nil {
+		t.Fatal("group/world-readable SSH identity accepted")
 	}
 }
 
@@ -509,6 +528,30 @@ func TestWritableArtifactsRejectReadOnlyPathAndInodeAliases(t *testing.T) {
 		}
 		if got, err := os.ReadFile(tokenPath); err != nil || string(got) != "secret-token\n" {
 			t.Fatalf("admin token mutated: %q / %v", got, err)
+		}
+	})
+
+	t.Run("proof equals peer SSH identity", func(t *testing.T) {
+		dir := privateDir(t)
+		identityPath := filepath.Join(dir, "identity")
+		if err := os.WriteFile(identityPath, []byte("test identity"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := PeerLegConfig{
+			Schema: ConfigSchema, ProofFile: identityPath,
+			Peers: []PeerTarget{{Name: "peer-a", SSHHost: "peer.example", SSHIdentityFile: identityPath, RemoteExecutable: "/private/helper", RemoteConfigFile: "/private/config", ExpectedIdentityKind: goBuildInfoIdentityKind, ExpectedExecutableIdentity: strings.Repeat("a", 64), TimeoutSeconds: 1}},
+		}
+		configPath := writeConfig(t, dir, "config.json", cfg)
+		before, err := os.ReadFile(identityPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := RunLeg(t.Context(), "peer-health-readiness", configPath, "test-run"); err == nil || !strings.Contains(err.Error(), "distinct") {
+			t.Fatalf("SSH identity alias error=%v", err)
+		}
+		after, err := os.ReadFile(identityPath)
+		if err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("SSH identity mutated: %q / %v", after, err)
 		}
 	})
 

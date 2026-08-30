@@ -31,6 +31,7 @@ type HTTPConfig struct {
 type PeerTarget struct {
 	Name                       string `json:"name"`
 	SSHHost                    string `json:"ssh_host"`
+	SSHIdentityFile            string `json:"ssh_identity_file,omitempty"`
 	RemoteExecutable           string `json:"remote_executable"`
 	RemoteConfigFile           string `json:"remote_config_file"`
 	ExpectedExecutableIdentity string `json:"expected_executable_identity"`
