@@ -357,6 +357,9 @@ func (c *apiClient) routedTurn(ctx context.Context, sessionID, model, marker str
 func claudeRequest(model, marker string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"model": model, "max_tokens": 64,
+		"system": []map[string]any{{
+			"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+		}},
 		"messages": []map[string]any{{"role": "user", "content": "Reply with exactly " + marker}},
 	})
 }
@@ -369,10 +372,25 @@ func exactClaudeMarkerResponse(body []byte, marker string) bool {
 			Text string `json:"text"`
 		} `json:"content"`
 	}
-	if marker == "" || json.Unmarshal(body, &response) != nil || response.Type != "message" || len(response.Content) != 1 {
+	if marker == "" || json.Unmarshal(body, &response) != nil || response.Type != "message" {
 		return false
 	}
-	return response.Content[0].Type == "text" && response.Content[0].Text == marker
+	matched := false
+	for _, content := range response.Content {
+		switch content.Type {
+		case "thinking", "redacted_thinking":
+			// Claude's default reasoning mode can emit internal blocks before the
+			// visible answer. They do not weaken the exact visible marker proof.
+		case "text":
+			if matched || content.Text != marker {
+				return false
+			}
+			matched = true
+		default:
+			return false
+		}
+	}
+	return matched
 }
 
 func (c *apiClient) claudeTurn(ctx context.Context, sessionID, model, marker string) (int, error) {
@@ -383,7 +401,10 @@ func (c *apiClient) claudeTurn(ctx context.Context, sessionID, model, marker str
 	headers := map[string]string{
 		"Authorization":            "Bearer subrouter",
 		"Content-Type":             "application/json",
+		"anthropic-beta":           "claude-code-20250219,oauth-2025-04-20",
 		"anthropic-version":        "2023-06-01",
+		"User-Agent":               "claude-cli/2.1.199 (external, cli)",
+		"x-app":                    "cli",
 		"X-Subrouter-Agent":        "claude",
 		"X-Claude-Code-Session-Id": sessionID,
 		"X-Subrouter-No-Retry":     "true",

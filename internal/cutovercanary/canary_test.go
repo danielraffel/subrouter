@@ -130,7 +130,10 @@ func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/messages":
 			if r.Header.Get("Authorization") != "Bearer subrouter" ||
+				r.Header.Get("anthropic-beta") != "claude-code-20250219,oauth-2025-04-20" ||
 				r.Header.Get("anthropic-version") != "2023-06-01" ||
+				r.Header.Get("User-Agent") != "claude-cli/2.1.199 (external, cli)" ||
+				r.Header.Get("x-app") != "cli" ||
 				r.Header.Get("X-Subrouter-Agent") != "claude" ||
 				r.Header.Get("X-Subrouter-No-Retry") != "true" {
 				t.Error("Claude canary request headers do not match the routed CLI shape")
@@ -139,7 +142,11 @@ func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
 			var body struct {
 				Model     string `json:"model"`
 				MaxTokens int    `json:"max_tokens"`
-				Messages  []struct {
+				System    []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"system"`
+				Messages []struct {
 					Role    string `json:"role"`
 					Content string `json:"content"`
 				} `json:"messages"`
@@ -147,6 +154,10 @@ func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Model != "claude-test" ||
 				body.MaxTokens != 64 || len(body.Messages) != 1 || body.Messages[0].Role != "user" {
 				t.Error("Claude canary request body is invalid")
+			}
+			if len(body.System) != 1 || body.System[0].Type != "text" ||
+				body.System[0].Text != "You are Claude Code, Anthropic's official CLI for Claude." {
+				t.Error("Claude canary request does not carry the Claude Code system identity")
 			}
 			marker := strings.TrimPrefix(body.Messages[0].Content, "Reply with exactly ")
 			mu.Lock()
@@ -231,6 +242,21 @@ func TestAuthenticatedClaudeCanaryRejectsWrongMarkerAndCleans(t *testing.T) {
 	}
 	if _, err := os.Stat(cfg.ProofFile); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("failed Claude canary wrote success proof")
+	}
+}
+
+func TestExactClaudeMarkerResponseAllowsInternalThinkingOnly(t *testing.T) {
+	if !exactClaudeMarkerResponse([]byte(`{"type":"message","content":[{"type":"thinking","thinking":"private","signature":"opaque"},{"type":"text","text":"MARK"}]}`), "MARK") {
+		t.Fatal("Claude marker with an internal thinking block was rejected")
+	}
+	for _, body := range []string{
+		`{"type":"message","content":[{"type":"text","text":"MARK"},{"type":"text","text":"EXTRA"}]}`,
+		`{"type":"message","content":[{"type":"tool_use","name":"unexpected"},{"type":"text","text":"MARK"}]}`,
+		`{"type":"message","content":[{"type":"thinking","thinking":"private"}]}`,
+	} {
+		if exactClaudeMarkerResponse([]byte(body), "MARK") {
+			t.Fatalf("unsafe Claude response was accepted: %s", body)
+		}
 	}
 }
 
