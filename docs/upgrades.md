@@ -118,13 +118,70 @@ The one-time transition cannot preserve connections accepted by an older, unsupe
 
 ### Transactional per-user LaunchAgent migration
 
+This migration is an optional high-assurance path for sensitive changes. Choose
+one of three credential layouts:
+
+1. **Full isolated production cutover (default):** run `enroll-isolated`
+   without `--only`. The complete retiring Codex OAuth inventory is enrolled
+   into a separate candidate store, allowing the full activation preflight and
+   an independently usable legacy service.
+2. **Selected isolated validation only:** repeat `--only ACCOUNT` to enroll
+   explicit accounts for offline or canary validation. A partial candidate is
+   useful for those checks, but the complete-inventory preflight still blocks
+   full activation.
+3. **Ordinary in-place upgrade:** keep the original state root and use
+   `sr codex migrate-isolation` when required. This avoids a second inventory,
+   but it does not provide an independent credential rollback guarantee.
+
+Use a separate candidate state root when rollback must preserve an independently
+usable legacy service. Re-enroll every served OAuth account into that root so
+the candidate and legacy service never share a rotating refresh-token chain:
+
+```bash
+candidate_state="$HOME/.subrouter-candidate"
+retiring_state="$HOME/.subrouter"
+candidate_bin="$(command -v subrouter)" # or an absolute reviewed candidate path
+SUBROUTER_STATE_DIR="$candidate_state" \
+  SUBROUTER_BIN="$candidate_bin" \
+  "$candidate_bin" codex enroll-isolated \
+  --retiring-state-dir "$retiring_state" \
+  --device-auth
+```
+
+Omitting `--only` above is the production default and enrolls the complete
+inventory. To prepare only named accounts for offline or canary validation,
+repeat the flag, for example `--only first@example.com --only
+second@example.com`. The command reports a partial candidate and leaves full
+activation blocked until every retiring Codex OAuth identity is enrolled.
+
+The mandatory `codex isolation-check` preflight enforces this separation only
+for the Codex store. Add every other OAuth subscription profile through its
+normal account-specific login command with the same candidate state root, and
+make its identity plus a real routed request an explicit deployment canary.
+Claude, Kimi, and future OAuth providers do not inherit Codex's refresh-chain
+comparison automatically. Static API keys may be added to both stores without
+reauthorization because using them does not rotate or invalidate the rollback
+copy. Never copy OAuth refresh tokens to avoid the login step: either finish
+and independently verify each provider's isolated enrollment or choose the
+ordinary in-place upgrade. The generic transaction fails closed on the Codex
+comparison and every declared callback; it cannot prove an undeclared
+provider-specific isolation property.
+
+Recommend this mode when a short maintenance window is acceptable but a failed
+cutover must restore the complete previous provider pool. Its cost is one fresh
+approval per OAuth account plus deployment-specific functional-canary setup.
+Its benefit is that health, real routed Codex and Claude traffic, failover, and
+an existing session can all be proven while automatic rollback remains armed.
+
 The per-user migration does not accept health alone as cutover proof. Preparation
 is non-disruptive, while activation requires a bounded preflight and an explicit
 functional canary command:
 
 ```bash
-deploy/macos/migrate-launchagent-to-supervisor.sh
-deploy/macos/migrate-launchagent-to-supervisor.sh --activate \
+SUBROUTER_STATE_DIR="$candidate_state" SUBROUTER_BIN="$candidate_bin" \
+  deploy/macos/migrate-launchagent-to-supervisor.sh
+SUBROUTER_STATE_DIR="$candidate_state" SUBROUTER_BIN="$candidate_bin" \
+  deploy/macos/migrate-launchagent-to-supervisor.sh --activate \
   --canary-callback /path/to/real-routed-canary
 ```
 
@@ -134,7 +191,14 @@ public listener and worker arguments explicitly on both preparation and
 activation:
 
 ```bash
-deploy/macos/migrate-launchagent-to-supervisor.sh \
+SUBROUTER_STATE_DIR="$candidate_state" SUBROUTER_BIN="$candidate_bin" \
+  deploy/macos/migrate-launchagent-to-supervisor.sh \
+  --public-addr 127.0.0.1:8080 \
+  --worker-serve-args-json /path/to/worker-serve-args.json \
+  --candidate-env-json /path/to/candidate-environment.json
+SUBROUTER_STATE_DIR="$candidate_state" SUBROUTER_BIN="$candidate_bin" \
+  deploy/macos/migrate-launchagent-to-supervisor.sh --activate \
+  --canary-callback /path/to/real-routed-canary \
   --public-addr 127.0.0.1:8080 \
   --worker-serve-args-json /path/to/worker-serve-args.json \
   --candidate-env-json /path/to/candidate-environment.json
@@ -284,13 +348,15 @@ Validate those exact files before the maintenance window, then pass the runner
 as the migration callback:
 
 ```bash
+candidate_state="$HOME/.subrouter-candidate"
 candidate_worker=/private/subrouter
 candidate_worker_sha256="$(shasum -a 256 "$candidate_worker" | awk '{print $1}')"
 SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$candidate_worker" \
   SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256="$candidate_worker_sha256" \
   SUBROUTER_CANARY_MANIFEST_FILE=/private/manifest.json \
   deploy/macos/run-functional-canary.py --validate-only
-SUBROUTER_CANARY_MANIFEST_FILE=/private/manifest.json \
+SUBROUTER_STATE_DIR="$candidate_state" SUBROUTER_BIN="$candidate_worker" \
+  SUBROUTER_CANARY_MANIFEST_FILE=/private/manifest.json \
   deploy/macos/migrate-launchagent-to-supervisor.sh --activate \
   --canary-callback /absolute/path/run-functional-canary.py
 ```

@@ -21,7 +21,7 @@ import (
 const codexIsolationRemediation = "sr codex migrate-isolation"
 const codexIsolatedEnrollmentCommand = "sr codex enroll-isolated"
 const codexIsolationComparisonRemediation = "verify candidate and retiring credential stores before activation"
-const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH], sr codex migrate-isolation [--device-auth], or sr codex enroll-isolated --retiring-state-dir PATH [--device-auth]"
+const codexAccountUsage = "sr codex isolation-check [--json] [--retiring-state-dir PATH], sr codex migrate-isolation [--device-auth], or sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]..."
 
 var errCodexIsolationCheckFailed = errors.New("codex credential isolation preflight failed")
 
@@ -814,16 +814,58 @@ func codexEnrollmentComplete(inventory codexEnrollmentInventory) bool {
 	return len(inventory.candidateByEmail) == len(inventory.retiringByEmail)
 }
 
+func codexEnrollmentTargets(
+	inventory codexEnrollmentInventory,
+	selectors []string,
+) ([]accounts.StoredCodexAccount, error) {
+	if len(selectors) == 0 {
+		return append([]accounts.StoredCodexAccount(nil), inventory.retiring...), nil
+	}
+	targets := make([]accounts.StoredCodexAccount, 0, len(selectors))
+	seen := make(map[string]struct{}, len(selectors))
+	for _, raw := range selectors {
+		selector := strings.ToLower(strings.TrimSpace(raw))
+		if selector == "" {
+			return nil, errors.New("--only account selector must not be empty")
+		}
+		if _, duplicate := seen[selector]; duplicate {
+			return nil, fmt.Errorf("duplicate --only account selector %q", strings.TrimSpace(raw))
+		}
+		target, ok := inventory.retiringByEmail[selector]
+		if !ok {
+			return nil, fmt.Errorf("--only account %q is not a retiring Codex OAuth identity", strings.TrimSpace(raw))
+		}
+		seen[selector] = struct{}{}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+func selectedCodexEnrollmentComplete(
+	inventory codexEnrollmentInventory,
+	targets []accounts.StoredCodexAccount,
+) bool {
+	for _, target := range targets {
+		selector := strings.ToLower(strings.TrimSpace(target.Email))
+		if _, ok := inventory.candidateByEmail[selector]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (r srRunner) enrollCodexIsolation(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet(codexIsolatedEnrollmentCommand, flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	retiringStateDir := flags.String("retiring-state-dir", "", "read the retiring service state root")
 	deviceAuth := flags.Bool("device-auth", false, "use codex login --device-auth")
+	var only stringList
+	flags.Var(&only, "only", "enroll one retiring Codex OAuth identity (repeatable; partial candidates cannot pass full activation preflight)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || strings.TrimSpace(*retiringStateDir) == "" {
-		return fmt.Errorf("usage: %s --retiring-state-dir PATH [--device-auth]", codexIsolatedEnrollmentCommand)
+		return fmt.Errorf("usage: %s --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]...", codexIsolatedEnrollmentCommand)
 	}
 	candidateRoot, err := normalizeStateRoot(storepath.StateDir())
 	if err != nil {
@@ -842,6 +884,10 @@ func (r srRunner) enrollCodexIsolation(ctx context.Context, args []string) error
 	if err != nil {
 		return err
 	}
+	targets, err := codexEnrollmentTargets(inventory, only)
+	if err != nil {
+		return err
+	}
 	originalActive, err := snapshotActiveCodexAuth()
 	if err != nil {
 		return fmt.Errorf("snapshot local Codex auth: %w", err)
@@ -851,21 +897,32 @@ func (r srRunner) enrollCodexIsolation(ctx context.Context, args []string) error
 		return fmt.Errorf("snapshot retiring state tree: %w", err)
 	}
 
-	pending := make([]accounts.StoredCodexAccount, 0, len(inventory.retiring))
-	for _, target := range inventory.retiring {
+	pending := make([]accounts.StoredCodexAccount, 0, len(targets))
+	for _, target := range targets {
 		if _, enrolled := inventory.candidateByEmail[strings.ToLower(strings.TrimSpace(target.Email))]; !enrolled {
 			pending = append(pending, target)
 		}
 	}
 	if len(pending) == 0 {
-		if !codexEnrollmentComplete(inventory) {
+		if err := verifyEnrollmentSourcesUnchanged(originalActive, retiringStore.Dir, retiringBefore); err != nil {
+			return err
+		}
+		if codexEnrollmentComplete(inventory) {
+			fmt.Fprintln(r.out, "Candidate already contains the complete isolated Codex account inventory. No enrollment needed.")
+			return nil
+		}
+		if len(only) == 0 || !selectedCodexEnrollmentComplete(inventory, targets) {
 			return errCodexIsolationCheckFailed
 		}
-		fmt.Fprintln(r.out, "Candidate already contains the complete isolated Codex account inventory. No enrollment needed.")
-		return verifyEnrollmentSourcesUnchanged(originalActive, retiringStore.Dir, retiringBefore)
+		fmt.Fprintf(r.out, "Selected Codex OAuth account(s) are already enrolled. Candidate contains %d of %d retiring Codex OAuth identities. Full activation preflight remains blocked until the inventory is complete.\n", len(inventory.candidateByEmail), len(inventory.retiringByEmail))
+		return nil
 	}
 
-	fmt.Fprintf(r.out, "Found %d retiring Codex OAuth account(s); %d require isolated enrollment.\n", len(inventory.retiring), len(pending))
+	if len(only) == 0 {
+		fmt.Fprintf(r.out, "Found %d retiring Codex OAuth account(s); %d require isolated enrollment.\n", len(inventory.retiring), len(pending))
+	} else {
+		fmt.Fprintf(r.out, "Selected %d of %d retiring Codex OAuth account(s); %d require isolated enrollment.\n", len(targets), len(inventory.retiring), len(pending))
+	}
 	fmt.Fprintln(r.out, "Each login uses a temporary CODEX_HOME; local Codex auth and the retiring state tree will not be changed.")
 	for index, target := range pending {
 		fmt.Fprintf(r.out, "\nSign in as %s (%d/%d).\n", target.Email, index+1, len(pending))
@@ -923,8 +980,15 @@ func (r srRunner) enrollCodexIsolation(ctx context.Context, args []string) error
 	if err != nil {
 		return err
 	}
+	if !selectedCodexEnrollmentComplete(inventory, targets) {
+		return fmt.Errorf("selected Codex isolation comparison failed: %w", errCodexIsolationCheckFailed)
+	}
 	if !codexEnrollmentComplete(inventory) {
-		return fmt.Errorf("final Codex isolation comparison failed: %w", errCodexIsolationCheckFailed)
+		if len(only) == 0 {
+			return fmt.Errorf("final Codex isolation comparison failed: %w", errCodexIsolationCheckFailed)
+		}
+		fmt.Fprintf(r.out, "\nEnrolled %d selected Codex OAuth account(s). Candidate contains %d of %d retiring Codex OAuth identities; local Codex auth and the retiring account store are unchanged. This partial candidate is suitable for offline or canary validation, but full activation preflight remains blocked until the inventory is complete.\n", len(pending), len(inventory.candidateByEmail), len(inventory.retiringByEmail))
+		return nil
 	}
 	fmt.Fprintf(r.out, "\nEnrolled %d Codex OAuth account(s). Candidate and retiring Codex OAuth inventories match; local Codex auth and the retiring account store are unchanged.\n", len(pending))
 	return nil

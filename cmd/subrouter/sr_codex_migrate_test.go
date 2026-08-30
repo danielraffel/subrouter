@@ -171,6 +171,140 @@ func TestCodexEnrollIsolatedResumesSafeSubsetAndPreservesSources(t *testing.T) {
 	}
 }
 
+func TestCodexEnrollIsolatedOnlyBuildsExplicitPartialCandidate(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(root, "retiring")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+	if err := accounts.WriteActiveCodexAuth(testCodexAuth("interactive@example.com", "acct-interactive")); err != nil {
+		t.Fatal(err)
+	}
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+	saveLegacyCodexAccount(t, retiring, "beta@example.com", "acct-beta", "retiring-beta")
+	retiringBefore := snapshotTestTree(t, retiringRoot)
+
+	beta := testCodexAuth("beta@example.com", "acct-beta")
+	beta.Tokens.RefreshToken = "candidate-beta"
+	fake := &recordingSRCommandRunner{loginAuth: beta}
+	var out bytes.Buffer
+	runner := srRunner{store: accounts.DefaultCodexStore(), in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	if err := runner.codexAccount(context.Background(), []string{
+		"enroll-isolated", "--retiring-state-dir", retiringRoot,
+		"--only", "beta@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.commandCount("codex", "login"); got != 1 {
+		t.Fatalf("login count = %d, want one", got)
+	}
+	stored, err := rawCodexStoreForStateRoot(candidateRoot).ListStoredReadOnly()
+	if err != nil || len(stored) != 1 || stored[0].Email != "beta@example.com" {
+		t.Fatalf("candidate accounts = %#v, err=%v", stored, err)
+	}
+	for _, want := range []string{"Selected 1 of 2", "partial candidate", "full activation preflight remains blocked"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
+	}
+	if after := snapshotTestTree(t, retiringRoot); !reflect.DeepEqual(after, retiringBefore) {
+		t.Fatalf("partial enrollment changed retiring state: before=%v after=%v", retiringBefore, after)
+	}
+
+	var checkOut bytes.Buffer
+	checkRunner := srRunner{store: rawCodexStoreForStateRoot(candidateRoot), in: strings.NewReader(""), out: &checkOut, errOut: &checkOut}
+	checkErr := checkRunner.codexAccount(context.Background(), []string{
+		"isolation-check", "--json", "--retiring-state-dir", retiringRoot,
+	})
+	if !errors.Is(checkErr, errCodexIsolationCheckFailed) {
+		t.Fatalf("full isolation check error = %v, want activation-blocking failure", checkErr)
+	}
+	var result codexIsolationCheckResult
+	if err := json.Unmarshal(checkOut.Bytes(), &result); err != nil {
+		t.Fatalf("decode full isolation result %q: %v", checkOut.String(), err)
+	}
+	if result.OK || result.Comparison == nil || result.Comparison.AccountInventoryMatch {
+		t.Fatalf("partial candidate unexpectedly passed full comparison: %#v", result)
+	}
+}
+
+func TestCodexEnrollIsolatedOnlyRejectsInvalidSelectionBeforeLogin(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown", args: []string{"--only", "missing@example.com"}, want: "not a retiring Codex OAuth identity"},
+		{name: "duplicate", args: []string{"--only", "alpha@example.com", "--only", "ALPHA@example.com"}, want: "duplicate --only"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			candidateRoot := filepath.Join(root, "candidate")
+			retiringRoot := filepath.Join(root, "retiring")
+			t.Setenv("HOME", filepath.Join(root, "home"))
+			t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+			retiring := rawCodexStoreForStateRoot(retiringRoot)
+			saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+			before := snapshotTestTree(t, root)
+			fake := &recordingSRCommandRunner{}
+			runner := srRunner{store: accounts.DefaultCodexStore(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: fake}
+			args := append([]string{"enroll-isolated", "--retiring-state-dir", retiringRoot}, test.args...)
+			err := runner.codexAccount(context.Background(), args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			if got := fake.commandCount("codex", "login"); got != 0 {
+				t.Fatalf("login count = %d, want zero", got)
+			}
+			if after := snapshotTestTree(t, root); !reflect.DeepEqual(after, before) {
+				t.Fatalf("invalid selection mutated state: before=%v after=%v", before, after)
+			}
+		})
+	}
+}
+
+func TestCodexEnrollIsolatedOnlyResumesCompletedSelection(t *testing.T) {
+	root := t.TempDir()
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(root, "retiring")
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+	saveLegacyCodexAccount(t, retiring, "beta@example.com", "acct-beta", "retiring-beta")
+	candidate := rawCodexStoreForStateRoot(candidateRoot)
+	alpha := testCodexAuth("alpha@example.com", "acct-alpha")
+	alpha.Tokens.RefreshToken = "candidate-alpha"
+	if err := candidate.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "alpha@example.com",
+		Provider:              accounts.ProviderCodex,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  alpha,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &recordingSRCommandRunner{}
+	var out bytes.Buffer
+	runner := srRunner{store: candidate, in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	if err := runner.codexAccount(context.Background(), []string{
+		"enroll-isolated", "--retiring-state-dir", retiringRoot,
+		"--only", "alpha@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.commandCount("codex", "login"); got != 0 {
+		t.Fatalf("login count = %d, want zero", got)
+	}
+	for _, want := range []string{"already enrolled", "contains 1 of 2", "Full activation preflight remains blocked"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
 func filteredTreeSnapshot(snapshot map[string]string, prefix string) map[string]string {
 	filtered := make(map[string]string)
 	for path, value := range snapshot {

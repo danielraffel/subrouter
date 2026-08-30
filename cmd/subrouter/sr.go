@@ -88,8 +88,9 @@ Usage:
                         Check serving credential isolation without changing credentials
   sr codex migrate-isolation [--device-auth]
                         Re-enroll legacy OAuth accounts without changing local Codex auth
-  sr codex enroll-isolated --retiring-state-dir PATH [--device-auth]
-                        Build a separate candidate store with fresh isolated OAuth logins
+  sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]...
+                        Enroll the full isolated candidate by default; repeat --only for
+                        validation-only accounts (partial candidates cannot activate)
   sr az status          Show whether the Azure Codex fallback is armed
   sr az test [model]    Prove the Azure route with one forced request
   sr az codex [args]    Run Codex forced onto Azure

@@ -189,6 +189,22 @@ A server with neither credential configured rejects every account import, includ
 
 Serving processes accept and refresh only Codex OAuth credentials created by an isolated Subrouter login. This keeps proxy refresh-token chains independent from interactive `~/.codex/auth.json`. After upgrading a local store that contains older accounts without provenance metadata, run `sr codex migrate-isolation` (or add `--device-auth`) once; it enumerates the affected accounts, requires each login to match the expected identity, and leaves the active Codex login unchanged. For a shared server use `sr server sync <name> --all`, or repair an individual hosted credential with `sr account repair <account-id>`. Complete this migration before starting the upgraded serving process: upgraded serving rejects affected credentials immediately rather than continuing to use them until their access tokens expire. `sr doctor` and `sr status` report the remaining local migration count without exposing credential material.
 
+For a sensitive migration, choose one credential layout deliberately:
+
+- A full isolated production cutover uses `sr codex enroll-isolated` without
+  `--only`. It stages the complete account inventory and keeps the legacy
+  service independently usable until the routed canaries pass.
+- For offline or canary validation only, repeat `--only ACCOUNT` to enroll
+  selected accounts. A partial candidate cannot pass the full activation
+  preflight.
+- An ordinary in-place upgrade keeps the original store and uses
+  `sr codex migrate-isolation` when needed. It does not provide an independent
+  credential rollback guarantee.
+
+See the optional
+[rollback-isolated transactional cutover](docs/upgrades.md#transactional-per-user-launchagent-migration)
+for the full production procedure.
+
 ### Tailnet authentication for self-hosted servers
 
 A server whose port is already restricted to a tailnet by ACL does not need a second credential system on top of it. Start it with `--tailscale-auth` (or `SUBROUTER_TAILSCALE_AUTH=1`) and non-loopback callers are authenticated by their tailnet identity instead:

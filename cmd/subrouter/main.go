@@ -1617,8 +1617,9 @@ Usage:
                            Check serving credential isolation without changing credentials
   %[1]s codex migrate-isolation [--device-auth]
                            Re-enroll legacy Codex OAuth accounts without changing local Codex auth
-  %[1]s codex enroll-isolated --retiring-state-dir PATH [--device-auth]
-                           Build a separate candidate store with fresh isolated OAuth logins
+  %[1]s codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]...
+                           Enroll the full isolated candidate by default; repeat --only for
+                           validation-only accounts (partial candidates cannot activate)
 
   %[1]s remote -v          List local, cmux hosted, and self-hosted remotes
   %[1]s remote use local   Route agents through this computer
