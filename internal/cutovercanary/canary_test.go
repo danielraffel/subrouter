@@ -152,7 +152,7 @@ func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
 				} `json:"messages"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Model != "claude-test" ||
-				body.MaxTokens != 64 || len(body.Messages) != 1 || body.Messages[0].Role != "user" {
+				body.MaxTokens != 256 || len(body.Messages) != 1 || body.Messages[0].Role != "user" {
 				t.Error("Claude canary request body is invalid")
 			}
 			if len(body.System) != 1 || body.System[0].Type != "text" ||

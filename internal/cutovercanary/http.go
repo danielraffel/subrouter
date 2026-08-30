@@ -356,7 +356,7 @@ func (c *apiClient) routedTurn(ctx context.Context, sessionID, model, marker str
 
 func claudeRequest(model, marker string) ([]byte, error) {
 	return json.Marshal(map[string]any{
-		"model": model, "max_tokens": 64,
+		"model": model, "max_tokens": 256,
 		"system": []map[string]any{{
 			"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.",
 		}},
