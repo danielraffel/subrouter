@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ func TestPublishAccountDiskMutationDoesNotMutateWhenPublicationFails(t *testing.
 	want := errors.New("generation unavailable")
 	err := publishAccountDiskMutation(
 		context.Background(),
-		t.TempDir(),
+		conventionalAccountStore(t.TempDir()),
 		func(string) error { return want },
 		func() (bool, error) {
 			called = true
@@ -39,11 +40,29 @@ func TestPublishAccountDiskMutationDoesNotMutateWhenPublicationFails(t *testing.
 	}
 }
 
+func TestPublishAccountDiskMutationAcceptsCommittedClaudeRemoval(t *testing.T) {
+	committedErr := fmt.Errorf("%w: injected directory sync failure", agentclaude.ErrProfileRegistryWriteCommitted)
+	err := publishAccountDiskMutation(
+		context.Background(), conventionalAccountStore(t.TempDir()), advanceAccountDiskGeneration,
+		func() (bool, error) { return true, committedErr },
+	)
+	if err != nil {
+		t.Fatalf("committed ordinary Claude removal = %v", err)
+	}
+	err = publishAccountDiskMutation(
+		context.Background(), conventionalAccountStore(t.TempDir()), advanceAccountDiskGeneration,
+		func() (bool, error) { return false, committedErr },
+	)
+	if !errors.Is(err, agentclaude.ErrProfileRegistryWriteCommitted) {
+		t.Fatalf("uncommitted Claude removal error = %v", err)
+	}
+}
+
 func TestPublishAccountDiskMutationPublishesBeforeMutation(t *testing.T) {
 	published := false
 	err := publishAccountDiskMutation(
 		context.Background(),
-		t.TempDir(),
+		conventionalAccountStore(t.TempDir()),
 		func(string) error {
 			published = true
 			return nil
@@ -64,7 +83,7 @@ func TestWithAccountDiskMutationPublicationSkipsNoOpGeneration(t *testing.T) {
 	published := 0
 	err := withAccountDiskMutationPublication(
 		context.Background(),
-		t.TempDir(),
+		conventionalAccountStore(t.TempDir()),
 		func(string) error {
 			published++
 			return nil
@@ -84,7 +103,7 @@ func TestWithAccountDiskMutationPublicationRunsHookOnceBeforeMutation(t *testing
 	mutated := false
 	err := withAccountDiskMutationPublication(
 		context.Background(),
-		t.TempDir(),
+		conventionalAccountStore(t.TempDir()),
 		func(string) error {
 			if mutated {
 				t.Fatal("account generation published after credential mutation")
@@ -189,6 +208,43 @@ func TestOpenAccountRefDoesNotLoadCredentialsWhileRollbackMarkerExists(t *testin
 	}
 	if got := ref.All(); len(got) != 0 {
 		t.Fatalf("new worker loaded credentials behind rollback marker: %+v", got)
+	}
+}
+
+func TestOpenAccountRefRestoresPreRegistryClaudeRemovalStage(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile, found := claudeStore.FindProfile("work")
+	if !found {
+		t.Fatal("Claude profile missing before simulated crash")
+	}
+	instancePath := filepath.Join(claudeStore.InstancesDir(), profile.Dir)
+	snapshot, found, err := claudeStore.SnapshotProfileRemovalContext(t.Context(), "work")
+	if err != nil || !found {
+		t.Fatalf("Claude snapshot = found %v, err %v", found, err)
+	}
+	stageRoot := filepath.Join(filepath.Dir(instancePath), "."+filepath.Base(instancePath)+".remove-12345")
+	stageClaudeRemovalForTest(t, instancePath, stageRoot, snapshot.CredentialVersion)
+
+	ref, err := OpenAccountRef(store, claudeStore, http.DefaultClient)
+	if err != nil {
+		t.Fatalf("OpenAccountRef restart reconciliation: %v", err)
+	}
+	got := ref.All()
+	if len(got) != 1 || got[0].ID != "work" || got[0].Token != "claude-access" {
+		t.Fatalf("restarted accounts = %+v, want restored Claude account", got)
+	}
+	if _, err := os.Stat(filepath.Join(instancePath, ".credentials.json")); err != nil {
+		t.Fatalf("canonical Claude credential was not restored: %v", err)
+	}
+	if _, err := os.Lstat(stageRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reconciled stage remains: %v", err)
 	}
 }
 
@@ -508,16 +564,18 @@ func TestPreparedClaudeRollbackJournalCompletesCredentialCleanupAfterCrash(t *te
 			if err := os.WriteFile(filepath.Join(instancePath, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"must-delete"}}`), 0o600); err != nil {
 				t.Fatal(err)
 			}
+			snapshot, found, err := claudeStore.SnapshotProfileRemovalContext(t.Context(), "unpublished")
+			if err != nil || !found {
+				t.Fatalf("snapshot = found %v, err %v", found, err)
+			}
 			if _, found, err := prepareClaudeProfileRollback(context.Background(), root, "unpublished"); err != nil || !found {
 				t.Fatalf("prepare rollback = found %v, err %v", found, err)
 			}
-			stagingRoot := filepath.Join(filepath.Dir(instancePath), ".unpublished.remove-crash")
-			if err := os.Mkdir(stagingRoot, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Rename(instancePath, filepath.Join(stagingRoot, "instance")); err != nil {
-				t.Fatal(err)
-			}
+			// Match the decimal suffix emitted by os.MkdirTemp in
+			// stageProfileInstancePaths. Recovery intentionally ignores arbitrary
+			// .remove-* lookalikes so it cannot claim another profile's directory.
+			stagingRoot := filepath.Join(filepath.Dir(instancePath), ".unpublished.remove-123456789")
+			stageClaudeRemovalForTest(t, instancePath, stagingRoot, snapshot.CredentialVersion)
 			if registryRemoved {
 				mutateClaudeRegistryForRollbackTest(t, claudeStore, func(profiles map[string]agentclaude.Profile) {
 					delete(profiles, "unpublished")
@@ -553,6 +611,117 @@ func TestPreparedClaudeRollbackJournalCompletesCredentialCleanupAfterCrash(t *te
 				}
 			}
 		})
+	}
+}
+
+func TestPreparedTenantClaudeDeleteJournalCompletesAcrossCrash(t *testing.T) {
+	for _, registryRemoved := range []bool{false, true} {
+		name := "after-staging"
+		if registryRemoved {
+			name = "after-registry-removal"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			journalDir := filepath.Join(root, "accounts")
+			claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude-store")}
+			instancePath, err := claudeStore.CreateProfile("work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+				AccessToken: "must-delete", RefreshToken: "must-delete-refresh",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, found, err := claudeStore.SnapshotProfileRemovalContext(t.Context(), "work")
+			if err != nil || !found {
+				t.Fatalf("snapshot = found %v, err %v", found, err)
+			}
+			if err := advanceAccountDiskGeneration(journalDir); err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := prepareClaudeProfileDelete(t.Context(), journalDir, "work", claudeStore, snapshot); err != nil || !found {
+				t.Fatalf("prepare delete = found %v, err %v", found, err)
+			}
+			// Match the decimal suffix emitted by os.MkdirTemp in
+			// stageProfileInstancePaths.
+			stagingRoot := filepath.Join(filepath.Dir(instancePath), ".work.remove-123456789")
+			stageClaudeRemovalForTest(t, instancePath, stagingRoot, snapshot.CredentialVersion)
+			if registryRemoved {
+				mutateClaudeRegistryForRollbackTest(t, claudeStore, func(profiles map[string]agentclaude.Profile) {
+					delete(profiles, "work")
+				})
+			}
+			installFakeClaudeSecurityForRollbackTest(t)
+
+			reconciled, err := reconcileCompletedAccountRollback(t.Context(), conventionalAccountStore(journalDir), advanceAccountDiskGeneration)
+			if err != nil || !reconciled {
+				t.Fatalf("restart reconciliation = reconciled %v, err %v", reconciled, err)
+			}
+			if _, found := claudeStore.FindProfile("work"); found {
+				t.Fatal("restart retained deleted Claude registry entry")
+			}
+			if matches, err := filepath.Glob(filepath.Join(filepath.Dir(instancePath), ".work.remove-*")); err != nil || len(matches) != 0 {
+				t.Fatalf("restart retained staged credential dirs %v, err %v", matches, err)
+			}
+			if active, err := accountRollbackActive(journalDir); err != nil || active {
+				t.Fatalf("completed delete marker = active %v, err %v", active, err)
+			}
+		})
+	}
+}
+
+func TestPreparedTenantClaudeDeleteJournalAbortsSameDirectoryReplacement(t *testing.T) {
+	root := t.TempDir()
+	journalDir := filepath.Join(root, "accounts")
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude-store")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "old-access", RefreshToken: "old-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, found, err := claudeStore.SnapshotProfileRemovalContext(t.Context(), "work")
+	if err != nil || !found {
+		t.Fatalf("snapshot = found %v, err %v", found, err)
+	}
+	if err := advanceAccountDiskGeneration(journalDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := prepareClaudeProfileDelete(t.Context(), journalDir, "work", claudeStore, snapshot); err != nil || !found {
+		t.Fatalf("prepare delete = found %v, err %v", found, err)
+	}
+	instancePath := claudeStore.ClaudeConfigDir("work")
+	journalStage := filepath.Join(filepath.Dir(instancePath), "."+filepath.Base(instancePath)+".remove-123456789")
+	stageClaudeRemovalForTest(t, instancePath, journalStage, snapshot.CredentialVersion)
+	unrelatedStage := filepath.Join(filepath.Dir(instancePath), "."+filepath.Base(instancePath)+".remove-unrelated")
+	if err := os.MkdirAll(filepath.Join(unrelatedStage, "instance"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unrelatedStage, "instance", ".credentials.json"), []byte(`{"unrelated":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "replacement-access", RefreshToken: "replacement-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reconciled, err := reconcileCompletedAccountRollback(t.Context(), conventionalAccountStore(journalDir), advanceAccountDiskGeneration)
+	if err != nil || !reconciled {
+		t.Fatalf("replacement reconciliation = reconciled %v, err %v", reconciled, err)
+	}
+	if active, err := accountRollbackActive(journalDir); err != nil || active {
+		t.Fatalf("replacement marker = active %v, err %v", active, err)
+	}
+	credential, err := claudeStore.ReadCredential(t.Context(), claudeStore.ClaudeConfigDir("work"))
+	if err != nil || credential == nil || credential.AccessToken != "replacement-access" {
+		t.Fatalf("replacement changed by reconciliation: credential=%+v err=%v", credential, err)
+	}
+	if _, err := os.Lstat(journalStage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal-owned staged credential was not cleaned: %v", err)
+	}
+	if _, err := os.Lstat(unrelatedStage); err != nil {
+		t.Fatalf("unrelated staged credential was removed: %v", err)
 	}
 }
 
@@ -594,6 +763,51 @@ func installFakeClaudeSecurityForRollbackTest(t *testing.T) string {
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("SUBROUTER_ROLLBACK_KEYCHAIN_RECORD", recordPath)
 	return recordPath
+}
+
+func stageClaudeRemovalForTest(t *testing.T, originalPath, stagingRoot, credentialSetVersion string) {
+	t.Helper()
+	originalPath, err := filepath.Abs(filepath.Clean(originalPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagingRoot, err = filepath.Abs(filepath.Clean(stagingRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID := "00112233445566778899aabbccddeeff"
+	manifest, err := json.Marshal(map[string]any{
+		"version":                3,
+		"original_path":          originalPath,
+		"staging_root":           stagingRoot,
+		"entry_name":             "instance",
+		"operation_id":           operationID,
+		"credential_set_version": credentialSetVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingRoot, ".subrouter-removal-stage.json"), append(manifest, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := json.Marshal(map[string]any{
+		"version":                2,
+		"original_path":          originalPath,
+		"operation_id":           operationID,
+		"credential_set_version": credentialSetVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(originalPath, ".subrouter-removal-operation.json"), append(marker, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(originalPath, filepath.Join(stagingRoot, "instance")); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPreparedClaudeRollbackJournalRejectsCorruptRegistry(t *testing.T) {

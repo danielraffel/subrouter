@@ -95,6 +95,7 @@ type tenantCredentialLeaseRequest struct {
 	SessionID        string `json:"sessionId"`
 	UserEmail        string `json:"userEmail,omitempty"`
 	PreferAccountID  string `json:"preferAccountId,omitempty"`
+	ForceAccountID   string `json:"forceAccountId,omitempty"`
 	Model            string `json:"model,omitempty"`
 	SessionToken     string `json:"sessionToken,omitempty"`
 }
@@ -132,6 +133,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		http.Error(w, "invalid credential lease request", http.StatusBadRequest)
 		return
 	}
+	forceAccountRequested := strings.TrimSpace(input.ForceAccountID) != ""
 	input.normalize()
 	provider := accounts.Provider(input.Provider)
 	if keyedProvider, ok := APIKeyProviderForName(input.Provider); ok {
@@ -150,8 +152,8 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	}
 	if input.SessionID == "" || len(input.SessionID) > 512 ||
 		len(input.AgentType) > 64 || len(input.UserEmail) > 320 ||
-		len(input.PreferAccountID) > 512 || len(input.Model) > 256 ||
-		len(input.SessionToken) > 128 {
+		len(input.PreferAccountID) > 512 || len(input.ForceAccountID) > 512 || len(input.Model) > 256 ||
+		len(input.SessionToken) > 128 || (forceAccountRequested && input.ForceAccountID == "") {
 		http.Error(w, "invalid credential lease request", http.StatusBadRequest)
 		return
 	}
@@ -281,6 +283,7 @@ func (input *tenantCredentialLeaseRequest) normalize() {
 	input.SessionID = strings.TrimSpace(input.SessionID)
 	input.UserEmail = session.NormalizeUserEmail(input.UserEmail)
 	input.PreferAccountID = session.NormalizeAccountID(input.PreferAccountID)
+	input.ForceAccountID = session.NormalizeAccountID(input.ForceAccountID)
 	input.Model = session.NormalizeModel(input.Model)
 	input.SessionToken = strings.TrimSpace(input.SessionToken)
 }
@@ -394,9 +397,9 @@ func pickTenantCredentialLeaseAccount(
 	if server.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
 	}
-	// Preferred and sticky routing are hints, not permission to reuse a cooled
-	// credential. Filtering must happen first; if every candidate is blocked,
-	// return a retryable outage rather than silently defeating the cooldown.
+	// Forced, sticky, and preferred routing never grant permission to reuse a
+	// cooled credential. Filtering must happen first; if every candidate is
+	// blocked, return a retryable outage rather than defeating the cooldown.
 	now := time.Now()
 	eligible := candidates[:0]
 	var retryAt time.Time
@@ -427,10 +430,11 @@ func pickTenantCredentialLeaseAccount(
 		return accounts.Account{}, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 	}
 	candidates = eligible
-	if input.PreferAccountID != "" {
-		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
-			return preferred, nil
+	if input.ForceAccountID != "" {
+		if forced, ok := findAccount(candidates, input.ForceAccountID); ok {
+			return forced, nil
 		}
+		return accounts.Account{}, fmt.Errorf("forced account %q is unavailable", input.ForceAccountID)
 	}
 	if server.Sessions != nil {
 		agentType := tenantCredentialLeaseAgentType(input, provider)
@@ -438,6 +442,11 @@ func pickTenantCredentialLeaseAccount(
 			if sticky, found := findAccount(candidates, assignment.AccountID); found {
 				return sticky, nil
 			}
+		}
+	}
+	if input.PreferAccountID != "" {
+		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
+			return preferred, nil
 		}
 	}
 	return pickRoutingAccount(scheduler, candidates)

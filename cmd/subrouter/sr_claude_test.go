@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net"
@@ -13,9 +15,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1139,6 +1143,225 @@ func TestSRClaudeProxyUsesSelectedRemoteWithoutLocalProfile(t *testing.T) {
 	}
 }
 
+func TestResolveClaudeProxyAccountSelectorFailsClosed(t *testing.T) {
+	inventory := []remoteServerAccount{
+		{ID: "claude-profile-1", Label: "account-one", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "claude-profile-2", Label: "account-two", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "claude-profile-1", Label: "same-id-codex", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+		{ID: "codex-profile", Label: "codex-only", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+		{ID: "claude-api", Label: "metered", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey},
+	}
+	for selector, want := range map[string]string{
+		"claude-profile-1": "claude-profile-1",
+		"ACCOUNT-TWO":      "claude-profile-2",
+		"profile-2":        "claude-profile-2",
+	} {
+		got, err := resolveClaudeProxyAccountSelector(inventory, selector)
+		if err != nil || got != want {
+			t.Fatalf("resolve %q = %q, %v; want %q", selector, got, err, want)
+		}
+	}
+	for _, tc := range []struct {
+		selector string
+		wantErr  string
+	}{
+		{selector: "", wantErr: "cannot be empty"},
+		{selector: "missing", wantErr: "was not found"},
+		{selector: "profile", wantErr: "ambiguous"},
+		{selector: "codex-only", wantErr: "not Claude"},
+		{selector: "metered", wantErr: "subscription profile"},
+	} {
+		if _, err := resolveClaudeProxyAccountSelector(inventory, tc.selector); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Fatalf("resolve %q error = %v, want %q", tc.selector, err, tc.wantErr)
+		}
+	}
+	injected := slices.Clone(inventory)
+	injected[0].ID = "good\r\nX-Injected: yes"
+	if _, err := resolveClaudeProxyAccountSelector(injected, "account-one"); err == nil || !strings.Contains(err.Error(), "invalid server routing ID") {
+		t.Fatalf("header-injecting account ID error = %v", err)
+	}
+}
+
+func TestSRClaudeProxyPinnedAccountsLaunchInParallelWithoutSharedMutation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	recordDir := filepath.Join(home, "records")
+	if err := os.MkdirAll(recordDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var requestMu sync.Mutex
+	accountRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/accounts" {
+			http.NotFound(w, req)
+			return
+		}
+		requestMu.Lock()
+		accountRequests++
+		requestMu.Unlock()
+		_ = json.NewEncoder(w).Encode([]remoteServerAccount{
+			{ID: "claude-profile-1", Label: "account-one", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+			{ID: "claude-profile-2", Label: "account-two", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		})
+	}))
+	defer server.Close()
+
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.save(srServerFile{Default: "team", Servers: []srServerConfig{{Name: "team", URL: server.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	serverBefore, err := os.ReadFile(serverStore.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localProfiles := claude.DefaultStore()
+	if _, err := localProfiles.CreateProfile("local-active"); err != nil {
+		t.Fatal(err)
+	}
+	if err := localProfiles.SetActiveProfile("local-active"); err != nil {
+		t.Fatal(err)
+	}
+	profilesBefore, err := os.ReadFile(localProfiles.ProfilesPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+settings=
+marker=
+previous=
+for arg in "$@"; do
+  if [ "$previous" = "--settings" ]; then settings=$arg; fi
+  if [ "$previous" = "--marker" ]; then marker=$arg; fi
+  previous=$arg
+done
+printf 'args=%s\n' "$*" > "$RECORD_DIR/$marker.process"
+env >> "$RECORD_DIR/$marker.process"
+cp "$settings" "$RECORD_DIR/$marker.settings.json"
+printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$RECORD_DIR/$marker.config"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("RECORD_DIR", recordDir)
+
+	type launch struct{ selector, marker string }
+	launches := []launch{{selector: "account-one", marker: "one"}, {selector: "account-two", marker: "two"}}
+	errCh := make(chan error, len(launches))
+	start := make(chan struct{})
+	for _, item := range launches {
+		item := item
+		go func() {
+			<-start
+			runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+			errCh <- runner.claude(t.Context(), []string{"proxy", "--account", item.selector, "--marker", item.marker})
+		}()
+	}
+	close(start)
+	for range launches {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	requestMu.Lock()
+	gotRequests := accountRequests
+	requestMu.Unlock()
+	if gotRequests != len(launches) {
+		t.Fatalf("account inventory requests = %d, want %d independent validations", gotRequests, len(launches))
+	}
+	configDirs := make(map[string]bool)
+	for index, item := range launches {
+		settingsBody, err := os.ReadFile(filepath.Join(recordDir, item.marker+".settings.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var overlay struct {
+			Env map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+			t.Fatal(err)
+		}
+		wantID := fmt.Sprintf("claude-profile-%d", index+1)
+		wantHeaders := "X-Subrouter-Agent: claude\nX-Subrouter-Account-ID: " + wantID
+		if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != wantHeaders {
+			t.Fatalf("%s forced headers = %q, want %q", item.marker, got, wantHeaders)
+		}
+		processBody, err := os.ReadFile(filepath.Join(recordDir, item.marker+".process"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, accountID := range []string{"claude-profile-1", "claude-profile-2"} {
+			if bytes.Contains(processBody, []byte(accountID)) {
+				t.Fatalf("%s exposed account routing ID through argv/env:\n%s", item.marker, processBody)
+			}
+		}
+		configBody, err := os.ReadFile(filepath.Join(recordDir, item.marker+".config"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		configDir := strings.TrimSpace(string(configBody))
+		if configDir == "" || strings.Contains(configDir, wantID) {
+			t.Fatalf("%s config dir is not opaque: %q", item.marker, configDir)
+		}
+		configDirs[configDir] = true
+	}
+	if len(configDirs) != len(launches) {
+		t.Fatalf("pinned launches shared config directories: %v", configDirs)
+	}
+	serverAfter, err := os.ReadFile(serverStore.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profilesAfter, err := os.ReadFile(localProfiles.ProfilesPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(serverBefore, serverAfter) {
+		t.Fatal("parallel pinned launches mutated selected-server state")
+	}
+	if !bytes.Equal(profilesBefore, profilesAfter) || localProfiles.ActiveProfile() != "local-active" {
+		t.Fatal("parallel pinned launches mutated the active local Claude profile")
+	}
+}
+
+func TestSRClaudeProxyPinnedAccountValidationFailsBeforeLaunch(t *testing.T) {
+	home := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_ = json.NewEncoder(w).Encode([]remoteServerAccount{
+			{ID: "claude-profile-1", Label: "account-one", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		})
+	}))
+	defer server.Close()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "team", Servers: []srServerConfig{{Name: "team", URL: server.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "launched")
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	err := runner.claude(t.Context(), []string{"proxy", "--account", "missing", "-p", "hello"})
+	if err == nil || !strings.Contains(err.Error(), "was not found") {
+		t.Fatalf("missing pinned account error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched before pinned-account validation: %v", statErr)
+	}
+}
+
 func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
 	home := t.TempDir()
 	tempRoot := filepath.Join(home, "tmp")
@@ -1180,7 +1403,7 @@ func TestProfilelessClaudePlaintextServerPinsExactNodeAtLaunch(t *testing.T) {
 	}
 	runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(home, "accounts")}, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.runProxyClaudeForServerWithResolvers(
-		t.Context(), []string{"--resume", "session-a"}, server, "subrouter", configDir, lookup, load,
+		t.Context(), []string{"--resume", "session-a"}, server, "subrouter", configDir, "", "", lookup, load,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1331,7 +1554,7 @@ func TestProfilelessClaudePlaintextServerFailsClosedOnNodeStatus(t *testing.T) {
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(home, "accounts")}, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 			err := runner.runProxyClaudeForServerWithResolvers(
-				t.Context(), []string{"--resume", "session-a"}, server, "subrouter", filepath.Join(home, "isolated"),
+				t.Context(), []string{"--resume", "session-a"}, server, "subrouter", filepath.Join(home, "isolated"), "", "",
 				func(context.Context, string) ([]net.IPAddr, error) {
 					t.Fatal("failed exact-node launch fell back to DNS")
 					return nil, nil
@@ -1452,13 +1675,34 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	}
 }
 
-func TestSRClaudeBareRemainsProfileManager(t *testing.T) {
+func TestSRClaudeBareLaunchesInteractivePooledPreference(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_ = json.NewEncoder(w).Encode([]remoteServerAccount{
+			{ID: "claude-one", Label: "Same ID Codex", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+			{ID: "claude-one", Label: "Account One", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+			{ID: "claude-two", Label: "Account Two", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		})
+	}))
+	defer server.Close()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "team", Servers: []srServerConfig{{Name: "team", URL: server.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settingsCopyPath := filepath.Join(home, "settings.json")
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\ncp \"$2\" "+shellQuote(settingsCopyPath)+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var out bytes.Buffer
 	runner := srRunner{
-		store:  accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")},
-		in:     strings.NewReader(""),
+		store:  store,
+		in:     strings.NewReader("1\n"),
 		out:    &out,
 		errOut: &out,
 		client: http.DefaultClient,
@@ -1466,11 +1710,324 @@ func TestSRClaudeBareRemainsProfileManager(t *testing.T) {
 	if err := runner.claude(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "No Claude profiles") {
-		t.Fatalf("bare command did not show profile manager output: %q", out.String())
+	if !strings.Contains(out.String(), "POOLED Claude process") || !strings.Contains(out.String(), "failover remains enabled") {
+		t.Fatalf("bare command did not explain pooled preference semantics: %q", out.String())
 	}
-	if strings.Contains(out.String(), "daemon") {
-		t.Fatalf("bare command attempted daemon management: %q", out.String())
+	settingsBody, err := os.ReadFile(settingsCopyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overlay struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Preferred-Account-ID: claude-one" {
+		t.Fatalf("bare pooled headers = %q", got)
+	}
+	out.Reset()
+	runner.in = strings.NewReader("2\n")
+	if err := runner.claude(context.Background(), []string{"proxy", "--account"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "PINNED process") || !strings.Contains(out.String(), "No account failover") {
+		t.Fatalf("interactive pin did not explain no-failover semantics: %q", out.String())
+	}
+	settingsBody, err = os.ReadFile(settingsCopyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Account-ID: claude-two" {
+		t.Fatalf("interactive pinned headers = %q", got)
+	}
+}
+
+func TestSRClaudeBareLaunchDoesNotRevalidateSoftPickerChoice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	accountRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/accounts" {
+			http.NotFound(w, req)
+			return
+		}
+		accountRequests++
+		if accountRequests == 1 {
+			_ = json.NewEncoder(w).Encode([]remoteServerAccount{
+				{ID: "removed-after-pick", Label: "Initially available", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+				{ID: "remaining", Label: "Remaining", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+			})
+			return
+		}
+		// A second validation observes the account's removal and would abort the
+		// pooled launch. Soft preference must instead reach the server, whose
+		// scheduler can select the remaining account.
+		_ = json.NewEncoder(w).Encode([]remoteServerAccount{
+			{ID: "remaining", Label: "Remaining", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		})
+	}))
+	defer server.Close()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "team", Servers: []srServerConfig{{Name: "team", URL: server.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settingsCopyPath := filepath.Join(home, "settings.json")
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\ncp \"$2\" "+shellQuote(settingsCopyPath)+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := srRunner{
+		store: store, in: strings.NewReader("2\n"), out: io.Discard, errOut: io.Discard,
+		client: http.DefaultClient,
+	}
+	if err := runner.claude(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if accountRequests != 1 {
+		t.Fatalf("account inventory requests = %d, want one picker snapshot and no soft revalidation", accountRequests)
+	}
+	settingsBody, err := os.ReadFile(settingsCopyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overlay struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	if got := overlay.Env["ANTHROPIC_CUSTOM_HEADERS"]; got != "X-Subrouter-Agent: claude\nX-Subrouter-Preferred-Account-ID: removed-after-pick" {
+		t.Fatalf("soft picker headers = %q", got)
+	}
+}
+
+func TestClaudeProxyScopeMatchesSessionConfigIdentityWithoutExposingCredential(t *testing.T) {
+	server := srServerConfig{Name: "team", TenantKey: testTenantKey, TailscaleNodeID: "node-old"}
+	scope := claudeProxyScope(server, true)
+	if scope != "tenant:"+testTenantKey+"|tailscale-node:node-old|endpoint:/t/"+testTenantKey {
+		t.Fatalf("scope = %q", scope)
+	}
+	opaque := opaqueClaudeProxyScope(scope)
+	wantHash := sha256.Sum256([]byte(scope))
+	want := fmt.Sprintf("%x", wantHash[:12])
+	if opaque != want {
+		t.Fatalf("opaque scope = %q, want %q", opaque, want)
+	}
+	if strings.Contains(opaque, testTenantKey) || strings.Contains(opaque, server.Name) {
+		t.Fatalf("opaque scope exposed identity: %q", opaque)
+	}
+	if got := claudeProxyScope(srServerConfig{Name: "m3", URL: "https://M3.EXAMPLE:31415/", TailscaleNodeID: "node-new"}, true); got != "tailscale-node:node-new|endpoint:https://m3.example:31415" {
+		t.Fatalf("Tailscale scope = %q", got)
+	}
+	if got := claudeProxyScope(srServerConfig{Name: "m3", URL: "https://M3.EXAMPLE/"}, true); got != "server:m3|endpoint:https://m3.example" {
+		t.Fatalf("named scope = %q", got)
+	}
+	if got := claudeProxyScope(srServerConfig{}, false); got != "local" {
+		t.Fatalf("local scope = %q", got)
+	}
+}
+
+func TestClaudeProxyScopeRejectsSameNameAndCredentialEndpointReplacement(t *testing.T) {
+	old := srServerConfig{Name: "team", URL: "https://old.example", TenantKey: testTenantKey}
+	replacements := []srServerConfig{
+		{Name: "team", URL: "https://new.example", TenantKey: testTenantKey},
+		{Name: "team", URL: "https://new.example"},
+		{Name: "team", URL: "https://new.example", TailscaleNodeID: "same-node"},
+	}
+	oldScope := opaqueClaudeProxyScope(claudeProxyScope(old, true))
+	for _, replacement := range replacements {
+		if got := opaqueClaudeProxyScope(claudeProxyScope(replacement, true)); got == oldScope {
+			t.Fatalf("endpoint replacement retained scope: old=%+v replacement=%+v", old, replacement)
+		}
+	}
+	canonicalEquivalent := srServerConfig{Name: "team", URL: "https://OLD.EXAMPLE/", TenantKey: testTenantKey}
+	if got := opaqueClaudeProxyScope(claudeProxyScope(canonicalEquivalent, true)); got != oldScope {
+		t.Fatalf("canonical equivalent endpoint changed scope: got %s want %s", got, oldScope)
+	}
+}
+
+func TestParseClaudeProxyLaunchArgsBindsReservedScopeBeforeDelimiter(t *testing.T) {
+	scope := opaqueClaudeProxyScope("tenant:" + testTenantKey)
+	options, gotArgs, err := parseClaudeProxyLaunchArgs([]string{
+		"--account", "work", "--sr-expect-scope", scope, "--", "-p", "--resume", "session-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.expectedScope != scope || options.accountSelector != "work" || !reflect.DeepEqual(gotArgs, []string{"-p", "--resume", "session-a"}) {
+		t.Fatalf("parsed options/args = %+v, %#v", options, gotArgs)
+	}
+	for _, args := range [][]string{
+		{"--sr-expect-scope"},
+		{"--sr-expect-scope", scope, "-p"},
+		{"--sr-expect-scope", "not-a-scope", "--"},
+		{"--account", "--model", "opus"},
+		{"--account=", "-p"},
+		{"--account", "one", "--account", "two"},
+	} {
+		if _, _, err := parseClaudeProxyLaunchArgs(args); err == nil {
+			t.Fatalf("malformed reserved args accepted: %#v", args)
+		}
+	}
+	pickerOptions, pickerArgs, err := parseClaudeProxyLaunchArgs([]string{"--account"})
+	if err != nil || !pickerOptions.pickPinnedAccount || pickerArgs != nil {
+		t.Fatalf("bare --account picker parse = %+v, %#v, %v", pickerOptions, pickerArgs, err)
+	}
+	pickerOptions, pickerArgs, err = parseClaudeProxyLaunchArgs([]string{"--account", "--", "-p", "hello"})
+	if err != nil || !pickerOptions.pickPinnedAccount || !reflect.DeepEqual(pickerArgs, []string{"-p", "hello"}) {
+		t.Fatalf("delimited --account picker parse = %+v, %#v, %v", pickerOptions, pickerArgs, err)
+	}
+	literalOptions, literalArgs, err := parseClaudeProxyLaunchArgs([]string{"--account=work", "-p", "--", "--account", "literal", "--sr-expect-scope", scope})
+	if err != nil || literalOptions.expectedScope != "" || literalOptions.accountSelector != "work" || !reflect.DeepEqual(literalArgs, []string{"-p", "--", "--account", "literal", "--sr-expect-scope", scope}) {
+		t.Fatalf("literal Claude args changed: options %+v args %#v err %v", literalOptions, literalArgs, err)
+	}
+	delimiterOptions, delimiterArgs, err := parseClaudeProxyLaunchArgs([]string{"--", "--account", "literal"})
+	if err != nil || delimiterOptions != (claudeProxyLaunchOptions{}) || !reflect.DeepEqual(delimiterArgs, []string{"--", "--account", "literal"}) {
+		t.Fatalf("literal delimiter changed: options %+v args %#v err %v", delimiterOptions, delimiterArgs, err)
+	}
+}
+
+func TestClaudeProxyExpectedScopeFailsBeforeLaunch(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{
+			Name: "team", URL: "https://router.example", TenantKey: testTenantKey,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "launched")
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	err := runner.claude(t.Context(), []string{
+		"proxy", "--sr-expect-scope", opaqueClaudeProxyScope("tenant:different"), "--", "-p", "hello",
+	})
+	if err == nil || !strings.Contains(err.Error(), "scope changed") {
+		t.Fatalf("scope mismatch error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched after scope mismatch: %v", statErr)
+	}
+}
+
+func TestClaudeProxyExpectedScopeRejectsSameKeyURLReplacementBeforeLaunch(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}
+	oldServer := srServerConfig{Name: "team", URL: "https://old.example", TenantKey: testTenantKey}
+	newServer := srServerConfig{Name: "team", URL: "https://new.example", TenantKey: testTenantKey}
+	if err := defaultSRServerStore(store).save(srServerFile{Default: "team", Servers: []srServerConfig{newServer}}); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "launched")
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := srRunner{program: "sr", store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	err := runner.claude(t.Context(), []string{
+		"proxy", "--sr-expect-scope", opaqueClaudeProxyScope(claudeProxyScope(oldServer, true)), "--", "-p", "hello",
+	})
+	if err == nil || !strings.Contains(err.Error(), "scope changed") {
+		t.Fatalf("same-key endpoint replacement error = %v", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Claude launched after same-key endpoint replacement: %v", statErr)
+	}
+}
+
+func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordPath := filepath.Join(home, "claude-direct.txt")
+	settingsCopyPath := filepath.Join(home, "claude-direct-settings.json")
+	claudePath := filepath.Join(binDir, "claude")
+	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_|CLAUDE_CONFIG_DIR=|CLAUDE_CODE_(USE|API|AUTH|BASE|OAUTH|CONFIG))' || true; } > " + shellQuote(recordPath) + "\nsettings=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --settings ]; then settings=$2; break; fi; shift; done\n[ -n \"$settings\" ] && cat \"$settings\" > " + shellQuote(settingsCopyPath) + "\n"
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ANTHROPIC_BASE_URL", "http://stale.invalid")
+	t.Setenv("ANTHROPIC_API_KEY", "stale-api-key")
+	t.Setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/stale/config")
+
+	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.claudeDirect(t.Context(), []string{
+		"-p", "hello", "--settings", `{"env":{"ANTHROPIC_BASE_URL":"http://attacker.invalid"}}`,
+		"--setting-sources", "user,project,local", "--", "--setting-sources", "literal",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "args=--setting-sources  --settings ") ||
+		!strings.Contains(got, " -p hello -- --setting-sources literal\n") {
+		t.Fatalf("direct Claude invocation missing authoritative settings or flags:\n%s", got)
+	}
+	if strings.Contains(got, "user,project,local") {
+		t.Fatalf("direct Claude invocation retained caller setting sources:\n%s", got)
+	}
+	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") {
+		t.Fatalf("direct Claude invocation retained hostile routing:\n%s", got)
+	}
+	for _, key := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_API_KEY=", "CLAUDE_CODE_USE_BEDROCK="} {
+		if strings.Contains(got, key) {
+			t.Fatalf("direct Claude environment retained %s:\n%s", key, got)
+		}
+	}
+	for _, forbidden := range []string{"CLAUDE_CONFIG_DIR=", "CLAUDE_CODE_CONFIG_DIR="} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("direct Claude environment retained config selector %s:\n%s", forbidden, got)
+		}
+	}
+	settingsBody, err := os.ReadFile(settingsCopyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overlay struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range claudeRoutingEnvKeys {
+		if key == "CLAUDE_CONFIG_DIR" || key == "CLAUDE_CODE_CONFIG_DIR" {
+			if _, ok := overlay.Env[key]; ok {
+				t.Fatalf("direct Claude setting unexpectedly selected %s", key)
+			}
+			continue
+		}
+		if got, ok := overlay.Env[key]; !ok || got != "" {
+			t.Fatalf("direct Claude setting %s = %q, present %v; want authoritative empty", key, got, ok)
+		}
 	}
 }
 
@@ -1480,8 +2037,15 @@ func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
 	if err := runner.claude(context.Background(), []string{"help"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "sr claude proxy [args...]") {
-		t.Fatalf("help missing proxy command:\n%s", out.String())
+	for _, want := range []string{
+		"sr claude proxy [options] [args...]",
+		"--account [ACCOUNT]",
+		"Pin to one profile with no account failover",
+		"args at/after -- are literal",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("help missing %q:\n%s", want, out.String())
+		}
 	}
 }
 

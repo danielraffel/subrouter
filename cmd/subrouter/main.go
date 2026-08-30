@@ -1593,7 +1593,7 @@ Usage:
   %[1]s remove-admin-key <label>
   %[1]s attach-project <api-key-label> [--project-id <id-or-name>]
 
-  %[1]s claude             Manage Claude Code profiles
+  %[1]s claude             Interactively launch pooled Claude through Subrouter
   %[1]s claude-aws [--model fable] [claude args...]
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]

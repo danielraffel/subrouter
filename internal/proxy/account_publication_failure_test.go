@@ -511,6 +511,40 @@ func TestAccountMutationInvalidatesUsageCacheWhenReloadFails(t *testing.T) {
 	}
 }
 
+func TestInstallAccountMutationAcceptsCommittedClaudeImportOnlyAfterExactReload(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	server := Server{AccountRef: ref}
+	committedErr := fmt.Errorf("%w: injected directory sync failure", agentclaude.ErrProfileRegistryWriteCommitted)
+
+	installed, err := server.installAccountMutation(t.Context(), func() (string, func() error, error) {
+		return "work", func() error {
+			if err := ref.claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+				AccessToken: "access", RefreshToken: "refresh",
+			}); err != nil {
+				return err
+			}
+			return committedErr
+		}, nil
+	})
+	if err != nil || installed != "work" {
+		t.Fatalf("committed Claude import = installed %q, err %v", installed, err)
+	}
+	loaded := ref.All()
+	if len(loaded) != 1 || loaded[0].ID != "work" || loaded[0].Token != "access" {
+		t.Fatalf("committed Claude import snapshot = %+v", loaded)
+	}
+
+	_, err = server.installAccountMutation(t.Context(), func() (string, func() error, error) {
+		return "missing", func() error { return committedErr }, nil
+	})
+	if !errors.Is(err, agentclaude.ErrProfileRegistryWriteCommitted) {
+		t.Fatalf("unverified committed mutation error = %v", err)
+	}
+}
+
 func TestAccountMutationReleasesTransactionBeforeUsageCacheInvalidation(t *testing.T) {
 	root := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}

@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+// ErrStoredAccountRemoved reports that a refresh request's exact durable
+// account disappeared before the request acquired its account lock. A stale
+// refresh must never recreate a credential deleted by another transaction.
+var ErrStoredAccountRemoved = errors.New("stored account was removed before refresh")
+
 // codexOAuthTokenURL is a var so tests can point refresh at a fake OAuth server
 // that models the provider's rotate-on-use semantics. Nothing in production
 // reassigns it.
@@ -290,9 +295,12 @@ func (s CodexStore) refreshStored(
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, false, err
 	}
-	if found {
-		account = latest
+	if !found {
+		removeErr := fmt.Errorf("%w: %q", ErrStoredAccountRemoved, account.Email)
+		logCodexRefreshSkipped(ctx, s, account, force, "account_removed_after_lock")
+		return account, false, removeErr
 	}
+	account = latest
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens_after_lock")
 		return account, false, nil

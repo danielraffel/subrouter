@@ -1231,32 +1231,12 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		http.NotFound(w, r)
 		return
 	}
-	removed := false
-	stored, ok, err := server.AccountRef.store.FindStored(id)
-	if err != nil {
-		http.Error(w, "remove account", http.StatusInternalServerError)
-		return
-	}
-	if ok {
-		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
-			removed, err = removeTenantQwenAccount(r.Context(), server.AccountRef, stored)
-		} else {
-			_, removed, err = server.AccountRef.store.RemoveStored(stored.Email)
-		}
-		if err != nil {
+	removed, removeErr := removeTenantAccounts(r.Context(), server.AccountRef, id)
+	if !removed {
+		if removeErr != nil {
 			http.Error(w, "remove account", http.StatusInternalServerError)
 			return
 		}
-	}
-	claudeRemoved, claudeRemoveErr := server.AccountRef.claudeStore.RemoveProfile(id)
-	if claudeRemoved {
-		removed = true
-	}
-	if claudeRemoveErr != nil && !claudeRemoved {
-		http.Error(w, "remove account", http.StatusInternalServerError)
-		return
-	}
-	if !removed {
 		http.Error(w, "account not found", http.StatusNotFound)
 		return
 	}
@@ -1264,14 +1244,39 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		http.Error(w, "account removed but reload failed", http.StatusInternalServerError)
 		return
 	}
-	if claudeRemoveErr != nil {
+	if removeErr != nil {
 		http.Error(w, "account removed but credential cleanup failed", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func removeTenantQwenAccount(ctx context.Context, ref *AccountRef, expected accounts.StoredCodexAccount) (removed bool, err error) {
+// removeTenantAccounts snapshots the exact requested identities before joining
+// the canonical installMu -> cross-process account transaction. It then
+// revalidates those identities under the transaction, publishes a generation,
+// and only then mutates durable credentials. A sibling worker that observes
+// the generation blocks on the transaction until every deletion and provider
+// cleanup has either committed or rolled back.
+func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (removed bool, err error) {
+	expectedStored, expectedStoredFound, err := ref.store.FindStored(id)
+	if err != nil {
+		return false, err
+	}
+	expectedClaude, expectedClaudeFound, err := snapshotTenantClaudeProfile(ctx, ref, id)
+	if err != nil {
+		return false, err
+	}
+	var expectedQwenConsole tenantQwenConsoleVersion
+	if expectedStoredFound && expectedStored.ProviderOrDefault() == accounts.ProviderQwenToken {
+		expectedQwenConsole, err = readTenantQwenConsoleVersion(ref, expectedStored.Email)
+		if err != nil {
+			return false, err
+		}
+	}
+	if !expectedStoredFound && !expectedClaudeFound {
+		return false, nil
+	}
+
 	if err := lockMutexContext(ctx, &ref.installMu); err != nil {
 		return false, err
 	}
@@ -1281,21 +1286,134 @@ func removeTenantQwenAccount(ctx context.Context, ref *AccountRef, expected acco
 		return false, err
 	}
 	defer func() { err = errors.Join(err, transactionLock.Close()) }()
-	if _, err := reconcileCompletedAccountRollback(ctx, ref.store.StoreDir(), advanceAccountDiskGeneration); err != nil {
+	if _, err := reconcileCompletedAccountRollback(ctx, ref.store, advanceAccountDiskGeneration); err != nil {
 		return false, err
 	}
-	stored, found, err := ref.store.FindStored(expected.Email)
-	if err != nil {
-		return false, err
+	var stored accounts.StoredCodexAccount
+	if expectedStoredFound {
+		var found bool
+		stored, found, err = ref.store.FindStored(expectedStored.Email)
+		if err != nil {
+			return false, err
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			currentConsole, err := readTenantQwenConsoleVersion(ref, stored.Email)
+			if err != nil {
+				return false, err
+			}
+			if currentConsole != expectedQwenConsole {
+				return false, errors.New("Qwen console credential changed during removal")
+			}
+		}
 	}
-	if !found || stored.Email != expected.Email || stored.ProviderOrDefault() != accounts.ProviderQwenToken ||
-		storedAccountMutationVersion(stored) != storedAccountMutationVersion(expected) {
-		return false, errors.New("Qwen account changed during removal")
+	if expectedClaudeFound {
+		current, found, err := snapshotTenantClaudeProfile(ctx, ref, id)
+		if err != nil {
+			return false, err
+		}
+		if !found || current != expectedClaude {
+			return false, errors.New("Claude profile changed during removal")
+		}
 	}
-	if err := ref.advanceDiskGeneration(); err != nil {
-		return false, err
+	published := false
+	if expectedClaudeFound && expectedStoredFound {
+		storedLease, leaseErr := ref.store.AcquireStoredAccountLease(expectedStored.Email)
+		if leaseErr != nil {
+			return false, leaseErr
+		}
+		defer func() { err = errors.Join(err, storedLease.Close()) }()
+		var found bool
+		stored, found, err = storedLease.FindExact()
+		if err != nil {
+			return false, err
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			currentConsole, readErr := readTenantQwenConsoleVersion(ref, stored.Email)
+			if readErr != nil {
+				return false, readErr
+			}
+			if currentConsole != expectedQwenConsole {
+				return false, errors.New("Qwen console credential changed during removal")
+			}
+		}
+		if ref.afterTenantStoredRevalidateForTest != nil {
+			ref.afterTenantStoredRevalidateForTest()
+		}
+		removed, removeErr := removeJournaledTenantAccountLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude, stored,
+			storedLease, ref.store.Dir, expectedQwenConsole, ref.qwenRoot(),
+			func() error {
+				if err := ref.advanceDiskGeneration(); err != nil {
+					return err
+				}
+				published = true
+				return nil
+			},
+			ref.beforeTenantStoredRemovalForTest,
+		)
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+		}
+		return removed, removeErr
 	}
-	return removeTenantQwenAccountLocked(ref, stored)
+	if expectedClaudeFound {
+		claudeRemoved, removeErr := removeJournaledClaudeProfileLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude,
+			func() error {
+				if err := ref.advanceDiskGeneration(); err != nil {
+					return err
+				}
+				published = true
+				return nil
+			},
+		)
+		removed = removed || claudeRemoved
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+			return removed, removeErr
+		}
+	}
+	if expectedStoredFound {
+		if !published {
+			if err := ref.advanceDiskGeneration(); err != nil {
+				return removed, err
+			}
+		}
+		if ref.beforeTenantStoredRemovalForTest != nil {
+			ref.beforeTenantStoredRemovalForTest()
+		}
+		var storedRemoved bool
+		var removeErr error
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			storedRemoved, removeErr = removeTenantQwenAccountLocked(ref, stored, expectedQwenConsole)
+		} else {
+			storedRemoved, removeErr = removeTenantStoredAccountLocked(ref, stored)
+		}
+		removed = removed || storedRemoved
+		if removeErr != nil {
+			return removed, removeErr
+		}
+	}
+	return removed, nil
+}
+
+func snapshotTenantClaudeProfile(ctx context.Context, ref *AccountRef, id string) (agentclaude.ProfileRemovalSnapshot, bool, error) {
+	if err := agentclaude.ValidateProfileNameAllowEmail(id); err != nil {
+		return agentclaude.ProfileRemovalSnapshot{}, false, nil
+	}
+	return ref.claudeStore.SnapshotProfileRemovalContext(ctx, id)
 }
 
 func storedAccountMutationVersion(stored accounts.StoredCodexAccount) [sha256.Size]byte {
@@ -1303,41 +1421,31 @@ func storedAccountMutationVersion(stored accounts.StoredCodexAccount) [sha256.Si
 	return sha256.Sum256(body)
 }
 
-func removeTenantQwenAccountLocked(ref *AccountRef, stored accounts.StoredCodexAccount) (bool, error) {
-	consoleDir := agentqwen.ConsoleConfigDirIn(ref.qwenRoot(), stored.Email)
-	info, statErr := os.Lstat(consoleDir)
-	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return false, statErr
-	}
-	if statErr == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
-		return false, errors.New("Qwen console profile is not a safe directory")
-	}
-	hasConsole, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), stored.Email)
-	if err != nil {
-		return false, err
-	}
-	var consoleCredential agentqwen.ConsoleCredential
-	if hasConsole {
-		consoleCredential, err = agentqwen.ExportConsoleCredentialIn(ref.qwenRoot(), stored.Email)
-		if err != nil {
-			return false, err
-		}
-	}
-	return removeTenantQwenAccountWithOps(
-		hasConsole,
-		func() error {
-			if err := agentqwen.RemoveConsoleCredentialIn(ref.qwenRoot(), stored.Email); err != nil {
-				return err
-			}
-			return syncAccountStateDir(filepath.Dir(consoleDir))
-		},
-		func() (bool, error) {
-			_, removed, err := ref.store.RemoveStored(stored.Email)
-			return removed, err
-		},
-		func() error {
-			return restoreTenantQwenConsoleDurably(ref.qwenRoot(), stored.Email, consoleCredential, syncAccountStateDir)
-		},
+type tenantQwenConsoleVersion struct {
+	Found   bool
+	Version string
+}
+
+var syncTenantStoredAccountDir = syncAccountStateDir
+
+func readTenantQwenConsoleVersion(ref *AccountRef, id string) (tenantQwenConsoleVersion, error) {
+	found, version, err := agentqwen.ConsoleCredentialVersionIn(ref.qwenRoot(), id)
+	return tenantQwenConsoleVersion{Found: found, Version: version}, err
+}
+
+func removeTenantStoredAccountLocked(ref *AccountRef, expected accounts.StoredCodexAccount) (bool, error) {
+	_, removed, err := ref.store.RemoveStoredExactDurable(expected, syncTenantStoredAccountDir)
+	return removed, err
+}
+
+func removeTenantQwenAccountLocked(
+	ref *AccountRef,
+	stored accounts.StoredCodexAccount,
+	expectedConsole tenantQwenConsoleVersion,
+) (bool, error) {
+	return agentqwen.RemoveConsoleCredentialExactIn(
+		ref.qwenRoot(), stored.Email, expectedConsole.Found, expectedConsole.Version,
+		func() (bool, error) { return removeTenantStoredAccountLocked(ref, stored) },
 	)
 }
 

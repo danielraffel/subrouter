@@ -4811,6 +4811,156 @@ func TestHandlerDivertsOverloadedCodexWebSocketToAzure(t *testing.T) {
 	}
 }
 
+// A caller-forced account is an exact provider/account contract. Even a
+// provider-side websocket failure must stay visible to that caller rather
+// than pinning the session to Azure behind its back.
+func TestHandlerForcedCodexWebSocketServerErrorDoesNotDivertToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var upgrades atomic.Int32
+	failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"capacity"}}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("upstream read: %v", err)
+			return
+		}
+		if upgrades.Add(1) == 1 {
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("forced websocket request reached Azure")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sticky := newAzureCodexSticky()
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:           store,
+		Scheduler:          selectacct.NewScheduler(nil),
+		MaxBodyBytes:       1 << 20,
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		azureCodexSessions: sticky,
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{
+		"Session-Id":             []string{"forced-ws-server-error"},
+		"X-Subrouter-Account-ID": []string{"codex-account"},
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := conn.ReadMessage()
+	_ = conn.Close()
+	if err != nil || string(body) != failed {
+		t.Fatalf("forced websocket failure = %q, %v; want upstream failure forwarded", body, err)
+	}
+	if _, pinned := sticky.lookup(azureCodexSessionKeyFor("codex", "forced-ws-server-error")); pinned {
+		t.Fatal("forced websocket server error pinned the session to Azure")
+	}
+
+	// A repeat forced upgrade must remain on the exact account, not be refused
+	// with 426 due to an Azure pin created by the first server error.
+	conn, response, err = websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+		}
+		t.Fatalf("repeat forced upgrade: %v (status %d)", err, status)
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, body, err := conn.ReadMessage(); err != nil || !strings.Contains(string(body), "response.completed") {
+		t.Fatalf("repeat forced websocket response = %q, %v", body, err)
+	}
+}
+
+// If an explicit account cannot be selected, the websocket request must fail
+// closed with the selection error. A configured Azure fallback must not turn
+// that exact-account failure into a 426 provider switch.
+func TestHandlerForcedCodexWebSocketSelectionErrorDoesNotOfferAzure(t *testing.T) {
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("forced websocket selection failure reached Azure")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{
+		"Session-Id":             []string{"forced-ws-missing"},
+		"X-Subrouter-Account-ID": []string{"missing-account"},
+	}
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("forced websocket selection unexpectedly upgraded")
+	}
+	if response == nil {
+		t.Fatalf("forced websocket selection error had no HTTP response: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("forced websocket selection status = %d, want 503 (never Azure 426)", response.StatusCode)
+	}
+}
+
 // An overloaded event for a model the fallback does not serve is forwarded
 // unchanged: absorbing it without an alternative would strand the turn.
 func TestHandlerForwardsOverloadedEventWhenModelNotServed(t *testing.T) {

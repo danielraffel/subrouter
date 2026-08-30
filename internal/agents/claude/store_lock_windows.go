@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -22,7 +24,7 @@ const (
 
 var (
 	profileRegistryProcessMu sync.Mutex
-	profileRegistryKernel32  = syscall.NewLazyDLL("kernel32.dll")
+	profileRegistryKernel32  = windows.NewLazySystemDLL("kernel32.dll")
 	profileRegistryLockFile  = profileRegistryKernel32.NewProc("LockFileEx")
 	profileRegistryUnlock    = profileRegistryKernel32.NewProc("UnlockFileEx")
 )

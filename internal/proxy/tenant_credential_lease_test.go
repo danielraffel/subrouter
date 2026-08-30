@@ -44,6 +44,40 @@ func tenantLeaseTestServer(items ...accounts.Account) *Server {
 	}
 }
 
+func tenantLeaseTestBrokerClient(
+	t *testing.T,
+	server *Server,
+	store *tenantCredentialLeaseStore,
+) *broker.Client {
+	t.Helper()
+	const tenantKey = "srt_0123456789abcdef0123456789abcdef"
+	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := "/t/" + tenantKey
+		if !strings.HasPrefix(r.URL.Path, prefix) {
+			http.NotFound(w, r)
+			return
+		}
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/_subrouter/leases":
+			store.handleIssue(server, tenant.Tenant{ID: "team"}, w, r)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/_subrouter/leases/") && strings.HasSuffix(r.URL.Path, "/events"):
+			store.handleReport(server, w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(hosted.Close)
+	client := broker.NewClient(broker.Config{
+		Version: 1, BaseURL: broker.DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team", CredentialSource: broker.CredentialSourceTeam,
+		HostedURL: hosted.URL, TenantKey: tenantKey,
+	})
+	client.HTTPClient = hosted.Client()
+	return client
+}
+
 func tenantLeaseTestLease(
 	account accounts.Account,
 	agentType string,
@@ -444,6 +478,108 @@ func TestTenantCredentialLeaseFiltersBeforePreferredAndSticky(t *testing.T) {
 	}
 	if picked.ID != accountB.ID {
 		t.Fatalf("shared-cooldown pick = %s, want %s", picked.ID, accountB.ID)
+	}
+}
+
+func TestTenantCredentialBrokerPreferenceYieldsToReroutedStickySession(t *testing.T) {
+	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderClaude)
+	accountB := tenantLeaseTestAccount("account-b", accounts.ProviderClaude)
+	server := tenantLeaseTestServer(accountA, accountB)
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Sessions = sessions
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		return account, nil
+	}
+	store := newTenantCredentialLeaseStore()
+	client := tenantLeaseTestBrokerClient(t, server, store)
+	request := broker.LeaseRequest{
+		Provider: accounts.ProviderClaude, AgentType: "claude",
+		SessionID: "preferred-session", PreferAccountID: accountA.ID, Model: "claude-opus-4",
+	}
+
+	first, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Account.ID != accountA.ID {
+		t.Fatalf("initial preferred lease = %s, want %s", first.Account.ID, accountA.ID)
+	}
+	if err := client.Report(context.Background(), first.ID, broker.LeaseReport{
+		Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTooManyRequests,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Account.ID != accountB.ID {
+		t.Fatalf("rerouted lease = %s, want %s while preferred account is avoided", second.Account.ID, accountB.ID)
+	}
+
+	// Make A eligible again without changing the durable session placement.
+	// The next lease still carries the original soft preference, but sticky B
+	// must now outrank it.
+	store.mu.Lock()
+	for key, avoidance := range store.avoidances {
+		avoidance.expiresAt = time.Now().Add(-time.Minute)
+		store.avoidances[key] = avoidance
+	}
+	store.mu.Unlock()
+	client.InvalidateLease(second.ID)
+	third, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Account.ID != accountB.ID {
+		t.Fatalf("post-recovery lease = %s, want sticky %s instead of preferred %s", third.Account.ID, accountB.ID, accountA.ID)
+	}
+}
+
+func TestTenantCredentialBrokerForcedAccountOverridesStickyAndFailsClosed(t *testing.T) {
+	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderClaude)
+	accountB := tenantLeaseTestAccount("account-b", accounts.ProviderClaude)
+	server := tenantLeaseTestServer(accountA, accountB)
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "forced-session", accountB.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	server.Sessions = sessions
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		return account, nil
+	}
+	store := newTenantCredentialLeaseStore()
+	client := tenantLeaseTestBrokerClient(t, server, store)
+	request := broker.LeaseRequest{
+		Provider: accounts.ProviderClaude, AgentType: "claude",
+		SessionID: "forced-session", ForceAccountID: accountA.ID, Model: "claude-opus-4",
+	}
+
+	forced, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forced.Account.ID != accountA.ID {
+		t.Fatalf("forced lease = %s, want %s despite sticky %s", forced.Account.ID, accountA.ID, accountB.ID)
+	}
+	if err := client.Report(context.Background(), forced.ID, broker.LeaseReport{
+		Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTooManyRequests,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Lease(context.Background(), request); err == nil {
+		t.Fatalf("avoided forced account silently failed over to %s", accountB.ID)
+	} else {
+		var statusErr *broker.HTTPStatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("forced unavailable error = %v, want broker 503", err)
+		}
 	}
 }
 

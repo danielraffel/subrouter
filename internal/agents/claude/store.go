@@ -3,7 +3,9 @@ package claude
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -63,6 +65,18 @@ type Store struct {
 	// Subrouter does not duplicate trajectories once per profile. Server-side
 	// stores leave it empty because they never launch Claude Code.
 	SharedStateDir string
+	// syncDirectoryForTest injects registry directory-sync failures. Production
+	// stores leave it nil and use the platform durability boundary below.
+	syncDirectoryForTest func(string) error
+	// syncRemovalParentsForTest injects instance staging/rollback/cleanup
+	// directory-sync failures. Production stores leave it nil.
+	syncRemovalParentsForTest func(map[string]struct{}) error
+	// afterProfileInstancesStagedForTest injects a non-cooperating credential
+	// mutation at the exact post-stage/pre-registry-commit boundary.
+	afterProfileInstancesStagedForTest func([]stagedProfileInstance)
+	// afterPostStageCredentialHashForTest injects a path recreation after the
+	// post-stage traversal but before its final absence boundary.
+	afterPostStageCredentialHashForTest func()
 }
 
 type Profile struct {
@@ -93,6 +107,43 @@ type CredentialInfo struct {
 	SubscriptionType string `json:"subscriptionType,omitempty"`
 	RateLimitTier    string `json:"rateLimitTier,omitempty"`
 	ExpiresAt        int64  `json:"expiresAt,omitempty"`
+}
+
+// ProfileRemovalSnapshot is a non-secret, exact identity for one registered
+// profile and the credential currently stored at its instance paths. It is
+// safe to persist in a crash-recovery journal.
+type ProfileRemovalSnapshot struct {
+	InstanceDir       string
+	CredentialVersion string
+}
+
+var ErrProfileRemovalCredentialChanged = errors.New("Claude profile credential changed during removal")
+
+// ErrProfileRegistryWriteCommitted means the registry rename is already
+// visible but syncing its containing directory failed, so callers must not
+// roll the visible mutation back as though the write never happened.
+var ErrProfileRegistryWriteCommitted = errors.New("Claude profile registry write committed with uncertain durability")
+
+type profileRegistryWriteCommittedError struct{ cause error }
+
+func (e *profileRegistryWriteCommittedError) Error() string {
+	return fmt.Sprintf("%v: %v", ErrProfileRegistryWriteCommitted, e.cause)
+}
+
+func (e *profileRegistryWriteCommittedError) Unwrap() []error {
+	return []error{ErrProfileRegistryWriteCommitted, e.cause}
+}
+
+func profileRegistryWriteCommitted(err error) bool {
+	return errors.Is(err, ErrProfileRegistryWriteCommitted)
+}
+
+func acceptCommittedProfileRegistryWrite(operation string, err error) error {
+	if !profileRegistryWriteCommitted(err) {
+		return err
+	}
+	slog.Warn("Claude profile registry mutation is visible but directory durability is uncertain", "operation", operation, "error", err)
+	return nil
 }
 
 // PlanType returns the subscription label explicitly carried by a Claude
@@ -297,79 +348,958 @@ func closeProfileCredentialLocks(locks []*profileCredentialLock) error {
 }
 
 type stagedProfileInstance struct {
-	originalPath string
-	stagedPath   string
-	stagingRoot  string
+	originalPath         string
+	stagedPath           string
+	stagingRoot          string
+	operationID          string
+	credentialSetVersion string
+	prepared             bool
+}
+
+const (
+	profileRemovalStageManifestVersion   = 3
+	profileRemovalStageManifestName      = ".subrouter-removal-stage.json"
+	profileRemovalStageEntryName         = "instance"
+	profileRemovalStageManifestMaxSize   = 4096
+	profileRemovalOperationMarkerVersion = 2
+	profileRemovalOperationMarkerName    = ".subrouter-removal-operation.json"
+	profileRemovalOperationMarkerMaxSize = 4096
+)
+
+type profileRemovalStageManifest struct {
+	Version              int    `json:"version"`
+	OriginalPath         string `json:"original_path"`
+	StagingRoot          string `json:"staging_root"`
+	EntryName            string `json:"entry_name"`
+	OperationID          string `json:"operation_id"`
+	CredentialSetVersion string `json:"credential_set_version"`
+}
+
+type profileRemovalOperationMarker struct {
+	Version              int    `json:"version"`
+	OriginalPath         string `json:"original_path"`
+	OperationID          string `json:"operation_id"`
+	CredentialSetVersion string `json:"credential_set_version"`
 }
 
 func stageProfileInstancePaths(paths []string) ([]stagedProfileInstance, error) {
+	credentialSetVersion, err := filesystemProfileCredentialVersion(paths)
+	if err != nil {
+		return nil, err
+	}
+	return stageProfileInstancePathsWithVersion(paths, credentialSetVersion, syncProfileRemovalParents)
+}
+
+func stageProfileInstancePathsWithSync(
+	paths []string,
+	syncParents func(map[string]struct{}) error,
+) ([]stagedProfileInstance, error) {
+	credentialSetVersion, err := filesystemProfileCredentialVersion(paths)
+	if err != nil {
+		return nil, err
+	}
+	return stageProfileInstancePathsWithVersion(paths, credentialSetVersion, syncParents)
+}
+
+func stageProfileInstancePathsWithVersion(
+	paths []string,
+	credentialSetVersion string,
+	syncParents func(map[string]struct{}) error,
+) ([]stagedProfileInstance, error) {
+	if !validProfileCredentialSetVersion(credentialSetVersion) {
+		return nil, errors.New("invalid Claude profile credential-set version")
+	}
+	operationID, err := newProfileRemovalOperationID()
+	if err != nil {
+		return nil, err
+	}
 	staged := make([]stagedProfileInstance, 0, len(paths))
 	for _, path := range paths {
 		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
-			return nil, errors.Join(err, rollbackStagedProfileInstances(staged))
+			return nil, errors.Join(err, rollbackStagedProfileInstancesWithSync(staged, syncParents))
 		}
 		stagingRoot, err := os.MkdirTemp(
 			filepath.Dir(path),
 			"."+filepath.Base(path)+".remove-*",
 		)
 		if err != nil {
-			return nil, errors.Join(err, rollbackStagedProfileInstances(staged))
+			return nil, errors.Join(err, rollbackStagedProfileInstancesWithSync(staged, syncParents))
 		}
 		entry := stagedProfileInstance{
-			originalPath: path,
-			stagedPath:   filepath.Join(stagingRoot, "instance"),
-			stagingRoot:  stagingRoot,
+			originalPath:         path,
+			stagedPath:           filepath.Join(stagingRoot, profileRemovalStageEntryName),
+			stagingRoot:          stagingRoot,
+			operationID:          operationID,
+			credentialSetVersion: credentialSetVersion,
+		}
+		if err := writeProfileRemovalStageManifest(entry); err != nil {
+			_ = os.RemoveAll(stagingRoot)
+			parents := map[string]struct{}{filepath.Dir(stagingRoot): {}}
+			return nil, errors.Join(err, syncParents(parents), rollbackStagedProfileInstancesWithSync(staged, syncParents))
+		}
+		// Persist the stage-root entry itself before moving the only credential.
+		if err := syncParents(map[string]struct{}{filepath.Dir(stagingRoot): {}}); err != nil {
+			_ = os.RemoveAll(stagingRoot)
+			return nil, errors.Join(err, syncParents(map[string]struct{}{filepath.Dir(stagingRoot): {}}), rollbackStagedProfileInstancesWithSync(staged, syncParents))
+		}
+		if err := writeProfileRemovalOperationMarker(entry); err != nil {
+			cleanupErr := removeProfileRemovalOperationMarker(entry, syncParents)
+			var stageCleanupErr error
+			if cleanupErr == nil {
+				stageCleanupErr = errors.Join(
+					os.RemoveAll(stagingRoot),
+					syncParents(map[string]struct{}{filepath.Dir(stagingRoot): {}}),
+				)
+			}
+			// Never discard the ownership manifest while an exact live marker may
+			// remain. Startup can safely finish marker cleanup only while that
+			// provenance root is still available.
+			return nil, errors.Join(err, cleanupErr, stageCleanupErr, rollbackStagedProfileInstancesWithSync(staged, syncParents))
 		}
 		if err := os.Rename(entry.originalPath, entry.stagedPath); err != nil {
-			_ = os.Remove(stagingRoot)
-			return nil, errors.Join(err, rollbackStagedProfileInstances(staged))
+			markerErr := removeProfileRemovalOperationMarker(entry, syncParents)
+			_ = os.RemoveAll(stagingRoot)
+			parents := map[string]struct{}{filepath.Dir(stagingRoot): {}}
+			return nil, errors.Join(err, markerErr, syncParents(parents), rollbackStagedProfileInstancesWithSync(staged, syncParents))
 		}
 		staged = append(staged, entry)
+		// The rename removes an entry from the instance parent and adds one to
+		// the stage root. Both directory records must reach disk before the
+		// next path is touched, otherwise a crash mid-loop can lose the only
+		// copy before startup has a durable stage to recover.
+		parents := map[string]struct{}{
+			filepath.Dir(entry.originalPath): {},
+			entry.stagingRoot:                {},
+		}
+		if err := syncParents(parents); err != nil {
+			return nil, errors.Join(err, rollbackStagedProfileInstancesWithSync(staged, syncParents))
+		}
 	}
 	return staged, nil
 }
 
+func (s Store) stageProfileInstancePathsValidated(
+	ctx context.Context,
+	paths []string,
+) ([]stagedProfileInstance, error) {
+	// Include already-owned stages so exact-removal replay fingerprints the
+	// journaled credential rather than a stale path-keyed Keychain item.
+	credentialSetVersion, err := s.profileCredentialVersionLocked(ctx, paths, true)
+	if err != nil {
+		return nil, err
+	}
+	staged, err := stageProfileInstancePathsWithVersion(paths, credentialSetVersion, s.syncProfileRemovalParents)
+	if err != nil {
+		return nil, err
+	}
+	if s.afterProfileInstancesStagedForTest != nil {
+		s.afterProfileInstancesStagedForTest(staged)
+	}
+	postStageVersion, validationErr := s.profileCredentialVersionLockedRequiringAbsent(ctx, paths, true, staged)
+	if s.afterPostStageCredentialHashForTest != nil {
+		s.afterPostStageCredentialHashForTest()
+	}
+	if validationErr == nil {
+		validationErr = validateStagedProfilePathsRemainAbsent(staged)
+	}
+	if validationErr == nil && postStageVersion == credentialSetVersion {
+		return staged, nil
+	}
+	if validationErr == nil {
+		validationErr = ErrProfileRemovalCredentialChanged
+	}
+	rollbackErr := rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents)
+	return nil, errors.Join(
+		fmt.Errorf("validate staged Claude profile credential identity: %w", validationErr),
+		rollbackErr,
+	)
+}
+
+func validateStagedProfilePathsRemainAbsent(staged []stagedProfileInstance) error {
+	for _, entry := range staged {
+		if _, err := os.Lstat(entry.originalPath); err == nil {
+			return fmt.Errorf("%w: staged Claude profile path %q reappeared", ErrProfileRemovalCredentialChanged, entry.originalPath)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("validate staged Claude profile path %q: %w", entry.originalPath, err)
+		}
+	}
+	return nil
+}
+
+func (s Store) validateStagedProfileCommitBoundary(staged []stagedProfileInstance) error {
+	if err := validateStagedProfilePathsRemainAbsent(staged); err != nil {
+		return errors.Join(err, rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents))
+	}
+	return nil
+}
+
 func rollbackStagedProfileInstances(staged []stagedProfileInstance) error {
-	var rollbackErr error
-	for index := len(staged) - 1; index >= 0; index-- {
-		entry := staged[index]
-		if err := os.Rename(entry.stagedPath, entry.originalPath); err != nil {
-			rollbackErr = errors.Join(rollbackErr, err)
+	return rollbackStagedProfileInstancesWithSync(staged, syncProfileRemovalParents)
+}
+
+func rollbackStagedProfileInstancesWithSync(
+	staged []stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+) error {
+	return rollbackStagedProfileInstancesWithOps(staged, syncParents, renameProfileInstanceNoReplace)
+}
+
+func rollbackStagedProfileInstancesWithOps(
+	staged []stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+	rename func(string, string) error,
+) error {
+	return restoreStagedProfileInstancesWithOps(staged, staged, syncParents, rename)
+}
+
+func restoreStagedProfileInstancesWithOps(
+	restore []stagedProfileInstance,
+	provenance []stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+	rename func(string, string) error,
+) error {
+	var restoreErr error
+	for index := len(restore) - 1; index >= 0; index-- {
+		entry := restore[index]
+		if err := rename(entry.stagedPath, entry.originalPath); err != nil {
+			restoreErr = errors.Join(restoreErr, err)
 			continue
 		}
-		rollbackErr = errors.Join(rollbackErr, os.Remove(entry.stagingRoot))
+		// Prove the reverse rename before removing its ownership provenance. If
+		// this boundary fails, startup sees a live path plus a manifest-only
+		// prepared stage and can safely finish the rollback.
+		if err := syncParents(map[string]struct{}{
+			filepath.Dir(entry.originalPath): {},
+			entry.stagingRoot:                {},
+		}); err != nil {
+			restoreErr = errors.Join(restoreErr, err)
+		}
 	}
-	return rollbackErr
+	// Never remove any provenance unless every reverse rename and its immediate
+	// durability boundary succeeded. This lets startup finish a multi-root
+	// rollback without seeing one live path beside another actual stage merely
+	// because the first root's sync failed.
+	if restoreErr != nil {
+		return restoreErr
+	}
+	return finalizeRestoredProfileInstances(provenance, syncParents)
+}
+
+func finalizeRestoredProfileInstances(
+	provenance []stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+) error {
+	// The marker is the strong proof that each live directory is the directory
+	// restored by this operation, not a same-path replacement. Keep every stage
+	// manifest until all marker removals are durable across the whole set.
+	var markerErr error
+	for _, entry := range provenance {
+		markerErr = errors.Join(markerErr, removeProfileRemovalOperationMarker(entry, syncParents))
+	}
+	if markerErr != nil {
+		return markerErr
+	}
+	var cleanupErr error
+	for index := len(provenance) - 1; index >= 0; index-- {
+		entry := provenance[index]
+		// Keep provenance present until cleanup removes the owned root. Removing
+		// the manifest first would turn an interrupted rollback into an unowned
+		// lookalike that safe restart reconciliation must refuse forever.
+		removeErr := os.RemoveAll(entry.stagingRoot)
+		syncErr := syncParents(map[string]struct{}{filepath.Dir(entry.stagingRoot): {}})
+		cleanupErr = errors.Join(cleanupErr, removeErr, syncErr)
+	}
+	return cleanupErr
+}
+
+func deletePreparedProfileStagesWithSync(
+	prepared []stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+) error {
+	if err := syncPreparedProfileStages(prepared, syncParents); err != nil {
+		return err
+	}
+	return finalizeRestoredProfileInstances(prepared, syncParents)
+}
+
+func syncPreparedProfileStages(
+	prepared []stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+) error {
+	var syncErr error
+	for _, entry := range prepared {
+		if !entry.prepared {
+			return fmt.Errorf("Claude profile removal stage %q is not prepared", entry.stagingRoot)
+		}
+		// A manifest-only stage means the credential was never moved or was
+		// already restored. Prove both live-parent and provenance-root state
+		// across the whole set before discarding any recovery marker.
+		syncErr = errors.Join(syncErr, syncParents(map[string]struct{}{
+			filepath.Dir(entry.originalPath): {},
+			entry.stagingRoot:                {},
+		}))
+	}
+	return syncErr
 }
 
 func deleteStagedProfileInstances(
 	staged []stagedProfileInstance,
 ) error {
+	return deleteStagedProfileInstancesWithSync(staged, syncProfileRemovalParents)
+}
+
+func deleteStagedProfileInstancesWithSync(
+	staged []stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+) error {
 	var cleanupErr error
+	parents := make(map[string]struct{})
 	for _, entry := range staged {
 		cleanupErr = errors.Join(cleanupErr, os.RemoveAll(entry.stagingRoot))
+		parents[filepath.Dir(entry.stagingRoot)] = struct{}{}
 	}
-	return cleanupErr
+	return errors.Join(cleanupErr, syncParents(parents))
 }
 
 func deleteOrphanedStagedProfileInstances(instancePaths []string) error {
+	return deleteOrphanedStagedProfileInstancesWithSync(instancePaths, syncProfileRemovalParents)
+}
+
+func deleteOrphanedStagedProfileInstancesWithSync(
+	instancePaths []string,
+	syncParents func(map[string]struct{}) error,
+) error {
 	var cleanupErr error
+	parents := make(map[string]struct{})
 	for _, instancePath := range instancePaths {
-		matches, err := filepath.Glob(filepath.Join(
-			filepath.Dir(instancePath),
-			"."+filepath.Base(instancePath)+".remove-*",
-		))
+		// Sync even when no orphan is currently visible. A prior cleanup may
+		// have removed it but failed its parent-directory sync; replay must not
+		// clear the durable journal until that directory boundary succeeds.
+		parents[filepath.Dir(instancePath)] = struct{}{}
+		matches, err := stagedProfileInstanceRoots(instancePath)
 		if err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue
 		}
 		for _, match := range matches {
 			cleanupErr = errors.Join(cleanupErr, os.RemoveAll(match))
+			parents[filepath.Dir(match)] = struct{}{}
 		}
 	}
-	return cleanupErr
+	return errors.Join(cleanupErr, syncParents(parents))
+}
+
+func normalizedProfileRemovalPath(path string) (string, error) {
+	return filepath.Abs(filepath.Clean(path))
+}
+
+func newProfileRemovalOperationID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate Claude profile removal operation identity: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func validProfileRemovalOperationID(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func validProfileCredentialSetVersion(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func writeProfileRemovalStageManifest(entry stagedProfileInstance) error {
+	if !validProfileRemovalOperationID(entry.operationID) || !validProfileCredentialSetVersion(entry.credentialSetVersion) {
+		return errors.New("invalid Claude profile removal ownership identity")
+	}
+	originalPath, err := normalizedProfileRemovalPath(entry.originalPath)
+	if err != nil {
+		return err
+	}
+	stagingRoot, err := normalizedProfileRemovalPath(entry.stagingRoot)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(profileRemovalStageManifest{
+		Version:              profileRemovalStageManifestVersion,
+		OriginalPath:         originalPath,
+		StagingRoot:          stagingRoot,
+		EntryName:            profileRemovalStageEntryName,
+		OperationID:          entry.operationID,
+		CredentialSetVersion: entry.credentialSetVersion,
+	})
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	return writePrivateFileAtomic(filepath.Join(entry.stagingRoot, profileRemovalStageManifestName), body)
+}
+
+func writeProfileRemovalOperationMarker(entry stagedProfileInstance) error {
+	originalPath, err := normalizedProfileRemovalPath(entry.originalPath)
+	if err != nil {
+		return err
+	}
+	if !validProfileRemovalOperationID(entry.operationID) || !validProfileCredentialSetVersion(entry.credentialSetVersion) {
+		return errors.New("invalid Claude profile removal operation identity")
+	}
+	markerPath := filepath.Join(entry.originalPath, profileRemovalOperationMarkerName)
+	if _, err := os.Lstat(markerPath); err == nil {
+		return fmt.Errorf("Claude profile removal operation marker %q already exists", markerPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	body, err := json.Marshal(profileRemovalOperationMarker{
+		Version:              profileRemovalOperationMarkerVersion,
+		OriginalPath:         originalPath,
+		OperationID:          entry.operationID,
+		CredentialSetVersion: entry.credentialSetVersion,
+	})
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	return writePrivateFileAtomic(markerPath, body)
+}
+
+func readProfileRemovalOperationMarker(entry stagedProfileInstance) (bool, error) {
+	return readProfileRemovalOperationMarkerAt(entry, entry.originalPath)
+}
+
+func readProfileRemovalOperationMarkerAt(entry stagedProfileInstance, directory string) (bool, error) {
+	marker, present, err := readProfileRemovalOperationMarkerIdentity(directory, entry.originalPath)
+	if err != nil || !present {
+		return present, err
+	}
+	if marker.operationID != entry.operationID || marker.credentialSetVersion != entry.credentialSetVersion {
+		return false, fmt.Errorf("Claude profile removal operation marker %q does not match its exact identity", filepath.Join(directory, profileRemovalOperationMarkerName))
+	}
+	return true, nil
+}
+
+func readProfileRemovalOperationMarkerIdentity(directory, expectedOriginalPath string) (stagedProfileInstance, bool, error) {
+	markerPath := filepath.Join(directory, profileRemovalOperationMarkerName)
+	entry := stagedProfileInstance{originalPath: filepath.Clean(expectedOriginalPath)}
+	info, err := os.Lstat(markerPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return entry, false, nil
+	}
+	if err != nil {
+		return entry, false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > profileRemovalOperationMarkerMaxSize {
+		return entry, false, fmt.Errorf("Claude profile removal operation marker %q is not a safe regular file", markerPath)
+	}
+	body, err := os.ReadFile(markerPath)
+	if err != nil {
+		return entry, false, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var marker profileRemovalOperationMarker
+	if err := decoder.Decode(&marker); err != nil {
+		return entry, false, fmt.Errorf("decode Claude profile removal operation marker %q: %w", markerPath, err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return entry, false, fmt.Errorf("Claude profile removal operation marker %q has trailing data", markerPath)
+	}
+	originalPath, err := normalizedProfileRemovalPath(expectedOriginalPath)
+	if err != nil {
+		return entry, false, err
+	}
+	if marker.Version != profileRemovalOperationMarkerVersion ||
+		marker.OriginalPath != originalPath ||
+		!validProfileRemovalOperationID(marker.OperationID) ||
+		!validProfileCredentialSetVersion(marker.CredentialSetVersion) {
+		return entry, false, fmt.Errorf("Claude profile removal operation marker %q does not match its exact identity", markerPath)
+	}
+	entry.operationID = marker.OperationID
+	entry.credentialSetVersion = marker.CredentialSetVersion
+	return entry, true, nil
+}
+
+func removeProfileRemovalOperationMarker(
+	entry stagedProfileInstance,
+	syncParents func(map[string]struct{}) error,
+) error {
+	present, err := readProfileRemovalOperationMarker(entry)
+	if err != nil {
+		return err
+	}
+	if present {
+		if err := os.Remove(filepath.Join(entry.originalPath, profileRemovalOperationMarkerName)); err != nil {
+			return err
+		}
+	}
+	// Sync the live directory even when replay finds the marker absent: an
+	// earlier attempt may have removed it but failed this durability boundary.
+	return syncParents(map[string]struct{}{entry.originalPath: {}})
+}
+
+func readOwnedProfileRemovalStage(stagingRoot, expectedOriginalPath string) (stagedProfileInstance, error) {
+	entry := stagedProfileInstance{
+		originalPath: filepath.Clean(expectedOriginalPath),
+		stagedPath:   filepath.Join(stagingRoot, profileRemovalStageEntryName),
+		stagingRoot:  filepath.Clean(stagingRoot),
+	}
+	rootInfo, err := os.Lstat(entry.stagingRoot)
+	if err != nil {
+		return entry, err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return entry, fmt.Errorf("Claude profile removal stage %q is not a regular directory", entry.stagingRoot)
+	}
+	manifestPath := filepath.Join(entry.stagingRoot, profileRemovalStageManifestName)
+	manifestInfo, err := os.Lstat(manifestPath)
+	if err != nil {
+		return entry, fmt.Errorf("Claude profile removal stage %q has no valid ownership manifest: %w", entry.stagingRoot, err)
+	}
+	if manifestInfo.Mode()&os.ModeSymlink != 0 || !manifestInfo.Mode().IsRegular() || manifestInfo.Size() > profileRemovalStageManifestMaxSize {
+		return entry, fmt.Errorf("Claude profile removal stage %q ownership manifest is not a safe regular file", entry.stagingRoot)
+	}
+	body, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return entry, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var manifest profileRemovalStageManifest
+	if err := decoder.Decode(&manifest); err != nil {
+		return entry, fmt.Errorf("decode Claude profile removal stage manifest %q: %w", manifestPath, err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return entry, fmt.Errorf("Claude profile removal stage manifest %q has trailing data", manifestPath)
+	}
+	expectedOriginal, err := normalizedProfileRemovalPath(expectedOriginalPath)
+	if err != nil {
+		return entry, err
+	}
+	expectedRoot, err := normalizedProfileRemovalPath(stagingRoot)
+	if err != nil {
+		return entry, err
+	}
+	if manifest.Version != profileRemovalStageManifestVersion ||
+		manifest.OriginalPath != expectedOriginal ||
+		manifest.StagingRoot != expectedRoot ||
+		manifest.EntryName != profileRemovalStageEntryName ||
+		!validProfileRemovalOperationID(manifest.OperationID) ||
+		!validProfileCredentialSetVersion(manifest.CredentialSetVersion) {
+		return entry, fmt.Errorf("Claude profile removal stage %q ownership manifest does not match its exact identity", entry.stagingRoot)
+	}
+	entry.operationID = manifest.OperationID
+	entry.credentialSetVersion = manifest.CredentialSetVersion
+	entries, err := os.ReadDir(entry.stagingRoot)
+	if err != nil {
+		return entry, err
+	}
+	if len(entries) == 1 && entries[0].Name() == profileRemovalStageManifestName {
+		entry.prepared = true
+		return entry, nil
+	}
+	if len(entries) != 2 {
+		return entry, fmt.Errorf("Claude profile removal stage %q has unexpected structure", entry.stagingRoot)
+	}
+	seenManifest, seenInstance := false, false
+	for _, child := range entries {
+		switch child.Name() {
+		case profileRemovalStageManifestName:
+			seenManifest = true
+		case profileRemovalStageEntryName:
+			if child.Type()&os.ModeSymlink != 0 || !child.IsDir() {
+				return entry, fmt.Errorf("Claude profile removal staged instance %q is not a regular directory", entry.stagedPath)
+			}
+			seenInstance = true
+		default:
+			return entry, fmt.Errorf("Claude profile removal stage %q has unexpected entry %q", entry.stagingRoot, child.Name())
+		}
+	}
+	if !seenManifest || !seenInstance {
+		return entry, fmt.Errorf("Claude profile removal stage %q has incomplete structure", entry.stagingRoot)
+	}
+	markerPresent, err := readProfileRemovalOperationMarkerAt(entry, entry.stagedPath)
+	if err != nil {
+		return entry, err
+	}
+	if !markerPresent {
+		return entry, fmt.Errorf("Claude profile removal staged instance %q has no operation marker", entry.stagedPath)
+	}
+	return entry, nil
+}
+
+func stagedProfileInstanceRoots(instancePath string) ([]string, error) {
+	parent := filepath.Dir(instancePath)
+	entries, err := os.ReadDir(parent)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	prefix := "." + filepath.Base(instancePath) + ".remove-"
+	matches := make([]string, 0)
+	for _, entry := range entries {
+		suffix := strings.TrimPrefix(entry.Name(), prefix)
+		generatedSuffix := suffix != "" && suffix != entry.Name()
+		for index := 0; generatedSuffix && index < len(suffix); index++ {
+			generatedSuffix = suffix[index] >= '0' && suffix[index] <= '9'
+		}
+		// os.MkdirTemp appends a decimal random value. Requiring that exact
+		// suffix keeps a profile named "work" from claiming a stage owned by a
+		// sibling named "work.remove-extra".
+		if generatedSuffix {
+			root := filepath.Join(parent, entry.Name())
+			if _, err := readOwnedProfileRemovalStage(root, instancePath); err != nil {
+				return nil, err
+			}
+			matches = append(matches, root)
+		}
+	}
+	return matches, nil
+}
+
+// ReconcileProfileInstanceStagesContext repairs an interrupted profile removal
+// using the registry as the commit authority. A registered profile whose live
+// instance is absent gets its one exact stage restored. Stages for profiles no
+// longer in the registry are deleted. A live replacement plus a staged secret,
+// or multiple possible stages, is left untouched and reported as ambiguous.
+func (s Store) ReconcileProfileInstanceStagesContext(ctx context.Context) (err error) {
+	registryLock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, registryLock.Close()) }()
+
+	data := profilesFile{Profiles: map[string]Profile{}}
+	body, readErr := readFileForAtomicReplace(s.ProfilesPath())
+	if readErr == nil {
+		if err := json.Unmarshal(body, &data); err != nil {
+			return fmt.Errorf("decode Claude profile registry: %w", err)
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+
+	registeredByPath := make(map[string]string)
+	pathsByProfile := make(map[string][]string)
+	instanceRoots := []string{filepath.Clean(s.InstancesDir())}
+	if legacyRoot, ok := s.legacyInstancePath(s.InstancesDir()); ok {
+		instanceRoots = append(instanceRoots, filepath.Clean(legacyRoot))
+	}
+	for name, profile := range data.Profiles {
+		if profile.Name != name {
+			return fmt.Errorf("Claude profile %q has mismatched registry identity %q", name, profile.Name)
+		}
+		dir := resolvedClaudeProfileInstanceDir(name, profile)
+		paths, err := s.profileInstancePaths(dir)
+		if err != nil {
+			return fmt.Errorf("resolve Claude profile %q instance paths: %w", name, err)
+		}
+		for _, path := range paths {
+			path = filepath.Clean(path)
+			if owner, exists := registeredByPath[path]; exists && owner != name {
+				return fmt.Errorf("Claude profiles %q and %q share instance path %q", owner, name, path)
+			}
+			registeredByPath[path] = name
+			pathsByProfile[name] = append(pathsByProfile[name], path)
+		}
+	}
+
+	stagesByOriginal := make(map[string][]stagedProfileInstance)
+	for _, root := range instanceRoots {
+		entries, err := os.ReadDir(root)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			originalPath, ok := stagedProfileOriginalPath(root, entry.Name())
+			if !ok {
+				continue
+			}
+			stagingRoot := filepath.Join(root, entry.Name())
+			owned, err := readOwnedProfileRemovalStage(stagingRoot, originalPath)
+			if err != nil {
+				return err
+			}
+			stagesByOriginal[originalPath] = append(stagesByOriginal[originalPath], owned)
+		}
+	}
+	orphanMarkersByOriginal := make(map[string]stagedProfileInstance)
+	for originalPath := range registeredByPath {
+		marker, present, err := readProfileRemovalOperationMarkerIdentity(originalPath, originalPath)
+		if err != nil {
+			return err
+		}
+		if present && len(stagesByOriginal[originalPath]) == 0 {
+			orphanMarkersByOriginal[originalPath] = marker
+		}
+	}
+	if len(stagesByOriginal) == 0 && len(orphanMarkersByOriginal) == 0 {
+		return nil
+	}
+
+	lockPathSet := make(map[string]struct{})
+	for path := range stagesByOriginal {
+		lockPathSet[path] = struct{}{}
+	}
+	for path := range registeredByPath {
+		lockPathSet[path] = struct{}{}
+	}
+	originalPaths := make([]string, 0, len(lockPathSet))
+	for path := range lockPathSet {
+		originalPaths = append(originalPaths, path)
+	}
+	sort.Strings(originalPaths)
+	credentialLocks, err := lockProfileCredentialPaths(ctx, originalPaths)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, closeProfileCredentialLocks(credentialLocks)) }()
+
+	// A path outside the current registry is a committed removal. Every stage
+	// was provenance-validated before this point, so those roots can roll
+	// forward independently.
+	for _, originalPath := range originalPaths {
+		if _, isRegistered := registeredByPath[originalPath]; isRegistered {
+			continue
+		}
+		if staged := stagesByOriginal[originalPath]; len(staged) != 0 {
+			if err := deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents); err != nil {
+				return err
+			}
+		}
+	}
+
+	profileNames := make([]string, 0, len(pathsByProfile))
+	for name := range pathsByProfile {
+		profileNames = append(profileNames, name)
+	}
+	sort.Strings(profileNames)
+	for _, profileName := range profileNames {
+		paths := pathsByProfile[profileName]
+		sort.Strings(paths)
+		var orphanMarkers []stagedProfileInstance
+		profileHasStages := false
+		for _, path := range paths {
+			profileHasStages = profileHasStages || len(stagesByOriginal[path]) != 0
+			if marker, found := orphanMarkersByOriginal[path]; found {
+				orphanMarkers = append(orphanMarkers, marker)
+			}
+		}
+		if len(orphanMarkers) != 0 {
+			if profileHasStages {
+				return fmt.Errorf("Claude profile %q has an orphan operation marker beside staged recovery state", profileName)
+			}
+			operationID := orphanMarkers[0].operationID
+			credentialSetVersion := orphanMarkers[0].credentialSetVersion
+			for _, marker := range orphanMarkers[1:] {
+				if marker.operationID != operationID || marker.credentialSetVersion != credentialSetVersion {
+					return fmt.Errorf("Claude profile %q has orphan markers from multiple removal operations", profileName)
+				}
+			}
+			currentVersion, err := s.profileCredentialVersionLocked(ctx, paths, true)
+			if err != nil {
+				return err
+			}
+			if currentVersion != credentialSetVersion {
+				return fmt.Errorf("Claude profile %q credential changed while an orphan removal marker remained", profileName)
+			}
+			var cleanupErr error
+			for _, marker := range orphanMarkers {
+				cleanupErr = errors.Join(cleanupErr, removeProfileRemovalOperationMarker(marker, s.syncProfileRemovalParents))
+			}
+			if cleanupErr != nil {
+				return cleanupErr
+			}
+			continue
+		}
+		var prepared []stagedProfileInstance
+		preparedByPath := make(map[string][]stagedProfileInstance)
+		actualByPath := make(map[string][]stagedProfileInstance)
+		for _, path := range paths {
+			for _, candidate := range stagesByOriginal[path] {
+				if candidate.prepared {
+					prepared = append(prepared, candidate)
+					preparedByPath[path] = append(preparedByPath[path], candidate)
+				} else {
+					actualByPath[path] = append(actualByPath[path], candidate)
+				}
+			}
+		}
+		actualCount := 0
+		operationID := ""
+		credentialSetVersion := ""
+		for _, path := range paths {
+			if len(preparedByPath[path]) > 1 {
+				return fmt.Errorf("Claude profile %q has multiple prepared stages for %q", profileName, path)
+			}
+			if len(actualByPath[path]) > 1 {
+				return fmt.Errorf("Claude profile %q has multiple staged credentials for %q", profileName, path)
+			}
+			actualCount += len(actualByPath[path])
+			for _, candidate := range append(append([]stagedProfileInstance(nil), preparedByPath[path]...), actualByPath[path]...) {
+				if operationID == "" {
+					operationID = candidate.operationID
+				} else if candidate.operationID != operationID {
+					return fmt.Errorf("Claude profile %q has stages from multiple removal operations", profileName)
+				}
+				if credentialSetVersion == "" {
+					credentialSetVersion = candidate.credentialSetVersion
+				} else if candidate.credentialSetVersion != credentialSetVersion {
+					return fmt.Errorf("Claude profile %q has stages from multiple credential snapshots", profileName)
+				}
+			}
+		}
+		if credentialSetVersion == "" {
+			continue
+		}
+		currentCredentialSetVersion, err := s.profileCredentialVersionLocked(ctx, paths, true)
+		if err != nil {
+			return err
+		}
+		if currentCredentialSetVersion != credentialSetVersion {
+			return fmt.Errorf("Claude profile %q credential changed during interrupted removal recovery", profileName)
+		}
+		liveByPath := make(map[string]bool)
+		anyLive := false
+		for _, path := range paths {
+			if _, liveErr := os.Lstat(path); liveErr == nil {
+				anyLive = true
+				liveByPath[path] = true
+			} else if !errors.Is(liveErr, os.ErrNotExist) {
+				return liveErr
+			}
+		}
+		if actualCount == 0 {
+			for path := range preparedByPath {
+				if !liveByPath[path] {
+					return fmt.Errorf("Claude profile %q has a prepared stage without its live instance at %q", profileName, path)
+				}
+			}
+			if err := deletePreparedProfileStagesWithSync(prepared, s.syncProfileRemovalParents); err != nil {
+				return err
+			}
+			continue
+		}
+		var restore []stagedProfileInstance
+		for _, path := range paths {
+			restore = append(restore, actualByPath[path]...)
+		}
+		if anyLive {
+			// A partial rollback is distinguishable from a replacement only when
+			// every live physical path retains its exact prepared manifest and no
+			// actual stage claims that same path. Any unproven live path is a
+			// replacement boundary and must remain untouched.
+			for _, path := range paths {
+				if liveByPath[path] {
+					if len(preparedByPath[path]) != 1 || len(actualByPath[path]) != 0 {
+						return fmt.Errorf("Claude profile %q has both a live instance and a staged credential across its canonical or legacy paths", profileName)
+					}
+					markerPresent, markerErr := readProfileRemovalOperationMarker(preparedByPath[path][0])
+					if markerErr != nil {
+						return markerErr
+					}
+					if !markerPresent {
+						return fmt.Errorf("Claude profile %q live instance %q lacks matching rollback operation provenance", profileName, path)
+					}
+				} else if len(preparedByPath[path]) != 0 {
+					return fmt.Errorf("Claude profile %q has ambiguous prepared rollback provenance for %q", profileName, path)
+				}
+			}
+			if err := syncPreparedProfileStages(prepared, s.syncProfileRemovalParents); err != nil {
+				return err
+			}
+		} else if len(prepared) != 0 {
+			return fmt.Errorf("Claude profile %q has prepared rollback provenance without a live instance", profileName)
+		}
+		provenance := append(append([]stagedProfileInstance(nil), restore...), prepared...)
+		if err := restoreStagedProfileInstancesWithOps(restore, provenance, s.syncProfileRemovalParents, renameProfileInstanceNoReplace); err != nil {
+			return fmt.Errorf("restore Claude profile %q instances: %w", profileName, err)
+		}
+	}
+	return nil
+}
+
+func stagedProfileOriginalPath(root, entryName string) (string, bool) {
+	if !strings.HasPrefix(entryName, ".") {
+		return "", false
+	}
+	marker := strings.LastIndex(entryName, ".remove-")
+	if marker <= 1 {
+		return "", false
+	}
+	suffix := entryName[marker+len(".remove-"):]
+	if suffix == "" {
+		return "", false
+	}
+	for index := range suffix {
+		if suffix[index] < '0' || suffix[index] > '9' {
+			return "", false
+		}
+	}
+	base := entryName[1:marker]
+	if !safeProfileDir(base) {
+		return "", false
+	}
+	return filepath.Join(filepath.Clean(root), base), true
+}
+
+func syncProfileRemovalParents(parents map[string]struct{}) error {
+	return syncProfileRemovalParentsForOS(runtime.GOOS, parents, os.Open)
+}
+
+func (s Store) syncProfileRemovalParents(parents map[string]struct{}) error {
+	if s.syncRemovalParentsForTest != nil {
+		return s.syncRemovalParentsForTest(parents)
+	}
+	return syncProfileRemovalParents(parents)
+}
+
+func syncProfileRemovalParentsForOS(
+	goos string,
+	parents map[string]struct{},
+	openDir func(string) (*os.File, error),
+) error {
+	if goos == "windows" {
+		return nil
+	}
+	var syncErr error
+	for parent := range parents {
+		dir, err := openDir(parent)
+		if err != nil {
+			// A legacy instance root may never have existed on this host. There is
+			// no removed directory entry to make durable in an absent parent, so
+			// replay can treat that boundary as already satisfied.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			syncErr = errors.Join(syncErr, err)
+			continue
+		}
+		syncErr = errors.Join(syncErr, dir.Sync(), dir.Close())
+	}
+	return syncErr
 }
 
 type profileCredentialBackup struct {
@@ -430,7 +1360,7 @@ func (s Store) rollbackProfileRemoval(
 	staged []stagedProfileInstance,
 	backups []profileCredentialBackup,
 ) error {
-	if err := rollbackStagedProfileInstances(staged); err != nil {
+	if err := rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents); err != nil {
 		return err
 	}
 	for _, backup := range backups {
@@ -545,7 +1475,7 @@ func (s Store) SetActiveProfile(name string) error {
 	data.Active = name
 	profile.LastUsed = time.Now().UTC().Format(time.RFC3339)
 	data.Profiles[name] = profile
-	return s.writeProfiles(data)
+	return acceptCommittedProfileRegistryWrite("set active profile", s.writeProfiles(data))
 }
 
 func (s Store) CreateProfile(name string) (string, error) {
@@ -577,7 +1507,7 @@ func (s Store) CreateProfile(name string) (string, error) {
 	if data.Active == "" {
 		data.Active = name
 	}
-	return instancePath, s.writeProfiles(data)
+	return instancePath, acceptCommittedProfileRegistryWrite("create profile", s.writeProfiles(data))
 }
 
 func (s Store) CreateTempInstance() (string, string, error) {
@@ -617,7 +1547,7 @@ func (s Store) RegisterProfile(name, dir string) error {
 	if data.Active == "" {
 		data.Active = name
 	}
-	return s.writeProfiles(data)
+	return acceptCommittedProfileRegistryWrite("register profile", s.writeProfiles(data))
 }
 
 // ImportProfileCredential installs one server-owned OAuth credential without
@@ -745,7 +1675,7 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 	if err != nil {
 		return false, err
 	}
-	staged, err := stageProfileInstancePaths(instancePaths)
+	staged, err := s.stageProfileInstancePathsValidated(ctx, instancePaths)
 	if err != nil {
 		return false, err
 	}
@@ -757,8 +1687,27 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 			break
 		}
 	}
-	if err := s.writeProfiles(data); err != nil {
-		return false, errors.Join(err, rollbackStagedProfileInstances(staged))
+	// This is the final observable filesystem boundary before the atomic
+	// registry replacement. A non-cooperating writer can always race the tiny
+	// syscall gap, but every reappearance visible before it fails closed.
+	if err := s.validateStagedProfileCommitBoundary(staged); err != nil {
+		return false, err
+	}
+	if writeErr := s.writeProfiles(data); writeErr != nil {
+		if profileRegistryWriteCommitted(writeErr) {
+			// The registry deletion is already visible. Roll forward so a
+			// returned removed=true never leaves an invisible staged secret.
+			cleanupErr := errors.Join(
+				deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+				deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
+			)
+			if cleanupErr != nil {
+				return true, errors.Join(writeErr, cleanupErr)
+			}
+			slog.Warn("Claude profile removal is visible but registry directory durability is uncertain", "profile", name, "error", writeErr)
+			return true, nil
+		}
+		return false, errors.Join(writeErr, rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents))
 	}
 	if err := deleteProfileKeychainCredentialsContext(ctx, instancePaths); err != nil {
 		// The caller's deadline may be the reason cleanup failed. Rollback must
@@ -767,8 +1716,8 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 		rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		rollbackErr := s.rollbackProfileRemoval(rollbackCtx, original, staged, credentialBackups)
 		rollbackCancel()
-		if rollbackErr == nil {
-			return false, err
+		if rollbackErr == nil || profileRegistryWriteCommitted(rollbackErr) {
+			return false, errors.Join(err, rollbackErr)
 		}
 		slog.Error(
 			"Claude profile removal cleanup failed and rollback was incomplete; profile remains removed",
@@ -778,12 +1727,13 @@ func (s Store) RemoveProfileContext(ctx context.Context, name string) (removed b
 		)
 		return true, errors.Join(err, fmt.Errorf("rollback Claude profile removal: %w", rollbackErr))
 	}
-	if err := deleteStagedProfileInstances(staged); err != nil {
+	if err := deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents); err != nil {
 		slog.Warn(
 			"Claude profile removed with staged credential cleanup pending",
 			"profile", name,
 			"error", err,
 		)
+		return true, err
 	}
 	return true, nil
 }
@@ -833,7 +1783,7 @@ func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string)
 		}
 	}()
 
-	staged, err := stageProfileInstancePaths(instancePaths)
+	staged, err := s.stageProfileInstancePathsValidated(ctx, instancePaths)
 	if err != nil {
 		return false, err
 	}
@@ -845,15 +1795,25 @@ func (s Store) RemoveUnpublishedProfileContext(ctx context.Context, name string)
 			break
 		}
 	}
-	if err := s.writeProfiles(data); err != nil {
-		return false, errors.Join(err, rollbackStagedProfileInstances(staged))
+	if err := s.validateStagedProfileCommitBoundary(staged); err != nil {
+		return false, err
+	}
+	if writeErr := s.writeProfiles(data); writeErr != nil {
+		if profileRegistryWriteCommitted(writeErr) {
+			cleanupErr := errors.Join(
+				deleteProfileKeychainCredentialsContext(ctx, instancePaths),
+				deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
+			)
+			return true, errors.Join(writeErr, cleanupErr)
+		}
+		return false, errors.Join(writeErr, rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents))
 	}
 
 	// The removal is committed at this point. In particular, do not restore the
 	// registry or staged credential when Keychain cleanup fails.
 	cleanupErr := errors.Join(
 		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
-		deleteStagedProfileInstances(staged),
+		deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
 	)
 	if cleanupErr != nil {
 		return true, cleanupErr
@@ -884,6 +1844,9 @@ func (s Store) PrepareUnpublishedProfileRemovalContext(
 		}
 	}()
 	body, err := readFileForAtomicReplace(s.ProfilesPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -908,6 +1871,94 @@ func (s Store) PrepareUnpublishedProfileRemovalContext(
 	return true, prepare(dir)
 }
 
+// SnapshotProfileRemovalContext returns one exact profile/credential identity
+// while holding the registry and all path-keyed credential locks. A caller can
+// compare snapshots before and after joining a broader account transaction
+// without ever retaining secret material.
+func (s Store) SnapshotProfileRemovalContext(ctx context.Context, name string) (snapshot ProfileRemovalSnapshot, found bool, err error) {
+	return s.prepareExactProfileRemovalContext(ctx, name, nil)
+}
+
+// PrepareExactProfileRemovalContext snapshots one exact profile and invokes
+// prepare under the same registry and credential locks. This makes the durable
+// journal the final operation before those locks are released.
+func (s Store) PrepareExactProfileRemovalContext(
+	ctx context.Context,
+	name string,
+	prepare func(snapshot ProfileRemovalSnapshot) error,
+) (found bool, err error) {
+	_, found, err = s.prepareExactProfileRemovalContext(ctx, name, prepare)
+	return found, err
+}
+
+func (s Store) prepareExactProfileRemovalContext(
+	ctx context.Context,
+	name string,
+	prepare func(snapshot ProfileRemovalSnapshot) error,
+) (snapshot ProfileRemovalSnapshot, found bool, err error) {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
+		return snapshot, false, err
+	}
+	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
+	if err != nil {
+		return snapshot, false, err
+	}
+	defer func() {
+		if closeErr := lock.Close(); closeErr != nil {
+			found = false
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	body, err := readFileForAtomicReplace(s.ProfilesPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return snapshot, false, nil
+	}
+	if err != nil {
+		return snapshot, false, err
+	}
+	var data profilesFile
+	if err := json.Unmarshal(body, &data); err != nil {
+		return snapshot, false, fmt.Errorf("decode Claude profile registry: %w", err)
+	}
+	profile, found := data.Profiles[name]
+	if !found {
+		return snapshot, false, nil
+	}
+	if profile.Name != name {
+		return snapshot, false, fmt.Errorf("Claude profile %q has mismatched registry identity %q", name, profile.Name)
+	}
+	dir := profile.Dir
+	if dir == "" {
+		dir = sanitizeName(name)
+	}
+	if !safeProfileDir(dir) {
+		return snapshot, false, errors.New("Claude profile directory is invalid")
+	}
+	instancePaths, err := s.profileInstancePaths(dir)
+	if err != nil {
+		return snapshot, false, err
+	}
+	credentialLocks, err := lockProfileCredentialPaths(ctx, instancePaths)
+	if err != nil {
+		return snapshot, false, err
+	}
+	defer func() {
+		if closeErr := closeProfileCredentialLocks(credentialLocks); closeErr != nil {
+			found = false
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	credentialVersion, err := s.profileCredentialVersionLocked(ctx, instancePaths, false)
+	if err != nil {
+		return snapshot, false, err
+	}
+	snapshot = ProfileRemovalSnapshot{InstanceDir: dir, CredentialVersion: credentialVersion}
+	if prepare == nil {
+		return snapshot, true, nil
+	}
+	return snapshot, true, prepare(snapshot)
+}
+
 // CompleteUnpublishedProfileRemovalContext idempotently completes removal of
 // one exact journaled profile identity. It cleans the path-keyed Keychain
 // credential and every staged .remove-* directory even when registry removal
@@ -918,10 +1969,22 @@ func (s Store) CompleteUnpublishedProfileRemovalContext(
 	name string,
 	expectedInstanceDir string,
 ) (completed bool, err error) {
+	return s.CompleteExactProfileRemovalContext(ctx, name, ProfileRemovalSnapshot{InstanceDir: expectedInstanceDir})
+}
+
+// CompleteExactProfileRemovalContext idempotently completes a journaled
+// removal. While the registry entry still exists, both its instance identity
+// and actual credential fingerprint must match. Once registry removal has
+// committed, replay only cleans the exact journaled paths and orphan stages.
+func (s Store) CompleteExactProfileRemovalContext(
+	ctx context.Context,
+	name string,
+	expected ProfileRemovalSnapshot,
+) (completed bool, err error) {
 	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return false, err
 	}
-	if !safeProfileDir(expectedInstanceDir) {
+	if !safeProfileDir(expected.InstanceDir) {
 		return false, errors.New("Claude profile rollback instance directory is invalid")
 	}
 	lock, err := lockProfileRegistryContext(ctx, s.ProfilesPath())
@@ -945,10 +2008,11 @@ func (s Store) CompleteUnpublishedProfileRemovalContext(
 	if data.Profiles == nil {
 		return false, errors.New("Claude profile registry has no profiles map")
 	}
-	if err := s.ensureClaudeProfileInstanceDirAvailable(data, name, expectedInstanceDir); err != nil {
+	if err := s.ensureClaudeProfileInstanceDirAvailable(data, name, expected.InstanceDir); err != nil {
 		return false, fmt.Errorf("refuse Claude rollback cleanup: %w", err)
 	}
 	profile, found := data.Profiles[name]
+	var registryCommitErr error
 	if found {
 		if profile.Name != name {
 			return false, fmt.Errorf("Claude profile %q has mismatched registry identity %q", name, profile.Name)
@@ -957,11 +2021,11 @@ func (s Store) CompleteUnpublishedProfileRemovalContext(
 		if actualDir == "" {
 			actualDir = sanitizeName(name)
 		}
-		if actualDir != expectedInstanceDir {
-			return false, fmt.Errorf("Claude profile %q instance directory changed from %q to %q", name, expectedInstanceDir, actualDir)
+		if actualDir != expected.InstanceDir {
+			return false, fmt.Errorf("Claude profile %q instance directory changed from %q to %q", name, expected.InstanceDir, actualDir)
 		}
 	}
-	instancePaths, err := s.profileInstancePaths(expectedInstanceDir)
+	instancePaths, err := s.profileInstancePaths(expected.InstanceDir)
 	if err != nil {
 		return false, err
 	}
@@ -975,7 +2039,45 @@ func (s Store) CompleteUnpublishedProfileRemovalContext(
 			err = errors.Join(err, closeErr)
 		}
 	}()
-	staged, err := stageProfileInstancePaths(instancePaths)
+	// Validate every stage-looking candidate before moving or deleting a live
+	// credential, including legacy journals that did not record a fingerprint.
+	// Discovery is intentionally fail-closed on anything without exact owned
+	// provenance.
+	for _, instancePath := range instancePaths {
+		if _, err := stagedProfileInstanceRoots(instancePath); err != nil {
+			return false, err
+		}
+	}
+	if !found {
+		// A prior attempt may have renamed the registry and failed only its
+		// directory fsync. Replay must prove that boundary before completing.
+		if syncErr := s.syncProfilesDirectory(); syncErr != nil {
+			return false, syncErr
+		}
+	}
+	if expected.CredentialVersion != "" {
+		credentialVersion, versionErr := s.profileCredentialVersionLocked(ctx, instancePaths, true)
+		if versionErr != nil {
+			return false, versionErr
+		}
+		// Once the registry and every credential payload are absent, replay is
+		// already past the destructive boundary. The empty-set fingerprint is a
+		// snapshot identity, not a replacement credential.
+		emptyVersion, emptyErr := absentProfileCredentialVersion(instancePaths)
+		if emptyErr != nil {
+			return false, emptyErr
+		}
+		alreadyRemoved := !found && credentialVersion == emptyVersion
+		if credentialVersion != expected.CredentialVersion && !alreadyRemoved {
+			if cleanupErr := cleanupExactStagedProfileCredentialLockedWithSync(instancePaths, expected.CredentialVersion, s.syncProfileRemovalParents); cleanupErr != nil {
+				// Keep the journal fail-closed when its staged secret cannot be
+				// identified or durably removed. Reconciliation must not clear it.
+				return false, cleanupErr
+			}
+			return false, fmt.Errorf("%w: %q", ErrProfileRemovalCredentialChanged, name)
+		}
+	}
+	staged, err := s.stageProfileInstancePathsValidated(ctx, instancePaths)
 	if err != nil {
 		return false, err
 	}
@@ -988,19 +2090,398 @@ func (s Store) CompleteUnpublishedProfileRemovalContext(
 				break
 			}
 		}
-		if err := s.writeProfiles(data); err != nil {
-			return false, errors.Join(err, rollbackStagedProfileInstances(staged))
+		if err := s.validateStagedProfileCommitBoundary(staged); err != nil {
+			return false, err
 		}
+		if writeErr := s.writeProfiles(data); writeErr != nil {
+			if !profileRegistryWriteCommitted(writeErr) {
+				return false, errors.Join(writeErr, rollbackStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents))
+			}
+			registryCommitErr = writeErr
+		}
+	} else if err := s.validateStagedProfileCommitBoundary(staged); err != nil {
+		return false, err
 	}
 	cleanupErr := errors.Join(
 		deleteProfileKeychainCredentialsContext(ctx, instancePaths),
-		deleteStagedProfileInstances(staged),
-		deleteOrphanedStagedProfileInstances(instancePaths),
+		deleteStagedProfileInstancesWithSync(staged, s.syncProfileRemovalParents),
+		deleteOrphanedStagedProfileInstancesWithSync(instancePaths, s.syncProfileRemovalParents),
 	)
 	if cleanupErr != nil {
-		return false, cleanupErr
+		return false, errors.Join(registryCommitErr, cleanupErr)
+	}
+	if registryCommitErr != nil {
+		return false, registryCommitErr
 	}
 	return true, nil
+}
+
+func (s Store) profileCredentialVersionLocked(ctx context.Context, instancePaths []string, includeStaged bool) (string, error) {
+	return s.profileCredentialVersionLockedRequiringAbsent(ctx, instancePaths, includeStaged, nil)
+}
+
+func (s Store) profileCredentialVersionLockedRequiringAbsent(
+	ctx context.Context,
+	instancePaths []string,
+	includeStaged bool,
+	requireAbsent []stagedProfileInstance,
+) (string, error) {
+	requiredAbsent := make(map[string]struct{}, len(requireAbsent))
+	for _, entry := range requireAbsent {
+		normalized, err := normalizedProfileRemovalPath(entry.originalPath)
+		if err != nil {
+			return "", err
+		}
+		requiredAbsent[normalized] = struct{}{}
+	}
+	entries := make([]profileCredentialVersionEntry, 0, len(instancePaths))
+	for _, instancePath := range instancePaths {
+		normalizedPath, err := normalizedProfileRemovalPath(instancePath)
+		if err != nil {
+			return "", err
+		}
+		entry := profileCredentialVersionEntry{originalPath: normalizedPath}
+		if info, statErr := os.Lstat(instancePath); statErr == nil {
+			if _, mustBeAbsent := requiredAbsent[normalizedPath]; mustBeAbsent {
+				return "", fmt.Errorf("%w: staged Claude profile path %q reappeared during credential traversal", ErrProfileRemovalCredentialChanged, instancePath)
+			}
+			entry.instancePresent = true
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return "", fmt.Errorf("Claude profile instance %q is not a regular directory", instancePath)
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", statErr
+		}
+		if includeStaged {
+			// Validate every stage candidate even when a live credential wins the
+			// version comparison. Otherwise an unowned lookalike can be discovered
+			// only after the live credential has already been staged for deletion.
+			roots, listErr := stagedProfileInstanceRoots(instancePath)
+			if listErr != nil {
+				return "", listErr
+			}
+			// Once deletion has staged the live directory away, a stale path-keyed
+			// Keychain item must not mask the exact file payload owned by the
+			// journal. Prefer a live file, then its staged replacement, and only
+			// consult Keychain when neither exists.
+			livePayload, liveErr := os.ReadFile(filepath.Join(instancePath, ".credentials.json"))
+			if liveErr == nil {
+				entry.payloadPresent = true
+				entry.payload = livePayload
+				entries = append(entries, entry)
+				continue
+			}
+			if !errors.Is(liveErr, os.ErrNotExist) {
+				return "", liveErr
+			}
+			// A live directory, even one without a credential file, is a replacement
+			// boundary. Never substitute an older staged payload at the same path.
+			if !entry.instancePresent {
+				var actualStages []stagedProfileInstance
+				for _, root := range roots {
+					owned, readErr := readOwnedProfileRemovalStage(root, instancePath)
+					if readErr != nil {
+						return "", readErr
+					}
+					if !owned.prepared {
+						actualStages = append(actualStages, owned)
+					}
+				}
+				if len(actualStages) > 1 {
+					return "", fmt.Errorf("Claude profile credential has multiple stages for %q", instancePath)
+				}
+				if len(actualStages) == 1 {
+					entry.instancePresent = true
+					stagedPayload, readErr := os.ReadFile(filepath.Join(actualStages[0].stagedPath, ".credentials.json"))
+					if readErr == nil {
+						entry.payloadPresent = true
+						entry.payload = stagedPayload
+						entries = append(entries, entry)
+						continue
+					}
+					if !errors.Is(readErr, os.ErrNotExist) {
+						return "", readErr
+					}
+				}
+			}
+		}
+		payload, found, err := s.readCredentialPayloadLocked(ctx, instancePath)
+		if err != nil {
+			return "", err
+		}
+		if found {
+			entry.payloadPresent = true
+			entry.payload = payload
+		}
+		entries = append(entries, entry)
+	}
+	return profileCredentialEntriesVersion(entries)
+}
+
+type profileCredentialVersionEntry struct {
+	originalPath    string
+	instancePresent bool
+	payloadPresent  bool
+	payload         []byte
+}
+
+func filesystemProfileCredentialVersion(instancePaths []string) (string, error) {
+	entries := make([]profileCredentialVersionEntry, 0, len(instancePaths))
+	for _, instancePath := range instancePaths {
+		entry := profileCredentialVersionEntry{originalPath: instancePath}
+		info, err := os.Lstat(instancePath)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return "", fmt.Errorf("Claude profile instance %q is not a regular directory", instancePath)
+			}
+			entry.instancePresent = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		payload, err := os.ReadFile(filepath.Join(instancePath, ".credentials.json"))
+		if err == nil {
+			entry.payloadPresent = true
+			entry.payload = payload
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		entries = append(entries, entry)
+	}
+	return profileCredentialEntriesVersion(entries)
+}
+
+func profileCredentialEntriesVersion(entries []profileCredentialVersionEntry) (string, error) {
+	ordered := append([]profileCredentialVersionEntry(nil), entries...)
+	for index := range ordered {
+		normalizedPath, err := normalizedProfileRemovalPath(ordered[index].originalPath)
+		if err != nil {
+			return "", err
+		}
+		ordered[index].originalPath = normalizedPath
+	}
+	sort.Slice(ordered, func(left, right int) bool { return ordered[left].originalPath < ordered[right].originalPath })
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("subrouter-claude-profile-credential-v2\x00"))
+	var priorPath string
+	for index, entry := range ordered {
+		if index != 0 && entry.originalPath == priorPath {
+			return "", fmt.Errorf("duplicate Claude profile credential path %q", entry.originalPath)
+		}
+		priorPath = entry.originalPath
+		writeCredentialVersionFrame(hash, []byte(entry.originalPath))
+		flags := byte(0)
+		if entry.instancePresent {
+			flags |= 1
+		}
+		if entry.payloadPresent {
+			flags |= 2
+		}
+		_, _ = hash.Write([]byte{flags})
+		payload := []byte(nil)
+		if entry.payloadPresent {
+			payload = bytes.TrimSpace(entry.payload)
+		}
+		writeCredentialVersionFrame(hash, payload)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func writeCredentialVersionFrame(writer io.Writer, value []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = writer.Write(size[:])
+	_, _ = writer.Write(value)
+}
+
+func absentProfileCredentialVersion(instancePaths []string) (string, error) {
+	entries := make([]profileCredentialVersionEntry, 0, len(instancePaths))
+	for _, path := range instancePaths {
+		entries = append(entries, profileCredentialVersionEntry{originalPath: path})
+	}
+	return profileCredentialEntriesVersion(entries)
+}
+
+func cleanupExactStagedProfileCredentialLocked(instancePaths []string, expectedVersion string) error {
+	return cleanupExactStagedProfileCredentialLockedWithSync(instancePaths, expectedVersion, syncProfileRemovalParents)
+}
+
+func cleanupExactStagedProfileCredentialLockedWithSync(
+	instancePaths []string,
+	expectedVersion string,
+	syncParents func(map[string]struct{}) error,
+) error {
+	type candidate struct {
+		entry          stagedProfileInstance
+		payloadPresent bool
+		payload        []byte
+	}
+	var candidates []candidate
+	var prepared []stagedProfileInstance
+	for _, instancePath := range instancePaths {
+		roots, err := stagedProfileInstanceRoots(instancePath)
+		if err != nil {
+			return err
+		}
+		for _, root := range roots {
+			owned, err := readOwnedProfileRemovalStage(root, instancePath)
+			if err != nil {
+				return err
+			}
+			if owned.prepared {
+				prepared = append(prepared, owned)
+				continue
+			}
+			stagedPath := owned.stagedPath
+			payload, err := os.ReadFile(filepath.Join(stagedPath, ".credentials.json"))
+			payloadPresent := err == nil
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			candidates = append(candidates, candidate{
+				entry:          owned,
+				payloadPresent: payloadPresent,
+				payload:        payload,
+			})
+		}
+	}
+	var exact []stagedProfileInstance
+	if len(candidates) == 0 {
+		if len(prepared) != 0 {
+			return deletePreparedProfileStagesWithSync(prepared, syncParents)
+		}
+		parents := make(map[string]struct{}, len(instancePaths))
+		for _, instancePath := range instancePaths {
+			// A prior attempt may have removed the exact stage and failed only
+			// its parent fsync. Replay must re-prove that durability boundary
+			// before allowing the journal to clear.
+			parents[filepath.Dir(instancePath)] = struct{}{}
+		}
+		return syncParents(parents)
+	}
+	for _, candidate := range candidates {
+		candidateVersion, err := stagedProfileCredentialVersion(instancePaths, []profileCredentialVersionEntry{{
+			originalPath:    candidate.entry.originalPath,
+			instancePresent: true,
+			payloadPresent:  candidate.payloadPresent,
+			payload:         candidate.payload,
+		}})
+		if err != nil {
+			return err
+		}
+		if candidateVersion == expectedVersion {
+			exact = append(exact, candidate.entry)
+		}
+	}
+	if len(exact) == 1 {
+		if err := deleteStagedProfileInstancesWithSync(exact, syncParents); err != nil {
+			return err
+		}
+		return deletePreparedProfileStagesWithSync(prepared, syncParents)
+	}
+	if len(exact) > 1 {
+		return errors.New("Claude profile removal staged credential is ambiguous")
+	}
+	if len(candidates) > 1 && len(candidates) <= len(instancePaths) {
+		versionEntries := make([]profileCredentialVersionEntry, 0, len(candidates))
+		entries := make([]stagedProfileInstance, 0, len(candidates))
+		seenPaths := make(map[string]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			key := profileInstancePathKey(candidate.entry.originalPath)
+			if _, duplicate := seenPaths[key]; duplicate {
+				return errors.New("Claude profile removal staged credential is ambiguous")
+			}
+			seenPaths[key] = struct{}{}
+			versionEntries = append(versionEntries, profileCredentialVersionEntry{
+				originalPath:    candidate.entry.originalPath,
+				instancePresent: true,
+				payloadPresent:  candidate.payloadPresent,
+				payload:         candidate.payload,
+			})
+			entries = append(entries, candidate.entry)
+		}
+		candidateVersion, err := stagedProfileCredentialVersion(instancePaths, versionEntries)
+		if err != nil {
+			return err
+		}
+		if candidateVersion == expectedVersion {
+			if err := deleteStagedProfileInstancesWithSync(entries, syncParents); err != nil {
+				return err
+			}
+			return deletePreparedProfileStagesWithSync(prepared, syncParents)
+		}
+	}
+	return errors.Join(
+		errors.New("Claude profile removal staged credential does not match its journal"),
+		deletePreparedProfileStagesWithSync(prepared, syncParents),
+	)
+}
+
+func stagedProfileCredentialVersion(
+	instancePaths []string,
+	staged []profileCredentialVersionEntry,
+) (string, error) {
+	byPath := make(map[string]profileCredentialVersionEntry, len(staged))
+	for _, entry := range staged {
+		normalized, err := normalizedProfileRemovalPath(entry.originalPath)
+		if err != nil {
+			return "", err
+		}
+		if _, duplicate := byPath[normalized]; duplicate {
+			return "", fmt.Errorf("duplicate staged Claude profile credential path %q", normalized)
+		}
+		entry.originalPath = normalized
+		byPath[normalized] = entry
+	}
+	entries := make([]profileCredentialVersionEntry, 0, len(instancePaths))
+	for _, path := range instancePaths {
+		normalized, err := normalizedProfileRemovalPath(path)
+		if err != nil {
+			return "", err
+		}
+		if entry, found := byPath[normalized]; found {
+			entries = append(entries, entry)
+			delete(byPath, normalized)
+		} else {
+			entries = append(entries, profileCredentialVersionEntry{originalPath: normalized})
+		}
+	}
+	if len(byPath) != 0 {
+		return "", errors.New("staged Claude credential path is outside the exact instance set")
+	}
+	return profileCredentialEntriesVersion(entries)
+}
+
+func (s Store) readCredentialPayloadLocked(ctx context.Context, instancePath string) ([]byte, bool, error) {
+	body, err := os.ReadFile(filepath.Join(instancePath, ".credentials.json"))
+	if err == nil {
+		return body, true, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
+	}
+	if runtime.GOOS != "darwin" {
+		return nil, false, nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve current user for Claude Keychain lookup: %w", err)
+	}
+	service := "Claude Code-credentials-" + keychainHash(instancePath)
+	keychainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(keychainCtx, "security", "find-generic-password", "-s", service, "-a", u.Username, "-w")
+	body, err = cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read Claude credential from keychain: %w", err)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, false, nil
+	}
+	return body, true, nil
 }
 
 func (s Store) CleanupInstance(dir string) error {
@@ -1058,7 +2539,18 @@ func (s Store) writeProfiles(data profilesFile) error {
 		return err
 	}
 	body = append(body, '\n')
-	return writePrivateFileAtomic(s.ProfilesPath(), body)
+	committed, err := writePrivateFileAtomicWithDirectorySync(s.ProfilesPath(), body, s.syncDirectoryForTest)
+	if committed && err != nil {
+		return &profileRegistryWriteCommittedError{cause: err}
+	}
+	return err
+}
+
+func (s Store) syncProfilesDirectory() error {
+	if s.syncDirectoryForTest != nil {
+		return s.syncDirectoryForTest(filepath.Dir(s.ProfilesPath()))
+	}
+	return syncPrivateFileDirectoryForOS(runtime.GOOS, filepath.Dir(s.ProfilesPath()), os.Open)
 }
 
 func safeProfileDir(dir string) bool {
@@ -1166,38 +2658,55 @@ func profileInstancePhysicalIdentity(path string) (string, error) {
 }
 
 func writePrivateFileAtomic(path string, body []byte) error {
+	_, err := writePrivateFileAtomicWithDirectorySync(path, body, nil)
+	return err
+}
+
+func writePrivateFileAtomicWithDirectorySync(path string, body []byte, syncDirectory func(string) error) (committed bool, err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return false, err
 	}
 	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	tempPath := file.Name()
 	defer func() { _ = os.Remove(tempPath) }()
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
-		return err
+		return false, err
 	}
 	if _, err := file.Write(body); err != nil {
 		_ = file.Close()
-		return err
+		return false, err
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return err
+		return false, err
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return false, err
 	}
 	if err := os.Rename(tempPath, path); err != nil {
+		return false, err
+	}
+	if syncDirectory != nil {
+		return true, syncDirectory(filepath.Dir(path))
+	}
+	return true, syncPrivateFileDirectoryForOS(runtime.GOOS, filepath.Dir(path), os.Open)
+}
+
+func syncPrivateFileDirectoryForOS(goos, path string, openDir func(string) (*os.File, error)) error {
+	// Windows has no os.File directory-sync primitive. Atomic replacement is
+	// the explicit platform durability boundary, matching other store writers.
+	if goos == "windows" {
+		return nil
+	}
+	dir, err := openDir(path)
+	if err != nil {
 		return err
 	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
+	return errors.Join(dir.Sync(), dir.Close())
 }
 
 func (s Store) initInstanceDir(instancePath string) error {
@@ -1758,14 +3267,15 @@ func (s Store) UpsertCredentialProfile(name string, credential CredentialInfo) (
 	// local import: a collision-resistant directory for a new label, the
 	// existing registered directory for a repair, and the profile credential
 	// lock so a concurrent OAuth refresh cannot observe a partial replacement.
-	if err := s.ImportProfileCredential(name, credential); err != nil {
-		return Profile{}, err
+	importErr := s.ImportProfileCredential(name, credential)
+	if importErr != nil && !profileRegistryWriteCommitted(importErr) {
+		return Profile{}, importErr
 	}
 	profile, ok := s.FindProfile(name)
 	if !ok {
 		return Profile{}, fmt.Errorf("Claude profile %q was not readable after registration", name)
 	}
-	return profile, nil
+	return profile, importErr
 }
 
 func deleteKeychainCredential(instancePath string) error {
