@@ -80,7 +80,8 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	handler := Server{
-		ClaudeUpstream: upstreamURL,
+		ClaudeUpstream:    upstreamURL,
+		ClaudeFableAPIKey: "must-not-fallback",
 		Accounts: []accounts.Account{
 			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
 			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
@@ -139,6 +140,164 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 		if !strings.Contains(logs, want) {
 			t.Fatalf("expected rate-limit header %q in logs; logs=\n%s", want, logs)
 		}
+	}
+}
+
+func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
+	var cookedHits, alternateHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		switch r.Header.Get("Authorization") {
+		case "Bearer tok-cooked":
+			cookedHits++
+			w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(realisticAnthropic429Body))
+		case "Bearer tok-alternate":
+			alternateHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"must_not_be_served"}`))
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+			{ID: "alternate@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-alternate"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "alternate@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		}),
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-fable-5","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-forced")
+	req.Header.Set("X-Subrouter-Account-ID", "cooked@example.com")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want forced account's 429; body=%s", response.Code, response.Body.String())
+	}
+	if cookedHits != 1 || alternateHits != 0 {
+		t.Fatalf("upstream hits = forced:%d alternate:%d, want 1 and 0", cookedHits, alternateHits)
+	}
+}
+
+func TestClaudePreferredAccountStartsThereAndKeepsFailover(t *testing.T) {
+	var preferredHits, alternateHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "" {
+			t.Fatalf("preferred account header leaked upstream: %q", got)
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		switch r.Header.Get("Authorization") {
+		case "Bearer tok-preferred":
+			preferredHits++
+			w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(realisticAnthropic429Body))
+		case "Bearer tok-alternate":
+			alternateHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"served_after_failover"}`))
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "preferred@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-preferred"},
+			{ID: "alternate@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-alternate"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "preferred@example.com", Provider: accounts.ProviderClaude, Headroom: 0.2, ShortHeadroom: 0.2},
+			{AccountID: "alternate@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		}),
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-preferred")
+	req.Header.Set("X-Subrouter-Preferred-Account-ID", "preferred@example.com")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after pooled failover; body=%s", response.Code, response.Body.String())
+	}
+	if preferredHits != 1 || alternateHits != 1 {
+		t.Fatalf("upstream hits = preferred:%d alternate:%d, want 1 and 1", preferredHits, alternateHits)
+	}
+}
+
+func TestClaudeMissingPreferredAccountFallsBackToPool(t *testing.T) {
+	var hits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "" {
+			t.Fatalf("preferred account header leaked upstream: %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok-available" {
+			t.Fatalf("authorization = %q, want available account", got)
+		}
+		hits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"served_by_pool"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID: "available@example.com", Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth, Token: "tok-available",
+		}},
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: "available@example.com", Provider: accounts.ProviderClaude,
+			Headroom: 1, ShortHeadroom: 1,
+		}}),
+		Sessions:     store,
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-stale-preference")
+	req.Header.Set("X-Subrouter-Preferred-Account-ID", "removed@example.com")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || hits != 1 {
+		t.Fatalf("pooled fallback = status %d hits %d body %s", response.Code, hits, response.Body.String())
 	}
 }
 

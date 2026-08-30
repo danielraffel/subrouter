@@ -3285,6 +3285,19 @@ func (s Server) proxyHandler() http.Handler {
 		if modelCatalogRequest && boundLease == nil {
 			routingRequest = codexModelCatalogRoutingRequest(r)
 		}
+		// A caller-supplied account selector is a strict per-request binding, not
+		// a preference. Session leases install the same header internally but are
+		// already exact-bound by their lease, so keep this flag scoped to ordinary
+		// caller routing.
+		forcedAccountID := ""
+		if boundLease == nil {
+			forcedAccountID = session.ExtractAccountID(routingRequest)
+		}
+		forcedAccountSelection := forcedAccountID != ""
+		preferredAccountID := ""
+		if !forcedAccountSelection {
+			preferredAccountID = session.NormalizeAccountID(routingRequest.Header.Get("X-Subrouter-Preferred-Account-ID"))
+		}
 
 		if s.Lifecycle != nil && s.Lifecycle.Quiesced() {
 			http.Error(w, "subrouter is quiesced", http.StatusServiceUnavailable)
@@ -3312,7 +3325,7 @@ func (s Server) proxyHandler() http.Handler {
 		if requestProvider == accounts.ProviderClaude {
 			requestPoolModel = claudePoolModel(requestModel)
 			retryPoolModel = requestPoolModel
-			fableFallbackConfigured = boundLease == nil && s.CredentialBroker == nil &&
+			fableFallbackConfigured = !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				s.claudeFableEnabled() && claudeFableModel(requestModel) &&
 				r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v1/messages")
 		}
@@ -3320,7 +3333,7 @@ func (s Server) proxyHandler() http.Handler {
 		// touching the subscription pool. A non-2xx or unreachable Bedrock restores
 		// the body and falls through to the normal pool path (which still carries
 		// its own Bedrock/API-key fallback), so this never hard-fails Fable.
-		if s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
+		if preferredAccountID == "" && s.FableBedrockPrimary && fableFallbackConfigured && s.Bedrock != nil && s.Bedrock.configured() {
 			if s.serveClaudeFableBedrockPrimary(w, r) {
 				return
 			}
@@ -3331,7 +3344,7 @@ func (s Server) proxyHandler() http.Handler {
 		// has answered, the session is pinned so the following turns reuse the
 		// same Azure prompt cache instead of alternating providers, which would
 		// re-upload the whole conversation as a cache miss every turn.
-		azureCodexConfigured := boundLease == nil && s.CredentialBroker == nil &&
+		azureCodexConfigured := !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 			requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() &&
 			azureCodexRequest(r.Method, r.URL.Path)
 		azureCodexSessionKey := ""
@@ -3376,7 +3389,8 @@ func (s Server) proxyHandler() http.Handler {
 				AgentType:        sessionAgentType,
 				SessionID:        sessionID,
 				UserEmail:        userEmail,
-				PreferAccountID:  session.ExtractAccountID(routingRequest),
+				PreferAccountID:  preferredAccountID,
+				ForceAccountID:   forcedAccountID,
 				Model:            session.ExtractModel(routingRequest, s.MaxBodyBytes),
 			})
 			if leaseErr != nil {
@@ -3384,6 +3398,9 @@ func (s Server) proxyHandler() http.Handler {
 			} else {
 				account = lease.Account
 				credentialLease = &lease
+				if forcedAccountSelection && !accountMatches(account, forcedAccountID) {
+					err = fmt.Errorf("requested account %q is unavailable", forcedAccountID)
+				}
 			}
 		} else {
 			account, sessionID, userEmail, err = s.accountForSessionProviderWithOptions(
@@ -3391,7 +3408,7 @@ func (s Server) proxyHandler() http.Handler {
 				sessionAgentType,
 				sessionID,
 				routingRequest,
-				accountSelectionOptions{oauthOnly: modelCatalogRequest, pendingSessionCommit: &pendingSessionCommit},
+				accountSelectionOptions{oauthOnly: modelCatalogRequest, preferredAccountID: preferredAccountID, pendingSessionCommit: &pendingSessionCommit},
 			)
 			if err == nil {
 				pendingSessionExpectedAccount = account.ID
@@ -3423,7 +3440,7 @@ func (s Server) proxyHandler() http.Handler {
 			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_account", true) {
 				return
 			}
-			if azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable account; retry over https", http.StatusUpgradeRequired)
 				return
 			}
@@ -3447,7 +3464,7 @@ func (s Server) proxyHandler() http.Handler {
 			if azureCodexConfigured && s.serveAzureCodex(w, r, azureCodexSessionKey, -1, "no_usable_credential", true) {
 				return
 			}
-			if azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
+			if !forcedAccountSelection && azureCodexUpgradeShouldFallBack(s, boundLease, requestProvider, r) {
 				http.Error(w, "codex pool has no usable credential; retry over https", http.StatusUpgradeRequired)
 				return
 			}
@@ -3470,7 +3487,7 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		if websocket.IsWebSocketUpgrade(r) {
 			var azureDivert func(model string) bool
-			if boundLease == nil && s.CredentialBroker == nil &&
+			if !forcedAccountSelection && boundLease == nil && s.CredentialBroker == nil &&
 				requestProvider == accounts.ProviderCodex && s.AzureCodex.configured() {
 				key := azureCodexSessionKeyFor(sessionAgentType, sessionID)
 				if _, pinned := s.azureCodexSessions.lookup(key); pinned {
@@ -3492,6 +3509,7 @@ func (s Server) proxyHandler() http.Handler {
 		proxyRequest.URL.Path = s.pathForUpstream(proxyRequest.URL.Path, account)
 		proxyRequest.URL.RawPath = ""
 		session.StripSubrouterHeaders(proxyRequest.Header)
+		proxyRequest.Header.Del("X-Subrouter-Preferred-Account-ID")
 		s.setDelegatedSessionHeaders(proxyRequest.Header, sessionAgentType, sessionID)
 		stripOutboundForwardingHeaders(proxyRequest.Header)
 		retryPost := retryableUpstreamPostRequest(requestProvider, proxyRequest)
@@ -3535,7 +3553,7 @@ func (s Server) proxyHandler() http.Handler {
 		localUsageFailover = localUsageFailover ||
 			(account.AuthMode == accounts.AuthModeAPIKey && keyedRequestProvider)
 		usageFailoverInstalled := false
-		if boundLease == nil && retryPost && postReplayable && localUsageFailover &&
+		if !forcedAccountSelection && boundLease == nil && retryPost && postReplayable && localUsageFailover &&
 			s.CredentialBroker == nil {
 			var fableFallback func() (*http.Response, bool)
 			if fableFallbackConfigured {
@@ -5432,6 +5450,7 @@ type accountSelectionOptions struct {
 	allowFableAPIKeyPool bool
 	ignoreForcedAccount  bool
 	oauthOnly            bool
+	preferredAccountID   string
 	// pendingSessionCommit is set when an existing sticky assignment is
 	// provisionally rerouted. Request-serving callers commit it only after the
 	// replacement account succeeds; nil preserves eager assignment for direct
@@ -5558,6 +5577,16 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	}
 
 	var account accounts.Account
+	if picked == nil && options.preferredAccountID != "" {
+		preferred, ok := findAccount(availableAccounts, options.preferredAccountID)
+		// A preference is intentionally softer than a pin. If the selected
+		// account disappeared after the picker ran or is already known exhausted,
+		// start on the scheduler's current recommendation instead of failing the
+		// pooled launch before a request.
+		if ok && !scheduler.Exhausted(schedulerAccountProvider(preferred.Provider), preferred.ID) {
+			picked = &preferred
+		}
+	}
 	if picked != nil {
 		account = *picked
 	} else {

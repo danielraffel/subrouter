@@ -162,6 +162,50 @@ func TestCredentialBrokerKeepsProviderTrafficOnLocalProxy(t *testing.T) {
 	}
 }
 
+func TestCredentialBrokerKeepsForcedAndPreferredAccountSignalsDistinct(t *testing.T) {
+	tests := []struct {
+		name       string
+		header     string
+		wantPrefer string
+		wantForce  string
+	}{
+		{name: "preferred", header: "X-Subrouter-Preferred-Account-ID", wantPrefer: "claude-a"},
+		{name: "forced", header: "X-Subrouter-Account-ID", wantForce: "claude-a"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			leased := &fakeCredentialBroker{
+				leaseErr:    errors.New("selection stopped after capture"),
+				leaseInputs: make(chan broker.LeaseRequest, 1),
+				reports:     make(chan broker.LeaseOutcome, 1),
+			}
+			handler := Server{CredentialBroker: leased, MaxBodyBytes: 1 << 20}.Handler()
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"http://127.0.0.1:31415/v1/messages",
+				bytes.NewBufferString(`{"model":"claude-opus-4"}`),
+			)
+			request.Header.Set("X-Subrouter-Agent", "claude")
+			request.Header.Set("X-Subrouter-Session", "session-a")
+			request.Header.Set(testCase.header, "claude-a")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", response.Code)
+			}
+			select {
+			case input := <-leased.leaseInputs:
+				if input.PreferAccountID != testCase.wantPrefer || input.ForceAccountID != testCase.wantForce {
+					t.Fatalf("lease routing signals = prefer %q force %q, want prefer %q force %q",
+						input.PreferAccountID, input.ForceAccountID, testCase.wantPrefer, testCase.wantForce)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("central broker did not receive the lease request")
+			}
+		})
+	}
+}
+
 func TestTypedNilCredentialBrokerUsesLocalAccounts(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer local-access" {

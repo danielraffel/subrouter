@@ -46,6 +46,7 @@ type tenantCredentialLeaseRequest struct {
 	SessionID        string `json:"sessionId"`
 	UserEmail        string `json:"userEmail,omitempty"`
 	PreferAccountID  string `json:"preferAccountId,omitempty"`
+	ForceAccountID   string `json:"forceAccountId,omitempty"`
 	Model            string `json:"model,omitempty"`
 }
 
@@ -78,6 +79,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		http.Error(w, "invalid credential lease request", http.StatusBadRequest)
 		return
 	}
+	forceAccountRequested := strings.TrimSpace(input.ForceAccountID) != ""
 	input.normalize()
 	provider := accounts.Provider(input.Provider)
 	if keyedProvider, ok := APIKeyProviderForName(input.Provider); ok {
@@ -96,7 +98,8 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	}
 	if input.SessionID == "" || len(input.SessionID) > 512 ||
 		len(input.AgentType) > 64 || len(input.UserEmail) > 320 ||
-		len(input.PreferAccountID) > 512 || len(input.Model) > 256 {
+		len(input.PreferAccountID) > 512 || len(input.ForceAccountID) > 512 || len(input.Model) > 256 ||
+		(forceAccountRequested && input.ForceAccountID == "") {
 		http.Error(w, "invalid credential lease request", http.StatusBadRequest)
 		return
 	}
@@ -181,6 +184,7 @@ func (input *tenantCredentialLeaseRequest) normalize() {
 	input.SessionID = strings.TrimSpace(input.SessionID)
 	input.UserEmail = session.NormalizeUserEmail(input.UserEmail)
 	input.PreferAccountID = session.NormalizeAccountID(input.PreferAccountID)
+	input.ForceAccountID = session.NormalizeAccountID(input.ForceAccountID)
 	input.Model = session.NormalizeModel(input.Model)
 }
 
@@ -254,10 +258,11 @@ func pickTenantCredentialLeaseAccount(
 	if len(candidates) == 0 {
 		return accounts.Account{}, errors.New("no untried credential accounts")
 	}
-	if input.PreferAccountID != "" {
-		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
-			return preferred, nil
+	if input.ForceAccountID != "" {
+		if forced, ok := findAccount(candidates, input.ForceAccountID); ok {
+			return forced, nil
 		}
+		return accounts.Account{}, fmt.Errorf("forced account %q is unavailable", input.ForceAccountID)
 	}
 	if server.Sessions != nil {
 		agentType := input.AgentType
@@ -268,6 +273,11 @@ func pickTenantCredentialLeaseAccount(
 			if sticky, found := findAccount(candidates, assignment.AccountID); found {
 				return sticky, nil
 			}
+		}
+	}
+	if input.PreferAccountID != "" {
+		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
+			return preferred, nil
 		}
 	}
 	model := input.Model

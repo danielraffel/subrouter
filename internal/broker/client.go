@@ -65,6 +65,7 @@ type LeaseRequest struct {
 	SessionID        string
 	UserEmail        string
 	PreferAccountID  string
+	ForceAccountID   string
 	Model            string
 }
 
@@ -463,6 +464,9 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	if input.PreferAccountID != "" {
 		body["preferAccountId"] = input.PreferAccountID
 	}
+	if input.ForceAccountID != "" {
+		body["forceAccountId"] = input.ForceAccountID
+	}
 	if input.Model != "" {
 		body["model"] = input.Model
 	}
@@ -487,6 +491,12 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 		lease.Account.AuthMode != input.RequiredAuthMode {
 		return Lease{}, errors.New(
 			"cmux.com returned a credential with the wrong auth mode",
+		)
+	}
+	if input.ForceAccountID != "" &&
+		!strings.EqualFold(strings.TrimSpace(lease.Account.ID), strings.TrimSpace(input.ForceAccountID)) {
+		return Lease{}, errors.New(
+			"cmux.com returned a credential for a different forced account",
 		)
 	}
 	c.mu.Lock()
@@ -701,6 +711,7 @@ func leaseCacheKey(input LeaseRequest) string {
 		input.SessionID,
 		input.UserEmail,
 		input.PreferAccountID,
+		input.ForceAccountID,
 		input.Model,
 	}, "\x00")
 }
