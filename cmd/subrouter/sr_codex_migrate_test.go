@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -48,6 +49,7 @@ func TestCodexAccountCommandsAreReservedWithoutHijackingCodexLauncher(t *testing
 	}{
 		{[]string{"codex", "migrate-isolation"}, true},
 		{[]string{"codex", "migrate-isolation", "--device-auth"}, true},
+		{[]string{"codex", "enroll-isolated", "--retiring-state-dir", "/tmp/retiring"}, true},
 		{[]string{"codex", "isolation-check"}, true},
 		{[]string{"codex", "isolation-check", "--json"}, true},
 		{[]string{"codex"}, false},
@@ -57,6 +59,245 @@ func TestCodexAccountCommandsAreReservedWithoutHijackingCodexLauncher(t *testing
 		if got := isCodexAccountCommand(test.args); got != test.want {
 			t.Fatalf("isCodexAccountCommand(%q) = %v, want %v", test.args, got, test.want)
 		}
+	}
+}
+
+func TestCodexEnrollIsolatedDispatchDoesNotImportLegacyStore(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(root, "retiring")
+	legacyRoot := filepath.Join(home, ".codex-accounts")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+
+	legacy := accounts.CodexStore{Dir: legacyRoot}
+	saveLegacyCodexAccount(t, legacy, "legacy@example.com", "acct-legacy", "legacy-refresh")
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+
+	store := codexStoreForCommand([]string{"codex", "enroll-isolated", "--retiring-state-dir", retiringRoot})
+	if store.Dir != filepath.Join(candidateRoot, "codex", "accounts") {
+		t.Fatalf("candidate store = %q, want raw candidate root", store.Dir)
+	}
+	if stored, err := store.ListStoredReadOnly(); err != nil || len(stored) != 0 {
+		t.Fatalf("candidate store before enrollment = %d accounts, err=%v", len(stored), err)
+	}
+	if _, err := os.Stat(filepath.Join(candidateRoot, "migration.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected legacy migration marker: %v", err)
+	}
+}
+
+func TestCodexEnrollIsolatedResumesSafeSubsetAndPreservesSources(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(root, "retiring")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+
+	active := testCodexAuth("interactive@example.com", "acct-interactive")
+	active.Tokens.RefreshToken = "active-refresh"
+	if err := accounts.WriteActiveCodexAuth(active); err != nil {
+		t.Fatal(err)
+	}
+	activeBefore, err := os.ReadFile(accounts.DefaultCodexAuthPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+	saveLegacyCodexAccount(t, retiring, "beta@example.com", "acct-beta", "retiring-beta")
+	if err := retiring.SaveStored(accounts.StoredCodexAccount{
+		Email: "qwen:unrelated", Provider: accounts.ProviderQwen,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "unrelated-key"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	retiringBefore := snapshotTestTree(t, retiringRoot)
+
+	candidate := rawCodexStoreForStateRoot(candidateRoot)
+	alpha := testCodexAuth("alpha@example.com", "acct-alpha")
+	alpha.Tokens.RefreshToken = "candidate-alpha"
+	if err := candidate.SaveStored(accounts.StoredCodexAccount{
+		Email:                 "alpha@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  alpha,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beta := testCodexAuth("beta@example.com", "acct-beta")
+	beta.Tokens.RefreshToken = "candidate-beta"
+	fake := &recordingSRCommandRunner{loginAuth: beta, onLogin: func(_ []string) {
+		liveDir := filepath.Join(retiringRoot, "sessions")
+		if err := os.MkdirAll(liveDir, 0o700); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.WriteFile(filepath.Join(liveDir, "live.json"), []byte("changing live state"), 0o600); err != nil {
+			t.Error(err)
+		}
+	}}
+	var out bytes.Buffer
+	runner := srRunner{store: accounts.DefaultCodexStore(), in: strings.NewReader(""), out: &out, errOut: &out, cmd: fake}
+	if err := runner.codexAccount(context.Background(), []string{
+		"enroll-isolated", "--retiring-state-dir", retiringRoot, "--device-auth",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.commandCount("codex", "login", "--device-auth"); got != 1 {
+		t.Fatalf("login count = %d, want one missing account", got)
+	}
+	inventory, err := inspectCodexEnrollmentInventories(candidate, retiring)
+	if err != nil || !codexEnrollmentComplete(inventory) {
+		t.Fatalf("final Codex OAuth inventory complete=%v, err=%v", codexEnrollmentComplete(inventory), err)
+	}
+	activeAfter, err := os.ReadFile(accounts.DefaultCodexAuthPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(activeBefore, activeAfter) {
+		t.Fatal("isolated enrollment changed interactive auth")
+	}
+	retiringAccountsBefore := filteredTreeSnapshot(retiringBefore, filepath.Join("codex", "accounts"))
+	retiringAccountsAfter := filteredTreeSnapshot(snapshotTestTree(t, retiringRoot), filepath.Join("codex", "accounts"))
+	if !reflect.DeepEqual(retiringAccountsAfter, retiringAccountsBefore) {
+		t.Fatalf("retiring account store changed: before=%v after=%v", retiringAccountsBefore, retiringAccountsAfter)
+	}
+	if !strings.Contains(out.String(), "1 require isolated enrollment") || !strings.Contains(out.String(), "inventories match") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func filteredTreeSnapshot(snapshot map[string]string, prefix string) map[string]string {
+	filtered := make(map[string]string)
+	for path, value := range snapshot {
+		if path == prefix || strings.HasPrefix(path, prefix+string(filepath.Separator)) {
+			filtered[path] = value
+		}
+	}
+	return filtered
+}
+
+func TestCodexEnrollIsolatedRejectsRelatedRootsBeforeLogin(t *testing.T) {
+	root := t.TempDir()
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(candidateRoot, "retiring")
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+	before := snapshotTestTree(t, root)
+	fake := &recordingSRCommandRunner{}
+	runner := srRunner{store: accounts.DefaultCodexStore(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: fake}
+	err := runner.codexAccount(context.Background(), []string{"enroll-isolated", "--retiring-state-dir", retiringRoot})
+	if err == nil || !strings.Contains(err.Error(), "must not be nested") {
+		t.Fatalf("error = %v, want nested-root rejection", err)
+	}
+	if got := fake.commandCount("codex", "login"); got != 0 {
+		t.Fatalf("login count = %d, want zero", got)
+	}
+	if after := snapshotTestTree(t, root); !reflect.DeepEqual(after, before) {
+		t.Fatalf("root rejection mutated state: before=%v after=%v", before, after)
+	}
+}
+
+func TestCodexEnrollIsolatedRejectsWrongImmutableIdentityBeforeSave(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(root, "retiring")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+	active := testCodexAuth("interactive@example.com", "acct-interactive")
+	if err := accounts.WriteActiveCodexAuth(active); err != nil {
+		t.Fatal(err)
+	}
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+	wrong := testCodexAuth("alpha@example.com", "acct-other")
+	wrong.Tokens.RefreshToken = "candidate-wrong"
+	fake := &recordingSRCommandRunner{loginAuth: wrong}
+	runner := srRunner{store: accounts.DefaultCodexStore(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: fake}
+	err := runner.codexAccount(context.Background(), []string{"enroll-isolated", "--retiring-state-dir", retiringRoot})
+	if err == nil || !strings.Contains(err.Error(), "immutable account identity") {
+		t.Fatalf("error = %v, want immutable-identity rejection", err)
+	}
+	stored, findErr := rawCodexStoreForStateRoot(candidateRoot).ListStoredReadOnly()
+	if findErr != nil || len(stored) != 0 {
+		t.Fatalf("candidate stored accounts = %d, err=%v", len(stored), findErr)
+	}
+}
+
+func TestCodexEnrollIsolatedRejectsNonCodexSelectorCollisionBeforeLogin(t *testing.T) {
+	root := t.TempDir()
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(root, "retiring")
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+	candidate := rawCodexStoreForStateRoot(candidateRoot)
+	if err := candidate.SaveStored(accounts.StoredCodexAccount{
+		Email:    "ALPHA@example.com",
+		Provider: accounts.ProviderQwen,
+		Auth:     accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "qwen-key"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTestTree(t, candidateRoot)
+	fake := &recordingSRCommandRunner{}
+	runner := srRunner{store: candidate, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: fake}
+	err := runner.codexAccount(context.Background(), []string{"enroll-isolated", "--retiring-state-dir", retiringRoot})
+	if err == nil || !strings.Contains(err.Error(), "colliding with a retiring Codex account selector") {
+		t.Fatalf("error = %v, want selector-collision rejection", err)
+	}
+	if got := fake.commandCount("codex", "login"); got != 0 {
+		t.Fatalf("login count = %d, want zero", got)
+	}
+	if after := snapshotTestTree(t, candidateRoot); !reflect.DeepEqual(after, before) {
+		t.Fatalf("collision rejection mutated candidate: before=%v after=%v", before, after)
+	}
+}
+
+func TestCodexEnrollIsolatedRejectsRetiringAccountDriftBeforeSave(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	candidateRoot := filepath.Join(root, "candidate")
+	retiringRoot := filepath.Join(root, "retiring")
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("SUBROUTER_STATE_DIR", candidateRoot)
+	if err := accounts.WriteActiveCodexAuth(testCodexAuth("interactive@example.com", "acct-interactive")); err != nil {
+		t.Fatal(err)
+	}
+	retiring := rawCodexStoreForStateRoot(retiringRoot)
+	saveLegacyCodexAccount(t, retiring, "alpha@example.com", "acct-alpha", "retiring-alpha")
+	fresh := testCodexAuth("alpha@example.com", "acct-alpha")
+	fresh.Tokens.RefreshToken = "candidate-alpha"
+	fake := &recordingSRCommandRunner{loginAuth: fresh, onLogin: func(_ []string) {
+		account, ok, err := retiring.FindStored("alpha@example.com")
+		if err != nil || !ok {
+			t.Errorf("find retiring account: ok=%v err=%v", ok, err)
+			return
+		}
+		account.Label = "changed during login"
+		if err := retiring.SaveStored(account); err != nil {
+			t.Error(err)
+		}
+	}}
+	runner := srRunner{store: accounts.DefaultCodexStore(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard, cmd: fake}
+	err := runner.codexAccount(context.Background(), []string{"enroll-isolated", "--retiring-state-dir", retiringRoot})
+	if err == nil || !strings.Contains(err.Error(), "retiring Codex account store changed") {
+		t.Fatalf("error = %v, want retiring account drift rejection", err)
+	}
+	stored, findErr := rawCodexStoreForStateRoot(candidateRoot).ListStoredReadOnly()
+	if findErr != nil || len(stored) != 0 {
+		t.Fatalf("candidate stored accounts = %d, err=%v", len(stored), findErr)
 	}
 }
 
@@ -442,6 +683,7 @@ func TestCodexIsolationComparisonFailsClosedAndDoesNotMutate(t *testing.T) {
 				comparison.AccountInventoryMatch != test.wantInventory ||
 				comparison.RootsDistinct != test.wantRootsDistinct ||
 				comparison.CandidateStoreAnchored != test.wantStoreAnchored ||
+				!comparison.RetiringStoreAnchored ||
 				comparison.EffectiveStoresDistinct != test.wantStoresDistinct ||
 				comparison.SharedOAuthRefreshTokenCount != test.wantShared ||
 				comparison.CandidateOAuthOriginsTrusted != test.wantOriginsTrusted ||

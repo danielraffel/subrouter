@@ -26,6 +26,7 @@ import (
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 	"github.com/mattn/go-runewidth"
@@ -87,6 +88,8 @@ Usage:
                         Check serving credential isolation without changing credentials
   sr codex migrate-isolation [--device-auth]
                         Re-enroll legacy OAuth accounts without changing local Codex auth
+  sr codex enroll-isolated --retiring-state-dir PATH [--device-auth]
+                        Build a separate candidate store with fresh isolated OAuth logins
   sr az status          Show whether the Azure Codex fallback is armed
   sr az test [model]    Prove the Azure route with one forced request
   sr az codex [args]    Run Codex forced onto Azure
@@ -251,12 +254,7 @@ func cxAlias(args []string) error {
 }
 
 func srForProgram(program string, args []string) error {
-	var store accounts.CodexStore
-	if isCodexIsolationCheckCommand(args) {
-		store = accounts.DefaultCodexStoreForReadOnlyInspection()
-	} else {
-		store = accounts.DefaultCodexStore()
-	}
+	store := codexStoreForCommand(args)
 	runner := srRunner{
 		program: program,
 		store:   store,
@@ -266,6 +264,16 @@ func srForProgram(program string, args []string) error {
 		client:  &http.Client{Timeout: 120 * time.Second},
 	}
 	return runner.run(context.Background(), args)
+}
+
+func codexStoreForCommand(args []string) accounts.CodexStore {
+	if isCodexIsolatedEnrollmentCommand(args) {
+		return rawCodexStoreForStateRoot(storepath.StateDir())
+	}
+	if isCodexIsolationCheckCommand(args) {
+		return accounts.DefaultCodexStoreForReadOnlyInspection()
+	}
+	return accounts.DefaultCodexStore()
 }
 
 func (r srRunner) run(ctx context.Context, args []string) error {
