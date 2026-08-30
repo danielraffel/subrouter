@@ -127,6 +127,12 @@ func RunLeg(ctx context.Context, leg, configPath, runID string) error {
 			return err
 		}
 		return runLiveFailover(ctx, cfg, start, runID)
+	case "authenticated-routed-claude":
+		var cfg ClaudeLegConfig
+		if err := loadConfig(configPath, &cfg, cfg.Schema); err != nil {
+			return err
+		}
+		return runAuthenticatedClaude(ctx, cfg, start, runID)
 	case "existing-session-next-turn":
 		var cfg ExistingLegConfig
 		if err := loadConfig(configPath, &cfg, cfg.Schema); err != nil {
@@ -151,6 +157,9 @@ func loadConfig(path string, dst any, _ string) error {
 		schema = cfg.Schema
 		cfg.configPath = path
 	case *IsolatedLegConfig:
+		schema = cfg.Schema
+		cfg.configPath = path
+	case *ClaudeLegConfig:
 		schema = cfg.Schema
 		cfg.configPath = path
 	case *ExistingLegConfig:
@@ -358,6 +367,105 @@ func runAuthenticated(ctx context.Context, cfg RoutedLegConfig, start time.Time,
 		return err
 	}
 	return nil
+}
+
+func runAuthenticatedClaude(ctx context.Context, cfg ClaudeLegConfig, start time.Time, runID string) error {
+	if cfg.Model == "" {
+		return errors.New("Claude canary model is required")
+	}
+	if err := validateArtifactPaths(
+		[]string{cfg.ProofFile, cfg.Journal, cfg.Journal + ".lock"},
+		[]string{cfg.configPath, cfg.HTTP.AdminTokenFile},
+	); err != nil {
+		return err
+	}
+	client, err := newAPIClient(cfg.HTTP, false)
+	if err != nil {
+		return err
+	}
+	journalLease, err := acquireJournalLease(cfg.Journal)
+	if err != nil {
+		return err
+	}
+	defer journalLease.Close()
+	configHash := claudeCleanupConfigHash(cfg)
+	if err := recoverClaudeJournal(ctx, client, cfg.Journal, configHash); err != nil {
+		return err
+	}
+	nonce, err := randomHex(16)
+	if err != nil {
+		return err
+	}
+	sessionID := "cutover-claude-" + nonce
+	journal := cleanupJournal{Schema: JournalSchema, SessionID: sessionID, AgentType: "claude", RunID: runID, ConfigHash: configHash}
+	if err := createPrivateJSON(cfg.Journal, journal); err != nil {
+		return err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = cleanupJournalSession(context.Background(), client, cfg.Journal, journal)
+		}
+	}()
+	marker := "SUBROUTER_CLAUDE_CANARY_" + strings.ToUpper(nonce)
+	status, err := client.claudeTurn(ctx, sessionID, cfg.Model, marker)
+	if err != nil {
+		return err
+	}
+	all, err := client.sessions(ctx)
+	if err != nil {
+		return err
+	}
+	assignment, ok := findSession(all, "claude", sessionID)
+	if !ok || assignment.AccountID == "" {
+		return errors.New("routed Claude session assignment absent")
+	}
+	if err := cleanupClaudeSession(ctx, client, cfg.Journal, journal); err != nil {
+		return err
+	}
+	cleanup = false
+	return writePrivateJSON(cfg.ProofFile, proof{
+		Schema: ProofSchema, Leg: "authenticated-routed-claude", OK: true,
+		Scope: "live-claude-one-turn-cleaned", DurationMillis: time.Since(start).Milliseconds(),
+		HTTPStatus: status, SessionHash: hashProof(nonce, sessionID),
+		AccountHash: hashProof(nonce, assignment.AccountID), Attempts: 1, RunHash: hashProof("run", runID),
+	})
+}
+
+func recoverClaudeJournal(ctx context.Context, client *apiClient, journalPath, expectedConfigHash string) error {
+	var journal cleanupJournal
+	if err := readStrictPrivateJSON(journalPath, &journal); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.New("cleanup journal invalid")
+	}
+	if journal.Schema != JournalSchema || journal.AgentType != "claude" ||
+		!validRunID(journal.RunID) || journal.ConfigHash != expectedConfigHash ||
+		!validCanarySessionID(journal.SessionID, "cutover-claude-") {
+		return errors.New("cleanup journal invalid")
+	}
+	return cleanupJournalSession(ctx, client, journalPath, journal)
+}
+
+func cleanupClaudeSession(ctx context.Context, client *apiClient, journalPath string, expected cleanupJournal) error {
+	if err := requireOwnedJournal(journalPath, expected); err != nil {
+		return err
+	}
+	if err := client.deleteSession(ctx, expected.AgentType, expected.SessionID); err != nil {
+		return err
+	}
+	all, err := client.sessions(ctx)
+	if err != nil {
+		return err
+	}
+	if _, exists := findSession(all, expected.AgentType, expected.SessionID); exists {
+		return errors.New("routed Claude session remained after cleanup")
+	}
+	if err := requireOwnedJournal(journalPath, expected); err != nil {
+		return err
+	}
+	return removeIfExists(journalPath, JournalSchema)
 }
 
 func runSticky(ctx context.Context, cfg RoutedLegConfig, start time.Time, runID string) error {
@@ -621,6 +729,17 @@ func isolatedCleanupConfigHash(cfg IsolatedLegConfig) string {
 		UnavailableAccountID: cfg.UnavailableAccountID,
 	})
 	return hashProof("cleanup-config", string(b))
+}
+
+func claudeCleanupConfigHash(cfg ClaudeLegConfig) string {
+	b, _ := json.Marshal(struct {
+		HTTP    HTTPConfig `json:"http"`
+		Journal string     `json:"cleanup_journal"`
+		Model   string     `json:"model"`
+	}{
+		HTTP: cfg.HTTP, Journal: cfg.Journal, Model: cfg.Model,
+	})
+	return hashProof("claude-cleanup-config", string(b))
 }
 
 func cleanupLiveArtifacts(ctx context.Context, client *apiClient, statePath, journalPath string, expected cleanupJournal) error {

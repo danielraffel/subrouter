@@ -101,6 +101,119 @@ func liveServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	return server, &turns
 }
 
+func TestAuthenticatedClaudeCanaryRoutesAndCleansExactSession(t *testing.T) {
+	dir := privateDir(t)
+	assignments := map[string]string{}
+	var mu sync.Mutex
+	var observedSession string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/messages":
+			if r.Header.Get("Authorization") != "Bearer subrouter" ||
+				r.Header.Get("anthropic-version") != "2023-06-01" ||
+				r.Header.Get("X-Subrouter-Agent") != "claude" ||
+				r.Header.Get("X-Subrouter-No-Retry") != "true" {
+				t.Error("Claude canary request headers do not match the routed CLI shape")
+			}
+			observedSession = r.Header.Get("X-Claude-Code-Session-Id")
+			var body struct {
+				Model     string `json:"model"`
+				MaxTokens int    `json:"max_tokens"`
+				Messages  []struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Model != "claude-test" ||
+				body.MaxTokens != 64 || len(body.Messages) != 1 || body.Messages[0].Role != "user" {
+				t.Error("Claude canary request body is invalid")
+			}
+			marker := strings.TrimPrefix(body.Messages[0].Content, "Reply with exactly ")
+			mu.Lock()
+			assignments[observedSession] = "claude-account-secret"
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"type":"message","content":[{"type":"text","text":%q}],"stop_reason":"end_turn"}`, marker)
+		case "/_subrouter/sessions":
+			mu.Lock()
+			defer mu.Unlock()
+			if r.Method == http.MethodDelete {
+				delete(assignments, r.URL.Query().Get("session_id"))
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			all := make([]session.Assignment, 0, len(assignments))
+			for id, account := range assignments {
+				all = append(all, session.Assignment{AgentType: "claude", SessionID: id, AccountID: account})
+			}
+			_ = json.NewEncoder(w).Encode(all)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := ClaudeLegConfig{
+		Schema: ConfigSchema, HTTP: HTTPConfig{BaseURL: server.URL, TimeoutSeconds: 2, MaxResponseBytes: 1 << 16},
+		ProofFile: filepath.Join(dir, "proof.json"), Journal: filepath.Join(dir, "journal.json"), Model: "claude-test",
+	}
+	path := writeConfig(t, dir, "config.json", cfg)
+	if err := RunLeg(context.Background(), "authenticated-routed-claude", path, "test-run"); err != nil {
+		t.Fatal(err)
+	}
+	if !validCanarySessionID(observedSession, "cutover-claude-") {
+		t.Fatalf("Claude canary session ID = %q", observedSession)
+	}
+	mu.Lock()
+	remaining := len(assignments)
+	mu.Unlock()
+	if remaining != 0 {
+		t.Fatal("Claude canary assignment was not cleaned")
+	}
+	if _, err := os.Stat(cfg.Journal); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("Claude canary cleanup journal remained")
+	}
+	proofBody, err := os.ReadFile(cfg.ProofFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(proofBody, []byte("claude-account-secret")) || bytes.Contains(proofBody, []byte(observedSession)) {
+		t.Fatal("Claude canary proof leaked raw account or session identity")
+	}
+}
+
+func TestAuthenticatedClaudeCanaryRejectsWrongMarkerAndCleans(t *testing.T) {
+	dir := privateDir(t)
+	deleted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/messages":
+			_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"wrong"}]}`)
+		case "/_subrouter/sessions":
+			if r.Method == http.MethodDelete {
+				deleted = true
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			_, _ = io.WriteString(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	cfg := ClaudeLegConfig{Schema: ConfigSchema, HTTP: HTTPConfig{BaseURL: server.URL, TimeoutSeconds: 2, MaxResponseBytes: 1 << 16}, ProofFile: filepath.Join(dir, "proof.json"), Journal: filepath.Join(dir, "journal.json"), Model: "claude-test"}
+	path := writeConfig(t, dir, "config.json", cfg)
+	if err := RunLeg(context.Background(), "authenticated-routed-claude", path, "test-run"); err == nil {
+		t.Fatal("wrong Claude marker was accepted")
+	}
+	if !deleted {
+		t.Fatal("failed Claude canary did not attempt session cleanup")
+	}
+	if _, err := os.Stat(cfg.ProofFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("failed Claude canary wrote success proof")
+	}
+}
+
 func TestAuthenticatedAndStickyCoordinateAndClean(t *testing.T) {
 	dir := privateDir(t)
 	server, turns := liveServer(t)

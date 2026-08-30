@@ -416,6 +416,7 @@ legs = (
     "authenticated-routed-codex",
     "sticky-reuse",
     "safe-failover-reuse",
+    "authenticated-routed-claude",
     "existing-session-next-turn",
 )
 
@@ -526,6 +527,7 @@ for name, leg in zip(expected_legs, evidence["legs"]):
         "authenticated-routed-codex",
         "sticky-reuse",
         "safe-failover-reuse",
+        "authenticated-routed-claude",
         "existing-session-next-turn",
     ).index(name)
     assert leg["ok"] is True
@@ -947,12 +949,14 @@ assert_functional_canary_order \
   authenticated-routed-codex \
   sticky-reuse \
   safe-failover-reuse \
+  authenticated-routed-claude \
   existing-session-next-turn
 assert_functional_canary_evidence passed \
   peer-health-readiness \
   authenticated-routed-codex \
   sticky-reuse \
   safe-failover-reuse \
+  authenticated-routed-claude \
   existing-session-next-turn
 [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
 [ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$supervisor" ]

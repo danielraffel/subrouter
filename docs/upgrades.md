@@ -205,7 +205,7 @@ and timeout. The migration passes its actual `WORKER_BIN` path and captured
 SHA-256 to the runner; the runner requires an exact manifest match before it
 acquires leases or starts any leg. The runner rechecks file identities
 immediately before execution.
-Use the same reviewed `subrouter-cutover-canary` binary for all five legs; its
+Use the same reviewed `subrouter-cutover-canary` binary for all six legs; its
 configs use schema `subrouter.cutover-canary-config/v1` and keep host-, account-,
 and session-specific values outside the repository.
 
@@ -247,7 +247,7 @@ replacing that pathname after `exec` cannot make an older process attest newer
 bytes. Non-macOS validation uses the explicit `go-build-info-sha256` identity
 kind, which hashes build metadata embedded in the running image.
 
-All five manifest legs must name the same reviewed helper path and SHA-256; the
+All six manifest legs must name the same reviewed helper path and SHA-256; the
 runner rejects a mix of otherwise-valid executables. The peer's referenced probe config is
 `{"schema":"subrouter.cutover-canary-config/v1","http":{...}}`. The peer leg
 does not execute arbitrary local argv: it invokes `/usr/bin/ssh` with fixed
@@ -268,10 +268,11 @@ Use separate proof files for the authenticated and sticky legs, but the same
 state and cleanup-journal paths so their sanitized handoff is continuous.
 
 The private mode-`0600` manifest has this exact top-level shape; include all
-five leg objects in the order below and pin every path by SHA-256:
+six leg objects in the order below and pin every path by SHA-256. The Claude
+leg config is `{"schema":"subrouter.cutover-canary-config/v1","http":{...},"proof_file":"/private/claude-proof.json","cleanup_journal":"/private/claude-journal.json","model":"CLAUDE_MODEL"}`:
 
 ```json
-{"schema":"subrouter.launchagent-functional-canary/v1","source_git_oid_unverified":"FULL_40_CHARACTER_OID","candidate_worker":{"path":"/private/subrouter","sha256":"SHA256"},"evidence_file":"/private/evidence.json","total_timeout_seconds":240,"legs":[{"name":"peer-health-readiness","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/peer-leg.json","config_sha256":"SHA256","timeout_seconds":30},{"name":"authenticated-routed-codex","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/auth-leg.json","config_sha256":"SHA256","timeout_seconds":45},{"name":"sticky-reuse","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/sticky-leg.json","config_sha256":"SHA256","timeout_seconds":10},{"name":"safe-failover-reuse","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/failover-leg.json","config_sha256":"SHA256","timeout_seconds":60},{"name":"existing-session-next-turn","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/existing-leg.json","config_sha256":"SHA256","timeout_seconds":95}]}
+{"schema":"subrouter.launchagent-functional-canary/v1","source_git_oid_unverified":"FULL_40_CHARACTER_OID","candidate_worker":{"path":"/private/subrouter","sha256":"SHA256"},"evidence_file":"/private/evidence.json","total_timeout_seconds":270,"legs":[{"name":"peer-health-readiness","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/peer-leg.json","config_sha256":"SHA256","timeout_seconds":30},{"name":"authenticated-routed-codex","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/auth-leg.json","config_sha256":"SHA256","timeout_seconds":45},{"name":"sticky-reuse","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/sticky-leg.json","config_sha256":"SHA256","timeout_seconds":10},{"name":"safe-failover-reuse","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/failover-leg.json","config_sha256":"SHA256","timeout_seconds":60},{"name":"authenticated-routed-claude","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/claude-leg.json","config_sha256":"SHA256","timeout_seconds":30},{"name":"existing-session-next-turn","executable":"/private/subrouter-cutover-canary","executable_sha256":"SHA256","config_file":"/private/existing-leg.json","config_sha256":"SHA256","timeout_seconds":95}]}
 ```
 
 `source_git_oid_unverified` is an operator-supplied review reference, not a
@@ -294,7 +295,7 @@ SUBROUTER_CANARY_MANIFEST_FILE=/private/manifest.json \
   --canary-callback /absolute/path/run-functional-canary.py
 ```
 
-For gate 5, wait for `existing-challenge.json`, send its exact `prompt` through
+For gate 6, wait for `existing-challenge.json`, send its exact `prompt` through
 the already-idle selected Codex session, and pass only that session's exact
 one-line response to the witness command after the challenge's `not_before`:
 
@@ -315,7 +316,8 @@ legs exactly once and in this order:
 2. `authenticated-routed-codex`
 3. `sticky-reuse`
 4. `safe-failover-reuse`
-5. `existing-session-next-turn`
+5. `authenticated-routed-claude`
+6. `existing-session-next-turn`
 
 Every leg must emit only this bounded JSON record, with its own exact name:
 
@@ -324,7 +326,7 @@ Every leg must emit only this bounded JSON record, with its own exact name:
 ```
 
 The runner rejects unknown fields, wrong order, duplicate or missing legs,
-unsafe paths, timeout budgets above 240 seconds, malformed or oversized output,
+unsafe paths, timeout budgets above 270 seconds, malformed or oversized output,
 nonzero exits, and mismatched evidence. It terminates the complete child process
 group on timeout or signal. Each leg inherits the callback's isolated process
 group so the migration's outer timeout cannot leave a nested leg running after

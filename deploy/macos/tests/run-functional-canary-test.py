@@ -24,6 +24,7 @@ LEGS = (
     "authenticated-routed-codex",
     "sticky-reuse",
     "safe-failover-reuse",
+    "authenticated-routed-claude",
     "existing-session-next-turn",
 )
 SOURCE_OID = "a" * 40
@@ -136,7 +137,7 @@ class FunctionalCanaryTest(unittest.TestCase):
             _active_runner = None
         return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
-    def test_all_five_exact_legs_pass_and_write_bounded_evidence(self) -> None:
+    def test_all_six_exact_legs_pass_and_write_bounded_evidence(self) -> None:
         manifest = self.manifest()
         validated = self.run_runner(manifest, "--validate-only")
         self.assertEqual(validated.returncode, 0, validated.stderr)
@@ -438,7 +439,7 @@ class FunctionalCanaryTest(unittest.TestCase):
         cases = {
             "unknown field": lambda body: body.update({"unknown": True}),
             "boolean total": lambda body: body.update({"total_timeout_seconds": True}),
-            "total above cap": lambda body: body.update({"total_timeout_seconds": 241}),
+            "total above cap": lambda body: body.update({"total_timeout_seconds": 271}),
             "bad candidate hash": lambda body: body["candidate_worker"].update({"sha256": "f" * 64}),
             "bad executable hash": lambda body: body["legs"][0].update({"executable_sha256": "f" * 64}),
             "bad config hash": lambda body: body["legs"][0].update({"config_sha256": "f" * 64}),

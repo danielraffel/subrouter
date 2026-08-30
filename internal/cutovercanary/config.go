@@ -66,6 +66,15 @@ type IsolatedLegConfig struct {
 	configPath           string
 }
 
+type ClaudeLegConfig struct {
+	Schema     string     `json:"schema"`
+	HTTP       HTTPConfig `json:"http"`
+	ProofFile  string     `json:"proof_file"`
+	Journal    string     `json:"cleanup_journal"`
+	Model      string     `json:"model"`
+	configPath string
+}
+
 type ExistingLegConfig struct {
 	Schema            string     `json:"schema"`
 	HTTP              HTTPConfig `json:"http"`

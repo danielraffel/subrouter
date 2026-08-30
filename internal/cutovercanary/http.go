@@ -342,6 +342,50 @@ func (c *apiClient) routedTurn(ctx context.Context, sessionID, model, marker str
 	return status, nil
 }
 
+func claudeRequest(model, marker string) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"model": model, "max_tokens": 64,
+		"messages": []map[string]any{{"role": "user", "content": "Reply with exactly " + marker}},
+	})
+}
+
+func exactClaudeMarkerResponse(body []byte, marker string) bool {
+	var response struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if marker == "" || json.Unmarshal(body, &response) != nil || response.Type != "message" || len(response.Content) != 1 {
+		return false
+	}
+	return response.Content[0].Type == "text" && response.Content[0].Text == marker
+}
+
+func (c *apiClient) claudeTurn(ctx context.Context, sessionID, model, marker string) (int, error) {
+	body, err := claudeRequest(model, marker)
+	if err != nil {
+		return 0, err
+	}
+	headers := map[string]string{
+		"Authorization":            "Bearer subrouter",
+		"Content-Type":             "application/json",
+		"anthropic-version":        "2023-06-01",
+		"X-Subrouter-Agent":        "claude",
+		"X-Claude-Code-Session-Id": sessionID,
+		"X-Subrouter-No-Retry":     "true",
+	}
+	status, response, err := c.request(ctx, http.MethodPost, "/v1/messages", body, headers)
+	if err != nil {
+		return status, err
+	}
+	if status < 200 || status >= 300 || !exactClaudeMarkerResponse(response, marker) {
+		return status, errors.New("routed Claude canary response not proven")
+	}
+	return status, nil
+}
+
 func (c *apiClient) liveTurn(ctx context.Context, sessionID, model, marker, forcedAccount string, noRetry bool) (int, []byte, error) {
 	body, err := responseRequest(model, marker)
 	if err != nil {

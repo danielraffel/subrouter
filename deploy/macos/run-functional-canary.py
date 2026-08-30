@@ -35,9 +35,10 @@ REQUIRED_LEGS = (
     "authenticated-routed-codex",
     "sticky-reuse",
     "safe-failover-reuse",
+    "authenticated-routed-claude",
     "existing-session-next-turn",
 )
-MAX_TOTAL_TIMEOUT = 240
+MAX_TOTAL_TIMEOUT = 270
 MAX_LEG_OUTPUT = 64 * 1024
 _active_child: subprocess.Popen[bytes] | None = None
 _active_child_token: str | None = None
