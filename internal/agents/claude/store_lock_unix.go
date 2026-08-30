@@ -26,7 +26,19 @@ type profileCredentialLock struct {
 // lockProfileRegistry serializes registry mutations within one process and
 // across overlapping supervisor worker generations.
 func lockProfileRegistry(path string) (*profileRegistryLock, error) {
-	profileRegistryProcessMu.Lock()
+	return lockProfileRegistryContext(context.Background(), path)
+}
+
+func lockProfileRegistryContext(ctx context.Context, path string) (*profileRegistryLock, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !profileRegistryProcessMu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		profileRegistryProcessMu.Unlock()
 		return nil, err
@@ -36,12 +48,24 @@ func lockProfileRegistry(path string) (*profileRegistryLock, error) {
 		profileRegistryProcessMu.Unlock()
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		_ = file.Close()
-		profileRegistryProcessMu.Unlock()
-		return nil, err
+	for {
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return &profileRegistryLock{file: file}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			_ = file.Close()
+			profileRegistryProcessMu.Unlock()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			profileRegistryProcessMu.Unlock()
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
-	return &profileRegistryLock{file: file}, nil
 }
 
 func (l *profileRegistryLock) Close() error {

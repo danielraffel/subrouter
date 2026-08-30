@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -2287,5 +2289,758 @@ func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
 	}
 	if _, ok := items[0]["health"]; ok {
 		t.Fatalf("account list presented uncached health: %#v", items[0])
+	}
+}
+
+func TestTenantStoredAccountDeletePublishesToOverlappingWorker(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "apikey:work", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	deleting := NewAccountRef(store, initial, nil)
+	deleting.claudeStore = claudeStore
+	sibling := NewAccountRef(store, initial, nil)
+	sibling.claudeStore = claudeStore
+	before := sibling.Generation()
+
+	removed, err := removeTenantAccounts(t.Context(), deleting, stored.Email)
+	if err != nil || !removed {
+		t.Fatalf("delete = removed %v, err %v", removed, err)
+	}
+	if got := sibling.All(); len(got) != 1 || got[0].ID != stored.Email {
+		t.Fatalf("sibling fixture changed before observing generation: %+v", got)
+	}
+	reloaded, generation, err := sibling.reloadIfDiskGenerationChanged(t.Context())
+	if err != nil || !reloaded || generation <= before {
+		t.Fatalf("sibling reload = reloaded %v generation %d before %d err %v", reloaded, generation, before, err)
+	}
+	if got := sibling.All(); len(got) != 0 {
+		t.Fatalf("sibling retained deleted stored secret: %+v", got)
+	}
+}
+
+func TestTenantClaudeAccountDeletePublishesToOverlappingWorker(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if _, err := claudeStore.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := claudeStore.ListAccounts(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleting := NewAccountRef(store, initial, nil)
+	deleting.claudeStore = claudeStore
+	sibling := NewAccountRef(store, initial, nil)
+	sibling.claudeStore = claudeStore
+	before := sibling.Generation()
+
+	removed, err := removeTenantAccounts(t.Context(), deleting, "work")
+	if err != nil || !removed {
+		t.Fatalf("delete = removed %v, err %v", removed, err)
+	}
+	reloaded, generation, err := sibling.reloadIfDiskGenerationChanged(t.Context())
+	if err != nil || !reloaded || generation <= before {
+		t.Fatalf("sibling reload = reloaded %v generation %d before %d err %v", reloaded, generation, before, err)
+	}
+	if got := sibling.All(); len(got) != 0 {
+		t.Fatalf("sibling retained deleted Claude secret: %+v", got)
+	}
+}
+
+func TestRestartCompletesCompositeClaudeAndStoredAccountDeletion(t *testing.T) {
+	if root := os.Getenv("SUBROUTER_TEST_COMPOSITE_DELETE_CRASH_ROOT"); root != "" {
+		store := compositeCrashAccountStore(root)
+		ref := NewAccountRef(store, nil, nil)
+		ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+		ref.beforeTenantStoredRemovalForTest = func() { os.Exit(91) }
+		_, _ = removeTenantAccounts(t.Context(), ref, "work")
+		os.Exit(92)
+	}
+	root := t.TempDir()
+	store := compositeCrashAccountStore(root)
+	stored := accounts.StoredCodexAccount{
+		Email: "work", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runCompositeDeleteCrash(t, root)
+
+	journal, active, err := readAccountRollbackJournal(store.StoreDir())
+	if err != nil || !active || journal.Target != accountRollbackTargetTenantDelete || journal.Progress != accountRollbackClaudeRemoved {
+		t.Fatalf("crash journal = active %v journal %+v err %v", active, journal, err)
+	}
+	if _, found := claudeStore.FindProfile("work"); found {
+		t.Fatal("Claude component remained after crash boundary")
+	}
+	if current, found, err := store.FindStored("work"); err != nil || !found || current.Auth.OpenAIAPIKey != "model-secret" {
+		t.Fatalf("stored component before restart = found %v current %+v err %v", found, current, err)
+	}
+
+	restarted, err := OpenAccountRef(store, claudeStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.All(); len(got) != 0 {
+		t.Fatalf("restarted accounts resurfaced deleted identity: %+v", got)
+	}
+	if _, found, err := store.FindStored("work"); err != nil || found {
+		t.Fatalf("stored component after restart = found %v err %v", found, err)
+	}
+	if _, found := claudeStore.FindProfile("work"); found {
+		t.Fatal("Claude component resurfaced after restart")
+	}
+	if active, err := accountRollbackActive(store.StoreDir()); err != nil || active {
+		t.Fatalf("completed composite journal = active %v err %v", active, err)
+	}
+}
+
+func TestCompositeDeleteHoldsStoredLeaseAcrossClaudeCommit(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts"), DisableActiveAuthSync: true}
+	stored := proxyStoredOAuthAccount("work", "old", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var refreshCalls atomic.Int32
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		refreshCalls.Add(1)
+		return nil, errors.New("refresh endpoint must not be called after deletion")
+	})}
+	ref := NewAccountRef(store, nil, client)
+	ref.claudeStore = claudeStore
+	refreshAttempted := make(chan struct{})
+	refreshResult := make(chan error, 1)
+	ref.afterTenantStoredRevalidateForTest = func() {
+		go func() {
+			close(refreshAttempted)
+			_, _, err := store.RefreshStored(context.Background(), client, stored)
+			refreshResult <- err
+		}()
+		<-refreshAttempted
+		runtime.Gosched()
+		select {
+		case err := <-refreshResult:
+			t.Fatalf("refresh crossed a held stored-account lease: %v", err)
+		default:
+		}
+	}
+
+	removed, err := removeTenantAccounts(t.Context(), ref, "work")
+	if err != nil || !removed {
+		t.Fatalf("composite delete = removed %v err %v", removed, err)
+	}
+	select {
+	case err := <-refreshResult:
+		if !errors.Is(err, accounts.ErrStoredAccountRemoved) {
+			t.Fatalf("waiting refresh error = %v, want removed-account error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting refresh did not resume after composite deletion")
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("refresh endpoint calls = %d, want 0", refreshCalls.Load())
+	}
+	if _, found, err := store.FindStored("work"); err != nil || found {
+		t.Fatalf("stored account after delete = found %v err %v", found, err)
+	}
+	if _, found := claudeStore.FindProfile("work"); found {
+		t.Fatal("Claude profile remained after composite deletion")
+	}
+}
+
+func TestCompositeDeleteRejectsRefreshThatWinsStoredLease(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts"), DisableActiveAuthSync: true}
+	stored := proxyStoredOAuthAccount("work", "old", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newAccess := proxyTestCodexJWT("work", "new-access", time.Now().Add(time.Hour))
+	newID := proxyTestCodexJWT("work", "new-id", time.Now().Add(time.Hour))
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"access_token":%q,"refresh_token":"new-refresh","id_token":%q}`, newAccess, newID,
+			))),
+		}, nil
+	})}
+	refreshHoldingLease := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	refreshResult := make(chan error, 1)
+	go func() {
+		_, _, err := store.RefreshStoredIfExpiredBeforeRefresh(context.Background(), client, stored, func() error {
+			close(refreshHoldingLease)
+			<-releaseRefresh
+			return nil
+		})
+		refreshResult <- err
+	}()
+	<-refreshHoldingLease
+
+	ref := NewAccountRef(store, nil, client)
+	ref.claudeStore = claudeStore
+	type deleteResult struct {
+		removed bool
+		err     error
+	}
+	deleteResultCh := make(chan deleteResult, 1)
+	go func() {
+		removed, err := removeTenantAccounts(context.Background(), ref, "work")
+		deleteResultCh <- deleteResult{removed: removed, err: err}
+	}()
+	waitForTenantDeleteTransaction(t, ref)
+	close(releaseRefresh)
+	if err := <-refreshResult; err != nil {
+		t.Fatalf("winning refresh = %v", err)
+	}
+	result := <-deleteResultCh
+	if result.removed || result.err == nil || !strings.Contains(result.err.Error(), "stored account changed during removal") {
+		t.Fatalf("delete after winning refresh = removed %v err %v", result.removed, result.err)
+	}
+	current, found, err := store.FindStored("work")
+	if err != nil || !found || current.Auth.Tokens == nil || current.Auth.Tokens.RefreshToken != "new-refresh" {
+		t.Fatalf("winning refresh credential = found %v account %+v err %v", found, current, err)
+	}
+	if _, found := claudeStore.FindProfile("work"); !found {
+		t.Fatal("stale composite deletion removed Claude before rejecting refreshed stored identity")
+	}
+}
+
+func TestRestartCompositeDeletePreservesChangedStoredReplacement(t *testing.T) {
+	root := t.TempDir()
+	store := compositeCrashAccountStore(root)
+	original := accounts.StoredCodexAccount{
+		Email: "work", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "old-model-secret"},
+	}
+	if err := store.SaveStored(original); err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runCompositeDeleteCrash(t, root)
+	replacement := original
+	replacement.Auth.OpenAIAPIKey = "replacement-model-secret"
+	if err := store.SaveStored(replacement); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := OpenAccountRef(store, claudeStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := restarted.All()
+	if len(got) != 1 || got[0].ID != "work" || got[0].Token != "replacement-model-secret" {
+		t.Fatalf("restarted accounts = %+v, want exact stored replacement", got)
+	}
+	if _, found := claudeStore.FindProfile("work"); found {
+		t.Fatal("removed Claude component resurfaced with stored replacement")
+	}
+	if active, err := accountRollbackActive(store.StoreDir()); err != nil || active {
+		t.Fatalf("changed replacement journal = active %v err %v", active, err)
+	}
+}
+
+func TestCompositeDeleteSupportsSelectorMatchedStoredIdentity(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "work@example.com", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "claude-access", RefreshToken: "claude-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = claudeStore
+
+	removed, err := removeTenantAccounts(t.Context(), ref, "work")
+	if err != nil || !removed {
+		t.Fatalf("selector-matched composite delete = removed %v err %v", removed, err)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || found {
+		t.Fatalf("stored account after delete = found %v err %v", found, err)
+	}
+	if _, found := claudeStore.FindProfile("work"); found {
+		t.Fatal("Claude profile remained after selector-matched composite deletion")
+	}
+	if active, err := accountRollbackActive(store.StoreDir()); err != nil || active {
+		t.Fatalf("selector-matched composite journal = active %v err %v", active, err)
+	}
+}
+
+func runCompositeDeleteCrash(t *testing.T, root string) {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=^TestRestartCompletesCompositeClaudeAndStoredAccountDeletion$")
+	command.Env = append(os.Environ(), "SUBROUTER_TEST_COMPOSITE_DELETE_CRASH_ROOT="+root)
+	if err := command.Run(); err == nil {
+		t.Fatal("crash helper unexpectedly completed")
+	} else if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 91 {
+		t.Fatalf("crash helper = %v, want exit 91", err)
+	}
+}
+
+func compositeCrashAccountStore(root string) accounts.CodexStore {
+	return accounts.CodexStore{Dir: filepath.Join(root, "tenant-state", "nonstandard-credentials")}
+}
+
+func TestTenantStoredDeleteRestoresExactStateAfterPostRenameSyncFailure(t *testing.T) {
+	want := errors.New("post-rename directory sync failed")
+	originalSync := syncTenantStoredAccountDir
+	calls := 0
+	syncTenantStoredAccountDir = func(path string) error {
+		calls++
+		if calls == 1 {
+			return want
+		}
+		return originalSync(path)
+	}
+	t.Cleanup(func() { syncTenantStoredAccountDir = originalSync })
+
+	calls = 0
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{Email: "apikey:work", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"}}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	removed, err := removeTenantAccounts(t.Context(), ref, stored.Email)
+	if removed || !errors.Is(err, want) {
+		t.Fatalf("post-rename sync failure = removed %v err %v", removed, err)
+	}
+	got, found, readErr := store.FindStored(stored.Email)
+	if readErr != nil || !found || got.Auth.OpenAIAPIKey != "model-secret" {
+		t.Fatalf("restored model credential = found %v got %+v err %v", found, got, readErr)
+	}
+}
+
+func TestRestartReconcilesStagedStoredDeletionWithoutOverwritingSibling(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	target := accounts.StoredCodexAccount{Email: "apikey:work", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "target-secret"}}
+	sibling := accounts.StoredCodexAccount{Email: "apikey:sibling", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sibling-secret"}}
+	if err := store.SaveStored(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveStored(sibling); err != nil {
+		t.Fatal(err)
+	}
+	targetPath := filepath.Join(store.Dir, "apikey_work.json")
+	if err := os.Rename(targetPath, targetPath+".delete-staged"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcileCompletedAccountRollback(t.Context(), store, advanceAccountDiskGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.FindStored(target.Email); err != nil || found {
+		t.Fatalf("target after restart = found %v err %v", found, err)
+	}
+	got, found, err := store.FindStored(sibling.Email)
+	if err != nil || !found || got.Auth.OpenAIAPIKey != "sibling-secret" {
+		t.Fatalf("sibling after restart = found %v got %+v err %v", found, got, err)
+	}
+}
+
+func TestOpenAccountRefReconcilesStandaloneStoredDeleteCrashInCustomAccountDir(t *testing.T) {
+	const crashRootEnv = "SUBROUTER_TEST_STANDALONE_STORED_DELETE_CRASH_ROOT"
+	if root := os.Getenv(crashRootEnv); root != "" {
+		store := accounts.CodexStore{Dir: filepath.Join(root, "tenant-state", "nonstandard-credentials")}
+		ref := NewAccountRef(store, nil, nil)
+		syncTenantStoredAccountDir = func(string) error { os.Exit(93); return nil }
+		_, _ = removeTenantAccounts(t.Context(), ref, "apikey:work")
+		os.Exit(94)
+	}
+
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "tenant-state", "nonstandard-credentials")}
+	stored := accounts.StoredCodexAccount{
+		Email: "apikey:work", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "must-delete"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestOpenAccountRefReconcilesStandaloneStoredDeleteCrashInCustomAccountDir$")
+	command.Env = append(os.Environ(), crashRootEnv+"="+root)
+	err := command.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 93 {
+		t.Fatalf("delete crash subprocess = %v, want exit 93", err)
+	}
+	stages, err := filepath.Glob(filepath.Join(store.Dir, "*.json.delete-staged"))
+	if err != nil || len(stages) != 1 {
+		t.Fatalf("crash stage = %v err %v, want one staged secret", stages, err)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || found {
+		t.Fatalf("live account after crash = found %v err %v", found, err)
+	}
+
+	restarted, err := OpenAccountRef(store, agentclaude.Store{Dir: filepath.Join(root, "claude")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.All(); len(got) != 0 {
+		t.Fatalf("restart resurfaced staged account: %+v", got)
+	}
+	stages, err = filepath.Glob(filepath.Join(store.Dir, "*.json.delete-staged"))
+	if err != nil || len(stages) != 0 {
+		t.Fatalf("restart retained staged secret %v err %v", stages, err)
+	}
+}
+
+func TestTenantAccountDeletePublicationFailurePreventsCredentialMutation(t *testing.T) {
+	want := errors.New("generation publication unavailable")
+
+	t.Run("stored API key", func(t *testing.T) {
+		root := t.TempDir()
+		store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+		stored := accounts.StoredCodexAccount{
+			Email: "apikey:work", Provider: accounts.ProviderCodex,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+		}
+		if err := store.SaveStored(stored); err != nil {
+			t.Fatal(err)
+		}
+		ref := NewAccountRef(store, nil, nil)
+		ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+		ref.publishGenerationForTest = func(string) error { return want }
+		removed, err := removeTenantAccounts(t.Context(), ref, stored.Email)
+		if removed || !errors.Is(err, want) {
+			t.Fatalf("delete = removed %v, err %v", removed, err)
+		}
+		if current, found, err := store.FindStored(stored.Email); err != nil || !found || current.Auth.OpenAIAPIKey != "model-secret" {
+			t.Fatalf("publication failure changed stored credential: found=%v err=%v account=%+v", found, err, current)
+		}
+	})
+
+	t.Run("Claude profile", func(t *testing.T) {
+		root := t.TempDir()
+		store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+		claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+		if _, err := claudeStore.CreateProfile("work"); err != nil {
+			t.Fatal(err)
+		}
+		if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+			AccessToken: "access", RefreshToken: "refresh",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		ref := NewAccountRef(store, nil, nil)
+		ref.claudeStore = claudeStore
+		ref.publishGenerationForTest = func(string) error { return want }
+		removed, err := removeTenantAccounts(t.Context(), ref, "work")
+		if removed || !errors.Is(err, want) {
+			t.Fatalf("delete = removed %v, err %v", removed, err)
+		}
+		if _, found := claudeStore.FindProfile("work"); !found {
+			t.Fatal("publication failure removed Claude profile")
+		}
+		credential, err := claudeStore.ReadCredential(t.Context(), claudeStore.ClaudeConfigDir("work"))
+		if err != nil || credential.AccessToken != "access" {
+			t.Fatalf("publication failure changed Claude credential: credential=%+v err=%v", credential, err)
+		}
+	})
+
+}
+
+func TestTenantStoredDeleteRejectsCredentialVersionChangeBeforeMutation(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	original := accounts.StoredCodexAccount{
+		Email: "apikey:work", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "old-secret"},
+	}
+	if err := store.SaveStored(original); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+	held, err := lockAccountImportTransaction(t.Context(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type deleteResult struct {
+		removed bool
+		err     error
+	}
+	resultCh := make(chan deleteResult, 1)
+	go func() {
+		removed, err := removeTenantAccounts(context.Background(), ref, original.Email)
+		resultCh <- deleteResult{removed: removed, err: err}
+	}()
+	waitForTenantDeleteTransaction(t, ref)
+	replacement := original
+	replacement.Auth.OpenAIAPIKey = "replacement-secret"
+	if err := store.SaveStored(replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.removed || result.err == nil || !strings.Contains(result.err.Error(), "changed during removal") {
+		t.Fatalf("stale delete = removed %v, err %v", result.removed, result.err)
+	}
+	stored, found, err := store.FindStored(original.Email)
+	if err != nil || !found || stored.Auth.OpenAIAPIKey != replacement.Auth.OpenAIAPIKey {
+		t.Fatalf("stale delete changed replacement: found=%v err=%v account=%+v", found, err, stored)
+	}
+}
+
+func TestTenantStoredDeleteRejectsRepairAfterTransactionRevalidation(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	original := accounts.StoredCodexAccount{
+		Email: "apikey:work", Provider: accounts.ProviderCodex,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "old-secret"},
+	}
+	if err := store.SaveStored(original); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+	replacement := original
+	replacement.Auth.OpenAIAPIKey = "replacement-secret"
+	ref.beforeTenantStoredRemovalForTest = func() {
+		if err := store.SaveStored(replacement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := removeTenantAccounts(t.Context(), ref, original.Email)
+	if removed || err == nil || !strings.Contains(err.Error(), "changed during removal") {
+		t.Fatalf("post-revalidation repair delete = removed %v, err %v", removed, err)
+	}
+	stored, found, err := store.FindStored(original.Email)
+	if err != nil || !found || stored.Auth.OpenAIAPIKey != replacement.Auth.OpenAIAPIKey {
+		t.Fatalf("post-revalidation repair changed: found=%v err=%v account=%+v", found, err, stored)
+	}
+}
+
+func TestTenantClaudeDeleteRejectsProfileIdentityChangeBeforeMutation(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if _, err := claudeStore.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = claudeStore
+	held, err := lockAccountImportTransaction(t.Context(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type deleteResult struct {
+		removed bool
+		err     error
+	}
+	resultCh := make(chan deleteResult, 1)
+	go func() {
+		removed, err := removeTenantAccounts(context.Background(), ref, "work")
+		resultCh <- deleteResult{removed: removed, err: err}
+	}()
+	waitForTenantDeleteTransaction(t, ref)
+	if err := claudeStore.RegisterProfile("work", "replacement"); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.removed || result.err == nil || !strings.Contains(result.err.Error(), "changed during removal") {
+		t.Fatalf("stale delete = removed %v, err %v", result.removed, result.err)
+	}
+	profile, found := claudeStore.FindProfile("work")
+	if !found || profile.Dir != "replacement" {
+		t.Fatalf("stale delete changed replacement profile: found=%v profile=%+v", found, profile)
+	}
+}
+
+func TestTenantClaudeDeleteRejectsSameDirectoryCredentialRepair(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "old-access", RefreshToken: "old-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = claudeStore
+	held, err := lockAccountImportTransaction(t.Context(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type deleteResult struct {
+		removed bool
+		err     error
+	}
+	resultCh := make(chan deleteResult, 1)
+	go func() {
+		removed, err := removeTenantAccounts(context.Background(), ref, "work")
+		resultCh <- deleteResult{removed: removed, err: err}
+	}()
+	waitForTenantDeleteTransaction(t, ref)
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "replacement-access", RefreshToken: "replacement-refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.removed || result.err == nil || !strings.Contains(result.err.Error(), "changed during removal") {
+		t.Fatalf("stale delete = removed %v, err %v", result.removed, result.err)
+	}
+	credential, err := claudeStore.ReadCredential(t.Context(), claudeStore.ClaudeConfigDir("work"))
+	if err != nil || credential == nil || credential.AccessToken != "replacement-access" {
+		t.Fatalf("stale delete changed replacement credential: credential=%+v err=%v", credential, err)
+	}
+	if active, err := accountRollbackActive(store.StoreDir()); err != nil || active {
+		t.Fatalf("stale delete journal = active %v, err %v", active, err)
+	}
+}
+
+func TestTenantClaudeDeleteCanJournalCorruptCredentialPayload(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	instancePath, err := claudeStore.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(instancePath, ".credentials.json"), []byte("{corrupt-credential"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = claudeStore
+	removed, err := removeTenantAccounts(t.Context(), ref, "work")
+	if err != nil || !removed {
+		t.Fatalf("delete corrupt credential = removed %v, err %v", removed, err)
+	}
+	if _, found := claudeStore.FindProfile("work"); found {
+		t.Fatal("corrupt Claude credential profile remained registered")
+	}
+	if active, err := accountRollbackActive(store.StoreDir()); err != nil || active {
+		t.Fatalf("completed corrupt credential journal = active %v, err %v", active, err)
+	}
+}
+
+func waitForTenantDeleteTransaction(t *testing.T, ref *AccountRef) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for ref.installMu.TryLock() {
+		ref.installMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("delete did not reach the account transaction lock")
+		}
+		runtime.Gosched()
+	}
+}
+
+func TestTenantClaudeDeleteReloadsCommittedRemovalWhenCleanupFails(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS Keychain is only available on Darwin")
+	}
+	root := t.TempDir()
+	accountStore := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	instancePath, err := claudeStore.CreateProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := OpenAccountRef(accountStore, claudeStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accounts := ref.All(); len(accounts) != 1 || accounts[0].ID != "work" {
+		t.Fatalf("initial accounts = %+v, want Claude work profile", accounts)
+	}
+
+	fakeBin := t.TempDir()
+	securityPath := filepath.Join(fakeBin, "security")
+	if err := os.WriteFile(
+		securityPath,
+		[]byte("#!/bin/sh\nrm -rf \"$SUBROUTER_TEST_INSTANCE_PARENT\"/.work.remove-*\necho 'forced cleanup and rollback failure' >&2\nexit 1\n"),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_TEST_INSTANCE_PARENT", filepath.Dir(instancePath))
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	response := httptest.NewRecorder()
+	handleTenantAccountDelete(
+		&Server{AccountRef: ref},
+		response,
+		httptest.NewRequest(http.MethodDelete, "/_subrouter/accounts/work", nil),
+	)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	if got := ref.All(); len(got) != 0 {
+		t.Fatalf("live accounts retained durably removed Claude profile: %+v", got)
+	}
+	if active, err := accountRollbackActive(accountStore.StoreDir()); err != nil || !active {
+		t.Fatalf("failed cleanup journal = active %v, err %v", active, err)
 	}
 }

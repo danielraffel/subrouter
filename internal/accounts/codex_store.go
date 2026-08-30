@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	accountpkg "github.com/manaflow-ai/subrouter/account"
@@ -23,6 +25,72 @@ type CodexStore struct {
 }
 
 const migrationBatchControlLockID = ".subrouter-migration-batch-control"
+
+var storedAccountProcessLocks sync.Map
+
+func storedAccountProcessMutex(storeDir, identifier string) *sync.Mutex {
+	key, err := filepath.Abs(filepath.Join(storeDir, "."+accountLockFilename(identifier)+".lock"))
+	if err != nil {
+		key = filepath.Clean(filepath.Join(storeDir, "."+accountLockFilename(identifier)+".lock"))
+	}
+	value, _ := storedAccountProcessLocks.LoadOrStore(key, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+// StoredAccountLease holds the same process and cross-process account lock used
+// by saves, refreshes, and exact removals. Callers coordinating a stored
+// credential with another provider store can keep one exact stored identity
+// stable across that larger transaction without re-entering the account lock.
+//
+// A lease is bound to one exact account identifier. Close must be called once.
+type StoredAccountLease struct {
+	store      CodexStore
+	identifier string
+	lock       *accountFileLock
+	closed     bool
+}
+
+// AcquireStoredAccountLease locks one exact stored-account identity. The
+// caller must already hold any broader transaction locks; the canonical order
+// is broader transaction -> stored-account lease -> provider-specific locks.
+func (s CodexStore) AcquireStoredAccountLease(identifier string) (*StoredAccountLease, error) {
+	identifier = strings.TrimSpace(identifier)
+	if err := validateStoredAccountIdentifier(identifier); err != nil {
+		return nil, err
+	}
+	lock, err := s.lockStoredAccount(identifier)
+	if err != nil {
+		return nil, err
+	}
+	return &StoredAccountLease{store: s, identifier: identifier, lock: lock}, nil
+}
+
+// Close releases the stored-account lease.
+func (l *StoredAccountLease) Close() error {
+	if l == nil || l.lock == nil || l.closed {
+		return nil
+	}
+	l.closed = true
+	return l.lock.Close()
+}
+
+func (l *StoredAccountLease) validFor(identifier string) error {
+	if l == nil || l.lock == nil || l.closed {
+		return errors.New("stored account lease is not active")
+	}
+	if !strings.EqualFold(strings.TrimSpace(identifier), l.identifier) {
+		return fmt.Errorf("stored account lease for %q cannot access %q", l.identifier, identifier)
+	}
+	return nil
+}
+
+// FindExact returns the exact account protected by this lease.
+func (l *StoredAccountLease) FindExact() (StoredCodexAccount, bool, error) {
+	if err := l.validFor(l.identifier); err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	return l.store.findStoredExact(l.identifier)
+}
 
 type StorageKeyCollisionError struct {
 	Identifier         string
@@ -754,6 +822,222 @@ func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, e
 		return account, false, err
 	}
 	return account, true, nil
+}
+
+// RemoveStoredExact holds the account's credential lock across the final
+// identity check and unlink. A same-ID repair that wins before this lock is
+// rejected; one that starts afterward cannot be unlinked by this deletion.
+func (s CodexStore) RemoveStoredExact(expected StoredCodexAccount) (StoredCodexAccount, bool, error) {
+	lock, err := s.lockStoredAccount(expected.Email)
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	defer lock.Close()
+	current, found, err := s.findStoredExact(expected.Email)
+	if err != nil || !found {
+		return current, found, err
+	}
+	if !reflect.DeepEqual(current, expected) {
+		return current, false, fmt.Errorf("stored account %q changed during removal", expected.Email)
+	}
+	if err := os.Remove(filepath.Join(s.Dir, emailToFilename(current.Email))); err != nil {
+		return current, false, err
+	}
+	return current, true, nil
+}
+
+const storedRemovalStageSuffix = ".delete-staged"
+
+// RemoveStoredExactDurable stages the exact record out of the live namespace,
+// syncs that rename, and then removes the staged secret. A crash after the
+// rename is recoverable by ReconcileStoredRemovalStages and cannot resurrect a
+// stale live account.
+func (s CodexStore) RemoveStoredExactDurable(expected StoredCodexAccount, syncDir func(string) error) (StoredCodexAccount, bool, error) {
+	lease, err := s.AcquireStoredAccountLease(expected.Email)
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	defer lease.Close()
+	return lease.RemoveExactDurable(expected, syncDir)
+}
+
+// RemoveExactDurable performs an exact durable removal while retaining an
+// already-held lease. This avoids releasing or recursively acquiring the
+// account lock inside a composite provider transaction.
+func (l *StoredAccountLease) RemoveExactDurable(expected StoredCodexAccount, syncDir func(string) error) (StoredCodexAccount, bool, error) {
+	if err := l.validFor(expected.Email); err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	current, found, err := l.store.findStoredExact(expected.Email)
+	if err != nil || !found {
+		return current, found, err
+	}
+	if !reflect.DeepEqual(current, expected) {
+		return current, false, fmt.Errorf("stored account %q changed during removal", expected.Email)
+	}
+	path := filepath.Join(l.store.Dir, emailToFilename(current.Email))
+	staged := path + storedRemovalStageSuffix
+	if err := os.Remove(staged); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return current, false, err
+	}
+	if err := os.Rename(path, staged); err != nil {
+		return current, false, err
+	}
+	if err := syncDir(l.store.Dir); err != nil {
+		renameErr := os.Rename(staged, path)
+		if renameErr != nil {
+			// The live record could not be restored, so the deletion remains
+			// logically committed even though its directory publication failed.
+			return current, true, errors.Join(err, renameErr)
+		}
+		// Once the reverse rename succeeds the record is live again. Report
+		// removed=false even if publishing that restoration fails so a caller
+		// coordinating another credential store restores its side as well.
+		return current, false, errors.Join(err, syncDir(l.store.Dir))
+	}
+	if err := os.Remove(staged); err != nil {
+		return current, true, err
+	}
+	// The first parent sync made the live-to-staged rename durable. Therefore a
+	// failure syncing the final staged unlink cannot resurrect the live record:
+	// either the unlink persists, or the staged record reappears and startup
+	// reconciliation removes it. The deletion is committed in both cases.
+	return current, true, syncDir(l.store.Dir)
+}
+
+// ReconcileStoredRemovalStages rolls forward exact deletions whose live record
+// was already staged away before a process crash.
+func (s CodexStore) ReconcileStoredRemovalStages(syncDir func(string) error) error {
+	return s.reconcileStoredRemovalStages(syncDir, nil)
+}
+
+func (s CodexStore) reconcileStoredRemovalStages(syncDir func(string) error, beforeLease func(string)) error {
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json"+storedRemovalStageSuffix) {
+			continue
+		}
+		path := filepath.Join(s.Dir, entry.Name())
+		staged, found, err := readStoredRemovalStage(path, entry.Name())
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if beforeLease != nil {
+			beforeLease(staged.Email)
+		}
+		lease, err := s.AcquireStoredAccountLease(staged.Email)
+		if err != nil {
+			return err
+		}
+		err = lease.reconcileRemovalStage(path, entry.Name(), staged, syncDir)
+		closeErr := lease.Close()
+		if err != nil || closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
+	}
+	return nil
+}
+
+func readStoredRemovalStage(path, name string) (StoredCodexAccount, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, nil
+	}
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q is not a regular file", name)
+	}
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, nil
+	}
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	var staged StoredCodexAccount
+	if err := json.Unmarshal(body, &staged); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("parse stored removal stage %q: %w", name, err)
+	}
+	if err := validateStoredAccountIdentifier(staged.Email); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q has ambiguous identity: %w", name, err)
+	}
+	if want := emailToFilename(staged.Email) + storedRemovalStageSuffix; name != want {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q does not match its account identity", name)
+	}
+	return staged, true, nil
+}
+
+func (l *StoredAccountLease) reconcileRemovalStage(path, name string, observed StoredCodexAccount, syncDir func(string) error) error {
+	if err := l.validFor(observed.Email); err != nil {
+		return err
+	}
+	staged, found, err := readStoredRemovalStage(path, name)
+	if err != nil || !found {
+		return err
+	}
+	if !reflect.DeepEqual(staged, observed) {
+		return fmt.Errorf("stored removal stage %q changed while awaiting its account lease", name)
+	}
+
+	livePath := strings.TrimSuffix(path, storedRemovalStageSuffix)
+	liveAccount, live, err := readStoredRemovalLive(livePath, strings.TrimSuffix(name, storedRemovalStageSuffix))
+	if err != nil {
+		return err
+	}
+	if live {
+		if !strings.EqualFold(strings.TrimSpace(liveAccount.Email), strings.TrimSpace(staged.Email)) {
+			return fmt.Errorf("stored removal stage %q collides with live account identity", name)
+		}
+		// A live record is an authoritative replacement (or a restored failed
+		// deletion). The stage is stale, but only this identity's lease may
+		// remove it.
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return syncDir(l.store.Dir)
+}
+
+func readStoredRemovalLive(path, name string) (StoredCodexAccount, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, nil
+	}
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q is not a regular file", name)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	var live StoredCodexAccount
+	if err := json.Unmarshal(body, &live); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("parse stored account %q: %w", name, err)
+	}
+	if err := validateStoredAccountIdentifier(live.Email); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q has ambiguous identity: %w", name, err)
+	}
+	if want := emailToFilename(live.Email); name != want {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q does not match its account identity", name)
+	}
+	return live, true, nil
 }
 
 // MigratedDirName holds credentials this machine has handed to the team vault.

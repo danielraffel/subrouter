@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -1173,20 +1175,12 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		http.NotFound(w, r)
 		return
 	}
-	removed := false
-	if _, ok, err := server.AccountRef.store.RemoveStored(id); err != nil {
-		http.Error(w, "remove account", http.StatusInternalServerError)
-		return
-	} else if ok {
-		removed = true
-	}
-	if ok, err := server.AccountRef.claudeStore.RemoveProfile(id); err != nil {
-		http.Error(w, "remove account", http.StatusInternalServerError)
-		return
-	} else if ok {
-		removed = true
-	}
+	removed, removeErr := removeTenantAccounts(r.Context(), server.AccountRef, id)
 	if !removed {
+		if removeErr != nil {
+			http.Error(w, "remove account", http.StatusInternalServerError)
+			return
+		}
 		http.Error(w, "account not found", http.StatusNotFound)
 		return
 	}
@@ -1194,7 +1188,152 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		http.Error(w, "account removed but reload failed", http.StatusInternalServerError)
 		return
 	}
+	if removeErr != nil {
+		http.Error(w, "account removed but credential cleanup failed", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// removeTenantAccounts snapshots both provider identities before joining the
+// canonical installMu -> cross-process account transaction. It revalidates
+// those identities under the transaction, publishes before mutation, and uses
+// one durable journal when a Codex/Claude pair must be removed together.
+func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (removed bool, err error) {
+	expectedStored, expectedStoredFound, err := ref.store.FindStored(id)
+	if err != nil {
+		return false, err
+	}
+	expectedClaude, expectedClaudeFound, err := snapshotTenantClaudeProfile(ctx, ref, id)
+	if err != nil {
+		return false, err
+	}
+	if !expectedStoredFound && !expectedClaudeFound {
+		return false, nil
+	}
+
+	if err := lockMutexContext(ctx, &ref.installMu); err != nil {
+		return false, err
+	}
+	defer ref.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(ctx, ref.store.StoreDir())
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, transactionLock.Close()) }()
+	if _, err := reconcileCompletedAccountRollback(ctx, ref.store, advanceAccountDiskGeneration); err != nil {
+		return false, err
+	}
+
+	var stored accounts.StoredCodexAccount
+	if expectedStoredFound {
+		var found bool
+		stored, found, err = ref.store.FindStored(expectedStored.Email)
+		if err != nil {
+			return false, err
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		provider := stored.ProviderOrDefault()
+		if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude {
+			return false, fmt.Errorf("stored account provider %q is unsupported for exact removal", provider)
+		}
+	}
+	if expectedClaudeFound {
+		current, found, err := snapshotTenantClaudeProfile(ctx, ref, id)
+		if err != nil {
+			return false, err
+		}
+		if !found || current != expectedClaude {
+			return false, errors.New("Claude profile changed during removal")
+		}
+	}
+
+	published := false
+	publish := func() error {
+		if err := ref.advanceDiskGeneration(); err != nil {
+			return err
+		}
+		published = true
+		return nil
+	}
+	if expectedClaudeFound && expectedStoredFound {
+		storedLease, leaseErr := ref.store.AcquireStoredAccountLease(expectedStored.Email)
+		if leaseErr != nil {
+			return false, leaseErr
+		}
+		defer func() { err = errors.Join(err, storedLease.Close()) }()
+		stored, found, findErr := storedLease.FindExact()
+		if findErr != nil {
+			return false, findErr
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		if ref.afterTenantStoredRevalidateForTest != nil {
+			ref.afterTenantStoredRevalidateForTest()
+		}
+		removed, removeErr := removeJournaledTenantAccountLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude, stored,
+			storedLease, ref.store.Dir, publish, ref.beforeTenantStoredRemovalForTest,
+		)
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+		}
+		return removed, removeErr
+	}
+	if expectedClaudeFound {
+		claudeRemoved, removeErr := removeJournaledClaudeProfileLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude, publish,
+		)
+		removed = removed || claudeRemoved
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+			return removed, removeErr
+		}
+	}
+	if expectedStoredFound {
+		if !published {
+			if err := publish(); err != nil {
+				return removed, err
+			}
+		}
+		if ref.beforeTenantStoredRemovalForTest != nil {
+			ref.beforeTenantStoredRemovalForTest()
+		}
+		storedRemoved, removeErr := removeTenantStoredAccountLocked(ref, stored)
+		removed = removed || storedRemoved
+		if removeErr != nil {
+			return removed, removeErr
+		}
+	}
+	return removed, nil
+}
+
+func snapshotTenantClaudeProfile(ctx context.Context, ref *AccountRef, id string) (agentclaude.ProfileRemovalSnapshot, bool, error) {
+	if err := agentclaude.ValidateProfileNameAllowEmail(id); err != nil {
+		return agentclaude.ProfileRemovalSnapshot{}, false, nil
+	}
+	return ref.claudeStore.SnapshotProfileRemovalContext(ctx, id)
+}
+
+func storedAccountMutationVersion(stored accounts.StoredCodexAccount) [sha256.Size]byte {
+	body, _ := json.Marshal(stored)
+	return sha256.Sum256(body)
+}
+
+var syncTenantStoredAccountDir = syncAccountStateDir
+
+func removeTenantStoredAccountLocked(ref *AccountRef, expected accounts.StoredCodexAccount) (bool, error) {
+	_, removed, err := ref.store.RemoveStoredExactDurable(expected, syncTenantStoredAccountDir)
+	return removed, err
 }
 
 func (m *MultiTenant) reloadTenantAccounts(ctx context.Context) {

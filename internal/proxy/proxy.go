@@ -226,15 +226,20 @@ func (l *Lifecycle) Status() map[string]any {
 }
 
 type AccountRef struct {
-	mu                 sync.RWMutex
-	installMu          sync.Mutex
-	accounts           []accounts.Account
-	accountGeneration  uint64
-	credentialRevision uint64
-	diskGeneration     string
-	store              accounts.CodexStore
-	claudeStore        agentclaude.Store
-	client             *http.Client
+	mu        sync.RWMutex
+	installMu sync.Mutex
+	// publishGenerationForTest is immutable after AccountRef construction.
+	// Production constructors leave it nil and always use the durable publisher.
+	publishGenerationForTest           func(string) error
+	afterTenantStoredRevalidateForTest func()
+	beforeTenantStoredRemovalForTest   func()
+	accounts                           []accounts.Account
+	accountGeneration                  uint64
+	credentialRevision                 uint64
+	diskGeneration                     string
+	store                              accounts.CodexStore
+	claudeStore                        agentclaude.Store
+	client                             *http.Client
 
 	usageStatusMu    sync.Mutex
 	usageStatusCache []AccountUsageStatus
@@ -483,9 +488,29 @@ func OpenAccountRefContext(ctx context.Context, store accounts.CodexStore, claud
 		return nil, err
 	}
 	defer transactionLock.Close()
-	loaded, err := loadAccountRefAccounts(store, claudeStore)
+	_, rollbackErr := reconcileCompletedAccountRollback(ctx, store, advanceAccountDiskGeneration)
+	if rollbackErr != nil && !errors.Is(rollbackErr, errAccountRollbackIncomplete) {
+		return nil, rollbackErr
+	}
+	if rollbackErr == nil {
+		// The account journal covers published mutations. A process can also die
+		// after Claude credential directories are staged but before the registry
+		// changes; reconcile that pre-commit window from registry authority before
+		// loading any routable account snapshot.
+		if err := claudeStore.ReconcileProfileInstanceStagesContext(ctx); err != nil {
+			return nil, err
+		}
+	}
+	rollbackActive, err := accountRollbackActive(store.StoreDir())
 	if err != nil {
 		return nil, err
+	}
+	var loaded []accounts.Account
+	if !rollbackActive {
+		loaded, err = loadAccountRefAccounts(store, claudeStore)
+		if err != nil {
+			return nil, err
+		}
 	}
 	diskGeneration, err := readAccountDiskGeneration(store.StoreDir())
 	if err != nil {

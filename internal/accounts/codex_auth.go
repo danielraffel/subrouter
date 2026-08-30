@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+// ErrStoredAccountRemoved reports that a refresh request's exact durable
+// account disappeared before the request acquired its account lock. A stale
+// refresh must never recreate a credential deleted by another transaction.
+var ErrStoredAccountRemoved = errors.New("stored account was removed before refresh")
+
 // codexOAuthTokenURL is a var so tests can point refresh at a fake OAuth server
 // that models the provider's rotate-on-use semantics. Nothing in production
 // reassigns it.
@@ -192,14 +197,25 @@ func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, erro
 }
 
 func (s CodexStore) RefreshStoredIfExpired(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, false)
+	return s.refreshStored(ctx, client, account, false, nil)
+}
+
+// RefreshStoredIfExpiredBeforeRefresh calls beforeRefresh after the final
+// locked freshness checks and immediately before contacting the token endpoint.
+func (s CodexStore) RefreshStoredIfExpiredBeforeRefresh(
+	ctx context.Context,
+	client *http.Client,
+	account StoredCodexAccount,
+	beforeRefresh func() error,
+) (StoredCodexAccount, bool, error) {
+	return s.refreshStored(ctx, client, account, false, beforeRefresh)
 }
 
 func (s CodexStore) RefreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount) (StoredCodexAccount, bool, error) {
-	return s.refreshStored(ctx, client, account, true)
+	return s.refreshStored(ctx, client, account, true, nil)
 }
 
-func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount, force bool) (StoredCodexAccount, bool, error) {
+func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount, force bool, beforeRefresh func() error) (StoredCodexAccount, bool, error) {
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens")
 		return account, false, nil
@@ -227,9 +243,12 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 		logCodexRefreshFailed(ctx, s, account, force, err)
 		return account, false, err
 	}
-	if found {
-		account = latest
+	if !found {
+		removeErr := fmt.Errorf("%w: %q", ErrStoredAccountRemoved, account.Email)
+		logCodexRefreshSkipped(ctx, s, account, force, "account_removed_after_lock")
+		return account, false, removeErr
 	}
+	account = latest
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens_after_lock")
 		return account, false, nil
@@ -248,6 +267,12 @@ func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, acco
 	}
 
 	previous := account
+	if beforeRefresh != nil {
+		if err := beforeRefresh(); err != nil {
+			logCodexRefreshFailed(ctx, s, account, force, err)
+			return account, false, err
+		}
+	}
 	logCodexRefreshStart(ctx, s, previous, force)
 	auth, err := RefreshCodexAuth(ctx, client, account.Auth)
 	if err != nil {
