@@ -66,6 +66,7 @@ type LeaseRequest struct {
 	SessionID        string
 	UserEmail        string
 	PreferAccountID  string
+	ForceAccountID   string
 	Model            string
 }
 
@@ -174,7 +175,16 @@ type UsageStatus struct {
 	Refreshed          bool                             `json:"refreshed,omitempty"`
 	Error              string                           `json:"error,omitempty"`
 	Active             bool                             `json:"active,omitempty"`
+	KeyFingerprint     string                           `json:"key_fingerprint,omitempty"`
+	AssignedSessions   int                              `json:"assigned_sessions,omitempty"`
+	SessionsKnown      bool                             `json:"sessions_known,omitempty"`
 	PlanType           string                           `json:"plan_type,omitempty"`
+	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	AccountIdentity    string                           `json:"account_identity,omitempty"`
+	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
+	ProviderHealth     string                           `json:"provider_health,omitempty"`
+	ProviderModels     *int                             `json:"provider_models,omitempty"`
+	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
@@ -263,6 +273,8 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 					kind = "anthropic-apikey"
 				case "codex":
 					kind = "openai-apikey"
+				case "qwen-token":
+					kind = item.Provider
 				default:
 					return nil, fmt.Errorf("unsupported hosted account provider %q", item.Provider)
 				}
@@ -288,7 +300,7 @@ func (c *Client) ListAccounts(ctx context.Context) ([]SharedAccount, error) {
 }
 
 func (c *Client) UsageStatuses(ctx context.Context) ([]UsageStatus, error) {
-	if !c.Config.HostedReady() {
+	if !c.Config.HostedTenantReady() {
 		return nil, errors.New("hosted usage status requires a hosted tenant")
 	}
 	var statuses []UsageStatus
@@ -302,6 +314,19 @@ func (c *Client) UsageStatuses(ctx context.Context) ([]UsageStatus, error) {
 		return nil, err
 	}
 	return statuses, nil
+}
+
+// UploadQwenConsoleCredential copies an account-scoped Alibaba console
+// credential to the selected hosted tenant. The credential payload is owned by
+// the caller so this package does not depend on provider-specific storage.
+func (c *Client) UploadQwenConsoleCredential(ctx context.Context, accountID string, credential any) error {
+	if !c.Config.HostedTenantReady() {
+		return errors.New("Qwen console authorization requires a hosted tenant")
+	}
+	return c.doHostedJSON(ctx, http.MethodPost, "/_subrouter/qwen-console", map[string]any{
+		"account_id": accountID,
+		"credential": credential,
+	}, nil)
 }
 
 func (c *Client) UploadAccount(ctx context.Context, input AccountUpload) (SharedAccount, error) {
@@ -506,6 +531,9 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 	if input.PreferAccountID != "" {
 		body["preferAccountId"] = input.PreferAccountID
 	}
+	if input.ForceAccountID != "" {
+		body["forceAccountId"] = input.ForceAccountID
+	}
 	if input.Model != "" {
 		body["model"] = input.Model
 	}
@@ -530,6 +558,12 @@ func (c *Client) Lease(ctx context.Context, input LeaseRequest) (Lease, error) {
 		lease.Account.AuthMode != input.RequiredAuthMode {
 		return Lease{}, errors.New(
 			"cmux.com returned a credential with the wrong auth mode",
+		)
+	}
+	if input.ForceAccountID != "" &&
+		!strings.EqualFold(strings.TrimSpace(lease.Account.ID), strings.TrimSpace(input.ForceAccountID)) {
+		return Lease{}, errors.New(
+			"cmux.com returned a credential for a different forced account",
 		)
 	}
 	c.mu.Lock()
@@ -581,8 +615,7 @@ func (c *Client) Report(
 }
 
 func (c *Client) usesHostedLeaseAPI() bool {
-	return c.Config.CredentialSource == CredentialSourceTeam &&
-		c.Config.TeamModeReady()
+	return c.Config.HostedTenantReady()
 }
 
 func (c *Client) invalidateLease(leaseID string) {
@@ -703,7 +736,8 @@ func parseLease(raw leaseWire) (Lease, error) {
 		return Lease{}, errors.New("cmux.com returned an invalid lease session token")
 	}
 	provider := account.Provider(raw.Provider)
-	if provider != account.ProviderCodex && provider != account.ProviderClaude {
+	if provider != account.ProviderCodex && provider != account.ProviderClaude &&
+		provider != account.ProviderQwenToken && provider != account.ProviderQwenAnthropic {
 		return Lease{}, errors.New("cmux.com returned an invalid lease provider")
 	}
 	authMode := account.AuthMode(raw.AuthMode)
@@ -752,6 +786,7 @@ func leaseCacheKey(input LeaseRequest) string {
 		input.SessionID,
 		input.UserEmail,
 		input.PreferAccountID,
+		input.ForceAccountID,
 		input.Model,
 	}, "\x00")
 }

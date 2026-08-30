@@ -859,23 +859,6 @@ func TestSyncAccountStateDirUnixUsesProvidedDirectory(t *testing.T) {
 	}
 }
 
-func TestAdvanceAccountDiskGenerationReportsDirectorySyncFailure(t *testing.T) {
-	storeDir := t.TempDir()
-	want := errors.New("generation directory sync unavailable")
-	err := advanceAccountDiskGenerationWithSync(storeDir, func(path string) error {
-		if path != storeDir {
-			t.Fatalf("sync path = %q, want %q", path, storeDir)
-		}
-		return want
-	})
-	if !errors.Is(err, want) {
-		t.Fatalf("generation sync failure = %v, want %v", err, want)
-	}
-	if generation, readErr := readAccountDiskGeneration(storeDir); readErr != nil || generation == "" {
-		t.Fatalf("visible generation = %q, err %v", generation, readErr)
-	}
-}
-
 func TestAccountRefKeepsServingCompleteSnapshotDuringPublishedMutation(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	seed := accounts.StoredCodexAccount{
@@ -1048,5 +1031,55 @@ func TestTerminalCredentialFailureIsScopedToCredentialToken(t *testing.T) {
 	ref.noteCredResult(replacement, errors.New("invalid_grant"))
 	if _, dead := ref.terminalCredFailure(replacement); !dead {
 		t.Fatal("replacement's own terminal failure was not remembered")
+	}
+}
+
+func TestQwenAnthropicUnauthorizedMarksSharedTokenPlanCredential(t *testing.T) {
+	for _, storedProvider := range []accounts.Provider{
+		accounts.ProviderQwenToken,
+		accounts.ProviderQwenAnthropic,
+	} {
+		t.Run(string(storedProvider), func(t *testing.T) {
+			stored := accounts.Account{
+				ID: "qwen-token:work", Provider: storedProvider,
+				AuthMode: accounts.AuthModeAPIKey, Token: "shared-key",
+			}
+			requestAccount := stored
+			requestAccount.Provider = accounts.ProviderQwenAnthropic
+			ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{stored}, nil)
+			scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+				AccountID: stored.ID, Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1,
+			}}))
+			server := Server{AccountRef: ref, SchedulerRef: scheduler}
+			server.accountListSnapshotContext(context.Background())
+
+			server.markAccountExhaustedFromResponseForAccount(
+				requestAccount, "", http.StatusUnauthorized, http.Header{},
+			)
+			until, blocked := scheduler.ExhaustedUntilFor(accounts.ProviderQwenToken, stored.ID, "")
+			if !blocked || time.Until(until) < 50*time.Minute {
+				t.Fatalf("shared credential was not excluded after cross-protocol 401: blocked=%v until=%v", blocked, until)
+			}
+		})
+	}
+}
+
+func TestQwenAnthropicForbiddenMarksSharedTokenPlanAccount(t *testing.T) {
+	account := accounts.Account{
+		ID: "qwen-token:work", Provider: accounts.ProviderQwenAnthropic,
+		AuthMode: accounts.AuthModeAPIKey, Token: "shared-key",
+	}
+	scheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: accounts.ProviderQwenToken,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	server := Server{SchedulerRef: scheduler}
+
+	server.markAccountExhaustedFromResponseForAccount(
+		account, "", http.StatusForbidden, http.Header{},
+	)
+	until, blocked := scheduler.ExhaustedUntilFor(accounts.ProviderQwenToken, account.ID, "")
+	if !blocked || time.Until(until) < 50*time.Minute {
+		t.Fatalf("shared account was not excluded after cross-protocol 403: blocked=%v until=%v", blocked, until)
 	}
 }

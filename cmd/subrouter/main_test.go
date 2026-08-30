@@ -11,10 +11,67 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/selectacct"
 )
+
+func TestSchedulerAccountsByProviderExcludesNonCodexPools(t *testing.T) {
+	all := []accounts.Account{
+		{ID: "codex", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth},
+		{ID: "claude", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "kimi-oauth", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+		{ID: "kimi-key", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "grok", Provider: accounts.ProviderGrok, AuthMode: accounts.AuthModeOAuth},
+		{ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+		{ID: "qwen", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "legacy-empty-provider", AuthMode: accounts.AuthModeOAuth},
+	}
+	codex, claude := schedulerAccountsByProvider(all)
+	if len(codex) != 1 || codex[0].ID != "codex" {
+		t.Fatalf("Codex scheduler accounts = %+v", codex)
+	}
+	if len(claude) != 1 || claude[0].ID != "claude" {
+		t.Fatalf("Claude scheduler accounts = %+v", claude)
+	}
+
+	scores := fallbackScores(all)
+	if len(scores) != 1 || scores[0].AccountID != "codex" || scores[0].Provider != accounts.ProviderCodex {
+		t.Fatalf("Codex fallback scores = %+v", scores)
+	}
+}
+
+func TestInitialSchedulerCredentialSnapshotIncludesNonCodexProvidersAtSameRevision(t *testing.T) {
+	const (
+		generation = uint64(7)
+		revision   = uint64(11)
+	)
+	all := []accounts.Account{
+		{ID: "codex", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "codex-token"},
+		{ID: "qwen-token:work", Provider: accounts.ProviderQwenAnthropic, AuthMode: accounts.AuthModeAPIKey, Token: "qwen-key"},
+	}
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(all)))
+	initial := initialSchedulerCredentialAccounts(all)
+	ref.AdvanceAccountGenerationWithAccounts(generation, revision, initial)
+
+	// The first all-account refresh can legitimately carry the same revision as
+	// startup. Its no-op must be safe because startup already fingerprinted the
+	// non-Codex credential under its shared scheduler provider.
+	if !ref.SyncAccountCredentials(generation, revision, proxy.SchedulerAccounts(all)) {
+		t.Fatal("same-revision credential sync was rejected")
+	}
+	qwen := all[1]
+	ref.MarkCredentialExhaustedForSnapshot(
+		accounts.ProviderQwenToken, qwen.ID, qwen.CredentialIdentity(), time.Now().Add(time.Hour),
+		generation, revision, proxy.SchedulerAccounts(all),
+	)
+	if _, blocked := ref.ExhaustedUntilFor(accounts.ProviderQwenToken, qwen.ID, ""); !blocked {
+		t.Fatal("startup snapshot omitted same-revision Qwen credential")
+	}
+}
 
 func TestSecretValueUsesFileEnvironmentWithoutOverridingFlag(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tenant-secret")
@@ -114,6 +171,9 @@ func TestNormalizePublicSubrouterURLTrimsFlagValues(t *testing.T) {
 
 func TestServeKeepsHostedLoginCompatibleWithoutTenantDeleteToken(t *testing.T) {
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	// DefaultCodexStore performs one-time legacy migration. Isolate HOME so a
+	// unit test never walks or copies the developer's real account archive.
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SUBROUTER_STACK_PROJECT_ID", "project")
 	t.Setenv("SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY", "publishable")
 	t.Setenv("SUBROUTER_STACK_TENANT_KEY_SECRET", "0123456789abcdef0123456789abcdef")
@@ -329,12 +389,14 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"gui-switch",
 		"gui-use",
 		"import",
+		"kimi",
 		"list",
 		"list-admin-keys",
 		"login",
 		"logout",
 		"ls",
 		"pick",
+		"qwen",
 		"remote",
 		"remotes",
 		"remove",
@@ -377,6 +439,15 @@ func TestDirectSRCommandNames(t *testing.T) {
 	}
 }
 
+func TestKimiNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, program := range []string{"sr", "subrouter"} {
+		if err := runForProgram(program, []string{"kimi", "help"}); err != nil {
+			t.Fatalf("%s kimi help: %v", program, err)
+		}
+	}
+}
+
 func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(
@@ -393,6 +464,9 @@ func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
 	defer server.Close()
 
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	// sr initializes the local Codex store before dispatching the hosted alias.
+	// Keep its legacy migration away from the developer's real HOME.
+	t.Setenv("HOME", t.TempDir())
 	configPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
 	if err := broker.SaveConfig(configPath, broker.Config{

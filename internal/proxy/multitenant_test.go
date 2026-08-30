@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,8 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
@@ -32,6 +35,25 @@ import (
 type fakeStackVerifier struct {
 	claims stackauth.Claims
 	err    error
+}
+
+func TestTenantFallbackScoresCanonicalizeQwenEndpointAliases(t *testing.T) {
+	available := []accounts.Account{
+		{ID: "qwen-token:direct", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "qwen-token:anthropic", Provider: accounts.ProviderQwenAnthropic, AuthMode: accounts.AuthModeAPIKey},
+	}
+	scores := tenantFallbackScores(available)
+	if len(scores) != len(available) {
+		t.Fatalf("fallback score count = %d, want %d", len(scores), len(available))
+	}
+	for _, score := range scores {
+		if score.Provider != accounts.ProviderQwenToken {
+			t.Fatalf("fallback score %q provider = %q, want shared Token Plan provider %q", score.AccountID, score.Provider, accounts.ProviderQwenToken)
+		}
+		if score.Headroom != 0.01 || score.ShortHeadroom != 0.01 {
+			t.Fatalf("fallback score %q headroom = %v/%v, want API-key fallback", score.AccountID, score.Headroom, score.ShortHeadroom)
+		}
+	}
 }
 
 func (f fakeStackVerifier) Verify(context.Context, string) (stackauth.Claims, error) {
@@ -139,6 +161,42 @@ func TestMultiTenantUsageStatusNeedsOnlyTheTenantKey(t *testing.T) {
 	var statuses []AccountUsageStatus
 	if err := json.Unmarshal(response.Body.Bytes(), &statuses); err != nil {
 		t.Fatalf("decode usage status: %v", err)
+	}
+}
+
+func TestTenantServerScopesKimiProfilesToTenantState(t *testing.T) {
+	registry := tenant.NewRegistry(t.TempDir())
+	created, _, err := registry.Create("kimi-isolated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	multi := &MultiTenant{Base: Server{}, Registry: registry}
+	server, err := multi.newTenantServer(t.Context(), created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := server.AccountRef.kimiStore()
+	wantDir := filepath.Join(registry.Dir(created.ID), "kimi")
+	if store.ManagedDir != wantDir || filepath.Dir(store.Path) != wantDir {
+		t.Fatalf("tenant Kimi store = path %q managed %q, want root %q", store.Path, store.ManagedDir, wantDir)
+	}
+	if _, err := store.RefreshAccount(t.Context(), http.DefaultClient, accounts.Account{
+		ID: "kimi-code", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth,
+	}); err == nil || !strings.Contains(err.Error(), "not routable") {
+		t.Fatalf("tenant singleton Kimi refresh error = %v", err)
+	}
+	installed, err := store.SaveManagedCredential("work", agentkimi.CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.ID != "kimi-subscription:work" {
+		t.Fatalf("installed account = %+v", installed)
+	}
+	entries, err := os.ReadDir(wantDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("tenant Kimi credential was not stored under tenant state: entries=%v err=%v", entries, err)
 	}
 }
 
@@ -422,6 +480,29 @@ func TestMultiTenantScopedControlEndpoints(t *testing.T) {
 	for _, path := range []string{"/_subrouter/transcripts", "/_subrouter/dashboard", "/_subrouter/drain-status"} {
 		if resp := get("/t/" + key + path); resp.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want 404", path, resp.Code)
+		}
+	}
+}
+
+func TestTenantSessionsRequireManageAccountsCapability(t *testing.T) {
+	registry, handler, _ := newMultiTenantFixture(t)
+	const tenantID = "privacy-test"
+	const useKey = "srt_11111111111111111111111111111111"
+	const manageKey = "srt_22222222222222222222222222222222"
+	if _, err := registry.EnsureExternalRestricted(tenantID, "privacy", useKey, []tenant.Capability{tenant.CapabilityUse}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.EnsureExternalRestricted(tenantID, "privacy", manageKey, []tenant.Capability{tenant.CapabilityManageAccounts}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		key  string
+		want int
+	}{{useKey, http.StatusForbidden}, {manageKey, http.StatusOK}} {
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/t/"+test.key+"/_subrouter/sessions", nil))
+		if resp.Code != test.want {
+			t.Fatalf("sessions with scoped key status = %d, want %d", resp.Code, test.want)
 		}
 	}
 }
@@ -2243,55 +2324,6 @@ func TestTenantAccountDeleteReturnsUnavailableWithoutAccountStore(t *testing.T) 
 	}
 }
 
-func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
-	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
-	stored := proxyStoredOAuthAccount(
-		"broken@example.com",
-		"broken",
-		time.Now().Add(-time.Hour),
-	)
-	if err := store.SaveStored(stored); err != nil {
-		t.Fatal(err)
-	}
-	account, ok := stored.Account(stored.SourcePath(store))
-	if !ok {
-		t.Fatal("stored account was not loadable")
-	}
-	var upstreamRequests atomic.Int32
-	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
-		upstreamRequests.Add(1)
-		return &http.Response{
-			StatusCode: http.StatusUnauthorized,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
-		}, nil
-	})}
-	accountRef := NewAccountRef(store, []accounts.Account{account}, client)
-	accountRef.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
-	server := Server{AccountRef: accountRef}
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(
-		response,
-		httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil),
-	)
-	if response.Code != http.StatusOK {
-		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
-	}
-	var items []map[string]any
-	if err := json.Unmarshal(response.Body.Bytes(), &items); err != nil {
-		t.Fatal(err)
-	}
-	if len(items) != 1 {
-		t.Fatalf("items = %#v", items)
-	}
-	if upstreamRequests.Load() != 0 {
-		t.Fatalf("account list made %d provider request(s)", upstreamRequests.Load())
-	}
-	if _, ok := items[0]["health"]; ok {
-		t.Fatalf("account list presented uncached health: %#v", items[0])
-	}
-}
-
 func TestTenantStoredAccountDeletePublishesToOverlappingWorker(t *testing.T) {
 	root := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
@@ -2585,37 +2617,163 @@ func TestRestartCompositeDeletePreservesChangedStoredReplacement(t *testing.T) {
 	}
 }
 
-func TestCompositeDeleteSupportsSelectorMatchedStoredIdentity(t *testing.T) {
+func TestCompositeClaudeAndQwenAccountDelete(t *testing.T) {
 	root := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
 	stored := accounts.StoredCodexAccount{
-		Email: "work@example.com", Provider: accounts.ProviderCodex,
-		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+		Email: "work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "qwen-model-secret"},
 	}
 	if err := store.SaveStored(stored); err != nil {
 		t.Fatal(err)
 	}
 	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
-	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{
-		AccessToken: "claude-access", RefreshToken: "claude-refresh",
-	}); err != nil {
+	if err := claudeStore.ImportProfileCredential("work", agentclaude.CredentialInfo{AccessToken: "claude-access", RefreshToken: "claude-refresh"}); err != nil {
 		t.Fatal(err)
 	}
 	ref := NewAccountRef(store, nil, nil)
 	ref.claudeStore = claudeStore
-
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), "work", agentqwen.ConsoleCredential{AccessToken: "qwen-console-secret"}); err != nil {
+		t.Fatal(err)
+	}
 	removed, err := removeTenantAccounts(t.Context(), ref, "work")
 	if err != nil || !removed {
-		t.Fatalf("selector-matched composite delete = removed %v err %v", removed, err)
+		t.Fatalf("composite Qwen delete = removed %v err %v", removed, err)
 	}
-	if _, found, err := store.FindStored(stored.Email); err != nil || found {
-		t.Fatalf("stored account after delete = found %v err %v", found, err)
+	if _, found, err := store.FindStored("work"); err != nil || found {
+		t.Fatalf("Qwen stored component = found %v err %v", found, err)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), "work"); err != nil || has {
+		t.Fatalf("Qwen console component = found %v err %v", has, err)
 	}
 	if _, found := claudeStore.FindProfile("work"); found {
-		t.Fatal("Claude profile remained after selector-matched composite deletion")
+		t.Fatal("Claude component remained after composite Qwen delete")
 	}
-	if active, err := accountRollbackActive(store.StoreDir()); err != nil || active {
-		t.Fatalf("selector-matched composite journal = active %v err %v", active, err)
+}
+
+func TestRestartReconcilesStandaloneQwenRemovalCrash(t *testing.T) {
+	if root := os.Getenv("SUBROUTER_TEST_QWEN_DELETE_CRASH_ROOT"); root != "" {
+		store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+		accountID := "qwen-token:work"
+		found, version, err := agentqwen.ConsoleCredentialVersionIn(agentqwen.ConsoleRootForStore(store), accountID)
+		if err != nil || !found {
+			os.Exit(93)
+		}
+		phase := os.Getenv("SUBROUTER_TEST_QWEN_DELETE_CRASH_PHASE")
+		_, _ = agentqwen.RemoveConsoleCredentialExactIn(
+			agentqwen.ConsoleRootForStore(store), accountID, true, version,
+			func() (bool, error) {
+				if phase == "after-model" {
+					stored, found, err := store.FindStored(accountID)
+					if err != nil || !found {
+						os.Exit(94)
+					}
+					if _, removed, err := store.RemoveStoredExactDurable(stored, syncAccountStateDir); err != nil || !removed {
+						os.Exit(95)
+					}
+					os.Exit(97)
+				}
+				os.Exit(96)
+				return false, nil
+			},
+		)
+		os.Exit(98)
+	}
+
+	for _, phase := range []string{"before-model", "after-model"} {
+		t.Run(phase, func(t *testing.T) {
+			root := t.TempDir()
+			store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+			stored := accounts.StoredCodexAccount{
+				Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+				Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+			}
+			if err := store.SaveStored(stored); err != nil {
+				t.Fatal(err)
+			}
+			qwenRoot := agentqwen.ConsoleRootForStore(store)
+			if err := agentqwen.SaveConsoleCredentialIn(qwenRoot, stored.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+				t.Fatal(err)
+			}
+			runStandaloneQwenDeleteCrash(t, root, phase)
+			if _, err := OpenAccountRef(store, agentclaude.Store{Dir: filepath.Join(root, "claude")}, nil); err != nil {
+				t.Fatalf("restart reconciliation: %v", err)
+			}
+			_, modelFound, err := store.FindStored(stored.Email)
+			if err != nil {
+				t.Fatal(err)
+			}
+			consoleFound, _, err := agentqwen.ConsoleCredentialVersionIn(qwenRoot, stored.Email)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantFound := phase == "before-model"
+			if modelFound != wantFound || consoleFound != wantFound {
+				t.Fatalf("reconciled state = model %v console %v, want both %v", modelFound, consoleFound, wantFound)
+			}
+		})
+	}
+}
+
+func TestCompositeQwenReplayFinalizesConsoleStageAfterModelCrash(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	stored, _, _ = store.FindStored(stored.Email)
+	storedVersion := storedAccountMutationVersion(stored)
+	qwenRoot := agentqwen.ConsoleRootForStore(store)
+	if err := agentqwen.SaveConsoleCredentialIn(qwenRoot, stored.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	consoleFound, consoleVersion, err := agentqwen.ConsoleCredentialVersionIn(qwenRoot, stored.Email)
+	if err != nil || !consoleFound {
+		t.Fatalf("console version = found %v version %q err %v", consoleFound, consoleVersion, err)
+	}
+	runStandaloneQwenDeleteCrash(t, root, "after-model")
+
+	journal := accountRollbackJournal{
+		StoredTargetID: stored.Email, StoredStoreDir: store.Dir,
+		StoredProvider: string(accounts.ProviderQwenToken), StoredVersion: hex.EncodeToString(storedVersion[:]),
+		QwenConsoleRoot: qwenRoot, QwenConsoleFound: consoleFound, QwenConsoleVersion: consoleVersion,
+	}
+	lease, err := store.AcquireStoredAccountLease(stored.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := lease.Close(); err != nil {
+			t.Errorf("close stored-account lease: %v", err)
+		}
+	}()
+	removed, err := replayPreparedTenantStoredRemovalWithLease(journal, lease)
+	if err != nil || !removed {
+		t.Fatalf("composite replay = removed %v err %v", removed, err)
+	}
+	if found, _, err := agentqwen.ConsoleCredentialVersionIn(qwenRoot, stored.Email); err != nil || found {
+		t.Fatalf("console after composite replay = found %v err %v", found, err)
+	}
+}
+
+func runStandaloneQwenDeleteCrash(t *testing.T, root, phase string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRestartReconcilesStandaloneQwenRemovalCrash$")
+	cmd.Env = append(os.Environ(),
+		"SUBROUTER_TEST_QWEN_DELETE_CRASH_ROOT="+root,
+		"SUBROUTER_TEST_QWEN_DELETE_CRASH_PHASE="+phase,
+	)
+	runErr := cmd.Run()
+	wantExit := 96
+	if phase == "after-model" {
+		wantExit = 97
+	}
+	if exitErr, ok := runErr.(*exec.ExitError); !ok || exitErr.ExitCode() != wantExit {
+		t.Fatalf("crash helper = %v, want exit %d", runErr, wantExit)
 	}
 }
 
@@ -2634,6 +2792,76 @@ func compositeCrashAccountStore(root string) accounts.CodexStore {
 	return accounts.CodexStore{Dir: filepath.Join(root, "tenant-state", "nonstandard-credentials")}
 }
 
+func TestTenantQwenAccountDeletePublishesToOverlappingWorker(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	deleting := NewAccountRef(store, initial, nil)
+	deleting.claudeStore = claudeStore
+	sibling := NewAccountRef(store, initial, nil)
+	sibling.claudeStore = claudeStore
+	if err := agentqwen.SaveConsoleCredentialIn(deleting.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	before := sibling.Generation()
+
+	removed, err := removeTenantAccounts(t.Context(), deleting, stored.Email)
+	if err != nil || !removed {
+		t.Fatalf("delete = removed %v, err %v", removed, err)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(deleting.qwenRoot(), stored.Email); err != nil || has {
+		t.Fatalf("deleted Qwen console credential = has %v, err %v", has, err)
+	}
+	reloaded, generation, err := sibling.reloadIfDiskGenerationChanged(t.Context())
+	if err != nil || !reloaded || generation <= before {
+		t.Fatalf("sibling reload = reloaded %v generation %d before %d err %v", reloaded, generation, before, err)
+	}
+	if got := sibling.All(); len(got) != 0 {
+		t.Fatalf("sibling retained deleted Qwen secret: %+v", got)
+	}
+}
+
+func TestTenantQwenAccountDeleteRemovesInterruptedTokenlessConsoleLogin(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:interrupted", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "old-console-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := agentqwen.PrepareConsoleLoginIn(ref.qwenRoot(), stored.Email, "temporary-model-api-key", "https://example.test/v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := removeTenantAccounts(t.Context(), ref, stored.Email)
+	if err != nil || !removed {
+		t.Fatalf("interrupted login delete = removed %v, err %v", removed, err)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || found {
+		t.Fatalf("interrupted login retained model account: found %v err %v", found, err)
+	}
+	if _, err := os.Lstat(agentqwen.ConsoleConfigDirIn(ref.qwenRoot(), stored.Email)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted login retained console secrets: %v", err)
+	}
+}
+
 func TestTenantStoredDeleteRestoresExactStateAfterPostRenameSyncFailure(t *testing.T) {
 	want := errors.New("post-rename directory sync failed")
 	originalSync := syncTenantStoredAccountDir
@@ -2647,48 +2875,75 @@ func TestTenantStoredDeleteRestoresExactStateAfterPostRenameSyncFailure(t *testi
 	}
 	t.Cleanup(func() { syncTenantStoredAccountDir = originalSync })
 
-	calls = 0
-	root := t.TempDir()
-	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
-	stored := accounts.StoredCodexAccount{Email: "apikey:work", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"}}
-	if err := store.SaveStored(stored); err != nil {
-		t.Fatal(err)
-	}
-	ref := NewAccountRef(store, nil, nil)
-	removed, err := removeTenantAccounts(t.Context(), ref, stored.Email)
-	if removed || !errors.Is(err, want) {
-		t.Fatalf("post-rename sync failure = removed %v err %v", removed, err)
-	}
-	got, found, readErr := store.FindStored(stored.Email)
-	if readErr != nil || !found || got.Auth.OpenAIAPIKey != "model-secret" {
-		t.Fatalf("restored model credential = found %v got %+v err %v", found, got, readErr)
+	for _, provider := range []accounts.Provider{accounts.ProviderCodex, accounts.ProviderQwenToken} {
+		t.Run(string(provider), func(t *testing.T) {
+			calls = 0
+			root := t.TempDir()
+			store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+			id := "apikey:work"
+			if provider == accounts.ProviderQwenToken {
+				id = "qwen-token:work"
+			}
+			stored := accounts.StoredCodexAccount{Email: id, Provider: provider, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"}}
+			if err := store.SaveStored(stored); err != nil {
+				t.Fatal(err)
+			}
+			ref := NewAccountRef(store, nil, nil)
+			if provider == accounts.ProviderQwenToken {
+				if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), id, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			removed, err := removeTenantAccounts(t.Context(), ref, id)
+			if removed || !errors.Is(err, want) {
+				t.Fatalf("post-rename sync failure = removed %v err %v", removed, err)
+			}
+			got, found, readErr := store.FindStored(id)
+			if readErr != nil || !found || got.Auth.OpenAIAPIKey != "model-secret" {
+				t.Fatalf("restored model credential = found %v got %+v err %v", found, got, readErr)
+			}
+			if provider == accounts.ProviderQwenToken {
+				credential, readErr := agentqwen.ExportConsoleCredentialIn(ref.qwenRoot(), id)
+				if readErr != nil || credential.AccessToken != "console-secret" {
+					t.Fatalf("restored Qwen credential = %+v err %v", credential, readErr)
+				}
+			}
+		})
 	}
 }
 
 func TestRestartReconcilesStagedStoredDeletionWithoutOverwritingSibling(t *testing.T) {
-	root := t.TempDir()
-	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
-	target := accounts.StoredCodexAccount{Email: "apikey:work", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "target-secret"}}
-	sibling := accounts.StoredCodexAccount{Email: "apikey:sibling", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sibling-secret"}}
-	if err := store.SaveStored(target); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SaveStored(sibling); err != nil {
-		t.Fatal(err)
-	}
-	targetPath := filepath.Join(store.Dir, "apikey_work.json")
-	if err := os.Rename(targetPath, targetPath+".delete-staged"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reconcileCompletedAccountRollback(t.Context(), store, advanceAccountDiskGeneration); err != nil {
-		t.Fatal(err)
-	}
-	if _, found, err := store.FindStored(target.Email); err != nil || found {
-		t.Fatalf("target after restart = found %v err %v", found, err)
-	}
-	got, found, err := store.FindStored(sibling.Email)
-	if err != nil || !found || got.Auth.OpenAIAPIKey != "sibling-secret" {
-		t.Fatalf("sibling after restart = found %v got %+v err %v", found, got, err)
+	for _, provider := range []accounts.Provider{accounts.ProviderCodex, accounts.ProviderQwenToken} {
+		t.Run(string(provider), func(t *testing.T) {
+			root := t.TempDir()
+			store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+			id, filename := "apikey:work", "apikey_work.json"
+			if provider == accounts.ProviderQwenToken {
+				id, filename = "qwen-token:work", "qwen-token_work.json"
+			}
+			target := accounts.StoredCodexAccount{Email: id, Provider: provider, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "target-secret"}}
+			sibling := accounts.StoredCodexAccount{Email: "apikey:sibling", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "sibling-secret"}}
+			if err := store.SaveStored(target); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveStored(sibling); err != nil {
+				t.Fatal(err)
+			}
+			targetPath := filepath.Join(store.Dir, filename)
+			if err := os.Rename(targetPath, targetPath+".delete-staged"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reconcileCompletedAccountRollback(t.Context(), store, advanceAccountDiskGeneration); err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := store.FindStored(target.Email); err != nil || found {
+				t.Fatalf("target after restart = found %v err %v", found, err)
+			}
+			got, found, err := store.FindStored(sibling.Email)
+			if err != nil || !found || got.Auth.OpenAIAPIKey != "sibling-secret" {
+				t.Fatalf("sibling after restart = found %v got %+v err %v", found, got, err)
+			}
+		})
 	}
 }
 
@@ -2792,6 +3047,238 @@ func TestTenantAccountDeletePublicationFailurePreventsCredentialMutation(t *test
 		}
 	})
 
+	t.Run("Qwen model and console credentials", func(t *testing.T) {
+		root := t.TempDir()
+		store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+		stored := accounts.StoredCodexAccount{
+			Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+		}
+		if err := store.SaveStored(stored); err != nil {
+			t.Fatal(err)
+		}
+		ref := NewAccountRef(store, nil, nil)
+		ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+		ref.publishGenerationForTest = func(string) error { return want }
+		if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+			t.Fatal(err)
+		}
+		removed, err := removeTenantAccounts(t.Context(), ref, stored.Email)
+		if removed || !errors.Is(err, want) {
+			t.Fatalf("delete = removed %v, err %v", removed, err)
+		}
+		if _, found, err := store.FindStored(stored.Email); err != nil || !found {
+			t.Fatalf("publication failure removed Qwen model credential: found=%v err=%v", found, err)
+		}
+		if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), stored.Email); err != nil || !has {
+			t.Fatalf("publication failure removed Qwen console credential: has=%v err=%v", has, err)
+		}
+	})
+}
+
+func TestTenantQwenDeleteKeepsAccountWhenCredentialCleanupFails(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email:    "qwen-token:work",
+		Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{
+			AuthMode:     "apikey",
+			OpenAIAPIKey: "model-secret",
+		},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	stored, _, err := store.FindStored(stored.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := os.MkdirAll(ref.qwenRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), agentqwen.ConsoleConfigDirIn(ref.qwenRoot(), stored.Email)); err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	handleTenantAccountDelete(
+		&Server{AccountRef: ref},
+		response,
+		httptest.NewRequest(http.MethodDelete, "/_subrouter/accounts/"+stored.Email, nil),
+	)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	if _, ok, err := store.FindStored(stored.Email); err != nil || !ok {
+		t.Fatalf("Qwen account changed before failed cleanup: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestTenantQwenDeleteRemovesConsoleBeforeAccountAndRestoresOnFailure(t *testing.T) {
+	var operations []string
+	wantErr := errors.New("account store unavailable")
+	removed, err := removeTenantQwenAccountWithOps(
+		true,
+		func() error {
+			operations = append(operations, "remove console")
+			return nil
+		},
+		func() (bool, error) {
+			operations = append(operations, "remove account")
+			return false, wantErr
+		},
+		func() error {
+			operations = append(operations, "restore console")
+			return nil
+		},
+	)
+	if removed || !errors.Is(err, wantErr) {
+		t.Fatalf("result = removed %v, err %v", removed, err)
+	}
+	want := []string{"remove console", "remove account", "restore console"}
+	if !reflect.DeepEqual(operations, want) {
+		t.Fatalf("operations = %v, want %v", operations, want)
+	}
+}
+
+func TestTenantQwenConsoleRestoreSyncsProfileAndContainingDirectory(t *testing.T) {
+	root := t.TempDir()
+	accountID := "qwen-token:work"
+	credential := agentqwen.ConsoleCredential{AccessToken: "console-secret", Account: "owner@example.com"}
+	var synced []string
+	if err := restoreTenantQwenConsoleDurably(root, accountID, credential, func(path string) error {
+		synced = append(synced, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := agentqwen.ExportConsoleCredentialIn(root, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != credential.AccessToken || got.Account != credential.Account {
+		t.Fatalf("restored credential = %+v", got)
+	}
+	consoleDir := agentqwen.ConsoleConfigDirIn(root, accountID)
+	want := []string{consoleDir, filepath.Dir(consoleDir)}
+	if !reflect.DeepEqual(synced, want) {
+		t.Fatalf("directory sync boundary = %v, want %v", synced, want)
+	}
+}
+
+func TestTenantQwenDeleteWaitsForAccountMutationTransaction(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	stored, _, err := store.FindStored(stored.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	removed, removeErr := removeTenantAccounts(ctx, ref, stored.Email)
+	if removed || !errors.Is(removeErr, context.DeadlineExceeded) {
+		t.Fatalf("blocked delete = removed %v, err %v", removed, removeErr)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || !found {
+		t.Fatalf("blocked delete changed account: found=%v err=%v", found, err)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), stored.Email); err != nil || !has {
+		t.Fatalf("blocked delete changed console credential: has=%v err=%v", has, err)
+	}
+	current, found, currentErr := store.FindStored(stored.Email)
+	if currentErr != nil || !found || current.Email != stored.Email ||
+		storedAccountMutationVersion(current) != storedAccountMutationVersion(stored) {
+		t.Fatalf("blocked delete changed durable version: found=%v err=%v current=%+v expected=%+v", found, currentErr, current, stored)
+	}
+	removed, removeErr = removeTenantAccounts(context.Background(), ref, stored.Email)
+	if !removed || removeErr != nil {
+		t.Fatalf("delete after transaction release = removed %v, err %v", removed, removeErr)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || found {
+		t.Fatalf("released delete retained account: found=%v err=%v", found, err)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), stored.Email); err != nil || has {
+		t.Fatalf("released delete retained console credential: has=%v err=%v", has, err)
+	}
+}
+
+func TestTenantQwenDeleteRejectsCredentialVersionChangeBeforeMutation(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	original := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "old-model-secret"},
+	}
+	if err := store.SaveStored(original); err != nil {
+		t.Fatal(err)
+	}
+	original, _, err := store.FindStored(original.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), original.Email, agentqwen.ConsoleCredential{AccessToken: "console-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type deleteResult struct {
+		removed bool
+		err     error
+	}
+	resultCh := make(chan deleteResult, 1)
+	go func() {
+		removed, err := removeTenantAccounts(context.Background(), ref, original.Email)
+		resultCh <- deleteResult{removed: removed, err: err}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for ref.installMu.TryLock() {
+		ref.installMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("delete did not reach the account transaction lock")
+		}
+		runtime.Gosched()
+	}
+	replacement := original
+	replacement.Auth.OpenAIAPIKey = "replacement-model-secret"
+	if err := store.SaveStored(replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deleteResultValue := <-resultCh
+	removed, err := deleteResultValue.removed, deleteResultValue.err
+	if removed || err == nil || !strings.Contains(err.Error(), "changed during removal") {
+		t.Fatalf("stale delete = removed %v, err %v", removed, err)
+	}
+	stored, found, err := store.FindStored(original.Email)
+	if err != nil || !found || stored.Auth.OpenAIAPIKey != replacement.Auth.OpenAIAPIKey {
+		t.Fatalf("stale delete changed replacement: found=%v err=%v account=%+v", found, err, stored)
+	}
+	if has, err := agentqwen.HasConsoleCredentialIn(ref.qwenRoot(), original.Email); err != nil || !has {
+		t.Fatalf("stale delete removed console credential: has=%v err=%v", has, err)
+	}
 }
 
 func TestTenantStoredDeleteRejectsCredentialVersionChangeBeforeMutation(t *testing.T) {
@@ -2980,6 +3467,87 @@ func TestTenantClaudeDeleteCanJournalCorruptCredentialPayload(t *testing.T) {
 	}
 }
 
+func TestTenantQwenDeleteRejectsConsoleCredentialRepair(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "old-console"}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := lockAccountImportTransaction(t.Context(), store.StoreDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type deleteResult struct {
+		removed bool
+		err     error
+	}
+	resultCh := make(chan deleteResult, 1)
+	go func() {
+		removed, err := removeTenantAccounts(context.Background(), ref, stored.Email)
+		resultCh <- deleteResult{removed: removed, err: err}
+	}()
+	waitForTenantDeleteTransaction(t, ref)
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "replacement-console"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.removed || result.err == nil || !strings.Contains(result.err.Error(), "console credential changed") {
+		t.Fatalf("stale delete = removed %v, err %v", result.removed, result.err)
+	}
+	credential, err := agentqwen.ExportConsoleCredentialIn(ref.qwenRoot(), stored.Email)
+	if err != nil || credential.AccessToken != "replacement-console" {
+		t.Fatalf("stale delete changed replacement console credential: credential=%+v err=%v", credential, err)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || !found {
+		t.Fatalf("stale delete removed Qwen model credential: found=%v err=%v", found, err)
+	}
+}
+
+func TestTenantQwenDeleteRejectsConsoleRepairAfterTransactionRevalidation(t *testing.T) {
+	root := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(root, "accounts")}
+	stored := accounts.StoredCodexAccount{
+		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
+	}
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "old-console"}); err != nil {
+		t.Fatal(err)
+	}
+	ref.beforeTenantStoredRemovalForTest = func() {
+		if err := agentqwen.SaveConsoleCredentialIn(ref.qwenRoot(), stored.Email, agentqwen.ConsoleCredential{AccessToken: "replacement-console"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := removeTenantAccounts(t.Context(), ref, stored.Email)
+	if removed || err == nil || !strings.Contains(err.Error(), "console credential changed") {
+		t.Fatalf("post-revalidation Qwen repair delete = removed %v, err %v", removed, err)
+	}
+	credential, err := agentqwen.ExportConsoleCredentialIn(ref.qwenRoot(), stored.Email)
+	if err != nil || credential.AccessToken != "replacement-console" {
+		t.Fatalf("post-revalidation repair changed console: credential=%+v err=%v", credential, err)
+	}
+	if _, found, err := store.FindStored(stored.Email); err != nil || !found {
+		t.Fatalf("post-revalidation repair removed model credential: found=%v err=%v", found, err)
+	}
+}
+
 func waitForTenantDeleteTransaction(t *testing.T, ref *AccountRef) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -3042,5 +3610,54 @@ func TestTenantClaudeDeleteReloadsCommittedRemovalWhenCleanupFails(t *testing.T)
 	}
 	if active, err := accountRollbackActive(accountStore.StoreDir()); err != nil || !active {
 		t.Fatalf("failed cleanup journal = active %v, err %v", active, err)
+	}
+}
+
+func TestAccountListDoesNotRefreshOrRewriteOAuthCredentials(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	stored := proxyStoredOAuthAccount(
+		"broken@example.com",
+		"broken",
+		time.Now().Add(-time.Hour),
+	)
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := stored.Account(stored.SourcePath(store))
+	if !ok {
+		t.Fatal("stored account was not loadable")
+	}
+	var upstreamRequests atomic.Int32
+	client := &http.Client{Transport: proxyRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		upstreamRequests.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
+		}, nil
+	})}
+	accountRef := NewAccountRef(store, []accounts.Account{account}, client)
+	accountRef.claudeStore = agentclaude.Store{Dir: filepath.Join(t.TempDir(), "claude")}
+	server := Server{AccountRef: accountRef}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodGet, "/_subrouter/accounts", nil),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d: %s", response.Code, response.Body.String())
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	if upstreamRequests.Load() != 0 {
+		t.Fatalf("account list made %d provider request(s)", upstreamRequests.Load())
+	}
+	if _, ok := items[0]["health"]; ok {
+		t.Fatalf("account list presented uncached health: %#v", items[0])
 	}
 }

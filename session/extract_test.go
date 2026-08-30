@@ -164,6 +164,7 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	req.Header.Set("X-User-Email", "alice@example.com")
 	req.Header.Set("X-Subrouter-Account-ID", "apikey:paid")
 	req.Header.Set("X-Subrouter-Account", "paid")
+	req.Header.Set("X-Subrouter-Preferred-Account-ID", "preferred")
 	req.Header.Set("X-Subrouter-Model", "GPT-5.3-Codex-Spark")
 	req.Header.Set("X-Model", "GPT-5.3-Codex-Spark")
 	req.Header.Set("X-Other", "keep")
@@ -193,6 +194,9 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Subrouter-Account"); got != "" {
 		t.Fatalf("X-Subrouter-Account = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "" {
+		t.Fatalf("X-Subrouter-Preferred-Account-ID = %q, want empty", got)
 	}
 	if got := req.Header.Get("X-Subrouter-Model"); got != "" {
 		t.Fatalf("X-Subrouter-Model = %q, want empty", got)

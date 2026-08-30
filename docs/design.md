@@ -44,8 +44,12 @@ through to normal account routing.
 Codex Pi leases select only OAuth subscription accounts because Pi's
 `openai-codex-responses` adapter and `/backend-api` route are ChatGPT-specific.
 If no Codex OAuth account is available, lease creation returns `503` without
-creating a lease or sticky session assignment. Claude, Kimi, and ZAI leases may
-use API-key accounts supported by their returned Pi adapter configuration.
+creating a lease or sticky session assignment. Claude, Kimi, ZAI,
+OpenRouter, Grok, and Qwen leases may use API-key accounts supported by their
+returned Pi adapter configuration. A provider is leased with the adapter its
+protocol needs rather than its vendor: the Qwen Token Plan is reachable both as
+`openai-completions` and, on its Anthropic endpoint, as `anthropic-messages`,
+and each hands the sandbox the environment variables its own client reads.
 
 A model-bound lease requires a top-level `model` string in the forwarded JSON
 body. Every body occurrence and any forwarded `model` query value must match
@@ -216,6 +220,10 @@ Claude Code:
 - Read profile metadata from `~/.subrouter/codex/claude.json`.
 - Read per-profile credentials from `~/.subrouter/codex/claude/<profile>` or macOS Keychain using Claude Code's `Claude Code-credentials-<hash>` service naming.
 - Profile switching, env output, run, remove, and OAuth login are native Go commands under `sr claude`.
+- Bare `sr claude` manages local profiles. `sr claude proxy [claude args...]` is
+  the explicit profileless pooled launcher: it uses the selected Subrouter
+  server, needs no local daemon when that server is remote, and passes Claude
+  arguments through unchanged.
 
 Gemini:
 

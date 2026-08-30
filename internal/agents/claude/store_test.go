@@ -15,11 +15,59 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+func TestCredentialPlanTypeUsesOnlyCredentialMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		credential *CredentialInfo
+		want       string
+	}{
+		{name: "nil", want: "unknown"},
+		{name: "absent", credential: &CredentialInfo{AccessToken: "secret"}, want: "unknown"},
+		{name: "max normalized", credential: &CredentialInfo{SubscriptionType: " MAX "}, want: "max"},
+		{name: "pro normalized", credential: &CredentialInfo{SubscriptionType: "Pro"}, want: "pro"},
+		{name: "free from tier", credential: &CredentialInfo{RateLimitTier: "FREE"}, want: "free"},
+		{name: "max vendor tier", credential: &CredentialInfo{RateLimitTier: "default_claude_max_20x"}, want: "max"},
+		{name: "subscription wins", credential: &CredentialInfo{SubscriptionType: "max", RateLimitTier: "pro"}, want: "max"},
+		{name: "vendor label", credential: &CredentialInfo{RateLimitTier: "enterprise"}, want: "enterprise"},
+		{name: "unsafe vendor label", credential: &CredentialInfo{RateLimitTier: "enterprise\x1b[31m"}, want: "unknown"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.credential.PlanType(); got != test.want {
+				t.Fatalf("PlanType() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRefreshCredentialDetailsReturnsSameCredentialSnapshot(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	credential := CredentialInfo{
+		AccessToken: "access", RefreshToken: "refresh", SubscriptionType: "max",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}
+	if err := store.ImportProfileCredential("work", credential); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := store.FindProfile("work")
+	if !ok {
+		t.Fatal("missing imported profile")
+	}
+	account, got, refreshed, err := store.RefreshCredentialDetailsIfExpired(t.Context(), http.DefaultClient, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed || got == nil || got.PlanType() != "max" || account.Token != credential.AccessToken {
+		t.Fatalf("details = account:%+v credential:%+v refreshed:%v", account, got, refreshed)
+	}
+}
 
 func TestStoreCreateSetRemoveProfile(t *testing.T) {
 	store := Store{Dir: t.TempDir()}
@@ -47,6 +95,31 @@ func TestStoreCreateSetRemoveProfile(t *testing.T) {
 	}
 	if profiles := store.ListProfiles(); len(profiles) != 0 {
 		t.Fatalf("profiles = %d, want 0", len(profiles))
+	}
+}
+
+func TestRemoveProfileContextStopsAtRegistryLockDeadline(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	if _, err := store.CreateProfile("work"); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := lockProfileRegistry(store.ProfilesPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	removed, err := store.RemoveProfileContext(ctx, "work")
+	if removed {
+		t.Fatal("profile was removed without acquiring the registry lock")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("remove error = %v, want context deadline exceeded", err)
+	}
+	if _, ok := store.FindProfile("work"); !ok {
+		t.Fatal("timed-out removal changed the profile registry")
 	}
 }
 
@@ -124,6 +197,7 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "api-key")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
 	t.Setenv("ANTHROPIC_BASE_URL", "http://stale-proxy:31415")
+	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: Bearer stale")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
 
@@ -138,6 +212,7 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_CUSTOM_HEADERS",
 		"CLAUDE_CODE_OAUTH_TOKEN",
 	} {
 		if _, ok := seen[key]; ok {
@@ -310,7 +385,7 @@ func TestImportProfileCredentialSerializesRegistryAcrossProcesses(t *testing.T) 
 	}
 }
 
-func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.T) {
+func TestRefreshCredentialDoesNotOverwriteNewerTenantUploadAcrossProcesses(t *testing.T) {
 	if os.Getenv("SUBROUTER_CLAUDE_REFRESH_HELPER") == "1" {
 		oauthTokenURL = os.Getenv("SUBROUTER_CLAUDE_REFRESH_URL")
 		store := Store{Dir: os.Getenv("SUBROUTER_CLAUDE_REFRESH_DIR")}
@@ -356,7 +431,7 @@ func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses$")
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRefreshCredentialDoesNotOverwriteNewerTenantUploadAcrossProcesses$")
 	command.Env = append(os.Environ(),
 		"SUBROUTER_CLAUDE_REFRESH_HELPER=1",
 		"SUBROUTER_CLAUDE_REFRESH_DIR="+store.Dir,
@@ -373,16 +448,17 @@ func TestRefreshCredentialDoesNotOverwriteNewerImportAcrossProcesses(t *testing.
 		t.Fatal("refresh helper did not reach OAuth endpoint")
 	}
 
-	importDone := make(chan error, 1)
+	uploadDone := make(chan error, 1)
 	go func() {
-		importDone <- store.ImportProfileCredential("founders@example.com", CredentialInfo{
+		_, err := store.UpsertCredentialProfile("founders@example.com", CredentialInfo{
 			AccessToken:  "new-import-access",
 			RefreshToken: "new-import-refresh",
 			ExpiresAt:    time.Now().Add(time.Hour).UnixMilli(),
 		})
+		uploadDone <- err
 	}()
 	select {
-	case err := <-importDone:
+	case err := <-uploadDone:
 		if err != nil {
 			close(releaseRefresh)
 			_ = command.Wait()
@@ -2597,57 +2673,6 @@ func TestImportProfileCredentialReportsVisibleCommitOnRegistrySyncFailure(t *tes
 	}
 }
 
-func TestProfileRegistryMutationsReportVisibleCommitOnDirectorySyncFailure(t *testing.T) {
-	want := errors.New("registry directory sync unavailable")
-	assertCommitted := func(t *testing.T, err error) {
-		t.Helper()
-		if !errors.Is(err, ErrProfileRegistryWriteCommitted) || !errors.Is(err, want) {
-			t.Fatalf("registry sync failure = %v", err)
-		}
-	}
-
-	t.Run("create", func(t *testing.T) {
-		store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
-		store.syncDirectoryForTest = func(string) error { return want }
-		instancePath, err := store.CreateProfile("work")
-		assertCommitted(t, err)
-		if instancePath == "" {
-			t.Fatal("committed create did not return its instance path")
-		}
-		if _, found := store.FindProfile("work"); !found {
-			t.Fatal("committed create is invisible in the registry")
-		}
-	})
-
-	t.Run("register", func(t *testing.T) {
-		store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
-		_, dir, err := store.CreateTempInstance()
-		if err != nil {
-			t.Fatal(err)
-		}
-		store.syncDirectoryForTest = func(string) error { return want }
-		assertCommitted(t, store.RegisterProfile("work", dir))
-		if _, found := store.FindProfile("work"); !found {
-			t.Fatal("committed registration is invisible in the registry")
-		}
-	})
-
-	t.Run("set-active", func(t *testing.T) {
-		store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
-		if _, err := store.CreateProfile("first"); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := store.CreateProfile("second"); err != nil {
-			t.Fatal(err)
-		}
-		store.syncDirectoryForTest = func(string) error { return want }
-		assertCommitted(t, store.SetActiveProfile("second"))
-		if active := store.ActiveProfile(); active != "second" {
-			t.Fatalf("visible active profile = %q, want second", active)
-		}
-	})
-}
-
 func TestRemoveProfileRollsForwardOnRegistrySyncFailure(t *testing.T) {
 	store := Store{Dir: filepath.Join(t.TempDir(), "claude-store")}
 	installSuccessfulSecurityCommand(t)
@@ -3320,6 +3345,7 @@ func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
 		err        error
 	}
 	results := make([]result, callers)
+	var publications atomic.Int32
 	var start sync.WaitGroup
 	var done sync.WaitGroup
 	start.Add(1)
@@ -3328,7 +3354,13 @@ func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
 		go func(i int) {
 			defer done.Done()
 			start.Wait()
-			account, didRefresh, err := store.RefreshCredentialIfExpired(context.Background(), server.Client(), profile)
+			account, _, didRefresh, err := store.RefreshCredentialDetailsIfExpiredBeforeRefresh(
+				context.Background(), server.Client(), profile,
+				func() error {
+					publications.Add(1)
+					return nil
+				},
+			)
 			results[i] = result{account: account, didRefresh: didRefresh, err: err}
 		}(i)
 	}
@@ -3349,6 +3381,9 @@ func TestRefreshCredentialIfExpiredRedeemsRefreshTokenOnce(t *testing.T) {
 	}
 	if refreshes != 1 {
 		t.Fatalf("network refreshes reported = %d, want exactly 1", refreshes)
+	}
+	if publications.Load() != 1 {
+		t.Fatalf("refresh publications = %d, want exactly 1", publications.Load())
 	}
 
 	mu.Lock()

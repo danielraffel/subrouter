@@ -95,6 +95,7 @@ type tenantCredentialLeaseRequest struct {
 	SessionID        string `json:"sessionId"`
 	UserEmail        string `json:"userEmail,omitempty"`
 	PreferAccountID  string `json:"preferAccountId,omitempty"`
+	ForceAccountID   string `json:"forceAccountId,omitempty"`
 	Model            string `json:"model,omitempty"`
 	SessionToken     string `json:"sessionToken,omitempty"`
 }
@@ -132,9 +133,15 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		http.Error(w, "invalid credential lease request", http.StatusBadRequest)
 		return
 	}
+	forceAccountRequested := strings.TrimSpace(input.ForceAccountID) != ""
 	input.normalize()
 	provider := accounts.Provider(input.Provider)
-	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude {
+	if keyedProvider, ok := APIKeyProviderForName(input.Provider); ok {
+		provider = keyedProvider
+		input.Provider = string(keyedProvider)
+	}
+	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude &&
+		provider != accounts.ProviderQwenToken && provider != accounts.ProviderQwenAnthropic {
 		http.Error(w, "unsupported credential lease provider", http.StatusBadRequest)
 		return
 	}
@@ -145,8 +152,8 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 	}
 	if input.SessionID == "" || len(input.SessionID) > 512 ||
 		len(input.AgentType) > 64 || len(input.UserEmail) > 320 ||
-		len(input.PreferAccountID) > 512 || len(input.Model) > 256 ||
-		len(input.SessionToken) > 128 {
+		len(input.PreferAccountID) > 512 || len(input.ForceAccountID) > 512 || len(input.Model) > 256 ||
+		len(input.SessionToken) > 128 || (forceAccountRequested && input.ForceAccountID == "") {
 		http.Error(w, "invalid credential lease request", http.StatusBadRequest)
 		return
 	}
@@ -191,7 +198,7 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 			return
 		}
 		lease := tenantCredentialLease{
-			accountID: account.ID, provider: provider, authMode: account.AuthMode,
+			accountID: account.ID, provider: schedulerAccountProvider(provider), authMode: account.AuthMode,
 			credentialIdentity: account.CredentialIdentity(),
 			agentType:          tenantCredentialLeaseAgentType(input, provider),
 			sessionID:          input.SessionID,
@@ -276,6 +283,7 @@ func (input *tenantCredentialLeaseRequest) normalize() {
 	input.SessionID = strings.TrimSpace(input.SessionID)
 	input.UserEmail = session.NormalizeUserEmail(input.UserEmail)
 	input.PreferAccountID = session.NormalizeAccountID(input.PreferAccountID)
+	input.ForceAccountID = session.NormalizeAccountID(input.ForceAccountID)
 	input.Model = session.NormalizeModel(input.Model)
 	input.SessionToken = strings.TrimSpace(input.SessionToken)
 }
@@ -354,10 +362,7 @@ func selectTenantCredentialLeaseAccount(
 			}
 		}
 		if server.Sessions != nil {
-			agentType := input.AgentType
-			if agentType == "" {
-				agentType = string(provider)
-			}
+			agentType := tenantCredentialLeaseAgentType(input, provider)
 			if _, err := server.Sessions.Put(agentType, input.SessionID, refreshed.ID, input.UserEmail); err != nil {
 				return accounts.Account{}, 0, &tenantCredentialLeasePersistenceError{err: err}
 			}
@@ -390,11 +395,11 @@ func pickTenantCredentialLeaseAccount(
 	model := tenantCredentialLeasePoolModel(provider, input.Model)
 	scheduler := server.scheduler().ForModel(model)
 	if server.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(server.Sessions.CountByAccount())
+		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(server.Sessions))
 	}
-	// Preferred and sticky routing are hints, not permission to reuse a cooled
-	// credential. Filtering must happen first; if every candidate is blocked,
-	// return a retryable outage rather than silently defeating the cooldown.
+	// Forced, sticky, and preferred routing never grant permission to reuse a
+	// cooled credential. Filtering must happen first; if every candidate is
+	// blocked, return a retryable outage rather than defeating the cooldown.
 	now := time.Now()
 	eligible := candidates[:0]
 	var retryAt time.Time
@@ -425,23 +430,26 @@ func pickTenantCredentialLeaseAccount(
 		return accounts.Account{}, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 	}
 	candidates = eligible
-	if input.PreferAccountID != "" {
-		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
-			return preferred, nil
+	if input.ForceAccountID != "" {
+		if forced, ok := findAccount(candidates, input.ForceAccountID); ok {
+			return forced, nil
 		}
+		return accounts.Account{}, fmt.Errorf("forced account %q is unavailable", input.ForceAccountID)
 	}
 	if server.Sessions != nil {
-		agentType := input.AgentType
-		if agentType == "" {
-			agentType = input.Provider
-		}
+		agentType := tenantCredentialLeaseAgentType(input, provider)
 		if assignment, ok := server.Sessions.Get(agentType, input.SessionID); ok {
 			if sticky, found := findAccount(candidates, assignment.AccountID); found {
 				return sticky, nil
 			}
 		}
 	}
-	return scheduler.Pick(candidates)
+	if input.PreferAccountID != "" {
+		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
+			return preferred, nil
+		}
+	}
+	return pickRoutingAccount(scheduler, candidates)
 }
 
 func tenantCredentialLeaseTrustedBlockedUntil(
@@ -453,13 +461,14 @@ func tenantCredentialLeaseTrustedBlockedUntil(
 	if server.SchedulerRef == nil {
 		return time.Time{}, false
 	}
+	schedulerProvider := schedulerAccountProvider(account.Provider)
 	if account.AuthMode == accounts.AuthModeAPIKey {
 		return server.SchedulerRef.ExplicitBlockedUntilFor(
-			account.Provider, account.ID, model, now,
+			schedulerProvider, account.ID, model, now,
 		)
 	}
 	return server.SchedulerRef.BlockedUntilFor(
-		account.Provider, account.ID, model, now,
+		schedulerProvider, account.ID, model, now,
 	)
 }
 
@@ -470,7 +479,7 @@ func tenantCredentialLeaseAgentType(
 	if agentType := session.NormalizeAgentType(input.AgentType); agentType != "" {
 		return agentType
 	}
-	return string(provider)
+	return string(schedulerAccountProvider(provider))
 }
 
 func tenantCredentialLeasePoolModel(provider accounts.Provider, model string) string {
@@ -514,11 +523,12 @@ func normalizeTenantCredentialLeaseReport(
 	case broker.LeaseForbidden:
 		validStatus = report.StatusCode == http.StatusForbidden
 	case broker.LeaseRateLimited:
-		// Claude can report quota rejection headers on a non-429 response. The
-		// hosted report intentionally carries no provider headers, so preserve
-		// that legitimate signal but constrain it to the issued model pool.
+		// Claude can report quota rejection headers on a non-429 error response.
+		// Hosted reports carry no provider headers, so require an HTTP error before
+		// honoring this untrusted signal and constrain it to the issued model pool.
 		validStatus = report.StatusCode == http.StatusTooManyRequests ||
 			(lease.provider == accounts.ProviderClaude &&
+				report.StatusCode >= http.StatusBadRequest &&
 				report.StatusCode != http.StatusUnauthorized)
 	case broker.LeaseProviderError:
 		validStatus = report.StatusCode >= http.StatusBadRequest &&
@@ -600,7 +610,7 @@ func (s *tenantCredentialLeaseStore) consumeReport(
 	key := tenantCredentialLeaseAvoidanceKey{
 		agentType: lease.agentType, sessionID: lease.sessionID,
 		sessionToken: lease.sessionToken,
-		provider:     lease.provider, accountID: lease.accountID,
+		provider:     schedulerAccountProvider(lease.provider), accountID: lease.accountID,
 	}
 	if normalized.Scope == broker.LeaseCooldownQuota {
 		// lease.model is canonicalized once, when the lease is issued. Re-running
@@ -625,7 +635,7 @@ func (s *tenantCredentialLeaseStore) consumeReport(
 		if candidate.agentType == lease.agentType &&
 			candidate.sessionID == lease.sessionID &&
 			candidate.sessionToken == lease.sessionToken &&
-			candidate.provider == lease.provider &&
+			schedulerAccountProvider(candidate.provider) == schedulerAccountProvider(lease.provider) &&
 			candidate.accountID == lease.accountID &&
 			(normalized.Scope != broker.LeaseCooldownQuota || candidate.model == lease.model) {
 			delete(s.leases, candidateID)
@@ -690,6 +700,7 @@ func (s *tenantCredentialLeaseStore) resolveSessionToken(
 	defer s.mu.Unlock()
 	s.pruneLocked(now)
 	agentType := tenantCredentialLeaseAgentType(input, provider)
+	provider = schedulerAccountProvider(provider)
 	if existing, ok := s.sessions[input.SessionToken]; ok &&
 		existing.agentType == agentType && existing.sessionID == input.SessionID &&
 		existing.provider == provider {
@@ -743,15 +754,16 @@ func (s *tenantCredentialLeaseStore) putIfEligible(
 	}
 	if scheduler != nil {
 		publish := func() { s.putLocked(id, lease) }
+		schedulerProvider := schedulerAccountProvider(lease.provider)
 		var until time.Time
 		var published bool
 		if lease.authMode == accounts.AuthModeAPIKey {
 			until, published = scheduler.RunIfAccountNotExplicitlyBlocked(
-				lease.provider, lease.accountID, lease.model, now, publish,
+				schedulerProvider, lease.accountID, lease.model, now, publish,
 			)
 		} else {
 			until, published = scheduler.RunIfAccountNotBlocked(
-				lease.provider, lease.accountID, lease.model, now, publish,
+				schedulerProvider, lease.accountID, lease.model, now, publish,
 			)
 		}
 		if !published {
@@ -788,7 +800,7 @@ func (s *tenantCredentialLeaseStore) putLocked(id string, lease tenantCredential
 		}
 		session = tenantCredentialLeaseSession{
 			agentType: lease.agentType, sessionID: lease.sessionID,
-			provider: lease.provider,
+			provider: schedulerAccountProvider(lease.provider),
 		}
 	}
 	if lease.sessionToken != "" {
@@ -870,7 +882,7 @@ func (s *tenantCredentialLeaseStore) avoidanceUntilLeaseKeysLocked(
 	base := tenantCredentialLeaseAvoidanceKey{
 		agentType: lease.agentType, sessionID: lease.sessionID,
 		sessionToken: lease.sessionToken,
-		provider:     lease.provider, accountID: lease.accountID,
+		provider:     schedulerAccountProvider(lease.provider), accountID: lease.accountID,
 	}
 	keys := []tenantCredentialLeaseAvoidanceKey{
 		base,

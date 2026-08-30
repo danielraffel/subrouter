@@ -633,6 +633,68 @@ func TestSyncActiveToStoreDoesNotOverwriteNewerStoredToken(t *testing.T) {
 	}
 }
 
+func TestSyncActiveToStoreBeforeSaveStopsBeforeCredentialMutation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := CodexStore{Dir: t.TempDir()}
+	stored := storedOAuthAccount("founders@example.com", "stored", time.Now().Add(time.Hour))
+	stored.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	interactive := storedOAuthAccount("founders@example.com", "interactive", time.Now().Add(time.Hour))
+	if err := store.SaveStored(stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteActiveCodexAuth(interactive.Auth); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("publish generation")
+	err := store.SyncActiveToStoreBeforeSave(func() error { return wantErr })
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("sync error = %v, want %v", err, wantErr)
+	}
+	got, found, err := store.FindStored(stored.Email)
+	if err != nil || !found {
+		t.Fatalf("stored account found = %v, err = %v", found, err)
+	}
+	if got.OAuthCredentialOrigin != CodexOAuthOriginIsolatedServerLogin {
+		t.Fatalf("stored OAuth origin = %q, want isolated server login", got.OAuthCredentialOrigin)
+	}
+	if got.Auth.Tokens == nil || got.Auth.Tokens.RefreshToken != stored.Auth.Tokens.RefreshToken {
+		t.Fatal("stored credential changed before publication")
+	}
+}
+
+func TestRefreshStoredIfExpiredBeforeRefreshStopsBeforeTokenRedemption(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	account := storedOAuthAccount("founders@example.com", "expired", time.Now().Add(-time.Hour))
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	client := &http.Client{Transport: codexRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return nil, errors.New("token endpoint should not be called")
+	})}
+	wantErr := errors.New("publish generation")
+	_, refreshed, err := store.RefreshStoredIfExpiredBeforeRefresh(
+		context.Background(), client, account, func() error { return wantErr },
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("refresh error = %v, want %v", err, wantErr)
+	}
+	if refreshed {
+		t.Fatal("refresh reported success despite publication failure")
+	}
+	if requests != 0 {
+		t.Fatalf("token endpoint requests = %d, want zero", requests)
+	}
+	got, found, err := store.FindStored(account.Email)
+	if err != nil || !found {
+		t.Fatalf("stored account found = %v, err = %v", found, err)
+	}
+	if got.Auth.Tokens == nil || got.Auth.Tokens.RefreshToken != account.Auth.Tokens.RefreshToken {
+		t.Fatal("stored credential changed before publication")
+	}
+}
+
 type codexRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f codexRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -706,5 +768,84 @@ func TestAccountMismatchMessageIsTerminalRefreshFailure(t *testing.T) {
 	}
 	if err := terminalStoredRefreshFailure(account); err == nil {
 		t.Fatal("expected account-mismatch refresh failure to be terminal")
+	}
+}
+
+// A locally added API key must be stored against its provider. Storing one
+// without a provider made every non-Codex key look like a Codex account, so it
+// was selected for Codex and forwarded to the OpenAI upstream — the key's own
+// provider was unreachable from the local CLI entirely.
+func TestAddProviderAPIKeyScopesTheAccountToItsProvider(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+
+	account, existed, err := store.AddProviderAPIKey(ProviderQwenToken, "tokenplan", "sk-sp-qwen-key")
+	if err != nil {
+		t.Fatalf("add failed: %v", err)
+	}
+	if existed {
+		t.Fatal("a fresh account should not report as existing")
+	}
+	if account.Provider != ProviderQwenToken {
+		t.Fatalf("Provider = %q, want qwen-token", account.Provider)
+	}
+	if account.Email != "qwen-token:tokenplan" {
+		t.Fatalf("Email = %q, want the provider-prefixed identifier", account.Email)
+	}
+
+	// Codex keeps the historical apikey: prefix so existing accounts still
+	// resolve.
+	codex, _, err := store.AddProviderAPIKey(ProviderCodex, "work", "sk-openai-key")
+	if err != nil {
+		t.Fatalf("codex add failed: %v", err)
+	}
+	if codex.Email != "apikey:work" || codex.ProviderOrDefault() != ProviderCodex {
+		t.Fatalf("codex account = %+v, want apikey:work on the codex provider", codex)
+	}
+
+	// An empty provider defaults to Codex, which is what AddAPIKey relies on.
+	legacy, _, err := store.AddAPIKey("legacy", "sk-legacy")
+	if err != nil {
+		t.Fatalf("legacy add failed: %v", err)
+	}
+	if legacy.Email != "apikey:legacy" || legacy.ProviderOrDefault() != ProviderCodex {
+		t.Fatalf("legacy account = %+v, want the codex shape", legacy)
+	}
+
+	// Two providers may share a label without colliding.
+	other, _, err := store.AddProviderAPIKey(ProviderQwenAnthropic, "tokenplan", "sk-sp-qwen-key")
+	if err != nil {
+		t.Fatalf("second provider add failed: %v", err)
+	}
+	if other.Email == account.Email {
+		t.Fatal("the same label under two providers must not collide")
+	}
+	stored, err := store.ListStored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 4 {
+		t.Fatalf("stored %d accounts, want 4: %+v", len(stored), stored)
+	}
+}
+
+// Only Codex guarantees an sk- prefix. Other providers issue their own formats,
+// so requiring sk- there would reject valid keys — xAI's begin with xai-.
+func TestAddProviderAPIKeyValidatesTheKeyPerProvider(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+
+	if _, _, err := store.AddProviderAPIKey(ProviderCodex, "work", "not-an-sk-key"); err == nil {
+		t.Fatal("a Codex key without the sk- prefix must be rejected")
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderCodex, "empty", "  "); err == nil || err.Error() != "API key is required" {
+		t.Fatalf("empty Codex key error = %v, want missing-key error", err)
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderGrok, "grok", "xai-some-key"); err != nil {
+		t.Fatalf("a provider with its own key format must be accepted: %v", err)
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderGrok, "empty", ""); err == nil {
+		t.Fatal("an empty key must be rejected for every provider")
+	}
+	if _, _, err := store.AddProviderAPIKey(ProviderGrok, "", "xai-some-key"); err == nil {
+		t.Fatal("a missing label must be rejected")
 	}
 }

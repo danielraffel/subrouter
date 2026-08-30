@@ -7,11 +7,14 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
 
 const defaultSRSwitchInterval = 10 * time.Minute
+
+const srAutoSwitchPublishAttempts = 3
 
 type srAutoSwitchConfig struct {
 	Interval     time.Duration
@@ -68,31 +71,65 @@ func srAutoSwitchOnce(ctx context.Context, cfg srAutoSwitchConfig) (string, erro
 	if fetchScores == nil {
 		fetchScores = fetchCodexScoresWithSuccess
 	}
-	allAccounts := cfg.Accounts
-	accountGeneration := uint64(0)
-	if cfg.AccountsSnapshotFunc != nil {
-		allAccounts, accountGeneration = cfg.AccountsSnapshotFunc()
-	} else if cfg.AccountsFunc != nil {
-		allAccounts = cfg.AccountsFunc()
-	}
-	candidates := codexOAuthAccounts(allAccounts)
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
-	}
+	var scheduler selectacct.Scheduler
+	var candidates []accounts.Account
+	lastConflict := "scheduler score snapshot changed"
+	for attempt := 1; attempt <= srAutoSwitchPublishAttempts; attempt++ {
+		allAccounts := cfg.Accounts
+		accountGeneration := uint64(0)
+		if cfg.AccountsSnapshotFunc != nil {
+			allAccounts, accountGeneration = cfg.AccountsSnapshotFunc()
+		} else if cfg.AccountsFunc != nil {
+			allAccounts = cfg.AccountsFunc()
+		}
+		candidates = codexOAuthAccounts(allAccounts)
+		if len(candidates) == 0 {
+			return "", fmt.Errorf("no OAuth Codex accounts available for sr auto-switch")
+		}
+		scoreRevision := uint64(0)
+		if cfg.SchedulerRef != nil {
+			scoreRevision = cfg.SchedulerRef.ScoreRevision()
+		}
 
-	scores, successful := fetchScores(ctx, candidates)
-	if successful == 0 {
-		return "", fmt.Errorf("no fresh OAuth usage scores available")
-	}
+		scores, successful := fetchScores(ctx, candidates)
+		if successful == 0 {
+			return "", fmt.Errorf("no fresh OAuth usage scores available")
+		}
 
-	scheduler := selectacct.NewScheduler(scores)
-	if cfg.SchedulerRef != nil {
-		if !cfg.SchedulerRef.SetForAccountGeneration(scheduler, accountGeneration) {
-			return "", fmt.Errorf("account pool changed during sr auto-switch")
+		scheduler = selectacct.NewScheduler(scores)
+		if cfg.SchedulerRef == nil {
+			break
+		}
+		// The auto-switch refresh is Codex-only, but SchedulerRef is shared by
+		// every provider. Atomically replace only the freshly fetched Codex scores
+		// so a concurrent full-provider refresh cannot be erased.
+		var published bool
+		scheduler, published = cfg.SchedulerRef.MergeScoresForAccountGenerationAtScoreRevision(
+			scores, accountGeneration, scoreRevision,
+		)
+		if published {
+			break
+		}
+		if cfg.AccountsSnapshotFunc != nil {
+			_, currentGeneration := cfg.AccountsSnapshotFunc()
+			if currentGeneration != accountGeneration {
+				lastConflict = "account pool changed"
+			} else {
+				lastConflict = "scheduler score snapshot changed"
+			}
+		}
+		if attempt == srAutoSwitchPublishAttempts {
+			return "", fmt.Errorf(
+				"sr auto-switch could not publish fresh usage after %d attempts because the %s concurrently",
+				srAutoSwitchPublishAttempts, lastConflict,
+			)
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
 	}
 	if cfg.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(cfg.Sessions.CountByAccount())
+		scheduler = scheduler.WithSessionCounts(proxy.SchedulerSessionCounts(cfg.Sessions))
 	}
 
 	// PickBest, not Pick: auto-switch maintains one active CLI account over

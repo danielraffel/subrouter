@@ -484,7 +484,7 @@ func TestUsageLimitRetryTransportClaudeFableFallbackFailureLogsExhausted(t *test
 	}
 }
 
-func TestOauthRetryAccountSkipsAPIKeyAccountsWhenOAuthOnly(t *testing.T) {
+func TestOauthRetryCandidateSkipsAPIKeyAccountsWhenOAuthOnly(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	server.Accounts = append(server.Accounts, accounts.Account{
 		ID: "apikey-fallback", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "sk-ant-pool-key",
@@ -493,10 +493,10 @@ func TestOauthRetryAccountSkipsAPIKeyAccountsWhenOAuthOnly(t *testing.T) {
 		"cooked@example.com": {},
 		"fresh@example.com":  {},
 	}
-	if _, err := server.oauthRetryAccount(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, true); err == nil {
+	if _, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, true); err == nil {
 		t.Fatal("oauthOnly must not hand out the API-key pool account")
 	}
-	account, err := server.oauthRetryAccount(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, false)
+	account, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "s", "", "", tried, false)
 	if err != nil {
 		t.Fatalf("non-oauthOnly retry should use the API-key account: %v", err)
 	}

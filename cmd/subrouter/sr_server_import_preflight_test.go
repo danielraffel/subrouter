@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 // A server that authenticates by tailnet identity has no credential for the
@@ -29,6 +31,23 @@ func TestAccountImportPreflightSucceedsWithoutAStoredCredential(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("preflight failed against a credential-free server: %v", err)
+	}
+}
+
+func TestAccountImportProviderPreflightRejectsAnOlderServerBeforeOAuth(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true,"providers":["codex","claude"]}`)
+	}))
+	defer remote.Close()
+
+	runner := srRunner{program: "sr", client: remote.Client()}
+	err := runner.ensureServerAccountImportProviderAvailable(
+		context.Background(),
+		srServerConfig{Name: "old-server", URL: remote.URL},
+		accounts.ProviderKimi,
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not advertise kimi account import") {
+		t.Fatalf("provider preflight error = %v", err)
 	}
 }
 

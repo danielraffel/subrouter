@@ -101,6 +101,13 @@ func (s CodexStore) DetectActiveAccount() (string, error) {
 }
 
 func (s CodexStore) SyncActiveToStore() error {
+	return s.SyncActiveToStoreBeforeSave(nil)
+}
+
+// SyncActiveToStoreBeforeSave performs its final freshness check while holding
+// the stored-account lock, then calls beforeSave immediately before the first
+// durable credential mutation. A nil hook preserves the legacy call shape.
+func (s CodexStore) SyncActiveToStoreBeforeSave(beforeSave func() error) error {
 	auth, ok, err := ReadActiveCodexAuth()
 	if err != nil || !ok {
 		return err
@@ -128,6 +135,11 @@ func (s CodexStore) SyncActiveToStore() error {
 	previous := account
 	account.Auth = auth
 	account.OAuthCredentialOrigin = CodexOAuthOriginInteractiveImport
+	if beforeSave != nil {
+		if err := beforeSave(); err != nil {
+			return err
+		}
+	}
 	appendCodexAuthBreadcrumb(context.Background(), s, &account, "active_auth_synced", "active_auth", false, &previous, &account, nil, nil)
 	if err := s.saveStoredUnlocked(account); err != nil {
 		return err
@@ -138,8 +150,11 @@ func (s CodexStore) SyncActiveToStore() error {
 
 func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 	auth, ok, err := ReadActiveCodexAuth()
-	if err != nil || !ok {
+	if err != nil {
 		return StoredCodexAccount{}, false, err
+	}
+	if !ok {
+		return StoredCodexAccount{}, false, fmt.Errorf("no active Codex OAuth auth found in %s", DefaultCodexAuthPath())
 	}
 	if auth.Tokens == nil || auth.Tokens.IDToken == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("no active Codex OAuth auth found in %s", DefaultCodexAuthPath())
@@ -170,15 +185,39 @@ func (s CodexStore) ImportActive() (StoredCodexAccount, bool, error) {
 }
 
 func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, error) {
+	return s.AddProviderAPIKey(ProviderCodex, label, key)
+}
+
+// AddAPIKeyForProvider preserves the original provider-aware call shape for
+// callers on older stacked branches. New code should prefer AddProviderAPIKey,
+// whose provider-first order matches the account's routing identity.
+func (s CodexStore) AddAPIKeyForProvider(label, key string, provider Provider) (StoredCodexAccount, bool, error) {
+	return s.AddProviderAPIKey(provider, label, key)
+}
+
+// AddProviderAPIKey stores an API key under the provider-scoped identifier
+// used by proxy routing. ProviderCodex retains the legacy apikey: prefix and
+// sk- validation; registry-backed providers may use their own key formats.
+func (s CodexStore) AddProviderAPIKey(provider Provider, label, key string) (StoredCodexAccount, bool, error) {
+	if provider == "" {
+		provider = ProviderCodex
+	}
 	label = strings.TrimSpace(label)
 	key = strings.TrimSpace(key)
 	if label == "" {
 		return StoredCodexAccount{}, false, fmt.Errorf("label is required")
 	}
-	if !strings.HasPrefix(key, "sk-") {
+	if key == "" {
+		return StoredCodexAccount{}, false, fmt.Errorf("API key is required")
+	}
+	if provider == ProviderCodex && !strings.HasPrefix(key, "sk-") {
 		return StoredCodexAccount{}, false, fmt.Errorf("invalid API key format, expected sk-...")
 	}
-	email := "apikey:" + label
+	emailPrefix := "apikey:"
+	if provider != ProviderCodex {
+		emailPrefix = string(provider) + ":"
+	}
+	email := emailPrefix + label
 	account, existed, err := s.FindStored(email)
 	if err != nil {
 		return StoredCodexAccount{}, false, err
@@ -188,6 +227,11 @@ func (s CodexStore) AddAPIKey(label, key string) (StoredCodexAccount, bool, erro
 			Email:   email,
 			AddedAt: time.Now().UTC().Format(time.RFC3339),
 		}
+	}
+	if provider == ProviderCodex {
+		account.Provider = ""
+	} else {
+		account.Provider = provider
 	}
 	account.Auth = CodexAuthFile{
 		AuthMode:     "apikey",
@@ -202,6 +246,8 @@ func (s CodexStore) RefreshStoredIfExpired(ctx context.Context, client *http.Cli
 
 // RefreshStoredIfExpiredBeforeRefresh calls beforeRefresh after the final
 // locked freshness checks and immediately before contacting the token endpoint.
+// This lets callers publish a cross-process generation before an OAuth refresh
+// can rotate the credential chain or persist a terminal failure.
 func (s CodexStore) RefreshStoredIfExpiredBeforeRefresh(
 	ctx context.Context,
 	client *http.Client,
@@ -215,7 +261,13 @@ func (s CodexStore) RefreshStored(ctx context.Context, client *http.Client, acco
 	return s.refreshStored(ctx, client, account, true, nil)
 }
 
-func (s CodexStore) refreshStored(ctx context.Context, client *http.Client, account StoredCodexAccount, force bool, beforeRefresh func() error) (StoredCodexAccount, bool, error) {
+func (s CodexStore) refreshStored(
+	ctx context.Context,
+	client *http.Client,
+	account StoredCodexAccount,
+	force bool,
+	beforeRefresh func() error,
+) (StoredCodexAccount, bool, error) {
 	if account.Auth.Tokens == nil {
 		logCodexRefreshSkipped(ctx, s, account, force, "missing_tokens")
 		return account, false, nil

@@ -86,8 +86,8 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 		sessionCounts: map[string]int{},
 		liveDebits:    s.liveDebits,
 	}
-	for accountID, count := range counts {
-		next.sessionCounts[accountID] = count
+	for accountKey, count := range counts {
+		next.sessionCounts[accountKey] = count
 	}
 	return next
 }
@@ -351,7 +351,14 @@ func (s Scheduler) measuredScore(provider account.Provider, accountID string) Sc
 		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 	}
 	if s.sessionCounts != nil {
-		score.Sessions = s.sessionCounts[accountID]
+		key := ScoreKey(provider, accountID)
+		if count, ok := s.sessionCounts[key]; ok {
+			score.Sessions = count
+		} else {
+			// Keep source compatibility for callers that still pass bare account
+			// IDs. Production routing supplies provider-scoped ScoreKey values.
+			score.Sessions = s.sessionCounts[accountID]
+		}
 	}
 	return score
 }

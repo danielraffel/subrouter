@@ -15,6 +15,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 )
 
 const accountDiskGenerationFile = ".account-generation"
@@ -46,6 +47,9 @@ type accountRollbackJournal struct {
 	StoredStoreDir       string `json:"stored_store_dir,omitempty"`
 	StoredProvider       string `json:"stored_provider,omitempty"`
 	StoredVersion        string `json:"stored_version,omitempty"`
+	QwenConsoleRoot      string `json:"qwen_console_root,omitempty"`
+	QwenConsoleFound     bool   `json:"qwen_console_found,omitempty"`
+	QwenConsoleVersion   string `json:"qwen_console_version,omitempty"`
 	Progress             string `json:"progress"`
 	CompletionGeneration string `json:"completion_generation,omitempty"`
 }
@@ -149,6 +153,8 @@ func prepareTenantAccountDelete(
 	expectedClaude agentclaude.ProfileRemovalSnapshot,
 	expectedStored accounts.StoredCodexAccount,
 	storedStoreDir string,
+	expectedQwen tenantQwenConsoleVersion,
+	qwenRoot string,
 ) (accountRollbackJournal, bool, error) {
 	if err := agentclaude.ValidateProfileNameAllowEmail(profileName); err != nil {
 		return accountRollbackJournal{}, false, fmt.Errorf("invalid tenant deletion target %q: %w", profileName, err)
@@ -182,6 +188,15 @@ func prepareTenantAccountDelete(
 			StoredProvider: string(expectedStored.ProviderOrDefault()),
 			StoredVersion:  hex.EncodeToString(storedDigest[:]), Progress: accountRollbackPrepared,
 		}
+		if expectedStored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			canonicalQwenRoot, absErr := filepath.Abs(filepath.Clean(qwenRoot))
+			if absErr != nil {
+				return absErr
+			}
+			journal.QwenConsoleRoot = canonicalQwenRoot
+			journal.QwenConsoleFound = expectedQwen.Found
+			journal.QwenConsoleVersion = expectedQwen.Version
+		}
 		return writeAccountRollbackJournal(journalStoreDir, journal)
 	})
 	return journal, found, err
@@ -204,7 +219,7 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 	}
 	switch journal.Target {
 	case accountRollbackTargetGeneric:
-		if journal.TargetID != "" || journal.TargetStoreDir != "" || journal.TargetInstanceDir != "" || journal.PreconditionVersion != "" || journal.CredentialVersion != "" || journal.StoredTargetID != "" || journal.StoredStoreDir != "" || journal.StoredProvider != "" || journal.StoredVersion != "" {
+		if journal.TargetID != "" || journal.TargetStoreDir != "" || journal.TargetInstanceDir != "" || journal.PreconditionVersion != "" || journal.CredentialVersion != "" || journal.StoredTargetID != "" || journal.StoredStoreDir != "" || journal.StoredProvider != "" || journal.StoredVersion != "" || journal.QwenConsoleRoot != "" || journal.QwenConsoleFound || journal.QwenConsoleVersion != "" {
 			return journal, true, errors.New("generic account rollback journal unexpectedly names a target")
 		}
 	case accountRollbackTargetClaude, accountRollbackTargetClaudeDelete, accountRollbackTargetTenantDelete:
@@ -238,8 +253,8 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 			return journal, true, errors.New("unpublished Claude rollback journal unexpectedly names a store directory")
 		}
 		if journal.Target == accountRollbackTargetTenantDelete {
-			if journal.StoredTargetID == "" {
-				return journal, true, errors.New("tenant deletion journal stored target is missing")
+			if journal.StoredTargetID == "" || journal.StoredTargetID != journal.TargetID {
+				return journal, true, errors.New("tenant deletion journal stored target does not match Claude target")
 			}
 			if !filepath.IsAbs(journal.StoredStoreDir) || filepath.Clean(journal.StoredStoreDir) != journal.StoredStoreDir || journal.StoredStoreDir == string(filepath.Separator) {
 				return journal, true, errors.New("tenant deletion journal stored account directory is invalid")
@@ -251,10 +266,17 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 			if provider == "" {
 				provider = accounts.ProviderCodex
 			}
-			if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude {
-				return journal, true, fmt.Errorf("tenant deletion journal stored provider %q is unsupported", provider)
+			if provider == accounts.ProviderQwenToken {
+				if !filepath.IsAbs(journal.QwenConsoleRoot) || filepath.Clean(journal.QwenConsoleRoot) != journal.QwenConsoleRoot || journal.QwenConsoleRoot == string(filepath.Separator) {
+					return journal, true, errors.New("tenant deletion journal Qwen console root is invalid")
+				}
+				if journal.QwenConsoleFound && !validAccountRollbackDigest(journal.QwenConsoleVersion) {
+					return journal, true, errors.New("tenant deletion journal Qwen console version is invalid")
+				}
+			} else if journal.QwenConsoleRoot != "" || journal.QwenConsoleFound || journal.QwenConsoleVersion != "" {
+				return journal, true, errors.New("non-Qwen tenant deletion journal names a Qwen credential")
 			}
-		} else if journal.StoredTargetID != "" || journal.StoredStoreDir != "" || journal.StoredProvider != "" || journal.StoredVersion != "" {
+		} else if journal.StoredTargetID != "" || journal.StoredStoreDir != "" || journal.StoredProvider != "" || journal.StoredVersion != "" || journal.QwenConsoleRoot != "" || journal.QwenConsoleFound || journal.QwenConsoleVersion != "" {
 			return journal, true, errors.New("Claude rollback journal unexpectedly names a stored account")
 		}
 	default:
@@ -397,15 +419,54 @@ func replayPreparedTenantStoredRemovalWithLease(journal accountRollbackJournal, 
 	if err != nil {
 		return false, err
 	}
+	provider := accounts.Provider(journal.StoredProvider)
+	if provider == "" {
+		provider = accounts.ProviderCodex
+	}
 	if !found {
-		return true, nil
+		if provider != accounts.ProviderQwenToken {
+			return true, nil
+		}
+		consoleFound, consoleVersion, versionErr := agentqwen.ConsoleCredentialVersionIn(journal.QwenConsoleRoot, journal.StoredTargetID)
+		if versionErr != nil {
+			return false, versionErr
+		}
+		if !consoleFound {
+			return true, nil
+		}
+		if consoleFound != journal.QwenConsoleFound || consoleVersion != journal.QwenConsoleVersion {
+			return false, errTenantStoredRemovalCredentialChanged
+		}
+		// The exact model record is already durably absent. Complete any
+		// console stage left by a crash after the model callback committed.
+		return agentqwen.RemoveConsoleCredentialExactIn(
+			journal.QwenConsoleRoot, journal.StoredTargetID,
+			journal.QwenConsoleFound, journal.QwenConsoleVersion,
+			func() (bool, error) { return true, nil },
+		)
 	}
 	digest := storedAccountMutationVersion(current)
 	if hex.EncodeToString(digest[:]) != journal.StoredVersion {
 		return false, errTenantStoredRemovalCredentialChanged
 	}
-	_, removed, removeErr := lease.RemoveExactDurable(current, syncAccountStateDir)
-	return removed, removeErr
+	removeStored := func() (bool, error) {
+		_, removed, removeErr := lease.RemoveExactDurable(current, syncAccountStateDir)
+		return removed, removeErr
+	}
+	if provider == accounts.ProviderQwenToken {
+		found, version, versionErr := agentqwen.ConsoleCredentialVersionIn(journal.QwenConsoleRoot, current.Email)
+		if versionErr != nil {
+			return false, versionErr
+		}
+		if found != journal.QwenConsoleFound || version != journal.QwenConsoleVersion {
+			return false, errTenantStoredRemovalCredentialChanged
+		}
+		return agentqwen.RemoveConsoleCredentialExactIn(
+			journal.QwenConsoleRoot, current.Email, journal.QwenConsoleFound, journal.QwenConsoleVersion,
+			removeStored,
+		)
+	}
+	return removeStored()
 }
 
 func reconcileTenantAccountDelete(
@@ -540,6 +601,8 @@ func removeJournaledTenantAccountLocked(
 	expectedStored accounts.StoredCodexAccount,
 	storedLease *accounts.StoredAccountLease,
 	storedStoreDir string,
+	expectedQwen tenantQwenConsoleVersion,
+	qwenRoot string,
 	publish func() error,
 	beforeStoredRemoval func(),
 ) (removed bool, err error) {
@@ -547,7 +610,7 @@ func removeJournaledTenantAccountLocked(
 		return false, err
 	}
 	journal, found, err := prepareTenantAccountDelete(
-		ctx, storeDir, profileName, claudeStore, expectedClaude, expectedStored, storedStoreDir,
+		ctx, storeDir, profileName, claudeStore, expectedClaude, expectedStored, storedStoreDir, expectedQwen, qwenRoot,
 	)
 	if err != nil || !found {
 		return false, err
@@ -687,11 +750,7 @@ func readAccountDiskGeneration(storeDir string) (string, error) {
 // advanceAccountDiskGeneration publishes one completed disk mutation to every
 // overlapping supervisor worker. Callers hold the cross-process import lock,
 // so truncation cannot expose a partial generation to another reload.
-func advanceAccountDiskGeneration(storeDir string) error {
-	return advanceAccountDiskGenerationWithSync(storeDir, syncAccountStateDir)
-}
-
-func advanceAccountDiskGenerationWithSync(storeDir string, syncDir func(string) error) (err error) {
+func advanceAccountDiskGeneration(storeDir string) (err error) {
 	value := make([]byte, 16)
 	if _, err := rand.Read(value); err != nil {
 		return fmt.Errorf("generate account state generation: %w", err)
@@ -729,7 +788,11 @@ func advanceAccountDiskGenerationWithSync(storeDir string, syncDir func(string) 
 	if err := os.Rename(tempPath, accountDiskGenerationPath(storeDir)); err != nil {
 		return err
 	}
-	return syncDir(storeDir)
+	if dir, openErr := os.Open(storeDir); openErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 func (r *AccountRef) advanceDiskGeneration() error {

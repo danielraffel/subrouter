@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -746,5 +747,16 @@ func TestCodexStoreCaseVariantUpdatesOneCanonicalAccount(t *testing.T) {
 	}
 	if !ok || removed.Email != first.Email {
 		t.Fatalf("removed = found:%v account:%+v", ok, removed)
+	}
+}
+
+func TestCodexStoreRejectsIdentifierThatCannotFitDecoratedFilenames(t *testing.T) {
+	store := CodexStore{Dir: t.TempDir()}
+	account := StoredCodexAccount{
+		Email: strings.Repeat("a", 216),
+		Auth:  CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "test-key"},
+	}
+	if err := store.SaveStored(account); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("SaveStored error = %v, want identifier length rejection", err)
 	}
 }

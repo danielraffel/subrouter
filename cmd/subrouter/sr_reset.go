@@ -127,7 +127,11 @@ type remoteResetPayload struct {
 // resetRemoteRequest performs one reset call against the server and returns the
 // decoded payload without printing, so callers (sweep, GTO) can aggregate.
 func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig, email string, all, dryRun bool) (remoteResetPayload, error) {
-	u := server.URL + "/_subrouter/rate-limit-reset?"
+	baseURL, err := serverControlBaseURL(server)
+	if err != nil {
+		return remoteResetPayload{}, err
+	}
+	u := baseURL + "/_subrouter/rate-limit-reset?"
 	q := url.Values{}
 	if all {
 		q.Set("all", "true")
@@ -140,16 +144,20 @@ func (r srRunner) resetRemoteRequest(ctx context.Context, server srServerConfig,
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u+q.Encode(), nil)
 	if err != nil {
-		return remoteResetPayload{}, err
+		return remoteResetPayload{}, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
 	client := r.client
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
-	res, err := client.Do(req)
+	secured, err := securedServerRequestClient(client, baseURL)
 	if err != nil {
 		return remoteResetPayload{}, err
+	}
+	res, err := secured.Do(req)
+	if err != nil {
+		return remoteResetPayload{}, redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))

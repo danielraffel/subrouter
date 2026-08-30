@@ -150,6 +150,42 @@ func TestScoreExcludesFeatureWindowsFromBase(t *testing.T) {
 	}
 }
 
+func TestSparkShortAndWeeklyWindowsRemainIndependentFromBase(t *testing.T) {
+	tests := []struct {
+		name              string
+		shortUsed         float64
+		weeklyUsed        float64
+		wantShortHeadroom float64
+	}{
+		{name: "short exhausted", shortUsed: 100, weeklyUsed: 48, wantShortHeadroom: 0},
+		{name: "weekly exhausted", shortUsed: 0, weeklyUsed: 100, wantShortHeadroom: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			score := ScoreFromLimitWindows("acct", 0, []LimitWindow{
+				{Name: "primary", UsedPercent: 28, LimitWindowSeconds: 7 * 24 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: tt.shortUsed, LimitWindowSeconds: 5 * 60 * 60},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: tt.weeklyUsed, LimitWindowSeconds: 7 * 24 * 60 * 60},
+			})
+
+			if math.Abs(score.Headroom-0.72) > 0.0001 {
+				t.Fatalf("base headroom = %.2f, want 0.72", score.Headroom)
+			}
+			spark, ok := score.ModelScores[ModelKey("gpt-5.3-codex-spark")]
+			if !ok {
+				t.Fatal("expected a Spark model pool score")
+			}
+			if !spark.exhausted() {
+				t.Fatal("Spark pool should be exhausted when either its short or weekly window is exhausted")
+			}
+			if math.Abs(spark.ShortHeadroom-tt.wantShortHeadroom) > 0.0001 {
+				t.Fatalf("Spark short headroom = %.2f, want %.2f", spark.ShortHeadroom, tt.wantShortHeadroom)
+			}
+		})
+	}
+}
+
 func TestForModelZeroesAccountsLackingTheFeature(t *testing.T) {
 	// One account advertises the Spark pool, another does not. A Spark request
 	// must not land on the account that cannot serve it.

@@ -184,6 +184,7 @@ func StripSubrouterHeaders(headers http.Header) {
 	headers.Del("X-User-Email")
 	headers.Del("X-Subrouter-Account-ID")
 	headers.Del("X-Subrouter-Account")
+	headers.Del("X-Subrouter-Preferred-Account-ID")
 	headers.Del("X-Subrouter-Model")
 	headers.Del("X-Model")
 	headers.Del("X-Subrouter-Azure")

@@ -44,6 +44,40 @@ func tenantLeaseTestServer(items ...accounts.Account) *Server {
 	}
 }
 
+func tenantLeaseTestBrokerClient(
+	t *testing.T,
+	server *Server,
+	store *tenantCredentialLeaseStore,
+) *broker.Client {
+	t.Helper()
+	const tenantKey = "srt_0123456789abcdef0123456789abcdef"
+	hosted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := "/t/" + tenantKey
+		if !strings.HasPrefix(r.URL.Path, prefix) {
+			http.NotFound(w, r)
+			return
+		}
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/_subrouter/leases":
+			store.handleIssue(server, tenant.Tenant{ID: "team"}, w, r)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/_subrouter/leases/") && strings.HasSuffix(r.URL.Path, "/events"):
+			store.handleReport(server, w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(hosted.Close)
+	client := broker.NewClient(broker.Config{
+		Version: 1, BaseURL: broker.DefaultBaseURL,
+		AccessToken: "cmux-access", RefreshToken: "cmux-refresh",
+		TeamID: "team", CredentialSource: broker.CredentialSourceTeam,
+		HostedURL: hosted.URL, TenantKey: tenantKey,
+	})
+	client.HTTPClient = hosted.Client()
+	return client
+}
+
 func tenantLeaseTestLease(
 	account accounts.Account,
 	agentType string,
@@ -96,6 +130,21 @@ func TestTenantCredentialLeaseReportStatusMatrix(t *testing.T) {
 			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
 			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusForbidden, Scope: broker.LeaseCooldownAccount},
 			wantScope: broker.LeaseCooldownAccount,
+		},
+		"Claude rejected 500": {
+			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusInternalServerError},
+			wantScope: broker.LeaseCooldownQuota,
+		},
+		"Claude successful response cannot masquerade as rate limit": {
+			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusOK},
+			wantError: true,
+		},
+		"Claude redirect cannot masquerade as rate limit": {
+			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+			report:    tenantCredentialLeaseReport{Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTemporaryRedirect},
+			wantError: true,
 		},
 		"Claude rate limit without scope stays model local": {
 			lease:     tenantCredentialLease{provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
@@ -429,6 +478,108 @@ func TestTenantCredentialLeaseFiltersBeforePreferredAndSticky(t *testing.T) {
 	}
 	if picked.ID != accountB.ID {
 		t.Fatalf("shared-cooldown pick = %s, want %s", picked.ID, accountB.ID)
+	}
+}
+
+func TestTenantCredentialBrokerPreferenceYieldsToReroutedStickySession(t *testing.T) {
+	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderClaude)
+	accountB := tenantLeaseTestAccount("account-b", accounts.ProviderClaude)
+	server := tenantLeaseTestServer(accountA, accountB)
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Sessions = sessions
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		return account, nil
+	}
+	store := newTenantCredentialLeaseStore()
+	client := tenantLeaseTestBrokerClient(t, server, store)
+	request := broker.LeaseRequest{
+		Provider: accounts.ProviderClaude, AgentType: "claude",
+		SessionID: "preferred-session", PreferAccountID: accountA.ID, Model: "claude-opus-4",
+	}
+
+	first, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Account.ID != accountA.ID {
+		t.Fatalf("initial preferred lease = %s, want %s", first.Account.ID, accountA.ID)
+	}
+	if err := client.Report(context.Background(), first.ID, broker.LeaseReport{
+		Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTooManyRequests,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Account.ID != accountB.ID {
+		t.Fatalf("rerouted lease = %s, want %s while preferred account is avoided", second.Account.ID, accountB.ID)
+	}
+
+	// Make A eligible again without changing the durable session placement.
+	// The next lease still carries the original soft preference, but sticky B
+	// must now outrank it.
+	store.mu.Lock()
+	for key, avoidance := range store.avoidances {
+		avoidance.expiresAt = time.Now().Add(-time.Minute)
+		store.avoidances[key] = avoidance
+	}
+	store.mu.Unlock()
+	client.InvalidateLease(second.ID)
+	third, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Account.ID != accountB.ID {
+		t.Fatalf("post-recovery lease = %s, want sticky %s instead of preferred %s", third.Account.ID, accountB.ID, accountA.ID)
+	}
+}
+
+func TestTenantCredentialBrokerForcedAccountOverridesStickyAndFailsClosed(t *testing.T) {
+	accountA := tenantLeaseTestAccount("account-a", accounts.ProviderClaude)
+	accountB := tenantLeaseTestAccount("account-b", accounts.ProviderClaude)
+	server := tenantLeaseTestServer(accountA, accountB)
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "forced-session", accountB.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	server.Sessions = sessions
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		return account, nil
+	}
+	store := newTenantCredentialLeaseStore()
+	client := tenantLeaseTestBrokerClient(t, server, store)
+	request := broker.LeaseRequest{
+		Provider: accounts.ProviderClaude, AgentType: "claude",
+		SessionID: "forced-session", ForceAccountID: accountA.ID, Model: "claude-opus-4",
+	}
+
+	forced, err := client.Lease(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forced.Account.ID != accountA.ID {
+		t.Fatalf("forced lease = %s, want %s despite sticky %s", forced.Account.ID, accountA.ID, accountB.ID)
+	}
+	if err := client.Report(context.Background(), forced.ID, broker.LeaseReport{
+		Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTooManyRequests,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Lease(context.Background(), request); err == nil {
+		t.Fatalf("avoided forced account silently failed over to %s", accountB.ID)
+	} else {
+		var statusErr *broker.HTTPStatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("forced unavailable error = %v, want broker 503", err)
+		}
 	}
 }
 
@@ -1467,5 +1618,176 @@ func TestTenantCredentialLeaseConcurrentCapacityFloodDoesNotBlockVictimOrSchedul
 		len(store.leases) > tenantCredentialLeaseMax ||
 		len(store.avoidances) > tenantCredentialLeaseMax {
 		t.Fatalf("unbounded state: sessions=%d leases=%d avoidances=%d", len(store.sessions), len(store.leases), len(store.avoidances))
+	}
+}
+
+func TestQwenAnthropicLeaseSelectionUsesSharedTokenPlanScores(t *testing.T) {
+	const model = "qwen3.7-plus"
+	available := []accounts.Account{
+		{ID: "qwen-token:a-cooked", Provider: accounts.ProviderQwenAnthropic, AuthMode: accounts.AuthModeAPIKey, Token: "cooked"},
+		{ID: "qwen-token:z-healthy", Provider: accounts.ProviderQwenAnthropic, AuthMode: accounts.AuthModeAPIKey, Token: "healthy"},
+	}
+	scheduler := selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "qwen-token:a-cooked", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "qwen-token:z-healthy", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+	})
+	schedulerRef := selectacct.NewSchedulerRef(scheduler)
+	schedulerRef.MarkExhaustedUntil(accounts.ProviderQwenToken, "qwen-token:a-cooked", model, time.Now().Add(time.Hour))
+	server := &Server{SchedulerRef: schedulerRef}
+
+	for _, testCase := range []struct {
+		name      string
+		configure func(*testing.T, *Server, *tenantCredentialLeaseRequest)
+	}{
+		{name: "scheduler"},
+		{
+			name: "preferred cooked account",
+			configure: func(_ *testing.T, _ *Server, input *tenantCredentialLeaseRequest) {
+				input.PreferAccountID = "qwen-token:a-cooked"
+			},
+		},
+		{
+			name: "sticky cooked account",
+			configure: func(t *testing.T, server *Server, input *tenantCredentialLeaseRequest) {
+				sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sessions.Put(string(accounts.ProviderQwenAnthropic), input.SessionID, "qwen-token:a-cooked", ""); err != nil {
+					t.Fatal(err)
+				}
+				server.Sessions = sessions
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			copyServer := *server
+			input := tenantCredentialLeaseRequest{
+				Provider:  string(accounts.ProviderQwenAnthropic),
+				SessionID: "session-a", Model: model,
+			}
+			if testCase.configure != nil {
+				testCase.configure(t, &copyServer, &input)
+			}
+			picked, err := pickTenantCredentialLeaseAccount(nil, &copyServer, available, nil, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if picked.ID != "qwen-token:z-healthy" {
+				t.Fatalf("picked %q, want healthy shared Token Plan account", picked.ID)
+			}
+		})
+	}
+}
+
+func TestQwenAnthropicLeasePublicationHonorsSharedTokenPlanCooldown(t *testing.T) {
+	const model = "qwen3.7-plus"
+	now := time.Now()
+	account := accounts.Account{
+		ID: "qwen-token:cooked", Provider: accounts.ProviderQwenAnthropic,
+		AuthMode: accounts.AuthModeAPIKey, Token: "key",
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: accounts.ProviderQwenToken,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	schedulerRef.MarkExhaustedUntil(accounts.ProviderQwenToken, account.ID, model, now.Add(time.Hour))
+	store := newTenantCredentialLeaseStore()
+	lease := tenantLeaseTestLease(account, string(accounts.ProviderQwenAnthropic), "session-a", model, now)
+	lease.authMode = accounts.AuthModeAPIKey
+	lease.model = model
+
+	until, avoided := store.putIfEligible("lease", lease, now, schedulerRef)
+	if !avoided || until.Before(now.Add(50*time.Minute)) {
+		t.Fatalf("publication guard: avoided=%v until=%v", avoided, until)
+	}
+	if _, ok := store.get("lease", now); ok {
+		t.Fatal("published a lease for a shared Token Plan account under cooldown")
+	}
+}
+
+func TestQwenLeaseAvoidanceUsesSharedTokenPlanIdentityAcrossProtocols(t *testing.T) {
+	now := time.Now()
+	store := newTenantCredentialLeaseStore()
+	input := tenantCredentialLeaseRequest{
+		Provider:  string(accounts.ProviderQwenAnthropic),
+		SessionID: "session-a",
+		Model:     "qwen3.7-plus",
+	}
+	token, err := store.resolveSessionToken(input, accounts.ProviderQwenAnthropic, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.SessionToken = token
+	account := accounts.Account{
+		ID: "qwen-token:shared", Provider: accounts.ProviderQwenToken,
+		AuthMode: accounts.AuthModeAPIKey, Token: "key",
+	}
+	lease := tenantLeaseTestLease(account, tenantCredentialLeaseAgentType(input, accounts.ProviderQwenAnthropic), input.SessionID, input.Model, now)
+	// Model the requested transport alias exactly as the issue path receives it;
+	// internal quota identity must canonicalize it before report and lookup.
+	lease.provider = accounts.ProviderQwenAnthropic
+	lease.sessionToken = token
+	store.put("lease", lease, now)
+	if _, err := store.consumeReport("lease", tenantCredentialLeaseReport{
+		Outcome: broker.LeaseRateLimited, StatusCode: http.StatusTooManyRequests,
+		Scope: broker.LeaseCooldownQuota,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	pool := tenantCredentialLeasePoolModel(accounts.ProviderQwenToken, input.Model)
+	if _, avoided := store.avoidanceUntil(input, account, pool, now); !avoided {
+		t.Fatal("Qwen Anthropic report did not cool the shared Token Plan account")
+	}
+
+	canonical := input
+	canonical.Provider = string(accounts.ProviderQwenToken)
+	canonicalToken, err := store.resolveSessionToken(canonical, accounts.ProviderQwenToken, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonicalToken != token {
+		t.Fatal("Qwen protocol alias did not retain the session capability")
+	}
+	canonical.SessionToken = canonicalToken
+	if _, avoided := store.avoidanceUntil(canonical, account, pool, now); !avoided {
+		t.Fatal("Qwen Token report lookup did not share the alias cooldown")
+	}
+	other := account
+	other.ID = "qwen-token:other"
+	if _, avoided := store.avoidanceUntil(canonical, other, pool, now); avoided {
+		t.Fatal("shared-provider cooldown leaked to another account")
+	}
+}
+
+func TestTenantCredentialLeaseSessionCountsAreProviderScoped(t *testing.T) {
+	const sharedID = "shared@example.com"
+	shared := accounts.Account{
+		ID: sharedID, Provider: accounts.ProviderCodex,
+		AuthMode: accounts.AuthModeAPIKey, Token: "shared-key",
+	}
+	other := accounts.Account{
+		ID: "z-other@example.com", Provider: accounts.ProviderCodex,
+		AuthMode: accounts.AuthModeAPIKey, Token: "other-key",
+	}
+	server := tenantLeaseTestServer(shared, other)
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "claude-session", sharedID, ""); err != nil {
+		t.Fatal(err)
+	}
+	server.Sessions = sessions
+
+	picked, err := pickTenantCredentialLeaseAccount(nil, server, []accounts.Account{shared, other}, nil, tenantCredentialLeaseRequest{
+		Provider: string(accounts.ProviderCodex), AgentType: "codex",
+		SessionID: "new-codex-session", Model: "gpt-5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != sharedID {
+		t.Fatalf("Claude session count damped same-ID Codex account: picked %q, want %q", picked.ID, sharedID)
 	}
 }

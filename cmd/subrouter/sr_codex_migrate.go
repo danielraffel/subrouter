@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 const codexIsolationRemediation = "sr codex migrate-isolation"
@@ -188,7 +189,11 @@ func (r srRunner) migrateCodexIsolation(ctx context.Context, args []string) erro
 			reportCodexIsolationRemaining(r.out, r.store)
 			return errors.New("isolated login returned the active Codex refresh-token chain; retry the isolated login")
 		}
-		if err := r.store.ReplaceStoredOAuthWithIsolated(ctx, target.Email, auth); err != nil {
+		err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+			replaceErr := r.store.ReplaceStoredOAuthWithIsolated(ctx, target.Email, auth)
+			return replaceErr == nil, replaceErr
+		})
+		if err != nil {
 			reportCodexIsolationRemaining(r.out, r.store)
 			return fmt.Errorf("replace isolated credential for %s: %w", target.Email, err)
 		}

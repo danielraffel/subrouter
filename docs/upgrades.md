@@ -2,6 +2,83 @@
 
 Use this runbook for local macOS daemon upgrades when Codex is already pointed at `127.0.0.1:31415`.
 
+## Replacing the binary in place on macOS
+
+A LaunchAgent that runs `subrouter serve` directly, rather than behind
+`subrouter supervise`, is upgraded by replacing its executable. **Do not
+overwrite the live executable with `cp`.** Writing through the existing inode
+invalidates the binary's code-signing state, and macOS then kills every respawn
+with `OS_REASON_CODESIGNING` (SIGKILL, exit 137). The daemon appears to
+flap: launchd restarts it, the kernel kills it, and the log shows nothing
+useful.
+
+Restoring the previous binary to the same path does **not** recover it. The
+pathname stays poisoned even when `codesign --verify --strict` passes and the
+restored file is byte-identical to the original. Recovery requires deleting the
+file first, so the copy lands on a fresh inode:
+
+```bash
+set -euo pipefail
+cp ~/bin/subrouter.backup ~/bin/subrouter.restore
+chmod 755 ~/bin/subrouter.restore
+codesign --verify --strict --verbose=4 ~/bin/subrouter.restore
+~/bin/subrouter.restore --help >/dev/null
+launchctl bootout gui/$(id -u)/<label>
+mv -f ~/bin/subrouter.restore ~/bin/subrouter
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+```
+
+The upgrade procedure that avoids this staged the new binary under its own name,
+signs and proves it runs *before* the old one is taken out of service, and puts
+it in place with an atomic rename:
+
+```bash
+set -euo pipefail
+cp subrouter.new ~/bin/subrouter.new
+# Preserve release signatures. A failed release verification is fatal; only an
+# explicitly selected local build may replace its absent signature ad hoc.
+if ! codesign --verify --strict ~/bin/subrouter.new 2>/dev/null; then
+  [ "${SUBROUTER_LOCAL_BUILD:-0}" = 1 ] || {
+    echo "release artifact signature verification failed" >&2
+    exit 1
+  }
+  codesign --force --sign - ~/bin/subrouter.new
+fi
+codesign --verify --strict --verbose=4 ~/bin/subrouter.new
+~/bin/subrouter.new --help >/dev/null            # prove it executes first
+cp -p ~/bin/subrouter ~/bin/subrouter.rollback
+launchctl bootout gui/$(id -u)/<label>
+mv ~/bin/subrouter.new ~/bin/subrouter           # rename, never cp
+if ! launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist; then
+  mv -f ~/bin/subrouter.rollback ~/bin/subrouter
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+  exit 1
+fi
+rm -f ~/bin/subrouter.rollback
+```
+
+On macOS versions whose launchd policy accepts ad-hoc signatures, the explicit
+local-build fallback makes an unsigned build runnable without replacing a valid
+release signature. A deployment using `SpawnConstraint` with a
+`team-identifier` must instead use a certificate-backed signature for that team;
+an ad-hoc signature has no Team ID and cannot satisfy the constraint.
+
+### What a restart costs
+
+`serve` drains on SIGTERM: it stops accepting, finishes in-flight requests, and
+exits, bounded by `--shutdown-timeout` (default 10 minutes). launchd is the
+shorter fuse. Without an explicit `ExitTimeOut` in the direct `install-daemon`
+plist, the escalation timeout is system-defined and may be shorter than
+`--shutdown-timeout`; a stream still running when launchd escalates is cut, and
+`ThrottleInterval` delays the restart by its value. Sticky session assignments
+survive, because the session store is read back from its file at startup; the
+scheduler's exhaustion marks do not, since they are in-memory only.
+
+During a supervised worker upgrade, the supervisor keeps owning the listener
+and hands existing connections to their original worker, avoiding listener
+interruption and connection drops. Restarting the supervisor itself still
+closes the listener and uses the normal drain/restart behavior.
+
 ## Credential-origin rollback boundary
 
 The rollback binary must understand the stored Codex

@@ -266,7 +266,7 @@ X-Subrouter-Session: <conversation-or-thread-id>
 
 If that header is missing, Subrouter checks Codex headers such as `x-codex-window-id` and `x-codex-turn-state`, common session headers, query params, and small JSON bodies for `session_id`, `conversation_id`, or `thread_id`.
 
-Subrouter scopes sticky assignments and transcript files by agent type. It infers `codex`, `claude`, or `gemini` from provider session headers, and clients can set an explicit namespace:
+Subrouter scopes sticky assignments and transcript files by agent type. It infers `codex`, `claude`, or `gemini` from provider session headers, uses the provider name for the API-key providers below (a request to `/qwen-token/...` is scoped to `qwen-token`), and clients can set an explicit namespace:
 
 ```text
 X-Subrouter-Agent: codex
@@ -278,7 +278,9 @@ For teammate-level graphs, clients can also send a self-reported user header:
 X-Subrouter-User-Email: alice@example.com
 ```
 
-Subrouter stores the normalized email on the session assignment, includes it in proxy logs as `user`, and exposes it in `GET /_subrouter/sessions`. This is observability metadata, not authentication. To force a selected account, send `X-Subrouter-Account-ID`; API-key labels can omit the `apikey:` prefix. Subrouter strips `X-Subrouter-Session`, `X-Subrouter-Agent`, `X-Subrouter-User-Email`, `X-Subrouter-User`, `X-User-Email`, `X-Subrouter-Account-ID`, and `X-Subrouter-Account` before forwarding upstream.
+Subrouter stores the normalized email on the session assignment for up to 30 days after the session's last activity. Proxy logs contain only a truncated SHA-256 `user_hash`, not the email. The full value is available through admin-authorized `GET /_subrouter/sessions`; hosted tenant keys additionally need `manage_accounts`. An administrator can delete the complete assignment and its email with `DELETE /_subrouter/sessions?agent_type=TYPE&session_id=ID`. This is observability metadata, not authentication. To force a selected account, send `X-Subrouter-Account-ID`; Codex API-key labels can omit the `apikey:` prefix, and an API-key account for another provider is identified as `<provider>:<label>`, such as `qwen-token:work`. Subrouter strips `X-Subrouter-Session`, `X-Subrouter-Agent`, `X-Subrouter-User-Email`, `X-Subrouter-User`, `X-User-Email`, `X-Subrouter-Account-ID`, and `X-Subrouter-Account` before forwarding upstream.
+
+Only send this header when storing the normalized email in Subrouter session state and a truncated hash in proxy logs is acceptable under your privacy policy. Protect the admin-gated sessions endpoint and log access accordingly; the value is self-reported and must not be treated as verified identity.
 
 ## Codex CLI
 
@@ -290,13 +292,40 @@ subrouter codex exec "your prompt"
 subrouter codex --version
 ```
 
-The wrapper injects this config override into the child Codex process:
+The wrapper is intentionally opt-in. Plain `codex` keeps Codex's normal direct
+OpenAI configuration and does not depend on a running Subrouter; `sr codex`
+routes that process through the configured Subrouter account pool. A session
+started or migrated through the wrapper should be reopened with the directly
+copyable `sr codex resume <session-id>` form.
+
+The wrapper launches the child with an authenticated custom provider pointed at
+Subrouter:
 
 ```toml
-openai_base_url = "http://127.0.0.1:31415/v1"
+model_provider = "subrouter"
+[model_providers.subrouter]
+base_url = "http://127.0.0.1:31415/v1"
+experimental_bearer_token = "subrouter"
+wire_api = "responses"
+supports_websockets = true
 ```
 
-It does not edit Codex config or set auth environment variables. Do not set a dummy `OPENAI_API_KEY` for normal subscription routing. Leave Codex logged in the same way it already is. If Codex is in ChatGPT auth mode, `/model` keeps the subscription model picker. Subrouter replaces outbound credentials with the selected `sr` account before forwarding. Responses and realtime WebSocket requests are proxied through the same route.
+It does not edit Codex config or depend on `~/.codex/auth.json`. This is
+intentional: an expired or logged-out local ChatGPT credential must not prevent
+a request from reaching Subrouter, where the selected pool account is applied.
+Do not set a dummy `OPENAI_API_KEY`; the wrapper supplies a non-secret provider
+token only for the local hop. Subrouter replaces it with the selected account
+before forwarding. Responses and realtime WebSocket requests use the same
+route. Resume through `sr codex resume ...` so the provider overrides are
+present on the resumed process.
+
+`sr codex` owns its routing overrides. It removes older Subrouter provider,
+backend `-c`, and local-provider `--oss` values from a copied or saved command
+before adding the selected server, preventing another provider or a retired URL
+from overriding the current configuration. Session managers can preserve the
+opt-in launcher identity via the exported `SUBROUTER_CODEX_LAUNCHER` and
+`SUBROUTER_CODEX_RESUME_COMMAND` variables; their value follows the invoked
+`sr`, `subrouter`, or `cx` alias.
 
 Override the subrouter URL with `SUBROUTER_CODEX_BASE_URL` if needed. See [docs/codex.md](docs/codex.md) for details and the custom-provider fallback.
 
@@ -305,6 +334,29 @@ If `SUBROUTER_CODEX_BASE_URL` is not set, the wrapper uses local `127.0.0.1:3141
 ```bash
 sr server add team --url http://100.64.0.1:31415 --default
 ```
+
+For a server reached through Tailscale, record its exact node ID so a MagicDNS
+rename does not strand clients:
+
+```bash
+sr server add team \
+  --url http://current-host.example.ts.net:31415 \
+  --tailscale-node-id nEXAMPLE11CNTRL \
+  --default
+```
+
+Subrouter loads `tailscale status --json`, requires an exact node-ID match, and
+only trusts the stored URL when its host is still one of that node's advertised
+addresses and its health check passes. Otherwise it rebuilds only the URL host,
+tries the node's current MagicDNS name and Tailscale IPs, health-checks the
+candidate, and atomically updates the server registry. It never matches a
+similar hostname, and discovery is time-bounded and fail-closed. The CLI is
+found through `PATH` or the standard macOS Tailscale app bundle; set
+`SUBROUTER_TAILSCALE_BIN` only for a non-standard installation.
+Replacing a named server with a different `--url` clears its prior node binding
+unless `--tailscale-node-id` is supplied again. If discovery for the unpinned
+default fails, `sr codex` may use a healthy local daemon under the normal local
+fallback policy; an explicit environment pin remains fail-closed.
 
 `sr server add --default` and `sr server use <name>` write these top-level keys in `CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is unset:
 
@@ -334,7 +386,10 @@ SUBROUTER_CODEX_ACCOUNT_ID=team-codex-1 subrouter codex exec "your prompt"
 SUBROUTER_CODEX_ACCOUNT_ID=apikey:team-codex-1 subrouter codex exec "your prompt"
 ```
 
-When either variable is set, the wrapper uses a custom `subrouter` provider with WebSockets enabled so Codex can send `X-Subrouter-User-Email` and `X-Subrouter-Account-ID`. Subrouter still replaces outbound credentials before forwarding upstream. `SUBROUTER_CODEX_USER_EMAIL` is only teammate observability metadata; account selection belongs in `SUBROUTER_CODEX_ACCOUNT_ID`.
+The wrapper always uses the custom `subrouter` provider with WebSockets enabled
+and sends `X-Subrouter-Agent: codex`. These variables add
+`X-Subrouter-User-Email` and `X-Subrouter-Account-ID`. Subrouter still replaces
+outbound credentials before forwarding upstream.
 
 Codex Desktop is separate from the CLI wrapper. Its app-server reads `CODEX_HOME/config.toml`, and its Electron shell reads `CODEX_API_BASE_URL` at process start. See [docs/codex.md](docs/codex.md) for the desktop routing setup.
 
@@ -393,23 +448,255 @@ sr claude list
 sr claude switch <profile>
 sr claude env
 sr claude run <profile>
+sr claude proxy [claude args...]
 ```
 
-Claude Code can also proxy through Subrouter with Claude Code OAuth tokens. Generate a long-lived token with `claude setup-token`, then configure the Claude user settings env:
+Bare `sr claude` opens the local profile manager, and `sr claude run <profile>`
+launches one managed local profile directly. `sr claude proxy [claude args...]`
+instead launches Claude profilelessly through the selected Subrouter server's
+pooled Claude accounts. When the selected server is remote, this needs neither
+local Claude profiles nor a local Subrouter daemon; Claude arguments such as
+`--resume <session-id>` pass through unchanged.
+
+For manual client configuration, authenticate to the Subrouter proxy rather
+than exposing an upstream Claude OAuth token. A trusted local or legacy
+single-tenant server accepts the non-secret placeholder `subrouter`:
 
 ```json
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:31415",
-    "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-...",
-    "ANTHROPIC_AUTH_TOKEN": "sk-ant-oat01-..."
+    "ANTHROPIC_AUTH_TOKEN": "subrouter",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude"
   }
 }
 ```
 
-For a shared server, replace `127.0.0.1` with the server URL. Subrouter recognizes Claude Code traffic, selects a Claude OAuth account from its own store, strips API-key auth, and forwards to Anthropic with the OAuth beta header. Claude Code prompt caching does not require Subrouter-specific cache settings: Subrouter keeps the same Claude conversation pinned to the same Claude account when that account is still available, and forwards the client `Anthropic-Beta` values and request body `cache_control` blocks unchanged.
+For a tenant-scoped shared server, put the tenant key in the URL path and use
+the same key as the auth token:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://router.example/t/srt_REDACTED",
+    "ANTHROPIC_AUTH_TOKEN": "srt_REDACTED",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Subrouter-Agent: claude"
+  }
+}
+```
+
+Remote tenant servers must use HTTPS unless they are reached over a verified
+Tailscale address. Plain HTTP is allowed only on loopback or after Subrouter
+verifies and pins the destination to a loopback or tailnet IP; a `*.ts.net`
+name alone is not trusted. Because `/t/<key>` contains a credential, URL logs
+and diagnostics must redact that path segment. The
+`X-Subrouter-Agent: claude` marker remains required as the agent discriminator;
+it does not replace the tenant path or token. `sr claude proxy` sets all three
+values correctly from the selected server.
+Subrouter then selects a Claude OAuth account from its own store, strips client
+auth before forwarding, and adds the OAuth beta header. Claude Code prompt
+caching does not require Subrouter-specific cache settings: Subrouter keeps the
+same Claude conversation pinned to the same Claude account when that account is
+still available, and forwards the client `Anthropic-Beta` values and request
+body `cache_control` blocks unchanged.
 
 Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
+
+## API-key providers
+
+Beyond Codex and Claude, Subrouter routes a set of providers that authenticate
+with an API key. Each one owns a path prefix, so a client picks a provider by
+the URL it calls and Subrouter replaces the outbound credential with whichever
+account it selects:
+
+| Prefix | Provider | Default upstream |
+|---|---|---|
+| `/kimi` | Kimi For Coding | `https://api.kimi.com/coding/v1` |
+| `/zai` | Z.AI coding | `https://api.z.ai/api/coding/paas/v4` |
+| `/openrouter` | OpenRouter | `https://openrouter.ai/api/v1` |
+| `/deepseek` | DeepSeek | `https://api.deepseek.com` |
+| `/together` | Together AI | `https://api.together.ai/v1` |
+| `/fireworks` | Fireworks AI | `https://api.fireworks.ai/inference/v1` |
+| `/opencode-zen` | OpenCode Zen | `https://opencode.ai/zen/v1` |
+| `/grok` | xAI Grok | `https://api.x.ai/v1` |
+| `/qwen` | Model Studio Coding Plan | `https://coding-intl.dashscope.aliyuncs.com/v1` |
+| `/qwen-token` | Model Studio Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
+| `/qwen-anthropic` | Token Plan, Anthropic protocol | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
+
+Each has a `--<name>-upstream` flag for a different region or a gateway; the
+Anthropic-protocol Token Plan route uses `--qwen-anthropic-upstream`. Add a
+key with the provider named, or it is stored as a Codex account and forwarded to
+OpenAI:
+
+```bash
+sr add-key --provider qwen-token
+```
+
+Aliases are accepted where a provider is named: `glm` for Z.AI, `xai` for Grok,
+`dashscope` for the Coding Plan, `tokenplan` for the Token Plan, `together-ai`
+for Together, `fireworks-ai` for Fireworks, and `zen` for OpenCode Zen.
+
+DeepSeek, Together, Fireworks, and OpenCode Zen use the same account lifecycle
+as the other API-key providers. Add more than one key under the same provider
+to enable sticky-session failover when a key returns 429:
+
+```bash
+sr add-key --provider deepseek
+sr add-key --provider together
+sr add-key --provider fireworks
+sr add-key --provider opencode-zen
+```
+
+Their client base URLs are respectively `/deepseek/v1`, `/together/v1`,
+`/fireworks/v1`, and `/opencode-zen/v1` beneath the Subrouter origin. Cursor
+and GitHub Copilot subscription credentials are not included in this API-key
+support. Cursor's public API manages Cloud Agents rather than exposing raw
+inference, and its CLI has its own authentication flow
+([API](https://cursor.com/docs/cloud-agent/api/endpoints),
+[CLI auth](https://docs.cursor.com/en/cli/reference/authentication)). The
+Copilot SDK speaks JSON-RPC to a Copilot CLI agent/session server rather than an
+OpenAI-compatible subscription endpoint
+([compatibility](https://docs.github.com/en/copilot/how-tos/copilot-sdk/troubleshooting/compatibility),
+[authentication](https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate),
+[SDK](https://github.com/github/copilot-sdk)). Subrouter therefore does not
+claim it can import or fail over either product's subscription.
+
+`sr status` groups these under their own provider rather than under Codex. Kimi
+OAuth subscriptions report their independent 5-hour and weekly windows and
+reset times from Kimi's usage endpoint. The condensed API-key rows report key
+health and only quota data the provider actually exposes.
+
+Antigravity OAuth is intentionally limited to the single CLI login available
+on a machine. The official CLI documents cached keyring sign-in/logout, but no
+token export or account selector, so Subrouter does not advertise binary token
+extraction or multi-account OAuth failover as upstream-ready. Direct
+`GEMINI_API_KEY` and Application Default Credentials are separate supported
+authentication paths, not additional selectable OAuth profiles
+([install](https://antigravity.google/docs/cli/install/),
+[headless auth](https://antigravity.google/docs/cli/headless/),
+[enterprise](https://antigravity.google/docs/enterprise/)).
+
+Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
+subscription logins in isolated profiles without switching or rewriting that
+global credential. The global CLI login appears in `sr kimi list` as
+`not routed`; `sr status` shows only independently authorized profiles that the
+proxy can safely refresh. This prevents a serving daemon from redeeming the
+CLI's rotating refresh-token chain and silently signing the interactive client
+out. Kimi does not expose the account email, so give each managed profile a
+recognizable local label:
+
+```bash
+sr kimi login work
+sr kimi login personal
+sr kimi list
+sr kimi remove personal
+```
+
+The labels are the management and status names; Subrouter does not infer an
+email or account name from undocumented token contents. Each profile refreshes
+atomically and is independently schedulable; `active` means a persistent session
+is assigned, `rec` is the next eligible profile, and `ready` means authenticated
+with quota but currently idle.
+Kimi Code subscription API keys can also be added with
+`sr add-key --provider kimi`. Kimi documents that every device and API key under
+one membership shares the same quota, so extra keys are failover credentials,
+not additional quota pools. The current API-key response does not expose a
+verified membership owner identity; use distinct labels and do not assume two
+keys represent separate subscriptions.
+
+For each Qwen Token Plan account, authorize the Alibaba console once:
+
+```bash
+sr qwen login --console-account you@example.com qwen-token:large-plan
+```
+
+Subrouter supplies the selected key to Bailian CLI, opens the international
+Alibaba browser flow, and stores the resulting console credential in an
+account-isolated profile. The optional sign-in label becomes the account name
+because Alibaba's console API exposes a stable billing instance ID but not the
+login email. If two keys share that label, their saved labels are appended to
+keep the rows distinct. Browser approval is the only manual step. Afterwards
+`sr status` reports the vendor-owned Lite/Pro plan and every rolling-window
+percentage and reset time Alibaba actually returns. A window omitted by Alibaba
+is omitted from the table rather than displayed as empty or inferred. `auth ok` means
+the vendor accepted that key for its authenticated model-list endpoint; it does
+not claim that a generation was spent or that quota remains. Other vendors
+remain `not exposed` when no quota API is available.
+
+Store multiple Qwen accounts with distinct labels; each key remains a separate
+schedulable account while the Token Plan's two protocol routes share that pool:
+
+```bash
+sr add-key --provider qwen-token  # enter label "large-plan"
+sr add-key --provider qwen-token  # enter label "small-plan"
+```
+
+Those saved labels remain the unique management identifiers; reusing one
+updates that account instead of creating a second one. `sr status` normally
+shows the friendlier console login, while list/remove commands use the same
+provider-qualified saved labels as other Subrouter accounts:
+
+```bash
+sr list
+sr remove qwen-token:small-plan
+```
+
+Point Qwen Code at Subrouter once, using any non-empty placeholder as the
+client-side key; the real plan keys remain in Subrouter. When Alibaba returns a
+429 for one plan account, Subrouter replays the generation request with another
+stored Qwen account and moves that sticky session to the successful account:
+
+```bash
+OPENAI_API_KEY=subrouter OPENAI_BASE_URL=http://127.0.0.1:31415/qwen-token/v1 qwen --auth-type openai
+```
+
+Standalone local status probes use the documented vendor default upstream;
+custom serving upstreams are not persisted into the CLI configuration.
+
+To put a new provider on an already-running macOS daemon, follow
+[docs/upgrades.md](docs/upgrades.md#replacing-the-binary-in-place-on-macos).
+Replacing a live executable with `cp` invalidates its code signature and macOS
+kills every respawn.
+
+### Two protocols against one subscription
+
+Some vendors serve the same subscription over both the OpenAI and the Anthropic
+wire protocol. Alibaba's Token Plan is the current example, which is why it has
+two entries: `/qwen-token` speaks OpenAI-compatible JSON, and
+`/qwen-anthropic` speaks Anthropic Messages. Subrouter forwards bodies
+unchanged, so an Anthropic-shaped client can run on that subscription without
+any translation in the proxy — the vendor does the adaptation:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:31415/qwen-anthropic \
+  ANTHROPIC_AUTH_TOKEN=subrouter claude
+```
+
+The two entries differ in one detail worth knowing if you add a provider like
+this. The OpenAI base already ends in `/v1`, so a client's own `/v1` is
+collapsed to avoid `/v1/v1`. The Anthropic base stops at `/apps/anthropic` and
+the client appends `/v1/messages` itself, so there the version segment is
+preserved — collapsing it produces the duplicated path the vendor documents as a
+404.
+
+### Declaring a provider without a release
+
+A provider whose only distinguishing feature is its base URL — a subscription
+plan on its own host, a self-hosted gateway, a relay — does not need code:
+
+```bash
+sr serve --openai-compatible acme=https://gateway.acme.test/v1
+sr serve --openai-compatible 'acme|acme-relay=https://gateway.acme.test/v1'
+```
+
+A declared provider gets the same routing, auth, lease, import, and CLI handling
+as a built-in one. A standalone local or remote `sr add-key --provider <name>`
+carries the validated custom name to the serving process, which accepts the
+account only when that process declared the provider. Declarations are rejected if they claim a name or path
+segment that Codex, Claude, or a built-in provider already routes on, since that
+would silently redirect traffic which already had a home. Providers are read on
+every request and declared once at startup, so they cannot change while the
+server is serving.
 
 ## Multi-tenant mode
 
