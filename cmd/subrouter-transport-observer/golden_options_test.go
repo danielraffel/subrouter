@@ -38,7 +38,7 @@ func TestGoldenOptionsRequireProductionPredecessorV0160(t *testing.T) {
 	}
 }
 
-func TestGoldenOptionsRequirePinnedCandidate(t *testing.T) {
+func TestGoldenOptionsRequireVersionedCandidate(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = false
 	t.Cleanup(func() { goldenTestHooks = previousHooks })
@@ -64,12 +64,21 @@ func TestGoldenOptionsRequirePinnedCandidate(t *testing.T) {
 	}
 	for index := range args {
 		if args[index] == "v0.1.129" {
-			args[index] = "v0.1.80"
+			args[index] = "latest"
 			break
 		}
 	}
 	if _, err := parseGoldenArgs(args); err == nil {
-		t.Fatal("previous v0.1.80 candidate was accepted")
+		t.Fatal("unversioned candidate was accepted")
+	}
+	for index := range args {
+		if args[index] == "latest" {
+			args[index] = "v0.1.130"
+			break
+		}
+	}
+	if _, err := parseGoldenArgs(args); err != nil {
+		t.Fatalf("v0.1.130 candidate was rejected: %v", err)
 	}
 }
 
