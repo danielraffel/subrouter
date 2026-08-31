@@ -85,17 +85,17 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 	if len(args) > 0 && args[0] == "proxy-scope" {
 		return r.printClaudeProxyScope()
 	}
-	if len(args) == 0 {
-		selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false)
-		if err != nil {
-			return err
-		}
-		return r.proxyClaudeSelectedRemote(ctx, nil, claudeProxyLaunchOptions{
-			expectedScope:      scope,
-			preferredAccountID: selector,
-		})
-	}
 	if claudeLaunchesAgent(args) {
+		if len(args) == 0 {
+			selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false)
+			if err != nil {
+				return err
+			}
+			return r.proxyClaudeSelectedRemote(ctx, nil, claudeProxyLaunchOptions{
+				expectedScope:      scope,
+				preferredAccountID: selector,
+			})
+		}
 		options, launchArgs, err := parseClaudeProxyLaunchArgs(args[1:])
 		if err != nil {
 			return err

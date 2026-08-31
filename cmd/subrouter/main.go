@@ -56,7 +56,10 @@ func main() {
 }
 
 func configureDefaultLogger(program string, args []string) {
-	if shouldUseProcessLogger(program, args) {
+	// Process-owned commands, including read-only isolation checks, must keep
+	// the logger installed by their caller. Creating the CLI file handler calls
+	// StateDir and creates durable state as a side effect.
+	if shouldKeepProcessLogger(program, args) {
 		return
 	}
 	path := filepath.Join(storepath.StateDir(), "logs", "subrouter-cli.log")
@@ -64,7 +67,7 @@ func configureDefaultLogger(program string, args []string) {
 	slog.SetDefault(slog.New(handler))
 }
 
-func shouldUseProcessLogger(_ string, args []string) bool {
+func shouldKeepProcessLogger(_ string, args []string) bool {
 	return isCodexIsolationCheckCommand(args) ||
 		(len(args) > 0 && (args[0] == "serve" || args[0] == "supervise" || args[0] == "front" || args[0] == "listener-transfer"))
 }

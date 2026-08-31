@@ -23,6 +23,11 @@ const (
 	subrouterCodexResumeCommandEnv = "SUBROUTER_CODEX_RESUME_COMMAND"
 )
 
+// ambientProxyEnvKeys covers the conventional upper- and lower-case spellings
+// used by HTTP clients. envWithout compares names case-insensitively, so one
+// entry per variable is sufficient.
+var ambientProxyEnvKeys = []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
+
 func codex(args []string) error {
 	bin := envOrDefault("SUBROUTER_CODEX_BIN", "codex")
 	if !codexInvocationUsesSubrouter(args) {
@@ -73,7 +78,7 @@ func directPlainHTTPEnvironment(environ []string, baseURL string) []string {
 	if err != nil || !strings.EqualFold(parsed.Scheme, "http") {
 		return environ
 	}
-	return envWithout(environ, []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"})
+	return envWithout(environ, ambientProxyEnvKeys)
 }
 
 func runCodexCommand(bin string, args, env []string) error {

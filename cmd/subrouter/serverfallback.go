@@ -204,9 +204,9 @@ func fallbackHTTPClient() *http.Client {
 	}
 }
 
-// claudeLaunchesAgent reports whether `sr claude <args>` requests the explicit
-// profileless proxy launcher. All other forms retain their profile-management
-// and direct managed-profile semantics without starting a Subrouter daemon.
+// claudeLaunchesAgent reports whether `sr claude <args>` launches Claude Code.
+// Bare invocation is the pooled interactive launcher. The explicit proxy form
+// is also profileless; all other forms retain profile-management semantics.
 func claudeLaunchesAgent(args []string) bool {
-	return len(args) > 0 && args[0] == "proxy"
+	return len(args) == 0 || args[0] == "proxy"
 }
