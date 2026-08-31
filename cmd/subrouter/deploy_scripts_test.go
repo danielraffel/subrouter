@@ -306,6 +306,10 @@ if [[ "${command_line}" == *"compute instance-groups describe"* ]]; then
   exit 0
 fi
 if [[ "${command_line}" == *"compute backend-services describe"* ]]; then
+  if [[ "${command_line}" == *"subrouter-backend"* ]]; then
+    printf '%s\n' '{"name":"subrouter-backend","portName":"http","protocol":"HTTP","backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone/instanceGroups/subrouter-ig"}]}'
+    exit 0
+  fi
   if [[ "${FAKE_POLICY_STATE:-valid}" == detached ]]; then
     printf '%s\n' '{"securityPolicy":"https://www.googleapis.com/compute/v1/projects/test-project/global/securityPolicies/other-policy"}'
     exit 0
