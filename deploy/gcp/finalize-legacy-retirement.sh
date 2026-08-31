@@ -244,7 +244,9 @@ wait_for_legacy_absence() {
     subrouter_systemd_socket_state_is_waitable "${socket_state}" \
       || die "legacy socket entered unexpected ${socket_state:-unknown} state during retirement"
     if [[ "${legacy_state}" == inactive && ( "${socket_state}" == inactive || "${socket_state}" == not-found ) ]]; then
-      gcloud_ssh "sudo test ! -S /var/lib/subrouter/supervisor.sock"
+      # The socket path may be stale after the supervisor exits. The installer
+      # checks unit state and kernel ownership before removing it.
+      cleanup_stopped_legacy_control
       return
     fi
     sleep 0.1

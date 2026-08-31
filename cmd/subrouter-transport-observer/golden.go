@@ -2270,7 +2270,6 @@ func (r *goldenRunner) stopSamplingEvidenceWriter() error {
 }
 
 func (r *goldenRunner) recordGoldenProcessSample(pid int) {
-	started := time.Now().UTC()
 	r.mu.Lock()
 	sessions := append([]*goldenSession(nil), r.sessions...)
 	r.mu.Unlock()
@@ -2284,18 +2283,22 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 		}
 	}
 	table, tableErr := loadGoldenProcessTable(requestedPIDs)
+	// The continuity interval describes completed process-table observations.
+	// Timestamping before a slow scan makes overlapping workers report a gap
+	// even when the observations themselves completed continuously.
+	sampledAt := time.Now().UTC()
 	bytes, processes, paused, err := measureGoldenProcessTree(table, pid)
 	if tableErr != nil {
 		err = tableErr
 	}
 	r.localRSSMu.Lock()
-	if started.After(r.localLastSample) {
+	if sampledAt.After(r.localLastSample) {
 		if !r.localLastSample.IsZero() {
-			if gap := started.Sub(r.localLastSample); gap > r.localMaxSampleGap {
+			if gap := sampledAt.Sub(r.localLastSample); gap > r.localMaxSampleGap {
 				r.localMaxSampleGap = gap
 			}
 		}
-		r.localLastSample = started
+		r.localLastSample = sampledAt
 	}
 	if err == nil {
 		if bytes > r.localPeakRSS {
@@ -2314,7 +2317,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 	r.localRSSMu.Unlock()
 	if err == nil {
 		r.recordSamplingEvidence(map[string]any{
-			"kind": "process_sample", "timestamp": started.Format(time.RFC3339Nano),
+			"kind": "process_sample", "timestamp": sampledAt.Format(time.RFC3339Nano),
 			"label": "local-daemon", "rss_bytes": bytes, "process_count": processes, "paused": paused,
 		})
 	}
@@ -2330,13 +2333,13 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 			continue
 		}
 		session.mu.Lock()
-		if started.After(session.lastProcessSample) {
+		if sampledAt.After(session.lastProcessSample) {
 			if !session.lastProcessSample.IsZero() {
-				if gap := started.Sub(session.lastProcessSample); gap > session.maxProcessSampleGap {
+				if gap := sampledAt.Sub(session.lastProcessSample); gap > session.maxProcessSampleGap {
 					session.maxProcessSampleGap = gap
 				}
 			}
-			session.lastProcessSample = started
+			session.lastProcessSample = sampledAt
 		}
 		if sessionErr == nil {
 			if sessionBytes > session.peakRSSBytes {
@@ -2355,7 +2358,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 		session.mu.Unlock()
 		if sessionErr == nil {
 			r.recordSamplingEvidence(map[string]any{
-				"kind": "process_sample", "timestamp": started.Format(time.RFC3339Nano),
+				"kind": "process_sample", "timestamp": sampledAt.Format(time.RFC3339Nano),
 				"label": session.label, "rss_bytes": sessionBytes,
 				"process_count": sessionProcesses, "paused": sessionPaused,
 			})
