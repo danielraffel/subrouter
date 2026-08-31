@@ -68,7 +68,7 @@ case "${INSTANCE}" in
     ACTIVE_MATCHER="${SUBROUTER_GCP_ACTIVE_MATCHER:?set SUBROUTER_GCP_ACTIVE_MATCHER}"
     CANARY_MATCHER="${SUBROUTER_GCP_CANARY_MATCHER:?set SUBROUTER_GCP_CANARY_MATCHER}"
     CANARY_HOST="${SUBROUTER_GCP_CANARY_HOST:?set SUBROUTER_GCP_CANARY_HOST}"
-    CANARY_SECURITY_POLICY="${SUBROUTER_GCP_CANARY_SECURITY_POLICY:?set SUBROUTER_GCP_CANARY_SECURITY_POLICY}"
+    CANARY_SECURITY_POLICY="${SUBROUTER_GCP_CANARY_SECURITY_POLICY:-}"
     ;;
 esac
 
@@ -114,6 +114,9 @@ canary_backend_url="${front_backend_url}"
 route_assignments_verified=false
 canary_present=false
 canary_access_control_json='null'
+backend_port_verified=false
+legacy_backend_port_name=""
+instance_group_http_port=0
 
 if [[ "${MODE}" == migrate-front ]]; then
   [[ "${legacy_refs}" == 1 && "${front_refs}" == 0 ]] || die "URL map is not exactly on the legacy backend"
@@ -133,6 +136,9 @@ if [[ "${MODE}" == migrate-front ]]; then
   route_assignments_verified=true
   jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' < <(stream_shell_value "${group_json}") >/dev/null \
     || die "legacy named port http:31415 is missing"
+  backend_port_verified=true
+  legacy_backend_port_name="http"
+  instance_group_http_port=31415
   front_state="$(gcloud_ssh "if systemctl is-active --quiet subrouter-front.service || sudo test -S /var/lib/subrouter/front.sock; then echo present; else echo absent; fi" | tail -n 1)"
   [[ "${front_state}" == absent ]] || die "front topology already exists; use a slot preflight or finish the existing migration"
   legacy_status="$(gcloud_ssh "systemctl is-active --quiet subrouter.service; sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
@@ -208,6 +214,22 @@ else
       ' < <(stream_shell_value "${url_map_json}"))" \
       || die "URL map active and canary assignments do not match the post-migration route"
     route_assignments_verified=true
+    [[ -n "${CANARY_SECURITY_POLICY}" ]] || die "canary security policy is not configured for the listener-takeover route"
+    backend_json="$("${GCLOUD_BINARY}" compute backend-services describe "${LEGACY_BACKEND_SERVICE}" \
+      --project "${PROJECT_ID}" --global --format=json)"
+    expected_group_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/zones/${ZONE}/instanceGroups/${INSTANCE_GROUP}"
+    jq -e --arg group_url "${expected_group_url}" \
+      '.portName == "http" and .protocol == "HTTP" and
+       (.backends | type == "array" and length == 1) and
+       .backends[0].group == $group_url' \
+      < <(stream_shell_value "${backend_json}") >/dev/null \
+      || die "legacy backend is not pinned to the http:31415 listener"
+    jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' \
+      < <(stream_shell_value "${group_json}") >/dev/null \
+      || die "instance group http:31415 mapping is missing"
+    backend_port_verified=true
+    legacy_backend_port_name="http"
+    instance_group_http_port=31415
     expected_policy_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/securityPolicies/${CANARY_SECURITY_POLICY}"
     backend_policy_json="$("${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
       --project "${PROJECT_ID}" --global --format=json)"
@@ -272,8 +294,11 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type deploy
   --arg legacy_backend_url "${legacy_backend_url}" --arg front_backend_url "${front_backend_url}" \
   --arg canary_matcher "${CANARY_MATCHER}" --arg canary_host "${CANARY_HOST}" \
   --arg canary_backend_url "${canary_backend_url}" \
+  --arg legacy_backend_port_name "${legacy_backend_port_name}" \
+  --argjson instance_group_http_port "${instance_group_http_port}" \
   --argjson canary_access_control "${canary_access_control_json}" \
   --argjson legacy_refs "${legacy_refs}" --argjson front_refs "${front_refs}" \
+  --argjson backend_port_verified "${backend_port_verified}" \
   --argjson route_assignments_verified "${route_assignments_verified}" \
   --argjson canary_present "${canary_present}" \
   --argjson topology "${topology}" --arg emitted_at "${emitted_at}" \
@@ -286,6 +311,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type deploy
       front_backend_references:$front_refs,active_matcher:$active_matcher,
       active_backend_url:$active_backend_url,legacy_backend_url:$legacy_backend_url,
       front_backend_url:$front_backend_url,route_assignments_verified:$route_assignments_verified,
+      backend_port_verified:$backend_port_verified,legacy_backend_port_name:$legacy_backend_port_name,
+      instance_group_http_port:$instance_group_http_port,
       canary:{present:$canary_present,host:$canary_host,matcher:$canary_matcher,
         backend_url:$canary_backend_url,access_control:$canary_access_control}},
       topology:$topology,evidence_emitted_at:$emitted_at}' \

@@ -1272,6 +1272,23 @@ def validate_preflight_routing(
     else:
         fail("preflight URL-map reference shape is unsupported")
     exact(active_backend_url, expected_active_url, "routing.active_backend_url")
+    backend_port_verified = boolean(
+        field(routing, "backend_port_verified", "routing"),
+        "routing.backend_port_verified",
+    )
+    backend_port_required = mode == "migrate-front" or expected_shape == (1, 1)
+    exact(backend_port_verified, backend_port_required, "routing.backend_port_verified")
+    port_name = field(routing, "legacy_backend_port_name", "routing")
+    port_number = field(routing, "instance_group_http_port", "routing")
+    if backend_port_required:
+        exact(text(port_name, "routing.legacy_backend_port_name"), "http",
+              "routing.legacy_backend_port_name")
+        exact(integer(port_number, "routing.instance_group_http_port"), 31415,
+              "routing.instance_group_http_port")
+    else:
+        exact(port_name, "", "routing.legacy_backend_port_name")
+        exact(integer(port_number, "routing.instance_group_http_port"), 0,
+              "routing.instance_group_http_port")
     canary_present = boolean(field(canary, "present", "routing.canary"), "routing.canary.present")
     exact(canary_present, expected_canary_present, "routing.canary.present")
     access_value = field(canary, "access_control", "routing.canary")
