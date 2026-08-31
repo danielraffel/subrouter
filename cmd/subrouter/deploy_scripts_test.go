@@ -283,6 +283,55 @@ func TestGCPPreflightAcceptsPostMigrationListenerTakeoverRoute(t *testing.T) {
 	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
 set -euo pipefail
 command_line="$*"
+if [[ "${command_line}" == *"compute url-maps export"* ]]; then
+  destination=""
+  for ((index = 1; index <= $#; index++)); do
+    if [[ "${!index}" == "--destination" ]]; then
+      next=$((index + 1))
+      destination="${!next}"
+      break
+    fi
+  done
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == reversed ]]; then
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+  name: subrouter-front-canary
+YAML
+  elif [[ "${FAKE_ROUTE_STATE:-valid}" == path-override ]]; then
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+  name: subrouter-front-canary
+  pathRules:
+  - paths:
+    - /override
+    service: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/other-backend
+YAML
+  else
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+  name: subrouter-front-canary
+YAML
+  fi
+  exit 0
+fi
 if [[ "${command_line}" == *"compute url-maps describe"* ]]; then
   if [[ "${FAKE_ROUTE_STATE:-valid}" == reversed ]]; then
     cat <<'JSON'
@@ -401,6 +450,7 @@ exit 1
 		"SUBROUTER_RELEASE_ATTESTATION_VERIFIED=true",
 		"SUBROUTER_RELEASE_IMMUTABLE=true",
 		"SUBROUTER_PUBLIC_BASE_URL=https://example.test",
+		"SUBROUTER_DEPLOY_ARTIFACT_DIR="+filepath.Dir(artifact),
 	)
 	output, err := command.CombinedOutput()
 	if err != nil {

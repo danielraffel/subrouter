@@ -105,6 +105,9 @@ curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/health" >/dev/null || die
 curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/ready" >/dev/null || die "public readiness failed"
 url_map_json="$("${GCLOUD_BINARY}" compute url-maps describe "${URL_MAP}" --project "${PROJECT_ID}" --global --format=json)"
 group_json="$("${GCLOUD_BINARY}" compute instance-groups describe "${INSTANCE_GROUP}" --project "${PROJECT_ID}" --zone "${ZONE}" --format=json)"
+URL_MAP_YAML="${ARTIFACT_DIR}/url-map-${RUN_LABEL}.yaml"
+"${GCLOUD_BINARY}" compute url-maps export "${URL_MAP}" --project "${PROJECT_ID}" --global \
+  --destination "${URL_MAP_YAML}" --quiet
 legacy_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/backendServices/${LEGACY_BACKEND_SERVICE}"
 front_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/backendServices/${FRONT_BACKEND_SERVICE}"
 legacy_refs="$(jq -r --arg value "${legacy_backend_url}" '[.. | strings | select(. == $value)] | length' < <(stream_shell_value "${url_map_json}"))"
@@ -120,19 +123,11 @@ instance_group_http_port=0
 
 if [[ "${MODE}" == migrate-front ]]; then
   [[ "${legacy_refs}" == 1 && "${front_refs}" == 0 ]] || die "URL map is not exactly on the legacy backend"
-  route_assignments_json="$(jq -c -e \
-    --arg active_matcher "${ACTIVE_MATCHER}" --arg legacy_url "${legacy_backend_url}" '
-      def active_backends:
-        if $active_matcher == "__root__"
-        then [(.defaultService // empty)]
-        else [.pathMatchers[]? | select(.name == $active_matcher) | .defaultService // empty]
-        end;
-      {active_backends: active_backends}
-      | select(.active_backends == [$legacy_url])
-      | {verified:true,active_backend:$legacy_url}
-    ' < <(stream_shell_value "${url_map_json}"))" \
+  active_backend_url="$(python3 "${SCRIPT_DIR}/url-map-routing.py" active-backend \
+    "${URL_MAP_YAML}" "${ACTIVE_MATCHER}")" \
+    || die "URL map active route could not be parsed"
+  [[ "${active_backend_url}" == "${legacy_backend_url}" ]] \
     || die "URL map active route does not point to the legacy backend"
-  active_backend_url="$(jq -r '.active_backend' < <(stream_shell_value "${route_assignments_json}"))"
   route_assignments_verified=true
   jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' < <(stream_shell_value "${group_json}") >/dev/null \
     || die "legacy named port http:31415 is missing"
@@ -165,54 +160,24 @@ else
   # listener owner. Keep accepting the direct-front shape for fresh topology
   # and older installations.
   routing_current=""
-  route_assignments_json='null'
   route_assignments_verified=false
   listener_takeover_verified=false
   listener_takeover_json='null'
   if [[ "${legacy_refs}" == 0 && "${front_refs}" == 1 ]]; then
     routing_current="front"
-    route_assignments_json="$(jq -c -e \
-      --arg active_matcher "${ACTIVE_MATCHER}" --arg front_url "${front_backend_url}" '
-        def active_backends:
-          if $active_matcher == "__root__"
-          then [(.defaultService // empty)]
-          else [.pathMatchers[]? | select(.name == $active_matcher) | .defaultService // empty]
-          end;
-        {active_backends: active_backends}
-        | select(.active_backends == [$front_url])
-        | {verified:true,active_backend:$front_url}
-      ' < <(stream_shell_value "${url_map_json}"))" \
+    active_backend_url="$(python3 "${SCRIPT_DIR}/url-map-routing.py" active-backend \
+      "${URL_MAP_YAML}" "${ACTIVE_MATCHER}")" \
+      || die "URL map active route could not be parsed"
+    [[ "${active_backend_url}" == "${front_backend_url}" ]] \
       || die "URL map active route does not point to the front backend"
     route_assignments_verified=true
   elif [[ "${legacy_refs}" == 1 && "${front_refs}" == 1 ]]; then
     routing_current="front-listener"
-    route_assignments_json="$(jq -c -e \
-      --arg active_matcher "${ACTIVE_MATCHER}" --arg canary_matcher "${CANARY_MATCHER}" \
-      --arg canary_host "${CANARY_HOST}" --arg legacy_url "${legacy_backend_url}" \
-      --arg front_url "${front_backend_url}" '
-        def active_backends:
-          if $active_matcher == "__root__"
-          then [(.defaultService // empty)]
-          else [.pathMatchers[]? | select(.name == $active_matcher) | .defaultService // empty]
-          end;
-        def canary_rules:
-          [.hostRules[]? | select(.pathMatcher == $canary_matcher)];
-        def canary_matchers:
-          [.pathMatchers[]? | select(.name == $canary_matcher)];
-        {active_backends: active_backends, canary_rules: canary_rules,
-         canary_matchers: canary_matchers}
-        | select(
-            .active_backends == [$legacy_url]
-            and (.canary_rules | length) == 1
-            and .canary_rules[0].hosts == [$canary_host]
-            and ((.canary_rules[0] | keys | sort) == ["hosts", "pathMatcher"])
-            and (.canary_matchers | length) == 1
-            and .canary_matchers[0].defaultService == $front_url
-            and ((.canary_matchers[0] | keys | sort) == ["defaultService", "name"])
-          )
-        | {verified:true,active_backend:$legacy_url,canary_backend:$front_url}
-      ' < <(stream_shell_value "${url_map_json}"))" \
+    python3 "${SCRIPT_DIR}/url-map-routing.py" assert-state \
+      "${URL_MAP_YAML}" "${ACTIVE_MATCHER}" "${legacy_backend_url}" \
+      "${CANARY_MATCHER}" "${CANARY_HOST}" "${front_backend_url}" \
       || die "URL map active and canary assignments do not match the post-migration route"
+    active_backend_url="${legacy_backend_url}"
     route_assignments_verified=true
     [[ -n "${CANARY_SECURITY_POLICY}" ]] || die "canary security policy is not configured for the listener-takeover route"
     backend_json="$("${GCLOUD_BINARY}" compute backend-services describe "${LEGACY_BACKEND_SERVICE}" \
@@ -245,7 +210,6 @@ else
   else
     die "URL map does not describe a supported post-migration route"
   fi
-  active_backend_url="$(jq -r '.active_backend' < <(stream_shell_value "${route_assignments_json}"))"
   canary_backend_url="${front_backend_url}"
   canary_present=false
   [[ "${routing_current}" == front-listener ]] && canary_present=true
