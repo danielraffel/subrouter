@@ -251,6 +251,7 @@ esac
 		t.Fatal(err)
 	}
 	if !result.Passed || !result.PrivateWorkspaceRemoved || !result.FreshLocalLeaseObserved ||
+		!result.HostedTenantLeaseObserved ||
 		!result.ReleaseChecksumVerified || result.ReleasedVersion != "9.9.9" || len(result.Sessions) != 15 {
 		t.Fatalf("incomplete result: %#v", result)
 	}

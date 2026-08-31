@@ -432,14 +432,17 @@ type goldenSummary struct {
 	Health                      []goldenProbeSummary    `json:"health"`
 	ProcessSnapshots            []goldenProcessEvidence `json:"process_snapshots"`
 	FreshLocalLeaseObserved     bool                    `json:"fresh_local_lease_observed"`
-	LegacyBrokerLeaseObserved   bool                    `json:"legacy_broker_lease_observed"`
-	PrivateWorkspaceRemoved     bool                    `json:"private_workspace_removed"`
-	DeploymentEnvironmentRead   bool                    `json:"deployment_environment_recorded"`
-	LocalDaemonPeakRSSBytes     int64                   `json:"local_daemon_peak_rss_bytes"`
-	LocalDaemonRSSSamples       int                     `json:"local_daemon_rss_samples"`
-	LocalDaemonProcessSamples   int                     `json:"local_daemon_process_samples"`
-	LocalDaemonMaxSampleGapMS   int64                   `json:"local_daemon_max_process_sample_gap_ms"`
-	LocalDaemonPausedSamples    int                     `json:"local_daemon_paused_samples"`
+	HostedTenantLeaseObserved   bool                    `json:"hosted_tenant_lease_observed"`
+	// LegacyBrokerLeaseObserved is retained for older evidence readers. The
+	// current team-mode gate sets HostedTenantLeaseObserved instead.
+	LegacyBrokerLeaseObserved bool  `json:"legacy_broker_lease_observed"`
+	PrivateWorkspaceRemoved   bool  `json:"private_workspace_removed"`
+	DeploymentEnvironmentRead bool  `json:"deployment_environment_recorded"`
+	LocalDaemonPeakRSSBytes   int64 `json:"local_daemon_peak_rss_bytes"`
+	LocalDaemonRSSSamples     int   `json:"local_daemon_rss_samples"`
+	LocalDaemonProcessSamples int   `json:"local_daemon_process_samples"`
+	LocalDaemonMaxSampleGapMS int64 `json:"local_daemon_max_process_sample_gap_ms"`
+	LocalDaemonPausedSamples  int   `json:"local_daemon_paused_samples"`
 }
 
 type goldenActionSummary struct {
@@ -1199,7 +1202,7 @@ func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs gol
 			if err != nil {
 				return nil, err
 			}
-			leaseBefore = len(goldenLeaseRequests(inputs.leaseObserver.stats))
+			leaseBefore = len(goldenHostedLeaseRequests(inputs.leaseObserver.stats))
 		}
 		observation, err := r.startObserver(label, upstream)
 		if err != nil {
@@ -1320,7 +1323,7 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 		return result, err
 	}
 	r.summary.FreshLocalLeaseObserved = true
-	r.summary.LegacyBrokerLeaseObserved = true
+	r.summary.HostedTenantLeaseObserved = true
 	all := append(append([]*goldenSession{}, initial...), result.fresh...)
 	if err := requireSessionsRunning(all, "rehearsal_activation"); err != nil {
 		return result, err
@@ -3707,11 +3710,15 @@ func requireGoldenSessionStartsAfter(session *goldenSession, boundary time.Time)
 func requireGoldenLeaseWindow(leaseObserver *runningGoldenObserver, requestStart, activated time.Time, beforeCount int) error {
 	requests, _, _ := leaseObserver.stats.snapshot()
 	leaseCount := 0
+	freshLeaseObserved := false
 	for _, request := range requests {
 		if request.Path == "/v1/responses" || request.Path == "/responses" {
 			return failGolden("local_route_bypassed_daemon")
 		}
-		if !goldenLeaseRequestPath(request.Path) {
+		if request.Path == "/api/subrouter/leases" {
+			return failGolden("candidate_lease_endpoint_substituted")
+		}
+		if request.Path != "/_subrouter/leases" {
 			continue
 		}
 		if request.Method != http.MethodPost {
@@ -3720,8 +3727,11 @@ func requireGoldenLeaseWindow(leaseObserver *runningGoldenObserver, requestStart
 		leaseCount++
 		stamp, _ := time.Parse(time.RFC3339Nano, request.Timestamp)
 		if !stamp.Before(requestStart) && !stamp.After(activated) && leaseCount > beforeCount {
-			return nil
+			freshLeaseObserved = true
 		}
+	}
+	if freshLeaseObserved {
+		return nil
 	}
 	return failGolden("activation_fresh_local_lease_missing")
 }
@@ -3738,7 +3748,8 @@ func requireGoldenLeaseObserversClean(hosted, legacy *runningGoldenObserver) err
 		observerRequestCount(legacy.stats, "/responses") != 0 {
 		return failGolden("local_route_bypassed_daemon")
 	}
-	if len(goldenLeaseRequests(legacy.stats)) != 0 {
+	if len(goldenLeaseRequests(hosted.stats)) != len(goldenHostedLeaseRequests(hosted.stats)) ||
+		len(goldenLeaseRequests(legacy.stats)) != 0 {
 		return failGolden("candidate_lease_endpoint_substituted")
 	}
 	return nil
@@ -3872,7 +3883,7 @@ func (r *goldenRunner) startSpanningLocalSession(
 		"kind": "local_egress_baseline", "timestamp": baseline.Timestamp,
 		"phase": phase, "remote_socket_ids": baseline.RemoteSocketIDs,
 	})
-	leaseBefore := len(goldenLeaseRequests(inputs.leaseObserver.stats))
+	leaseBefore := len(goldenHostedLeaseRequests(inputs.leaseObserver.stats))
 	session, err := r.startActivationSession(
 		ctx, inputs.name+"-candidate-local", "local-egress", inputs.clientPath, inputs.authData,
 		inputs.cloud, inputs.directConfigPath, inputs.teamConfigPath, inputs.hostedOrigin, inputs.localOrigin,
@@ -4995,7 +5006,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	if !finalCandidateSocketStable || len(finalCandidateTransportSocket) != 64 {
 		return failGolden("final_candidate_socket_continuity_invalid")
 	}
-	if len(expected) != 0 || !summary.FreshLocalLeaseObserved || !summary.LegacyBrokerLeaseObserved || summary.DeploymentEnvironmentRead {
+	if len(expected) != 0 || !summary.FreshLocalLeaseObserved || !summary.HostedTenantLeaseObserved || summary.DeploymentEnvironmentRead {
 		return failGolden("golden_evidence_incomplete")
 	}
 	if len(summary.ProcessSnapshots) == 0 {

@@ -100,6 +100,20 @@ func goldenLeaseRequests(stats *observerStats) []transportEvent {
 	return result
 }
 
+func goldenHostedLeaseRequests(stats *observerStats) []transportEvent {
+	if stats == nil {
+		return nil
+	}
+	requests, _, _ := stats.snapshot()
+	result := make([]transportEvent, 0, len(requests))
+	for _, request := range requests {
+		if request.Path == "/_subrouter/leases" {
+			result = append(result, request)
+		}
+	}
+	return result
+}
+
 func goldenResponseMethodMatchesTransport(method, transport string) bool {
 	switch transport {
 	case "websocket":
@@ -133,7 +147,7 @@ func (r *goldenRunner) prepareGoldenLocalEgressBinding(
 	if len(localUpstreamID) != 64 {
 		return nil, false, failGolden("local_egress_binding_invalid")
 	}
-	leases := goldenLeaseRequests(leaseObserver.stats)
+	leases := goldenHostedLeaseRequests(leaseObserver.stats)
 	if len(leases) < leaseBefore+1 {
 		return nil, false, nil
 	}
