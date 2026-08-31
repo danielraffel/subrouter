@@ -11,6 +11,11 @@ import (
 // transition, counter, session, and process requirements as the full gate,
 // but does not accept or require the one-time legacy migration evidence.
 func validateGoldenSlotOnlySummary(summary goldenSummary, testMode bool, bootstrapSHA, candidateTag, candidateSHA, candidateRevision string) error {
+	if summary.MigrationPreparation != (goldenActionSummary{}) ||
+		summary.MigrationFinalCutover != (goldenActionSummary{}) ||
+		summary.LegacyCleanup != (goldenActionSummary{}) {
+		return failGolden("slot_only_migration_evidence_present")
+	}
 	if summary.ReleasedVersion == "" || len(summary.ReleasedSHA256) != 64 ||
 		!summary.ReleaseChecksumVerified || summary.ReleasePlatform != "darwin/arm64" {
 		return failGolden("release_evidence_incomplete")
@@ -151,6 +156,7 @@ func validateGoldenSlotOnlySessions(sessions []goldenSessionSummary) (string, er
 			session.PeakRSSBytes > goldenCodexRSSLimitBytes || session.RSSSamples == 0 ||
 			session.ProcessSamples == 0 || session.PausedProcessSamples != 0 ||
 			session.MaxProcessSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+			session.MaxChunkGapMillis > session.AllowedChunkGapMillis ||
 			session.AllowedChunkGapMillis < goldenChunkGapFloor.Milliseconds() ||
 			session.DeployMaxChunkGapMillis > session.AllowedChunkGapMillis {
 			return "", fmt.Errorf("%w: invalid session %q", failGolden("session_evidence_incomplete"), session.Label)
@@ -225,11 +231,14 @@ func validateGoldenSlotOnlyProcessSnapshots(summary goldenSummary, finalCandidat
 			return failGolden("process_evidence_incomplete")
 		}
 		for _, state := range item.ProcessStates {
-			if state == "" || strings.HasPrefix(state, "T") {
+			if state == "" || strings.HasPrefix(strings.ToUpper(state), "T") {
 				return failGolden("paused_process_detected")
 			}
 		}
 		isObserver := strings.HasPrefix(item.Label, "observer-")
+		if !goldenSlotOnlyProcessSnapshotAllowed(item, required) {
+			return failGolden("process_evidence_incomplete")
+		}
 		if !isObserver && (len(item.DescendantPIDs) == 0 || item.RSSBytes <= 0 ||
 			item.RSSBytes > goldenProcessRSSLimit(item.Label)) {
 			return failGolden("socket_evidence_incomplete")
@@ -273,4 +282,32 @@ func validateGoldenSlotOnlyProcessSnapshots(summary goldenSummary, finalCandidat
 		}
 	}
 	return nil
+}
+
+func goldenSlotOnlyProcessSnapshotAllowed(item goldenProcessEvidence, required map[string]bool) bool {
+	if strings.HasPrefix(item.Label, "observer-") {
+		return item.Phase != "" && !strings.HasPrefix(item.Phase, "migration-")
+	}
+	key := item.Phase + "\x00" + item.Label
+	if _, ok := required[key]; ok {
+		return true
+	}
+	for _, cycle := range []string{"rehearsal", "final"} {
+		if item.Phase == cycle+"-provisional-activation" {
+			for _, label := range []string{
+				cycle + "-direct-websocket", cycle + "-direct-http",
+				cycle + "-local-websocket", cycle + "-local-http",
+				cycle + "-candidate-local", "local-daemon",
+			} {
+				if item.Label == label {
+					return true
+				}
+			}
+		}
+		if item.Phase == cycle+"-candidate-local-ready" &&
+			(item.Label == cycle+"-candidate-local" || item.Label == "local-daemon") {
+			return true
+		}
+	}
+	return false
 }

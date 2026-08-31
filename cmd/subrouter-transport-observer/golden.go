@@ -4937,6 +4937,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 			session.DuplicateMarkerCount != 0 || session.PeakRSSBytes <= 0 || session.PeakRSSBytes > goldenCodexRSSLimitBytes ||
 			session.RSSSamples == 0 || session.ProcessSamples == 0 || session.PausedProcessSamples != 0 ||
 			session.MaxProcessSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+			session.MaxChunkGapMillis > session.AllowedChunkGapMillis ||
 			session.AllowedChunkGapMillis < goldenChunkGapFloor.Milliseconds() ||
 			session.DeployMaxChunkGapMillis > session.AllowedChunkGapMillis {
 			return fmt.Errorf("%w: invalid session %q", failGolden("session_evidence_incomplete"), session.Label)

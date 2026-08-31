@@ -110,11 +110,18 @@ func TestGoldenSlotOptionsRequirePinnedCandidateAndBootstrap(t *testing.T) {
 }
 
 func TestGoldenSlotOnlySummaryFixtureIsValid(t *testing.T) {
+	summary := validGoldenSlotOnlyAcceptanceSummary()
+	if err := validateGoldenSlotOnlySummary(summary, false, goldenPinnedBootstrapLinuxSHA256,
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40)); err != nil {
+		t.Fatalf("valid slot-only fixture rejected: %v", err)
+	}
+}
+
+func validGoldenSlotOnlyAcceptanceSummary() goldenSummary {
 	summary := validGoldenAcceptanceSummary()
 	filteredSessions := summary.Sessions[:0]
 	for _, session := range summary.Sessions {
-		if !strings.HasPrefix(session.Label, "migration-") &&
-			session.Label != "migration-candidate-front-final-destination-direct" {
+		if !strings.HasPrefix(session.Label, "migration-") {
 			filteredSessions = append(filteredSessions, session)
 		}
 	}
@@ -129,17 +136,27 @@ func TestGoldenSlotOnlySummaryFixtureIsValid(t *testing.T) {
 	summary.MigrationPreparation = goldenActionSummary{}
 	summary.MigrationFinalCutover = goldenActionSummary{}
 	summary.LegacyCleanup = goldenActionSummary{}
-	if err := validateGoldenSlotOnlySummary(summary, false, goldenPinnedBootstrapLinuxSHA256,
-		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40)); err != nil {
-		t.Fatalf("valid slot-only fixture rejected: %v", err)
-	}
+	return summary
 }
 
 func TestGoldenSlotOnlySummaryRejectsUnverifiedBootstrap(t *testing.T) {
-	summary := validGoldenAcceptanceSummary()
-	if err := validateGoldenSlotOnlySummary(summary, false, strings.Repeat("d", 64),
-		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40)); err == nil {
-		t.Fatal("slot-only summary accepted an unverified bootstrap")
+	summary := validGoldenSlotOnlyAcceptanceSummary()
+	if got := fixedGoldenFailure(validateGoldenSlotOnlySummary(summary, false, strings.Repeat("d", 64),
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40))); got != "deployment_provenance_mismatch" {
+		t.Fatalf("failure = %q, want deployment_provenance_mismatch", got)
+	}
+}
+
+func TestGoldenSlotOnlySummaryRejectsChunkGapAboveAllowed(t *testing.T) {
+	summary := validGoldenSlotOnlyAcceptanceSummary()
+	for index := range summary.Sessions {
+		if summary.Sessions[index].Label == "rehearsal-direct-websocket" {
+			summary.Sessions[index].MaxChunkGapMillis = summary.Sessions[index].AllowedChunkGapMillis + 1
+		}
+	}
+	if got := fixedGoldenFailure(validateGoldenSlotOnlySummary(summary, false, goldenPinnedBootstrapLinuxSHA256,
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40))); got != "session_evidence_incomplete" {
+		t.Fatalf("failure = %q, want session_evidence_incomplete", got)
 	}
 }
 
