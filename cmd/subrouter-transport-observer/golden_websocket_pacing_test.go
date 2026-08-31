@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
@@ -111,6 +112,107 @@ func TestGoldenWebSocketFrameParserRejectsInvalidLength(t *testing.T) {
 	}
 	if err == io.EOF {
 		t.Fatal("parser reported an incomplete frame instead of invalid length")
+	}
+}
+
+func TestGoldenWebSocketFrameParserRejectsMalformedControlFrame(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "fragmented ping", frame: []byte{0x09, 0x00}},
+		{name: "oversized ping", frame: []byte{0x89, 126, 0, 126}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parser := goldenWebSocketFrameParser{}
+			if _, err := parser.append(test.frame); err == nil {
+				t.Fatal("parser accepted a malformed control frame")
+			}
+		})
+	}
+}
+
+type blockingObserverDelay struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (delay *blockingObserverDelay) wait(
+	ctx context.Context,
+	_ <-chan struct{},
+	_ <-chan struct{},
+	duration time.Duration,
+) error {
+	select {
+	case <-delay.started:
+	default:
+		close(delay.started)
+	}
+	select {
+	case <-delay.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestGoldenWebSocketPacerDoesNotBlockReadsDuringPacingDelay(t *testing.T) {
+	gate := newGoldenResponseGate()
+	base := gate.newResponsePacer("read-ahead-test")
+	delay := &blockingObserverDelay{started: make(chan struct{}), release: make(chan struct{})}
+	base.delay = delay
+	pacer := newGoldenWebSocketPacer(base)
+	controlWritten := make(chan struct{}, 1)
+	sink := func(payload []byte) (int, error) {
+		if bytes.Equal(payload, []byte{0x89, 0x00}) {
+			controlWritten <- struct{}{}
+		}
+		return len(payload), nil
+	}
+	data := make([]byte, 0, 100*3)
+	for index := 0; index < 100; index++ {
+		data = append(data, 0x81, 0x01, byte('a'+index%26))
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := pacer.write(context.Background(), data, sink)
+		firstDone <- err
+	}()
+	select {
+	case <-delay.started:
+	case <-time.After(time.Second):
+		t.Fatal("pacer did not enter a data pacing delay")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := pacer.write(context.Background(), []byte{0x89, 0x00}, sink)
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("control write: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("control write blocked behind a pacing interval")
+	}
+	select {
+	case <-controlWritten:
+	case <-time.After(time.Second):
+		t.Fatal("control frame was not delivered while data pacing was held")
+	}
+	close(delay.release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("data write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("data write did not finish after pacing release")
+	}
+	gate.releasePacing()
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatalf("waitAndFlush: %v", err)
 	}
 }
 
