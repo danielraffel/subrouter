@@ -180,6 +180,33 @@ func TestGoldenWebSocketPacerKeepsCloseFrameInHeldTail(t *testing.T) {
 	}
 }
 
+func TestGoldenWebSocketPacerDoesNotDelayQueuedPing(t *testing.T) {
+	gate := newGoldenResponseGate()
+	base := gate.newResponsePacer("queued-ping-test")
+	delay := &accumulatingObserverDelay{}
+	base.delay = delay
+	pacer := newGoldenWebSocketPacer(base)
+	sink := func(payload []byte) (int, error) { return len(payload), nil }
+	frames := make([]byte, 0, 300)
+	for index := 0; index < 100; index++ {
+		frames = append(frames, 0x81, 0x01, byte('a'+index%26))
+	}
+	if _, err := pacer.write(context.Background(), frames, sink); err != nil {
+		t.Fatalf("data write: %v", err)
+	}
+	beforePing := delay.elapsed
+	if _, err := pacer.write(context.Background(), []byte{0x89, 0x00}, sink); err != nil {
+		t.Fatalf("ping write: %v", err)
+	}
+	if delay.elapsed != beforePing {
+		t.Fatalf("queued Ping added a pacing delay: before=%s after=%s", beforePing, delay.elapsed)
+	}
+	gate.releasePacing()
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatalf("waitAndFlush: %v", err)
+	}
+}
+
 func TestGoldenWebSocketFrameParserRejectsOversizedFrames(t *testing.T) {
 	parser := goldenWebSocketFrameParser{}
 	length := uint64(goldenWebSocketMaxFrameBytes)

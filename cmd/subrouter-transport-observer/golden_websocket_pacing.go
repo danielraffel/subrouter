@@ -252,7 +252,8 @@ func (p *goldenWebSocketPacer) writeFrameLocked(ctx context.Context, frame []byt
 	if p.base.wasSuperseded() {
 		return len(frame), nil
 	}
-	if p.started && !p.base.isReleased() && !goldenWebSocketImmediateControlFrame(frame) {
+	if p.started && !p.base.isReleased() && !goldenWebSocketImmediateControlFrame(frame) &&
+		!p.hasPendingImmediateControlFrameLocked() && !goldenWebSocketImmediateControlFramePrefix(p.parser.pending) {
 		if err := p.base.delay.wait(ctx, p.base.gateReleased, p.base.requestReleased, p.base.interval); err != nil {
 			return 0, err
 		}
