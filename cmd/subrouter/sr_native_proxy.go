@@ -45,7 +45,8 @@ Antigravity currently has one router-host login, so --account pinning is not sup
 Launch Kimi Code through the selected Subrouter pool. Plain 'kimi' remains direct.
 Omit --account for pooled failover. A named account is pinned with no account failover;
 bare --account opens a pinned-account picker.
-The process-scoped model override leaves Kimi's normal login and config unchanged.
+The child gets a private routed-only home while its session store remains linked.
+Kimi credential, migration/update, ACP, web, and server modes require the plain direct CLI.
 Account affinity is stable per working directory, including resumed sessions.
 The session-picker form requires an explicit ID: sr kimi --session <session-id>.
 `
@@ -110,16 +111,43 @@ func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(vendorArgs) > 0 {
-		switch vendorArgs[0] {
-		case "login", "provider":
-			return fmt.Errorf("%q changes Kimi's local credentials; use plain 'kimi %s' for the direct CLI or 'sr kimi login <label>' to manage the routed pool", vendorArgs[0], vendorArgs[0])
+	if mode := kimiProxyReloadCapableMode(vendorArgs); mode != "" {
+		if mode == "login" || mode == "provider" {
+			return fmt.Errorf("%q changes Kimi's local credentials; use plain 'kimi %s' for the direct CLI or 'sr kimi login <label>' to manage the routed pool", mode, mode)
 		}
+		return fmt.Errorf("Kimi %s mode can start credential or provider control surfaces; use plain 'kimi %s' for the direct CLI", mode, mode)
 	}
 	if nativeProxyResumePickerRequested(kimiNativeProxy, vendorArgs) {
 		return errors.New("'sr kimi --session' requires an explicit session ID so Subrouter can preserve sticky account routing")
 	}
 	return r.launchNativeProxy(ctx, kimiNativeProxy, vendorArgs, options)
+}
+
+func kimiProxyReloadCapableMode(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			continue
+		}
+		switch arg {
+		case "-S", "--session", "-m", "--model", "-p", "--prompt", "--output-format",
+			"--skills-dir", "--agent", "--agent-file", "--add-dir":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		switch arg {
+		case "login", "provider", "acp", "web", "server", "migrate", "upgrade", "update":
+			return arg
+		default:
+			return ""
+		}
+	}
+	return ""
 }
 
 func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
@@ -465,10 +493,18 @@ func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, 
 			if resolveErr != nil {
 				return srServerConfig{}, false, resolveErr
 			}
-			if !remote {
-				return srServerConfig{}, false, errors.New("legacy remote credential storage has no selected server; run 'sr remote use <name>' or 'sr storage local'")
+			if remote {
+				return server, true, nil
 			}
-			return server, true, nil
+			// Match `sr status` and serving account commands: legacy mode with
+			// no selected remote uses the healthy local daemon as its serving
+			// authority. This remains an HTTP control/data-plane boundary; the
+			// launcher never treats its own default disk store as authoritative.
+			server, resolveErr = r.readyLocalServingServer(ctx, defaultDaemonStarter())
+			if resolveErr != nil {
+				return srServerConfig{}, false, resolveErr
+			}
+			return server, false, nil
 		}
 	}
 	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
@@ -892,9 +928,17 @@ func nativeProxyPinnedSessionID(pooledSessionID, accountID string) string {
 var nativeProxyRoutingEnvKeys = []string{
 	"CLOUD_CODE_URL",
 	"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH",
+	"KIMI_CODE_HOME", "KIMI_CODE_NO_AUTO_UPDATE",
+	"KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL",
+	"KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST", "KIMI_CODE_PASSWORD", "KIMI_REGISTRY_API_KEY",
 	"KIMI_CODE_BASE_URL", "KIMI_CODE_CUSTOM_HEADERS", "KIMI_API_KEY", "KIMI_BASE_URL",
 	"KIMI_MODEL_NAME", "KIMI_MODEL_API_KEY", "KIMI_MODEL_BASE_URL", "KIMI_MODEL_PROVIDER_TYPE",
-	"KIMI_MODEL_MAX_CONTEXT_SIZE", "KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY",
+	"KIMI_MODEL_ADAPTIVE_THINKING", "KIMI_MODEL_CAPABILITIES", "KIMI_MODEL_DISPLAY_NAME",
+	"KIMI_MODEL_MAX_COMPLETION_TOKENS", "KIMI_MODEL_MAX_CONTEXT_SIZE", "KIMI_MODEL_MAX_OUTPUT_SIZE",
+	"KIMI_MODEL_MAX_TOKENS", "KIMI_MODEL_OUTPUT_FORMAT", "KIMI_MODEL_REASONING_KEY",
+	"KIMI_MODEL_TEMPERATURE", "KIMI_MODEL_THINKING_EFFORT", "KIMI_MODEL_THINKING_KEEP", "KIMI_MODEL_TOP_P",
+	"KIMI_SECONDARY_MODEL", "KIMI_SECONDARY_EFFORT",
+	"KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY",
 	"KIMI_WEB_FETCH_BASE_URL", "KIMI_WEB_FETCH_API_KEY",
 	"QWEN_OAUTH", "QWEN_MODEL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
 	"OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
@@ -914,20 +958,28 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		}
 		return upsertEnv(env, "CLOUD_CODE_URL", providerURL), func() {}, nil
 	case accounts.ProviderKimi:
+		overlay, cleanup, err := prepareKimiProxyHome(environ)
+		if err != nil {
+			return nil, func() {}, err
+		}
 		for key, value := range map[string]string{
-			"KIMI_MODEL_NAME":             "k3",
-			"KIMI_MODEL_API_KEY":          "subrouter",
-			"KIMI_MODEL_BASE_URL":         providerURL + "/v1",
-			"KIMI_MODEL_PROVIDER_TYPE":    "kimi",
-			"KIMI_MODEL_MAX_CONTEXT_SIZE": "1048576",
-			"KIMI_WEB_SEARCH_BASE_URL":    providerURL + "/v1/search",
-			"KIMI_WEB_SEARCH_API_KEY":     "subrouter",
-			"KIMI_WEB_FETCH_BASE_URL":     providerURL + "/v1/fetch",
-			"KIMI_WEB_FETCH_API_KEY":      "subrouter",
+			"KIMI_CODE_HOME":                         overlay.home,
+			"KIMI_CODE_NO_AUTO_UPDATE":               "1",
+			"KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL": "1",
+			"KIMI_MODEL_NAME":                        "kimi-for-coding",
+			"KIMI_MODEL_API_KEY":                     "subrouter",
+			"KIMI_MODEL_BASE_URL":                    providerURL + "/v1",
+			"KIMI_MODEL_PROVIDER_TYPE":               "kimi",
+			"KIMI_MODEL_MAX_CONTEXT_SIZE":            "262144",
+			"KIMI_SECONDARY_MODEL":                   "__kimi_env_model__",
+			"KIMI_WEB_SEARCH_BASE_URL":               providerURL + "/v1/search",
+			"KIMI_WEB_SEARCH_API_KEY":                "subrouter",
+			"KIMI_WEB_FETCH_BASE_URL":                providerURL + "/v1/fetch",
+			"KIMI_WEB_FETCH_API_KEY":                 "subrouter",
 		} {
 			env = upsertEnv(env, key, value)
 		}
-		return env, func() {}, nil
+		return env, cleanup, nil
 	case accounts.ProviderQwenToken:
 		model := qwenProxyModel(args)
 		overlay, cleanup, err := prepareQwenProxyOverlay(providerURL+"/v1", model, environ)
@@ -974,6 +1026,174 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 	default:
 		return nil, func() {}, fmt.Errorf("unsupported native proxy provider %s", spec.provider)
 	}
+}
+
+const kimiProxyConfig = `default_model = "__kimi_env_model__"
+
+[secondary_model]
+default_model = "__kimi_env_model__"
+force = true
+`
+
+type kimiProxyOverlay struct {
+	home string
+}
+
+func prepareKimiProxyHome(environ []string) (kimiProxyOverlay, func(), error) {
+	if err := kimiProxySessionLinksSupported(runtime.GOOS); err != nil {
+		return kimiProxyOverlay{}, func() {}, err
+	}
+	sourceHome, err := kimiSourceHome(environ)
+	if err != nil {
+		return kimiProxyOverlay{}, func() {}, err
+	}
+	sessions, sessionIndex, err := ensureKimiSessionSource(sourceHome)
+	if err != nil {
+		return kimiProxyOverlay{}, func() {}, err
+	}
+	home, err := os.MkdirTemp("", "subrouter-kimi-proxy-")
+	if err != nil {
+		return kimiProxyOverlay{}, func() {}, fmt.Errorf("create temporary Kimi proxy home: %w", err)
+	}
+	// os.RemoveAll removes symlinks rather than following them and uses the
+	// platform's race-resistant directory removal implementation. The path is
+	// generated here, never accepted from user input.
+	cleanup := func() { _ = os.RemoveAll(home) }
+	if err := os.Chmod(home, 0o700); err != nil {
+		cleanup()
+		return kimiProxyOverlay{}, func() {}, fmt.Errorf("lock temporary Kimi proxy home: %w", err)
+	}
+	configPath := filepath.Join(home, "config.toml")
+	if err := writeFileAtomic(configPath, []byte(kimiProxyConfig), 0o600); err != nil {
+		cleanup()
+		return kimiProxyOverlay{}, func() {}, fmt.Errorf("write temporary Kimi proxy config: %w", err)
+	}
+	if err := os.Chmod(configPath, 0o600); err != nil {
+		cleanup()
+		return kimiProxyOverlay{}, func() {}, fmt.Errorf("lock temporary Kimi proxy config: %w", err)
+	}
+	// Kimi initializes its logger and query cache before the first request.
+	// Keep both child-local and writable. Kimi also needs its private root to
+	// remain writable for the workspace catalog it atomically updates below.
+	for _, name := range []string{"logs", "cache"} {
+		if err := os.Mkdir(filepath.Join(home, name), 0o700); err != nil {
+			cleanup()
+			return kimiProxyOverlay{}, func() {}, fmt.Errorf("create temporary Kimi %s directory: %w", name, err)
+		}
+	}
+	for name, target := range map[string]string{
+		"sessions":            sessions,
+		"session_index.jsonl": sessionIndex,
+	} {
+		if err := os.Symlink(target, filepath.Join(home, name)); err != nil {
+			cleanup()
+			return kimiProxyOverlay{}, func() {}, fmt.Errorf("link Kimi %s into routed home: %w", name, err)
+		}
+	}
+	if err := os.Chmod(configPath, 0o400); err != nil {
+		cleanup()
+		return kimiProxyOverlay{}, func() {}, fmt.Errorf("restrict temporary Kimi proxy config: %w", err)
+	}
+	// Keep the private root writable only to this child/user. Kimi 0.39
+	// atomically rewrites workspaces.json on every startup and cannot run in a
+	// read-only home. Because the home starts without provider/OAuth state and is
+	// removed with the child, any Kimi-managed in-session reconfiguration remains
+	// ephemeral instead of being loaded from or written to the real Kimi config.
+	return kimiProxyOverlay{home: home}, cleanup, nil
+}
+
+func kimiProxySessionLinksSupported(goos string) error {
+	if goos == "windows" {
+		return errors.New("sr kimi session isolation is not supported on Windows; use plain 'kimi' for the direct CLI")
+	}
+	return nil
+}
+
+func kimiSourceHome(environ []string) (string, error) {
+	home := strings.TrimSpace(envValue(environ, "KIMI_CODE_HOME"))
+	if home == "" {
+		userHome := strings.TrimSpace(envValue(environ, "HOME"))
+		if userHome == "" {
+			var err error
+			userHome, err = os.UserHomeDir()
+			if err != nil {
+				return "", fmt.Errorf("locate Kimi session home: %w", err)
+			}
+		}
+		home = filepath.Join(userHome, ".kimi-code")
+	}
+	absolute, err := filepath.Abs(home)
+	if err != nil {
+		return "", fmt.Errorf("resolve Kimi session home: %w", err)
+	}
+	absolute = filepath.Clean(absolute)
+	if absolute == filepath.Dir(absolute) {
+		return "", errors.New("Kimi session home cannot be a filesystem root")
+	}
+	if err := os.MkdirAll(absolute, 0o700); err != nil {
+		return "", fmt.Errorf("create Kimi session home: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("validate Kimi session home: %w", err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("Kimi session home is not a directory")
+	}
+	return resolved, nil
+}
+
+func ensureKimiSessionSource(home string) (string, string, error) {
+	sessions := filepath.Join(home, "sessions")
+	if err := ensureKimiSessionDirectory(sessions); err != nil {
+		return "", "", err
+	}
+	index := filepath.Join(home, "session_index.jsonl")
+	if err := ensureKimiSessionIndex(index); err != nil {
+		return "", "", err
+	}
+	return sessions, index, nil
+}
+
+func ensureKimiSessionDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("create Kimi sessions directory: %w", err)
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return fmt.Errorf("validate Kimi sessions directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("Kimi sessions path must be a direct directory, not a link or other file")
+	}
+	return nil
+}
+
+func ensureKimiSessionIndex(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		file, createErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if createErr != nil && !errors.Is(createErr, os.ErrExist) {
+			return fmt.Errorf("create Kimi session index: %w", createErr)
+		}
+		if createErr == nil {
+			if closeErr := file.Close(); closeErr != nil {
+				return fmt.Errorf("close Kimi session index: %w", closeErr)
+			}
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return fmt.Errorf("validate Kimi session index: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("Kimi session index must be a direct regular file, not a link or other file")
+	}
+	return nil
 }
 
 func antigravityDirectProviderConflict(environ []string) (string, error) {

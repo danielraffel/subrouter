@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -624,10 +626,14 @@ func TestNativeProxyServerHonorsExplicitLocalOverLegacyStorage(t *testing.T) {
 	}
 }
 
-func TestNativeProxyServerRejectsUnselectedLegacyAuthority(t *testing.T) {
+func TestNativeProxyServerUsesReadyLocalServingAuthorityForUnselectedLegacy(t *testing.T) {
 	var localRequests atomic.Int32
-	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		localRequests.Add(1)
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(w, request)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer local.Close()
@@ -638,12 +644,15 @@ func TestNativeProxyServerRejectsUnselectedLegacyAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, err := (srRunner{store: accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}, errOut: io.Discard}).nativeProxyServer(t.Context())
-	if err == nil || !strings.Contains(err.Error(), "no selected server") {
-		t.Fatalf("unselected legacy authority error = %v", err)
+	server, remote, err := (srRunner{store: accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}, errOut: io.Discard}).nativeProxyServer(t.Context())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if localRequests.Load() != 0 {
-		t.Fatalf("unselected legacy authority silently probed local %d time(s)", localRequests.Load())
+	if remote || !sameEndpoint(server.URL, local.URL) {
+		t.Fatalf("native proxy server = %+v remote=%t, want ready local serving authority", server, remote)
+	}
+	if localRequests.Load() == 0 {
+		t.Fatal("unselected legacy authority did not health-check the local daemon")
 	}
 }
 
@@ -679,12 +688,17 @@ func TestNativeProxyServerUsesHostedAuthorityWithoutLegacyRegistry(t *testing.T)
 }
 
 func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t *testing.T) {
+	kimiSourceHome := filepath.Join(t.TempDir(), "kimi-home")
+	kimiSourceHome = prepareKimiTestSessionHome(t, kimiSourceHome)
 	original := []string{
-		"PATH=/usr/bin", "KEEP_ME=yes", "KIMI_CODE_HOME=/custom/kimi-home", "QWEN_HOME=/custom/qwen-home",
+		"PATH=/usr/bin", "KEEP_ME=yes", "KIMI_CODE_HOME=" + kimiSourceHome, "QWEN_HOME=/custom/qwen-home",
 		"OPENAI_API_KEY=real-openai-secret", "OPENAI_BASE_URL=https://vendor.invalid/v1",
 		"OPENAI_ORG_ID=direct-org-secret", "OPENAI_PROJECT_ID=direct-project-secret",
 		"BAILIAN_CODING_PLAN_API_KEY=real-coding-plan-secret",
 		"BAILIAN_TOKEN_PLAN_API_KEY=real-bailian-secret", "KIMI_MODEL_API_KEY=real-kimi-secret",
+		"KIMI_MODEL_MAX_CONTEXT_SIZE=999999", "KIMI_MODEL_CAPABILITIES=direct-tools",
+		"KIMI_SECONDARY_MODEL=direct/secondary", "KIMI_CODE_OAUTH_HOST=https://oauth.invalid",
+		"KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=0",
 		"KIMI_CODE_CUSTOM_HEADERS=X-Direct-Gateway-Secret: custom-header-secret",
 		"HTTP_PROXY=http://credential-sink.invalid", "https_proxy=http://credential-sink.invalid",
 		"ALL_PROXY=socks5://credential-sink.invalid", "NO_PROXY=vendor.invalid",
@@ -771,17 +785,293 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		t.Fatal(err)
 	}
 	defer kimiCleanup()
-	if got := testEnvValue(kimiEnv, "KIMI_CODE_HOME"); got != "/custom/kimi-home" {
-		t.Fatalf("KIMI_CODE_HOME = %q, want the user's unchanged session home", got)
+	kimiChildHome := testEnvValue(kimiEnv, "KIMI_CODE_HOME")
+	if kimiChildHome == "" || kimiChildHome == kimiSourceHome || !strings.HasPrefix(filepath.Base(kimiChildHome), "subrouter-kimi-proxy-") {
+		t.Fatalf("KIMI_CODE_HOME = %q, want a fresh routed child home distinct from %q", kimiChildHome, kimiSourceHome)
 	}
 	if got := testEnvValue(kimiEnv, "KIMI_MODEL_API_KEY"); got != "subrouter" {
 		t.Fatalf("KIMI_MODEL_API_KEY = %q", got)
 	}
+	for key, want := range map[string]string{
+		"KIMI_CODE_NO_AUTO_UPDATE":               "1",
+		"KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL": "1",
+		"KIMI_MODEL_NAME":                        "kimi-for-coding",
+		"KIMI_MODEL_MAX_CONTEXT_SIZE":            "262144",
+		"KIMI_SECONDARY_MODEL":                   "__kimi_env_model__",
+	} {
+		if got := testEnvValue(kimiEnv, key); got != want {
+			t.Fatalf("Kimi child %s = %q, want %q", key, got, want)
+		}
+	}
 	joinedKimi := strings.Join(kimiEnv, "\n")
-	for _, secret := range []string{"real-kimi-secret", "custom-header-secret"} {
+	for _, secret := range []string{"real-kimi-secret", "custom-header-secret", "direct-tools", "direct/secondary", "oauth.invalid"} {
 		if strings.Contains(joinedKimi, secret) {
 			t.Fatalf("Kimi child environment retained direct credential %q", secret)
 		}
+	}
+}
+
+func TestKimiProxyHomeIsolatesCatalogAndCredentialsWhileLinkingOnlySessions(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "real-kimi-home")
+	source = prepareKimiTestSessionHome(t, source)
+	sourceConfig := []byte("default_model = \"direct/private-model\"\n[providers.direct]\napi_key = \"real-secret\"\n")
+	if err := os.WriteFile(filepath.Join(source, "config.toml"), sourceConfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(source, "oauth"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "oauth", "kimi-code"), []byte("real-oauth-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	indexBefore, err := os.ReadFile(filepath.Join(source, "session_index.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(source, "sessions", "existing-session")
+	if err := os.WriteFile(marker, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	overlay, cleanup, err := prepareKimiProxyHome([]string{"KIMI_CODE_HOME=" + source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(overlay.home, "config.toml")
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if string(config) != kimiProxyConfig || strings.Contains(string(config), "direct") || strings.Contains(string(config), "api_key") || strings.Contains(string(config), "oauth") {
+		cleanup()
+		t.Fatalf("routed Kimi config was not minimal and isolated:\n%s", config)
+	}
+	for path, wantPerm := range map[string]os.FileMode{overlay.home: 0o700, configPath: 0o400} {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			cleanup()
+			t.Fatal(statErr)
+		}
+		if got := info.Mode().Perm(); got != wantPerm {
+			cleanup()
+			t.Fatalf("%s permissions = %o, want %o", path, got, wantPerm)
+		}
+	}
+	for name, want := range map[string]string{
+		"sessions":            filepath.Join(source, "sessions"),
+		"session_index.jsonl": filepath.Join(source, "session_index.jsonl"),
+	} {
+		got, readErr := os.Readlink(filepath.Join(overlay.home, name))
+		if readErr != nil || got != want {
+			cleanup()
+			t.Fatalf("routed Kimi %s link = %q, %v; want %q", name, got, readErr, want)
+		}
+	}
+	for _, forbidden := range []string{"oauth", "device_id", "tui.toml", "mcp.json"} {
+		if _, statErr := os.Lstat(filepath.Join(overlay.home, forbidden)); !errors.Is(statErr, os.ErrNotExist) {
+			cleanup()
+			t.Fatalf("routed Kimi home exposed %s: %v", forbidden, statErr)
+		}
+	}
+	// Kimi requires a writable root for its own atomic workspace catalog. Prove
+	// that even a deliberate child-local credential write stays inside the
+	// disposable home and cannot replace the user's real OAuth state.
+	if err := os.Mkdir(filepath.Join(overlay.home, "oauth"), 0o700); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(overlay.home, "oauth", "ephemeral"), []byte("child-only"), 0o600); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	cleanup()
+	if _, err := os.Lstat(overlay.home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("routed Kimi home survived cleanup: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(source, "config.toml")); err != nil || !bytes.Equal(got, sourceConfig) {
+		t.Fatalf("real Kimi config changed: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(source, "session_index.jsonl")); err != nil || !bytes.Equal(got, indexBefore) {
+		t.Fatalf("real Kimi session index changed during overlay setup/cleanup: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "keep me" {
+		t.Fatalf("real Kimi session content changed: %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(source, "oauth", "kimi-code")); err != nil || string(got) != "real-oauth-token" {
+		t.Fatalf("real Kimi OAuth content changed: %q, %v", got, err)
+	}
+}
+
+func TestKimiProxyCleanupNeverFollowsChildSymlinks(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "real-kimi-home")
+	source = prepareKimiTestSessionHome(t, source)
+	overlay, cleanup, err := prepareKimiProxyHome([]string{"KIMI_CODE_HOME=" + source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	externalMarker := filepath.Join(external, "must-survive")
+	if err := os.WriteFile(externalMarker, []byte("safe"), 0o600); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.Chmod(overlay.home, 0o700); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	localDir := filepath.Join(overlay.home, "logs")
+	if err := os.Symlink(external, filepath.Join(localDir, "outside")); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.Chmod(overlay.home, 0o500); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	cleanup()
+	if got, err := os.ReadFile(externalMarker); err != nil || string(got) != "safe" {
+		t.Fatalf("child cleanup followed an external symlink: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(source, "sessions")); err != nil {
+		t.Fatalf("child cleanup followed the real sessions link: %v", err)
+	}
+}
+
+func TestKimiProxyCleanupDoesNotFollowReplacedRoot(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "real-kimi-home")
+	source = prepareKimiTestSessionHome(t, source)
+	overlay, cleanup, err := prepareKimiProxyHome([]string{"KIMI_CODE_HOME=" + source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	detached := overlay.home + "-detached"
+	if err := os.Rename(overlay.home, detached); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(detached) })
+	external := t.TempDir()
+	marker := filepath.Join(external, "must-survive")
+	if err := os.WriteFile(marker, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, overlay.home); err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "safe" {
+		t.Fatalf("cleanup followed a replaced root: %q, %v", got, err)
+	}
+	if _, err := os.Lstat(overlay.home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement link survived cleanup: %v", err)
+	}
+}
+
+func TestKimiProxySessionLinksFailClosedOnWindows(t *testing.T) {
+	err := kimiProxySessionLinksSupported("windows")
+	if err == nil || !strings.Contains(err.Error(), "not supported on Windows") {
+		t.Fatalf("Windows session-link gate = %v", err)
+	}
+	if err := kimiProxySessionLinksSupported("darwin"); err != nil {
+		t.Fatalf("Darwin session-link gate = %v", err)
+	}
+	if err := kimiProxySessionLinksSupported("linux"); err != nil {
+		t.Fatalf("Linux session-link gate = %v", err)
+	}
+}
+
+func TestKimiProxyHomesAreUniqueAcrossConcurrentLaunches(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "real-kimi-home")
+	source = prepareKimiTestSessionHome(t, source)
+	type result struct {
+		overlay kimiProxyOverlay
+		cleanup func()
+		err     error
+	}
+	results := make(chan result, 2)
+	var start sync.WaitGroup
+	start.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			start.Done()
+			start.Wait()
+			overlay, cleanup, err := prepareKimiProxyHome([]string{"KIMI_CODE_HOME=" + source})
+			results <- result{overlay: overlay, cleanup: cleanup, err: err}
+		}()
+	}
+	first := <-results
+	second := <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent Kimi homes failed: %v / %v", first.err, second.err)
+	}
+	defer second.cleanup()
+	if first.overlay.home == second.overlay.home {
+		first.cleanup()
+		t.Fatalf("concurrent Kimi launches shared home %q", first.overlay.home)
+	}
+	first.cleanup()
+	if _, err := os.Stat(filepath.Join(second.overlay.home, "config.toml")); err != nil {
+		t.Fatalf("cleaning one Kimi home removed the other: %v", err)
+	}
+	if got, err := os.Readlink(filepath.Join(second.overlay.home, "sessions")); err != nil || got != filepath.Join(source, "sessions") {
+		t.Fatalf("second Kimi session link = %q, %v", got, err)
+	}
+}
+
+func TestKimiSessionIndexFirstCreationIsConcurrentSafe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session_index.jsonl")
+	const launches = 8
+	errorsSeen := make(chan error, launches)
+	var start sync.WaitGroup
+	start.Add(launches)
+	for i := 0; i < launches; i++ {
+		go func() {
+			start.Done()
+			start.Wait()
+			errorsSeen <- ensureKimiSessionIndex(path)
+		}()
+	}
+	for i := 0; i < launches; i++ {
+		if err := <-errorsSeen; err != nil {
+			t.Fatalf("concurrent first Kimi session-index creation failed: %v", err)
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("concurrent Kimi session index = %v, %v", info, err)
+	}
+}
+
+func TestKimiProxySessionLinksRejectIndirectSources(t *testing.T) {
+	for _, name := range []string{"sessions", "session_index.jsonl"} {
+		t.Run(name, func(t *testing.T) {
+			source := filepath.Join(t.TempDir(), "real-kimi-home")
+			if err := os.MkdirAll(source, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			external := t.TempDir()
+			if name == "sessions" {
+				if err := os.WriteFile(filepath.Join(source, "session_index.jsonl"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Mkdir(filepath.Join(source, "sessions"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(external, "index"), []byte("keep"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				external = filepath.Join(external, "index")
+			}
+			if err := os.Symlink(external, filepath.Join(source, name)); err != nil {
+				t.Fatal(err)
+			}
+			_, cleanup, err := prepareKimiProxyHome([]string{"KIMI_CODE_HOME=" + source})
+			cleanup()
+			if err == nil || !strings.Contains(err.Error(), "not a link") {
+				t.Fatalf("indirect %s source error = %v", name, err)
+			}
+		})
 	}
 }
 
@@ -858,6 +1148,29 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 	for _, args := range [][]string{{"-p", "serve"}, {"--model", "serve", "--continue"}, {"--", "--acp"}} {
 		if qwenProxyReloadCapableMode(args) {
 			t.Fatalf("ordinary Qwen args %q classified as reload-capable", args)
+		}
+	}
+}
+
+func TestKimiProxyRejectsCredentialAndServerModesBeforeLaunch(t *testing.T) {
+	for _, args := range [][]string{
+		{"login"}, {"--yolo", "provider"}, {"--", "acp"}, {"--auto", "web"}, {"--plan", "server"},
+		{"migrate"}, {"upgrade"}, {"update"},
+	} {
+		mode := kimiProxyReloadCapableMode(args)
+		if mode == "" {
+			t.Fatalf("Kimi control mode %q was not detected", args)
+		}
+		err := (srRunner{}).launchKimiProxy(t.Context(), args)
+		if err == nil || !strings.Contains(err.Error(), "plain 'kimi "+mode+"'") {
+			t.Fatalf("Kimi control mode %q error = %v", args, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"-p", "login"}, {"--model", "web", "--continue"}, {"--agent", "server", "--continue"}, {"export", "session-id"},
+	} {
+		if mode := kimiProxyReloadCapableMode(args); mode != "" {
+			t.Fatalf("ordinary Kimi args %q classified as %q", args, mode)
 		}
 	}
 }
@@ -1062,4 +1375,19 @@ func testEnvEntry(environ []string, key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func prepareKimiTestSessionHome(t *testing.T, home string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(home, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "session_index.jsonl"), []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
 }

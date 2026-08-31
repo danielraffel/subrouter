@@ -651,9 +651,23 @@ email or account name from undocumented token contents. Each profile refreshes
 atomically and is independently schedulable; `active` means a persistent session
 is assigned, `rec` is the next eligible profile, and `ready` means authenticated
 with quota but currently idle.
-Plain `kimi` remains direct. `sr kimi` uses a process-only model override
-for the selected Subrouter, including resumed sessions, without rewriting
-`~/.kimi-code` or changing its global OAuth login.
+Plain `kimi` remains direct. Each `sr kimi` launch gets a fresh private
+`KIMI_CODE_HOME` containing only a routed model config, so Kimi does not
+automatically load the user's provider catalog, OAuth token, or other global
+Kimi settings. This is configuration isolation, not an OS sandbox: the child
+still runs as the user and has the user's ordinary filesystem access. The
+child links only the validated `sessions/` directory and
+`session_index.jsonl`, so existing and newly written sessions remain resumable
+without copying or rewriting the rest of `~/.kimi-code`. Cleanup removes only
+the child-local tree and never follows those links. Routed Kimi uses the common
+`kimi-for-coding` model with a 262144-token context for both managed OAuth and
+verified coding-key accounts, forces the same routed model for subagents, and
+disables auto-update for the child. Credential/provider control,
+migration/update, and long-lived server modes (`login`, `provider`, `migrate`,
+`upgrade`, `update`, `acp`, `web`, and `server`) are rejected;
+use plain `kimi` for those direct operations.
+This session-link boundary currently requires macOS or Linux; `sr kimi` fails
+closed on Windows while plain `kimi` remains available there.
 The default launch is pooled and may fail over. `sr kimi --account work` pins
 that child to the exact routed profile or key with no account failover; bare
 `--account` opens a pinned-account picker. This per-launch pin does not change
