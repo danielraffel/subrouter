@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1146,6 +1147,23 @@ func TestGoldenLocalLeaseObserverRequiresLegacyPost(t *testing.T) {
 		0,
 	); err == nil {
 		t.Fatal("accepted a non-POST v0.1.60 lease request")
+	}
+}
+
+func TestGoldenLocalLeaseObserverAcceptsHostedTenantPost(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: http.MethodPost, Path: "/_subrouter/leases",
+	})
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err != nil {
+		t.Fatalf("hosted tenant lease POST was rejected: %v", err)
 	}
 }
 
