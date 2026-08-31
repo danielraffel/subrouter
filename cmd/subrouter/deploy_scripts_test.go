@@ -307,6 +307,10 @@ if [[ "${command_line}" == *"compute instance-groups describe"* ]]; then
 fi
 if [[ "${command_line}" == *"compute backend-services describe"* ]]; then
   if [[ "${command_line}" == *"subrouter-backend"* ]]; then
+    if [[ "${FAKE_BACKEND_STATE:-valid}" == wrong-port ]]; then
+      printf '%s\n' '{"name":"subrouter-backend","portName":"https","protocol":"HTTP","backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone/instanceGroups/subrouter-ig"}]}'
+      exit 0
+    fi
     printf '%s\n' '{"name":"subrouter-backend","portName":"http","protocol":"HTTP","backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone/instanceGroups/subrouter-ig"}]}'
     exit 0
   fi
@@ -464,6 +468,16 @@ exit 1
 	detachedPolicy.Env = append(command.Env, "FAKE_POLICY_STATE=detached")
 	if output, err := detachedPolicy.CombinedOutput(); err == nil {
 		t.Fatalf("detached canary policy was accepted:\n%s", output)
+	}
+
+	wrongBackend := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "wrong-backend.json"),
+	)
+	wrongBackend.Env = append(command.Env, "FAKE_BACKEND_STATE=wrong-port")
+	if output, err := wrongBackend.CombinedOutput(); err == nil {
+		t.Fatalf("legacy backend with the wrong port name was accepted:\n%s", output)
 	}
 }
 
