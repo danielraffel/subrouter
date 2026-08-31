@@ -377,6 +377,23 @@ func (r *AccountRef) kimiStore() agentkimi.Store {
 	return agentkimi.ServingStore()
 }
 
+func (r *AccountRef) hasOAuthUsageSource(provider accounts.Provider) bool {
+	if provider == "" || provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
+		return true
+	}
+	if r == nil {
+		return false
+	}
+	for _, source := range r.oauthSources {
+		if source.Provider() != provider {
+			continue
+		}
+		_, ok := source.(OAuthUsageSource)
+		return ok
+	}
+	return false
+}
+
 // OAuthAccountSource is one provider's OAuth credential store. Claude and
 // Codex predate it and keep their bespoke wiring; every OAuth provider added
 // since (Kimi, Antigravity, Grok) plugs in here instead of growing another
@@ -1993,7 +2010,8 @@ func (s Server) withSessionCounts(statuses []AccountUsageStatus) []AccountUsageS
 	for i := range out {
 		out[i].AssignedSessions = counts[selectacct.ScoreKey(accountProviderFor(out[i].Provider), out[i].ID)]
 		out[i].SessionsKnown = true
-		if out[i].Provider == accounts.ProviderKimi || (out[i].Provider == accounts.ProviderGrok && out[i].AuthMode == accounts.AuthModeOAuth) {
+		if out[i].Provider == accounts.ProviderKimi || out[i].Provider == accounts.ProviderAntigravity ||
+			(out[i].Provider == accounts.ProviderGrok && out[i].AuthMode == accounts.AuthModeOAuth) {
 			out[i].Active = out[i].AssignedSessions > 0
 		}
 	}
@@ -3220,6 +3238,21 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 					setZeroScore(scores, scoreByID, schedulerAccountProvider(account.Provider), account.ID)
 					scoreMu.Unlock()
 				}
+				return
+			}
+			if !s.AccountRef.hasOAuthUsageSource(refreshed.Provider) {
+				// Credential-only OAuth providers deliberately publish no quota API.
+				// A successful refresh is enough to restore routing eligibility; do
+				// not call the generic usage dispatcher and log its expected
+				// OAuth-usage-unavailable sentinel on every scoring sweep.
+				scoreMu.Lock()
+				if idx, ok := scoreByID[selectacct.ScoreKey(schedulerAccountProvider(refreshed.Provider), refreshed.ID)]; ok {
+					scores[idx].Headroom = 1
+					scores[idx].ShortHeadroom = 1
+					scores[idx].Fresh = false
+					scored++
+				}
+				scoreMu.Unlock()
 				return
 			}
 			windows, fresh, err := s.fetchAccountUsageWindows(sweepCtx, client, refreshed)

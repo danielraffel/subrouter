@@ -608,3 +608,21 @@ func TestOAuthClientFromEnvRequiresBothValues(t *testing.T) {
 		t.Fatal("a client id without a secret must not be used")
 	}
 }
+
+func TestCredentialDisplayLabelUsesSafeStoredIdentityClaim(t *testing.T) {
+	encode := func(claims string) string {
+		return "header." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".signature"
+	}
+	if got := credentialDisplayLabel(CredentialInfo{IDToken: encode(`{"email":"person@example.test"}`)}); got != "person@example.test" {
+		t.Fatalf("label = %q", got)
+	}
+	for _, token := range []string{
+		"not-a-jwt",
+		encode(`{"email":"not-an-email"}`),
+		encode("{\"email\":\"unsafe@example.test\\nspoof\"}"),
+	} {
+		if got := credentialDisplayLabel(CredentialInfo{IDToken: token}); got != "router agy login" {
+			t.Fatalf("unsafe token label = %q", got)
+		}
+	}
+}

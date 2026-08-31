@@ -3,6 +3,7 @@ package antigravity
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -452,8 +453,42 @@ func credentialAccount(credential CredentialInfo) account.Account {
 		ID:       accountID,
 		Provider: account.ProviderAntigravity,
 		AuthMode: account.AuthModeOAuth,
-		Label:    "Antigravity",
+		Label:    credentialDisplayLabel(credential),
 		Token:    credential.AccessToken,
 		Source:   "antigravity keychain",
 	}
+}
+
+func credentialDisplayLabel(credential CredentialInfo) string {
+	for _, token := range []string{credential.IDToken, credential.AccessToken} {
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			continue
+		}
+		body, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			continue
+		}
+		var claims struct {
+			Email string `json:"email"`
+		}
+		if json.Unmarshal(body, &claims) != nil {
+			continue
+		}
+		email := strings.TrimSpace(claims.Email)
+		if len(email) == 0 || len(email) > 320 || !strings.Contains(email, "@") {
+			continue
+		}
+		valid := true
+		for _, char := range email {
+			if char < 0x20 || char == 0x7f {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return email
+		}
+	}
+	return "router agy login"
 }

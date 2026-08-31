@@ -235,6 +235,8 @@ var directSRCommands = map[string]struct{}{
 	"add-api-key":      {},
 	"add-key":          {},
 	"admin-keys":       {},
+	"agy":              {},
+	"antigravity":      {},
 	"account":          {},
 	"accounts":         {},
 	"attach-project":   {},

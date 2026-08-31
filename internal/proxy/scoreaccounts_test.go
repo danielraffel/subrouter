@@ -54,6 +54,42 @@ func TestScoreAccountsPreservesHealthyScoreWhenUsageIsStale(t *testing.T) {
 	}
 }
 
+func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsRoutingHealth(t *testing.T) {
+	account := accounts.Account{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity,
+		AuthMode: accounts.AuthModeOAuth, Token: "access",
+	}
+	source := &stubOAuthSource{
+		provider:  accounts.ProviderAntigravity,
+		listed:    []accounts.Account{account},
+		refreshed: accounts.Account{ID: account.ID, Provider: account.Provider, AuthMode: account.AuthMode, Token: "fresh"},
+	}
+	networkCalls := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		networkCalls++
+		return nil, errors.New("unexpected quota request")
+	})}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, client)
+	ref.oauthSources = []OAuthAccountSource{source}
+	server := Server{
+		AccountRef: ref,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0,
+		}})),
+	}
+
+	scores, scored := server.scoreAccounts(t.Context(), []accounts.Account{account})
+	if source.refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want one auth check", source.refreshCalls)
+	}
+	if networkCalls != 0 {
+		t.Fatalf("unsupported quota endpoint was polled %d time(s)", networkCalls)
+	}
+	if scored != 1 || len(scores) != 1 || scores[0].Headroom != 1 || scores[0].ShortHeadroom != 1 || scores[0].Fresh {
+		t.Fatalf("auth-only routing score = %+v, scored=%d", scores, scored)
+	}
+}
+
 // Regression: request-time exhaustion is an expiring overlay, not measured
 // usage. If a refresh seeds its carried-forward score from that overlay and the
 // mark expires before FinishRefresh, the zero is stranded in the base scheduler

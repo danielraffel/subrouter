@@ -687,15 +687,15 @@ func TestFetchUsageRowsExcludesKimiCLICredentialWithoutRefreshingIt(t *testing.T
 	}
 	var out bytes.Buffer
 	printKimiCLIOnlyStatusHint(&out, nil)
-	if !strings.Contains(out.String(), "sr kimi login <label>") {
+	if !strings.Contains(out.String(), "plain 'kimi' login is direct") || !strings.Contains(out.String(), "sr kimi proxy") {
 		t.Fatalf("status hint is not actionable: %q", out.String())
 	}
 	out.Reset()
 	printKimiCLIOnlyStatusHint(&out, []srUsageRow{{
-		email: "kimi-subscription:work", provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth,
+		email: "kimi-code", provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth,
 	}})
-	if out.Len() != 0 {
-		t.Fatalf("status showed CLI-only hint alongside a routable managed profile: %q", out.String())
+	if !strings.Contains(out.String(), "Plain 'kimi' uses the local direct login") || !strings.Contains(out.String(), "sr kimi proxy") || strings.Contains(out.String(), "sr kimi login") {
+		t.Fatalf("status did not distinguish direct and managed Kimi launchers: %q", out.String())
 	}
 }
 
@@ -4078,6 +4078,49 @@ func TestQwenTokenPlanNamesAndQuotaWindowsDoNotTruncate(t *testing.T) {
 				t.Fatalf("Qwen %s width = %d, want an untruncated reset value", column.Key, column.Width)
 			}
 		}
+	}
+}
+
+func TestAntigravityStatusUsesAuthAndSessionTruthWithoutFakeQuota(t *testing.T) {
+	t.Setenv("COLUMNS", "120")
+	statuses := []remoteServerUsageStatus{
+		{
+			ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+			AccountIdentity: "router agy login", PlanType: "subscription", AuthChecked: true, AuthValid: true,
+			SessionsKnown: true,
+		},
+		{
+			ID: "antigravity-active", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+			AccountIdentity: "second agy login", PlanType: "subscription", AuthChecked: true, AuthValid: true,
+			AssignedSessions: 1, SessionsKnown: true,
+		},
+	}
+	rows := usageRowsFromServerUsageStatuses(statuses)
+	if len(rows) != 2 || usageGridState(rows[0]) != "ready" || usageGridState(rows[1]) != "active" {
+		t.Fatalf("Antigravity states = %+v", rows)
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	text := out.String()
+	for _, want := range []string{"router agy login", "second agy login", "subscription", "ready", "active", "quota not exposed"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Antigravity status should show %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"subsc...", "100%", "5h", "7d"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("Antigravity status should not show %q:\n%s", unwanted, text)
+		}
+	}
+}
+
+func TestAntigravityStatusSurfacesFailedAuth(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+		AuthChecked: true, AuthValid: false, Error: "refresh rejected",
+	}})
+	if len(rows) != 1 || !rows[0].authChecked || rows[0].authValid || usageGridState(rows[0]) != "error" {
+		t.Fatalf("failed Antigravity row = %+v", rows)
 	}
 }
 

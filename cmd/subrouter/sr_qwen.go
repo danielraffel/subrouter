@@ -37,8 +37,14 @@ Qwen console commands attach plan and quota metadata to an existing account:
                            Authorize Alibaba console plan/quota metadata
   sr qwen label <account> <email-or-label>
                            Set the saved sign-in label shown by sr status
+  sr qwen proxy [qwen args...]
+                           Launch Qwen Code through the selected Token Plan pool
+                           (plain qwen remains direct)
 `)
 		return nil
+	}
+	if args[0] == "proxy" {
+		return r.launchQwenProxy(ctx, args[1:])
 	}
 	if args[0] != "login" {
 		if args[0] == "label" && len(args) == 3 {

@@ -20,10 +20,13 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		fmt.Fprintln(r.out, "Usage: sr kimi login <label>")
 		fmt.Fprintln(r.out, "       sr kimi list")
 		fmt.Fprintln(r.out, "       sr kimi remove <label>")
-		fmt.Fprintln(r.out, "Only managed profiles are routed; the Kimi CLI's global login is listed as not routed.")
+		fmt.Fprintln(r.out, "       sr kimi proxy [kimi args...]")
+		fmt.Fprintln(r.out, "Managed profiles are routed only by 'sr kimi proxy'; plain 'kimi' remains direct.")
 		return nil
 	}
 	switch args[0] {
+	case "proxy":
+		return r.launchKimiProxy(ctx, args[1:])
 	case "login", "add":
 		label := ""
 		if len(args) > 1 {
@@ -80,7 +83,7 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		fmt.Fprintf(r.out, "Removed Kimi account: %s\n", acct.ID)
 		return nil
 	default:
-		return fmt.Errorf("unknown Kimi command %q; use login, list, or remove", args[0])
+		return fmt.Errorf("unknown Kimi command %q; use proxy, login, list, or remove", args[0])
 	}
 }
 
@@ -119,6 +122,7 @@ func (r srRunner) kimiRemote(ctx context.Context, server srServerConfig, args []
 		fmt.Fprintln(r.out, "Usage: sr kimi login <label>")
 		fmt.Fprintln(r.out, "       sr kimi list")
 		fmt.Fprintln(r.out, "       sr kimi remove <label>")
+		fmt.Fprintln(r.out, "       sr kimi proxy [kimi args...]")
 		fmt.Fprintf(r.out, "Managed profiles are stored on server %s.\n", server.Name)
 		return nil
 	}

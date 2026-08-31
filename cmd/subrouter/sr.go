@@ -76,7 +76,9 @@ Usage:
   sr status             Show usage across all configured providers (non-interactive)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
+  sr qwen proxy [args]  Run Qwen Code through the selected Token Plan pool
   sr kimi login <label> Add an isolated Kimi subscription account
+  sr kimi proxy [args]  Run Kimi Code through the selected Kimi pool
   sr kimi list          List Kimi CLI and managed subscription accounts
   sr kimi remove <label>
                         Remove one managed Kimi subscription account
@@ -136,6 +138,10 @@ Running agents:
   sr claude proxy --account [profile]
                         Run pinned to one Claude profile with no account failover
   sr gemini [args]      Run gemini through Subrouter
+  sr antigravity proxy [args]
+  sr agy proxy [args]   Run agy through Subrouter (plain agy stays direct)
+  sr kimi proxy [args]  Run Kimi Code through Subrouter (plain kimi stays direct)
+  sr qwen proxy [args]  Run Qwen Code through Subrouter (plain qwen stays direct)
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -217,6 +223,8 @@ type srUsageRow struct {
 	// upstream; it must not send a possibly gateway-specific key to a vendor
 	// default merely to populate this field.
 	providerHealth string
+	authChecked    bool
+	authValid      bool
 	// providerModels counts the models the key is entitled to, from that same
 	// probe. Negative means unknown.
 	providerModels     int
@@ -302,6 +310,16 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			if isCodexAccountCommand(args) {
 				return r.codexAccount(ctx, args[1:])
 			}
+		case "kimi":
+			if len(args) > 1 && args[1] == "proxy" {
+				return r.launchKimiProxy(ctx, args[2:])
+			}
+		case "qwen":
+			if len(args) > 1 && args[1] == "proxy" {
+				return r.launchQwenProxy(ctx, args[2:])
+			}
+		case "antigravity", "agy":
+			return r.antigravityCommand(ctx, args[1:])
 		}
 	}
 	if len(args) == 0 {
@@ -384,6 +402,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.qwen(ctx, args[1:])
 	case "kimi":
 		return r.kimiCommand(ctx, args[1:])
+	case "antigravity", "agy":
+		return r.antigravityCommand(ctx, args[1:])
 	case "pick":
 		return r.pick(ctx, srSwitchOptions{})
 	case "reset":
@@ -1026,11 +1046,9 @@ func (r srRunner) status(ctx context.Context) error {
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
 		} else if ok {
-			if sameEndpoint(server.URL, localBaseURL()) {
-				if err := printCodexIsolationStatus(r.out, r.store); err != nil {
-					return err
-				}
-			}
+			// The selected server owns the serving state. Even when its endpoint
+			// is loopback, the daemon may use a different SUBROUTER_STATE_DIR;
+			// inspecting this CLI process's local store would report stale warnings.
 			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
 		}
 		localStoreServing = true
@@ -1057,7 +1075,8 @@ func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
 		return
 	}
 	for _, row := range rows {
-		if row.provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth && strings.HasPrefix(row.email, "kimi-subscription:") {
+		if row.provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+			fmt.Fprintln(out, "Plain 'kimi' uses the local direct login; use 'sr kimi proxy' for the managed Subrouter pool.")
 			return
 		}
 	}
@@ -1065,7 +1084,7 @@ func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
 	if err != nil || !ok {
 		return
 	}
-	fmt.Fprintln(out, "Kimi CLI login is not routed. Run 'sr kimi login <label>' to add an isolated subscription account.")
+	fmt.Fprintln(out, "The plain 'kimi' login is direct. Run 'sr kimi login <label>' to add a managed account, then use 'sr kimi proxy'.")
 }
 
 func (r srRunner) statusOne(ctx context.Context, selector string) error {
@@ -2841,6 +2860,7 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	if extra <= 0 {
 		return columns
 	}
+	extra = widenUsageGridColumnForRows(columns, rows, "Plan", extra, 16)
 	extra = widenUsageGridColumnForRows(columns, rows, "Account", extra, 36)
 	extra = widenUsageGridColumnForRows(columns, rows, "Pick", extra, 34)
 	extra = widenUsageGridColumnForRows(columns, rows, "Session", extra, 12)
@@ -3129,6 +3149,22 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
+		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)
+		failed := row.err != nil || (row.authChecked && !row.authValid)
+		switch {
+		case active && failed:
+			return "active, error"
+		case active:
+			return "active"
+		case failed:
+			return "error"
+		case row.authChecked && row.authValid:
+			return "ready"
+		default:
+			return "stored"
+		}
+	}
 	if usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth {
 		var states []string
 		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {

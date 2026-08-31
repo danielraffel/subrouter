@@ -504,6 +504,8 @@ func TestDirectSRCommandNames(t *testing.T) {
 		"add-api-key",
 		"add-key",
 		"admin-keys",
+		"agy",
+		"antigravity",
 		"attach-project",
 		"az",
 		"azure",
@@ -576,6 +578,17 @@ func TestKimiNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T) {
 	for _, program := range []string{"sr", "subrouter"} {
 		if err := runForProgram(program, []string{"kimi", "help"}); err != nil {
 			t.Fatalf("%s kimi help: %v", program, err)
+		}
+	}
+}
+
+func TestAntigravityNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, program := range []string{"sr", "subrouter"} {
+		for _, command := range []string{"agy", "antigravity"} {
+			if err := runForProgram(program, []string{command, "help"}); err != nil {
+				t.Fatalf("%s %s help: %v", program, command, err)
+			}
 		}
 	}
 }

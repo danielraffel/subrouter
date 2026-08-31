@@ -956,6 +956,7 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
+		printKimiCLIOnlyStatusHint(r.out, rows)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
 		return nil
@@ -1361,6 +1362,8 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			complimentaryReset: status.ComplimentaryReset,
 			provider:           status.Provider,
 			providerHealth:     status.ProviderHealth,
+			authChecked:        status.AuthChecked,
+			authValid:          status.AuthValid,
 			providerModels:     -1,
 			providerEndpoints:  append([]string(nil), status.ProviderEndpoints...),
 			keyFingerprint:     status.KeyFingerprint,
