@@ -1116,7 +1116,7 @@ func (r *goldenRunner) runSlotOnlyHarness(
 	if r.evidence.failure() != nil || probeStats.record.failure() != nil {
 		return failGolden("evidence_write_failed")
 	}
-	if err := probeStats.validateInterval(parseSummaryTime(r.summary.StartedAt), parseSummaryTime(r.summary.FinalOldGenerationCleanup.FinishedAt)); err != nil {
+	if err := probeStats.validateInterval(probeStats.startedAt, parseSummaryTime(r.summary.FinalOldGenerationCleanup.FinishedAt)); err != nil {
 		return err
 	}
 	if err := r.finalizeLocalDaemonRSS(); err != nil {
@@ -2709,12 +2709,13 @@ type goldenProbeEvent struct {
 }
 
 type goldenProbeStats struct {
-	mu       sync.Mutex
-	events   []goldenProbeEvent
-	record   *jsonlRecorder
-	loops    sync.WaitGroup
-	samples  sync.WaitGroup
-	finished chan struct{}
+	startedAt time.Time
+	mu        sync.Mutex
+	events    []goldenProbeEvent
+	record    *jsonlRecorder
+	loops     sync.WaitGroup
+	samples   sync.WaitGroup
+	finished  chan struct{}
 }
 
 func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigin *url.URL) (*goldenProbeStats, error) {
@@ -2726,7 +2727,7 @@ func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigi
 		file.Close()
 		return nil, failGolden("health_evidence_protect_failed")
 	}
-	stats := &goldenProbeStats{record: &jsonlRecorder{writer: file}, finished: make(chan struct{})}
+	stats := &goldenProbeStats{startedAt: time.Now().UTC(), record: &jsonlRecorder{writer: file}, finished: make(chan struct{})}
 	targets := []struct {
 		label string
 		url   string
