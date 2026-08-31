@@ -74,15 +74,22 @@ esac
 
 log() { printf 'gcp-preflight: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
-for command in "${GCLOUD_BINARY}" curl jq python3 sha256sum; do
+for command in "${GCLOUD_BINARY}" curl jq python3; do
   command -v "${command}" >/dev/null 2>&1 || die "required command not found: ${command}"
 done
+if command -v sha256sum >/dev/null 2>&1; then
+  hash_file() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  die "required command not found: sha256sum or shasum"
+fi
 [[ "${MODE}" == slot || "${MODE}" == migrate-front ]] || die "preflight topology must be slot or migrate-front"
 [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "release tag is invalid"
 [[ -x "${DEPLOY_BINARY}" && -f "${RELEASE_SHA256_FILE}" ]] || die "verified release asset is missing"
 EXPECTED_SHA256="$(tr -d '[:space:]' <"${RELEASE_SHA256_FILE}")"
 [[ "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "release checksum is invalid"
-[[ "$(sha256sum "${DEPLOY_BINARY}" | awk '{print $1}')" == "${EXPECTED_SHA256}" ]] || die "release checksum changed"
+[[ "$(hash_file "${DEPLOY_BINARY}")" == "${EXPECTED_SHA256}" ]] || die "release checksum changed"
 [[ "${DEPLOY_REVISION}" =~ ^[0-9a-f]{40}$ ]] || die "release revision is invalid"
 [[ "${TAG_ON_MAIN}" == true && "${ATTESTATION_VERIFIED}" == true && "${RELEASE_IMMUTABLE}" == true ]] \
   || die "release trust proof is incomplete"
