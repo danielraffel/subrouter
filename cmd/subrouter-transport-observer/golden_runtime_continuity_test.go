@@ -162,7 +162,11 @@ func TestGoldenObserverAttributesUpstreamEvidenceToEachRequest(t *testing.T) {
 
 	request := func(method, path string) {
 		t.Helper()
-		request, err := http.NewRequest(method, proxy.URL+path, strings.NewReader("request"))
+		var body io.Reader
+		if method != http.MethodGet {
+			body = strings.NewReader("request")
+		}
+		request, err := http.NewRequest(method, proxy.URL+path, body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -201,7 +205,7 @@ func TestGoldenObserverAttributesUpstreamEvidenceToEachRequest(t *testing.T) {
 			t.Fatalf("response upstream event path = %q, want /v1/responses", event.Path)
 		}
 		switch event.Kind {
-		case "upstream_connection_opened":
+		case "upstream_connection_used":
 			opened++
 		case "upstream_request_chunk":
 			requestBytes += event.Bytes
@@ -211,6 +215,98 @@ func TestGoldenObserverAttributesUpstreamEvidenceToEachRequest(t *testing.T) {
 	}
 	if opened != 1 || requestBytes <= 0 || responseBytes <= 0 {
 		t.Fatalf("response upstream evidence = opened %d, request bytes %d, response bytes %d; want one complete upstream request", opened, requestBytes, responseBytes)
+	}
+}
+
+func TestGoldenObserverKeepsUpstreamEvidenceRequestScopedOnPooledConnections(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/plain")
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := newObserverStats()
+	observation := newObserver(io.Discard, stats)
+	proxy := httptest.NewServer(newObserverHandlerWithObserverAndGate(upstreamURL, observation, nil))
+	t.Cleanup(proxy.Close)
+
+	request := func(method, path string) {
+		t.Helper()
+		var body io.Reader
+		if method != http.MethodGet {
+			body = strings.NewReader("request")
+		}
+		request, err := http.NewRequest(method, proxy.URL+path, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request(http.MethodGet, "/metadata")
+	request(http.MethodGet, "/metadata")
+	request(http.MethodPost, "/v1/responses")
+	request(http.MethodPost, "/v1/responses")
+
+	requests, _, _ := stats.snapshot()
+	requestIDs := make(map[string]bool)
+	for _, candidate := range requests {
+		switch candidate.Path {
+		case "/other", "/v1/responses":
+			requestIDs[candidate.RequestID] = true
+		}
+	}
+	if len(requestIDs) != 4 {
+		t.Fatalf("request IDs = %d, want four", len(requestIDs))
+	}
+	physicalConnections := make(map[string]bool)
+	connectionsByRequest := make(map[string]map[string]bool)
+	requestBytesByRequest := make(map[string]int64)
+	responseBytesByRequest := make(map[string]int64)
+	for _, event := range stats.upstreamSnapshot() {
+		if event.Kind == "upstream_connection_opened" {
+			physicalConnections[event.ConnectionID] = true
+		}
+		if !requestIDs[event.RequestID] {
+			continue
+		}
+		switch event.Kind {
+		case "upstream_connection_used":
+			if connectionsByRequest[event.RequestID] == nil {
+				connectionsByRequest[event.RequestID] = make(map[string]bool)
+			}
+			connectionsByRequest[event.RequestID][event.ConnectionID] = true
+		case "upstream_request_chunk":
+			requestBytesByRequest[event.RequestID] += event.Bytes
+		case "upstream_response_chunk":
+			responseBytesByRequest[event.RequestID] += event.Bytes
+		}
+	}
+	if len(physicalConnections) == 0 {
+		t.Fatal("no physical upstream connection was observed")
+	}
+	for requestID := range requestIDs {
+		connections := connectionsByRequest[requestID]
+		if len(connections) != 1 || requestBytesByRequest[requestID] <= 0 || responseBytesByRequest[requestID] <= 0 {
+			t.Fatalf("request %s upstream evidence = connections %d, request bytes %d, response bytes %d; want one complete exchange", requestID, len(connections), requestBytesByRequest[requestID], responseBytesByRequest[requestID])
+		}
+		for connectionID := range connections {
+			if !physicalConnections[connectionID] {
+				t.Fatalf("request %s used unknown connection %q", requestID, connectionID)
+			}
+		}
 	}
 }
 
