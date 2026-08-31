@@ -40,6 +40,8 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	request.Header.Set("Authorization", "Bearer local-vendor-secret")
 	request.Header.Set("X-Api-Key", "local-api-secret")
 	request.Header.Set("Cookie", "vendor_session=local-secret")
+	request.Header.Set("OpenAI-Organization", "direct-org-secret")
+	request.Header.Set("OpenAI-Project", "direct-project-secret")
 	request.Header.Set("X-Subrouter-Account-ID", "untrusted-pin")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -60,8 +62,11 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	if key := got.Header.Get("X-Api-Key"); key != "" {
 		t.Fatalf("X-Api-Key leaked through relay: %q", key)
 	}
-	if got.Header.Get("Cookie") != "" || got.Header.Get("X-Subrouter-Account-ID") != "" {
-		t.Fatalf("client credential/routing metadata leaked: cookie=%q account=%q", got.Header.Get("Cookie"), got.Header.Get("X-Subrouter-Account-ID"))
+	if got.Header.Get("Cookie") != "" || got.Header.Get("X-Subrouter-Account-ID") != "" ||
+		got.Header.Get("OpenAI-Organization") != "" || got.Header.Get("OpenAI-Project") != "" {
+		t.Fatalf("client credential/routing metadata leaked: cookie=%q account=%q org=%q project=%q",
+			got.Header.Get("Cookie"), got.Header.Get("X-Subrouter-Account-ID"),
+			got.Header.Get("OpenAI-Organization"), got.Header.Get("OpenAI-Project"))
 	}
 	if got.Header.Get("X-Subrouter-Agent") != "kimi" || got.Header.Get("X-Subrouter-Session") != "sr-native-test-session" {
 		t.Fatalf("routing headers = agent %q session %q", got.Header.Get("X-Subrouter-Agent"), got.Header.Get("X-Subrouter-Session"))
@@ -458,7 +463,9 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	original := []string{
 		"PATH=/usr/bin", "KEEP_ME=yes", "KIMI_CODE_HOME=/custom/kimi-home", "QWEN_HOME=/custom/qwen-home",
 		"OPENAI_API_KEY=real-openai-secret", "OPENAI_BASE_URL=https://vendor.invalid/v1",
+		"OPENAI_ORG_ID=direct-org-secret", "OPENAI_PROJECT_ID=direct-project-secret",
 		"BAILIAN_TOKEN_PLAN_API_KEY=real-bailian-secret", "KIMI_MODEL_API_KEY=real-kimi-secret",
+		"KIMI_CODE_CUSTOM_HEADERS=X-Direct-Gateway-Secret: custom-header-secret",
 		"HTTP_PROXY=http://credential-sink.invalid", "https_proxy=http://credential-sink.invalid",
 		"ALL_PROXY=socks5://credential-sink.invalid", "NO_PROXY=vendor.invalid",
 	}
@@ -470,7 +477,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	}
 	defer qwenCleanup()
 	joined := strings.Join(qwenEnv, "\n")
-	for _, secret := range []string{"real-openai-secret", "real-bailian-secret", "real-kimi-secret", "vendor.invalid", "credential-sink.invalid"} {
+	for _, secret := range []string{"real-openai-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "vendor.invalid", "credential-sink.invalid"} {
 		if strings.Contains(joined, secret) {
 			t.Fatalf("Qwen child environment leaked %q:\n%s", secret, joined)
 		}
@@ -518,8 +525,11 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	if got := testEnvValue(kimiEnv, "KIMI_MODEL_API_KEY"); got != "subrouter" {
 		t.Fatalf("KIMI_MODEL_API_KEY = %q", got)
 	}
-	if strings.Contains(strings.Join(kimiEnv, "\n"), "real-kimi-secret") {
-		t.Fatal("Kimi child environment retained the direct credential")
+	joinedKimi := strings.Join(kimiEnv, "\n")
+	for _, secret := range []string{"real-kimi-secret", "custom-header-secret"} {
+		if strings.Contains(joinedKimi, secret) {
+			t.Fatalf("Kimi child environment retained direct credential %q", secret)
+		}
 	}
 }
 
@@ -715,6 +725,7 @@ func TestAntigravityProxyFailsClosedForDirectGeminiConfiguration(t *testing.T) {
 	for _, environ := range [][]string{
 		{"HOME=" + home},
 		{"HOME=" + t.TempDir(), "GEMINI_API_KEY=direct-secret"},
+		{"HOME=" + t.TempDir(), "GOOGLE_API_KEY=direct-secret"},
 		{"HOME=" + t.TempDir(), "GOOGLE_GEMINI_BASE_URL=https://direct.invalid"},
 		{"HOME=" + t.TempDir(), "AGY_ADC_AUTH=1"},
 	} {

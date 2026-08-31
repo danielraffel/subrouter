@@ -695,6 +695,7 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 		request := proxyRequest.Out
 		for _, header := range []string{
 			"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token",
+			"OpenAI-Organization", "OpenAI-Project",
 			"X-Subrouter-Lease", "X-Subrouter-Session", "X-Subrouter-Agent",
 			"X-Subrouter-User-Email", "X-Subrouter-User", "X-User-Email",
 			"X-Subrouter-Account-ID", "X-Subrouter-Account", "X-Subrouter-Preferred-Account-ID",
@@ -795,12 +796,13 @@ func nativeProxyPinnedSessionID(pooledSessionID, accountID string) string {
 
 var nativeProxyRoutingEnvKeys = []string{
 	"CLOUD_CODE_URL",
-	"GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH",
-	"KIMI_CODE_BASE_URL", "KIMI_API_KEY", "KIMI_BASE_URL",
+	"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH",
+	"KIMI_CODE_BASE_URL", "KIMI_CODE_CUSTOM_HEADERS", "KIMI_API_KEY", "KIMI_BASE_URL",
 	"KIMI_MODEL_NAME", "KIMI_MODEL_API_KEY", "KIMI_MODEL_BASE_URL", "KIMI_MODEL_PROVIDER_TYPE",
 	"KIMI_MODEL_MAX_CONTEXT_SIZE", "KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY",
 	"KIMI_WEB_FETCH_BASE_URL", "KIMI_WEB_FETCH_API_KEY",
 	"QWEN_OAUTH", "QWEN_MODEL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
+	"OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
 	"BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY",
 }
 
@@ -854,7 +856,7 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 }
 
 func antigravityDirectProviderConflict(environ []string) (string, error) {
-	for _, key := range []string{"GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH"} {
+	for _, key := range []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH"} {
 		if strings.TrimSpace(envValue(environ, key)) != "" {
 			return key, nil
 		}
