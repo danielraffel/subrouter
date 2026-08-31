@@ -147,19 +147,37 @@ func (r *goldenRunner) prepareGoldenLocalEgressBinding(
 	if len(localUpstreamID) != 64 {
 		return nil, false, failGolden("local_egress_binding_invalid")
 	}
+	afterCaptured, afterErr := parseGoldenEvidenceTime(after.Timestamp)
+	if afterErr != nil {
+		return nil, false, afterErr
+	}
 	leases := goldenHostedLeaseRequests(leaseObserver.stats)
-	if len(leases) < leaseBefore+1 {
+	if leaseBefore > len(leases) {
 		return nil, false, nil
 	}
-	if len(leases) > leaseBefore+1 {
-		return nil, false, failGolden("local_egress_lease_binding_invalid")
+	// A proxy can acquire leases for metadata requests before it acquires the
+	// lease used by the response. Bind to the earliest new hosted lease that
+	// starts at or after the observed response request. The process snapshot is
+	// the upper bound, so a lease observed after it is still incomplete.
+	var lease transportEvent
+	var leaseStarted time.Time
+	for _, candidate := range leases[leaseBefore:] {
+		if candidate.Method != http.MethodPost || candidate.RequestID == "" || candidate.ConnectionID == "" {
+			return nil, false, failGolden("local_egress_lease_binding_invalid")
+		}
+		candidateStarted, parseErr := parseGoldenEvidenceTime(candidate.Timestamp)
+		if parseErr != nil {
+			return nil, false, failGolden("local_egress_lease_binding_invalid")
+		}
+		if candidateStarted.Before(requestStarted) {
+			continue
+		}
+		if lease.RequestID == "" || candidateStarted.Before(leaseStarted) {
+			lease, leaseStarted = candidate, candidateStarted
+		}
 	}
-	lease := leases[leaseBefore]
-	leaseStarted, parseErr := parseGoldenEvidenceTime(lease.Timestamp)
-	afterCaptured, afterErr := parseGoldenEvidenceTime(after.Timestamp)
-	if parseErr != nil || afterErr != nil || lease.Method != http.MethodPost ||
-		lease.RequestID == "" || lease.ConnectionID == "" || leaseStarted.Before(requestStarted) {
-		return nil, false, failGolden("local_egress_lease_binding_invalid")
+	if lease.RequestID == "" {
+		return nil, false, nil
 	}
 	if leaseStarted.After(afterCaptured) {
 		return nil, false, nil
