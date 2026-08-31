@@ -1162,7 +1162,7 @@ func prepareKimiProxyHome(environ []string) (kimiProxyOverlay, func(), error) {
 	// os.RemoveAll removes symlinks rather than following them and uses the
 	// platform's race-resistant directory removal implementation. The path is
 	// generated here, never accepted from user input.
-	cleanup := func() { _ = os.RemoveAll(home) }
+	cleanup := func() { removePrivateProxyHome(home) }
 	if err := os.Chmod(home, 0o700); err != nil {
 		cleanup()
 		return kimiProxyOverlay{}, func() {}, fmt.Errorf("lock temporary Kimi proxy home: %w", err)

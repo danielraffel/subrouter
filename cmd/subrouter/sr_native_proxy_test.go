@@ -957,6 +957,9 @@ func TestKimiProxyCleanupNeverFollowsChildSymlinks(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(source, "sessions")); err != nil {
 		t.Fatalf("child cleanup followed the real sessions link: %v", err)
 	}
+	if _, err := os.Lstat(overlay.home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only routed Kimi home survived cleanup: %v", err)
+	}
 }
 
 func TestKimiProxyCleanupDoesNotFollowReplacedRoot(t *testing.T) {
