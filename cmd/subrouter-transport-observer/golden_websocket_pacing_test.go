@@ -207,6 +207,41 @@ func TestGoldenWebSocketPacerDoesNotDelayQueuedPing(t *testing.T) {
 	}
 }
 
+func TestGoldenWebSocketPacerDoesNotDelayControlFrameInSameWrite(t *testing.T) {
+	gate := newGoldenResponseGate()
+	base := gate.newResponsePacer("same-write-ping-test")
+	delay := &accumulatingObserverDelay{}
+	base.delay = delay
+	pacer := newGoldenWebSocketPacer(base)
+	var writes [][]byte
+	sink := func(payload []byte) (int, error) {
+		writes = append(writes, append([]byte(nil), payload...))
+		return len(payload), nil
+	}
+
+	// The ping is in the same read as enough data to cross the holdback. The
+	// pacer must inspect the complete batch before applying a data-frame delay.
+	stream := make([]byte, 0, 100*3+2)
+	for index := 0; index < 100; index++ {
+		stream = append(stream, 0x81, 0x01, byte('a'+index%26))
+	}
+	stream = append(stream, 0x89, 0x00)
+	if _, err := pacer.write(context.Background(), stream, sink); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if delay.elapsed != 0 {
+		t.Fatalf("same-write Ping added a pacing delay: %s", delay.elapsed)
+	}
+	if len(writes) != 101 || !bytes.Equal(writes[len(writes)-1], []byte{0x89, 0x00}) {
+		t.Fatalf("same-write Ping was not delivered promptly: %x", writes)
+	}
+
+	gate.releasePacing()
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatalf("waitAndFlush: %v", err)
+	}
+}
+
 func TestGoldenWebSocketFrameParserRejectsOversizedFrames(t *testing.T) {
 	parser := goldenWebSocketFrameParser{}
 	length := uint64(goldenWebSocketMaxFrameBytes)
@@ -240,6 +275,36 @@ func TestGoldenWebSocketPacerRetainsPartialWriteProgress(t *testing.T) {
 	}
 	if !bytes.Equal(delivered.Bytes(), frame) {
 		t.Fatalf("partial write was duplicated or lost: got %x want %x", delivered.Bytes(), frame)
+	}
+}
+
+func TestCountingConnEmitsClosedEventWhenWebSocketFlushFails(t *testing.T) {
+	gate := newGoldenResponseGate()
+	base := gate.newResponsePacer("truncated-close-test")
+	stats := newObserverStats()
+	observation := newObserver(io.Discard, stats)
+	peer, connection := net.Pipe()
+	t.Cleanup(func() {
+		_ = peer.Close()
+		_ = connection.Close()
+	})
+
+	counted := &countingConn{
+		Conn: connection, observer: observation,
+		meta:    requestEvidence{connectionID: "truncated-websocket"},
+		context: context.Background(), pacer: base,
+		websocketPacer: newGoldenWebSocketPacer(base),
+	}
+	if _, err := counted.Write([]byte{0x81}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	gate.releasePacing()
+	if err := counted.Close(); err == nil {
+		t.Fatal("Close succeeded for a truncated WebSocket frame")
+	}
+	closed := stats.closedSnapshot()
+	if len(closed) != 1 || closed[0].ConnectionID != "truncated-websocket" {
+		t.Fatalf("closed events = %+v, want one truncated-websocket event", closed)
 	}
 }
 
