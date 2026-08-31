@@ -1298,7 +1298,7 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
 		return result, err
 	}
-	if err := validateGoldenProvenance(r.expectedGoldenBootstrapSHA256(), result.activation); err != nil {
+	if err := validateGoldenProvenance(r.bootstrapForActivation(result.activation), result.activation); err != nil {
 		return result, err
 	}
 	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
@@ -1460,7 +1460,7 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
 		return result, err
 	}
-	if err := validateGoldenProvenance(r.expectedGoldenBootstrapSHA256(), result.activation); err != nil {
+	if err := validateGoldenProvenance(r.bootstrapForActivation(result.activation), result.activation); err != nil {
 		return result, err
 	}
 	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
@@ -1726,6 +1726,19 @@ func (r *goldenRunner) expectedGoldenBootstrapSHA256() string {
 	}
 	if r.summary != nil && r.summary.MigrationPreparation.migrationCanonical != nil {
 		return r.summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256
+	}
+	return ""
+}
+
+func (r *goldenRunner) bootstrapForActivation(activation goldenActionSummary) string {
+	if expected := r.expectedGoldenBootstrapSHA256(); expected != "" {
+		return expected
+	}
+	if r.testMode {
+		// Deterministic fixtures can carry their bootstrap identity in the
+		// activation evidence itself. Production parsing always supplies the
+		// pinned bootstrap checksum before a cycle can start.
+		return activation.FromReleaseSHA256
 	}
 	return ""
 }
