@@ -186,7 +186,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if spec.provider == accounts.ProviderKimi {
 		args = kimiNativeProxyArgs(args)
 	} else if spec.provider == accounts.ProviderQwenToken {
-		args = qwenNativeProxyArgs(args, qwenProxyModel(args), strings.TrimRight(relay.URL(), "/")+"/"+spec.route+"/v1")
+		args = qwenNativeProxyArgs(args, qwenProxyModel(args))
 	}
 	cmd := exec.CommandContext(ctx, commandPath, args...)
 	cmd.Stdin = r.in
@@ -582,15 +582,14 @@ func qwenProxyModel(args []string) string {
 	return model
 }
 
-func qwenNativeProxyArgs(args []string, model, baseURL string) []string {
-	out := make([]string, 0, len(args)+8)
+func qwenNativeProxyArgs(args []string, model string) []string {
+	out := make([]string, 0, len(args)+6)
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" {
 			out = append(out,
 				"--auth-type", "openai",
 				"--model", model,
 				"--openai-api-key", "subrouter",
-				"--openai-base-url", baseURL,
 			)
 			return append(out, args[i:]...)
 		}
@@ -608,7 +607,6 @@ func qwenNativeProxyArgs(args []string, model, baseURL string) []string {
 		"--auth-type", "openai",
 		"--model", model,
 		"--openai-api-key", "subrouter",
-		"--openai-base-url", baseURL,
 	)
 }
 

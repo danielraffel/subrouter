@@ -128,7 +128,9 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		"OPENAI_API_KEY=real-openai-secret", "OPENAI_BASE_URL=https://vendor.invalid/v1",
 		"BAILIAN_TOKEN_PLAN_API_KEY=real-bailian-secret", "KIMI_MODEL_API_KEY=real-kimi-secret",
 	}
-	qwenEnv, qwenCleanup, err := nativeProxyEnvironment(qwenNativeProxy, "http://127.0.0.1:43210", original, []string{"--model", "qwen-test-model"})
+	qwenRelay := "http://127.0.0.1:43210/private-relay-capability"
+	qwenProviderURL := qwenRelay + "/qwen-token/v1"
+	qwenEnv, qwenCleanup, err := nativeProxyEnvironment(qwenNativeProxy, qwenRelay, original, []string{"--model", "qwen-test-model"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +141,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 			t.Fatalf("Qwen child environment leaked %q:\n%s", secret, joined)
 		}
 	}
-	if got := testEnvValue(qwenEnv, "OPENAI_BASE_URL"); got != "http://127.0.0.1:43210/qwen-token/v1" {
+	if got := testEnvValue(qwenEnv, "OPENAI_BASE_URL"); got != qwenProviderURL {
 		t.Fatalf("OPENAI_BASE_URL = %q", got)
 	}
 	if got := testEnvValue(qwenEnv, "QWEN_HOME"); got != "/custom/qwen-home" {
@@ -160,7 +162,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		t.Fatal(err)
 	}
 	providers := overlay.ModelProviders["openai"]
-	if len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != "http://127.0.0.1:43210/qwen-token/v1" {
+	if len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != qwenProviderURL {
 		t.Fatalf("Qwen overlay = %+v", overlay)
 	}
 
@@ -181,19 +183,22 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 }
 
 func TestQwenNativeProxyArgsForceRoutingAndPreserveChosenModel(t *testing.T) {
-	baseURL := "http://127.0.0.1:43210/qwen-token/v1"
+	baseURL := "http://127.0.0.1:43210/private-relay-capability/qwen-token/v1"
 	for _, input := range [][]string{
 		{"--continue"},
 		{"--resume", "session-id", "--model", "qwen-custom"},
 		{"-p", "hello", "--model=qwen-equals"},
 	} {
 		model := qwenProxyModel(input)
-		got := qwenNativeProxyArgs(input, model, baseURL)
+		got := qwenNativeProxyArgs(input, model)
 		joined := strings.Join(got, " ")
-		for _, want := range []string{"--auth-type openai", "--openai-api-key subrouter", "--openai-base-url " + baseURL, "--model " + model} {
+		for _, want := range []string{"--auth-type openai", "--openai-api-key subrouter", "--model " + model} {
 			if !strings.Contains(joined, want) {
 				t.Fatalf("qwen proxy args %q do not contain %q", got, want)
 			}
+		}
+		if strings.Contains(joined, baseURL) {
+			t.Fatalf("qwen proxy args exposed the private relay capability: %q", got)
 		}
 		if strings.Count(joined, "--model") != 1 {
 			t.Fatalf("qwen proxy args retained a competing model: %q", got)
