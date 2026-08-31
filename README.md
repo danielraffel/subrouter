@@ -728,7 +728,9 @@ process. Direct Alibaba keys are replaced with non-secret process sentinels so
 Qwen cannot restore them from `.env` or saved settings. The overlay is removed
 when Qwen exits and contains no real plan key. If Qwen system-policy files or
 their path environment variables are present, the launcher fails closed instead
-of hiding administrator policy.
+of hiding administrator policy. Qwen's `serve` and ACP modes can reload saved
+environment routing while they run, so the routed wrapper refuses those modes;
+use plain `qwen` when that direct behavior is required.
 When Alibaba returns a 429 for one plan account, Subrouter replays the
 generation request with another stored Qwen account and moves that sticky
 session to the successful account. A launch with `--account` instead pins the

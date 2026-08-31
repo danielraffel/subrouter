@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -73,6 +74,69 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}
 	if got.Host != strings.TrimPrefix(upstream.URL, "http://") {
 		t.Fatalf("upstream Host = %q, want target host", got.Host)
+	}
+
+	guard, err := nativeProxyLoopbackGuardURL(relay.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	guardURL, err := url.Parse(guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyClient := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(guardURL)}}
+	proxiedRequest, err := http.NewRequest(http.MethodPost, relay.URL()+"/kimi/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxiedResponse, err := proxyClient.Do(proxiedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = proxiedResponse.Body.Close()
+	if proxiedResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("same-origin absolute-form relay status = %d, want 404", proxiedResponse.StatusCode)
+	}
+	select {
+	case leaked := <-seen:
+		t.Fatalf("same-origin absolute-form relay reached upstream: %s", leaked.URL)
+	default:
+	}
+
+	relayURL, err := url.Parse(relay.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalTarget := "http://outside.example.test" + relayURL.Path + "/kimi/v1/messages"
+	externalResponse, err := proxyClient.Get(externalTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = externalResponse.Body.Close()
+	if externalResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-origin absolute-form relay status = %d, want 404", externalResponse.StatusCode)
+	}
+	select {
+	case leaked := <-seen:
+		t.Fatalf("cross-origin absolute-form relay reached upstream: %s", leaked.URL)
+	default:
+	}
+	connectRequest, err := http.NewRequest(http.MethodConnect, relay.URL()+"/kimi/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectResponse, err := http.DefaultClient.Do(connectRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = connectResponse.Body.Close()
+	if connectResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("CONNECT relay status = %d, want 404", connectResponse.StatusCode)
+	}
+	select {
+	case leaked := <-seen:
+		t.Fatalf("CONNECT relay reached upstream: %s", leaked.URL)
+	default:
 	}
 
 	for _, forbidden := range []string{
@@ -230,6 +294,17 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	var accountRequests atomic.Int32
 	var pinnedRequests atomic.Int32
+	var credentialSinkRequests atomic.Int32
+	credentialSink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		credentialSinkRequests.Add(1)
+		http.Error(w, "unexpected proxy use", http.StatusBadGateway)
+	}))
+	defer credentialSink.Close()
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		t.Setenv(key, credentialSink.URL)
+	}
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health":
@@ -256,6 +331,16 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	var toolRequests atomic.Int32
+	toolServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/tool-check" {
+			http.NotFound(w, request)
+			return
+		}
+		toolRequests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer toolServer.Close()
 	var teamAccountRequests atomic.Int32
 	brokerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/api/subrouter/accounts" {
@@ -289,6 +374,7 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SUBROUTER_TEST_BINARY", os.Args[0])
+	t.Setenv("SUBROUTER_TEST_TOOL_URL", toolServer.URL+"/tool-check")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := srRunner{client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{}); err != nil {
@@ -324,6 +410,12 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	if got := pinnedRequests.Load(); got != 2 {
 		t.Fatalf("pinned team launches routed %d forced request(s), want 2", got)
 	}
+	if got := toolRequests.Load(); got != 2 {
+		t.Fatalf("pinned team launches made %d direct tool request(s), want 2", got)
+	}
+	if got := credentialSinkRequests.Load(); got != 0 {
+		t.Fatalf("Qwen child sent %d request(s) to the inherited credential sink", got)
+	}
 }
 
 func TestTeamNativeProxyQwenChild(t *testing.T) {
@@ -343,6 +435,14 @@ func TestTeamNativeProxyQwenChild(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("routed Qwen request status = %d", response.StatusCode)
+	}
+	toolResponse, err := http.Get(os.Getenv("SUBROUTER_TEST_TOOL_URL"))
+	if err != nil {
+		t.Fatalf("direct Qwen tool request: %v", err)
+	}
+	defer toolResponse.Body.Close()
+	if toolResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("direct Qwen tool request status = %d", toolResponse.StatusCode)
 	}
 }
 
@@ -613,6 +713,15 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 			t.Fatalf("Qwen child %s = %q, want a non-secret sentinel", key, got)
 		}
 	}
+	for key, want := range map[string]string{
+		"HTTP_PROXY": "http://127.0.0.1:43210", "HTTPS_PROXY": "http://127.0.0.1:43210", "ALL_PROXY": "http://127.0.0.1:43210",
+		"http_proxy": "http://127.0.0.1:43210", "https_proxy": "http://127.0.0.1:43210", "all_proxy": "http://127.0.0.1:43210",
+		"NO_PROXY": "*", "no_proxy": "*",
+	} {
+		if got, exists := testEnvEntry(qwenEnv, key); !exists || got != want {
+			t.Fatalf("Qwen child %s = %q exists=%t, want %q", key, got, exists, want)
+		}
+	}
 	settings := testEnvValue(qwenEnv, "QWEN_CODE_SYSTEM_SETTINGS_PATH")
 	body, err := os.ReadFile(settings)
 	if err != nil {
@@ -636,19 +745,25 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	if len(overlay.ModelProviders) != 1 || len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != qwenProviderURL {
 		t.Fatalf("Qwen overlay = %+v", overlay)
 	}
-	if overlay.Proxy == nil || *overlay.Proxy != "" {
-		t.Fatalf("Qwen overlay proxy = %v, want an explicit process-only disable", overlay.Proxy)
+	if overlay.Proxy == nil || *overlay.Proxy != " " {
+		t.Fatalf("Qwen overlay proxy = %v, want truthy whitespace that Qwen normalizes to disabled", overlay.Proxy)
 	}
 	for _, key := range []string{"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"} {
 		if value, exists := overlay.Env[key]; !exists || value != "subrouter" {
 			t.Fatalf("Qwen overlay env[%q] = %q exists=%t, want a non-secret sentinel", key, value, exists)
 		}
 	}
+	for key, want := range map[string]string{
+		"HTTP_PROXY": "http://127.0.0.1:43210", "HTTPS_PROXY": "http://127.0.0.1:43210", "ALL_PROXY": "http://127.0.0.1:43210",
+		"http_proxy": "http://127.0.0.1:43210", "https_proxy": "http://127.0.0.1:43210", "all_proxy": "http://127.0.0.1:43210",
+		"NO_PROXY": "*", "no_proxy": "*",
+	} {
+		if got, exists := overlay.Env[key]; !exists || got != want {
+			t.Fatalf("Qwen overlay env[%q] = %q exists=%t, want %q", key, got, exists, want)
+		}
+	}
 	if !reflect.DeepEqual(overlay.SlashCommands.Disabled, []string{"auth", "model"}) {
 		t.Fatalf("Qwen disabled slash commands = %q, want auth and model only", overlay.SlashCommands.Disabled)
-	}
-	if got := testEnvValue(qwenEnv, "NO_PROXY"); got != "127.0.0.1,localhost,::1" {
-		t.Fatalf("Qwen NO_PROXY = %q", got)
 	}
 
 	kimiEnv, kimiCleanup, err := nativeProxyEnvironment(kimiNativeProxy, "http://127.0.0.1:43211", original, nil)
@@ -672,13 +787,20 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 
 func TestQwenNativeProxyArgsForceRoutingAndPreserveChosenModel(t *testing.T) {
 	baseURL := "http://127.0.0.1:43210/private-relay-capability/qwen-token/v1"
-	for _, input := range [][]string{
-		{"--continue"},
-		{"--resume", "session-id", "--model", "qwen-custom"},
-		{"-p", "hello", "--model=qwen-equals"},
+	for _, test := range []struct {
+		input []string
+		model string
+	}{
+		{input: []string{"--continue"}, model: defaultQwenProxyModel},
+		{input: []string{"--resume", "session-id", "--model", "qwen-custom"}, model: "qwen-custom"},
+		{input: []string{"-p", "hello", "--model=qwen-equals"}, model: "qwen-equals"},
+		{input: []string{"-m=qwen-short-equals"}, model: "qwen-short-equals"},
 	} {
-		model := qwenProxyModel(input)
-		got := qwenNativeProxyArgs(input, model)
+		model := qwenProxyModel(test.input)
+		if model != test.model {
+			t.Fatalf("qwenProxyModel(%q) = %q, want %q", test.input, model, test.model)
+		}
+		got := qwenNativeProxyArgs(test.input, model)
 		joined := strings.Join(got, " ")
 		for _, want := range []string{"--auth-type openai", "--openai-api-key subrouter", "--model " + model} {
 			if !strings.Contains(joined, want) {
@@ -688,7 +810,7 @@ func TestQwenNativeProxyArgsForceRoutingAndPreserveChosenModel(t *testing.T) {
 		if strings.Contains(joined, baseURL) {
 			t.Fatalf("qwen proxy args exposed the private relay capability: %q", got)
 		}
-		if strings.Count(joined, "--model") != 1 {
+		if strings.Count(joined, "--model") != 1 || strings.Contains(joined, "-m=") {
 			t.Fatalf("qwen proxy args retained a competing model: %q", got)
 		}
 	}
@@ -725,6 +847,17 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), "proxy.invalid") {
 			t.Fatalf("proxy override error exposed the supplied URL: %v", err)
+		}
+	}
+	for _, args := range [][]string{{"serve"}, {"--safe-mode", "serve"}, {"--acp"}, {"--experimental-acp=true"}} {
+		err := (srRunner{}).launchQwenProxy(t.Context(), args)
+		if err == nil || !strings.Contains(err.Error(), "can reload saved credentials and proxies") {
+			t.Fatalf("reload-capable mode %q error = %v", args, err)
+		}
+	}
+	for _, args := range [][]string{{"-p", "serve"}, {"--model", "serve", "--continue"}, {"--", "--acp"}} {
+		if qwenProxyReloadCapableMode(args) {
+			t.Fatalf("ordinary Qwen args %q classified as reload-capable", args)
 		}
 	}
 }
@@ -803,13 +936,14 @@ func TestKimiNativeProxyArgsForceEphemeralModelOnNewAndResumedSessions(t *testin
 		{"--continue"},
 		{"--session", "session-id", "--model", "direct/model"},
 		{"-p", "hello", "-m", "direct-model"},
+		{"-m=direct-equals-model"},
 	} {
 		got := kimiNativeProxyArgs(input)
 		joined := strings.Join(got, " ")
 		if !strings.Contains(joined, "--model __kimi_env_model__") {
 			t.Fatalf("kimi proxy args = %q", got)
 		}
-		if strings.Contains(joined, "direct-model") || strings.Contains(joined, "direct/model") {
+		if strings.Contains(joined, "direct-model") || strings.Contains(joined, "direct/model") || strings.Contains(joined, "direct-equals-model") {
 			t.Fatalf("direct model survived proxy args: %q", got)
 		}
 	}
@@ -916,11 +1050,16 @@ func TestRequireNativeProxyAccountChecksProviderAndAuthMode(t *testing.T) {
 }
 
 func testEnvValue(environ []string, key string) string {
+	value, _ := testEnvEntry(environ, key)
+	return value
+}
+
+func testEnvEntry(environ []string, key string) (string, bool) {
 	prefix := key + "="
 	for _, item := range environ {
 		if strings.HasPrefix(item, prefix) {
-			return strings.TrimPrefix(item, prefix)
+			return strings.TrimPrefix(item, prefix), true
 		}
 	}
-	return ""
+	return "", false
 }

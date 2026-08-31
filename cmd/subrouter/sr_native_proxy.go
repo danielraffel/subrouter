@@ -58,6 +58,7 @@ bare --account opens a pinned-account picker.
 The process-only routing overlay preserves Qwen's normal sessions and configuration.
 Account affinity is stable per working directory, including resumed sessions.
 The session-picker form requires an explicit ID: sr qwen --resume <session-id>.
+Qwen serve/ACP can reload saved environment routing, so use plain 'qwen' for those modes.
 `
 )
 
@@ -126,6 +127,9 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if qwenProxyReloadCapableMode(vendorArgs) {
+		return errors.New("Qwen serve/ACP modes can reload saved credentials and proxies; use plain 'qwen' for those modes")
+	}
 	for i := 0; i < len(vendorArgs); i++ {
 		if vendorArgs[i] == "--" {
 			break
@@ -140,6 +144,33 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 		return errors.New("'sr qwen --resume' requires an explicit session ID so Subrouter can preserve sticky account routing")
 	}
 	return r.launchNativeProxy(ctx, qwenNativeProxy, vendorArgs, options)
+}
+
+func qwenProxyReloadCapableMode(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "--acp" || strings.HasPrefix(arg, "--acp=") ||
+			arg == "--experimental-acp" || strings.HasPrefix(arg, "--experimental-acp=") {
+			return true
+		}
+		switch arg {
+		case "-m", "--model", "--fallback-model", "-p", "--prompt", "-i", "--prompt-interactive", "-o", "--output-format", "-r", "--resume":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		// Qwen's first positional argument is its subcommand. Later values are
+		// owned by that command and cannot switch the top-level runtime mode.
+		return arg == "serve"
+	}
+	return false
 }
 
 // parseNativeProxyLaunchArgs reserves --account only at the beginning of the
@@ -748,6 +779,7 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 	}
 	relayPrefix := "/" + relayToken
 	providerPrefix := relayPrefix + "/" + spec.route
+	relayHost := listener.Addr().String()
 	reverse := &httputil.ReverseProxy{Transport: transport}
 	reverse.Rewrite = func(proxyRequest *httputil.ProxyRequest) {
 		proxyRequest.SetURL(target)
@@ -778,8 +810,12 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 		// The random path is a process-local capability: other local processes
 		// cannot turn this short-lived relay into a tenant-wide proxy merely by
 		// discovering its port. Restrict it to the one advertised provider too.
+		// Qwen also receives this relay origin as a fail-closed HTTP proxy guard;
+		// absolute-form requests for any other host must not inherit the
+		// capability merely because their path happens to match.
 		requestPath := request.URL.Path
-		if request.URL.RawPath != "" || pathpkg.Clean(requestPath) != requestPath ||
+		if request.Method == http.MethodConnect || request.URL.IsAbs() || request.Host != relayHost ||
+			request.URL.RawPath != "" || pathpkg.Clean(requestPath) != requestPath ||
 			(requestPath != providerPrefix && !strings.HasPrefix(requestPath, providerPrefix+"/")) {
 			http.NotFound(response, request)
 			return
@@ -898,6 +934,11 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		if err != nil {
 			return nil, func() {}, err
 		}
+		proxyGuard, err := nativeProxyLoopbackGuardURL(relayRoot)
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
 		for key, value := range map[string]string{
 			"QWEN_CODE_SYSTEM_SETTINGS_PATH": overlay.settings,
 			"QWEN_CODE_SYSTEM_DEFAULTS_PATH": overlay.defaults,
@@ -911,7 +952,21 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 			"BAILIAN_CODING_PLAN_API_KEY": "subrouter",
 			"BAILIAN_TOKEN_PLAN_API_KEY":  "subrouter",
 			"DASHSCOPE_API_KEY":           "subrouter",
-			"NO_PROXY":                    "127.0.0.1,localhost,::1",
+			// Qwen treats empty values as unset when it loads .qwen/.env. A
+			// non-secret loopback guard prevents a saved outbound proxy from being
+			// restored; the relay rejects proxy targets other than itself.
+			"HTTP_PROXY":  proxyGuard,
+			"HTTPS_PROXY": proxyGuard,
+			"ALL_PROXY":   proxyGuard,
+			"http_proxy":  proxyGuard,
+			"https_proxy": proxyGuard,
+			"all_proxy":   proxyGuard,
+			// Common HTTP stacks, including Qwen's EnvHttpProxyAgent, bypass the
+			// guard for every destination. This preserves ordinary tool and child
+			// process networking while the non-empty guard still blocks Qwen's
+			// saved .env proxy values from being restored.
+			"NO_PROXY": "*",
+			"no_proxy": "*",
 		} {
 			env = upsertEnv(env, key, value)
 		}
@@ -978,7 +1033,7 @@ func kimiNativeProxyArgs(args []string) []string {
 				i++
 			}
 			continue
-		case strings.HasPrefix(args[i], "--model="):
+		case strings.HasPrefix(args[i], "--model=") || strings.HasPrefix(args[i], "-m="):
 			continue
 		default:
 			out = append(out, args[i])
@@ -1001,8 +1056,9 @@ func qwenProxyModel(args []string) string {
 				model = candidate
 			}
 			i++
-		case strings.HasPrefix(args[i], "--model="):
-			if candidate := strings.TrimSpace(strings.TrimPrefix(args[i], "--model=")); candidate != "" {
+		case strings.HasPrefix(args[i], "--model=") || strings.HasPrefix(args[i], "-m="):
+			separator := strings.IndexByte(args[i], '=')
+			if candidate := strings.TrimSpace(args[i][separator+1:]); candidate != "" {
 				model = candidate
 			}
 		}
@@ -1026,7 +1082,7 @@ func qwenNativeProxyArgs(args []string, model string) []string {
 			if i+1 < len(args) {
 				i++
 			}
-		case strings.HasPrefix(args[i], "--model="):
+		case strings.HasPrefix(args[i], "--model=") || strings.HasPrefix(args[i], "-m="):
 		default:
 			out = append(out, args[i])
 		}
@@ -1043,9 +1099,22 @@ type qwenProxyOverlay struct {
 	defaults string
 }
 
+func nativeProxyLoopbackGuardURL(baseURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil ||
+		!isLoopbackServerHost(parsed.Hostname()) {
+		return "", errors.New("Qwen proxy relay must use an HTTP loopback URL")
+	}
+	return parsed.Scheme + "://" + parsed.Host, nil
+}
+
 func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxyOverlay, func(), error) {
 	if conflict := qwenSystemPolicyConflict(environ, runtime.GOOS); conflict != "" {
 		return qwenProxyOverlay{}, func() {}, fmt.Errorf("Qwen system policy %s is configured; refusing a proxy overlay that could bypass it", conflict)
+	}
+	proxyGuard, err := nativeProxyLoopbackGuardURL(baseURL)
+	if err != nil {
+		return qwenProxyOverlay{}, func() {}, err
 	}
 	dir, err := os.MkdirTemp("", "subrouter-qwen-proxy-")
 	if err != nil {
@@ -1054,13 +1123,22 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	payload := map[string]any{
 		// A saved Qwen proxy would otherwise receive the capability-bearing
-		// loopback URL. System settings merge last, so an explicit empty value
-		// disables that process only without rewriting the user's configuration.
-		"proxy": "",
+		// loopback URL. This truthy value wins the settings merge but Qwen's
+		// normalizeProxyUrl trims it to disabled. The non-empty environment guards
+		// below separately prevent .env from restoring an outbound proxy.
+		"proxy": " ",
 		"env": map[string]string{
 			"BAILIAN_CODING_PLAN_API_KEY": "subrouter",
 			"BAILIAN_TOKEN_PLAN_API_KEY":  "subrouter",
 			"DASHSCOPE_API_KEY":           "subrouter",
+			"HTTP_PROXY":                  proxyGuard,
+			"HTTPS_PROXY":                 proxyGuard,
+			"ALL_PROXY":                   proxyGuard,
+			"http_proxy":                  proxyGuard,
+			"https_proxy":                 proxyGuard,
+			"all_proxy":                   proxyGuard,
+			"NO_PROXY":                    "*",
+			"no_proxy":                    "*",
 		},
 		"slashCommands": map[string]any{
 			"disabled": []string{"auth", "model"},
