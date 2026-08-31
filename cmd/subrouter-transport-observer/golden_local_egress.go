@@ -158,9 +158,11 @@ func (r *goldenRunner) prepareGoldenLocalEgressBinding(
 	// A proxy can acquire leases for metadata requests before it acquires the
 	// lease used by the response. Bind to the earliest new hosted lease that
 	// starts at or after the observed response request. The process snapshot is
-	// the upper bound, so a lease observed after it is still incomplete.
+	// the upper bound, so a lease observed after it is still incomplete. More
+	// than one eligible lease is ambiguous and must fail closed.
 	var lease transportEvent
 	var leaseStarted time.Time
+	eligibleLeases := 0
 	for _, candidate := range leases[leaseBefore:] {
 		if candidate.Method != http.MethodPost || candidate.RequestID == "" || candidate.ConnectionID == "" {
 			return nil, false, failGolden("local_egress_lease_binding_invalid")
@@ -172,14 +174,18 @@ func (r *goldenRunner) prepareGoldenLocalEgressBinding(
 		if candidateStarted.Before(requestStarted) {
 			continue
 		}
+		if candidateStarted.After(afterCaptured) {
+			continue
+		}
+		eligibleLeases++
+		if eligibleLeases > 1 {
+			return nil, false, failGolden("local_egress_lease_binding_invalid")
+		}
 		if lease.RequestID == "" || candidateStarted.Before(leaseStarted) {
 			lease, leaseStarted = candidate, candidateStarted
 		}
 	}
 	if lease.RequestID == "" {
-		return nil, false, nil
-	}
-	if leaseStarted.After(afterCaptured) {
 		return nil, false, nil
 	}
 	left := goldenRemoteSocketsByID(before)
