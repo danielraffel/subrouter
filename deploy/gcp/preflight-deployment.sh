@@ -134,15 +134,7 @@ else
     routing_current="front"
   elif [[ "${legacy_refs}" == 1 && "${front_refs}" == 1 ]]; then
     routing_current="front-listener"
-    listener_takeover_json="$(gcloud_ssh "set -eu
-      front_pid=\$(systemctl show subrouter-front.service -p MainPID --value)
-      test \"\${front_pid}\" -gt 1
-      systemctl is-active --quiet subrouter-front.service
-      ! systemctl is-active --quiet subrouter.service
-      ! systemctl is-active --quiet subrouter.socket
-      sudo ss -H -lntp \"sport = :31415\" | grep -F \"pid=\${front_pid},\" >/dev/null
-      jq -nc --argjson pid \"\${front_pid}\" \
-        '{verified:true,service:"subrouter-front.service",port:31415,pid:\$pid}'")"
+    listener_takeover_json="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"{\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"
     listener_takeover_verified=true
   else
     die "URL map does not describe a supported post-migration route"
