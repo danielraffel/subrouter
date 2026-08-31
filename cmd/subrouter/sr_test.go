@@ -1137,6 +1137,8 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	var imported atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
+		case "/_subrouter/health":
+			w.WriteHeader(http.StatusOK)
 		case "/_subrouter/account-import":
 			if request.Header.Get("Authorization") != "Bearer import-token" {
 				http.Error(w, "missing import credential", http.StatusUnauthorized)
@@ -1208,6 +1210,13 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	if strings.Contains(text, "disk-only") || strings.Contains(text, "Codex isolation:") {
 		t.Fatalf("server-authoritative status leaked local disk state:\n%s", text)
 	}
+	out.Reset()
+	if err := runner.run(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if text := out.String(); !strings.Contains(text, "network") || strings.Contains(text, "disk-only") {
+		t.Fatalf("bare sr did not use the serving authority:\n%s", text)
+	}
 }
 
 func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
@@ -1215,6 +1224,8 @@ func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
 	var accountRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
+		case "/_subrouter/health":
+			w.WriteHeader(http.StatusOK)
 		case "/_subrouter/usage-status":
 			usageRequests.Add(1)
 			_, _ = io.WriteString(w, `[]`)
@@ -1252,6 +1263,37 @@ func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
 	}
 }
 
+func TestReadyLocalServingServerStartsColdDaemon(t *testing.T) {
+	var healthy atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(w, request)
+			return
+		}
+		if !healthy.Load() {
+			http.Error(w, "cold", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+
+	var starts atomic.Int32
+	runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}, errOut: io.Discard}
+	resolved, err := runner.readyLocalServingServer(t.Context(), func() error {
+		starts.Add(1)
+		healthy.Store(true)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if starts.Load() != 1 || !sameEndpoint(resolved.URL, server.URL) {
+		t.Fatalf("ready local server = %+v starts=%d", resolved, starts.Load())
+	}
+}
+
 func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
 	if err := store.SaveStored(accounts.StoredCodexAccount{
@@ -1262,12 +1304,15 @@ func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
 	}
 	var requested atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/_subrouter/reset-credits" {
+		switch request.URL.Path {
+		case "/_subrouter/health":
+			w.WriteHeader(http.StatusOK)
+		case "/_subrouter/reset-credits":
+			requested.Store(true)
+			_, _ = io.WriteString(w, `{"accounts":[{"email":"server-authority","count":1,"credits":[{"status":"available"}]}]}`)
+		default:
 			http.NotFound(w, request)
-			return
 		}
-		requested.Store(true)
-		_, _ = io.WriteString(w, `{"accounts":[{"email":"server-authority","count":1,"credits":[{"status":"available"}]}]}`)
 	}))
 	defer server.Close()
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
@@ -1288,12 +1333,12 @@ func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
 }
 
 func TestServingAPIAccountCommandDoesNotCaptureLocalOnlyCommands(t *testing.T) {
-	for _, command := range []string{"add", "add-key", "list", "status", "pick", "reset", "qwen", "kimi", "remove"} {
+	for _, command := range []string{"add", "add-key", "list", "status", "reset", "qwen", "kimi", "remove"} {
 		if !servingAPIAccountCommand(command) {
 			t.Fatalf("serving account command %q was not routed", command)
 		}
 	}
-	for _, command := range []string{"usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
+	for _, command := range []string{"switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
 		if servingAPIAccountCommand(command) {
 			t.Fatalf("local-only command %q was captured by the serving API", command)
 		}

@@ -388,7 +388,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		var server srServerConfig
 		var err error
 		if source == broker.CredentialSourceLocal {
-			server, err = r.localServingServer()
+			server, err = r.readyLocalServingServer(ctx, defaultDaemonStarter())
 			if err != nil {
 				return err
 			}
@@ -399,7 +399,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 				return err
 			}
 			if !ok {
-				server, err = r.localServingServer()
+				server, err = r.readyLocalServingServer(ctx, defaultDaemonStarter())
 				if err != nil {
 					return err
 				}
@@ -556,8 +556,8 @@ func isQwenManagementCommand(args []string) bool {
 // reports, traces, admin-key management, and project attachment stay local.
 func servingAPIAccountCommand(command string) bool {
 	switch command {
-	case "add", "add-key", "add-api-key", "list", "ls", "status", "pick", "reset", "qwen", "kimi",
-		"switch", "use", "g", "gui", "gui-switch", "gui-use", "import", "remove", "rm":
+	case "add", "add-key", "add-api-key", "list", "ls", "status", "reset", "qwen", "kimi",
+		"import", "remove", "rm":
 		return true
 	default:
 		return strings.Contains(command, "@")
@@ -1143,7 +1143,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if !r.useServingAPI {
 			break
 		}
-		server, err := r.localServingServer()
+		server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
 		if err != nil {
 			return err
 		}
@@ -1152,7 +1152,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if explicitLocalStateAuthority() || !r.useServingAPI {
 			break
 		}
-		server, err := r.localServingServer()
+		server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
 		if err != nil {
 			return err
 		}
@@ -1270,6 +1270,21 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 			return err
 		} else if ok {
 			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		}
+		if r.useServingAPI && !explicitLocalStateAuthority() {
+			server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
+			if err != nil {
+				return err
+			}
+			return r.serverStatusFor(ctx, server)
+		}
+	case broker.CredentialSourceLocal:
+		if r.useServingAPI && !explicitLocalStateAuthority() {
+			server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
+			if err != nil {
+				return err
+			}
+			return r.serverStatusFor(ctx, server)
 		}
 	}
 	if err := r.autoImportIfEmpty(ctx); err != nil {

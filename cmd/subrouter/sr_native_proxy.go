@@ -230,8 +230,12 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return fmt.Errorf("load credential storage: %w", err)
 	}
+	credentialSource := cloudConfig.EffectiveCredentialSource()
+	if credentialSource == broker.CredentialSourceTeam && !nativeProxyBrokerLeaseSupported(spec) {
+		return fmt.Errorf("team credential storage cannot lease %s accounts; use local or legacy storage for 'sr %s'", spec.display, spec.command)
+	}
 	var inventory []remoteServerAccount
-	if nativeProxyNeedsAccountInventory(options, cloudConfig.EffectiveCredentialSource()) {
+	if nativeProxyNeedsAccountInventory(options, credentialSource) {
 		inventory, err = r.nativeProxyAccounts(ctx, server, spec)
 		if err != nil {
 			return err
@@ -301,6 +305,10 @@ func nativeProxyNeedsAccountInventory(options nativeProxyLaunchOptions, source b
 	// owns no account inventory and obtains a provider-scoped lease from the
 	// credential broker on the first routed request.
 	return options.pickPinnedAccount || strings.TrimSpace(options.accountSelector) != "" || source != broker.CredentialSourceTeam
+}
+
+func nativeProxyBrokerLeaseSupported(spec nativeProxySpec) bool {
+	return spec.provider == accounts.ProviderQwenToken && spec.authMode == accounts.AuthModeAPIKey
 }
 
 func nativeProxyServerToken(root string) (string, error) {

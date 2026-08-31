@@ -898,6 +898,13 @@ func (r srRunner) localServingServer() (srServerConfig, error) {
 	return server, nil
 }
 
+func (r srRunner) readyLocalServingServer(ctx context.Context, start daemonStarter) (srServerConfig, error) {
+	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), start, r.errOut) {
+		return srServerConfig{}, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
+	}
+	return r.localServingServer()
+}
+
 func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
 	server, ok, err := store.find(name)
 	if err != nil {

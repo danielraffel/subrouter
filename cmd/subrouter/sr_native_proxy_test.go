@@ -273,6 +273,15 @@ func TestPooledTeamNativeProxyLaunchDefersAccountSelectionToBroker(t *testing.T)
 	if got := accountRequests.Load(); got != 0 {
 		t.Fatalf("pooled team launch made %d local account inventory request(s), want broker selection at request time", got)
 	}
+	for _, spec := range []nativeProxySpec{kimiNativeProxy, antigravityNativeProxy} {
+		err := runner.launchNativeProxy(t.Context(), spec, nil, nativeProxyLaunchOptions{})
+		if err == nil || !strings.Contains(err.Error(), "team credential storage cannot lease") {
+			t.Fatalf("pooled team %s launch error = %v, want unsupported broker provider", spec.display, err)
+		}
+	}
+	if got := accountRequests.Load(); got != 0 {
+		t.Fatalf("unsupported team launch made %d account inventory request(s), want pre-exec rejection", got)
+	}
 
 	err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{accountSelector: "work"})
 	if err == nil || !strings.Contains(err.Error(), "no routed Qwen apikey account") {
