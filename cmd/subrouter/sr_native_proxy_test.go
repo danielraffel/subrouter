@@ -95,15 +95,18 @@ func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *te
 	if err := os.WriteFile(configPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local","localProxyToken":"local-daemon-secret"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	token, err := nativeProxyServerToken(root+"/tenantless", false)
+	token, err := nativeProxyServerToken(root + "/tenantless")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token != "local-daemon-secret" {
 		t.Fatalf("local daemon token selected = %q", token)
 	}
-	if remoteToken, err := nativeProxyServerToken(root, true); err != nil || remoteToken != "subrouter" {
+	if remoteToken, err := nativeProxyServerToken("https://router.example.test"); err != nil || remoteToken != "subrouter" {
 		t.Fatalf("remote placeholder = %q err=%v", remoteToken, err)
+	}
+	if selectedLoopbackToken, err := nativeProxyServerToken(root + "/selected-server"); err != nil || selectedLoopbackToken != "local-daemon-secret" {
+		t.Fatalf("selected loopback token = %q err=%v", selectedLoopbackToken, err)
 	}
 	env, cleanup, err := nativeProxyEnvironment(kimiNativeProxy, "http://127.0.0.1:43214/capability", os.Environ(), nil)
 	cleanup()
@@ -205,12 +208,31 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 			t.Fatalf("policy environment error = %v", err)
 		}
 	}
+	if got := qwenSystemPolicyConflict([]string{"qwen_code_system_settings_path=C:\\managed\\settings.json"}, "windows"); got != "QWEN_CODE_SYSTEM_SETTINGS_PATH" {
+		t.Fatalf("case-insensitive Windows policy conflict = %q", got)
+	}
 	policyPath := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(policyPath, []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if got := qwenSystemPolicyConflictAtPaths(nil, []string{policyPath}); got != policyPath {
 		t.Fatalf("system policy conflict = %q, want %q", got, policyPath)
+	}
+}
+
+func TestQwenProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
+	for _, args := range [][]string{{"--resume"}, {"-r"}, {"--resume", "--model", "qwen-test"}} {
+		if !qwenResumePickerRequested(args) {
+			t.Fatalf("picker resume %q was not detected", args)
+		}
+	}
+	for _, args := range [][]string{{"--resume", "session-id"}, {"-r", "session-id"}, {"--resume=session-id"}, {"--", "--resume"}} {
+		if qwenResumePickerRequested(args) {
+			t.Fatalf("explicit/non-option resume %q was rejected", args)
+		}
+	}
+	if err := (srRunner{}).launchQwenProxy(t.Context(), []string{"--resume"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
+		t.Fatalf("picker launch error = %v", err)
 	}
 }
 

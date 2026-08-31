@@ -174,8 +174,12 @@ The subrouter cx <command> form is kept as a compatibility alias.
 `
 
 type srRunner struct {
-	program                     string
-	store                       accounts.CodexStore
+	program string
+	store   accounts.CodexStore
+	// useServingAPI is enabled by the real CLI entrypoint. Direct unit runners
+	// leave it false so injected stores remain hermetic and never contact a
+	// developer's live loopback daemon.
+	useServingAPI               bool
 	in                          io.Reader
 	out                         io.Writer
 	errOut                      io.Writer
@@ -265,12 +269,13 @@ func cxAlias(args []string) error {
 func srForProgram(program string, args []string) error {
 	store := codexStoreForCommand(args)
 	runner := srRunner{
-		program: program,
-		store:   store,
-		in:      os.Stdin,
-		out:     os.Stdout,
-		errOut:  os.Stderr,
-		client:  &http.Client{Timeout: 120 * time.Second},
+		program:       program,
+		store:         store,
+		useServingAPI: true,
+		in:            os.Stdin,
+		out:           os.Stdout,
+		errOut:        os.Stderr,
+		client:        &http.Client{Timeout: 120 * time.Second},
 	}
 	return runner.run(context.Background(), args)
 }
@@ -349,7 +354,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
+	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
 		server, ok, err := r.selectedRemoteServer()
 		if err != nil {
 			return err
@@ -577,12 +582,12 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "list", "ls":
 		return r.listServerAccounts(ctx, server)
 	case "status":
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		return r.serverStatusFor(ctx, server)
 	case "usage":
 		if len(args) > 1 {
 			return fmt.Errorf("remote usage does not accept a day count; use %s server status %s", r.programOrSubrouter(), server.Name)
 		}
-		return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		return r.serverStatusFor(ctx, server)
 	case "pick":
 		return r.pickRemoteAccount(ctx, server)
 	case "reset":
@@ -597,7 +602,7 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 			return err
 		}
 		if selector == "" {
-			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+			return r.serverStatusFor(ctx, server)
 		}
 		return r.unsupportedRemoteCommand(command, server, "remote servers select accounts per session; use SUBROUTER_CODEX_ACCOUNT_ID for a one-off forced account")
 	case "import":
@@ -1050,7 +1055,7 @@ func (r srRunner) status(ctx context.Context) error {
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLocal, broker.CredentialSourceLegacy:
-		if explicitLocalStateAuthority() {
+		if explicitLocalStateAuthority() || !r.useServingAPI {
 			break
 		}
 		if server, ok, err := r.defaultRemoteServer(); err != nil {

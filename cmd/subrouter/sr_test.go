@@ -1185,7 +1185,7 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	runner := srRunner{store: store, in: strings.NewReader("network\napi-key-placeholder\n"), out: &out, errOut: &out, client: server.Client()}
+	runner := srRunner{store: store, useServingAPI: true, in: strings.NewReader("network\napi-key-placeholder\n"), out: &out, errOut: &out, client: server.Client()}
 	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
 		t.Fatal(err)
 	}

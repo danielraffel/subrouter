@@ -41,6 +41,7 @@ The process-scoped model override leaves Kimi's normal login and config unchange
 
 Launch Qwen Code through the selected Qwen Token Plan pool. Plain 'qwen' remains direct.
 The process-only routing overlay preserves Qwen's normal sessions and configuration.
+For sticky resume, pass an explicit ID: sr qwen proxy --resume <session-id>.
 `
 )
 
@@ -100,11 +101,27 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 			}
 		}
 	}
+	if qwenResumePickerRequested(args) {
+		return errors.New("'sr qwen proxy --resume' requires an explicit session ID so Subrouter can preserve sticky account routing")
+	}
 	return r.launchNativeProxy(ctx, qwenNativeProxy, args)
 }
 
+func qwenResumePickerRequested(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--" {
+			return false
+		}
+		if args[i] != "-r" && args[i] != "--resume" {
+			continue
+		}
+		return i+1 >= len(args) || strings.HasPrefix(args[i+1], "-")
+	}
+	return false
+}
+
 func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, args []string) error {
-	server, remote, err := r.nativeProxyServer(ctx)
+	server, _, err := r.nativeProxyServer(ctx)
 	if err != nil {
 		return err
 	}
@@ -119,7 +136,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return err
 	}
-	proxyToken, err := nativeProxyServerToken(root, remote)
+	proxyToken, err := nativeProxyServerToken(root)
 	if err != nil {
 		return err
 	}
@@ -151,8 +168,8 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	return cmd.Run()
 }
 
-func nativeProxyServerToken(root string, remote bool) (string, error) {
-	if remote {
+func nativeProxyServerToken(root string) (string, error) {
+	if !loopbackEndpoint(root) || !sameEndpoint(root, localBaseURL()) {
 		return "subrouter", nil
 	}
 	config, err := cloudModeConfig()
@@ -602,12 +619,16 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 }
 
 func qwenSystemPolicyConflict(environ []string, goos string) string {
-	return qwenSystemPolicyConflictAtPaths(environ, qwenDefaultSystemPolicyPaths(environ, goos))
+	return qwenSystemPolicyConflictAtPathsForOS(environ, qwenDefaultSystemPolicyPaths(environ, goos), goos)
 }
 
 func qwenSystemPolicyConflictAtPaths(environ, paths []string) string {
+	return qwenSystemPolicyConflictAtPathsForOS(environ, paths, runtime.GOOS)
+}
+
+func qwenSystemPolicyConflictAtPathsForOS(environ, paths []string, goos string) string {
 	for _, key := range []string{"QWEN_CODE_SYSTEM_SETTINGS_PATH", "QWEN_CODE_SYSTEM_DEFAULTS_PATH"} {
-		if strings.TrimSpace(envValue(environ, key)) != "" {
+		if strings.TrimSpace(envValueForOS(environ, key, goos)) != "" {
 			return key
 		}
 	}
@@ -627,7 +648,7 @@ func qwenDefaultSystemPolicyPaths(environ []string, goos string) []string {
 			"/Library/Application Support/QwenCode/system-defaults.json",
 		}
 	case "windows":
-		root := envValue(environ, "ProgramData")
+		root := envValueForOS(environ, "ProgramData", goos)
 		if root == "" {
 			root = `C:\ProgramData`
 		}
@@ -638,10 +659,20 @@ func qwenDefaultSystemPolicyPaths(environ []string, goos string) []string {
 }
 
 func envValue(environ []string, key string) string {
-	prefix := key + "="
+	return envValueForOS(environ, key, runtime.GOOS)
+}
+
+func envValueForOS(environ []string, key, goos string) string {
 	for i := len(environ) - 1; i >= 0; i-- {
-		if strings.HasPrefix(environ[i], prefix) {
-			return strings.TrimPrefix(environ[i], prefix)
+		item := environ[i]
+		separator := strings.IndexByte(item, '=')
+		if separator < 0 {
+			continue
+		}
+		name := item[:separator]
+		if (goos == "windows" && strings.EqualFold(name, key)) ||
+			(goos != "windows" && name == key) {
+			return item[separator+1:]
 		}
 	}
 	return ""

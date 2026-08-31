@@ -1195,11 +1195,7 @@ func TestLocalCodexStoreServingDoesNotAssumeUnconfiguredSelectedRemoteIsLocal(t 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if localCodexStoreServesLegacy(store) {
-		t.Fatal("selected loopback origin was treated as proof of the daemon's state root")
-	}
-	t.Setenv("SUBROUTER_STATE_DIR", store.StoreDir())
 	if !localCodexStoreServesLegacy(store) {
-		t.Fatal("explicit local state root was not treated as the serving store")
+		t.Fatal("selected loopback server was not treated as the local credential store")
 	}
 }
