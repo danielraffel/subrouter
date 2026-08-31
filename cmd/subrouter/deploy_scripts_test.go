@@ -1903,6 +1903,70 @@ esac
 	}
 }
 
+func TestGoldenWrapperAccountIDLengthValidationIsPortable(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "jq", "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	externalLog := filepath.Join(t.TempDir(), "external.log")
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "uname"), `#!/bin/sh
+case "$1" in
+  -s) printf '%s\n' Darwin ;;
+  -m) printf '%s\n' arm64 ;;
+  *) exit 1 ;;
+esac
+`)
+	for _, name := range []string{"gh", "gcloud", "go"} {
+		writeExecutableTestFile(t, filepath.Join(fakeBin, name), "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >>\"$EXTERNAL_LOG\"\nexit 99\n")
+	}
+	config := filepath.Join(t.TempDir(), "cloud.json")
+	if err := os.WriteFile(config, []byte(`{"hostedUrl":"https://sr.cmux.com"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(accountID string) ([]byte, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx,
+			mustLookPath(t, "bash"),
+			filepath.Join(repoRoot, "deploy", "gcp", "golden-local-mac-production-continuity.sh"),
+			"--cloud-config", config,
+			"--artifact-dir", t.TempDir(),
+			"--account-id", accountID,
+		)
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"EXTERNAL_LOG="+externalLog,
+			"SUBROUTER_GCP_PROJECT=project",
+			"SUBROUTER_GCP_ZONE=us-south1-a",
+			"SUBROUTER_GCP_INSTANCE=subrouter-team",
+			"SUBROUTER_PUBLIC_BASE_URL=https://sr.cmux.com",
+		)
+		output, err := runDeployTestCommand(command)
+		if ctx.Err() != nil {
+			t.Fatalf("account validation command timed out: %v\n%s", ctx.Err(), output)
+		}
+		return output, err
+	}
+
+	validOutput, validErr := run(strings.Repeat("a", 256))
+	if validErr == nil {
+		t.Fatalf("valid 256-byte account ID unexpectedly completed:\n%s", validOutput)
+	}
+	if body, err := os.ReadFile(externalLog); err != nil || len(body) == 0 {
+		t.Fatalf("valid account ID did not pass validation before the first external operation: read=%v run=%v\noutput=%s", err, validErr, validOutput)
+	}
+	if err := os.WriteFile(externalLog, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := run(strings.Repeat("a", 257))
+	if err == nil || !strings.Contains(string(output), "valid Codex OAuth account ID") {
+		t.Fatalf("overlong account ID was not rejected locally: %v\n%s", err, output)
+	}
+	if body, readErr := os.ReadFile(externalLog); readErr != nil || len(body) != 0 {
+		t.Fatalf("overlong account ID reached an external operation: %v\n%s", readErr, body)
+	}
+}
+
 func TestGoldenReleaseHelperCoherenceRejectsDrift(t *testing.T) {
 	requireDeployScriptTools(t, "bash")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
