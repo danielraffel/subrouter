@@ -47,16 +47,25 @@ case "${INSTANCE}" in
     LEGACY_BACKEND_SERVICE="${SUBROUTER_GCP_BACKEND_SERVICE:-subrouter-backend}"
     FRONT_BACKEND_SERVICE="${SUBROUTER_GCP_FRONT_BACKEND_SERVICE:-subrouter-front-backend}"
     INSTANCE_GROUP="${SUBROUTER_GCP_INSTANCE_GROUP:-subrouter-ig}"
+    ACTIVE_MATCHER="__root__"
+    CANARY_MATCHER="subrouter-front-canary"
+    CANARY_HOST="front-canary.sr.cmux.internal"
     ;;
   subrouter-staging)
     LEGACY_BACKEND_SERVICE="${SUBROUTER_GCP_BACKEND_SERVICE:-subrouter-staging-backend}"
     FRONT_BACKEND_SERVICE="${SUBROUTER_GCP_FRONT_BACKEND_SERVICE:-subrouter-staging-front-backend}"
     INSTANCE_GROUP="${SUBROUTER_GCP_INSTANCE_GROUP:-subrouter-staging-ig}"
+    ACTIVE_MATCHER="staging-subrouter"
+    CANARY_MATCHER="staging-subrouter-front-canary"
+    CANARY_HOST="front-canary.staging.sr.cmux.internal"
     ;;
   *)
     LEGACY_BACKEND_SERVICE="${SUBROUTER_GCP_BACKEND_SERVICE:?set SUBROUTER_GCP_BACKEND_SERVICE}"
     FRONT_BACKEND_SERVICE="${SUBROUTER_GCP_FRONT_BACKEND_SERVICE:?set SUBROUTER_GCP_FRONT_BACKEND_SERVICE}"
     INSTANCE_GROUP="${SUBROUTER_GCP_INSTANCE_GROUP:?set SUBROUTER_GCP_INSTANCE_GROUP}"
+    ACTIVE_MATCHER="${SUBROUTER_GCP_ACTIVE_MATCHER:?set SUBROUTER_GCP_ACTIVE_MATCHER}"
+    CANARY_MATCHER="${SUBROUTER_GCP_CANARY_MATCHER:?set SUBROUTER_GCP_CANARY_MATCHER}"
+    CANARY_HOST="${SUBROUTER_GCP_CANARY_HOST:?set SUBROUTER_GCP_CANARY_HOST}"
     ;;
 esac
 
@@ -97,9 +106,27 @@ legacy_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}
 front_backend_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/backendServices/${FRONT_BACKEND_SERVICE}"
 legacy_refs="$(jq -r --arg value "${legacy_backend_url}" '[.. | strings | select(. == $value)] | length' < <(stream_shell_value "${url_map_json}"))"
 front_refs="$(jq -r --arg value "${front_backend_url}" '[.. | strings | select(. == $value)] | length' < <(stream_shell_value "${url_map_json}"))"
+active_backend_url=""
+canary_backend_url="${front_backend_url}"
+route_assignments_verified=false
+canary_present=false
 
 if [[ "${MODE}" == migrate-front ]]; then
   [[ "${legacy_refs}" == 1 && "${front_refs}" == 0 ]] || die "URL map is not exactly on the legacy backend"
+  route_assignments_json="$(jq -c -e \
+    --arg active_matcher "${ACTIVE_MATCHER}" --arg legacy_url "${legacy_backend_url}" '
+      def active_backends:
+        if $active_matcher == "__root__"
+        then [(.defaultService // empty)]
+        else [.pathMatchers[]? | select(.name == $active_matcher) | .defaultService // empty]
+        end;
+      {active_backends: active_backends}
+      | select(.active_backends == [$legacy_url])
+      | {verified:true,active_backend:$legacy_url}
+    ' < <(stream_shell_value "${url_map_json}"))" \
+    || die "URL map active route does not point to the legacy backend"
+  active_backend_url="$(jq -r '.active_backend' < <(stream_shell_value "${route_assignments_json}"))"
+  route_assignments_verified=true
   jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' < <(stream_shell_value "${group_json}") >/dev/null \
     || die "legacy named port http:31415 is missing"
   front_state="$(gcloud_ssh "if systemctl is-active --quiet subrouter-front.service || sudo test -S /var/lib/subrouter/front.sock; then echo present; else echo absent; fi" | tail -n 1)"
@@ -128,17 +155,62 @@ else
   # listener owner. Keep accepting the direct-front shape for fresh topology
   # and older installations.
   routing_current=""
+  route_assignments_json='null'
+  route_assignments_verified=false
   listener_takeover_verified=false
   listener_takeover_json='null'
   if [[ "${legacy_refs}" == 0 && "${front_refs}" == 1 ]]; then
     routing_current="front"
+    route_assignments_json="$(jq -c -e \
+      --arg active_matcher "${ACTIVE_MATCHER}" --arg front_url "${front_backend_url}" '
+        def active_backends:
+          if $active_matcher == "__root__"
+          then [(.defaultService // empty)]
+          else [.pathMatchers[]? | select(.name == $active_matcher) | .defaultService // empty]
+          end;
+        {active_backends: active_backends}
+        | select(.active_backends == [$front_url])
+        | {verified:true,active_backend:$front_url}
+      ' < <(stream_shell_value "${url_map_json}"))" \
+      || die "URL map active route does not point to the front backend"
+    route_assignments_verified=true
   elif [[ "${legacy_refs}" == 1 && "${front_refs}" == 1 ]]; then
     routing_current="front-listener"
-    listener_takeover_json="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"{\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"
+    route_assignments_json="$(jq -c -e \
+      --arg active_matcher "${ACTIVE_MATCHER}" --arg canary_matcher "${CANARY_MATCHER}" \
+      --arg canary_host "${CANARY_HOST}" --arg legacy_url "${legacy_backend_url}" \
+      --arg front_url "${front_backend_url}" '
+        def active_backends:
+          if $active_matcher == "__root__"
+          then [(.defaultService // empty)]
+          else [.pathMatchers[]? | select(.name == $active_matcher) | .defaultService // empty]
+          end;
+        def canary_rules:
+          [.hostRules[]? | select(.pathMatcher == $canary_matcher)];
+        def canary_matchers:
+          [.pathMatchers[]? | select(.name == $canary_matcher)];
+        {active_backends: active_backends, canary_rules: canary_rules,
+         canary_matchers: canary_matchers}
+        | select(
+            .active_backends == [$legacy_url]
+            and (.canary_rules | length) == 1
+            and .canary_rules[0].hosts == [$canary_host]
+            and (.canary_matchers | length) == 1
+            and .canary_matchers[0].defaultService == $front_url
+          )
+        | {verified:true,active_backend:$legacy_url,canary_backend:$front_url}
+      ' < <(stream_shell_value "${url_map_json}"))" \
+      || die "URL map active and canary assignments do not match the post-migration route"
+    route_assignments_verified=true
+    listener_takeover_json="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; ! systemctl is-enabled --quiet subrouter.service; ! systemctl is-enabled --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"{\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"
     listener_takeover_verified=true
   else
     die "URL map does not describe a supported post-migration route"
   fi
+  active_backend_url="$(jq -r '.active_backend' < <(stream_shell_value "${route_assignments_json}"))"
+  canary_backend_url="${front_backend_url}"
+  canary_present=false
+  [[ "${routing_current}" == front-listener ]] && canary_present=true
   front_status="$(gcloud_ssh "systemctl is-active --quiet subrouter-front.service; sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status")"
   active_slot="$(jq -r '.active.id // empty' < <(stream_shell_value "${front_status}"))"
   [[ "${active_slot}" == slot-a || "${active_slot}" == slot-b ]] || die "front active slot is invalid"
@@ -162,6 +234,8 @@ else
     --arg generation "${slot_generation}" --arg worker "${worker_checksum}" \
     --arg control "${control_checksum}" --arg front "${front_checksum}" \
     --argjson inactive "${slot_inactive_connections}" \
+    --argjson route_assignments_verified "${route_assignments_verified}" \
+    --argjson canary_present "${canary_present}" \
     --argjson listener_takeover_verified "${listener_takeover_verified}" \
     --argjson listener_takeover "${listener_takeover_json}" \
     '{kind:$kind,routing_current:$current,front:{service_active:true,active_slot:$slot,
@@ -178,7 +252,13 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type deploy
   --arg mode "${MODE}" --arg run_id "${RUN_LABEL}" --arg project "${PROJECT_ID}" \
   --arg zone "${ZONE}" --arg instance "${INSTANCE}" --arg tag "${RELEASE_TAG}" \
   --arg sha "${EXPECTED_SHA256}" --arg revision "${DEPLOY_REVISION}" --arg url_map "${URL_MAP}" \
+  --arg active_matcher "${ACTIVE_MATCHER}" --arg active_backend_url "${active_backend_url}" \
+  --arg legacy_backend_url "${legacy_backend_url}" --arg front_backend_url "${front_backend_url}" \
+  --arg canary_matcher "${CANARY_MATCHER}" --arg canary_host "${CANARY_HOST}" \
+  --arg canary_backend_url "${canary_backend_url}" \
   --argjson legacy_refs "${legacy_refs}" --argjson front_refs "${front_refs}" \
+  --argjson route_assignments_verified "${route_assignments_verified}" \
+  --argjson canary_present "${canary_present}" \
   --argjson topology "${topology}" --arg emitted_at "${emitted_at}" \
   '{schema:$schema,evidence_type:$evidence_type,mode:$mode,success:true,
     mutation_performed:false,local_golden_required:true,
@@ -186,7 +266,11 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type deploy
     release:{tag:$tag,sha256:$sha,source_revision:$revision,tag_on_main:true,
       attestation_verified:true,immutable:true},public:{health:true,ready:true},
     routing:{url_map:$url_map,legacy_backend_references:$legacy_refs,
-      front_backend_references:$front_refs},topology:$topology,evidence_emitted_at:$emitted_at}' \
+      front_backend_references:$front_refs,active_matcher:$active_matcher,
+      active_backend_url:$active_backend_url,legacy_backend_url:$legacy_backend_url,
+      front_backend_url:$front_backend_url,route_assignments_verified:$route_assignments_verified,
+      canary:{present:$canary_present,host:$canary_host,matcher:$canary_matcher,
+        backend_url:$canary_backend_url}},topology:$topology,evidence_emitted_at:$emitted_at}' \
   >"${evidence_tmp}"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect deployment-preflight "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"

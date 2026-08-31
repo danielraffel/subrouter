@@ -1214,6 +1214,71 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
         fail("legacy retirement evidence was emitted before absence")
 
 
+def validate_preflight_routing(
+    run: dict[str, Any],
+    routing: dict[str, Any],
+    mode: str,
+    legacy_refs: int,
+    front_refs: int,
+) -> None:
+    legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
+    front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
+        fail("preflight backend URLs must be distinct HTTPS resources")
+    project_prefix = f"https://www.googleapis.com/compute/v1/projects/{run['project']}/global/backendServices/"
+    if not legacy_url.startswith(project_prefix) or not front_url.startswith(project_prefix):
+        fail("preflight backend URLs must target the deployment project")
+
+    expected_routing = {
+        "subrouter-staging": (
+            "staging-subrouter",
+            "staging-subrouter-front-canary",
+            "front-canary.staging.sr.cmux.internal",
+        ),
+        "subrouter-team": (
+            "__root__",
+            "subrouter-front-canary",
+            "front-canary.sr.cmux.internal",
+        ),
+    }
+    target = expected_routing.get(run["instance"])
+    active_matcher = text(field(routing, "active_matcher", "routing"), "routing.active_matcher")
+    canary = obj(field(routing, "canary", "routing"), "routing.canary")
+    canary_matcher = text(field(canary, "matcher", "routing.canary"), "routing.canary.matcher")
+    canary_host = text(field(canary, "host", "routing.canary"), "routing.canary.host")
+    canary_backend_url = text(field(canary, "backend_url", "routing.canary"), "routing.canary.backend_url")
+    if target is not None:
+        expected_active_matcher, expected_canary_matcher, expected_canary_host = target
+        exact(active_matcher, expected_active_matcher, "routing.active_matcher")
+        exact(canary_matcher, expected_canary_matcher, "routing.canary.matcher")
+        exact(canary_host, expected_canary_host, "routing.canary.host")
+    exact(canary_backend_url, front_url, "routing.canary.backend_url")
+    exact(
+        boolean(field(routing, "route_assignments_verified", "routing"), "routing.route_assignments_verified"),
+        True,
+        "routing.route_assignments_verified",
+    )
+
+    active_backend_url = text(field(routing, "active_backend_url", "routing"), "routing.active_backend_url")
+    expected_shape = (legacy_refs, front_refs)
+    if mode == "migrate-front":
+        expected_shape = (1, 0)
+    if mode == "slot" and expected_shape == (0, 1):
+        expected_active_url = front_url
+        expected_canary_present = False
+    elif expected_shape in {(1, 0), (1, 1)}:
+        expected_active_url = legacy_url
+        expected_canary_present = expected_shape == (1, 1)
+    else:
+        fail("preflight URL-map reference shape is unsupported")
+    exact(active_backend_url, expected_active_url, "routing.active_backend_url")
+    exact(
+        boolean(field(canary, "present", "routing.canary"), "routing.canary.present"),
+        expected_canary_present,
+        "routing.canary.present",
+    )
+
+
 def validate_deployment_preflight(document: dict[str, Any]) -> None:
     exact(field(document, "evidence_type", "root"), "deployment-preflight", "evidence_type")
     mode = text(field(document, "mode", "root"), "mode")
@@ -1230,7 +1295,7 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
         True,
         "local_golden_required",
     )
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     public = obj(field(document, "public", "root"), "public")
     exact(boolean(field(public, "health", "public"), "public.health"), True, "public.health")
@@ -1239,6 +1304,7 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
     text(field(routing, "url_map", "routing"), "routing.url_map")
     legacy_refs = integer(field(routing, "legacy_backend_references", "routing"), "routing.legacy_backend_references")
     front_refs = integer(field(routing, "front_backend_references", "routing"), "routing.front_backend_references")
+    validate_preflight_routing(run, routing, mode, legacy_refs, front_refs)
     topology = obj(field(document, "topology", "root"), "topology")
     exact(
         boolean(field(topology, "candidate_differs_from_active", "topology"),
