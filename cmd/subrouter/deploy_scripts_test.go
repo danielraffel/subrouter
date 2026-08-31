@@ -290,6 +290,12 @@ if [[ "${command_line}" == *"compute url-maps describe"* ]]; then
 JSON
     exit 0
   fi
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == path-override ]]; then
+    cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","name":"subrouter-front-canary","pathRules":[{"paths":["/override"],"service":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/other-backend"}]}]}
+JSON
+    exit 0
+  fi
   cat <<'JSON'
 {"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","name":"subrouter-front-canary"}]}
 JSON
@@ -297,6 +303,20 @@ JSON
 fi
 if [[ "${command_line}" == *"compute instance-groups describe"* ]]; then
   printf '%s\n' '{"namedPorts":[{"name":"http","port":31415},{"name":"front","port":31416}]}'
+  exit 0
+fi
+if [[ "${command_line}" == *"compute backend-services describe"* ]]; then
+  if [[ "${FAKE_POLICY_STATE:-valid}" == detached ]]; then
+    printf '%s\n' '{"securityPolicy":"https://www.googleapis.com/compute/v1/projects/test-project/global/securityPolicies/other-policy"}'
+    exit 0
+  fi
+  printf '%s\n' '{"securityPolicy":"https://www.googleapis.com/compute/v1/projects/test-project/global/securityPolicies/subrouter-front-canary-policy"}'
+  exit 0
+fi
+if [[ "${command_line}" == *"compute security-policies describe"* ]]; then
+  cat <<'JSON'
+{"name":"subrouter-front-canary-policy","description":"Subrouter front migration canary access boundary","type":"CLOUD_ARMOR","rules":[{"action":"allow","description":"allow authenticated Subrouter front migration canary","headerAction":{"requestHeadersToAdds":[{"headerName":"X-Subrouter-Canary-Token","headerValue":"canary-authorized"}]},"match":{"expr":{"expression":"has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.sr.cmux.internal' && has(request.headers['x-subrouter-canary-token']) && request.headers['x-subrouter-canary-token'] == 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"}},"preview":false,"priority":900},{"action":"deny(403)","description":"deny unauthenticated Subrouter front migration canary","match":{"expr":{"expression":"has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.sr.cmux.internal'"}},"preview":false,"priority":1000},{"action":"allow","description":"default rule","match":{"config":{"srcIpRanges":["*"]},"versionedExpr":"SRC_IPS_V1"},"preview":false,"priority":2147483647}]}
+JSON
   exit 0
 fi
 if [[ "${1:-}" == compute && "${2:-}" == ssh ]]; then
@@ -420,6 +440,26 @@ exit 1
 	enabled.Env = append(command.Env, "FAKE_LEGACY_ENABLED=1")
 	if output, err := enabled.CombinedOutput(); err == nil {
 		t.Fatalf("enabled legacy unit was accepted:\n%s", output)
+	}
+
+	pathOverride := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "path-override.json"),
+	)
+	pathOverride.Env = append(command.Env, "FAKE_ROUTE_STATE=path-override")
+	if output, err := pathOverride.CombinedOutput(); err == nil {
+		t.Fatalf("canary path override was accepted:\n%s", output)
+	}
+
+	detachedPolicy := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "detached-policy.json"),
+	)
+	detachedPolicy.Env = append(command.Env, "FAKE_POLICY_STATE=detached")
+	if output, err := detachedPolicy.CombinedOutput(); err == nil {
+		t.Fatalf("detached canary policy was accepted:\n%s", output)
 	}
 }
 
