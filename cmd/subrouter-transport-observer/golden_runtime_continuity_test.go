@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,6 +142,75 @@ func TestGoldenObserverStopWaitsForConnectionClosureBeforeClosingEvidence(t *tes
 	}
 	if _, err := events.Stat(); err == nil {
 		t.Error("observer finalize left evidence writer open")
+	}
+}
+
+func TestGoldenObserverAttributesUpstreamEvidenceToEachRequest(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/plain")
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := newObserverStats()
+	observation := newObserver(io.Discard, stats)
+	proxy := httptest.NewServer(newObserverHandlerWithObserverAndGate(upstreamURL, observation, nil))
+	t.Cleanup(proxy.Close)
+
+	request := func(method, path string) {
+		t.Helper()
+		request, err := http.NewRequest(method, proxy.URL+path, strings.NewReader("request"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, response.Body); err != nil {
+			response.Body.Close()
+			t.Fatal(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request(http.MethodGet, "/metadata")
+	request(http.MethodPost, "/v1/responses")
+
+	requests, _, _ := stats.snapshot()
+	var responseRequest transportEvent
+	for _, candidate := range requests {
+		if candidate.Path == "/v1/responses" {
+			responseRequest = candidate
+			break
+		}
+	}
+	if responseRequest.RequestID == "" {
+		t.Fatal("response request was not observed")
+	}
+	opened, requestBytes, responseBytes := 0, int64(0), int64(0)
+	for _, event := range stats.upstreamSnapshot() {
+		if event.RequestID != responseRequest.RequestID {
+			continue
+		}
+		if event.Path != "/v1/responses" {
+			t.Fatalf("response upstream event path = %q, want /v1/responses", event.Path)
+		}
+		switch event.Kind {
+		case "upstream_connection_opened":
+			opened++
+		case "upstream_request_chunk":
+			requestBytes += event.Bytes
+		case "upstream_response_chunk":
+			responseBytes += event.Bytes
+		}
+	}
+	if opened != 1 || requestBytes <= 0 || responseBytes <= 0 {
+		t.Fatalf("response upstream evidence = opened %d, request bytes %d, response bytes %d; want one complete upstream request", opened, requestBytes, responseBytes)
 	}
 }
 
