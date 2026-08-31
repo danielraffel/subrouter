@@ -1623,7 +1623,9 @@ Usage:
   %[1]s status             Show usage across all configured providers (non-interactive)
   %[1]s qwen login [--console-account <email-or-label>] <account>
                            Authorize live Qwen Token Plan quota status
+  %[1]s qwen proxy [args]  Launch Qwen Code through the selected Token Plan pool
   %[1]s kimi login <label> Add an isolated Kimi subscription account
+  %[1]s kimi proxy [args]  Launch Kimi Code through the selected Kimi pool
   %[1]s kimi list          List Kimi CLI and managed subscription accounts
   %[1]s kimi remove <label>
                            Remove one managed Kimi subscription account
@@ -1679,8 +1681,9 @@ Usage:
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
+  %[1]s agy proxy [args]   Launch Antigravity through Subrouter (plain agy stays direct)
   %[1]s spend              Show AWS Bedrock spend tracked by the server
-  %[1]s gemini             Manage Gemini profiles
+  %[1]s gemini             Manage Gemini profiles (routing scaffold only)
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
   %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]

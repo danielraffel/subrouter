@@ -522,7 +522,9 @@ same Claude conversation pinned to the same Claude account when that account is
 still available, and forwards the client `Anthropic-Beta` values and request
 body `cache_control` blocks unchanged.
 
-Gemini has its own `sr gemini` namespace and store scaffold so future routing cannot collide with Codex or Claude state.
+Gemini has its own `sr gemini` namespace and store scaffold so future routing
+cannot collide with Codex or Claude state. It is not currently a routed
+provider or a native launcher.
 
 ## API-key providers
 
@@ -530,6 +532,11 @@ Beyond Codex and Claude, Subrouter routes a set of providers that authenticate
 with an API key. Each one owns a path prefix, so a client picks a provider by
 the URL it calls and Subrouter replaces the outbound credential with whichever
 account it selects:
+
+The [provider adapter matrix](docs/provider-adapters.md) distinguishes a server
+route from a dedicated native-CLI launcher and records which paths have live
+account validation. A server adapter does not by itself change how the vendor's
+CLI is launched.
 
 | Prefix | Provider | Default upstream |
 |---|---|---|
@@ -589,14 +596,26 @@ reset times from Kimi's usage endpoint. The condensed API-key rows report key
 health and only quota data the provider actually exposes.
 
 Antigravity OAuth is intentionally limited to the single CLI login available
-on a machine. The official CLI documents cached keyring sign-in/logout, but no
-token export or account selector, so Subrouter does not advertise binary token
-extraction or multi-account OAuth failover as upstream-ready. Direct
+on the router host. The official CLI documents cached keyring sign-in/logout,
+but no token export or account selector, so Subrouter does not advertise binary
+token extraction or multi-account OAuth failover as upstream-ready. Direct
 `GEMINI_API_KEY` and Application Default Credentials are separate supported
 authentication paths, not additional selectable OAuth profiles
 ([install](https://antigravity.google/docs/cli/install/),
 [headless auth](https://antigravity.google/docs/cli/headless/),
 [enterprise](https://antigravity.google/docs/enterprise/)).
+
+Plain `agy` remains the vendor's direct CLI. `sr agy proxy` (also
+`sr antigravity proxy`) launches that CLI locally while sending model traffic
+through the selected Subrouter and its Antigravity credential. The local CLI
+login is used only to satisfy the CLI's own bootstrap; its bearer credential is
+removed by a loopback relay and is never copied to the selected server. A
+remote router therefore needs its own `agy` login in the account running the
+daemon. There is deliberately no local-to-remote Antigravity token import: the
+CLI exposes neither a safe independent profile format nor a supported
+account-selector workflow. `sr status` reports the router credential as
+`ready`, `active`, or `error`, and says quota is not exposed instead of polling
+an unsupported quota endpoint.
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that
@@ -612,6 +631,7 @@ sr kimi login work
 sr kimi login personal
 sr kimi list
 sr kimi remove personal
+sr kimi proxy
 ```
 
 The labels are the management and status names; Subrouter does not infer an
@@ -619,6 +639,9 @@ email or account name from undocumented token contents. Each profile refreshes
 atomically and is independently schedulable; `active` means a persistent session
 is assigned, `rec` is the next eligible profile, and `ready` means authenticated
 with quota but currently idle.
+Plain `kimi` remains direct. `sr kimi proxy` uses a process-only model override
+for the selected Subrouter, including resumed sessions, without rewriting
+`~/.kimi-code` or changing its global OAuth login.
 Kimi Code subscription API keys can also be added with
 `sr add-key --provider kimi`. Kimi documents that every device and API key under
 one membership shares the same quota, so extra keys are failover credentials,
@@ -663,14 +686,23 @@ sr list
 sr remove qwen-token:small-plan
 ```
 
-Point Qwen Code at Subrouter once, using any non-empty placeholder as the
-client-side key; the real plan keys remain in Subrouter. When Alibaba returns a
-429 for one plan account, Subrouter replays the generation request with another
-stored Qwen account and moves that sticky session to the successful account:
+Launch Qwen Code through the selected Token Plan pool with:
 
 ```bash
-OPENAI_API_KEY=subrouter OPENAI_BASE_URL=http://127.0.0.1:31415/qwen-token/v1 qwen --auth-type openai
+sr qwen proxy
+sr qwen proxy --model qwen3.8-max
 ```
+
+Plain `qwen` remains direct. The proxy launcher keeps the normal Qwen home,
+sessions, skills, and extensions, but overlays routing only for the child
+process. This is stronger than setting `OPENAI_BASE_URL`: a saved Qwen
+`modelProviders` entry otherwise has higher precedence and can silently send a
+resumed session direct. The overlay is removed when Qwen exits and contains no
+real plan key. If Qwen system-policy files or their path environment variables
+are present, the launcher fails closed instead of hiding administrator policy.
+When Alibaba returns a 429 for one plan account, Subrouter replays the
+generation request with another stored Qwen account and moves that sticky
+session to the successful account.
 
 Standalone local status probes use the documented vendor default upstream;
 custom serving upstreams are not persisted into the CLI configuration.

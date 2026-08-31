@@ -1,0 +1,80 @@
+# Provider adapter and launcher matrix
+
+Subrouter's server route, native CLI launcher, and live-account validation are
+separate capabilities. A row marked “adapter” means the server can route and
+rewrite that wire protocol; it does not imply that invoking the vendor CLI by
+its ordinary name uses Subrouter.
+
+| Adapter / account mode | Native launcher or client path | Credential owned by selected router | Upstream auth rewrite | Direct bypass | Stickiness and failover | `sr status` evidence | Hermetic coverage | Live-account evidence |
+|---|---|---|---|---|---|---|---|---|
+| Codex OAuth and API key | `sr codex`; Responses at `/v1` | Isolated OAuth accounts and API keys | ChatGPT OAuth or OpenAI bearer selected per account; client placeholder removed | Plain `codex` | Per thread; quota, auth, and transport failover across eligible accounts | 5h/7d, reset credits, dollars, and named windows only when exposed | Full routing, credential isolation, retry, and launcher suites | User-tested |
+| Claude OAuth and API key | `sr claude proxy`; Anthropic Messages at router root | Isolated Claude profiles and API keys | Client auth removed; selected bearer and required beta headers added | Plain `claude` or `sr claude-direct` | Per conversation; pooled profile failover, with optional pinned launch | Plan, session, weekly, model-specific, and extra windows when exposed | Full routing, profile isolation, retry, and launcher suites | User-tested |
+| Kimi OAuth subscription | `sr kimi proxy`; `/kimi/v1/messages` | Isolated managed Kimi profiles | Client auth removed; selected OAuth bearer and Kimi headers added | Plain `kimi` | Per process/session; failover across managed profiles | Plan plus 5h/weekly windows; active/ready/recommended state | H1, H2, H3 | User-tested |
+| Kimi API key | `sr kimi proxy`; `/kimi/v1/messages` | Labeled API-key accounts | Client auth removed; selected bearer and `x-api-key` added | Plain `kimi` or direct vendor URL | Per session; 429/auth failover across keys and eligible Kimi accounts | Key health; subscription windows only when the default Kimi authority exposes them | H1, H2, H3 | Server route user-tested; distinct-key ownership is label-based |
+| Qwen Coding Plan API key | OpenAI-compatible client at `/qwen/v1` | Labeled Coding Plan keys | Client auth removed; selected bearer added | Plain `qwen` with its normal provider | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live generation canary recorded |
+| Qwen Token Plan, OpenAI protocol | `sr qwen proxy`; `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Per session; failover across keys; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
+| Qwen Token Plan, Anthropic protocol | Anthropic client at `/qwen-anthropic` | Same Token Plan pool as OpenAI route | Client auth removed; selected plan bearer and Anthropic version added | Direct vendor Anthropic endpoint | Same sticky account and exhaustion state as `/qwen-token` | Same shared account and console telemetry | H1, H2 | No live generation canary recorded |
+| Antigravity / AGY OAuth | `sr agy proxy` or `sr antigravity proxy`; `/antigravity` | One `agy` keychain login on the router host | Local CLI auth is stripped by loopback relay; router OAuth bearer added | Plain `agy` | Sticky session; no multi-account OAuth selector is claimed | Safe token identity claim when present, otherwise router-login label; ready/active/error; quota not exposed | H1, H3, H4 | Local login user-tested; proxy generation canary required after deployment |
+| Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
+| Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
+| OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | Planned after an operator configures a key; not yet recorded |
+| DeepSeek API key | OpenAI-compatible client at `/deepseek/v1` | Labeled DeepSeek keys | Client auth removed; selected bearer added | Direct DeepSeek URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
+| Together API key | OpenAI-compatible client at `/together/v1` | Labeled Together keys | Client auth removed; selected bearer added | Direct Together URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
+| Fireworks API key | OpenAI-compatible client at `/fireworks/v1` | Labeled Fireworks keys | Client auth removed; selected bearer added | Direct Fireworks URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
+| OpenCode Zen API key | OpenAI-compatible client at `/opencode-zen/v1` | Labeled OpenCode Zen keys | Client auth removed; selected bearer added | Direct OpenCode Zen URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
+| Z.AI API key | OpenAI-compatible client at `/zai/v1` | Labeled Z.AI keys | Client auth removed; selected bearer added | Direct Z.AI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
+| Declared OpenAI-compatible API key | OpenAI-compatible client at `/<declared-name>/v1` | Labeled keys for a startup-declared provider | Client auth removed; selected bearer added | Direct declared upstream | Per session; key failover | Account/routing state; vendor quota not inferred | H1, H2 | No live-account canary recorded |
+| Gemini | None | None | None | Plain Gemini tooling | None | Profile management scaffold only | Namespace/store tests | Not routed; not a canary target |
+
+Hermetic coverage key:
+
+- **H1 — route and auth:** `internal/proxy/opencode_provider_test.go` and
+  `internal/proxy/keyed_provider_config_test.go` prove path normalization,
+  credential replacement, protocol-specific headers, and declared-provider
+  validation without vendor credentials.
+- **H2 — stickiness and failure:**
+  `internal/proxy/qwen_failover_test.go` and
+  `internal/proxy/keyed_credential_failover_test.go` prove account ownership,
+  sticky placement, 429/auth failover, and the shared Token Plan pool.
+- **H3 — native launch:** `cmd/subrouter/sr_native_proxy_test.go` proves local
+  relay composition, credential scrubbing, process-only Kimi/Qwen routing,
+  system-policy refusal, and direct-home preservation.
+- **H4 — OAuth lifecycle:** `internal/proxy/oauth_source_test.go`,
+  `internal/proxy/scoreaccounts_test.go`, and provider-store tests prove refresh
+  behavior and suppression of unsupported quota polling.
+
+## Native launcher boundary
+
+The dedicated launchers are deliberately explicit:
+
+```text
+sr codex
+sr claude proxy
+sr kimi proxy
+sr qwen proxy
+sr agy proxy
+```
+
+The corresponding plain vendor commands remain direct. This preserves a usable
+bypass when Subrouter is unavailable and prevents installation from silently
+capturing unrelated CLI traffic.
+
+Kimi and Qwen launchers preserve their normal session stores. Kimi uses its
+documented in-memory model override and forces that model for resumed sessions.
+Qwen uses a temporary highest-precedence provider overlay because saved
+`modelProviders` outrank a simple base-URL environment variable. It refuses to
+run when an existing system policy is configured rather than masking that
+policy. The Antigravity relay similarly leaves the local keychain untouched and
+removes the local bearer before forwarding to the selected router.
+
+## Remote OAuth ownership
+
+Kimi has an explicit managed-profile login flow and can safely keep multiple
+router-owned subscriptions. Antigravity does not expose an equivalent profile
+or account selector: a remote router must be signed in with `agy` under the
+daemon account, and Subrouter does not copy the workstation's keychain token to
+that server. This is a product limitation, not missing quota telemetry.
+
+Live validation should be recorded only after a real request crosses the exact
+launcher and selected router. A successful status probe or local vendor login
+does not count as a routed generation canary.

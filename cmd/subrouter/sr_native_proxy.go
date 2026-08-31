@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -113,7 +114,11 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err := r.requireNativeProxyAccount(ctx, server, spec); err != nil {
 		return err
 	}
-	relay, err := startNativeProxyRelay(root, spec)
+	sessionID, err := nativeProxySessionID(spec, args)
+	if err != nil {
+		return err
+	}
+	relay, err := startNativeProxyRelay(root, spec, sessionID)
 	if err != nil {
 		return fmt.Errorf("start local %s proxy relay: %w", spec.display, err)
 	}
@@ -194,29 +199,36 @@ type nativeProxyRelay struct {
 	baseURL  string
 }
 
-func startNativeProxyRelay(targetRoot string, spec nativeProxySpec) (*nativeProxyRelay, error) {
+func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID string) (*nativeProxyRelay, error) {
 	target, err := url.Parse(strings.TrimRight(targetRoot, "/"))
-	if err != nil || target.Scheme == "" || target.Host == "" {
+	if err != nil || target.Scheme == "" || target.Host == "" || target.User != nil || target.Fragment != "" {
 		return nil, errors.New("proxy target must be an absolute URL")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
-	sessionID, err := newNativeProxySessionID()
-	if err != nil {
-		_ = listener.Close()
-		return nil, err
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID, err = newNativeProxySessionID()
+		if err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
 	}
 	reverse := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := reverse.Director
 	reverse.Director = func(request *http.Request) {
 		originalDirector(request)
 		for _, header := range []string{
-			"Authorization", "Proxy-Authorization", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token",
+			"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token",
+			"X-Subrouter-Lease", "X-Subrouter-Session", "X-Subrouter-Agent",
+			"X-Subrouter-User-Email", "X-Subrouter-User", "X-User-Email",
+			"X-Subrouter-Account-ID", "X-Subrouter-Account", "X-Subrouter-Preferred-Account-ID",
+			"X-Subrouter-Model", "X-Model", "X-Subrouter-Azure", "X-Subrouter-No-Retry",
 		} {
 			request.Header.Del(header)
 		}
+		request.Host = target.Host
 		request.Header.Set("Authorization", "Bearer subrouter")
 		request.Header.Set("X-Subrouter-Agent", spec.agent)
 		request.Header.Set("X-Subrouter-Session", sessionID)
@@ -257,6 +269,54 @@ func newNativeProxySessionID() (string, error) {
 		return "", fmt.Errorf("create proxy session ID: %w", err)
 	}
 	return "sr-native-" + hex.EncodeToString(body[:]), nil
+}
+
+func nativeProxySessionID(spec nativeProxySpec, args []string) (string, error) {
+	if identity := nativeProxyResumeIdentity(spec, args); identity != "" {
+		digest := sha256.Sum256([]byte(string(spec.provider) + "\x00" + identity))
+		return "sr-native-" + hex.EncodeToString(digest[:16]), nil
+	}
+	return newNativeProxySessionID()
+}
+
+func nativeProxyResumeIdentity(spec nativeProxySpec, args []string) string {
+	var idFlags []string
+	var continueFlags []string
+	switch spec.provider {
+	case accounts.ProviderKimi:
+		idFlags = []string{"-S", "--session"}
+		continueFlags = []string{"-c", "--continue"}
+	case accounts.ProviderQwenToken:
+		idFlags = []string{"-r", "--resume"}
+		continueFlags = []string{"-c", "--continue"}
+	default:
+		return ""
+	}
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--" {
+			break
+		}
+		for _, flag := range idFlags {
+			if strings.HasPrefix(args[i], flag+"=") {
+				if value := strings.TrimSpace(strings.TrimPrefix(args[i], flag+"=")); value != "" {
+					return "resume:" + value
+				}
+			}
+			if args[i] == flag && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				return "resume:" + strings.TrimSpace(args[i+1])
+			}
+		}
+		for _, flag := range continueFlags {
+			if args[i] == flag || args[i] == flag+"=true" {
+				cwd, err := os.Getwd()
+				if err != nil {
+					cwd = "."
+				}
+				return "continue:" + filepath.Clean(cwd)
+			}
+		}
+	}
+	return ""
 }
 
 var nativeProxyRoutingEnvKeys = []string{
@@ -433,12 +493,16 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 }
 
 func qwenSystemPolicyConflict(environ []string, goos string) string {
+	return qwenSystemPolicyConflictAtPaths(environ, qwenDefaultSystemPolicyPaths(environ, goos))
+}
+
+func qwenSystemPolicyConflictAtPaths(environ, paths []string) string {
 	for _, key := range []string{"QWEN_CODE_SYSTEM_SETTINGS_PATH", "QWEN_CODE_SYSTEM_DEFAULTS_PATH"} {
 		if strings.TrimSpace(envValue(environ, key)) != "" {
 			return key
 		}
 	}
-	for _, path := range qwenDefaultSystemPolicyPaths(environ, goos) {
+	for _, path := range paths {
 		if _, err := os.Stat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
 			return path
 		}

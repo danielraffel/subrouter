@@ -137,7 +137,7 @@ Running agents:
                         Run pooled using the server's current recommendation
   sr claude proxy --account [profile]
                         Run pinned to one Claude profile with no account failover
-  sr gemini [args]      Run gemini through Subrouter
+  sr gemini             Manage Gemini profiles (routing scaffold only)
   sr antigravity proxy [args]
   sr agy proxy [args]   Run agy through Subrouter (plain agy stays direct)
   sr kimi proxy [args]  Run Kimi Code through Subrouter (plain kimi stays direct)

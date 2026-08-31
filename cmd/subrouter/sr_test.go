@@ -1524,6 +1524,7 @@ func TestSRQwenHelpDocumentsGenericAccountLifecycle(t *testing.T) {
 		"sr remove <account>",
 		"sr qwen login [--console-account <email-or-label>] <account>",
 		"sr qwen label <account> <email-or-label>",
+		"sr qwen proxy [qwen args...]",
 		"console plan/quota metadata",
 	} {
 		if !strings.Contains(out.String(), want) {
@@ -1532,6 +1533,22 @@ func TestSRQwenHelpDocumentsGenericAccountLifecycle(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "sr qwen add") {
 		t.Fatalf("Qwen help advertises a redundant add alias:\n%s", out.String())
+	}
+}
+
+func TestHelpDistinguishesNativeProxyLaunchersFromDirectCLIs(t *testing.T) {
+	for name, help := range map[string]string{
+		"sr":        srHelp,
+		"subrouter": usageText("subrouter"),
+	} {
+		for _, command := range []string{"qwen proxy", "kimi proxy", "agy proxy"} {
+			if !strings.Contains(help, command) {
+				t.Errorf("%s help omits %q", name, command)
+			}
+		}
+		if !strings.Contains(help, "Gemini profiles (routing scaffold only)") {
+			t.Errorf("%s help does not disclose Gemini's scaffold-only state", name)
+		}
 	}
 }
 

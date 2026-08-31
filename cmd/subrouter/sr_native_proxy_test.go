@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -23,7 +24,7 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}))
 	defer upstream.Close()
 
-	relay, err := startNativeProxyRelay(upstream.URL+"/t/srt_test", kimiNativeProxy)
+	relay, err := startNativeProxyRelay(upstream.URL+"/t/srt_test", kimiNativeProxy, "sr-native-test-session")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +35,8 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}
 	request.Header.Set("Authorization", "Bearer local-vendor-secret")
 	request.Header.Set("X-Api-Key", "local-api-secret")
+	request.Header.Set("Cookie", "vendor_session=local-secret")
+	request.Header.Set("X-Subrouter-Account-ID", "untrusted-pin")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -53,8 +56,14 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	if key := got.Header.Get("X-Api-Key"); key != "" {
 		t.Fatalf("X-Api-Key leaked through relay: %q", key)
 	}
-	if got.Header.Get("X-Subrouter-Agent") != "kimi" || !strings.HasPrefix(got.Header.Get("X-Subrouter-Session"), "sr-native-") {
+	if got.Header.Get("Cookie") != "" || got.Header.Get("X-Subrouter-Account-ID") != "" {
+		t.Fatalf("client credential/routing metadata leaked: cookie=%q account=%q", got.Header.Get("Cookie"), got.Header.Get("X-Subrouter-Account-ID"))
+	}
+	if got.Header.Get("X-Subrouter-Agent") != "kimi" || got.Header.Get("X-Subrouter-Session") != "sr-native-test-session" {
 		t.Fatalf("routing headers = agent %q session %q", got.Header.Get("X-Subrouter-Agent"), got.Header.Get("X-Subrouter-Session"))
+	}
+	if got.Host != strings.TrimPrefix(upstream.URL, "http://") {
+		t.Fatalf("upstream Host = %q, want target host", got.Host)
 	}
 }
 
@@ -148,6 +157,13 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 			t.Fatalf("policy environment error = %v", err)
 		}
 	}
+	policyPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(policyPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := qwenSystemPolicyConflictAtPaths(nil, []string{policyPath}); got != policyPath {
+		t.Fatalf("system policy conflict = %q, want %q", got, policyPath)
+	}
 }
 
 func TestQwenDefaultSystemPolicyPathsCoverSupportedPlatforms(t *testing.T) {
@@ -180,6 +196,35 @@ func TestKimiNativeProxyArgsForceEphemeralModelOnNewAndResumedSessions(t *testin
 		if strings.Contains(joined, "direct-model") || strings.Contains(joined, "direct/model") {
 			t.Fatalf("direct model survived proxy args: %q", got)
 		}
+	}
+}
+
+func TestNativeProxySessionIdentitySurvivesExplicitResume(t *testing.T) {
+	for _, test := range []struct {
+		spec nativeProxySpec
+		args []string
+	}{
+		{spec: kimiNativeProxy, args: []string{"--session", "kimi-session-id"}},
+		{spec: kimiNativeProxy, args: []string{"--session=kimi-session-id"}},
+		{spec: qwenNativeProxy, args: []string{"--resume", "qwen-session-id"}},
+		{spec: qwenNativeProxy, args: []string{"--resume=qwen-session-id"}},
+	} {
+		first, err := nativeProxySessionID(test.spec, test.args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := nativeProxySessionID(test.spec, test.args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first != second || !strings.HasPrefix(first, "sr-native-") || strings.Contains(first, "session-id") {
+			t.Fatalf("resume session identity = %q then %q", first, second)
+		}
+	}
+	qwenID, _ := nativeProxySessionID(qwenNativeProxy, []string{"--resume", "same-id"})
+	kimiID, _ := nativeProxySessionID(kimiNativeProxy, []string{"--session", "same-id"})
+	if qwenID == kimiID {
+		t.Fatal("provider namespaces share a native proxy session ID")
 	}
 }
 
