@@ -87,6 +87,18 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}
 }
 
+func TestNativeProxyRelayTransportNeverUsesAmbientProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://credential-sink.invalid")
+	t.Setenv("HTTPS_PROXY", "http://credential-sink.invalid")
+	transport, err := nativeProxyRelayTransport("https://router.example.test/t/opaque")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("native relay transport retained an ambient proxy function")
+	}
+}
+
 func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *testing.T) {
 	root := "http://127.0.0.1:43213"
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", root)
@@ -112,6 +124,13 @@ func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *te
 	if pinnedLoopbackToken, err := nativeProxyServerToken("http://127.0.0.1:43213"); err != nil || pinnedLoopbackToken != "local-daemon-secret" {
 		t.Fatalf("pinned loopback token = %q err=%v", pinnedLoopbackToken, err)
 	}
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "https://router.example.test")
+	if sameLocalProxyEndpoint("https://router.example.test/t/opaque", "https://router.example.test") {
+		t.Fatal("matching non-loopback endpoints were treated as the local daemon")
+	}
+	if remoteOverrideToken, err := nativeProxyServerToken("https://router.example.test/t/opaque"); err != nil || remoteOverrideToken != "subrouter" {
+		t.Fatalf("non-loopback local override token = %q err=%v", remoteOverrideToken, err)
+	}
 	env, cleanup, err := nativeProxyEnvironment(kimiNativeProxy, "http://127.0.0.1:43214/capability", os.Environ(), nil)
 	cleanup()
 	if err != nil {
@@ -127,6 +146,8 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		"PATH=/usr/bin", "KEEP_ME=yes", "KIMI_CODE_HOME=/custom/kimi-home", "QWEN_HOME=/custom/qwen-home",
 		"OPENAI_API_KEY=real-openai-secret", "OPENAI_BASE_URL=https://vendor.invalid/v1",
 		"BAILIAN_TOKEN_PLAN_API_KEY=real-bailian-secret", "KIMI_MODEL_API_KEY=real-kimi-secret",
+		"HTTP_PROXY=http://credential-sink.invalid", "https_proxy=http://credential-sink.invalid",
+		"ALL_PROXY=socks5://credential-sink.invalid", "NO_PROXY=vendor.invalid",
 	}
 	qwenRelay := "http://127.0.0.1:43210/private-relay-capability"
 	qwenProviderURL := qwenRelay + "/qwen-token/v1"
@@ -136,7 +157,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	}
 	defer qwenCleanup()
 	joined := strings.Join(qwenEnv, "\n")
-	for _, secret := range []string{"real-openai-secret", "real-bailian-secret", "real-kimi-secret", "vendor.invalid"} {
+	for _, secret := range []string{"real-openai-secret", "real-bailian-secret", "real-kimi-secret", "vendor.invalid", "credential-sink.invalid"} {
 		if strings.Contains(joined, secret) {
 			t.Fatalf("Qwen child environment leaked %q:\n%s", secret, joined)
 		}
@@ -153,6 +174,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		t.Fatal(err)
 	}
 	var overlay struct {
+		Proxy          *string `json:"proxy"`
 		ModelProviders map[string][]struct {
 			ID      string `json:"id"`
 			BaseURL string `json:"baseUrl"`
@@ -164,6 +186,12 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	providers := overlay.ModelProviders["openai"]
 	if len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != qwenProviderURL {
 		t.Fatalf("Qwen overlay = %+v", overlay)
+	}
+	if overlay.Proxy == nil || *overlay.Proxy != "" {
+		t.Fatalf("Qwen overlay proxy = %v, want an explicit process-only disable", overlay.Proxy)
+	}
+	if got := testEnvValue(qwenEnv, "NO_PROXY"); got != "127.0.0.1,localhost,::1" {
+		t.Fatalf("Qwen NO_PROXY = %q", got)
 	}
 
 	kimiEnv, kimiCleanup, err := nativeProxyEnvironment(kimiNativeProxy, "http://127.0.0.1:43211", original, nil)
@@ -226,6 +254,18 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 	}
 	if got := qwenSystemPolicyConflictAtPaths(nil, []string{policyPath}); got != policyPath {
 		t.Fatalf("system policy conflict = %q, want %q", got, policyPath)
+	}
+}
+
+func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
+	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}} {
+		err := (srRunner{}).launchQwenProxy(t.Context(), args)
+		if err == nil || !strings.Contains(err.Error(), "--proxy controls Qwen routing") {
+			t.Fatalf("proxy override %q error = %v", args, err)
+		}
+		if strings.Contains(err.Error(), "proxy.invalid") {
+			t.Fatalf("proxy override error exposed the supplied URL: %v", err)
+		}
 	}
 }
 

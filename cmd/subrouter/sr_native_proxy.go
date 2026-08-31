@@ -101,7 +101,7 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 		if args[i] == "--" {
 			break
 		}
-		for _, option := range []string{"--auth-type", "--openai-api-key", "--openai-base-url"} {
+		for _, option := range []string{"--auth-type", "--openai-api-key", "--openai-base-url", "--proxy"} {
 			if args[i] == option || strings.HasPrefix(args[i], option+"=") {
 				return fmt.Errorf("%s controls Qwen routing and cannot be used with 'sr qwen proxy'", option)
 			}
@@ -204,21 +204,22 @@ func nativeProxyServerToken(root string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("load local Subrouter client credential: %w", err)
 	}
-	if token := cloudServerProxyToken(config); token != "" {
+	if token := cloudClientProxyToken(config, localBaseURL()); token != "" {
 		return token, nil
 	}
 	return "subrouter", nil
 }
 
 func sameLocalProxyEndpoint(left, right string) bool {
-	if sameEndpoint(left, right) {
-		return true
-	}
 	leftURL, leftErr := url.Parse(strings.TrimSpace(left))
 	rightURL, rightErr := url.Parse(strings.TrimSpace(right))
 	if leftErr != nil || rightErr != nil || !loopbackEndpoint(left) || !loopbackEndpoint(right) ||
-		!strings.EqualFold(leftURL.Scheme, rightURL.Scheme) {
+		!strings.EqualFold(leftURL.Scheme, rightURL.Scheme) ||
+		(!strings.EqualFold(leftURL.Scheme, "http") && !strings.EqualFold(leftURL.Scheme, "https")) {
 		return false
+	}
+	if sameEndpoint(left, right) {
+		return true
 	}
 	port := func(parsed *url.URL) string {
 		if value := parsed.Port(); value != "" {
@@ -310,15 +311,32 @@ func (r srRunner) requireNativeProxyAccount(ctx context.Context, server srServer
 }
 
 type nativeProxyRelay struct {
-	listener net.Listener
-	server   *http.Server
-	baseURL  string
+	listener  net.Listener
+	server    *http.Server
+	transport *http.Transport
+	baseURL   string
+}
+
+func nativeProxyRelayTransport(targetRoot string) (*http.Transport, error) {
+	client, err := securedServerRequestClient(&http.Client{Timeout: 15 * time.Second}, targetRoot)
+	if err != nil {
+		return nil, err
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		return nil, errors.New("native proxy relay requires a direct HTTP transport")
+	}
+	return transport, nil
 }
 
 func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken string) (*nativeProxyRelay, error) {
 	target, err := url.Parse(strings.TrimRight(targetRoot, "/"))
 	if err != nil || target.Scheme == "" || target.Host == "" || target.User != nil || target.Fragment != "" {
 		return nil, errors.New("proxy target must be an absolute URL")
+	}
+	transport, err := nativeProxyRelayTransport(targetRoot)
+	if err != nil {
+		return nil, fmt.Errorf("secure proxy target transport: %w", err)
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -343,6 +361,7 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 	relayPrefix := "/" + relayToken
 	providerPrefix := relayPrefix + "/" + spec.route
 	reverse := httputil.NewSingleHostReverseProxy(target)
+	reverse.Transport = transport
 	originalDirector := reverse.Director
 	reverse.Director = func(request *http.Request) {
 		originalDirector(request)
@@ -379,9 +398,10 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 		reverse.ServeHTTP(response, request)
 	})
 	relay := &nativeProxyRelay{
-		listener: listener,
-		server:   &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second},
-		baseURL:  "http://" + listener.Addr().String() + relayPrefix,
+		listener:  listener,
+		server:    &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second},
+		transport: transport,
+		baseURL:   "http://" + listener.Addr().String() + relayPrefix,
 	}
 	go func() { _ = relay.server.Serve(listener) }()
 	return relay, nil
@@ -402,6 +422,9 @@ func (r *nativeProxyRelay) Close() {
 	defer cancel()
 	_ = r.server.Shutdown(ctx)
 	_ = r.listener.Close()
+	if r.transport != nil {
+		r.transport.CloseIdleConnections()
+	}
 }
 
 func newNativeProxySessionID() (string, error) {
@@ -484,6 +507,7 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 			"OPENAI_API_KEY":                 "subrouter",
 			"OPENAI_BASE_URL":                providerURL + "/v1",
 			"OPENAI_MODEL":                   model,
+			"NO_PROXY":                       "127.0.0.1,localhost,::1",
 		} {
 			env = upsertEnv(env, key, value)
 		}
@@ -625,6 +649,10 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	payload := map[string]any{
+		// A saved Qwen proxy would otherwise receive the capability-bearing
+		// loopback URL. System settings merge last, so an explicit empty value
+		// disables that process only without rewriting the user's configuration.
+		"proxy": "",
 		"modelProviders": map[string]any{
 			"openai": []any{map[string]any{
 				"id":      model,

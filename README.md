@@ -711,9 +711,11 @@ Plain `qwen` remains direct. The proxy launcher keeps the normal Qwen home,
 sessions, skills, and extensions, but overlays routing only for the child
 process. This is stronger than setting `OPENAI_BASE_URL`: a saved Qwen
 `modelProviders` entry otherwise has higher precedence and can silently send a
-resumed session direct. The overlay is removed when Qwen exits and contains no
-real plan key. If Qwen system-policy files or their path environment variables
-are present, the launcher fails closed instead of hiding administrator policy.
+resumed session direct. It also disables any saved Qwen outbound proxy for that
+child and rejects `--proxy`, keeping the capability-bearing loopback URL out of
+another process. The overlay is removed when Qwen exits and contains no real
+plan key. If Qwen system-policy files or their path environment variables are
+present, the launcher fails closed instead of hiding administrator policy.
 When Alibaba returns a 429 for one plan account, Subrouter replays the
 generation request with another stored Qwen account and moves that sticky
 session to the successful account.
