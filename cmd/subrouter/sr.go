@@ -354,6 +354,11 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
+		if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
+			return err
+		}
+	}
 	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
 		server, ok, err := r.selectedRemoteServer()
 		if err != nil {
@@ -1054,13 +1059,30 @@ func (r srRunner) status(ctx context.Context) error {
 	switch source {
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
-	case broker.CredentialSourceLocal, broker.CredentialSourceLegacy:
+	case broker.CredentialSourceLegacy:
+		if explicitLocalStateAuthority() {
+			break
+		}
+		if server, ok, err := r.defaultRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatusFor(ctx, server)
+		}
+		if !r.useServingAPI {
+			break
+		}
+		server, err := r.localServingServer()
+		if err != nil {
+			return err
+		}
+		return r.serverStatusFor(ctx, server)
+	case broker.CredentialSourceLocal:
 		if explicitLocalStateAuthority() || !r.useServingAPI {
 			break
 		}
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
-		} else if ok && (source == broker.CredentialSourceLegacy || sameEndpoint(server.URL, localBaseURL())) {
+		} else if ok && sameEndpoint(server.URL, localBaseURL()) {
 			return r.serverStatusFor(ctx, server)
 		}
 		server, err := r.localServingServer()
