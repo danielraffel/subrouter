@@ -804,9 +804,20 @@ func (r *goldenRunner) prepareGoldenCodexShim() error {
 	contents := []byte("#!/bin/sh\n" +
 		"set -eu\n" +
 		": \"${SUBROUTER_GOLDEN_RAW_CODEX_BIN:?}\"\n" +
-		"exec \"${SUBROUTER_GOLDEN_RAW_CODEX_BIN}\" \"$@\" \\\n" +
-		"  -c 'model_providers.subrouter.supports_websockets=false' \\\n" +
-		"  -c 'model_providers.subrouter.env_http_headers={\"" + goldenResponseAttemptTokenHeader + "\"=\"" + goldenResponseRequestTokenEnv + "\"}'\n")
+		"case \"${SUBROUTER_GOLDEN_TRANSPORT:-websocket}\" in\n" +
+		"  http)\n" +
+		"    exec \"${SUBROUTER_GOLDEN_RAW_CODEX_BIN}\" \"$@\" \\\n" +
+		"      -c 'model_providers.subrouter.supports_websockets=false' \\\n" +
+		"      -c 'model_providers.subrouter.env_http_headers={\"" + goldenResponseAttemptTokenHeader + "\"=\"" + goldenResponseRequestTokenEnv + "\"}'\n" +
+		"    ;;\n" +
+		"  websocket)\n" +
+		"    exec \"${SUBROUTER_GOLDEN_RAW_CODEX_BIN}\" \"$@\" \\\n" +
+		"      -c 'model_providers.subrouter.env_http_headers={\"" + goldenResponseAttemptTokenHeader + "\"=\"" + goldenResponseRequestTokenEnv + "\"}'\n" +
+		"    ;;\n" +
+		"  *)\n" +
+		"    exit 64\n" +
+		"    ;;\n" +
+		"esac\n")
 	if err := os.WriteFile(shimPath, contents, 0o700); err != nil {
 		return failGolden("golden_codex_shim_failed")
 	}
@@ -3005,6 +3016,7 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 		"SUBROUTER_DISABLE_FALLBACK":  "1",
 		"SUBROUTER_STATE_DIR":         filepath.Join(session.home, ".subrouter"),
 		goldenResponseRequestTokenEnv: session.streamReleaseToken,
+		"SUBROUTER_GOLDEN_TRANSPORT":  session.transport,
 	}
 	if r.goldenCodexShimPath != "" {
 		overrides["SUBROUTER_CODEX_BIN"] = r.goldenCodexShimPath

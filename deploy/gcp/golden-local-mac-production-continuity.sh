@@ -48,6 +48,7 @@ EOF
 artifact_dir=""
 cloud_config_path=""
 codex_home_path=""
+codex_home_supplied=false
 account_id=""
 account_id_supplied=false
 slot_only=false
@@ -68,6 +69,7 @@ while (( $# > 0 )); do
     --codex-home)
       (( $# >= 2 )) || { usage >&2; exit 2; }
       codex_home_path="$2"
+      codex_home_supplied=true
       golden_args+=("$1" "$2")
       shift 2
       ;;
@@ -365,17 +367,68 @@ export SUBROUTER_DEPLOY_ARTIFACT_DIR="${private_root}/deploy-internal"
 mkdir -p "${SUBROUTER_DEPLOY_ARTIFACT_DIR}"
 
 if [[ "${account_id_supplied}" == false ]]; then
-  account_id="$(jq -r '.tokens.account_id // empty' "${codex_home_path}/auth.json" 2>/dev/null || true)"
+  account_id="$(python3 - "${codex_home_path}/auth.json" <<'PY'
+import base64
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        auth = json.load(handle)
+except (OSError, ValueError, TypeError):
+    auth = {}
+
+tokens = auth.get("tokens") if isinstance(auth, dict) else {}
+if not isinstance(tokens, dict):
+    tokens = {}
+account_id = tokens.get("account_id")
+if not isinstance(account_id, str) or not account_id.strip():
+    account_id = ""
+
+def claims(token):
+    if not isinstance(token, str):
+        return {}
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+        value = json.loads(payload)
+        return value if isinstance(value, dict) else {}
+    except (ValueError, TypeError, base64.binascii.Error):
+        return {}
+
+if not account_id:
+    for token in (tokens.get("id_token"), tokens.get("access_token")):
+        value = claims(token)
+        account_id = value.get("chatgpt_account_id", "")
+        if not account_id and isinstance(value.get("https://api.openai.com/auth"), dict):
+            account_id = value["https://api.openai.com/auth"].get("chatgpt_account_id", "")
+        if not account_id and isinstance(value.get("organizations"), list) and value["organizations"]:
+            first = value["organizations"][0]
+            if isinstance(first, dict):
+                account_id = first.get("id", "")
+        if isinstance(account_id, str) and account_id.strip():
+            break
+        account_id = ""
+
+if isinstance(account_id, str):
+    print(account_id.strip())
+PY
+  )"
 fi
 [[ "${account_id}" =~ ^[A-Za-z0-9._@:+/-]{1,320}$ ]] || {
   echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
   exit 1
 }
+if [[ "${codex_home_supplied}" == false ]]; then
+  golden_args+=(--codex-home "${codex_home_path}")
+fi
 if [[ "${account_id_supplied}" == false ]]; then
   golden_args+=(--account-id "${account_id}")
 fi
 
-if [[ "${SUBROUTER_GCP_INSTANCE}" == subrouter-staging ]]; then
+if [[ "${SUBROUTER_GCP_INSTANCE}" == subrouter-staging && "${slot_only}" == false ]]; then
   normalization_evidence="${artifact_dir}/staging-predecessor-normalization.json"
   [[ ! -e "${normalization_evidence}" ]] || { echo "staging normalization evidence already exists" >&2; exit 1; }
   "${root}/deploy/gcp/normalize-staging-predecessor.sh" --evidence-json "${normalization_evidence}"
