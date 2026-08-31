@@ -1,3 +1,5 @@
+//go:build darwin
+
 package main
 
 import (
@@ -5,8 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
-	"time"
 )
 
 func TestMacOSAutoUpdaterDefersDuringDeploymentTransaction(t *testing.T) {
@@ -31,27 +33,18 @@ func TestMacOSAutoUpdaterDefersDuringDeploymentTransaction(t *testing.T) {
 
 func TestMacOSAutoUpdaterDefersBeforeAnyMutationWhenLeaseIsHeld(t *testing.T) {
 	lock := filepath.Join(t.TempDir(), "supervisor-mutation.lock")
-	holder := exec.Command("/usr/bin/lockf", "-k", lock, "/bin/sleep", "30")
-	if err := holder.Start(); err != nil {
+	file, err := os.OpenFile(lock, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if holder.ProcessState == nil {
-			_ = holder.Process.Kill()
-			_, _ = holder.Process.Wait()
-		}
-	})
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		probe := exec.Command("/usr/bin/lockf", "-s", "-k", "-t", "0", lock, "/usr/bin/true")
-		if err := probe.Run(); err != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("mutation lease holder did not acquire its lock")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		t.Fatalf("acquire mutation lease: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	})
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	command := exec.Command("bash", filepath.Join(repoRoot, "deploy", "macos", "subrouter-autoupdate.sh"))
 	command.Env = append(os.Environ(), "SUBROUTER_MUTATION_LOCK_FILE="+lock)

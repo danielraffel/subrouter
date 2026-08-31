@@ -1672,6 +1672,12 @@ func TestProfilelessClaudePlaintextServerFailsClosedOnNodeStatus(t *testing.T) {
 }
 
 func TestTenantProxyTransportRequiresHTTPSOffLoopback(t *testing.T) {
+	// Keep this transport-policy test independent of whatever else is listening
+	// on the conventional local Subrouter port. DNS and liveness selection for
+	// loopback hostnames are covered by TestTenantScopedHTTPAllowsAndPinsSafeAddresses.
+	localhostLookup := func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
 	for _, tc := range []struct {
 		name      string
 		baseURL   string
@@ -1685,7 +1691,15 @@ func TestTenantProxyTransportRequiresHTTPSOffLoopback(t *testing.T) {
 		{name: "remote HTTP without secret", baseURL: "http://router.example", tenantKey: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := secureTenantProxyURL(t.Context(), tc.baseURL, tc.tenantKey)
+			var err error
+			if tc.name == "loopback localhost HTTP" {
+				_, err = secureTenantServerURLWithResolvers(
+					t.Context(), tc.baseURL,
+					srServerConfig{TenantKey: tc.tenantKey}, localhostLookup, nil,
+				)
+			} else {
+				_, err = secureTenantProxyURL(t.Context(), tc.baseURL, tc.tenantKey)
+			}
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("validateTenantProxyTransport() error = %v, wantErr %v", err, tc.wantErr)
 			}
