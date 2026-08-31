@@ -634,7 +634,9 @@ func serve(args []string) error {
 	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
 	defer stopActiveGenerationTasks()
 	autoSwitchScoresEnabled := srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil
-	startupScores := &startupScoreReadiness{required: autoSwitchScoresEnabled}
+	startupScores := &startupScoreReadiness{
+		required: autoSwitchScoresEnabled && requiresStartupScoreReadiness(initialAccounts),
+	}
 	var sharedScoreStore *srUsageScoreStore
 	if autoSwitchScoresEnabled {
 		sharedScoreStore = newSRUsageScoreStore(storepath.StateDir())
@@ -950,6 +952,13 @@ func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accoun
 
 func initialSchedulerCredentialAccounts(all []accounts.Account) []accounts.Account {
 	return proxy.SchedulerAccounts(all)
+}
+
+// requiresStartupScoreReadiness keeps non-Codex-only servers available. The
+// startup scorer intentionally ignores API-key and non-Codex accounts, so an
+// empty Codex OAuth set has no score sweep that can make the server ready.
+func requiresStartupScoreReadiness(all []accounts.Account) bool {
+	return len(codexOAuthAccounts(all)) > 0
 }
 
 func validatePublicSubrouterURL(raw string) error {

@@ -348,3 +348,23 @@ func TestStartupScoreReadinessPreservesDisabledSemantics(t *testing.T) {
 		t.Fatalf("published score gate = %v", err)
 	}
 }
+
+func TestStartupScoreReadinessOnlyAppliesToCodexOAuthAccounts(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		accounts []accounts.Account
+		want     bool
+	}{
+		{name: "empty", accounts: nil, want: false},
+		{name: "claude oauth", accounts: []accounts.Account{{Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth}}, want: false},
+		{name: "api key codex", accounts: []accounts.Account{{Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeAPIKey}}, want: false},
+		{name: "other oauth", accounts: []accounts.Account{{Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth}}, want: false},
+		{name: "codex oauth", accounts: []accounts.Account{{Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth}}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := requiresStartupScoreReadiness(test.accounts); got != test.want {
+				t.Fatalf("requiresStartupScoreReadiness() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}

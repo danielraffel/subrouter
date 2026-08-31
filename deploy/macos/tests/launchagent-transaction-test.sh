@@ -600,6 +600,14 @@ assert_exact_legacy_rollback() {
 wait_for_pid_gone() {
   local pid="$1" attempts=0
   while kill -0 "$pid" 2>/dev/null; do
+    # A drained callback can remain as a zombie until launchd reaps it. A
+    # zombie cannot execute or write traffic, so do not turn its reaping delay
+    # into a false transaction failure on a busy macOS runner.
+    local state
+    state="$(/bin/ps -p "$pid" -o state= 2>/dev/null || true)"
+    case "$state" in
+      Z*) return 0 ;;
+    esac
     attempts=$((attempts + 1))
     [ "$attempts" -lt 100 ] || return 1
     sleep 0.05
