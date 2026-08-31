@@ -313,6 +313,20 @@ func sameLocalProxyEndpoint(left, right string) bool {
 	if sameEndpoint(left, right) {
 		return true
 	}
+	// Different loopback names are equivalent only for the canonical local
+	// listener aliases. The rest of 127/8 can be bound by another process, so
+	// matching only the port must never disclose the daemon credential.
+	canonicalLocalHost := func(parsed *url.URL) bool {
+		host := strings.ToLower(parsed.Hostname())
+		if host == "localhost" {
+			return true
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && (ip.Equal(net.IPv4(127, 0, 0, 1)) || ip.Equal(net.IPv6loopback))
+	}
+	if !canonicalLocalHost(leftURL) || !canonicalLocalHost(rightURL) {
+		return false
+	}
 	port := func(parsed *url.URL) string {
 		if value := parsed.Port(); value != "" {
 			return value
@@ -366,8 +380,8 @@ func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, 
 		explicitTarget = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
 	}
 	explicitServer := explicitTarget != ""
-	explicitLocal := isLocalServerName(explicitTarget)
-	if source == broker.CredentialSourceLegacy || source == broker.CredentialSourceHosted || explicitServer {
+	explicitLocal := explicitServer && isLocalServerName(explicitTarget)
+	if explicitServer {
 		server, remote, resolveErr := r.selectedRemoteServer()
 		if resolveErr != nil {
 			return srServerConfig{}, false, resolveErr
@@ -378,8 +392,25 @@ func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, 
 			}
 			return server, true, nil
 		}
-		if source == broker.CredentialSourceLegacy && !explicitLocal {
-			return srServerConfig{}, false, errors.New("legacy remote credential storage has no selected server; run 'sr remote use <name>' or 'sr storage local'")
+	}
+	if !explicitLocal {
+		switch source {
+		case broker.CredentialSourceHosted:
+			if !config.HostedReady() {
+				return srServerConfig{}, false, errors.New("hosted credential storage is incomplete; run 'sr login'")
+			}
+			return srServerConfig{
+				Name: "cmux", URL: strings.TrimRight(config.HostedURL, "/"), TenantKey: config.TenantKey,
+			}, true, nil
+		case broker.CredentialSourceLegacy:
+			server, remote, resolveErr := r.selectedRemoteServer()
+			if resolveErr != nil {
+				return srServerConfig{}, false, resolveErr
+			}
+			if !remote {
+				return srServerConfig{}, false, errors.New("legacy remote credential storage has no selected server; run 'sr remote use <name>' or 'sr storage local'")
+			}
+			return server, true, nil
 		}
 	}
 	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
@@ -658,11 +689,10 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 	}
 	relayPrefix := "/" + relayToken
 	providerPrefix := relayPrefix + "/" + spec.route
-	reverse := httputil.NewSingleHostReverseProxy(target)
-	reverse.Transport = transport
-	originalDirector := reverse.Director
-	reverse.Director = func(request *http.Request) {
-		originalDirector(request)
+	reverse := &httputil.ReverseProxy{Transport: transport}
+	reverse.Rewrite = func(proxyRequest *httputil.ProxyRequest) {
+		proxyRequest.SetURL(target)
+		request := proxyRequest.Out
 		for _, header := range []string{
 			"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token",
 			"X-Subrouter-Lease", "X-Subrouter-Session", "X-Subrouter-Agent",

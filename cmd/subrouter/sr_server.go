@@ -877,7 +877,9 @@ func (r srRunner) localServingServer() (srServerConfig, error) {
 	}
 	file, err := defaultSRServerStore(r.store).load()
 	if err != nil {
-		return srServerConfig{}, err
+		// The registry is optional credential reuse, not the authority for a
+		// daemon explicitly selected by local credential storage.
+		return server, nil
 	}
 	var matching []srServerConfig
 	for _, candidate := range file.Servers {

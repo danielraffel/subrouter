@@ -1210,6 +1210,48 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	}
 }
 
+func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
+	var usageRequests atomic.Int32
+	var accountRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/_subrouter/usage-status":
+			usageRequests.Add(1)
+			_, _ = io.WriteString(w, `[]`)
+		case "/_subrouter/accounts":
+			accountRequests.Add(1)
+			_, _ = io.WriteString(w, `[]`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
+	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaultSRServerStore(store).Path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store, useServingAPI: true, out: io.Discard, errOut: io.Discard, client: server.Client()}
+	if err := runner.run(t.Context(), []string{"status"}); err != nil {
+		t.Fatalf("status with malformed optional server registry: %v", err)
+	}
+	if err := runner.run(t.Context(), []string{"list"}); err != nil {
+		t.Fatalf("list with malformed optional server registry: %v", err)
+	}
+	if usageRequests.Load() == 0 || accountRequests.Load() == 0 {
+		t.Fatalf("local serving API was not used: usage=%d accounts=%d", usageRequests.Load(), accountRequests.Load())
+	}
+}
+
 func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
 	if err := store.SaveStored(accounts.StoredCodexAccount{

@@ -385,14 +385,24 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		}
 	}
 	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && servingAPIAccountCommand(args[0]) && !explicitLocalStateAuthority() {
-		server, ok, err := r.selectedRemoteServer()
-		if err != nil {
-			return err
-		}
-		if !ok || (source == broker.CredentialSourceLocal && !sameEndpoint(server.URL, localBaseURL())) {
+		var server srServerConfig
+		var err error
+		if source == broker.CredentialSourceLocal {
 			server, err = r.localServingServer()
 			if err != nil {
 				return err
+			}
+		} else {
+			var ok bool
+			server, ok, err = r.selectedRemoteServer()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				server, err = r.localServingServer()
+				if err != nil {
+					return err
+				}
 			}
 		}
 		return r.runRemoteAccountCommand(ctx, server, args)
@@ -1141,11 +1151,6 @@ func (r srRunner) status(ctx context.Context) error {
 	case broker.CredentialSourceLocal:
 		if explicitLocalStateAuthority() || !r.useServingAPI {
 			break
-		}
-		if server, ok, err := r.defaultRemoteServer(); err != nil {
-			return err
-		} else if ok && sameEndpoint(server.URL, localBaseURL()) {
-			return r.serverStatusFor(ctx, server)
 		}
 		server, err := r.localServingServer()
 		if err != nil {

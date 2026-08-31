@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testing.T) {
@@ -108,6 +109,7 @@ func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	request.Header.Set("X-Subrouter-Account-ID", "untrusted-child-account")
+	request.Header.Set("Connection", "Authorization, X-Subrouter-Agent, X-Subrouter-Session, X-Subrouter-Account-ID")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +118,15 @@ func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
 	got := <-seen
 	if accountID := got.Header.Get("X-Subrouter-Account-ID"); accountID != "qwen-token:work" {
 		t.Fatalf("pinned account header = %q", accountID)
+	}
+	if authorization := got.Header.Get("Authorization"); authorization != "Bearer router-token" {
+		t.Fatalf("router authorization = %q", authorization)
+	}
+	if got.Header.Get("X-Subrouter-Agent") != "qwen-token" || got.Header.Get("X-Subrouter-Session") != "pinned-session" {
+		t.Fatalf("routing headers were removed by client hop metadata: agent=%q session=%q", got.Header.Get("X-Subrouter-Agent"), got.Header.Get("X-Subrouter-Session"))
+	}
+	if got.Header.Get("Connection") != "" {
+		t.Fatalf("client hop metadata leaked upstream: %q", got.Header.Get("Connection"))
 	}
 	if got.Header.Get("X-Subrouter-Account") != "" {
 		t.Fatalf("untrusted account alias leaked: %q", got.Header.Get("X-Subrouter-Account"))
@@ -299,6 +310,9 @@ func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *te
 	if pinnedLoopbackToken, err := nativeProxyServerToken("http://127.0.0.1:43213"); err != nil || pinnedLoopbackToken != "local-daemon-secret" {
 		t.Fatalf("pinned loopback token = %q err=%v", pinnedLoopbackToken, err)
 	}
+	if otherLoopbackToken, err := nativeProxyServerToken("http://127.0.0.2:43213"); err != nil || otherLoopbackToken != "subrouter" {
+		t.Fatalf("other loopback token = %q err=%v, want remote placeholder", otherLoopbackToken, err)
+	}
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "https://router.example.test")
 	if sameLocalProxyEndpoint("https://router.example.test/t/opaque", "https://router.example.test") {
 		t.Fatal("matching non-loopback endpoints were treated as the local daemon")
@@ -383,6 +397,60 @@ func TestNativeProxyServerHonorsExplicitLocalOverLegacyStorage(t *testing.T) {
 	}
 	if remote || !sameEndpoint(server.URL, local.URL) {
 		t.Fatalf("native proxy server = %+v remote=%t, want explicit local", server, remote)
+	}
+}
+
+func TestNativeProxyServerRejectsUnselectedLegacyAuthority(t *testing.T) {
+	var localRequests atomic.Int32
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		localRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := (srRunner{store: accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}, errOut: io.Discard}).nativeProxyServer(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "no selected server") {
+		t.Fatalf("unselected legacy authority error = %v", err)
+	}
+	if localRequests.Load() != 0 {
+		t.Fatalf("unselected legacy authority silently probed local %d time(s)", localRequests.Load())
+	}
+}
+
+func TestNativeProxyServerUsesHostedAuthorityWithoutLegacyRegistry(t *testing.T) {
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		CredentialSource: broker.CredentialSourceHosted,
+		AccessToken:      "hosted-access",
+		RefreshToken:     "hosted-refresh",
+		TeamID:           "hosted-team",
+		HostedURL:        "https://hosted.example.test",
+		TenantKey:        testTenantKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaultSRServerStore(store).Path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "http://127.0.0.1:1")
+
+	server, remote, err := (srRunner{store: store, errOut: io.Discard}).nativeProxyServer(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !remote || server.Name != "cmux" || server.URL != "https://hosted.example.test" || server.TenantKey != testTenantKey {
+		t.Fatalf("native proxy server = %+v remote=%t, want hosted cloud authority", server, remote)
 	}
 }
 
