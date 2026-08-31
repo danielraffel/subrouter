@@ -135,6 +135,16 @@ normalized_public_base_url="$(python3 "${deployment_contract}" validate-target \
 SUBROUTER_PUBLIC_BASE_URL="${normalized_public_base_url}"
 export SUBROUTER_PUBLIC_BASE_URL
 
+valid_account_id() {
+  local value="$1"
+  [[ -n "${value}" && ${#value} -le 256 && "${value}" =~ ^[A-Za-z0-9._@:+/-]+$ ]]
+}
+
+if [[ "${account_id_supplied}" == true ]] && ! valid_account_id "${account_id}"; then
+  echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
+  exit 1
+fi
+
 private_root="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-golden-production.XXXXXX")"
 cleanup() {
   if [[ -n "${private_root:-}" && -d "${private_root}" ]]; then
@@ -417,7 +427,7 @@ if isinstance(account_id, str):
 PY
   )"
 fi
-[[ "${account_id}" =~ ^[A-Za-z0-9._@:+/-]{1,256}$ ]] || {
+valid_account_id "${account_id}" || {
   echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
   exit 1
 }
