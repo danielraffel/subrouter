@@ -8,9 +8,53 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
+
+type goldenWebSocketWrites struct {
+	mu     sync.Mutex
+	writes [][]byte
+	notify chan struct{}
+}
+
+func newGoldenWebSocketWrites() *goldenWebSocketWrites {
+	return &goldenWebSocketWrites{notify: make(chan struct{}, 1)}
+}
+
+func (w *goldenWebSocketWrites) write(payload []byte) (int, error) {
+	w.mu.Lock()
+	w.writes = append(w.writes, append([]byte(nil), payload...))
+	w.mu.Unlock()
+	select {
+	case w.notify <- struct{}{}:
+	default:
+	}
+	return len(payload), nil
+}
+
+func (w *goldenWebSocketWrites) snapshot() [][]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]byte(nil), w.writes...)
+}
+
+func (w *goldenWebSocketWrites) waitForCount(t *testing.T, count int) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		if len(w.snapshot()) >= count {
+			return
+		}
+		select {
+		case <-w.notify:
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for %d WebSocket writes, got %d", count, len(w.snapshot()))
+		}
+	}
+}
 
 func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 	gate := newGoldenResponseGate()
@@ -22,11 +66,7 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 		t.Fatal("newGoldenWebSocketPacer returned nil")
 	}
 
-	var writes [][]byte
-	sink := func(payload []byte) (int, error) {
-		writes = append(writes, append([]byte(nil), payload...))
-		return len(payload), nil
-	}
+	writes := newGoldenWebSocketWrites()
 	frames := make([][]byte, 0, 128)
 	for index := 0; index < 128; index++ {
 		frame := []byte{0x81, 0x01, byte('a' + index%26)}
@@ -38,7 +78,7 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 		if end > len(stream) {
 			end = len(stream)
 		}
-		if n, err := pacer.write(context.Background(), stream[offset:end], sink); err != nil {
+		if n, err := pacer.write(context.Background(), stream[offset:end], writes.write); err != nil {
 			t.Fatalf("write: %v", err)
 		} else if n != end-offset {
 			t.Fatalf("write count = %d, want %d", n, end-offset)
@@ -46,13 +86,11 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 		offset = end
 	}
 
-	if len(writes) == 0 {
-		t.Fatal("pacer did not emit any complete frame while the stream was active")
-	}
-	if delay.elapsed == 0 {
+	writes.waitForCount(t, 1)
+	if delay.elapsedDuration() == 0 {
 		t.Fatal("pacer did not apply an interval between data frames")
 	}
-	for index, write := range writes {
+	for index, write := range writes.snapshot() {
 		if len(write)%3 != 0 {
 			t.Fatalf("write %d split a WebSocket frame: %d bytes", index, len(write))
 		}
@@ -68,7 +106,7 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 		t.Fatalf("waitAndFlush: %v", err)
 	}
 	var delivered bytes.Buffer
-	for _, write := range writes {
+	for _, write := range writes.snapshot() {
 		_, _ = delivered.Write(write)
 	}
 	if !bytes.Equal(delivered.Bytes(), stream) {
@@ -141,8 +179,10 @@ func (delay *blockingObserverDelay) wait(
 	ctx context.Context,
 	_ <-chan struct{},
 	_ <-chan struct{},
+	wake <-chan struct{},
 	duration time.Duration,
-) error {
+) (bool, error) {
+	_ = duration
 	select {
 	case <-delay.started:
 	default:
@@ -150,9 +190,11 @@ func (delay *blockingObserverDelay) wait(
 	}
 	select {
 	case <-delay.release:
-		return nil
+		return false, nil
+	case <-wake:
+		return true, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 }
 
@@ -221,29 +263,27 @@ func TestGoldenWebSocketPacerFlushesControlFramesBeforeGateRelease(t *testing.T)
 	base := gate.newResponsePacer("control-frame-test")
 	base.delay = &accumulatingObserverDelay{}
 	pacer := newGoldenWebSocketPacer(base)
-	var writes [][]byte
-	sink := func(payload []byte) (int, error) {
-		writes = append(writes, append([]byte(nil), payload...))
-		return len(payload), nil
-	}
+	writes := newGoldenWebSocketWrites()
 
 	// A control frame may arrive split across reads and after a held data frame.
 	// The complete data frame must be sent first to preserve wire order, then the
 	// control frame must be sent without waiting for the gate.
-	if _, err := pacer.write(context.Background(), []byte{0x81, 0x01, 'x'}, sink); err != nil {
+	if _, err := pacer.write(context.Background(), []byte{0x81, 0x01, 'x'}, writes.write); err != nil {
 		t.Fatalf("data write: %v", err)
 	}
-	if _, err := pacer.write(context.Background(), []byte{0x89}, sink); err != nil {
+	if _, err := pacer.write(context.Background(), []byte{0x89}, writes.write); err != nil {
 		t.Fatalf("partial control write: %v", err)
 	}
-	if len(writes) != 1 || !bytes.Equal(writes[0], []byte{0x81, 0x01, 'x'}) {
-		t.Fatalf("held data was not flushed before a control frame: %x", writes)
+	if len(writes.snapshot()) != 0 {
+		t.Fatalf("incomplete control frame changed the held tail: %x", writes.snapshot())
 	}
-	if _, err := pacer.write(context.Background(), []byte{0x00}, sink); err != nil {
+	if _, err := pacer.write(context.Background(), []byte{0x00}, writes.write); err != nil {
 		t.Fatalf("control write: %v", err)
 	}
-	if len(writes) != 2 || !bytes.Equal(writes[1], []byte{0x89, 0x00}) {
-		t.Fatalf("control frame was held behind the gate: %x", writes)
+	writes.waitForCount(t, 2)
+	gotWrites := writes.snapshot()
+	if !bytes.Equal(gotWrites[0], []byte{0x81, 0x01, 'x'}) || !bytes.Equal(gotWrites[1], []byte{0x89, 0x00}) {
+		t.Fatalf("control frame was held behind the gate: %x", gotWrites)
 	}
 
 	gate.releasePacing()
@@ -257,28 +297,24 @@ func TestGoldenWebSocketPacerKeepsCloseFrameInHeldTail(t *testing.T) {
 	base := gate.newResponsePacer("close-frame-test")
 	base.delay = &accumulatingObserverDelay{}
 	pacer := newGoldenWebSocketPacer(base)
-	var writes [][]byte
-	sink := func(payload []byte) (int, error) {
-		writes = append(writes, append([]byte(nil), payload...))
-		return len(payload), nil
-	}
+	writes := newGoldenWebSocketWrites()
 	stream := []byte{0x81, 0x01, 'x', 0x88, 0x00}
-	if _, err := pacer.write(context.Background(), stream, sink); err != nil {
+	if _, err := pacer.write(context.Background(), stream, writes.write); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if len(writes) != 0 {
-		t.Fatalf("close/data tail was exposed before gate release: %x", writes)
+	if len(writes.snapshot()) != 0 {
+		t.Fatalf("close/data tail was exposed before gate release: %x", writes.snapshot())
 	}
 	gate.releasePacing()
 	if err := pacer.waitAndFlush(); err != nil {
 		t.Fatalf("waitAndFlush: %v", err)
 	}
 	var delivered bytes.Buffer
-	for _, write := range writes {
+	for _, write := range writes.snapshot() {
 		_, _ = delivered.Write(write)
 	}
 	if !bytes.Equal(delivered.Bytes(), stream) {
-		t.Fatalf("close frame was not released after gate release: %x", writes)
+		t.Fatalf("close frame was not released after gate release: %x", writes.snapshot())
 	}
 }
 
@@ -296,12 +332,12 @@ func TestGoldenWebSocketPacerDoesNotDelayQueuedPing(t *testing.T) {
 	if _, err := pacer.write(context.Background(), frames, sink); err != nil {
 		t.Fatalf("data write: %v", err)
 	}
-	beforePing := delay.elapsed
+	beforePing := delay.elapsedDuration()
 	if _, err := pacer.write(context.Background(), []byte{0x89, 0x00}, sink); err != nil {
 		t.Fatalf("ping write: %v", err)
 	}
-	if delay.elapsed != beforePing {
-		t.Fatalf("queued Ping added a pacing delay: before=%s after=%s", beforePing, delay.elapsed)
+	if afterPing := delay.elapsedDuration(); afterPing != beforePing {
+		t.Fatalf("queued Ping added a pacing delay: before=%s after=%s", beforePing, afterPing)
 	}
 	gate.releasePacing()
 	if err := pacer.waitAndFlush(); err != nil {
@@ -315,11 +351,7 @@ func TestGoldenWebSocketPacerDoesNotDelayControlFrameInSameWrite(t *testing.T) {
 	delay := &accumulatingObserverDelay{}
 	base.delay = delay
 	pacer := newGoldenWebSocketPacer(base)
-	var writes [][]byte
-	sink := func(payload []byte) (int, error) {
-		writes = append(writes, append([]byte(nil), payload...))
-		return len(payload), nil
-	}
+	writes := newGoldenWebSocketWrites()
 
 	// The ping is in the same read as enough data to cross the holdback. The
 	// pacer must inspect the complete batch before applying a data-frame delay.
@@ -328,14 +360,16 @@ func TestGoldenWebSocketPacerDoesNotDelayControlFrameInSameWrite(t *testing.T) {
 		stream = append(stream, 0x81, 0x01, byte('a'+index%26))
 	}
 	stream = append(stream, 0x89, 0x00)
-	if _, err := pacer.write(context.Background(), stream, sink); err != nil {
+	if _, err := pacer.write(context.Background(), stream, writes.write); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if delay.elapsed != 0 {
-		t.Fatalf("same-write Ping added a pacing delay: %s", delay.elapsed)
+	writes.waitForCount(t, 101)
+	if elapsed := delay.elapsedDuration(); elapsed != 0 {
+		t.Fatalf("same-write Ping added a pacing delay: %s", elapsed)
 	}
-	if len(writes) != 101 || !bytes.Equal(writes[len(writes)-1], []byte{0x89, 0x00}) {
-		t.Fatalf("same-write Ping was not delivered promptly: %x", writes)
+	gotWrites := writes.snapshot()
+	if len(gotWrites) != 101 || !bytes.Equal(gotWrites[len(gotWrites)-1], []byte{0x89, 0x00}) {
+		t.Fatalf("same-write Ping was not delivered promptly: %x", gotWrites)
 	}
 
 	gate.releasePacing()
@@ -369,14 +403,14 @@ func TestGoldenWebSocketPacerRetainsPartialWriteProgress(t *testing.T) {
 		}
 		return delivered.Write(payload)
 	}
-	if _, err := pacer.write(context.Background(), frame, sink); err == nil {
+	if _, err := pacer.write(context.Background(), frame, sink); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := pacer.waitAndFlush(); err == nil {
 		t.Fatal("partial write error was lost")
 	}
-	if err := pacer.waitAndFlush(); err != nil {
-		t.Fatalf("waitAndFlush: %v", err)
-	}
-	if !bytes.Equal(delivered.Bytes(), frame) {
-		t.Fatalf("partial write was duplicated or lost: got %x want %x", delivered.Bytes(), frame)
+	if !bytes.Equal(delivered.Bytes(), frame[:2]) {
+		t.Fatalf("partial write was duplicated or lost: got %x want prefix %x", delivered.Bytes(), frame[:2])
 	}
 }
 

@@ -54,7 +54,20 @@ func goldenWebSocketFrameLength(payload []byte) (length int, complete bool, err 
 	if len(payload) < 2 {
 		return 0, false, nil
 	}
+	first := payload[0]
+	opcode := first & 0x0f
 	payloadLength := uint64(payload[1] & 0x7f)
+	if opcode >= 0x8 {
+		if first&0x80 == 0 {
+			return 0, false, errors.New("golden WebSocket control frame is fragmented")
+		}
+		if opcode != 0x8 && opcode != 0x9 && opcode != 0xa {
+			return 0, false, errors.New("golden WebSocket control opcode is reserved")
+		}
+		if payloadLength >= 126 {
+			return 0, false, errors.New("golden WebSocket control frame is oversized")
+		}
+	}
 	headerLength := 2
 	switch payloadLength {
 	case 126:
@@ -92,17 +105,23 @@ func goldenWebSocketFrameLength(payload []byte) (length int, complete bool, err 
 }
 
 // goldenWebSocketPacer applies the golden response gate to complete
-// WebSocket frames. It shares supersession and release state with the generic
-// response pacer, but uses one frame per pacing interval instead of splitting
-// arbitrary byte slices.
+// WebSocket frames. Writes only parse and enqueue; a single writer goroutine
+// owns delivery, so upstream reads continue while data frames are paced.
 type goldenWebSocketPacer struct {
-	base         *goldenResponsePacer
-	mu           sync.Mutex
-	parser       goldenWebSocketFrameParser
-	pending      [][]byte
-	pendingBytes int
-	started      bool
-	sink         func([]byte) (int, error)
+	base          *goldenResponsePacer
+	mu            sync.Mutex
+	parser        goldenWebSocketFrameParser
+	pending       [][]byte
+	pendingBytes  int
+	started       bool
+	sink          func([]byte) (int, error)
+	ctx           context.Context
+	notify        chan struct{}
+	controlWake   chan struct{}
+	writerDone    chan struct{}
+	writerStarted bool
+	closing       bool
+	writerErr     error
 }
 
 func newGoldenWebSocketPacer(base *goldenResponsePacer) *goldenWebSocketPacer {
@@ -110,13 +129,17 @@ func newGoldenWebSocketPacer(base *goldenResponsePacer) *goldenWebSocketPacer {
 		return nil
 	}
 	return &goldenWebSocketPacer{
-		base: base,
+		base:        base,
+		notify:      make(chan struct{}, 1),
+		controlWake: make(chan struct{}, 1),
+		writerDone:  make(chan struct{}),
 	}
 }
 
 func (p *goldenWebSocketPacer) releaseRequest() {
 	if p != nil {
 		p.base.releaseRequest()
+		p.signal()
 	}
 }
 
@@ -132,94 +155,100 @@ func (p *goldenWebSocketPacer) write(
 	if p == nil || len(payload) == 0 {
 		return write(payload)
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p.base.payloadSeen.Store(true)
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.sink = write
 	if p.base.wasSuperseded() {
-		p.clearLocked()
+		p.mu.Unlock()
 		return len(payload), nil
+	}
+	if p.writerErr != nil {
+		err := p.writerErr
+		p.mu.Unlock()
+		return 0, err
+	}
+	if p.closing {
+		p.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	if p.sink == nil {
+		p.sink = write
+		p.ctx = ctx
 	}
 	bufferedBytes := p.pendingBytes + len(p.parser.pending)
 	if bufferedBytes > goldenWebSocketMaxBufferedBytes ||
 		len(payload) > goldenWebSocketMaxBufferedBytes-bufferedBytes {
-		p.base.releaseRequest()
-		return 0, errors.New("golden WebSocket frame buffer exceeds limit")
+		err := errors.New("golden WebSocket frame buffer exceeds limit")
+		p.setWriterErrorLocked(err)
+		p.mu.Unlock()
+		return 0, err
 	}
 	frames, err := p.parser.append(payload)
 	if err != nil {
-		p.base.releaseRequest()
+		p.setWriterErrorLocked(err)
+		p.mu.Unlock()
 		return 0, err
 	}
+	controlPending := goldenWebSocketImmediateControlFramePrefix(p.parser.pending)
 	for _, frame := range frames {
 		if p.pendingBytes > goldenWebSocketMaxBufferedBytes-len(frame) {
-			p.base.releaseRequest()
-			return 0, errors.New("golden WebSocket frame buffer exceeds limit")
+			err := errors.New("golden WebSocket frame buffer exceeds limit")
+			p.setWriterErrorLocked(err)
+			p.mu.Unlock()
+			return 0, err
 		}
 		p.pending = append(p.pending, frame)
 		p.pendingBytes += len(frame)
+		controlPending = controlPending || goldenWebSocketImmediateControlFrame(frame)
 	}
-	// Queue the whole parser batch before deciding whether to pace. A control
-	// frame later in this read must also make preceding data frames immediate.
-	if err := p.flushEligibleLocked(ctx); err != nil {
-		p.base.releaseRequest()
-		return 0, err
+	p.startWriterLocked()
+	p.signalLocked()
+	if controlPending {
+		p.signalControlLocked()
 	}
+	p.mu.Unlock()
 	return len(payload), nil
 }
 
-func (p *goldenWebSocketPacer) flushEligibleLocked(ctx context.Context) error {
-	for len(p.pending) > 0 && p.shouldFlushFrameLocked() {
-		if err := p.writeQueuedFrameLocked(ctx); err != nil {
-			return err
-		}
+func (p *goldenWebSocketPacer) startWriterLocked() {
+	if p.writerStarted {
+		return
 	}
-	return nil
+	p.writerStarted = true
+	go p.runWriter()
 }
 
-func (p *goldenWebSocketPacer) writeQueuedFrameLocked(ctx context.Context) error {
-	frame := p.pending[0]
-	written, err := p.writeFrameLocked(ctx, frame)
-	if written < 0 || written > len(frame) {
-		return errors.New("golden WebSocket writer returned an invalid byte count")
+func (p *goldenWebSocketPacer) signal() {
+	select {
+	case p.notify <- struct{}{}:
+	default:
 	}
-	if written > 0 {
-		p.pendingBytes -= written
-		if written == len(frame) {
-			p.pending[0] = nil
-			p.pending = p.pending[1:]
-		} else {
-			p.pending[0] = append([]byte(nil), frame[written:]...)
-		}
-	}
-	if err != nil {
-		return err
-	}
-	if written != len(frame) {
-		return io.ErrShortWrite
-	}
-	return nil
 }
 
-func (p *goldenWebSocketPacer) shouldFlushFrameLocked() bool {
-	if p.base.wasSuperseded() || p.base.isReleased() {
-		return true
+func (p *goldenWebSocketPacer) signalLocked() {
+	p.signal()
+}
+
+func (p *goldenWebSocketPacer) signalControlLocked() {
+	select {
+	case p.controlWake <- struct{}{}:
+	default:
 	}
-	// Control frames must not wait behind the deployment gate. They carry
-	// heartbeats and close handshakes, and delaying them can make an otherwise
-	// healthy peer time out while data is held. Flush any preceding data frames
-	// too, so the wire order stays intact.
-	if p.hasPendingImmediateControlFrameLocked() || goldenWebSocketImmediateControlFramePrefix(p.parser.pending) {
-		return true
-	}
-	// Include an incomplete trailing frame in the held tail. If there is only
-	// one complete frame and no trailing bytes, retain it until release so a
-	// finite response cannot complete early.
-	tailBytes := p.pendingBytes + len(p.parser.pending)
-	if tailBytes <= p.base.holdbackBytes {
+}
+
+func goldenWebSocketImmediateControlFramePrefix(payload []byte) bool {
+	if len(payload) < 2 {
 		return false
 	}
-	return len(p.pending) > 1 || len(p.parser.pending) > 0
+	opcode := payload[0] & 0x0f
+	return payload[0]&0x80 != 0 &&
+		(opcode == 0x9 || opcode == 0xa) && payload[1]&0x7f < 126
+}
+
+func goldenWebSocketImmediateControlFrame(frame []byte) bool {
+	return goldenWebSocketImmediateControlFramePrefix(frame)
 }
 
 func (p *goldenWebSocketPacer) hasPendingImmediateControlFrameLocked() bool {
@@ -229,41 +258,6 @@ func (p *goldenWebSocketPacer) hasPendingImmediateControlFrameLocked() bool {
 		}
 	}
 	return false
-}
-
-func goldenWebSocketImmediateControlFramePrefix(payload []byte) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	opcode := payload[0] & 0x0f
-	return opcode == 0x9 || opcode == 0xa
-}
-
-func goldenWebSocketImmediateControlFrame(frame []byte) bool {
-	return goldenWebSocketImmediateControlFramePrefix(frame)
-}
-
-func (p *goldenWebSocketPacer) writeFrameLocked(ctx context.Context, frame []byte) (int, error) {
-	if p.sink == nil {
-		return 0, errors.New("golden WebSocket pacing sink is unavailable")
-	}
-	if p.base.wasSuperseded() {
-		return len(frame), nil
-	}
-	if p.started && !p.base.isReleased() && !goldenWebSocketImmediateControlFrame(frame) &&
-		!p.hasPendingImmediateControlFrameLocked() && !goldenWebSocketImmediateControlFramePrefix(p.parser.pending) {
-		if err := p.base.delay.wait(ctx, p.base.gateReleased, p.base.requestReleased, p.base.interval); err != nil {
-			return 0, err
-		}
-		if p.base.wasSuperseded() {
-			return len(frame), nil
-		}
-	}
-	// Complete frames are forwarded as whole records. The held tail keeps the
-	// request open across the deployment boundary while the interval preserves
-	// the pacing runway provided by the generic response pacer.
-	p.started = true
-	return goldenWriteAll(p.sink, frame)
 }
 
 func goldenWriteAll(write func([]byte) (int, error), payload []byte) (int, error) {
@@ -291,6 +285,185 @@ func (p *goldenWebSocketPacer) clearLocked() {
 	p.pendingBytes = 0
 }
 
+func (p *goldenWebSocketPacer) setWriterErrorLocked(err error) {
+	if err == nil || p.writerErr != nil {
+		return
+	}
+	p.writerErr = err
+	p.closing = true
+	p.base.releaseRequest()
+	p.signalLocked()
+}
+
+func (p *goldenWebSocketPacer) waitForNotification(ctx context.Context) error {
+	select {
+	case <-p.notify:
+		return nil
+	case <-p.base.gateReleased:
+		return nil
+	case <-p.base.requestReleased:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *goldenWebSocketPacer) waitForInterval(ctx context.Context) (bool, error) {
+	return p.base.delay.wait(ctx, p.base.gateReleased, p.base.requestReleased, p.controlWake, p.base.interval)
+}
+
+func (p *goldenWebSocketPacer) drainControlWakeLocked() {
+	for {
+		select {
+		case <-p.controlWake:
+		default:
+			return
+		}
+	}
+}
+
+func (p *goldenWebSocketPacer) shouldFlushFrameLocked() bool {
+	if p.base.wasSuperseded() || p.base.isReleased() {
+		return true
+	}
+	// Ping and Pong frames must not wait behind the deployment gate. Flush any
+	// preceding data frames too, so the wire order stays intact.
+	if p.hasPendingImmediateControlFrameLocked() || goldenWebSocketImmediateControlFramePrefix(p.parser.pending) {
+		return true
+	}
+	// Include an incomplete trailing frame in the held tail. If there is only
+	// one complete frame and no trailing bytes, retain it until release so a
+	// finite response cannot complete early.
+	tailBytes := p.pendingBytes + len(p.parser.pending)
+	if tailBytes <= p.base.holdbackBytes {
+		return false
+	}
+	return len(p.pending) > 1 || len(p.parser.pending) > 0
+}
+
+func (p *goldenWebSocketPacer) frameNeedsDelayLocked(frame []byte) bool {
+	return p.started && !p.base.isReleased() && !goldenWebSocketImmediateControlFrame(frame) &&
+		!p.hasPendingImmediateControlFrameLocked() && !goldenWebSocketImmediateControlFramePrefix(p.parser.pending)
+}
+
+func (p *goldenWebSocketPacer) runWriter() {
+	defer close(p.writerDone)
+	for {
+		p.mu.Lock()
+		if p.writerErr != nil {
+			p.mu.Unlock()
+			return
+		}
+		if p.base.wasSuperseded() {
+			p.clearLocked()
+			p.mu.Unlock()
+			return
+		}
+		if len(p.pending) == 0 {
+			if p.closing {
+				p.mu.Unlock()
+				return
+			}
+			ctx := p.ctx
+			p.mu.Unlock()
+			if err := p.waitForNotification(ctx); err != nil {
+				p.mu.Lock()
+				p.setWriterErrorLocked(err)
+				p.mu.Unlock()
+				return
+			}
+			continue
+		}
+		if !p.shouldFlushFrameLocked() {
+			ctx := p.ctx
+			p.mu.Unlock()
+			if err := p.waitForNotification(ctx); err != nil {
+				p.mu.Lock()
+				p.setWriterErrorLocked(err)
+				p.mu.Unlock()
+				return
+			}
+			continue
+		}
+		needDelay := p.frameNeedsDelayLocked(p.pending[0])
+		if needDelay {
+			p.drainControlWakeLocked()
+		}
+		ctx := p.ctx
+		p.mu.Unlock()
+		if needDelay {
+			woken, err := p.waitForInterval(ctx)
+			if err != nil {
+				p.mu.Lock()
+				p.setWriterErrorLocked(err)
+				p.mu.Unlock()
+				return
+			}
+			if woken {
+				continue
+			}
+		}
+
+		p.mu.Lock()
+		if p.writerErr != nil {
+			p.mu.Unlock()
+			return
+		}
+		if p.base.wasSuperseded() {
+			p.clearLocked()
+			p.mu.Unlock()
+			return
+		}
+		if len(p.pending) == 0 || !p.shouldFlushFrameLocked() {
+			p.mu.Unlock()
+			continue
+		}
+		frame := p.pending[0]
+		if p.frameNeedsDelayLocked(frame) {
+			p.mu.Unlock()
+			continue
+		}
+		sink := p.sink
+		p.mu.Unlock()
+		if sink == nil {
+			p.mu.Lock()
+			p.setWriterErrorLocked(errors.New("golden WebSocket pacing sink is unavailable"))
+			p.mu.Unlock()
+			return
+		}
+		written, err := goldenWriteAll(sink, frame)
+
+		p.mu.Lock()
+		if written < 0 || written > len(frame) {
+			p.setWriterErrorLocked(errors.New("golden WebSocket writer returned an invalid byte count"))
+			p.mu.Unlock()
+			return
+		}
+		if written > 0 {
+			p.pendingBytes -= written
+			if written == len(frame) {
+				p.pending[0] = nil
+				p.pending = p.pending[1:]
+			} else {
+				p.pending[0] = append([]byte(nil), frame[written:]...)
+			}
+		}
+		if err != nil {
+			p.setWriterErrorLocked(err)
+			p.mu.Unlock()
+			return
+		}
+		if written != len(frame) {
+			p.setWriterErrorLocked(io.ErrShortWrite)
+			p.mu.Unlock()
+			return
+		}
+		p.started = true
+		p.signalLocked()
+		p.mu.Unlock()
+	}
+}
+
 func (p *goldenWebSocketPacer) waitAndFlush() error {
 	if p == nil {
 		return nil
@@ -300,18 +473,28 @@ func (p *goldenWebSocketPacer) waitAndFlush() error {
 	case <-p.base.requestReleased:
 	}
 	p.mu.Lock()
+	p.closing = true
+	started := p.writerStarted
+	done := p.writerDone
+	p.signalLocked()
+	p.mu.Unlock()
+	if started {
+		<-done
+	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.base.wasSuperseded() {
 		p.clearLocked()
 		return nil
 	}
+	if p.writerErr != nil {
+		return p.writerErr
+	}
 	if len(p.parser.pending) != 0 {
 		return errors.New("golden WebSocket stream ended with an incomplete frame")
 	}
-	for len(p.pending) > 0 {
-		if err := p.writeQueuedFrameLocked(context.Background()); err != nil {
-			return err
-		}
+	if len(p.pending) != 0 {
+		return errors.New("golden WebSocket writer stopped with pending frames")
 	}
 	return nil
 }

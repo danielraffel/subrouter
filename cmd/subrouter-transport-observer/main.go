@@ -39,7 +39,7 @@ const (
 )
 
 type observerDelay interface {
-	wait(context.Context, <-chan struct{}, <-chan struct{}, time.Duration) error
+	wait(context.Context, <-chan struct{}, <-chan struct{}, <-chan struct{}, time.Duration) (bool, error)
 }
 
 type timerObserverDelay struct{}
@@ -48,19 +48,22 @@ func (timerObserverDelay) wait(
 	ctx context.Context,
 	gateReleased <-chan struct{},
 	requestReleased <-chan struct{},
+	wake <-chan struct{},
 	duration time.Duration,
-) error {
+) (bool, error) {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	case <-gateReleased:
-		return nil
+		return false, nil
 	case <-requestReleased:
-		return nil
+		return false, nil
+	case <-wake:
+		return true, nil
 	case <-timer.C:
-		return nil
+		return false, nil
 	}
 }
 
@@ -235,7 +238,7 @@ func (p *goldenResponsePacer) writePacedLocked(ctx context.Context, payload []by
 			return total, nil
 		}
 		if p.started {
-			if err := p.delay.wait(ctx, p.gateReleased, p.requestReleased, p.interval); err != nil {
+			if _, err := p.delay.wait(ctx, p.gateReleased, p.requestReleased, nil, p.interval); err != nil {
 				return total, err
 			}
 			if p.isReleased() {
