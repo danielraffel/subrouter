@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -138,6 +139,76 @@ func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *te
 	}
 	if strings.Contains(strings.Join(env, "\n"), "local-daemon-secret") {
 		t.Fatal("local daemon token leaked into the vendor child environment")
+	}
+}
+
+func TestNativeProxyServerIgnoresStaleRemoteDefaultForLocalStorage(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(w, request)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+	var staleRequests atomic.Int32
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		staleRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer stale.Close()
+
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.update(func(file *srServerFile) error {
+		file.Default = "stale"
+		file.Servers = []srServerConfig{{Name: "stale", URL: stale.URL}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, remote, err := (srRunner{store: store, errOut: io.Discard}).nativeProxyServer(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote || !sameEndpoint(server.URL, local.URL) {
+		t.Fatalf("native proxy server = %+v remote=%t, want active local storage", server, remote)
+	}
+	if staleRequests.Load() != 0 {
+		t.Fatalf("stale remote received %d request(s)", staleRequests.Load())
+	}
+}
+
+func TestNativeProxyServerHonorsExplicitLocalOverLegacyStorage(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(w, request)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL)
+	t.Setenv("SUBROUTER_SERVER", "local")
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server, remote, err := (srRunner{store: accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}, errOut: io.Discard}).nativeProxyServer(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote || !sameEndpoint(server.URL, local.URL) {
+		t.Fatalf("native proxy server = %+v remote=%t, want explicit local", server, remote)
 	}
 }
 

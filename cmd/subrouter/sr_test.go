@@ -1245,6 +1245,19 @@ func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
 	}
 }
 
+func TestServingAPIAccountCommandDoesNotCaptureLocalOnlyCommands(t *testing.T) {
+	for _, command := range []string{"add", "add-key", "list", "status", "pick", "reset", "qwen", "kimi", "remove"} {
+		if !servingAPIAccountCommand(command) {
+			t.Fatalf("serving account command %q was not routed", command)
+		}
+	}
+	for _, command := range []string{"usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
+		if servingAPIAccountCommand(command) {
+			t.Fatalf("local-only command %q was captured by the serving API", command)
+		}
+	}
+}
+
 func TestSRAddKeyForAnotherProviderDoesNotImportActiveCodexAuth(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))

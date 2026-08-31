@@ -3245,17 +3245,9 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 			}
 			if !s.AccountRef.hasOAuthUsageSource(refreshed.Provider) {
 				// Credential-only OAuth providers deliberately publish no quota API.
-				// A successful refresh is enough to restore routing eligibility; do
-				// not call the generic usage dispatcher and log its expected
-				// OAuth-usage-unavailable sentinel on every scoring sweep.
-				scoreMu.Lock()
-				if idx, ok := scoreByID[selectacct.ScoreKey(schedulerAccountProvider(refreshed.Provider), refreshed.ID)]; ok {
-					scores[idx].Headroom = 1
-					scores[idx].ShortHeadroom = 1
-					scores[idx].Fresh = false
-					scored++
-				}
-				scoreMu.Unlock()
+				// Successful refresh proves authentication, not quota recovery. Keep
+				// the seed and publish no positive quota evidence so a request-time
+				// exhaustion overlay remains effective until its own expiry.
 				return
 			}
 			windows, fresh, err := s.fetchAccountUsageWindows(sweepCtx, client, refreshed)

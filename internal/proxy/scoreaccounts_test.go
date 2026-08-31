@@ -54,7 +54,7 @@ func TestScoreAccountsPreservesHealthyScoreWhenUsageIsStale(t *testing.T) {
 	}
 }
 
-func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsRoutingHealth(t *testing.T) {
+func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsAuthEvidenceOnly(t *testing.T) {
 	account := accounts.Account{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity,
 		AuthMode: accounts.AuthModeOAuth, Token: "access",
@@ -74,7 +74,7 @@ func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsRoutingHealth(t *testing.T) {
 	server := Server{
 		AccountRef: ref,
 		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
-			AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0,
+			AccountID: account.ID, Provider: account.Provider, Headroom: 0.63, ShortHeadroom: 0.61,
 		}})),
 	}
 
@@ -85,8 +85,34 @@ func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsRoutingHealth(t *testing.T) {
 	if networkCalls != 0 {
 		t.Fatalf("unsupported quota endpoint was polled %d time(s)", networkCalls)
 	}
-	if scored != 1 || len(scores) != 1 || scores[0].Headroom != 1 || scores[0].ShortHeadroom != 1 || scores[0].Fresh {
+	if scored != 0 || len(scores) != 1 || scores[0].Headroom != 0.63 || scores[0].ShortHeadroom != 0.61 || scores[0].Fresh {
 		t.Fatalf("auth-only routing score = %+v, scored=%d", scores, scored)
+	}
+}
+
+func TestAuthOnlyOAuthRefreshPreservesRequestTimeExhaustion(t *testing.T) {
+	account := accounts.Account{
+		ID: "antigravity", Provider: accounts.ProviderAntigravity,
+		AuthMode: accounts.AuthModeOAuth, Token: "access",
+	}
+	source := &stubOAuthSource{
+		provider:  accounts.ProviderAntigravity,
+		listed:    []accounts.Account{account},
+		refreshed: accounts.Account{ID: account.ID, Provider: account.Provider, AuthMode: account.AuthMode, Token: "fresh"},
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+	ref.oauthSources = []OAuthAccountSource{source}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: account.ID, Provider: account.Provider, Headroom: 1, ShortHeadroom: 1,
+	}}))
+	_, generation, revision := ref.CredentialSnapshot()
+	schedulerRef.AdvanceAccountGenerationWithAccounts(generation, revision, SchedulerAccounts([]accounts.Account{account}))
+	schedulerRef.MarkExhaustedUntil(account.Provider, account.ID, "", time.Now().Add(time.Hour))
+	server := Server{AccountRef: ref, SchedulerRef: schedulerRef, UsageScoreTTL: -1}
+
+	server.refreshUsageScoresIfStale(t.Context())
+	if !schedulerRef.Get().Exhausted(account.Provider, account.ID) {
+		t.Fatal("auth-only token refresh cleared request-time quota exhaustion")
 	}
 }
 

@@ -359,7 +359,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
+	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && servingAPIAccountCommand(args[0]) && !explicitLocalStateAuthority() {
 		server, ok, err := r.selectedRemoteServer()
 		if err != nil {
 			return err
@@ -489,6 +489,19 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return r.statusOne(ctx, args[0])
 		}
 		return fmt.Errorf("unknown account command %q\n%s", args[0], srHelp)
+	}
+}
+
+// servingAPIAccountCommand is deliberately narrower than shouldRouteSRCommand.
+// Only account-store operations belong to an isolated serving daemon; usage
+// reports, traces, admin-key management, and project attachment stay local.
+func servingAPIAccountCommand(command string) bool {
+	switch command {
+	case "add", "add-key", "add-api-key", "list", "ls", "status", "pick", "reset", "qwen", "kimi",
+		"switch", "use", "g", "gui", "gui-switch", "gui-use", "import", "remove", "rm":
+		return true
+	default:
+		return strings.Contains(command, "@")
 	}
 }
 

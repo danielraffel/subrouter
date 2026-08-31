@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const (
@@ -263,12 +264,31 @@ func (r srRunner) requireNativeProxyDataPlane(ctx context.Context, root, proxyTo
 }
 
 func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, error) {
-	server, remote, err := r.selectedRemoteServer()
+	config, err := cloudModeConfig()
 	if err != nil {
-		return srServerConfig{}, false, err
+		return srServerConfig{}, false, fmt.Errorf("load credential storage: %w", err)
 	}
-	if remote {
-		return server, true, nil
+	source := config.EffectiveCredentialSource()
+	explicitTarget := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
+	if explicitTarget == "" {
+		explicitTarget = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
+	}
+	explicitServer := explicitTarget != ""
+	explicitLocal := isLocalServerName(explicitTarget)
+	if source == broker.CredentialSourceLegacy || source == broker.CredentialSourceHosted || explicitServer {
+		server, remote, resolveErr := r.selectedRemoteServer()
+		if resolveErr != nil {
+			return srServerConfig{}, false, resolveErr
+		}
+		if remote {
+			if source == broker.CredentialSourceTeam {
+				return srServerConfig{}, false, errors.New("team credentials may only use the local Subrouter daemon; select local or change credential storage")
+			}
+			return server, true, nil
+		}
+		if source == broker.CredentialSourceLegacy && !explicitLocal {
+			return srServerConfig{}, false, errors.New("legacy remote credential storage has no selected server; run 'sr remote use <name>' or 'sr storage local'")
+		}
 	}
 	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
 		return srServerConfig{}, false, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
