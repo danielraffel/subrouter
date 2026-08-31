@@ -1195,6 +1195,125 @@ func TestKimiUsageLimitClassificationMatchesOfficialErrors(t *testing.T) {
 	}
 }
 
+func TestKimiModelCapabilityClassificationMatchesOfficialErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "subscription has no k3 access",
+			body: `{"error":{"message":"Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}}`,
+			want: true,
+		},
+		{
+			name: "plan supports only 256k",
+			body: `{"error":"Your current plan supports only kimi-k3 up to 256K context. 1M context is available on higher-tier plans. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}`,
+			want: true,
+		},
+		{
+			name: "true invalid key",
+			body: `{"error":{"code":"invalid_api_key","message":"invalid authentication"}}`,
+		},
+		{
+			name: "similar but unofficial plan message",
+			body: `{"error":{"message":"Your current plan does not have access to k3."}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+			}
+			got, err := responseKimiModelCapabilityFailure(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("model capability failure = %v, want %v", got, test.want)
+			}
+			preserved, err := io.ReadAll(response.Body)
+			if err != nil || string(preserved) != test.body {
+				t.Fatalf("body was not preserved: %q, err=%v", preserved, err)
+			}
+		})
+	}
+}
+
+func TestKimiPlanCapability401IsModelScoped(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "subscription has no k3 access",
+			body: `{"error":{"message":"Your current subscription does not have access to k3. Upgrade to an Moderato plan or above. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}}`,
+		},
+		{
+			name: "plan supports only 256k",
+			body: `{"error":{"message":"Your current plan supports only kimi-k3 up to 256K context. 1M context is available on higher-tier plans. Upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				calls++
+				switch request.Header.Get("Authorization") {
+				case "Bearer kimi-primary":
+					w.WriteHeader(http.StatusUnauthorized)
+					_, _ = io.WriteString(w, test.body)
+				case "Bearer kimi-secondary":
+					_, _ = io.WriteString(w, `{"id":"msg_ok","content":[]}`)
+				default:
+					t.Errorf("unexpected Kimi credential %q", request.Header.Get("Authorization"))
+					w.WriteHeader(http.StatusUnauthorized)
+				}
+			}))
+			defer upstream.Close()
+
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const sessionID = "kimi-k3-capability"
+			if _, err := store.Put("kimi", sessionID, "kimi:a-primary", ""); err != nil {
+				t.Fatal(err)
+			}
+			schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+			server := Server{
+				Accounts: []accounts.Account{
+					{ID: "kimi:a-primary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "kimi-primary"},
+					{ID: "kimi:z-secondary", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth, Token: "kimi-secondary"},
+				},
+				Sessions: store, SchedulerRef: schedulerRef,
+				KimiUpstream: mustParseURL(t, upstream.URL+"/coding/v1"), MaxBodyBytes: 1024,
+			}
+			request := httptest.NewRequest(http.MethodPost, "/kimi/v1/messages", strings.NewReader(`{"model":"kimi-k3","messages":[]}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Subrouter-Agent", "kimi")
+			request.Header.Set("X-Subrouter-Session", sessionID)
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusOK || calls != 2 {
+				t.Fatalf("status=%d calls=%d body=%s, want model-capable second account", response.Code, calls, response.Body.String())
+			}
+			if _, ok := schedulerRef.ModelIncompatibleUntilFor(accounts.ProviderKimi, "kimi:a-primary", "kimi-k3"); !ok {
+				t.Fatal("Kimi plan rejection was not recorded for the rejected model")
+			}
+			if _, ok := schedulerRef.ExhaustedUntilFor(accounts.ProviderKimi, "kimi:a-primary", ""); ok {
+				t.Fatal("Kimi plan rejection cooked the credential account-wide")
+			}
+			assignment, ok := store.Get("kimi", sessionID)
+			if !ok || assignment.AccountID != "kimi:z-secondary" {
+				t.Fatalf("sticky assignment = %+v, want model-capable account", assignment)
+			}
+		})
+	}
+}
+
 func TestKimi429RetriesSameAccountWithoutCookingIt(t *testing.T) {
 	calls := 0
 	base := roundTripFunc(func(request *http.Request) (*http.Response, error) {

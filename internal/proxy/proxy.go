@@ -5415,10 +5415,14 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		provider = accounts.ProviderCodex
 	}
 	_, keyedProvider := keyedProviderFor(provider)
-	if keyedProvider && accountID != "" && response.StatusCode == http.StatusUnauthorized {
+	inspectKimiUnauthorized := s.SchedulerRef != nil && provider == accounts.ProviderKimi &&
+		accountID != "" && response.StatusCode == http.StatusUnauthorized && response.Body != nil
+	if keyedProvider && accountID != "" && response.StatusCode == http.StatusUnauthorized && !inspectKimiUnauthorized {
 		// Non-replayable requests cannot rotate accounts safely, but the rejected
 		// credential must still leave the routing pool immediately. Scope the mark
 		// to the exact response credential so a concurrent repair is not poisoned.
+		// Kimi also uses 401 for plan/model capability errors, so its body must be
+		// inspected before deciding whether the credential itself is bad.
 		s.markAccountExhaustedCredentialForAccount(account)
 	}
 	// Anthropic signals subscription exhaustion with a plain 429 and a dead or
@@ -5475,7 +5479,7 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		(response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusForbidden)
 	inspectModelCompatibility := s.SchedulerRef != nil && accountID != "" && compatibilityModel != "" &&
 		provider == accounts.ProviderCodex && response.StatusCode == http.StatusBadRequest
-	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !claudeUnusable) {
+	if response.Body == nil || (s.Transcripts == nil && s.Logger == nil && !inspectUsageLimit && !inspectCredentialFailure && !inspectModelCompatibility && !inspectKimiUnauthorized && !claudeUnusable) {
 		return
 	}
 	payload := map[string]any{"status": response.StatusCode}
@@ -5484,9 +5488,20 @@ func (s Server) captureResponseBodyForAccount(response *http.Response, clientCtx
 		responseCtx = response.Request.Context()
 	}
 	var inspect func([]byte)
-	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || claudeUnusable {
+	if inspectUsageLimit || inspectCredentialFailure || inspectModelCompatibility || inspectKimiUnauthorized || claudeUnusable {
 		loggedBody := false
 		inspect = func(body []byte) {
+			if inspectKimiUnauthorized {
+				if kimiModelCapabilityErrorJSON(body) {
+					if compatibilityModel != "" {
+						if err := s.rerouteModelIncompatibilityForReconnect(responseCtx, provider, agentType, sessionID, "", accountID, compatibilityModel); err != nil && s.Logger != nil {
+							s.Logger.Error("http model reroute could not persist next account", "agent", agentType, "session", sessionID, "account", accountID, "model", compatibilityModel, "error", err)
+						}
+					}
+				} else {
+					s.markAccountExhaustedCredentialForAccount(account)
+				}
+			}
 			if inspectCredentialFailure && credentialUnauthorizedJSON(body) {
 				s.markAccountExhaustedCredentialForAccount(account)
 			}
@@ -6973,6 +6988,42 @@ func responseKeyedCredentialFailure(response *http.Response) (bool, error) {
 	return credentialUnauthorizedJSON(prefix), nil
 }
 
+// responseKimiModelCapabilityFailure recognizes the two documented Kimi 401
+// responses that describe plan/model capability rather than authentication.
+// Keep these exact: an arbitrary Kimi 401 must continue to invalidate the
+// credential that produced it.
+func responseKimiModelCapabilityFailure(response *http.Response) (bool, error) {
+	if response == nil || response.StatusCode != http.StatusUnauthorized || response.Body == nil {
+		return false, nil
+	}
+	body := response.Body
+	prefix, err := io.ReadAll(io.LimitReader(body, usageLimitInspectMaxBytes+1))
+	if err != nil {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, err
+	}
+	if int64(len(prefix)) > usageLimitInspectMaxBytes {
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), body), Closer: body}
+		return false, nil
+	}
+	closeErr := body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(prefix))
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return kimiModelCapabilityErrorJSON(prefix), nil
+}
+
+func kimiModelCapabilityErrorJSON(body []byte) bool {
+	switch normalizedProviderErrorMessage(body) {
+	case "your current subscription does not have access to k3. upgrade to an moderato plan or above. upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error",
+		"your current plan supports only kimi-k3 up to 256k context. 1m context is available on higher-tier plans. upgrade: https://www.kimi.com/membership/pricing?from=server_k3_error":
+		return true
+	default:
+		return false
+	}
+}
+
 func responseKimiUsageLimit(response *http.Response) (limited, exhausted bool, err error) {
 	if response == nil || response.StatusCode != http.StatusForbidden || response.Body == nil {
 		return false, false, nil
@@ -7273,19 +7324,26 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return response, nil
 			}
 		}
-		usageLimited, exhausted, credentialFailure, inspectErr := t.responseUsageLimited(response)
+		modelUnsupported := false
+		var inspectErr error
+		switch t.provider {
+		case accounts.ProviderCodex:
+			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+		case accounts.ProviderKimi:
+			modelUnsupported, inspectErr = responseKimiModelCapabilityFailure(response)
+		}
 		if inspectErr != nil {
 			if t.logger != nil {
-				t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+				t.logger.Warn("model capability response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
 			}
 			return response, nil
 		}
-		modelUnsupported := false
-		if !usageLimited && t.provider == accounts.ProviderCodex {
-			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+		usageLimited, exhausted, credentialFailure := false, false, false
+		if !modelUnsupported {
+			usageLimited, exhausted, credentialFailure, inspectErr = t.responseUsageLimited(response)
 			if inspectErr != nil {
 				if t.logger != nil {
-					t.logger.Warn("codex model compatibility response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
+					t.logger.Warn("usage-limit response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", inspectErr)
 				}
 				return response, nil
 			}
@@ -7827,10 +7885,9 @@ func isTerminalCredentialError(err error) bool {
 	return false
 }
 
-// rerouteModelIncompatibility picks the next failover candidate. oauthOnly restricts the
-// pool to OAuth accounts; Fable requests with a fallback chain set it so a
-// metered API-key pool account never preempts the Bedrock stage (the dedicated
-// Fable API key is the chain's own last stage).
+// rerouteModelIncompatibility picks the next failover candidate. Codex ChatGPT
+// model compatibility is OAuth-only; Kimi plan/model capability applies to the
+// selected account regardless of how that account's credential is represented.
 func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, accountID, model string, tried map[string]struct{}) (accounts.Account, error) {
 	if model != "" && s.SchedulerRef != nil {
 		s.SchedulerRef.MarkModelIncompatible(provider, accountID, model)
@@ -7844,9 +7901,9 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 	// This runs inside the replay transport, so selection is provisional until
 	// the replacement request returns 2xx. Persisting here would pin the session
 	// to an account that may immediately reject or fail the replay.
-	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, true)
+	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex)
 	if err != nil && s.Logger != nil {
-		s.Logger.Warn("model incompatibility has no alternate OAuth account",
+		s.Logger.Warn("model incompatibility has no alternate account",
 			"provider", provider,
 			"agent", agentType,
 			"session", sessionID,
