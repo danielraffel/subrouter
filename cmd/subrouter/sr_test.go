@@ -1338,7 +1338,7 @@ func TestServingAPIAccountCommandDoesNotCaptureLocalOnlyCommands(t *testing.T) {
 			t.Fatalf("serving account command %q was not routed", command)
 		}
 	}
-	for _, command := range []string{"switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
+	for _, command := range []string{"switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "import", "usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
 		if servingAPIAccountCommand(command) {
 			t.Fatalf("local-only command %q was captured by the serving API", command)
 		}

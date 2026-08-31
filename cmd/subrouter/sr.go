@@ -557,7 +557,7 @@ func isQwenManagementCommand(args []string) bool {
 func servingAPIAccountCommand(command string) bool {
 	switch command {
 	case "add", "add-key", "add-api-key", "list", "ls", "status", "reset", "qwen", "kimi",
-		"import", "remove", "rm":
+		"remove", "rm":
 		return true
 	default:
 		return strings.Contains(command, "@")
