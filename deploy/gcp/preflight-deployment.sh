@@ -212,7 +212,20 @@ else
     canary_access_control_json="$(printf '%s\n' "${policy_json}" | python3 "${SCRIPT_DIR}/canary-security-policy.py" \
       assert-ready - "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}")" \
       || die "canary security policy does not satisfy the access boundary"
-    listener_takeover_json="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; ! systemctl is-enabled --quiet subrouter.service; ! systemctl is-enabled --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"{\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"
+    listener_takeover_output=""
+    if ! listener_takeover_output="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; ! systemctl is-enabled --quiet subrouter.service; ! systemctl is-enabled --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"{\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"; then
+      die "listener takeover proof command failed"
+    fi
+    listener_takeover_json=""
+    while IFS= read -r listener_takeover_line; do
+      case "${listener_takeover_line}" in
+        \{*\}) listener_takeover_json="${listener_takeover_line}" ;;
+      esac
+    done <<<"${listener_takeover_output}"
+    [[ -n "${listener_takeover_json}" ]] || die "listener takeover proof is missing"
+    jq -e 'type == "object" and .verified == true and .service == "subrouter-front.service" and .port == 31415 and (.pid | type) == "number" and .pid > 1' \
+      <<<"${listener_takeover_json}" >/dev/null \
+      || die "listener takeover proof is invalid"
     listener_takeover_verified=true
   else
     die "URL map does not describe a supported post-migration route"
