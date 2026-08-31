@@ -2,11 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/cutovercanary"
@@ -31,15 +35,37 @@ func TestPeerProbeSubcommandPrintsBoundedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := run([]string{"peer-probe", "--config", path}, bytes.NewReader(nil), &out); err != nil {
+	digest := fmt.Sprintf("%x", sha256.Sum256(b))
+	if err := run([]string{"peer-probe", "--config", path, "--config-sha256", digest}, bytes.NewReader(nil), &out); err != nil {
 		t.Fatal(err)
 	}
 	var result cutovercanary.PeerProbeResult
 	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Schema != cutovercanary.PeerProbeSchema || !result.OK || !result.HealthOK || !result.ReadyOK || result.Draining || result.IdentityKind == "" || result.ExecutableIdentity == "" {
+	if result.Schema != cutovercanary.PeerProbeSchema || !result.OK || !result.HealthOK || !result.ReadyOK || result.Draining || result.ConfigSHA256 != digest || result.IdentityKind == "" || result.ExecutableIdentity == "" {
 		t.Fatalf("unexpected output: %#v", result)
+	}
+}
+
+func TestPeerProbeSubcommandRequiresMatchingConfigDigest(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "probe.json")
+	if err := os.WriteFile(path, []byte(`{"schema":"subrouter.cutover-canary-config/v1","http":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"omitted":  {"peer-probe", "--config", path},
+		"mismatch": {"peer-probe", "--config", path, "--config-sha256", strings.Repeat("0", 64)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := run(args, bytes.NewReader(nil), io.Discard); err == nil {
+				t.Fatal("unbound peer probe accepted")
+			}
+		})
 	}
 }
 

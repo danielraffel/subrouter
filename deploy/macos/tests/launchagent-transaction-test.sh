@@ -235,6 +235,17 @@ esac
 exit 0
 SH
 chmod +x "$legacy" "$legacy_dependency" "$worker"
+write_prebuilt_supervisor() {
+  cat >"$supervisor" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  help) echo ' subrouter supervise --worker-bin PATH ' ;;
+esac
+exit 0
+SH
+  chmod +x "$supervisor"
+}
+write_prebuilt_supervisor
 cat >"$TMP/preflight" <<'SH'
 #!/bin/sh
 [ -z "${FAKE_PREFLIGHT_LOG:-}" ] || printf 'invoked\n' >>"$FAKE_PREFLIGHT_LOG"
@@ -615,6 +626,7 @@ export SUBROUTER_BIN="$worker"
 export SUBROUTER_SUPERVISOR_BIN="$supervisor"
 export SUBROUTER_STATE_DIR="$TMP/home/.subrouter"
 export SUBROUTER_CONTROL_SOCKET="$TMP/home/.subrouter/supervisor.sock"
+export SUBROUTER_TEST_CONTROLS_FROM_ENV=1
 export SUBROUTER_ABSENCE_ATTEMPTS=10 SUBROUTER_ABSENCE_INTERVAL=0.01
 export SUBROUTER_BOOTSTRAP_ATTEMPTS=2 SUBROUTER_BOOTSTRAP_INTERVAL=0.01
 export SUBROUTER_HEALTH_ATTEMPTS=2 SUBROUTER_HEALTH_INTERVAL=0.01
@@ -631,7 +643,19 @@ chmod 0700 "$TMP/mutation-lease-adopt-child"
 
 write_plist "$legacy" serve
 launchctl bootstrap "gui/$(id -u)" "$plist"
+prebuilt_supervisor_sha="$(shasum -a 256 "$supervisor" | awk '{print $1}')"
 "$MIGRATE" >"$TMP/prepare.out" 2>"$TMP/prepare.err"
+[ "$(shasum -a 256 "$supervisor" | awk '{print $1}')" = "$prebuilt_supervisor_sha" ]
+echo "PASS explicit prebuilt supervisor remained byte-for-byte unchanged"
+
+rm -f "$supervisor"
+env -u SUBROUTER_SUPERVISOR_BIN "$MIGRATE" >"$TMP/default-supervisor.out" 2>"$TMP/default-supervisor.err"
+cmp -s "$worker" "$supervisor"
+echo "PASS default supervisor path retained worker-copy behavior"
+write_prebuilt_supervisor
+prebuilt_supervisor_sha="$(shasum -a 256 "$supervisor" | awk '{print $1}')"
+"$MIGRATE" >/dev/null
+[ "$(shasum -a 256 "$supervisor" | awk '{print $1}')" = "$prebuilt_supervisor_sha" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_STATE_DIR' "${plist}.supervised")" = "$SUBROUTER_STATE_DIR" ]
 mutation_lock="${plist}.supervisor-mutation.lock"
 adopt_lock="$TMP/adopted-mutation.lock"
@@ -697,6 +721,29 @@ kill "$mutation_lock_holder" 2>/dev/null || true
 wait "$mutation_lock_holder" 2>/dev/null || true
 [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
 echo "PASS updater mutation lease excluded migration before any file change"
+
+if env -u SUBROUTER_TEST_CONTROLS_FROM_ENV \
+  SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" \
+  SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+  "$MIGRATE" --activate >"$TMP/ambient-callback.out" 2>"$TMP/ambient-callback.err"; then
+  echo "ambient callback unexpectedly authorized activation" >&2
+  exit 1
+fi
+grep -q 'activation requires --canary-callback' "$TMP/ambient-callback.err"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
+echo "PASS ambient callbacks were ignored without explicit test opt-in"
+
+env -u SUBROUTER_TEST_CONTROLS_FROM_ENV \
+  SUBROUTER_FAULT_INJECT_HARD_PHASE=candidate_plist_installing \
+  "$MIGRATE" --activate \
+    --preflight-callback "$TMP/preflight" \
+    --canary-callback "$TMP/canary-ok" \
+  >"$TMP/ambient-fault.out" 2>"$TMP/ambient-fault.err"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+[ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$supervisor" ]
+[ "$(shasum -a 256 "$supervisor" | awk '{print $1}')" = "$prebuilt_supervisor_sha" ]
+echo "PASS ambient fault injection was ignored without explicit test opt-in"
+reset_legacy
 
 if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
   SUBROUTER_CANARY_TIMEOUT=0 "$MIGRATE" --activate \

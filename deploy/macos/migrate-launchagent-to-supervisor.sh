@@ -26,13 +26,17 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter}"
 PLIST="${SUBROUTER_PLIST:-$HOME/Library/LaunchAgents/${LABEL}.plist}"
 WORKER_BIN="${SUBROUTER_BIN:-$HOME/bin/subrouter}"
+SUPERVISOR_BIN_EXPLICIT=0
+if [ "${SUBROUTER_SUPERVISOR_BIN+x}" = x ]; then
+  SUPERVISOR_BIN_EXPLICIT=1
+fi
 SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-$HOME/bin/subrouter-supervisor}"
 STATE_DIR="${SUBROUTER_STATE_DIR:-$HOME/.subrouter}"
 CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-${STATE_DIR}/supervisor.sock}"
 DOMAIN="gui/$(id -u)"
 
-PREFLIGHT_CALLBACK="${SUBROUTER_PREFLIGHT_CALLBACK:-}"
-CANARY_CALLBACK="${SUBROUTER_CANARY_CALLBACK:-}"
+PREFLIGHT_CALLBACK=""
+CANARY_CALLBACK=""
 RETIRING_STATE_DIR="${SUBROUTER_RETIRING_STATE_DIR:-}"
 PUBLIC_ADDR_OVERRIDE="${SUBROUTER_PUBLIC_ADDR:-}"
 WORKER_SERVE_ARGS_JSON="${SUBROUTER_WORKER_SERVE_ARGS_JSON:-}"
@@ -40,6 +44,10 @@ CANDIDATE_ENV_JSON="${SUBROUTER_CANDIDATE_ENV_JSON:-}"
 PREFLIGHT_TIMEOUT="${SUBROUTER_PREFLIGHT_TIMEOUT:-120}"
 CANARY_TIMEOUT="${SUBROUTER_CANARY_TIMEOUT:-300}"
 MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
+TEST_CONTROLS_FROM_ENV="${SUBROUTER_TEST_CONTROLS_FROM_ENV:-0}"
+FAULT_INJECT_PHASE=""
+FAULT_INJECT_HARD_PHASE=""
+FAULT_INJECT_HARD_AFTER_MUTATION=""
 
 # Serialize every worker-path mutation and activation with the routine updater.
 # A dedicated helper owns the kernel descriptor and releases it on parent exit
@@ -202,12 +210,43 @@ while [ "$#" -gt 0 ]; do
     --candidate-env-json)
       [ "$#" -ge 2 ] || die "--candidate-env-json requires a file path"
       CANDIDATE_ENV_JSON="$2"; shift 2 ;;
+    --test-controls-from-env)
+      TEST_CONTROLS_FROM_ENV=1; shift ;;
     -h|--help)
-      echo "usage: $0 [--activate] [--preflight-callback PATH] [--canary-callback PATH] [--retiring-state-dir PATH] [--public-addr HOST:PORT --worker-serve-args-json FILE] [--candidate-env-json FILE]"
+      echo "usage: $0 [--activate] [--preflight-callback PATH] [--canary-callback PATH] [--retiring-state-dir PATH] [--public-addr HOST:PORT --worker-serve-args-json FILE] [--candidate-env-json FILE] [--test-controls-from-env]"
       exit 0 ;;
     *) die "unknown argument $1" ;;
   esac
 done
+
+case "$TEST_CONTROLS_FROM_ENV" in
+  0|1) ;;
+  *) die "SUBROUTER_TEST_CONTROLS_FROM_ENV must be 0 or 1" ;;
+esac
+
+# Callback paths and fault injection are test/deployment harness controls, not
+# ambient process configuration. Production activation must name callbacks on
+# the command line. Tests that deliberately exercise environment-driven hooks
+# opt in explicitly, after which the values are copied and scrubbed before any
+# callback or service process is launched.
+if [ "$TEST_CONTROLS_FROM_ENV" -eq 1 ]; then
+  [ -n "$PREFLIGHT_CALLBACK" ] \
+    || PREFLIGHT_CALLBACK="${SUBROUTER_PREFLIGHT_CALLBACK:-}"
+  [ -n "$CANARY_CALLBACK" ] \
+    || CANARY_CALLBACK="${SUBROUTER_CANARY_CALLBACK:-}"
+  FAULT_INJECT_PHASE="${SUBROUTER_FAULT_INJECT_PHASE:-}"
+  FAULT_INJECT_HARD_PHASE="${SUBROUTER_FAULT_INJECT_HARD_PHASE:-}"
+  FAULT_INJECT_HARD_AFTER_MUTATION="${SUBROUTER_FAULT_INJECT_HARD_AFTER_MUTATION:-}"
+fi
+unset SUBROUTER_PREFLIGHT_CALLBACK SUBROUTER_CANARY_CALLBACK
+unset SUBROUTER_FAULT_INJECT_PHASE SUBROUTER_FAULT_INJECT_HARD_PHASE
+unset SUBROUTER_FAULT_INJECT_HARD_AFTER_MUTATION
+if [ "$TEST_CONTROLS_FROM_ENV" -eq 0 ]; then
+  while IFS= read -r fault_variable; do
+    unset "$fault_variable"
+  done < <(compgen -v SUBROUTER_FAULT_INJECT_ || true)
+fi
+unset SUBROUTER_TEST_CONTROLS_FROM_ENV
 
 if [ -n "$PUBLIC_ADDR_OVERRIDE" ] || [ -n "$WORKER_SERVE_ARGS_JSON" ]; then
   [ -n "$PUBLIC_ADDR_OVERRIDE" ] && [ -n "$WORKER_SERVE_ARGS_JSON" ] \
@@ -290,14 +329,24 @@ fi
 "$WORKER_BIN" help 2>/dev/null | grep -q ' supervise ' \
   || die "$WORKER_BIN does not support supervise; upgrade it first"
 
-# A separate copy, because routine upgrades replace the worker and must never
-# replace the supervisor that is holding the listener.
-mkdir -p "$(dirname "$SUPERVISOR_BIN")"
-cp -f "$WORKER_BIN" "${SUPERVISOR_BIN}.new"
-chmod 0755 "${SUPERVISOR_BIN}.new"
-mv -f "${SUPERVISOR_BIN}.new" "$SUPERVISOR_BIN"
-# An ad-hoc signature keeps macOS from killing the copy with OS_REASON_CODESIGNING.
-codesign -s - -f "$SUPERVISOR_BIN" >/dev/null 2>&1 || true
+# By default, derive a separate supervisor copy from the worker so routine
+# worker upgrades cannot replace the process holding the listener. An explicit
+# supervisor path instead names a prebuilt artifact whose bytes and signature
+# are part of the deployment identity; never mutate it here.
+if [ "$SUPERVISOR_BIN_EXPLICIT" -eq 0 ]; then
+  mkdir -p "$(dirname "$SUPERVISOR_BIN")"
+  cp -f "$WORKER_BIN" "${SUPERVISOR_BIN}.new"
+  chmod 0755 "${SUPERVISOR_BIN}.new"
+  mv -f "${SUPERVISOR_BIN}.new" "$SUPERVISOR_BIN"
+  # An ad-hoc signature keeps macOS from killing the derived copy with
+  # OS_REASON_CODESIGNING.
+  codesign -s - -f "$SUPERVISOR_BIN" >/dev/null 2>&1 || true
+else
+  [ -x "$SUPERVISOR_BIN" ] \
+    || die "explicit supervisor $SUPERVISOR_BIN is not executable"
+  "$SUPERVISOR_BIN" help 2>/dev/null | grep -q ' supervise ' \
+    || die "explicit supervisor $SUPERVISOR_BIN does not support supervise"
+fi
 
 prepared="${PLIST}.supervised"
 python3 - "$PLIST" "$prepared" "$SUPERVISOR_BIN" "$WORKER_BIN" "$CONTROL_SOCKET" "$STATE_DIR" \
@@ -489,7 +538,7 @@ EOF
 fi
 
 [ -n "$CANARY_CALLBACK" ] \
-  || die "activation requires --canary-callback (or SUBROUTER_CANARY_CALLBACK)"
+  || die "activation requires --canary-callback"
 [ -x "$CANARY_CALLBACK" ] || die "canary callback $CANARY_CALLBACK is not executable"
 if [ -n "$PREFLIGHT_CALLBACK" ]; then
   [ -x "$PREFLIGHT_CALLBACK" ] \
@@ -700,16 +749,16 @@ try:
 finally:
     os.close(directory_fd)
 PY
-  if [ "${SUBROUTER_FAULT_INJECT_PHASE:-}" = "$1" ]; then
+  if [ "$FAULT_INJECT_PHASE" = "$1" ]; then
     kill -TERM $$
   fi
-  if [ "${SUBROUTER_FAULT_INJECT_HARD_PHASE:-}" = "$1" ]; then
+  if [ "$FAULT_INJECT_HARD_PHASE" = "$1" ]; then
     kill -KILL $$
   fi
 }
 
 inject_hard_fault_after_mutation() {
-  if [ "${SUBROUTER_FAULT_INJECT_HARD_AFTER_MUTATION:-}" = "$1" ]; then
+  if [ "$FAULT_INJECT_HARD_AFTER_MUTATION" = "$1" ]; then
     kill -KILL $$
   fi
 }

@@ -296,12 +296,15 @@ Create the mode-`0600` leg configs with the following exact shapes. Every
 literal filenames or account/session IDs to copy:
 
 ```json
-{"schema":"subrouter.cutover-canary-config/v1","proof_file":"/private/peer-proof.json","peers":[{"name":"peer-a","ssh_host":"user@direct-host-or-address","ssh_identity_file":"/private/owner-only-ssh-key","remote_executable":"/private/subrouter-cutover-canary","remote_config_file":"/private/peer-a.json","expected_identity_kind":"darwin-cdhash-sha256","expected_executable_identity":"CDHASH","timeout_seconds":30}]}
+{"schema":"subrouter.cutover-canary-config/v1","proof_file":"/private/peer-proof.json","peers":[{"name":"peer-a","ssh_host":"user@direct-host-or-address","ssh_identity_file":"/private/owner-only-ssh-key","remote_executable":"/private/subrouter-cutover-canary","remote_config_file":"/private/peer-a.json","remote_config_sha256":"SHA256","expected_identity_kind":"darwin-cdhash-sha256","expected_executable_identity":"CDHASH","timeout_seconds":30}]}
 {"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/auth-proof.json","state_file":"/private/auth-state.json","cleanup_journal":"/private/auth-journal.json","model":"MODEL"}
 {"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/sticky-proof.json","state_file":"/private/auth-state.json","cleanup_journal":"/private/auth-journal.json","model":"MODEL"}
 {"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/failover-proof.json","cleanup_journal":"/private/failover-journal.json","model":"MODEL","unavailable_account_id":"ACCOUNT_ALREADY_AT_100_PERCENT"}
 {"schema":"subrouter.cutover-canary-config/v1","http":{"base_url":"http://127.0.0.1:PORT","admin_token_file":"/private/admin-token","timeout_seconds":30,"max_response_bytes":1048576},"proof_file":"/private/existing-proof.json","selection_file":"/private/existing-selection.json","challenge_file":"/private/existing-challenge.json","witness_file":"/private/existing-witness.json","wait_seconds":90,"candidate_log_files":["/private/candidate.log"],"max_log_append_bytes":1048576}
 ```
+
+After staging each peer probe config, set its `remote_config_sha256` to the
+lowercase digest printed by `shasum -a 256 /private/peer-a.json` on that peer.
 
 On macOS, obtain `CDHASH` from the staged, signed helper with
 `codesign -dvvv /private/subrouter-cutover-canary 2>&1` and copy its lowercase
@@ -317,7 +320,11 @@ runner rejects a mix of otherwise-valid executables. The peer's referenced probe
 does not execute arbitrary local argv: it invokes `/usr/bin/ssh` with fixed
 non-forwarding, non-interactive, no-backgrounding options, ignores SSH config,
 and runs only the declared absolute remote helper as `peer-probe --config
-REMOTE_CONFIG`. Consequently `ssh_host` must be a directly resolvable host,
+REMOTE_CONFIG --config-sha256 SHA256`. Before parsing the config or making any
+network request, the remote helper hashes the exact private config bytes and
+fails closed unless they match `remote_config_sha256`; only this non-secret
+digest is carried on the command line and returned in the bounded peer proof
+for an exact controller-side match. Consequently `ssh_host` must be a directly resolvable host,
 address, or `user@host`, not an SSH-config-only alias. Acceptance also requires
 the remote helper to report the configured kernel-bound CDHash captured from
 its running process image before any peer network probe. The optional

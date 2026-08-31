@@ -28,10 +28,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) > 0 {
 		switch args[0] {
 		case "peer-probe":
-			if len(args) != 3 || args[1] != "--config" {
+			if len(args) != 5 || args[1] != "--config" || args[3] != "--config-sha256" {
 				return errors.New("usage")
 			}
-			result, err := cutovercanary.Probe(ctx, args[2])
+			result, err := cutovercanary.Probe(ctx, args[2], args[4])
 			if err != nil {
 				return err
 			}

@@ -3,6 +3,7 @@ package cutovercanary
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +43,15 @@ func writeConfig(t *testing.T, dir, name string, value any) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func fileSHA256(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(body))
 }
 
 func waitForChallengeReady(t *testing.T, challenge Challenge) {
@@ -548,8 +558,34 @@ func TestProbeFailsClosedOnDraining(t *testing.T) {
 	}))
 	defer server.Close()
 	path := writeConfig(t, dir, "probe.json", PeerProbeConfig{Schema: ConfigSchema, HTTP: HTTPConfig{BaseURL: server.URL, TimeoutSeconds: 2, MaxResponseBytes: 1024}})
-	if _, err := Probe(context.Background(), path); err == nil {
+	if _, err := Probe(context.Background(), path, fileSHA256(t, path)); err == nil {
 		t.Fatal("draining readiness accepted")
+	}
+}
+
+func TestProbeRequiresExactConfigSHA256BeforeNetwork(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(`{"ok":true,"draining":false}`))
+	}))
+	defer server.Close()
+	dir := privateDir(t)
+	path := writeConfig(t, dir, "probe.json", PeerProbeConfig{Schema: ConfigSchema, HTTP: HTTPConfig{BaseURL: server.URL, TimeoutSeconds: 2, MaxResponseBytes: 1024}})
+
+	for name, digest := range map[string]string{
+		"missing":   "",
+		"malformed": strings.Repeat("A", 64),
+		"mismatch":  strings.Repeat("0", 64),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Probe(context.Background(), path, digest); err == nil {
+				t.Fatal("unbound peer config accepted")
+			}
+		})
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("config mismatch sent %d network requests", requests.Load())
 	}
 }
 
@@ -562,14 +598,15 @@ func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 	}
 	fakeSSH := filepath.Join(dir, "ssh")
 	argvFile := filepath.Join(dir, "argv")
-	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" >%q\ncase \"$*\" in *draining) draining=true ;; *) draining=false ;; esac\nprintf '{\"schema\":\"%s\",\"ok\":true,\"health_ok\":true,\"ready_ok\":true,\"draining\":%%s,\"identity_kind\":\"%s\",\"executable_identity\":\"%s\"}\\n' \"$draining\"\n", argvFile, PeerProbeSchema, goBuildInfoIdentityKind, digest)
+	configDigest := strings.Repeat("b", 64)
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" >%q\ncase \"$*\" in *'/private/draining'*) draining=true ;; *) draining=false ;; esac\nprintf '{\"schema\":\"%s\",\"ok\":true,\"health_ok\":true,\"ready_ok\":true,\"draining\":%%s,\"config_sha256\":\"%s\",\"identity_kind\":\"%s\",\"executable_identity\":\"%s\"}\\n' \"$draining\"\n", argvFile, PeerProbeSchema, configDigest, goBuildInfoIdentityKind, digest)
 	if err := os.WriteFile(fakeSSH, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	previousSSH := sshCommandPath
 	sshCommandPath = fakeSSH
 	defer func() { sshCommandPath = previousSSH }()
-	peer := PeerTarget{Name: "peer-a", SSHHost: "peer.example", SSHIdentityFile: identityFile, RemoteExecutable: "/private/subrouter-cutover-canary", RemoteConfigFile: "/private/healthy", ExpectedIdentityKind: goBuildInfoIdentityKind, ExpectedExecutableIdentity: digest, TimeoutSeconds: 10}
+	peer := PeerTarget{Name: "peer-a", SSHHost: "peer.example", SSHIdentityFile: identityFile, RemoteExecutable: "/private/subrouter-cutover-canary", RemoteConfigFile: "/private/healthy", RemoteConfigSHA256: configDigest, ExpectedIdentityKind: goBuildInfoIdentityKind, ExpectedExecutableIdentity: digest, TimeoutSeconds: 10}
 	if err := runPeer(context.Background(), peer); err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +614,7 @@ func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"-F\nnone\n", "ControlMaster=no", "ControlPersist=no", "ForkAfterAuthentication=no", "ProxyCommand=none", "ProxyJump=none", "IdentitiesOnly=yes", "IdentityAgent=none", "-i\n" + identityFile + "\n"} {
+	for _, required := range []string{"-F\nnone\n", "ControlMaster=no", "ControlPersist=no", "ForkAfterAuthentication=no", "ProxyCommand=none", "ProxyJump=none", "IdentitiesOnly=yes", "IdentityAgent=none", "-i\n" + identityFile + "\n", "--config-sha256\n" + peer.RemoteConfigSHA256 + "\n"} {
 		if !strings.Contains(string(argv), required) {
 			t.Fatalf("peer ssh argv omitted %q: %s", required, argv)
 		}
@@ -595,6 +632,11 @@ func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 		t.Fatal("draining peer accepted")
 	}
 	peer.RemoteConfigFile = "/private/healthy"
+	peer.RemoteConfigSHA256 = strings.Repeat("c", 64)
+	if err := runPeer(context.Background(), peer); err == nil {
+		t.Fatal("peer proof with wrong remote config digest accepted")
+	}
+	peer.RemoteConfigSHA256 = configDigest
 	peer.SSHHost = "-oProxyCommand=bad"
 	if err := runPeer(context.Background(), peer); err == nil {
 		t.Fatal("option-like peer host accepted")
@@ -605,6 +647,11 @@ func TestPeerCommandAcceptsOnlyStrictHealthyProof(t *testing.T) {
 		t.Fatal("shell-bearing remote path accepted")
 	}
 	peer.RemoteExecutable = "/private/subrouter-cutover-canary"
+	peer.RemoteConfigSHA256 = ""
+	if err := runPeer(context.Background(), peer); err == nil {
+		t.Fatal("peer without remote config digest accepted")
+	}
+	peer.RemoteConfigSHA256 = configDigest
 	if err := os.Chmod(identityFile, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +745,7 @@ func TestWritableArtifactsRejectReadOnlyPathAndInodeAliases(t *testing.T) {
 		}
 		cfg := PeerLegConfig{
 			Schema: ConfigSchema, ProofFile: identityPath,
-			Peers: []PeerTarget{{Name: "peer-a", SSHHost: "peer.example", SSHIdentityFile: identityPath, RemoteExecutable: "/private/helper", RemoteConfigFile: "/private/config", ExpectedIdentityKind: goBuildInfoIdentityKind, ExpectedExecutableIdentity: strings.Repeat("a", 64), TimeoutSeconds: 1}},
+			Peers: []PeerTarget{{Name: "peer-a", SSHHost: "peer.example", SSHIdentityFile: identityPath, RemoteExecutable: "/private/helper", RemoteConfigFile: "/private/config", RemoteConfigSHA256: strings.Repeat("b", 64), ExpectedIdentityKind: goBuildInfoIdentityKind, ExpectedExecutableIdentity: strings.Repeat("a", 64), TimeoutSeconds: 1}},
 		}
 		configPath := writeConfig(t, dir, "config.json", cfg)
 		before, err := os.ReadFile(identityPath)

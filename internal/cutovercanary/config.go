@@ -2,6 +2,8 @@ package cutovercanary
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +36,7 @@ type PeerTarget struct {
 	SSHIdentityFile            string `json:"ssh_identity_file,omitempty"`
 	RemoteExecutable           string `json:"remote_executable"`
 	RemoteConfigFile           string `json:"remote_config_file"`
+	RemoteConfigSHA256         string `json:"remote_config_sha256"`
 	ExpectedExecutableIdentity string `json:"expected_executable_identity"`
 	ExpectedIdentityKind       string `json:"expected_identity_kind"`
 	TimeoutSeconds             int    `json:"timeout_seconds"`
@@ -133,6 +136,25 @@ func readStrictPrivateJSON(path string, dst any) error {
 	if err != nil {
 		return err
 	}
+	return decodeStrictJSON(b, dst)
+}
+
+func readStrictPrivateJSONSHA256(path, expectedSHA256 string, dst any) error {
+	if !validSHA256(expectedSHA256) {
+		return errors.New("invalid expected canary config SHA-256")
+	}
+	b, err := readPrivateFile(path, 1<<20)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(b)
+	if hex.EncodeToString(digest[:]) != expectedSHA256 {
+		return errors.New("canary config SHA-256 mismatch")
+	}
+	return decodeStrictJSON(b, dst)
+}
+
+func decodeStrictJSON(b []byte, dst any) error {
 	if err := rejectDuplicateJSONKeys(b); err != nil {
 		return err
 	}

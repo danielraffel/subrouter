@@ -29,6 +29,7 @@ type PeerProbeResult struct {
 	HealthOK           bool   `json:"health_ok"`
 	ReadyOK            bool   `json:"ready_ok"`
 	Draining           bool   `json:"draining"`
+	ConfigSHA256       string `json:"config_sha256"`
 	ExecutableIdentity string `json:"executable_identity"`
 	IdentityKind       string `json:"identity_kind"`
 }
@@ -181,7 +182,8 @@ var sshCommandPath = "/usr/bin/ssh"
 
 func runPeer(ctx context.Context, peer PeerTarget) error {
 	if peer.Name == "" || !safeSSHHost(peer.SSHHost) || !safeRemotePath(peer.RemoteExecutable) ||
-		!safeRemotePath(peer.RemoteConfigFile) || !validExecutableIdentity(peer.ExpectedIdentityKind, peer.ExpectedExecutableIdentity) {
+		!safeRemotePath(peer.RemoteConfigFile) || !validSHA256(peer.RemoteConfigSHA256) ||
+		!validExecutableIdentity(peer.ExpectedIdentityKind, peer.ExpectedExecutableIdentity) {
 		return errors.New("invalid peer command")
 	}
 	if peer.SSHIdentityFile != "" {
@@ -205,7 +207,7 @@ func runPeer(ctx context.Context, peer PeerTarget) error {
 	if peer.SSHIdentityFile != "" {
 		args = append(args, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-i", peer.SSHIdentityFile)
 	}
-	args = append(args, "--", peer.SSHHost, peer.RemoteExecutable, "peer-probe", "--config", peer.RemoteConfigFile)
+	args = append(args, "--", peer.SSHHost, peer.RemoteExecutable, "peer-probe", "--config", peer.RemoteConfigFile, "--config-sha256", peer.RemoteConfigSHA256)
 	cmd := exec.CommandContext(deadline, sshCommandPath, args...)
 	cmd.Env = canaryEnvironment()
 	var out strings.Builder
@@ -217,7 +219,7 @@ func runPeer(ctx context.Context, peer PeerTarget) error {
 	var got PeerProbeResult
 	dec := json.NewDecoder(strings.NewReader(out.String()))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&got); err != nil || got.Schema != PeerProbeSchema || !got.OK || !got.HealthOK || !got.ReadyOK || got.Draining || got.IdentityKind != peer.ExpectedIdentityKind || got.ExecutableIdentity != peer.ExpectedExecutableIdentity {
+	if err := dec.Decode(&got); err != nil || got.Schema != PeerProbeSchema || !got.OK || !got.HealthOK || !got.ReadyOK || got.Draining || got.ConfigSHA256 != peer.RemoteConfigSHA256 || got.IdentityKind != peer.ExpectedIdentityKind || got.ExecutableIdentity != peer.ExpectedExecutableIdentity {
 		return errors.New("peer probe proof invalid")
 	}
 	var extra any
@@ -769,11 +771,15 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func Probe(ctx context.Context, configPath string) (PeerProbeResult, error) {
+func Probe(ctx context.Context, configPath, expectedConfigSHA256 string) (PeerProbeResult, error) {
 	var cfg PeerProbeConfig
-	if err := loadConfig(configPath, &cfg, cfg.Schema); err != nil {
+	if err := readStrictPrivateJSONSHA256(configPath, expectedConfigSHA256, &cfg); err != nil {
 		return PeerProbeResult{}, err
 	}
+	if cfg.Schema != ConfigSchema {
+		return PeerProbeResult{}, errors.New("unsupported canary config schema")
+	}
+	cfg.configPath = configPath
 	client, err := newAPIClient(cfg.HTTP, true)
 	if err != nil {
 		return PeerProbeResult{}, err
@@ -788,6 +794,7 @@ func Probe(ctx context.Context, configPath string) (PeerProbeResult, error) {
 	}
 	result.IdentityKind = identity.Kind
 	result.ExecutableIdentity = identity.Value
+	result.ConfigSHA256 = expectedConfigSHA256
 	return result, nil
 }
 
