@@ -62,3 +62,26 @@ jobs:
 
       - name: Exercise both profiles under the production memory limit
         run: deploy/docker/smoke-test.sh
+
+  macos-launchagent-transaction:
+    name: macOS LaunchAgent transaction
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Test functional canary runner and helper
+        run: |
+          python3 deploy/macos/tests/run-functional-canary-test.py
+          go test ./internal/cutovercanary ./cmd/subrouter-cutover-canary -count=1
+          go test ./cmd/subrouter \
+            -run 'TestLaunchAgentFunctionalCanary|TestPeerProbeSubcommand|TestLegResultHasExactRunnerKeys|TestMacOSAutoUpdaterDefers|TestParseSupervisorConfigRequiresAbsoluteUpgradeInhibitFile|TestUpgradeInhibitMarkerBlocksGenerationChange|TestSlotRetirementDrainsPinnedStreamBeforeSupervisorExit' \
+            -count=1
+
+      - name: Test rollback and signal transaction matrix
+        run: deploy/macos/tests/launchagent-transaction-test.sh

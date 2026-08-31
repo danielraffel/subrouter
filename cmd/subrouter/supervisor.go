@@ -28,6 +28,7 @@ type supervisorConfig struct {
 	Addr                string
 	ControlSocket       string
 	WorkerBin           string
+	UpgradeInhibitFile  string
 	ReadyTimeout        time.Duration
 	DrainTimeout        time.Duration
 	WorkerStopGrace     time.Duration
@@ -43,6 +44,7 @@ type workerGeneration struct {
 	address   string
 	socketDir string
 	command   *exec.Cmd
+	identity  processExecutableIdentity
 	done      chan struct{}
 
 	mu  sync.Mutex
@@ -114,6 +116,7 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.StringVar(&config.Addr, "addr", "127.0.0.1:31415", "stable client listen address")
 	flags.StringVar(&config.ControlSocket, "control-socket", "/var/run/subrouter-supervisor.sock", "permissioned supervisor control socket")
 	flags.StringVar(&config.WorkerBin, "worker-bin", "", "replaceable subrouter worker binary")
+	flags.StringVar(&config.UpgradeInhibitFile, "upgrade-inhibit-file", "", "absolute marker path that blocks worker generation changes while present")
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
 	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "interval for reporting retired worker connections that remain pinned")
 	flags.DurationVar(&config.WorkerStopGrace, "worker-stop-grace", 30*time.Second, "maximum time for a retired worker to exit after SIGTERM")
@@ -139,6 +142,9 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if strings.TrimSpace(config.WorkerBin) == "" {
 		return errors.New("worker-bin is required")
+	}
+	if config.UpgradeInhibitFile != "" && !filepath.IsAbs(config.UpgradeInhibitFile) {
+		return fmt.Errorf("upgrade-inhibit-file must be an absolute path, got %q", config.UpgradeInhibitFile)
 	}
 	if config.ReadyTimeout <= 0 {
 		return errors.New("ready-timeout must be positive")
@@ -210,6 +216,15 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 		_ = os.RemoveAll(socketDir)
 		return nil, err
 	}
+	identity, err := executableIdentityForProcess(command.Process.Pid)
+	if err != nil {
+		_ = command.Process.Kill()
+		_, _ = command.Process.Wait()
+		_ = file.Close()
+		_ = listener.Close()
+		_ = os.RemoveAll(socketDir)
+		return nil, fmt.Errorf("capture worker process identity: %w", err)
+	}
 	_ = file.Close()
 	_ = listener.Close()
 
@@ -219,6 +234,7 @@ func startWorkerGeneration(config supervisorConfig) (*workerGeneration, error) {
 		address:   address,
 		socketDir: socketDir,
 		command:   command,
+		identity:  identity,
 		done:      make(chan struct{}),
 	}
 	go func() { generation.setWaitError(command.Wait()) }()
@@ -436,6 +452,13 @@ func (s *supervisor) upgradeLocked() error {
 	if !accepting {
 		return errors.New("supervisor is shutting down")
 	}
+	if s.config.UpgradeInhibitFile != "" {
+		if _, err := os.Lstat(s.config.UpgradeInhibitFile); err == nil {
+			return errors.New("worker upgrades are inhibited by an active deployment transaction")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect upgrade inhibit marker: %w", err)
+		}
+	}
 	next, err := startWorkerGeneration(s.config)
 	if err != nil {
 		return err
@@ -539,10 +562,11 @@ func (s *supervisor) controlHandler() http.Handler {
 		accepting, retiring := s.lifecycleStatus()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"accepting": accepting,
-			"retiring":  retiring,
-			"active":    s.router.Active(),
-			"backends":  s.router.Status(),
+			"accepting":     accepting,
+			"retiring":      retiring,
+			"active":        s.router.Active(),
+			"backends":      s.router.Status(),
+			"active_worker": s.activeWorkerProcessStatus(),
 		})
 	})
 	mux.HandleFunc("POST /_subrouter/upgrade", func(w http.ResponseWriter, _ *http.Request) {
@@ -564,6 +588,35 @@ func (s *supervisor) controlHandler() http.Handler {
 		})
 	}
 	return mux
+}
+
+type activeWorkerProcessStatus struct {
+	ID                 string `json:"id"`
+	PID                int    `json:"pid"`
+	ProcessStart       string `json:"process_start_identity"`
+	IdentityKind       string `json:"identity_kind"`
+	ExecutableIdentity string `json:"executable_identity"`
+}
+
+func (s *supervisor) activeWorkerProcessStatus() activeWorkerProcessStatus {
+	active := s.router.Active()
+	s.workersMu.Lock()
+	worker := s.workers[active.ID]
+	s.workersMu.Unlock()
+	if worker == nil || worker.command == nil || worker.command.Process == nil {
+		return activeWorkerProcessStatus{ID: active.ID}
+	}
+	identity, err := executableIdentityForProcess(worker.command.Process.Pid)
+	if err != nil || identity != worker.identity {
+		return activeWorkerProcessStatus{ID: active.ID, PID: worker.command.Process.Pid}
+	}
+	return activeWorkerProcessStatus{
+		ID:                 active.ID,
+		PID:                worker.command.Process.Pid,
+		ProcessStart:       identity.StartIdentity,
+		IdentityKind:       identity.Kind,
+		ExecutableIdentity: identity.Value,
+	}
 }
 
 // requestRetirement begins the one-way shutdown of a private slot supervisor.

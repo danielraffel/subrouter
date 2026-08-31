@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,12 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
+)
+
+const (
+	managedClaudeBlockedBaseURL   = "http://127.0.0.1:1"
+	managedClaudeServerURLEnv     = "SUBROUTER_CLAUDE_SERVER_URL"
+	managedClaudeTailscaleNodeEnv = "SUBROUTER_CLAUDE_TAILSCALE_NODE_ID"
 )
 
 // pushClaudeProfileToServer uploads a local Claude profile's credential to the
@@ -66,6 +74,9 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 		}
 		return fmt.Errorf("no default Subrouter server configured; run '%s server use <name>'", r.programOrSubrouter())
 	}
+	if err := requireManagedClaudeServerIdentity(server); err != nil {
+		return err
+	}
 	store := claude.DefaultStore()
 	profile, ok, err := store.MatchProfile(name)
 	if err != nil {
@@ -85,7 +96,7 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 	if err := r.uploadServerClaudeProfile(ctx, server, store, profile, *credential); err != nil {
 		return err
 	}
-	if err := writeClaudeProxyEnv(configDir, serverProxyRootURL(server), strings.TrimSpace(server.TenantKey)); err != nil {
+	if err := writeClaudeProxyEnvForServer(configDir, server); err != nil {
 		return fmt.Errorf("profile uploaded, but writing proxy env to settings.json failed: %w", err)
 	}
 	fmt.Fprintf(r.out, "Uploaded Claude profile %s to server %s and switched local runs to the server pool.\n", profile.Name, server.Name)
@@ -102,6 +113,49 @@ func (r srRunner) uploadServerClaudeProfile(ctx context.Context, server srServer
 // it with pooled credentials; with a tenant key, the key itself is the auth
 // token so the server can scope the request to the tenant's pool.
 func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
+	_, err := secureTenantProxyURL(context.Background(), baseURL, tenantKey)
+	if err != nil {
+		return err
+	}
+	return writeClaudeProxyEnvCanonical(configDir, baseURL, tenantKey)
+}
+
+func writeClaudeProxyEnvForServer(configDir string, server srServerConfig) error {
+	return writeClaudeProxyEnvForServerWithResolvers(configDir, server, net.DefaultResolver.LookupIPAddr, defaultTailscaleStatusLoader)
+}
+
+func writeClaudeProxyEnvForServerWithResolvers(configDir string, server srServerConfig, lookup serverIPLookup, load tailscaleStatusLoader) error {
+	if err := requireManagedClaudeServerIdentity(server); err != nil {
+		return err
+	}
+	root := canonicalServerProxyRootURL(server)
+	if _, err := secureTenantServerURLWithResolvers(context.Background(), root, server, lookup, load); err != nil {
+		return err
+	}
+	parsed, _ := url.Parse(root)
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) {
+		// A plain `claude` launch cannot revalidate the saved Tailscale node.
+		// Leave it on a closed loopback endpoint. The same atomic settings
+		// generation records the non-credential server identity; `sr claude
+		// run` verifies that exact node and overrides the base URL per process.
+		return writeClaudeProxyEnvCanonicalForServer(configDir, managedClaudeBlockedBaseURL, strings.TrimSpace(server.TenantKey), &server)
+	}
+	return writeClaudeProxyEnvCanonical(configDir, root, strings.TrimSpace(server.TenantKey))
+}
+
+func requireManagedClaudeServerIdentity(server srServerConfig) error {
+	parsed, _ := url.Parse(canonicalServerProxyRootURL(server))
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) && strings.TrimSpace(server.TailscaleNodeID) == "" {
+		return fmt.Errorf("plaintext remote Claude server %q has no exact Tailscale node identity; re-add the server before uploading credentials", server.Name)
+	}
+	return nil
+}
+
+func writeClaudeProxyEnvCanonical(configDir, baseURL, tenantKey string) error {
+	return writeClaudeProxyEnvCanonicalForServer(configDir, baseURL, tenantKey, nil)
+}
+
+func writeClaudeProxyEnvCanonicalForServer(configDir, baseURL, tenantKey string, server *srServerConfig) error {
 	settingsPath := filepath.Join(configDir, "settings.json")
 	settings := map[string]any{}
 	if body, err := os.ReadFile(settingsPath); err == nil {
@@ -114,6 +168,14 @@ func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
 		env = map[string]any{}
 	}
 	env["ANTHROPIC_BASE_URL"] = strings.TrimRight(baseURL, "/")
+	env["ANTHROPIC_CUSTOM_HEADERS"] = "X-Subrouter-Agent: claude"
+	if server != nil {
+		env[managedClaudeServerURLEnv] = strings.TrimRight(strings.TrimSpace(server.URL), "/")
+		env[managedClaudeTailscaleNodeEnv] = strings.TrimSpace(server.TailscaleNodeID)
+	} else {
+		delete(env, managedClaudeServerURLEnv)
+		delete(env, managedClaudeTailscaleNodeEnv)
+	}
 	if tenantKey != "" {
 		env["ANTHROPIC_AUTH_TOKEN"] = tenantKey
 	} else if existing, ok := env["ANTHROPIC_AUTH_TOKEN"].(string); !ok || tenant.ValidKeyFormat(existing) {
@@ -131,5 +193,26 @@ func writeClaudeProxyEnv(configDir, baseURL, tenantKey string) error {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(settingsPath, out, 0o600)
+	tmp, err := os.CreateTemp(configDir, ".settings.json.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(out); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, settingsPath)
 }

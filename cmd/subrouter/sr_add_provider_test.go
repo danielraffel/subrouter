@@ -41,7 +41,9 @@ func TestProviderAliasesResolve(t *testing.T) {
 	for _, alias := range []string{"codex", "Codex", "openai", "chatgpt", "claude", "CLAUDE", "anthropic"} {
 		var out, errOut bytes.Buffer
 		runner := srRunner{program: "sr", in: strings.NewReader(""), out: &out, errOut: &errOut}
-		err := runner.addProvider(context.Background(), []string{alias})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := runner.addProvider(ctx, []string{alias})
 		// These reach the real login paths, which fail in a test environment.
 		// What matters is that they are not rejected as unknown providers.
 		if err != nil && strings.Contains(err.Error(), "unknown provider") {

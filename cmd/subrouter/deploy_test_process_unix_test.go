@@ -73,3 +73,23 @@ wait "$child"
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func configureTestProcessGroup(command *exec.Cmd) {
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+}
+
+func deployTestProcessGroupSupported() bool { return true }
+
+func terminateTestProcessGroup(command *exec.Cmd) {
+	if command.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-command.Process.Pid, syscall.SIGTERM)
+	time.Sleep(time.Second)
+	_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+}
+
+func processExistsForDeployTest(pid int) bool {
+	err := syscall.Kill(pid, syscall.Signal(0))
+	return err == nil || !errors.Is(err, syscall.ESRCH)
+}

@@ -142,6 +142,348 @@ func TestClaude429FailoverEndToEndAndCaptured(t *testing.T) {
 	}
 }
 
+func TestClaudeForcedAccount429DoesNotFailOver(t *testing.T) {
+	var cookedHits, alternateHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Fatalf("%s leaked upstream: %q", header, got)
+			}
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		switch r.Header.Get("Authorization") {
+		case "Bearer tok-cooked":
+			cookedHits++
+			w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(realisticAnthropic429Body))
+		case "Bearer tok-alternate":
+			alternateHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"must_not_be_served"}`))
+		default:
+			http.Error(w, "unexpected credential", http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+			{ID: "alternate@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-alternate"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "alternate@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		}),
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-forced")
+	req.Header.Set("X-Subrouter-Account-ID", "cooked@example.com")
+	req.Header.Set("X-Subrouter-Account", "cooked@example.com")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want forced account's 429; body=%s", response.Code, response.Body.String())
+	}
+	if cookedHits != 1 || alternateHits != 0 {
+		t.Fatalf("upstream hits = forced:%d alternate:%d, want 1 and 0", cookedHits, alternateHits)
+	}
+	assignment, ok := store.Get("claude", "session-forced")
+	if !ok || assignment.AccountID != "cooked@example.com" {
+		t.Fatalf("forced assignment = %+v, %t; want cooked@example.com", assignment, ok)
+	}
+}
+
+func TestReplayablePostRetryBudgetIsAggregateWithoutFallback(t *testing.T) {
+	const accountCount = replayablePostMaxAttempts * 2
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		if upstreamHits%replayablePostMaxAttempts == 0 {
+			http.Error(w, "request timeout", http.StatusRequestTimeout)
+			return
+		}
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed_warning")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, realisticAnthropic429Body)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := make([]accounts.Account, 0, accountCount)
+	scores := make([]selectacct.Score, 0, accountCount)
+	for index := range accountCount {
+		id := fmt.Sprintf("account-%d@example.com", index)
+		pool = append(pool, accounts.Account{
+			ID: id, Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token-" + id,
+		})
+		scores = append(scores, selectacct.Score{
+			AccountID: id, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+		})
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts:       pool,
+		Sessions:       store,
+		SchedulerRef:   selectacct.NewSchedulerRef(selectacct.NewScheduler(scores)),
+		MaxBodyBytes:   1 << 20,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "aggregate-retry-budget")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, req)
+
+	if response.Code != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want final upstream 408; body=%s", response.Code, response.Body.String())
+	}
+	if upstreamHits != replayablePostMaxAttempts {
+		t.Fatalf("upstream hits = %d, want aggregate cap %d across account failover and POST replay", upstreamHits, replayablePostMaxAttempts)
+	}
+}
+
+func TestForcedAccountTimeoutRetrySemantics(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		noRetry      bool
+		wantAttempts int
+	}{
+		{name: "ordinary forced traffic keeps bounded replay", wantAttempts: replayablePostMaxAttempts},
+		{name: "explicit no-retry canary is exactly once", noRetry: true, wantAttempts: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			upstreamHits := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamHits++
+				if got := r.Header.Get(subrouterNoRetryHeader); got != "" {
+					t.Fatalf("%s leaked upstream: %q", subrouterNoRetryHeader, got)
+				}
+				http.Error(w, "request timeout", http.StatusRequestTimeout)
+			}))
+			defer upstream.Close()
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			forced := accounts.Account{
+				ID: "forced@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "forced-token",
+			}
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := Server{
+				ClaudeUpstream: upstreamURL,
+				Accounts:       []accounts.Account{forced},
+				Sessions:       store,
+				Scheduler: selectacct.NewScheduler([]selectacct.Score{{
+					AccountID: forced.ID, Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+				}}),
+				MaxBodyBytes: 1 << 20,
+			}.Handler()
+			req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Subrouter-Agent", "claude")
+			req.Header.Set("X-Subrouter-Session", "forced-retry-semantics")
+			req.Header.Set("X-Subrouter-Account-ID", forced.ID)
+			if testCase.noRetry {
+				req.Header.Set(subrouterNoRetryHeader, "1")
+			}
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, req)
+
+			if response.Code != http.StatusRequestTimeout {
+				t.Fatalf("status = %d, want forced account's 408; body=%s", response.Code, response.Body.String())
+			}
+			if upstreamHits != testCase.wantAttempts {
+				t.Fatalf("forced account upstream hits = %d, want %d", upstreamHits, testCase.wantAttempts)
+			}
+		})
+	}
+}
+
+func TestClaudeInvalidForcedAccountSelectorIsRejectedBeforeFallback(t *testing.T) {
+	var upstreamHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream:    upstreamURL,
+		ClaudeFableAPIKey: "must-not-fallback",
+		Sessions:          store,
+		Scheduler:         selectacct.NewScheduler(nil),
+		MaxBodyBytes:      1 << 20,
+	}.Handler()
+
+	tests := []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{name: "primary oversize", header: "X-Subrouter-Account-ID", value: strings.Repeat("a", 257)},
+		{name: "alias oversize", header: "X-Subrouter-Account", value: strings.Repeat("a", 257)},
+		{name: "primary whitespace", header: "X-Subrouter-Account-ID", value: " \t "},
+		{name: "alias control", header: "X-Subrouter-Account", value: "bad\x7fselector"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-fable-5","messages":[]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Subrouter-Agent", "claude")
+			req.Header.Set(test.header, test.value)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if upstreamHits != 0 {
+		t.Fatalf("fallback upstream hits = %d, want 0", upstreamHits)
+	}
+}
+
+func TestClaudePreferredAccountStartsThereAndKeepsFailover(t *testing.T) {
+	var preferredHits, alternateHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "" {
+			t.Fatalf("preferred account header leaked upstream: %q", got)
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		switch r.Header.Get("Authorization") {
+		case "Bearer tok-preferred":
+			preferredHits++
+			w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(realisticAnthropic429Body))
+		case "Bearer tok-alternate":
+			alternateHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"served_after_failover"}`))
+		default:
+			http.Error(w, "unexpected credential", http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{
+			{ID: "preferred@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-preferred"},
+			{ID: "alternate@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-alternate"},
+		},
+		Sessions: store,
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "preferred@example.com", Provider: accounts.ProviderClaude, Headroom: 0.2, ShortHeadroom: 0.2},
+			{AccountID: "alternate@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		}),
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-preferred")
+	req.Header.Set("X-Subrouter-Preferred-Account-ID", "preferred@example.com")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after pooled failover; body=%s", response.Code, response.Body.String())
+	}
+	if preferredHits != 1 || alternateHits != 1 {
+		t.Fatalf("upstream hits = preferred:%d alternate:%d, want 1 and 1", preferredHits, alternateHits)
+	}
+}
+
+func TestClaudeMissingPreferredAccountFallsBackToPool(t *testing.T) {
+	var hits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "" {
+			t.Fatalf("preferred account header leaked upstream: %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok-available" {
+			t.Fatalf("authorization = %q, want available account", got)
+		}
+		hits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"served_by_pool"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		ClaudeUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID: "available@example.com", Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth, Token: "tok-available",
+		}},
+		Scheduler: selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: "available@example.com", Provider: accounts.ProviderClaude,
+			Headroom: 1, ShortHeadroom: 1,
+		}}),
+		Sessions:     store,
+		MaxBodyBytes: 1 << 20,
+	}.Handler()
+	req := httptest.NewRequest(http.MethodPost, "http://subrouter.local/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-stale-preference")
+	req.Header.Set("X-Subrouter-Preferred-Account-ID", "removed@example.com")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusOK || hits != 1 {
+		t.Fatalf("pooled fallback = status %d hits %d body %s", response.Code, hits, response.Body.String())
+	}
+}
+
 func TestHTTPProxyDoesNotForwardClientIPHeaders(t *testing.T) {
 	var upstreamHeaders http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +546,7 @@ func TestHTTPProxyDoesNotForwardClientIPHeaders(t *testing.T) {
 	}
 }
 
-func TestClaude429FailoverTriesPastDefaultAttemptBudget(t *testing.T) {
+func TestClaude429FailoverRespectsSharedAttemptBudget(t *testing.T) {
 	var hits []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -277,14 +619,14 @@ func TestClaude429FailoverTriesPastDefaultAttemptBudget(t *testing.T) {
 	}
 	defer response.Body.Close()
 	body, _ := io.ReadAll(response.Body)
-	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "msg_fresh") {
-		t.Fatalf("status=%d body=%s hits=%v, want failover to reach the eighth account", response.StatusCode, string(body), hits)
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d body=%s hits=%v, want final rate limit after the shared attempt budget", response.StatusCode, string(body), hits)
 	}
-	if len(hits) != 8 {
-		t.Fatalf("hits=%v, want all 8 accounts tried before success", hits)
+	if len(hits) != replayablePostMaxAttempts {
+		t.Fatalf("hits=%v, want aggregate cap %d", hits, replayablePostMaxAttempts)
 	}
-	if hits[len(hits)-1] != "fresh-7@example.com" {
-		t.Fatalf("last hit=%q, want fresh-7@example.com; hits=%v", hits[len(hits)-1], hits)
+	if hits[len(hits)-1] != "cooked-5@example.com" {
+		t.Fatalf("last hit=%q, want sixth account; hits=%v", hits[len(hits)-1], hits)
 	}
 }
 
@@ -735,7 +1077,7 @@ func TestClaudeFailoverExhaustionIsLogged(t *testing.T) {
 	}
 }
 
-func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
+func TestClaudeFailoverTriesMarkedExhaustedAlternateWhenScoreMayBeStale(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	if _, err := store.Put("claude", "session-exhausted-alt", "cooked@example.com", ""); err != nil {
 		t.Fatal(err)
@@ -745,9 +1087,6 @@ func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	var calls int
 	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
 		calls++
-		if strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
-			t.Fatal("fresh account is marked exhausted and must not be retried")
-		}
 		h := http.Header{}
 		h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		h.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
@@ -771,8 +1110,8 @@ func TestClaudeFailoverSkipsMarkedExhaustedAlternates(t *testing.T) {
 	if response.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status=%d, want original 429", response.StatusCode)
 	}
-	if calls != 1 {
-		t.Fatalf("upstream calls=%d, want 1 because marked-exhausted alternates are skipped", calls)
+	if calls != 2 {
+		t.Fatalf("upstream calls=%d, want the stale-scored alternate tried once", calls)
 	}
 }
 
@@ -1091,6 +1430,10 @@ func TestIsTerminalCredentialError(t *testing.T) {
 	}{
 		{fmt.Errorf(`Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant"}`), true},
 		{fmt.Errorf("profile has no refresh token"), true},
+		{fmt.Errorf("Kimi credential for kimi-subscription:work was not found"), true},
+		{fmt.Errorf("Grok subscription credential was not found"), true},
+		{fmt.Errorf("Antigravity keychain credential is missing"), true},
+		{&accounts.CodexUnisolatedCredentialError{}, true},
 		{fmt.Errorf("dial tcp: connection refused"), false},
 		{context.Canceled, false},
 		{context.DeadlineExceeded, false},
@@ -1253,8 +1596,8 @@ func TestClaudeOverloadRetryGivesUpAfterBudget(t *testing.T) {
 	if response.StatusCode != 529 {
 		t.Fatalf("status = %d, want 529 passed through after budget", response.StatusCode)
 	}
-	if calls != 1+claudeOverloadMaxRetries {
-		t.Fatalf("upstream calls = %d, want %d", calls, 1+claudeOverloadMaxRetries)
+	if calls != 1+providerOverloadMaxRetries {
+		t.Fatalf("upstream calls = %d, want %d", calls, 1+providerOverloadMaxRetries)
 	}
 }
 
@@ -1308,20 +1651,35 @@ func TestClaudeOverloadRetryPreservesFailoverAccount(t *testing.T) {
 }
 
 func TestClaudeOverloadBackoff(t *testing.T) {
+	now := time.Date(2026, time.August, 28, 12, 0, 0, 0, time.UTC)
 	h := http.Header{}
-	if d := claudeOverloadBackoff(h, 0); d != time.Second {
+	if d := providerOverloadBackoffAt(h, 0, now); d != time.Second {
 		t.Fatalf("retry0 = %v, want 1s", d)
 	}
-	if d := claudeOverloadBackoff(h, 1); d != 2*time.Second {
+	if d := providerOverloadBackoffAt(h, 1, now); d != 2*time.Second {
 		t.Fatalf("retry1 = %v, want 2s", d)
 	}
 	h.Set("Retry-After", "3")
-	if d := claudeOverloadBackoff(h, 0); d != 3*time.Second {
+	if d := providerOverloadBackoffAt(h, 0, now); d != 3*time.Second {
 		t.Fatalf("retry-after 3 = %v, want 3s", d)
 	}
 	h.Set("Retry-After", "9999")
-	if d := claudeOverloadBackoff(h, 0); d != claudeOverloadMaxWait {
-		t.Fatalf("retry-after 9999 = %v, want cap %v", d, claudeOverloadMaxWait)
+	if d := providerOverloadBackoffAt(h, 0, now); d != providerOverloadMaxWait {
+		t.Fatalf("retry-after 9999 = %v, want cap %v", d, providerOverloadMaxWait)
+	}
+	h.Set("Retry-After", now.Add(4*time.Second).Format(http.TimeFormat))
+	if d := providerOverloadBackoffAt(h, 0, now); d != 4*time.Second {
+		t.Fatalf("retry-after HTTP-date = %v, want 4s", d)
+	}
+	h.Set("Retry-After", now.Add(time.Hour).Format(http.TimeFormat))
+	if d := providerOverloadBackoffAt(h, 0, now); d != providerOverloadMaxWait {
+		t.Fatalf("retry-after future HTTP-date = %v, want cap %v", d, providerOverloadMaxWait)
+	}
+	for _, retryAfter := range []string{now.Add(-time.Second).Format(http.TimeFormat), "not-a-date"} {
+		h.Set("Retry-After", retryAfter)
+		if d := providerOverloadBackoffAt(h, 1, now); d != 2*time.Second {
+			t.Fatalf("retry-after %q = %v, want fallback 2s", retryAfter, d)
+		}
 	}
 	if !claudeOverloadStatus(529) || !claudeOverloadStatus(500) || claudeOverloadStatus(429) || claudeOverloadStatus(200) {
 		t.Fatal("claudeOverloadStatus classification wrong")
@@ -1342,6 +1700,7 @@ func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
 			cookedCalls++
 			h := http.Header{}
 			h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+			h.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
 			return &http.Response{StatusCode: http.StatusInternalServerError, Header: h, Body: io.NopCloser(strings.NewReader(`{"type":"error"}`))}
 		}
 		freshCalls++
@@ -1351,7 +1710,7 @@ func TestClaudeRejected5xxFailsOverNotOverloadRetried(t *testing.T) {
 	transport := usageLimitRetryTransport{
 		base: stub, server: &server, provider: accounts.ProviderClaude,
 		agent: "claude", session: "session-r5", account: "cooked@example.com",
-		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		method: http.MethodPost, path: "/v1/messages", poolModel: "claude-opus-4", maxAttempts: 6,
 		sleep: recordSleep(&waits),
 	}
 	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
@@ -1402,6 +1761,21 @@ func TestClaudeExhaustionExpiry(t *testing.T) {
 	h.Set("Retry-After", "300")
 	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(5 * time.Minute)) {
 		t.Fatalf("retry-after = %v, want now+5m", got)
+	}
+	// HTTP-date is the second Retry-After form permitted by RFC 9110.
+	h.Set("Retry-After", now.Add(10*time.Minute).Format(http.TimeFormat))
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(10 * time.Minute)) {
+		t.Fatalf("retry-after HTTP-date = %v, want now+10m", got)
+	}
+	h.Set("Retry-After", now.Add(30*24*time.Hour).Format(http.TimeFormat))
+	if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(8 * 24 * time.Hour)) {
+		t.Fatalf("retry-after future HTTP-date = %v, want cap now+8d", got)
+	}
+	for _, retryAfter := range []string{now.Add(-time.Second).Format(http.TimeFormat), "not-a-date"} {
+		h.Set("Retry-After", retryAfter)
+		if got := claudeExhaustionExpiry(h, now); !got.Equal(now.Add(selectacct.DefaultExhaustedTTL)) {
+			t.Fatalf("retry-after %q = %v, want default", retryAfter, got)
+		}
 	}
 }
 
@@ -1462,6 +1836,10 @@ func TestClaudeFailoverTriesRecoveredAccount(t *testing.T) {
 // shorten a header-derived expiry.
 func TestMarkTTLSelection(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
+	server.AccountRef = &AccountRef{accounts: []accounts.Account{
+		accounts.Account{ID: "dead@example.com", Provider: accounts.ProviderClaude, Token: "dead-token"},
+		accounts.Account{ID: "invalid@example.com", Provider: accounts.ProviderClaude, Token: "invalid-token"},
+	}}
 	resetEpoch := time.Now().Add(48 * time.Hour).Unix()
 	h := http.Header{}
 	h.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
@@ -1489,12 +1867,18 @@ func TestMarkTTLSelection(t *testing.T) {
 	}
 
 	// Terminal refresh failure: credential TTL; transient: short default.
-	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "invalid@example.com", "", fmt.Errorf("400 Bad Request: invalid_grant"))
+	server.markAccountExhaustedRefreshFailure(
+		accounts.Account{ID: "invalid@example.com", Provider: accounts.ProviderClaude, Token: "invalid-token"},
+		fmt.Errorf("400 Bad Request: invalid_grant"),
+	)
 	invUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "invalid@example.com", "")
 	if time.Until(invUntil) < 50*time.Minute {
 		t.Fatalf("terminal refresh mark in %v, want ~1h", time.Until(invUntil))
 	}
-	server.markAccountExhaustedRefreshFailure(accounts.ProviderClaude, "blip@example.com", "", fmt.Errorf("dial tcp: connection refused"))
+	server.markAccountExhaustedRefreshFailure(
+		accounts.Account{ID: "blip@example.com", Provider: accounts.ProviderClaude},
+		fmt.Errorf("dial tcp: connection refused"),
+	)
 	blipUntil, _ := server.SchedulerRef.ExhaustedUntilFor(accounts.ProviderClaude, "blip@example.com", "")
 	if time.Until(blipUntil) > 15*time.Minute {
 		t.Fatalf("transient refresh mark in %v, want ~10m default", time.Until(blipUntil))

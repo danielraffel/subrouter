@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -22,7 +24,7 @@ const (
 
 var (
 	profileRegistryProcessMu sync.Mutex
-	profileRegistryKernel32  = syscall.NewLazyDLL("kernel32.dll")
+	profileRegistryKernel32  = windows.NewLazySystemDLL("kernel32.dll")
 	profileRegistryLockFile  = profileRegistryKernel32.NewProc("LockFileEx")
 	profileRegistryUnlock    = profileRegistryKernel32.NewProc("UnlockFileEx")
 )
@@ -39,7 +41,19 @@ type profileCredentialLock struct {
 }
 
 func lockProfileRegistry(path string) (*profileRegistryLock, error) {
-	profileRegistryProcessMu.Lock()
+	return lockProfileRegistryContext(context.Background(), path)
+}
+
+func lockProfileRegistryContext(ctx context.Context, path string) (*profileRegistryLock, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !profileRegistryProcessMu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		profileRegistryProcessMu.Unlock()
 		return nil, err
@@ -50,20 +64,31 @@ func lockProfileRegistry(path string) (*profileRegistryLock, error) {
 		return nil, err
 	}
 	lock := &profileRegistryLock{file: file}
-	result, _, callErr := profileRegistryLockFile.Call(
-		file.Fd(),
-		profileRegistryExclusiveLock,
-		0,
-		uintptr(^uint32(0)),
-		uintptr(^uint32(0)),
-		uintptr(unsafe.Pointer(&lock.overlapped)),
-	)
-	if result == 0 {
-		_ = file.Close()
-		profileRegistryProcessMu.Unlock()
-		return nil, fmt.Errorf("lock Claude profile registry: %w", callErr)
+	for {
+		result, _, callErr := profileRegistryLockFile.Call(
+			file.Fd(),
+			profileRegistryExclusiveLock|profileRegistryFailImmediately,
+			0,
+			uintptr(^uint32(0)),
+			uintptr(^uint32(0)),
+			uintptr(unsafe.Pointer(&lock.overlapped)),
+		)
+		if result != 0 {
+			return lock, nil
+		}
+		if !errors.Is(callErr, profileLockViolation) {
+			_ = file.Close()
+			profileRegistryProcessMu.Unlock()
+			return nil, fmt.Errorf("lock Claude profile registry: %w", callErr)
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			profileRegistryProcessMu.Unlock()
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
 	}
-	return lock, nil
 }
 
 func (l *profileRegistryLock) Close() error {

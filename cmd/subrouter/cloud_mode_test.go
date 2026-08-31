@@ -34,19 +34,25 @@ func saveReadyCloudConfig(t *testing.T) {
 }
 
 func TestUsageRowsFromHostedStatusesPreservesQuotaWindows(t *testing.T) {
+	models := 12
 	rows := usageRowsFromHostedStatuses([]broker.UsageStatus{{
-		ID:        "account-1",
-		Provider:  accounts.ProviderCodex,
-		AuthMode:  accounts.AuthModeOAuth,
-		Email:     "user@example.com",
-		AuthValid: true,
+		ID:                "account-1",
+		Provider:          accounts.ProviderCodex,
+		AuthMode:          accounts.AuthModeOAuth,
+		Email:             "user@example.com",
+		AuthValid:         true,
+		ProviderHealth:    "unreachable",
+		ProviderModels:    &models,
+		ProviderEndpoints: []string{"/qwen-token", "/qwen-anthropic"},
 		Windows: []accounts.UsageWindow{{
 			Name:        "weekly",
 			UsedPercent: 25,
 		}},
 	}})
 	if len(rows) != 1 || rows[0].email != "user@example.com" ||
-		len(rows[0].windows) != 1 || rows[0].windows[0].UsedPercent != 25 {
+		len(rows[0].windows) != 1 || rows[0].windows[0].UsedPercent != 25 ||
+		rows[0].providerHealth != "unreachable" || rows[0].providerModels != 12 ||
+		len(rows[0].providerEndpoints) != 2 {
 		t.Fatalf("usage rows = %#v", rows)
 	}
 }
@@ -473,31 +479,38 @@ func TestDirectOpenAIAPIKeyRepairRejectsAnthropicPrefix(t *testing.T) {
 	}
 }
 
-func TestCloudClaudeEnvironmentRoutesLocallyWithoutProviderSecrets(t *testing.T) {
-	env := cloudClaudeEnvironment([]string{
+func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
+	env := claudeSettingsChildEnvironment([]string{
 		"PATH=/usr/bin",
 		"ANTHROPIC_BASE_URL=https://remote.example",
 		"ANTHROPIC_AUTH_TOKEN=old-token",
 		"ANTHROPIC_API_KEY=sk-ant-secret",
+		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK=1",
-	}, "http://127.0.0.1:31415/v1", "stack-local-token")
+		"CLAUDE_CONFIG_DIR=/personal/profile",
+	}, "http://127.0.0.1:31415/v1", "/isolated/profile")
 	joined := strings.Join(env, "\n")
 	for _, banned := range []string{
 		"https://remote.example",
 		"old-token",
 		"sk-ant-secret",
+		"X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK",
+		"ANTHROPIC_BASE_URL=",
+		"ANTHROPIC_AUTH_TOKEN=",
+		"ANTHROPIC_CUSTOM_HEADERS=",
+		"/personal/profile",
 	} {
 		if strings.Contains(joined, banned) {
-			t.Fatalf("cloud Claude env retained %q:\n%s", banned, joined)
+			t.Fatalf("settings-routed Claude env retained %q:\n%s", banned, joined)
 		}
 	}
 	for _, want := range []string{
-		"ANTHROPIC_BASE_URL=http://127.0.0.1:31415",
-		"ANTHROPIC_AUTH_TOKEN=stack-local-token",
+		"PATH=/usr/bin",
+		"CLAUDE_CONFIG_DIR=/isolated/profile",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("cloud Claude env missing %q:\n%s", want, joined)
+			t.Fatalf("settings-routed Claude env missing %q:\n%s", want, joined)
 		}
 	}
 }
@@ -634,6 +647,38 @@ func TestLocalAccountUploadsPreserveSupportedAPIKeyProviders(t *testing.T) {
 	}
 	if providers["claude:anthropic"] != "anthropic-apikey" {
 		t.Fatalf("Anthropic provider = %q", providers["claude:anthropic"])
+	}
+}
+
+func TestLocalAccountUploadsExcludeInteractiveCodexOAuthChains(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	interactive := accounts.StoredCodexAccount{
+		Email:                 "interactive@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginInteractiveImport,
+		Auth:                  testCodexAuth("interactive@example.com", "interactive"),
+	}
+	isolated := accounts.StoredCodexAccount{
+		Email:                 "isolated@example.com",
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		Auth:                  testCodexAuth("isolated@example.com", "isolated"),
+	}
+	for _, account := range []accounts.StoredCodexAccount{interactive, isolated} {
+		if err := store.SaveStored(account); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	uploads, err := localAccountUploads(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uploads) != 1 || uploads[0].label != "isolated@example.com" {
+		t.Fatalf("uploads = %#v, want only isolated OAuth", uploads)
+	}
+	if uploads[0].body["oauthCredentialOrigin"] != string(accounts.CodexOAuthOriginIsolatedServerLogin) {
+		t.Fatalf("OAuth origin = %#v", uploads[0].body["oauthCredentialOrigin"])
 	}
 }
 

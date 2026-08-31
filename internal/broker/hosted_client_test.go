@@ -113,11 +113,14 @@ func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{{
-			"id":         "user@example.com",
-			"provider":   "codex",
-			"auth_mode":  "oauth",
-			"email":      "user@example.com",
-			"auth_valid": true,
+			"id":                "user@example.com",
+			"provider":          "codex",
+			"auth_mode":         "oauth",
+			"email":             "user@example.com",
+			"auth_valid":        true,
+			"key_fingerprint":   "key:1234567890",
+			"assigned_sessions": 3,
+			"sessions_known":    true,
 			"windows": []map[string]any{{
 				"Name": "weekly", "UsedPercent": 25.0,
 			}},
@@ -137,7 +140,9 @@ func TestHostedClientUsesTenantScopedUsageStatus(t *testing.T) {
 	}
 	if len(statuses) != 1 || statuses[0].Email != "user@example.com" ||
 		len(statuses[0].Windows) != 1 ||
-		statuses[0].Windows[0].UsedPercent != 25 {
+		statuses[0].Windows[0].UsedPercent != 25 ||
+		statuses[0].KeyFingerprint != "key:1234567890" ||
+		statuses[0].AssignedSessions != 3 || !statuses[0].SessionsKnown {
 		t.Fatalf("usage statuses = %#v", statuses)
 	}
 }

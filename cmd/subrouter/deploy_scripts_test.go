@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -17,6 +18,74 @@ import (
 	"testing"
 	"time"
 )
+
+func TestLaunchAgentFunctionalCanaryRunner(t *testing.T) {
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	command := exec.Command(
+		mustLookPath(t, "python3"),
+		filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py"),
+	)
+	configureTestProcessGroup(command)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("functional canary runner tests failed: %v\n%s", err, output.Bytes())
+		}
+	case <-time.After(240 * time.Second):
+		terminateTestProcessGroup(command)
+		<-done
+		t.Fatalf("functional canary runner tests timed out\n%s", output.Bytes())
+	}
+}
+
+func TestLaunchAgentFunctionalCanaryWrapperTimeoutKillsNestedRunner(t *testing.T) {
+	if !deployTestProcessGroupSupported() {
+		t.Skip("nested functional-canary cleanup requires Unix process groups")
+	}
+	requireDeployScriptTools(t, "python3")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	pidPath := filepath.Join(t.TempDir(), "nested.pid")
+	command := exec.Command(
+		mustLookPath(t, "python3"),
+		filepath.Join(repoRoot, "deploy", "macos", "tests", "run-functional-canary-test.py"),
+	)
+	command.Env = append(os.Environ(), "SUBROUTER_CANARY_WRAPPER_TIMEOUT_PID_FILE="+pidPath)
+	configureTestProcessGroup(command)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var nestedPID int
+	for time.Now().Before(deadline) {
+		body, err := os.ReadFile(pidPath)
+		if err == nil {
+			nestedPID, err = strconv.Atoi(strings.TrimSpace(string(body)))
+			if err == nil && nestedPID > 0 {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if nestedPID <= 0 {
+		terminateTestProcessGroup(command)
+		_, _ = command.Process.Wait()
+		t.Fatal("timeout fixture did not publish its nested runner PID")
+	}
+	terminateTestProcessGroup(command)
+	_, _ = command.Process.Wait()
+	if processExistsForDeployTest(nestedPID) {
+		t.Fatalf("nested runner PID %d survived wrapper timeout cleanup", nestedPID)
+	}
+}
 
 func TestGCPClassicSCPWrapperForcesLegacyProtocol(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))

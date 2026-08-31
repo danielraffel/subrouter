@@ -3,35 +3,49 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/tenant"
 )
 
-const srClaudeHelp = `sr claude - Manage multiple Claude Code profiles
+const srClaudeHelp = `sr claude - Manage local profiles and launch server-pooled Claude
 
 Usage:
-  sr claude                     Show profiles and switch interactively
-  sr claude add [name]          Add account (opens OAuth login, infers email)
-  sr claude list                List all profiles with auth status
-  sr claude switch [name]       Switch active profile
+  sr claude                     Interactively launch pooled Claude (chosen account is a preference)
+  sr claude add [name]          Add local profile (opens OAuth login, infers email)
+  sr claude list                List local managed profiles with auth status
+  sr claude switch [name]       Switch active local profile
   sr claude remove <name>       Remove a profile
-  sr claude env                 Print export CLAUDE_CONFIG_DIR=...
+  sr claude env                 Print CLAUDE_CONFIG_DIR for local/HTTPS profiles
   sr claude push [name]         Upload a profile to the default Subrouter server pool
   sr claude pick                Switch to the profile with the most quota left
-  sr claude run [name] [...]    Launch Claude with a specific profile
+  sr claude proxy [options] [args...]
+                                Launch Claude profilelessly through the selected server pool
+    --account [ACCOUNT]         Pin to one profile with no account failover; omit ACCOUNT for a picker
+    --sr-expect-scope SCOPE --  Atomically bind launch to an opaque proxy scope (must be last option)
+                                Wrapper options must precede Claude args; args at/after -- are literal
+  sr claude proxy-scope         Print the opaque selected proxy session scope
+  sr claude run [name] [...]    Launch one authenticated local managed profile safely
   sr claude --flag [...]        Launch Claude with the active profile
   sr claude <name> [...]        Shorthand for 'sr claude run <name>'
   sr claude help                Show this help
@@ -43,6 +57,9 @@ type claudeRunner struct {
 	out    io.Writer
 	errOut io.Writer
 	client *http.Client
+	// authStatus is a test seam for the read-only local-login preflight.
+	// Production uses claude.AuthStatusForPath.
+	authStatus func(context.Context, string, string) (*claude.AuthStatus, error)
 	// pushToServer uploads a profile to the default Subrouter server, when
 	// one is configured. nil when the claude runner is built without server
 	// support (tests). pushAfterAdd is the same upload but no-ops silently
@@ -54,45 +71,47 @@ type claudeRunner struct {
 	// temporary store, the credential is uploaded, and no local profile or
 	// trajectory directory survives the command.
 	ephemeral bool
+	// afterAuthVerified is a test seam for cancellation and publication-failure
+	// races after Claude has durably written a credential.
+	afterAuthVerified func()
+	// mutateProfileInventoryForTest injects failures at the publication wrapper
+	// boundary, including errors returned after mutate has committed.
+	mutateProfileInventoryForTest func(context.Context, func() (bool, error)) error
 }
 
+const claudeProfileReconcileTimeout = 10 * time.Second
+
 func (r srRunner) claude(ctx context.Context, args []string) error {
-	// Launching Claude needs a live daemon; account management does not. Start
-	// the daemon only for the launching forms so `sr claude list` stays quiet.
+	if len(args) > 0 && args[0] == "proxy-scope" {
+		return r.printClaudeProxyScope()
+	}
 	if claudeLaunchesAgent(args) {
-		config, err := cloudModeConfig()
-		if err != nil {
-			return fmt.Errorf("load cmux.com login: %w", err)
-		}
-		source := config.EffectiveCredentialSource()
-		if source == broker.CredentialSourceTeam && !config.Ready() {
-			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
-		}
-		if source == broker.CredentialSourceHosted {
-			server, ok, err := r.selectedRemoteServer()
+		if len(args) == 0 {
+			selector, scope, _, err := r.pickClaudeProxyAccount(ctx, false)
 			if err != nil {
 				return err
 			}
-			if !ok || server.Name != "cmux" || server.TenantKey == "" {
-				return fmt.Errorf("hosted cmux remote is unavailable; run '%s login'", programBase())
-			}
-			return r.proxyClaudeTo(ctx, args, serverProxyRootURL(server), server.TenantKey)
+			return r.proxyClaudeSelectedRemote(ctx, nil, claudeProxyLaunchOptions{
+				expectedScope:      scope,
+				preferredAccountID: selector,
+			})
 		}
-		if source == broker.CredentialSourceTeam ||
-			source == broker.CredentialSourceLocal {
-			if !ensureLocalHealthy(
-				ctx,
-				fallbackHTTPClient(),
-				localBaseURL(),
-				defaultDaemonStarter(),
-				r.errOut,
-			) {
-				return fmt.Errorf("local proxy is unavailable; run '%s doctor'", programBase())
-			}
-			localProxyToken := cloudClientProxyToken(config, localBaseURL())
-			return r.proxyClaude(ctx, args, localProxyToken)
+		options, launchArgs, err := parseClaudeProxyLaunchArgs(args[1:])
+		if err != nil {
+			return err
 		}
-		ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut)
+		if options.pickPinnedAccount {
+			selector, scope, chosen, pickErr := r.pickClaudeProxyAccount(ctx, true)
+			if pickErr != nil {
+				return pickErr
+			}
+			if !chosen {
+				return nil
+			}
+			options.accountSelector = selector
+			options.expectedScope = scope
+		}
+		return r.proxyClaudeSelectedRemote(ctx, launchArgs, options)
 	}
 	cr := claudeRunner{
 		store:        claude.DefaultStore(),
@@ -105,6 +124,334 @@ func (r srRunner) claude(ctx context.Context, args []string) error {
 		pick:         r.pickClaudeProfile,
 	}
 	return cr.run(ctx, args)
+}
+
+type claudeProxyLaunchOptions struct {
+	expectedScope      string
+	accountSelector    string
+	preferredAccountID string
+	pickPinnedAccount  bool
+}
+
+func claudeProxyScope(server srServerConfig, remote bool) string {
+	if !remote {
+		return "local"
+	}
+	endpoint := canonicalServerProxyRootURL(server)
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.Scheme = strings.ToLower(parsed.Scheme)
+		parsed.Host = strings.ToLower(parsed.Host)
+		parsed.Fragment = ""
+		endpoint = parsed.String()
+	}
+	identity := make([]string, 0, 3)
+	if key := strings.TrimSpace(server.TenantKey); key != "" {
+		identity = append(identity, "tenant:"+key)
+	}
+	if nodeID := strings.TrimSpace(server.TailscaleNodeID); nodeID != "" {
+		identity = append(identity, "tailscale-node:"+nodeID)
+	}
+	if len(identity) == 0 {
+		identity = append(identity, "server:"+strings.TrimSpace(server.Name))
+	}
+	identity = append(identity, "endpoint:"+endpoint)
+	return strings.Join(identity, "|")
+}
+
+func opaqueClaudeProxyScope(scope string) string {
+	hash := sha256.Sum256([]byte(scope))
+	return fmt.Sprintf("%x", hash[:12])
+}
+
+func validOpaqueClaudeProxyScope(scope string) bool {
+	if len(scope) != 24 {
+		return false
+	}
+	for _, char := range scope {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func parseClaudeProxyLaunchArgs(args []string) (options claudeProxyLaunchOptions, launchArgs []string, err error) {
+	for i := 0; i < len(args); {
+		switch {
+		case args[i] == "--account":
+			if options.accountSelector != "" {
+				return options, nil, fmt.Errorf("--account may be specified only once")
+			}
+			if i+1 >= len(args) {
+				options.pickPinnedAccount = true
+				return options, nil, nil
+			}
+			if args[i+1] == "--" {
+				options.pickPinnedAccount = true
+				return options, args[i+2:], nil
+			}
+			if strings.HasPrefix(args[i+1], "-") || strings.TrimSpace(args[i+1]) == "" {
+				return options, nil, fmt.Errorf("--account requires a Claude account/profile selector")
+			}
+			options.accountSelector = strings.TrimSpace(args[i+1])
+			i += 2
+		case strings.HasPrefix(args[i], "--account="):
+			if options.accountSelector != "" {
+				return options, nil, fmt.Errorf("--account may be specified only once")
+			}
+			options.accountSelector = strings.TrimSpace(strings.TrimPrefix(args[i], "--account="))
+			if options.accountSelector == "" {
+				return options, nil, fmt.Errorf("--account requires a Claude account/profile selector")
+			}
+			i++
+		case args[i] == "--sr-expect-scope":
+			if len(args)-i < 3 || args[i+2] != "--" {
+				return options, nil, fmt.Errorf("usage: sr claude proxy [--account <account>] --sr-expect-scope <scope> -- [claude args...]")
+			}
+			if !validOpaqueClaudeProxyScope(args[i+1]) {
+				return options, nil, fmt.Errorf("invalid opaque Claude proxy scope")
+			}
+			options.expectedScope = args[i+1]
+			return options, args[i+3:], nil
+		default:
+			// The first non-wrapper argument starts Claude's argv. In particular,
+			// preserve a delimiter and everything after it byte-for-byte so an
+			// apparent wrapper option there remains literal Claude input.
+			return options, args[i:], nil
+		}
+	}
+	return options, nil, nil
+}
+
+func (r srRunner) pickClaudeProxyAccount(ctx context.Context, pinned bool) (selector, expectedScope string, chosen bool, err error) {
+	server, remote, err := r.selectedRemoteServer()
+	if err != nil {
+		return "", "", false, err
+	}
+	if !remote {
+		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
+			return "", "", false, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
+		}
+		server = srServerConfig{Name: "local", URL: localBaseURL()}
+	}
+	inventory, err := r.fetchServerAccounts(ctx, server)
+	if err != nil {
+		return "", "", false, fmt.Errorf("load Claude accounts from server %s: %w", server.Name, err)
+	}
+	eligible := make([]remoteServerAccount, 0, len(inventory))
+	for _, account := range inventory {
+		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth && validClaudeProxyAccountID(strings.TrimSpace(account.ID)) {
+			eligible = append(eligible, account)
+		}
+	}
+	if len(eligible) == 0 {
+		return "", "", false, fmt.Errorf("no Claude subscription profiles are available on server %s", server.Name)
+	}
+	sort.Slice(eligible, func(i, j int) bool { return strings.ToLower(eligible[i].ID) < strings.ToLower(eligible[j].ID) })
+	if pinned {
+		fmt.Fprintln(r.out, "Choose one Claude account for this PINNED process. No account failover will occur.")
+	} else {
+		fmt.Fprintln(r.out, "Choose the initial account for this POOLED Claude process. The choice is only an initial preference; failover remains enabled.")
+		fmt.Fprintln(r.out, "  0) Automatic current recommendation")
+	}
+	for i, account := range eligible {
+		name := strings.TrimSpace(account.Label)
+		if name == "" {
+			name = strings.TrimSpace(account.ID)
+		}
+		fmt.Fprintf(r.out, "  %d) %s\n", i+1, name)
+	}
+	answer, err := promptLine(r.out, bufio.NewReader(r.in), "Launch account (# or exact profile): ")
+	if err != nil {
+		return "", "", false, err
+	}
+	answer = strings.TrimSpace(answer)
+	scope := opaqueClaudeProxyScope(claudeProxyScope(server, remote))
+	if !pinned && (answer == "" || answer == "0") {
+		return "", scope, true, nil
+	}
+	if pinned && answer == "" {
+		return "", scope, false, nil
+	}
+	if index, parseErr := strconv.Atoi(answer); parseErr == nil && index >= 1 && index <= len(eligible) {
+		return eligible[index-1].ID, scope, true, nil
+	}
+	accountID, err := resolveClaudeProxyAccountSelector(inventory, answer)
+	if err != nil {
+		return "", "", false, fmt.Errorf("server %s: %w", server.Name, err)
+	}
+	return accountID, scope, true, nil
+}
+
+func (r srRunner) printClaudeProxyScope() error {
+	server, remote, err := r.selectedRemoteServer()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "scope=%s\n", opaqueClaudeProxyScope(claudeProxyScope(server, remote)))
+	return nil
+}
+
+// proxyClaudeSelectedRemote launches Claude without consulting or mutating any
+// local Claude profile. Pooled launches leave account selection to the server;
+// pinned launches resolve one current server-side Claude profile and carry its
+// routing ID only in the authoritative private settings for that child.
+func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, options claudeProxyLaunchOptions) error {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil {
+		return err
+	}
+	scope := claudeProxyScope(server, ok)
+	actualScope := opaqueClaudeProxyScope(scope)
+	if options.expectedScope != "" && options.expectedScope != actualScope {
+		return fmt.Errorf("Claude proxy scope changed (expected %s, current %s); no request was sent", options.expectedScope, actualScope)
+	}
+	if !ok {
+		config, configErr := cloudModeConfig()
+		if configErr != nil {
+			return fmt.Errorf("load cmux.com login: %w", configErr)
+		}
+		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
+		}
+		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
+			return fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
+		}
+		accountID, resolveErr := r.resolveClaudeProxyAccount(ctx, srServerConfig{Name: "local", URL: localBaseURL()}, options.accountSelector)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		preferredAccountID := strings.TrimSpace(options.preferredAccountID)
+		if preferredAccountID != "" && !validClaudeProxyAccountID(preferredAccountID) {
+			return fmt.Errorf("selected Claude preference has an invalid server routing ID")
+		}
+		proxyToken := cloudClientProxyToken(config, localBaseURL())
+		if proxyToken == "" {
+			proxyToken = "subrouter"
+		}
+		return r.proxyClaudeArgsTo(ctx, args, localBaseURL(), proxyToken, "local", accountID, preferredAccountID)
+	}
+	accountID, err := r.resolveClaudeProxyAccount(ctx, server, options.accountSelector)
+	if err != nil {
+		return err
+	}
+	preferredAccountID := strings.TrimSpace(options.preferredAccountID)
+	if preferredAccountID != "" && !validClaudeProxyAccountID(preferredAccountID) {
+		return fmt.Errorf("selected Claude preference has an invalid server routing ID")
+	}
+	proxyToken := strings.TrimSpace(server.TenantKey)
+	if proxyToken == "" {
+		proxyToken = "subrouter"
+	}
+	return r.proxyClaudeArgsToServer(ctx, args, server, proxyToken, scope, accountID, preferredAccountID)
+}
+
+func (r srRunner) resolveClaudeProxyAccount(ctx context.Context, server srServerConfig, selector string) (string, error) {
+	if strings.TrimSpace(selector) == "" {
+		return "", nil
+	}
+	inventory, err := r.fetchServerAccounts(ctx, server)
+	if err != nil {
+		return "", fmt.Errorf("validate pinned Claude account on server %s: %w", server.Name, err)
+	}
+	accountID, err := resolveClaudeProxyAccountSelector(inventory, selector)
+	if err != nil {
+		return "", fmt.Errorf("server %s: %w", server.Name, err)
+	}
+	return accountID, nil
+}
+
+func resolveClaudeProxyAccountSelector(inventory []remoteServerAccount, selector string) (string, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return "", fmt.Errorf("Claude account/profile selector cannot be empty")
+	}
+	type match struct {
+		account remoteServerAccount
+		exact   bool
+	}
+	findMatches := func(candidates []remoteServerAccount) []match {
+		matches := make([]match, 0)
+		for _, account := range candidates {
+			id := strings.TrimSpace(account.ID)
+			label := strings.TrimSpace(account.Label)
+			exact := strings.EqualFold(id, selector) || (label != "" && strings.EqualFold(label, selector))
+			partial := strings.Contains(strings.ToLower(id), strings.ToLower(selector)) ||
+				(label != "" && strings.Contains(strings.ToLower(label), strings.ToLower(selector)))
+			if exact || partial {
+				matches = append(matches, match{account: account, exact: exact})
+			}
+		}
+		return matches
+	}
+	eligible := make([]remoteServerAccount, 0, len(inventory))
+	for _, account := range inventory {
+		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
+			eligible = append(eligible, account)
+		}
+	}
+	// Provider inventories routinely contain Codex and Claude profiles with
+	// the same email-derived ID. Resolve within the launch-eligible Claude
+	// OAuth set first so an unrelated provider cannot make a valid pin
+	// ambiguous. Fall back to the full inventory only to retain actionable
+	// wrong-provider and wrong-auth-mode diagnostics.
+	matches := findMatches(eligible)
+	if len(matches) == 0 {
+		matches = findMatches(inventory)
+	}
+	hasExact := false
+	for _, candidate := range matches {
+		hasExact = hasExact || candidate.exact
+	}
+	if hasExact {
+		filtered := matches[:0]
+		for _, candidate := range matches {
+			if candidate.exact {
+				filtered = append(filtered, candidate)
+			}
+		}
+		matches = filtered
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("Claude account/profile %q was not found in the current account inventory", selector)
+	}
+	unique := make(map[string]remoteServerAccount, len(matches))
+	for _, candidate := range matches {
+		key := strings.ToLower(string(candidate.account.Provider)) + "\x00" +
+			strings.ToLower(string(candidate.account.AuthMode)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(candidate.account.ID))
+		unique[key] = candidate.account
+	}
+	if len(unique) != 1 {
+		return "", fmt.Errorf("account/profile selector %q is ambiguous; use the exact Claude account ID or profile label", selector)
+	}
+	var account remoteServerAccount
+	for _, candidate := range unique {
+		account = candidate
+	}
+	if account.Provider != accounts.ProviderClaude {
+		return "", fmt.Errorf("account/profile selector %q resolves to provider %s, not Claude", selector, account.Provider)
+	}
+	if account.AuthMode != accounts.AuthModeOAuth {
+		return "", fmt.Errorf("Claude account/profile %q uses auth mode %s; --account requires a Claude subscription profile", selector, account.AuthMode)
+	}
+	accountID := strings.TrimSpace(account.ID)
+	if !validClaudeProxyAccountID(accountID) {
+		return "", fmt.Errorf("Claude account/profile %q has an invalid server routing ID", selector)
+	}
+	return accountID, nil
+}
+
+func validClaudeProxyAccountID(accountID string) bool {
+	if accountID == "" || len(accountID) > 256 {
+		return false
+	}
+	for _, char := range accountID {
+		if char < 0x20 || char == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // cloudClaude launches Claude against the local proxy. The proxy leases an
@@ -146,24 +493,142 @@ func (r srRunner) proxyClaudeTo(
 	if err != nil {
 		return err
 	}
+	return r.runProxyClaude(ctx, launchArgs, baseURL, proxyToken, configDir, "", "")
+}
+
+func (r srRunner) proxyClaudeArgsTo(
+	ctx context.Context,
+	args []string,
+	baseURL string,
+	proxyToken string,
+	scope string,
+	accountID string,
+	preferredAccountID string,
+) error {
+	configDir := claudeProxyConfigDir(r.store.StoreDir(), scope, accountID)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fmt.Errorf("create isolated Claude proxy config: %w", err)
+	}
+	if err := os.Chmod(configDir, 0o700); err != nil {
+		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
+	}
+	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
+}
+
+func (r srRunner) proxyClaudeArgsToServer(
+	ctx context.Context,
+	args []string,
+	server srServerConfig,
+	proxyToken string,
+	scope string,
+	accountID string,
+	preferredAccountID string,
+) error {
+	configDir := claudeProxyConfigDir(r.store.StoreDir(), scope, accountID)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fmt.Errorf("create isolated Claude proxy config: %w", err)
+	}
+	if err := os.Chmod(configDir, 0o700); err != nil {
+		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
+	}
+	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, accountID, preferredAccountID)
+}
+
+func claudeProxyConfigDir(storeDir, scope, accountID string) string {
+	identity := scope
+	if accountID != "" {
+		identity += "\x00account:" + accountID
+	}
+	scopeHash := sha256.Sum256([]byte(identity))
+	return filepath.Join(storeDir, "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
+}
+
+func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
+	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, "", "")
+}
+
+func (r srRunner) runProxyClaudeForServerAccount(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir, accountID, preferredAccountID string) error {
+	return r.runProxyClaudeForServerWithResolvers(
+		ctx, args, server, proxyToken, configDir, accountID, preferredAccountID,
+		net.DefaultResolver.LookupIPAddr, defaultTailscaleStatusLoader,
+	)
+}
+
+func (r srRunner) runProxyClaudeForServerWithResolvers(
+	ctx context.Context,
+	args []string,
+	server srServerConfig,
+	proxyToken string,
+	configDir string,
+	accountID string,
+	preferredAccountID string,
+	lookup serverIPLookup,
+	load tailscaleStatusLoader,
+) error {
+	proxyRoot := canonicalServerProxyRootURL(server)
+	protectedServer := server
+	parsedProxyRoot, _ := url.Parse(proxyRoot)
+	if strings.TrimSpace(protectedServer.TenantKey) == "" && tenantKeyFromURL(parsedProxyRoot) == "" {
+		// Profileless traffic still contains prompts and responses even when
+		// the legacy compatibility token is non-secret. Force exact transport
+		// verification without manufacturing a tenant route segment.
+		protectedServer.TenantKey = "protected-profileless-claude"
+	}
+	secureBaseURL, err := secureTenantServerURLWithResolvers(ctx, proxyRoot, protectedServer, lookup, load)
+	if err != nil {
+		return err
+	}
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID)
+}
+
+func (r srRunner) runProxyClaude(
+	ctx context.Context,
+	args []string,
+	baseURL string,
+	proxyToken string,
+	configDir string,
+	accountID string,
+	preferredAccountID string,
+) error {
+	credential := strings.TrimSpace(proxyToken)
+	if credential == "subrouter" {
+		credential = ""
+	}
+	secureBaseURL, err := secureTenantProxyURL(ctx, baseURL, credential)
+	if err != nil {
+		return err
+	}
+	return r.launchProxyClaude(ctx, args, secureBaseURL, proxyToken, configDir, accountID, preferredAccountID)
+}
+
+func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL, proxyToken, configDir, accountID, preferredAccountID string) error {
+	settingsBody, err := proxyClaudeLaunchSettings(baseURL, proxyToken, configDir, accountID, preferredAccountID)
+	if err != nil {
+		return err
+	}
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, launchArgs...)
+	cmd := exec.CommandContext(ctx, claudePath)
+	settingsArg, cleanupSettings, err := attachClaudeLaunchSettings(cmd, settingsBody)
+	if err != nil {
+		return err
+	}
+	defer cleanupSettings()
+	launchArgs, err := managedClaudeLaunchArgs(args, settingsArg)
+	if err != nil {
+		return err
+	}
+	cmd.Args = append([]string{claudePath}, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 
-	env := cloudClaudeEnvironment(
-		os.Environ(),
-		baseURL,
-		proxyToken,
-	)
-	if configDir != "" {
-		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
-	}
-	cmd.Env = env
+	// The authoritative private settings file carries every routing value. Keep the
+	// child environment credential-free so tenant URLs and keys cannot be read
+	// through process inspection or inherited by subprocesses.
+	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
 	return cmd.Run()
 }
 
@@ -212,16 +677,14 @@ func proxyClaudeInvocation(
 	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
 }
 
-func cloudClaudeEnvironment(
-	environ []string,
-	baseURL string,
-	proxyToken string,
-) []string {
-	baseURL = strings.TrimRight(baseURL, "/")
-	baseURL = strings.TrimSuffix(baseURL, "/v1")
+func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
 	env := envWithout(environ, claudeRoutingEnvKeys)
-	env = upsertEnv(env, "ANTHROPIC_BASE_URL", baseURL)
-	return upsertEnv(env, "ANTHROPIC_AUTH_TOKEN", proxyToken)
+	env = directPlainHTTPEnvironment(env, baseURL)
+	if configDir != "" {
+		env = upsertEnv(env, "CLAUDE_CONFIG_DIR", configDir)
+		env = upsertEnv(env, "CLAUDE_CODE_CONFIG_DIR", configDir)
+	}
+	return env
 }
 
 func (r claudeRunner) run(ctx context.Context, args []string) error {
@@ -246,7 +709,7 @@ func (r claudeRunner) run(ctx context.Context, args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: sr claude remove <name>")
 		}
-		return r.remove(args[1])
+		return r.remove(ctx, args[1])
 	case "env":
 		return r.env()
 	case "pick":
@@ -305,9 +768,17 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	var tempDir string
 	var err error
 	if name != "" {
-		instancePath, err = r.store.CreateProfile(name)
-		if err != nil {
-			return err
+		created, createErr := r.mutateProfileInventory(ctx, func() (bool, error) {
+			var createErr error
+			instancePath, createErr = r.store.CreateProfile(name)
+			return createErr == nil, createErr
+		})
+		if createErr != nil {
+			if created {
+				rollbackErr := r.rollbackProfileInventory(ctx, name)
+				return errors.Join(createErr, wrapClaudeReconcileError("remove Claude profile committed before publication teardown failed", rollbackErr))
+			}
+			return createErr
 		}
 	} else {
 		instancePath, tempDir, err = r.store.CreateTempInstance()
@@ -335,7 +806,9 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	exitErr, autoClosed := r.runClaudeUntilCredential(ctx, cmd, claudeConfigDir)
 	if exitErr != nil && !autoClosed {
 		if name != "" {
-			_, _ = r.store.RemoveProfile(name)
+			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
+				return errors.Join(fmt.Errorf("Claude login did not complete: %w", exitErr), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
+			}
 		} else {
 			_ = r.store.CleanupInstance(tempDir)
 		}
@@ -345,11 +818,16 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 	status, err := claude.AuthStatusForPath(ctx, claudePath, claudeConfigDir)
 	if err != nil || status == nil || !status.LoggedIn {
 		if name != "" {
-			_, _ = r.store.RemoveProfile(name)
+			if rollbackErr := r.rollbackProfileInventory(ctx, name); rollbackErr != nil {
+				return errors.Join(errors.New("login was not completed"), fmt.Errorf("remove incomplete Claude profile: %w", rollbackErr))
+			}
 		} else {
 			_ = r.store.CleanupInstance(tempDir)
 		}
 		return fmt.Errorf("login was not completed")
+	}
+	if r.afterAuthVerified != nil {
+		r.afterAuthVerified()
 	}
 
 	profileName := name
@@ -358,11 +836,64 @@ func (r claudeRunner) add(ctx context.Context, name string) error {
 		if profileName == "" {
 			profileName = "default"
 		}
-		if _, ok := r.store.FindProfile(profileName); ok {
-			_, _ = r.store.RemoveProfile(profileName)
+		registered := false
+		_, registerErr := r.mutateProfileInventory(ctx, func() (bool, error) {
+			if _, ok := r.store.FindProfile(profileName); ok {
+				removed, removeErr := r.store.RemoveProfile(profileName)
+				if removeErr != nil {
+					return removed, removeErr
+				}
+			}
+			err := r.store.RegisterProfile(profileName, tempDir)
+			registered = err == nil
+			return registered, err
+		})
+		if registerErr != nil {
+			// The outer publication lock can report a teardown error after the
+			// registry write committed. Never delete a credential directory that
+			// the durable registry can still name. The explicit committed bit also
+			// fails closed if the registry cannot subsequently be read or changes
+			// concurrently after this transaction releases its lock.
+			if registered || r.profileInventoryReferencesDir(tempDir) {
+				return fmt.Errorf("register Claude profile committed before publication teardown failed: %w", registerErr)
+			}
+			if cleanupErr := r.cleanupTemporaryInstance(ctx, tempDir); cleanupErr != nil {
+				return errors.Join(registerErr, fmt.Errorf("clean up authenticated temporary Claude profile: %w", cleanupErr))
+			}
+			return registerErr
 		}
-		if err := r.store.RegisterProfile(profileName, tempDir); err != nil {
-			return err
+	} else if published, err := r.publishProfileCompletion(ctx); err != nil {
+		// OAuth has already committed outside Subrouter's process. A cancellation
+		// at this boundary must not leave the profile usable on disk but invisible
+		// to a worker that consumed the earlier, credential-less generation.
+		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+		retryPublished, reconcileErr := r.publishProfileCompletion(reconcileCtx)
+		cancel()
+		if reconcileErr != nil {
+			if published || retryPublished {
+				// At least one generation was durably written and its completion
+				// mutation ran. A teardown failure must not reclassify that credential
+				// as unpublished and delete a profile a worker can already observe.
+				return errors.Join(
+					fmt.Errorf("publish completed Claude profile: %w", err),
+					fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
+				)
+			}
+			// A persistent generation-path failure would make the normal published
+			// rollback fail for the same reason as both completion attempts. Journal
+			// the exact profile identity before removing it so a restarted worker can
+			// complete the deletion while every worker remains fail-closed.
+			rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+			removed, rollbackErr := proxy.RollbackUnpublishedClaudeProfileDiskMutation(rollbackCtx, r.store.Dir, name)
+			rollbackCancel()
+			if !removed && rollbackErr == nil {
+				rollbackErr = fmt.Errorf("Claude profile %q was not present for unpublished rollback", name)
+			}
+			return errors.Join(
+				fmt.Errorf("publish completed Claude profile: %w", err),
+				fmt.Errorf("retry completed Claude profile publication: %w", reconcileErr),
+				wrapClaudeReconcileError("remove unpublished Claude profile", rollbackErr),
+			)
 		}
 	}
 
@@ -487,6 +1018,10 @@ func (r claudeRunner) fetchInfos(ctx context.Context) []claude.ProfileInfo {
 		go func() {
 			defer wg.Done()
 			claudeConfigDir := r.store.ClaudeConfigDir(profile.Name)
+			if _, err := secureManagedClaudeProfileTransport(claudeConfigDir); err != nil {
+				infos[i].Error = err
+				return
+			}
 			var auth *claude.AuthStatus
 			var credential *claude.CredentialInfo
 			var authErr, credentialErr error
@@ -535,12 +1070,25 @@ func (r claudeRunner) switchProfile(selector string) error {
 		return err
 	}
 	fmt.Fprintf(r.out, "Active Claude profile: %s\n", profile.Name)
-	fmt.Fprintf(r.out, "\n  export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(profile.Name))
+	configDir := r.store.ClaudeConfigDir(profile.Name)
+	launchMode, err := managedClaudeProfileLaunchMode(configDir)
+	if err != nil {
+		return err
+	}
+	if launchMode == managedClaudeLaunchNeedsMigration {
+		fmt.Fprintf(r.out, "\nThis legacy plaintext profile needs a durable server identity. Repair it first with:\n\n  sr claude push %s\n\nThen launch it with:\n\n  sr claude run %s [claude args...]\n", profile.Name, profile.Name)
+		return nil
+	}
+	if launchMode == managedClaudeLaunchWrapped {
+		fmt.Fprintf(r.out, "\nThis profile uses a protected plaintext server. Launch it with:\n\n  sr claude run %s [claude args...]\n", profile.Name)
+		return nil
+	}
+	fmt.Fprintf(r.out, "\n  export CLAUDE_CONFIG_DIR=%s\n", configDir)
 	fmt.Fprintln(r.out, "\nOr add to shell rc: eval \"$(sr claude env)\"")
 	return nil
 }
 
-func (r claudeRunner) remove(selector string) error {
+func (r claudeRunner) remove(ctx context.Context, selector string) error {
 	profile, ok, err := r.store.MatchProfile(selector)
 	if err != nil {
 		return err
@@ -548,15 +1096,90 @@ func (r claudeRunner) remove(selector string) error {
 	if !ok {
 		return fmt.Errorf("profile %q not found", selector)
 	}
-	removed, err := r.store.RemoveProfile(profile.Name)
-	if err != nil {
+	if err := r.removeProfileInventory(ctx, profile.Name); err != nil {
 		return err
-	}
-	if !removed {
-		return fmt.Errorf("profile %q not found", selector)
 	}
 	fmt.Fprintf(r.out, "Removed Claude profile: %s\n", profile.Name)
 	return nil
+}
+
+func (r claudeRunner) mutateProfileInventory(ctx context.Context, mutate func() (bool, error)) (committed bool, err error) {
+	trackedMutate := func() (bool, error) {
+		committed, err = mutate()
+		return committed, err
+	}
+	if r.mutateProfileInventoryForTest != nil {
+		err = r.mutateProfileInventoryForTest(ctx, trackedMutate)
+		return committed, err
+	}
+	if r.ephemeral {
+		return trackedMutate()
+	}
+	err = proxy.PublishAccountDiskMutation(ctx, r.store.Dir, trackedMutate)
+	return committed, err
+}
+
+func (r claudeRunner) removeProfileInventory(ctx context.Context, name string) error {
+	_, err := r.mutateProfileInventory(ctx, func() (bool, error) {
+		removed, err := r.store.RemoveProfile(name)
+		if err != nil {
+			return removed, err
+		}
+		if !removed {
+			return false, fmt.Errorf("profile %q not found", name)
+		}
+		return true, nil
+	})
+	return err
+}
+
+func (r claudeRunner) rollbackProfileInventory(ctx context.Context, name string) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+	defer cancel()
+	return r.removeProfileInventory(rollbackCtx, name)
+}
+
+func (r claudeRunner) removeUnpublishedProfile(ctx context.Context, name string) (bool, error) {
+	removed, err := r.store.RemoveUnpublishedProfileContext(ctx, name)
+	if err != nil {
+		return removed, err
+	}
+	if !removed {
+		return false, fmt.Errorf("profile %q not found", name)
+	}
+	return true, nil
+}
+
+func wrapClaudeReconcileError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func (r claudeRunner) publishProfileCompletion(ctx context.Context) (bool, error) {
+	return r.mutateProfileInventory(ctx, func() (bool, error) {
+		// Claude writes the credential outside Subrouter's process during the
+		// interactive login. Publish a completion generation after verifying it
+		// so a worker that observed profile creation before credential landing
+		// receives a second, usable snapshot.
+		return true, nil
+	})
+}
+
+func (r claudeRunner) cleanupTemporaryInstance(ctx context.Context, dir string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeProfileReconcileTimeout)
+	defer cancel()
+	return r.store.CleanupInstanceContext(cleanupCtx, dir)
+}
+
+func (r claudeRunner) profileInventoryReferencesDir(dir string) bool {
+	for _, profile := range r.store.ListProfiles() {
+		if profile.Dir == dir {
+			return true
+		}
+	}
+	return false
 }
 
 func (r claudeRunner) env() error {
@@ -564,7 +1187,18 @@ func (r claudeRunner) env() error {
 	if active == "" {
 		return nil
 	}
-	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", r.store.ClaudeConfigDir(active))
+	configDir := r.store.ClaudeConfigDir(active)
+	launchMode, err := managedClaudeProfileLaunchMode(configDir)
+	if err != nil {
+		return err
+	}
+	if launchMode == managedClaudeLaunchNeedsMigration {
+		return fmt.Errorf("profile %q is a legacy plaintext remote profile; repair it with 'sr claude push %s', then launch it with 'sr claude run %s [claude args...]'", active, active, active)
+	}
+	if launchMode == managedClaudeLaunchWrapped {
+		return fmt.Errorf("profile %q uses a protected plaintext server; launch it with 'sr claude run %s [claude args...]' so Subrouter can verify the server for each run", active, active)
+	}
+	fmt.Fprintf(r.out, "export CLAUDE_CONFIG_DIR=%s\n", configDir)
 	return nil
 }
 
@@ -652,9 +1286,31 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	if !ok {
 		return fmt.Errorf("profile %q not found", name)
 	}
+	// Resolve the existing instance without ClaudeConfigDir: ClaudeConfigDir
+	// prepares shared-history links and therefore writes to disk. A rejected
+	// local login must leave the profile tree byte-for-byte untouched.
+	configDir := r.store.PreferredInstancePath(r.store.InstancePath(profile.Name))
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
+	}
+	authStatus := r.authStatus
+	if authStatus == nil {
+		authStatus = claude.AuthStatusForPath
+	}
+	auth, err := authStatus(ctx, claudePath, configDir)
+	if err != nil {
+		return fmt.Errorf("check local Claude profile %q login: %w", profile.Name, err)
+	}
+	if auth == nil || !auth.LoggedIn {
+		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Use sr claude proxy --account %s for the server-pool account, or 'sr claude add <new-name>' to create a logged-in local profile", profile.Name, shellQuote(profile.Name))
+	}
+	// Login is accepted; profile preparation and the remaining launch mutations
+	// are now allowed.
+	configDir = r.store.ClaudeConfigDir(profile.Name)
+	secureBaseURL, err := secureManagedClaudeProfileTransport(configDir)
+	if err != nil {
+		return err
 	}
 	if err := r.store.SetActiveProfile(profile.Name); err != nil {
 		return err
@@ -667,12 +1323,279 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 			fmt.Fprintf(r.errOut, "Copied session %s from profile %q.\n", sessionID, from)
 		}
 	}
-	cmd := exec.CommandContext(ctx, claudePath, extra...)
+	launchArgs := extra
+	var launchSettingsBody []byte
+	if secureBaseURL != "" {
+		settingsOverride, settingsErr := managedClaudeLaunchSettings(secureBaseURL, configDir)
+		if settingsErr != nil {
+			return settingsErr
+		}
+		launchSettingsBody = settingsOverride
+	}
+	cmd := exec.CommandContext(ctx, claudePath)
+	if len(launchSettingsBody) > 0 {
+		settingsArg, cleanupSettings, settingsErr := attachClaudeLaunchSettings(cmd, launchSettingsBody)
+		if settingsErr != nil {
+			return settingsErr
+		}
+		defer cleanupSettings()
+		launchArgs, err = managedClaudeLaunchArgs(extra, settingsArg)
+		if err != nil {
+			return err
+		}
+	}
+	cmd.Args = append([]string{claudePath}, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = claude.EnvForConfigDir(r.store.ClaudeConfigDir(profile.Name))
+	cmd.Env = claudeSettingsChildEnvironment(claude.EnvForConfigDir(configDir), secureBaseURL, configDir)
 	return cmd.Run()
+}
+
+func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, error) {
+	clean := make([]string, 0, len(args)+2)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			clean = append(clean, args[i:]...)
+			break
+		}
+		switch {
+		case arg == "--settings" || arg == "--managed-settings":
+			if i+1 >= len(args) || args[i+1] == "--" || strings.HasPrefix(args[i+1], "-") {
+				return nil, fmt.Errorf("%s requires a value", arg)
+			}
+			i++
+		case strings.HasPrefix(arg, "--settings=") || strings.HasPrefix(arg, "--managed-settings="):
+			_, value, _ := strings.Cut(arg, "=")
+			if strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("%s requires a value", strings.SplitN(arg, "=", 2)[0])
+			}
+			// Drop user-provided settings and higher-precedence managed settings
+			// before the option terminator. The verified transport overlay is the
+			// only global settings source that can affect the launch.
+		default:
+			clean = append(clean, arg)
+		}
+	}
+	return append([]string{"--settings", settingsPath}, clean...), nil
+}
+
+func isolatedClaudeSettingSourcesArgs(args []string) ([]string, error) {
+	clean := make([]string, 0, len(args)+2)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			clean = append(clean, args[i:]...)
+			break
+		}
+		switch {
+		case arg == "--setting-sources":
+			if i+1 >= len(args) || args[i+1] == "--" {
+				return nil, fmt.Errorf("%s requires a value", arg)
+			}
+			i++
+		case strings.HasPrefix(arg, "--setting-sources="):
+			// Drop caller-selected persisted sources. Direct mode must not reload a
+			// config selector or provider route after its environment is scrubbed.
+		default:
+			clean = append(clean, arg)
+		}
+	}
+	return append([]string{"--setting-sources", ""}, clean...), nil
+}
+
+func secureManagedClaudeProfileTransport(configDir string) (string, error) {
+	return secureManagedClaudeProfileTransportWithResolvers(configDir, net.DefaultResolver.LookupIPAddr, defaultTailscaleStatusLoader)
+}
+
+func secureManagedClaudeProfileTransportWithResolvers(configDir string, lookup serverIPLookup, load tailscaleStatusLoader) (string, error) {
+	settingsPath := filepath.Join(configDir, "settings.json")
+	body, err := os.ReadFile(settingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read managed Claude settings: %w", err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return "", fmt.Errorf("parse managed Claude settings: %w", err)
+	}
+	baseURL := strings.TrimSpace(settings.Env["ANTHROPIC_BASE_URL"])
+	if baseURL == "" {
+		return "", nil
+	}
+	authToken := strings.TrimSpace(settings.Env["ANTHROPIC_AUTH_TOKEN"])
+	transportCredential := authToken
+	if transportCredential == "subrouter" {
+		transportCredential = ""
+	}
+	if transportCredential == "" {
+		for _, key := range []string{
+			"ANTHROPIC_API_KEY",
+			"CLAUDE_CODE_OAUTH_TOKEN",
+			"CLAUDE_CODE_API_KEY",
+			"CLAUDE_CODE_AUTH_TOKEN",
+		} {
+			if strings.TrimSpace(settings.Env[key]) != "" {
+				transportCredential = "protected-managed-credential"
+				break
+			}
+		}
+	}
+	if transportCredential == "" && strings.TrimSpace(settings.Env["ANTHROPIC_CUSTOM_HEADERS"]) != "" {
+		transportCredential = "protected-managed-custom-header"
+	}
+	serverURL := strings.TrimSpace(settings.Env[managedClaudeServerURLEnv])
+	nodeID := strings.TrimSpace(settings.Env[managedClaudeTailscaleNodeEnv])
+	if serverURL != "" || nodeID != "" {
+		if serverURL == "" || nodeID == "" || baseURL != managedClaudeBlockedBaseURL {
+			return "", fmt.Errorf("managed Claude server identity is incomplete; run 'sr claude push' to repair it")
+		}
+		server := srServerConfig{
+			URL:             serverURL,
+			TailscaleNodeID: nodeID,
+		}
+		if tenant.ValidKeyFormat(authToken) {
+			server.TenantKey = authToken
+		}
+		proxyRoot := canonicalServerProxyRootURL(server)
+		protectedServer := server
+		parsedProxyRoot, _ := url.Parse(proxyRoot)
+		if strings.TrimSpace(protectedServer.TenantKey) == "" && tenantKeyFromURL(parsedProxyRoot) == "" {
+			// Force transport protection without allowing an arbitrary Claude
+			// credential to become a tenant route segment.
+			protectedServer.TenantKey = "protected-managed-credential"
+		}
+		secureBaseURL, err := secureTenantServerURLWithResolvers(context.Background(), proxyRoot, protectedServer, lookup, load)
+		if err != nil {
+			return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: %w", err)
+		}
+		return secureBaseURL, nil
+	}
+	parsed, _ := url.Parse(baseURL)
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) {
+		return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: plaintext server is missing an exact durable identity; run 'sr claude push' to repair it")
+	}
+	secureBaseURL, err := secureTenantServerURLWithResolvers(
+		context.Background(), baseURL,
+		srServerConfig{URL: baseURL, TenantKey: transportCredential},
+		lookup, load,
+	)
+	if err != nil {
+		return "", fmt.Errorf("managed Claude profile has unsafe proxy transport: %w", err)
+	}
+	return secureBaseURL, nil
+}
+
+type managedClaudeLaunchMode uint8
+
+const (
+	managedClaudeLaunchDirect managedClaudeLaunchMode = iota
+	managedClaudeLaunchWrapped
+	managedClaudeLaunchNeedsMigration
+)
+
+func managedClaudeProfileLaunchMode(configDir string) (managedClaudeLaunchMode, error) {
+	body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return managedClaudeLaunchDirect, nil
+	}
+	if err != nil {
+		return managedClaudeLaunchDirect, fmt.Errorf("read managed Claude settings: %w", err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return managedClaudeLaunchDirect, fmt.Errorf("parse managed Claude settings: %w", err)
+	}
+	if strings.TrimSpace(settings.Env[managedClaudeServerURLEnv]) != "" || strings.TrimSpace(settings.Env[managedClaudeTailscaleNodeEnv]) != "" {
+		return managedClaudeLaunchWrapped, nil
+	}
+	parsed, _ := url.Parse(strings.TrimSpace(settings.Env["ANTHROPIC_BASE_URL"]))
+	if parsed != nil && strings.EqualFold(parsed.Scheme, "http") && !isLoopbackServerHost(parsed.Hostname()) {
+		return managedClaudeLaunchNeedsMigration, nil
+	}
+	return managedClaudeLaunchDirect, nil
+}
+
+func managedClaudeLaunchSettings(secureBaseURL, configDir string) ([]byte, error) {
+	return claudeLaunchSettingsJSON(configDir, map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
+}
+
+func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs ...string) ([]byte, error) {
+	accountID := ""
+	preferredAccountID := ""
+	if len(accountIDs) > 2 {
+		return nil, fmt.Errorf("encode Claude proxy launch settings: too many account routes")
+	}
+	if len(accountIDs) >= 1 {
+		accountID = strings.TrimSpace(accountIDs[0])
+		if accountID != "" && !validClaudeProxyAccountID(accountID) {
+			return nil, fmt.Errorf("encode Claude proxy launch settings: invalid forced account ID")
+		}
+	}
+	if len(accountIDs) == 2 {
+		preferredAccountID = strings.TrimSpace(accountIDs[1])
+		if preferredAccountID != "" && !validClaudeProxyAccountID(preferredAccountID) {
+			return nil, fmt.Errorf("encode Claude proxy launch settings: invalid preferred account ID")
+		}
+	}
+	if accountID != "" && preferredAccountID != "" {
+		return nil, fmt.Errorf("encode Claude proxy launch settings: forced and preferred accounts are mutually exclusive")
+	}
+	baseURL = strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1")
+	customHeaders := "X-Subrouter-Agent: claude"
+	if accountID != "" {
+		customHeaders += "\nX-Subrouter-Account-ID: " + accountID
+	} else if preferredAccountID != "" {
+		customHeaders += "\nX-Subrouter-Preferred-Account-ID: " + preferredAccountID
+	}
+	return claudeLaunchSettingsJSON(configDir, map[string]string{
+		"ANTHROPIC_BASE_URL":       baseURL,
+		"ANTHROPIC_AUTH_TOKEN":     proxyToken,
+		"ANTHROPIC_CUSTOM_HEADERS": customHeaders,
+	})
+}
+
+func claudeLaunchSettingsJSON(configDir string, env map[string]string) ([]byte, error) {
+	// Claude merges --settings with the selected CLAUDE_CONFIG_DIR settings.
+	// Empty strings are Claude's own neutral value for provider-selection flags:
+	// its provider overlay clears every flag before enabling one. Clear every
+	// known routing value here as well so a reused profile cannot retain a
+	// Bedrock, Vertex, gateway, or other alternate-provider route underneath the
+	// private launch settings. Intended Subrouter values are applied last.
+	authoritative := make(map[string]string, len(claudeRoutingEnvKeys)+len(env))
+	for _, key := range claudeRoutingEnvKeys {
+		// An explicitly empty CLAUDE_CONFIG_DIR is not the default directory:
+		// Claude treats it as the current working directory. An explicitly set
+		// ~/.claude also selects a separate Keychain namespace on macOS. For a
+		// normal direct login, leave both selectors absent after scrubbing the
+		// child environment; managed profiles pass a non-empty directory below.
+		if configDir == "" && (key == "CLAUDE_CONFIG_DIR" || key == "CLAUDE_CODE_CONFIG_DIR") {
+			continue
+		}
+		authoritative[key] = ""
+	}
+	if configDir != "" {
+		// Keep Claude's dynamically consulted config selectors pinned to the same
+		// durable profile selected for the child process. Clearing them would route
+		// later session reads and writes back to the user's default profile.
+		authoritative["CLAUDE_CONFIG_DIR"] = configDir
+		authoritative["CLAUDE_CODE_CONFIG_DIR"] = configDir
+	}
+	for key, value := range env {
+		authoritative[key] = value
+	}
+	override, err := json.Marshal(map[string]any{"env": authoritative})
+	if err != nil {
+		return nil, fmt.Errorf("encode managed Claude launch settings: %w", err)
+	}
+	return override, nil
 }
 
 // claudeAWS launches Claude Code in Amazon Bedrock gateway mode, routed through
@@ -689,7 +1612,15 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	if !ok {
 		return fmt.Errorf("sr claude-aws needs a default Subrouter server; run '%s server use <name>'", r.programOrSubrouter())
 	}
-	baseURL := strings.TrimRight(server.URL, "/") + "/bedrock"
+	protectedServer := server
+	if strings.TrimSpace(protectedServer.TenantKey) == "" {
+		protectedServer.TenantKey = "protected-bedrock-request"
+	}
+	secureRoot, err := secureTenantServerURL(ctx, server.URL, protectedServer)
+	if err != nil {
+		return err
+	}
+	baseURL := strings.TrimRight(secureRoot, "/") + "/bedrock"
 
 	model := "fable"
 	region := "us-east-1"
@@ -733,7 +1664,7 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	if token := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN")); token != "" {
 		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
 	}
-	cmd.Env = env
+	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
 	return cmd.Run()
 }
 
@@ -742,13 +1673,33 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 // gateway) is not used. It strips every routing/gateway env var plus
 // ANTHROPIC_API_KEY (which would otherwise override the claude.ai login and bill
 // pay-per-token), so the run cannot be silently pointed at a proxy or API key,
-// then passes all flags through unchanged.
+// then passes all flags through unchanged. Direct mode leaves both config
+// selectors absent, which is Claude's only login-preserving spelling of the
+// normal config/Keychain identity on macOS.
 func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 	claudePath, ok := claude.DetectCLI()
 	if !ok {
 		return fmt.Errorf("Claude CLI not found. Install from https://claude.ai/download")
 	}
-	cmd := exec.CommandContext(ctx, claudePath, args...)
+	settingsBody, err := claudeLaunchSettingsJSON("", nil)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, claudePath)
+	settingsArg, cleanupSettings, err := attachClaudeLaunchSettings(cmd, settingsBody)
+	if err != nil {
+		return err
+	}
+	defer cleanupSettings()
+	launchArgs, err := managedClaudeLaunchArgs(args, settingsArg)
+	if err != nil {
+		return err
+	}
+	launchArgs, err = isolatedClaudeSettingSourcesArgs(launchArgs)
+	if err != nil {
+		return err
+	}
+	cmd.Args = append([]string{claudePath}, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
@@ -762,18 +1713,32 @@ var claudeRoutingEnvKeys = []string{
 	"ANTHROPIC_BASE_URL",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"CLAUDE_CONFIG_DIR",
+	"CLAUDE_CODE_CONFIG_DIR",
+	"CLAUDE_CODE_OAUTH_TOKEN",
+	"CLAUDE_CODE_API_KEY",
+	"CLAUDE_CODE_AUTH_TOKEN",
+	"CLAUDE_CODE_BASE_URL",
 	"CLAUDE_CODE_USE_BEDROCK",
 	"ANTHROPIC_BEDROCK_BASE_URL",
 	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
 	"CLAUDE_CODE_USE_VERTEX",
 	"ANTHROPIC_VERTEX_BASE_URL",
 	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"ANTHROPIC_FOUNDRY_BASE_URL",
+	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
 	"CLAUDE_CODE_USE_MANTLE",
 	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
 	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
 	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
 	"ANTHROPIC_AWS_BASE_URL",
 	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+	"CLAUDE_CODE_USE_GATEWAY",
 }
 
 // envWithout returns environ with the named keys removed (case-insensitive).

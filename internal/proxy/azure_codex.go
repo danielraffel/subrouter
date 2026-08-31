@@ -140,7 +140,7 @@ const (
 	// account failover (429/usage limit) and transport-level retries (5xx,
 	// connection failures) together, so a request cannot spend 5 retries per
 	// layer.
-	azureCodexPoolRetryBudget = 5
+	azureCodexPoolRetryBudget = replayablePostMaxAttempts - 1
 	// azureCodexStickyTTL is how long a session stays pinned to Azure after a
 	// successful fallback, refreshed on every request. It matches the 30-minute
 	// minimum lifetime Azure gives a cached prompt prefix: pinning for less
@@ -154,9 +154,9 @@ const (
 	azureCodexMaxErrorBodyBytes = 512
 )
 
-// attemptBudget bounds the retries a single client request may spend on the
-// pool before the fallback takes over. Both retry transports draw from the same
-// budget, so nested retry loops cannot multiply into 5 retries per layer.
+// attemptBudget bounds the retries a single client request may spend across
+// nested retry transports. Both transports draw from the same budget, so their
+// retry loops cannot multiply into one full allowance per layer.
 type attemptBudget struct {
 	remaining atomic.Int64
 }
@@ -168,8 +168,9 @@ func newAttemptBudget(retries int) *attemptBudget {
 }
 
 // consume claims one retry. It returns false once the budget is spent, which
-// tells the caller to stop retrying and let the fallback run. A nil budget is
-// unbounded, which is the behaviour when no fallback is configured.
+// tells the caller to stop retrying. A nil budget leaves standalone transport
+// tests and explicitly unbounded call sites unchanged; request wiring supplies
+// a budget whenever a POST body can be replayed.
 func (b *attemptBudget) consume() bool {
 	if b == nil {
 		return true
@@ -942,8 +943,14 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 			switch class {
 			case codexFailureQuota:
 				// The stream form of a 429: mark the account so the next pick
-				// avoids it, then let the fallback finish this turn.
-				t.server.markAccountExhausted(accounts.ProviderCodex, t.accountID, t.poolModel)
+				// avoids it, then let the fallback finish this turn. The retry
+				// transport beneath us may have routed the response through a
+				// different account than the request's initial pick.
+				accountID := t.accountID
+				if routed, ok := routedResponseAccount(response); ok && routed.ID != "" {
+					accountID = routed.ID
+				}
+				t.server.markAccountExhausted(accounts.ProviderCodex, accountID, t.poolModel)
 				reason = "pool_stream_quota"
 			case codexFailureServer:
 				reason = "pool_stream_failed"
@@ -977,7 +984,7 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
-	return fallback, nil
+	return tagRoutedResponseAccount(fallback, accounts.Account{Provider: accounts.ProviderCodex}), nil
 }
 
 // azureCodexOverloadSniffBytes bounds how much of a pool SSE stream the

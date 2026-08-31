@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -16,6 +17,35 @@ func TestParseCredentialPayloadDecodesValidBlob(t *testing.T) {
 	}
 	if credential == nil || credential.AccessToken != "sk-ant-oat-secret" {
 		t.Fatalf("decoded credential did not round-trip: %+v", credential)
+	}
+}
+
+func TestParseCredentialPayloadDecodesMacOSKeychainHexData(t *testing.T) {
+	body := make([]byte, hex.EncodedLen(len(validCredentialPayload)))
+	hex.Encode(body, []byte(validCredentialPayload))
+	body = append(body, '\n')
+	credential, err := parseCredentialPayload(body, "keychain")
+	if err != nil {
+		t.Fatalf("hex keychain payload must decode: %v", err)
+	}
+	if credential == nil || credential.AccessToken != "sk-ant-oat-secret" {
+		t.Fatalf("decoded credential did not round-trip: %+v", credential)
+	}
+}
+
+func TestParseCredentialPayloadRejectsHexOutsideKeychain(t *testing.T) {
+	body := make([]byte, hex.EncodedLen(len(validCredentialPayload)))
+	hex.Encode(body, []byte(validCredentialPayload))
+	if _, err := parseCredentialPayload(body, "credentials file"); err == nil {
+		t.Fatal("hex text in a credential file must not be treated as keychain data")
+	}
+}
+
+func TestParseCredentialPayloadRejectsHexThatIsNotCredentialJSON(t *testing.T) {
+	body := make([]byte, hex.EncodedLen(len("not json")))
+	hex.Encode(body, []byte("not json"))
+	if _, err := parseCredentialPayload(body, "keychain"); err == nil {
+		t.Fatal("hex keychain data must decode to a complete credential payload")
 	}
 }
 
@@ -70,29 +100,6 @@ func TestParseCredentialPayloadNeverEchoesTheBlob(t *testing.T) {
 		if strings.Contains(message, "leftover") {
 			t.Fatalf("decode error leaked trailing payload bytes: %q", message)
 		}
-	}
-}
-
-func TestClassifyTrailingBytes(t *testing.T) {
-	cases := []struct {
-		name     string
-		trailing []byte
-		want     string
-	}{
-		{name: "empty", trailing: nil, want: "empty"},
-		{name: "binary plist", trailing: []byte("bplist00\x00\x08"), want: "binary-plist"},
-		{name: "nul padding", trailing: []byte{0, 0, 0, 0}, want: "nul-padding"},
-		{name: "whitespace", trailing: []byte("\n\t  "), want: "whitespace"},
-		{name: "json fragment", trailing: []byte(`Token":"abc"}}`), want: "json-fragment"},
-		{name: "text", trailing: []byte("truncated write"), want: "text"},
-		{name: "binary", trailing: []byte{0xff, 0xfe, 0x01}, want: "binary"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyTrailingBytes(tc.trailing); got != tc.want {
-				t.Fatalf("classifyTrailingBytes(%q) = %q, want %q", tc.trailing, got, tc.want)
-			}
-		})
 	}
 }
 

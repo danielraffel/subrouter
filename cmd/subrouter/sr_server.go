@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"golang.org/x/term"
@@ -31,12 +33,37 @@ import (
 // unchanged against a tenant pool. The stored URL is normalized through the
 // same root-stripping as data-plane URLs, so an entry saved with a /v1 or
 // /backend-api suffix still reaches control endpoints at the server root.
-func serverControlBaseURL(server srServerConfig) string {
+func serverControlBaseURL(server srServerConfig) (string, error) {
+	return serverControlBaseURLFor(server, false)
+}
+
+func protectedServerControlBaseURL(server srServerConfig) (string, error) {
+	return serverControlBaseURLFor(server, true)
+}
+
+func serverControlBaseURLFor(server srServerConfig, forceProtected bool) (string, error) {
+	return serverControlBaseURLForResolvers(server, forceProtected, net.DefaultResolver.LookupIPAddr, defaultTailscaleStatusLoader)
+}
+
+func serverControlBaseURLForResolvers(server srServerConfig, forceProtected bool, lookup serverIPLookup, load tailscaleStatusLoader) (string, error) {
 	base := codexProxyRootURL(server.URL)
 	if key := strings.TrimSpace(server.TenantKey); key != "" {
-		return base + "/t/" + key
+		base += "/t/" + key
 	}
-	return base
+	protectedServer := server
+	parsedBase, _ := url.Parse(base)
+	loopbackHTTP := parsedBase != nil && strings.EqualFold(parsedBase.Scheme, "http") && isLoopbackServerHost(parsedBase.Hostname())
+	if loopbackHTTP {
+		protectedServer.TailscaleNodeID = ""
+	}
+	plainHTTPWithNodeIdentity := parsedBase != nil && strings.EqualFold(parsedBase.Scheme, "http") && !loopbackHTTP && strings.TrimSpace(server.TailscaleNodeID) != ""
+	if strings.TrimSpace(protectedServer.TenantKey) == "" && (forceProtected || plainHTTPWithNodeIdentity || strings.TrimSpace(server.AdminToken) != "" || strings.TrimSpace(server.AccountImportToken) != "") {
+		// Control requests may carry admin or account-import credentials even
+		// when the server itself is not tenant scoped. Apply the same transport
+		// policy without adding a tenant path.
+		protectedServer.TenantKey = "protected-control-request"
+	}
+	return secureTenantServerURLWithResolvers(context.Background(), base, protectedServer, lookup, load)
 }
 
 func (r srRunner) serverCommand() string {
@@ -67,7 +94,7 @@ This machine's daemon:
 
 Named servers:
   %[1]s list
-  %[1]s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
+  %[1]s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
   %[1]s use <name|local> [--no-codex-config]
   %[1]s current
   %[1]s clear-default
@@ -104,12 +131,16 @@ type srServerStore struct {
 }
 
 type srServerConfig struct {
-	Name        string `json:"name"`
-	URL         string `json:"url"`
-	GCPProject  string `json:"gcpProject,omitempty"`
-	GCPZone     string `json:"gcpZone,omitempty"`
-	GCPInstance string `json:"gcpInstance,omitempty"`
-	AdminToken  string `json:"adminToken,omitempty"`
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	// TailscaleNodeID identifies the exact tailnet node hosting this server.
+	// When URL becomes stale after a MagicDNS rename, clients may use this
+	// stable identity to discover and health-check the node's current address.
+	TailscaleNodeID string `json:"tailscaleNodeID,omitempty"`
+	GCPProject      string `json:"gcpProject,omitempty"`
+	GCPZone         string `json:"gcpZone,omitempty"`
+	GCPInstance     string `json:"gcpInstance,omitempty"`
+	AdminToken      string `json:"adminToken,omitempty"`
 	// AccountImportToken grants only protected HTTP account import. Keeping it
 	// separate prevents a self-service login from gaining administrator access.
 	AccountImportToken string `json:"accountImportToken,omitempty"`
@@ -271,7 +302,7 @@ func (r srRunner) remoteList(store srServerStore) error {
 		if server.Name == file.Default {
 			marker = "\t(default)"
 		}
-		fmt.Fprintf(r.out, "%s\t%s%s\n", server.Name, server.URL, marker)
+		fmt.Fprintf(r.out, "%s\t%s%s\n", server.Name, redactedServerURL(server.URL), marker)
 	}
 	if !haveCMUX {
 		fmt.Fprintln(r.out, "cmux\thttps://sr.cmux.com\t(login required)")
@@ -416,7 +447,11 @@ func (r srRunner) serverList(store srServerStore) error {
 		if server.Name == file.Default {
 			suffix = "\t(default)"
 		}
-		fmt.Fprintf(r.out, "%s\t%s\t%s\t%s%s\n", server.Name, server.URL, server.GCPInstance, server.GCPZone, suffix)
+		tailscaleIdentity := ""
+		if server.TailscaleNodeID != "" {
+			tailscaleIdentity = "tailscale:" + server.TailscaleNodeID
+		}
+		fmt.Fprintf(r.out, "%s\t%s\t%s\t%s\t%s%s\n", server.Name, redactedServerURL(server.URL), server.GCPInstance, server.GCPZone, tailscaleIdentity, suffix)
 	}
 	return nil
 }
@@ -424,7 +459,7 @@ func (r srRunner) serverList(store srServerStore) error {
 func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
+		return fmt.Errorf("usage: %s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>] [--no-codex-config]", command)
 	}
 	name := args[0]
 	if isBuiltInRemoteName(name) {
@@ -433,6 +468,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	flags := flag.NewFlagSet(command+" add", flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
 	serverURL := flags.String("url", "", "subrouter base URL, such as http://100.64.0.1:31415")
+	tailscaleNodeID := flags.String("tailscale-node-id", "", "stable Tailscale node ID used to repair renamed MagicDNS hosts")
 	gcpProject := flags.String("gcp-project", "", "GCP project; defaults to current gcloud project")
 	gcpZone := flags.String("gcp-zone", "", "GCP zone")
 	gcpInstance := flags.String("gcp-instance", "", "GCP instance name")
@@ -449,6 +485,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	accountImportTokenSet := false
 	tenantKeySet := false
 	sshHostSet := false
+	tailscaleNodeIDSet := false
 	flags.Visit(func(flag *flag.Flag) {
 		if flag.Name == "ssh-host" {
 			sshHostSet = true
@@ -462,9 +499,15 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 		if flag.Name == "tenant-key" {
 			tenantKeySet = true
 		}
+		if flag.Name == "tailscale-node-id" {
+			tailscaleNodeIDSet = true
+		}
 	})
 	if strings.TrimSpace(*tenantKey) != "" && !tenant.ValidKeyFormat(strings.TrimSpace(*tenantKey)) {
 		return fmt.Errorf("--tenant-key must look like srt_<32 hex>")
+	}
+	if strings.TrimSpace(*tailscaleNodeID) != "" && !validTailscaleNodeID(*tailscaleNodeID) {
+		return fmt.Errorf("--tailscale-node-id must be a stable Tailscale node ID")
 	}
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("server name is required")
@@ -478,6 +521,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	next := srServerConfig{
 		Name:               name,
 		URL:                strings.TrimRight(*serverURL, "/"),
+		TailscaleNodeID:    strings.TrimSpace(*tailscaleNodeID),
 		GCPProject:         *gcpProject,
 		GCPZone:            *gcpZone,
 		GCPInstance:        *gcpInstance,
@@ -490,6 +534,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 	if err := store.update(func(file *srServerFile) error {
 		for i := range file.Servers {
 			if file.Servers[i].Name == name {
+				previousURL := strings.TrimRight(strings.TrimSpace(file.Servers[i].URL), "/")
 				if !adminTokenSet {
 					next.AdminToken = file.Servers[i].AdminToken
 				}
@@ -502,12 +547,21 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 				if !sshHostSet {
 					next.SSHHost = file.Servers[i].SSHHost
 				}
+				if !tailscaleNodeIDSet && next.URL == previousURL {
+					next.TailscaleNodeID = file.Servers[i].TailscaleNodeID
+				}
+				if err := validateTenantServerConfig(context.Background(), next); err != nil {
+					return err
+				}
 				file.Servers[i] = next
 				replaced = true
 				break
 			}
 		}
 		if !replaced {
+			if err := validateTenantServerConfig(context.Background(), next); err != nil {
+				return err
+			}
 			file.Servers = append(file.Servers, next)
 		}
 		if *makeDefault {
@@ -565,6 +619,10 @@ func (r srRunner) serverUse(store srServerStore, args []string) error {
 	}
 	rollbackSelection := func(cause error) error {
 		return rollbackSRServerDefault(store, name, previousDefault, cause)
+	}
+	server, err = r.healRemoteServer(store, server)
+	if err != nil {
+		return rollbackSelection(err)
 	}
 	var (
 		hostedConfigPath string
@@ -690,7 +748,7 @@ func (r srRunner) serverCurrent(store srServerStore) error {
 	if !ok {
 		return fmt.Errorf("default server %q not found", file.Default)
 	}
-	fmt.Fprintf(r.out, "Default Codex server: %s\t%s\n", server.Name, server.URL)
+	fmt.Fprintf(r.out, "Default Codex server: %s\t%s\n", server.Name, redactedServerURL(server.URL))
 	return nil
 }
 
@@ -777,12 +835,9 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 		if isLocalServerName(serverName) {
 			return srServerConfig{}, false, nil
 		}
-		server, ok, err := store.find(serverName)
+		server, err := r.namedRemoteServer(context.Background(), store, serverName)
 		if err != nil {
 			return srServerConfig{}, false, err
-		}
-		if !ok {
-			return srServerConfig{}, false, fmt.Errorf("Subrouter server %q not found", serverName)
 		}
 		return server, true, nil
 	}
@@ -797,7 +852,22 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	if !ok {
 		return srServerConfig{}, false, fmt.Errorf("default server %q not found; run %s server use local or %s server clear-default", file.Default, r.programOrSubrouter(), r.programOrSubrouter())
 	}
+	server, err = r.healRemoteServer(store, server)
+	if err != nil {
+		return srServerConfig{}, false, err
+	}
 	return server, true, nil
+}
+
+func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
+	server, ok, err := store.find(name)
+	if err != nil {
+		return srServerConfig{}, err
+	}
+	if !ok {
+		return srServerConfig{}, fmt.Errorf("Subrouter server %q not found", name)
+	}
+	return r.healRemoteServerContext(ctx, store, server)
 }
 
 func (r srRunner) programOrSubrouter() string {
@@ -873,12 +943,9 @@ func (r srRunner) serverRemove(store srServerStore, name string) error {
 }
 
 func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name string) error {
-	server, ok, err := store.find(name)
+	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
 	}
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
@@ -886,7 +953,7 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 	}
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
-		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		r.printBedrockStatus(ctx, server)
@@ -913,7 +980,7 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 	if len(remoteAccounts) == 0 {
 		fmt.Fprintln(r.out, "No accounts configured on server.")
 		return nil
@@ -937,7 +1004,7 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, arg
 	command := r.programOrSubrouter() + " add-key"
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(r.errOut)
-	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: codex, claude, kimi, or zai")
+	providerRaw := flags.String("provider", string(accounts.ProviderCodex), "API-key provider: "+proxy.APIKeyProviderList())
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -998,17 +1065,20 @@ func (r srRunner) addKeyToServer(ctx context.Context, server srServerConfig, arg
 }
 
 func parseAPIKeyProvider(value string) (accounts.Provider, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
 	case "", string(accounts.ProviderCodex), "openai":
 		return accounts.ProviderCodex, nil
 	case string(accounts.ProviderClaude), "anthropic":
 		return accounts.ProviderClaude, nil
-	case string(accounts.ProviderKimi), "kimi-for-coding":
-		return accounts.ProviderKimi, nil
-	case string(accounts.ProviderZAI), "glm", "glm-5.2":
-		return accounts.ProviderZAI, nil
 	default:
-		return "", fmt.Errorf("unsupported API-key provider %q, expected codex, claude, kimi, or zai", value)
+		if provider, ok := proxy.APIKeyProviderForName(normalized); ok {
+			return proxy.APIKeyAccountProvider(provider), nil
+		}
+		if proxy.ValidDeclaredProviderName(normalized) {
+			return accounts.Provider(normalized), nil
+		}
+		return "", fmt.Errorf("unsupported API-key provider %q, expected %s", value, proxy.APIKeyProviderList())
 	}
 }
 
@@ -1051,7 +1121,7 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 		if len(matches) == 0 {
 			return fmt.Errorf("no server account found for %s", selector)
 		}
-		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRows(r.out, matches, false)
 		return nil
 	}
@@ -1069,7 +1139,7 @@ func (r srRunner) statusOneRemote(ctx context.Context, server srServerConfig, se
 	if len(matches) == 0 {
 		return fmt.Errorf("no server account found for %s", selector)
 	}
-	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 	for _, account := range matches {
 		name := accountEmail(account.ID, account.Email)
 		if name == "" {
@@ -1093,6 +1163,7 @@ type remoteServerAccount struct {
 	ID       string            `json:"id"`
 	Provider accounts.Provider `json:"provider"`
 	AuthMode accounts.AuthMode `json:"auth_mode"`
+	Label    string            `json:"label,omitempty"`
 	Email    string            `json:"email,omitempty"`
 	Source   string            `json:"source"`
 }
@@ -1120,23 +1191,44 @@ type remoteServerUsageStatus struct {
 	Refreshed          bool                             `json:"refreshed,omitempty"`
 	Error              string                           `json:"error,omitempty"`
 	Active             bool                             `json:"active,omitempty"`
+	KeyFingerprint     string                           `json:"key_fingerprint,omitempty"`
+	AssignedSessions   int                              `json:"assigned_sessions,omitempty"`
+	SessionsKnown      bool                             `json:"sessions_known,omitempty"`
 	PlanType           string                           `json:"plan_type,omitempty"`
+	ProviderHealth     string                           `json:"provider_health,omitempty"`
+	ProviderModels     *int                             `json:"provider_models,omitempty"`
+	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
+	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	AccountIdentity    string                           `json:"account_identity,omitempty"`
+	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/accounts", nil)
+	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
 		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/accounts", nil)
+	if err != nil {
+		return nil, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
 	client := r.client
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	return client.Do(req)
+	secured, err := securedServerRequestClient(client, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	res, err := secured.Do(req)
+	if err != nil {
+		return nil, redactServerRequestError(err, server)
+	}
+	return res, nil
 }
 
 func (r srRunner) fetchServerAccounts(ctx context.Context, server srServerConfig) ([]remoteServerAccount, error) {
@@ -1156,23 +1248,31 @@ func (r srRunner) fetchServerAccounts(ctx context.Context, server srServerConfig
 }
 
 func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServerConfig, forceRefresh bool) ([]remoteServerAccountStatus, bool, error) {
-	statusURL := serverControlBaseURL(server) + "/_subrouter/account-status"
+	baseURL, err := serverControlBaseURL(server)
+	if err != nil {
+		return nil, false, err
+	}
+	statusURL := baseURL + "/_subrouter/account-status"
 	method := http.MethodGet
 	if forceRefresh {
 		method = http.MethodPost
 	}
 	req, err := http.NewRequestWithContext(ctx, method, statusURL, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
 	client := r.client
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	res, err := client.Do(req)
+	secured, err := securedServerRequestClient(client, statusURL)
 	if err != nil {
 		return nil, false, err
+	}
+	res, err := secured.Do(req)
+	if err != nil {
+		return nil, false, redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 200 && res.StatusCode < 300 {
@@ -1201,18 +1301,26 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 }
 
 func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverControlBaseURL(server)+"/_subrouter/usage-status", nil)
+	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
 		return nil, false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status", nil)
+	if err != nil {
+		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
 	client := r.client
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	res, err := client.Do(req)
+	secured, err := securedServerRequestClient(client, baseURL)
 	if err != nil {
 		return nil, false, err
+	}
+	res, err := secured.Do(req)
+	if err != nil {
+		return nil, false, redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 200 && res.StatusCode < 300 {
@@ -1241,25 +1349,57 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		row := srUsageRow{
 			email:              email,
+			displayAccount:     status.AccountIdentity,
 			active:             status.Active,
 			authMode:           status.AuthMode,
 			planType:           status.PlanType,
+			quotaStatus:        status.QuotaStatus,
+			accountIdentity:    status.AccountIdentity,
+			quotaUsageKnown:    status.QuotaUsageKnown,
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
 			provider:           status.Provider,
+			providerHealth:     status.ProviderHealth,
+			providerModels:     -1,
+			providerEndpoints:  append([]string(nil), status.ProviderEndpoints...),
+			keyFingerprint:     status.KeyFingerprint,
+			assignedSessions:   status.AssignedSessions,
+			sessionsKnown:      status.SessionsKnown,
 		}
-		if status.Provider == accounts.ProviderClaude && row.planType == "" {
-			row.planType = "claude"
+		if status.ProviderModels != nil {
+			row.providerModels = *status.ProviderModels
+		}
+		if status.AuthMode == accounts.AuthModeOAuth && status.Provider == accounts.ProviderGrok && status.AuthChecked {
+			row.providerHealth = "auth error"
+			if status.AuthValid {
+				row.providerHealth = "auth ok"
+			}
+		}
+		if status.AuthMode == accounts.AuthModeAPIKey && row.providerHealth == "" && status.AuthChecked {
+			row.providerHealth = "bad key"
+			if status.AuthValid {
+				row.providerHealth = "auth ok"
+			}
+		}
+		if status.Provider == accounts.ProviderClaude && (row.planType == "" || strings.EqualFold(row.planType, "claude")) {
+			row.planType = "unknown"
 		}
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
 			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+		} else if status.AuthMode == accounts.AuthModeAPIKey &&
+			(status.Provider == accounts.ProviderQwenToken || status.Provider == accounts.ProviderKimi) && status.QuotaUsageKnown {
+			row.score = scoreFromWindows(email, status.Windows)
+			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
 		} else if status.AuthMode == accounts.AuthModeAPIKey {
 			row.score = selectacct.Score{AccountID: email, Headroom: 0.01, ShortHeadroom: 0.01}
 			if row.planType == "" {
 				row.planType = "api key"
 			}
+		} else if status.Provider == accounts.ProviderGrok && status.AuthMode == accounts.AuthModeOAuth && status.AuthValid {
+			row.score = selectacct.Score{AccountID: email, Headroom: 1, ShortHeadroom: 1}
 		} else {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
@@ -1439,12 +1579,9 @@ func (r srRunner) serverLogin(ctx context.Context, store srServerStore, args []s
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
-	server, ok, err := store.find(name)
+	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
 	}
 	return r.serverLoginOne(ctx, server, *deviceAuth, "")
 }
@@ -1469,12 +1606,9 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	server, ok, err := store.find(name)
+	server, err := r.namedRemoteServer(ctx, store, name)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("server %q not found", name)
 	}
 	localStored, err := r.store.ListStored()
 	if err != nil {
@@ -1534,7 +1668,7 @@ func (r srRunner) serverSync(ctx context.Context, store srServerStore, args []st
 		}
 	}
 
-	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, server.URL)
+	fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 	if !statusAvailable {
 		fmt.Fprintln(r.out, "Account status: unavailable on this server version; run sr server install "+server.Name+" to enable refresh-token checks.")
 	}
@@ -1730,9 +1864,10 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 		return fmt.Errorf("logged in as %s, expected %s; no account was uploaded", email, expectedEmail)
 	}
 	account := accounts.StoredCodexAccount{
-		Email:   email,
-		AddedAt: time.Now().UTC().Format(time.RFC3339),
-		Auth:    auth,
+		Email:                 email,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
+		Auth:                  auth,
 	}
 	if err := lock.Close(); err != nil {
 		return err
