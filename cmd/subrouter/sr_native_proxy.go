@@ -140,7 +140,7 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 		if !matched {
 			continue
 		}
-		return i+1 >= len(args) || strings.HasPrefix(args[i+1], "-")
+		return i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" || strings.HasPrefix(args[i+1], "-")
 	}
 	return false
 }

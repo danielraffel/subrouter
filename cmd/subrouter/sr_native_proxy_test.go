@@ -225,7 +225,7 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 }
 
 func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
-	for _, args := range [][]string{{"--resume"}, {"-r"}, {"--resume="}, {"--resume", "--model", "qwen-test"}} {
+	for _, args := range [][]string{{"--resume"}, {"-r"}, {"--resume="}, {"--resume", ""}, {"-r", "   "}, {"--resume", "--model", "qwen-test"}} {
 		if !nativeProxyResumePickerRequested(qwenNativeProxy, args) {
 			t.Fatalf("picker resume %q was not detected", args)
 		}
@@ -238,7 +238,7 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 	if err := (srRunner{}).launchQwenProxy(t.Context(), []string{"--resume"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
 		t.Fatalf("picker launch error = %v", err)
 	}
-	for _, args := range [][]string{{"--session"}, {"-S"}, {"--session="}, {"--session", "--model", "kimi-test"}} {
+	for _, args := range [][]string{{"--session"}, {"-S"}, {"--session="}, {"--session", ""}, {"-S", "   "}, {"--session", "--model", "kimi-test"}} {
 		if !nativeProxyResumePickerRequested(kimiNativeProxy, args) {
 			t.Fatalf("Kimi picker resume %q was not detected", args)
 		}
