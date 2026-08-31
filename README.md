@@ -619,6 +619,11 @@ account-selector workflow. `sr status` reports the router credential as
 `ready`, `active`, or `error`, and says quota is not exposed instead of polling
 an unsupported quota endpoint.
 
+Native proxy launchers preflight the selected router before starting the vendor
+CLI. Hosted or otherwise lease-required routers are rejected until Subrouter has
+a native-launcher session-lease client; local and ordinary self-hosted routers
+remain supported.
+
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that
 global credential. The global CLI login appears in `sr kimi list` as

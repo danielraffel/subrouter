@@ -67,6 +67,11 @@ run when an existing system policy is configured rather than masking that
 policy. The Antigravity relay similarly leaves the local keychain untouched and
 removes the local bearer before forwarding to the selected router.
 
+Before starting the child, every native launcher performs an authenticated
+`HEAD` preflight against the exact data-plane root. Lease-required/hosted
+routers fail closed; the current launchers support local and ordinary
+self-hosted routers, not the Cloudmux session-lease contract.
+
 ## Remote OAuth ownership
 
 Kimi has an explicit managed-profile login flow and can safely keep multiple

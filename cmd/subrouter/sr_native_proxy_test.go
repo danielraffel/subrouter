@@ -220,19 +220,51 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 	}
 }
 
-func TestQwenProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
+func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 	for _, args := range [][]string{{"--resume"}, {"-r"}, {"--resume", "--model", "qwen-test"}} {
-		if !qwenResumePickerRequested(args) {
+		if !nativeProxyResumePickerRequested(qwenNativeProxy, args) {
 			t.Fatalf("picker resume %q was not detected", args)
 		}
 	}
 	for _, args := range [][]string{{"--resume", "session-id"}, {"-r", "session-id"}, {"--resume=session-id"}, {"--", "--resume"}} {
-		if qwenResumePickerRequested(args) {
+		if nativeProxyResumePickerRequested(qwenNativeProxy, args) {
 			t.Fatalf("explicit/non-option resume %q was rejected", args)
 		}
 	}
 	if err := (srRunner{}).launchQwenProxy(t.Context(), []string{"--resume"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
 		t.Fatalf("picker launch error = %v", err)
+	}
+	for _, args := range [][]string{{"--session"}, {"-S"}, {"--session", "--model", "kimi-test"}} {
+		if !nativeProxyResumePickerRequested(kimiNativeProxy, args) {
+			t.Fatalf("Kimi picker resume %q was not detected", args)
+		}
+	}
+	if err := (srRunner{}).launchKimiProxy(t.Context(), []string{"--session"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
+		t.Fatalf("Kimi picker launch error = %v", err)
+	}
+}
+
+func TestNativeProxyDataPlanePreflightRejectsLeaseRequiredRouter(t *testing.T) {
+	for _, test := range []struct {
+		status  int
+		wantErr bool
+	}{{status: http.StatusNoContent}, {status: http.StatusUnauthorized, wantErr: true}} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			if request.Method != http.MethodHead || request.URL.Path != "/" || request.Header.Get("Authorization") != "Bearer relay-token" {
+				http.Error(w, "bad preflight", http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(test.status)
+		}))
+		runner := srRunner{client: server.Client()}
+		err := runner.requireNativeProxyDataPlane(t.Context(), server.URL, "relay-token")
+		server.Close()
+		if (err != nil) != test.wantErr {
+			t.Fatalf("status %d preflight error = %v, wantErr=%t", test.status, err, test.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), "no vendor CLI was started") {
+			t.Fatalf("preflight error did not fail before launch: %v", err)
+		}
 	}
 }
 

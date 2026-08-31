@@ -36,6 +36,7 @@ The agy CLI must still have its own local login; Subrouter never copies or chang
 
 Launch Kimi Code through the selected Subrouter pool. Plain 'kimi' remains direct.
 The process-scoped model override leaves Kimi's normal login and config unchanged.
+For sticky resume, pass an explicit ID: sr kimi proxy --session <session-id>.
 `
 	qwenProxyHelp = `Usage: sr qwen proxy [qwen args...]
 
@@ -87,6 +88,9 @@ func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {
 			return fmt.Errorf("%q changes Kimi's local credentials; use plain 'kimi %s' for the direct CLI or 'sr kimi login <label>' to manage the routed pool", args[0], args[0])
 		}
 	}
+	if nativeProxyResumePickerRequested(kimiNativeProxy, args) {
+		return errors.New("'sr kimi proxy --session' requires an explicit session ID so Subrouter can preserve sticky account routing")
+	}
 	return r.launchNativeProxy(ctx, kimiNativeProxy, args)
 }
 
@@ -101,18 +105,32 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 			}
 		}
 	}
-	if qwenResumePickerRequested(args) {
+	if nativeProxyResumePickerRequested(qwenNativeProxy, args) {
 		return errors.New("'sr qwen proxy --resume' requires an explicit session ID so Subrouter can preserve sticky account routing")
 	}
 	return r.launchNativeProxy(ctx, qwenNativeProxy, args)
 }
 
-func qwenResumePickerRequested(args []string) bool {
+func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool {
+	var pickerFlags []string
+	switch spec.provider {
+	case accounts.ProviderKimi:
+		// Kimi Code 0.39 exposes -S/--session (not -r/--resume).
+		pickerFlags = []string{"-S", "--session"}
+	case accounts.ProviderQwenToken:
+		pickerFlags = []string{"-r", "--resume"}
+	default:
+		return false
+	}
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" {
 			return false
 		}
-		if args[i] != "-r" && args[i] != "--resume" {
+		matched := false
+		for _, flag := range pickerFlags {
+			matched = matched || args[i] == flag
+		}
+		if !matched {
 			continue
 		}
 		return i+1 >= len(args) || strings.HasPrefix(args[i+1], "-")
@@ -138,6 +156,9 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	}
 	proxyToken, err := nativeProxyServerToken(root)
 	if err != nil {
+		return err
+	}
+	if err := r.requireNativeProxyDataPlane(ctx, root, proxyToken); err != nil {
 		return err
 	}
 	relay, err := startNativeProxyRelay(root, spec, sessionID, proxyToken)
@@ -180,6 +201,36 @@ func nativeProxyServerToken(root string) (string, error) {
 		return token, nil
 	}
 	return "subrouter", nil
+}
+
+func (r srRunner) requireNativeProxyDataPlane(ctx context.Context, root, proxyToken string) error {
+	probeURL := strings.TrimRight(root, "/") + "/"
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
+	if err != nil {
+		return errors.New("build native proxy data-plane preflight")
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(proxyToken))
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	secured, err := securedServerRequestClient(client, root)
+	if err != nil {
+		return errors.New("selected router data-plane transport is not safe for a native proxy launcher; no vendor CLI was started")
+	}
+	response, err := secured.Do(request)
+	if err != nil {
+		return errors.New("selected router data-plane preflight failed; no vendor CLI was started")
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	if response.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return errors.New("selected router requires session-lease or data-plane authentication that native proxy launchers do not support; no vendor CLI was started")
+	}
+	return fmt.Errorf("selected router data-plane preflight returned HTTP %d; no vendor CLI was started", response.StatusCode)
 }
 
 func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, error) {
