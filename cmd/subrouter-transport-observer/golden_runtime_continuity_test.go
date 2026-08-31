@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -411,6 +412,44 @@ func TestGoldenLocalEgressBindingPinsRequestLeaseDestinationAndTransport(t *test
 		map[string]goldenProcessEvidence{"local-daemon": reconnectedEvidence},
 	)); got != "local_egress_socket_reconnected" {
 		t.Fatalf("failure = %q, want local_egress_socket_reconnected", got)
+	}
+}
+
+func TestGoldenLocalEgressBindingSelectsResponseLeaseAfterMetadataLeases(t *testing.T) {
+	now := time.Now().UTC()
+	requestStarted := now.Add(10 * time.Millisecond)
+	requestStats := newObserverStats()
+	requestStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: requestStarted.Format(time.RFC3339Nano), Transport: "websocket",
+		Method: http.MethodGet, Path: "/responses", RequestID: "response-1", ConnectionID: strings.Repeat("a", 64),
+	})
+	leaseStats := newObserverStats()
+	for index, stamp := range []time.Time{now, now.Add(5 * time.Millisecond), requestStarted.Add(time.Microsecond)} {
+		leaseStats.observe(transportEvent{
+			Kind: "request_started", Timestamp: stamp.Format(time.RFC3339Nano), Transport: "http",
+			Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: fmt.Sprintf("lease-%d", index+1),
+			ConnectionID: strings.Repeat(string(rune('b'+index)), 64),
+		})
+	}
+	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
+	if !ok {
+		t.Fatal("test socket was not remote")
+	}
+	session := &goldenSession{
+		label: "rehearsal-local-websocket", route: "local-egress", transport: "websocket",
+		observer: &runningGoldenObserver{stats: requestStats}, localUpstreamSocket: strings.Repeat("c", 64),
+	}
+	before := goldenProcessEvidence{Timestamp: now.Add(-time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon"}
+	after := goldenProcessEvidence{
+		Timestamp: now.Add(20 * time.Millisecond).Format(time.RFC3339Nano), Label: "local-daemon",
+		RemoteSocketIDs: []string{socket.SocketID}, remoteSockets: []goldenRemoteSocket{socket},
+	}
+	runner := &goldenRunner{evidence: &jsonlRecorder{writer: io.Discard}}
+	if err := runner.bindGoldenLocalEgress(session, &runningGoldenObserver{stats: leaseStats}, 0, before, after); err != nil {
+		t.Fatalf("metadata leases before the response lease should not invalidate binding: %v", err)
+	}
+	if got := session.localEgressBinding.LeaseRequestID; got != "lease-3" {
+		t.Fatalf("bound lease = %q, want response lease", got)
 	}
 }
 
