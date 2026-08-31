@@ -109,6 +109,40 @@ func TestGoldenSlotOptionsRequirePinnedCandidateAndBootstrap(t *testing.T) {
 	}
 }
 
+func TestGoldenSlotOnlySummaryFixtureIsValid(t *testing.T) {
+	summary := validGoldenAcceptanceSummary()
+	filteredSessions := summary.Sessions[:0]
+	for _, session := range summary.Sessions {
+		if !strings.HasPrefix(session.Label, "migration-") &&
+			session.Label != "migration-candidate-front-final-destination-direct" {
+			filteredSessions = append(filteredSessions, session)
+		}
+	}
+	summary.Sessions = filteredSessions
+	filteredSnapshots := summary.ProcessSnapshots[:0]
+	for _, snapshot := range summary.ProcessSnapshots {
+		if !strings.HasPrefix(snapshot.Phase, "migration-") {
+			filteredSnapshots = append(filteredSnapshots, snapshot)
+		}
+	}
+	summary.ProcessSnapshots = filteredSnapshots
+	summary.MigrationPreparation = goldenActionSummary{}
+	summary.MigrationFinalCutover = goldenActionSummary{}
+	summary.LegacyCleanup = goldenActionSummary{}
+	if err := validateGoldenSlotOnlySummary(summary, false, goldenPinnedBootstrapLinuxSHA256,
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40)); err != nil {
+		t.Fatalf("valid slot-only fixture rejected: %v", err)
+	}
+}
+
+func TestGoldenSlotOnlySummaryRejectsUnverifiedBootstrap(t *testing.T) {
+	summary := validGoldenAcceptanceSummary()
+	if err := validateGoldenSlotOnlySummary(summary, false, strings.Repeat("d", 64),
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40)); err == nil {
+		t.Fatal("slot-only summary accepted an unverified bootstrap")
+	}
+}
+
 func TestGoldenOptionsPinSparkAndSelectedOAuthAccount(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = true
