@@ -139,6 +139,7 @@ type goldenResponsePacer struct {
 	requestReleased    chan struct{}
 	releaseRequestOnce sync.Once
 	superseded         atomic.Bool
+	payloadSeen        atomic.Bool
 	mu                 sync.Mutex
 	started            bool
 	pending            []byte
@@ -182,6 +183,7 @@ func (p *goldenResponsePacer) write(ctx context.Context, payload []byte, write f
 	if p == nil || len(payload) == 0 {
 		return write(payload)
 	}
+	p.payloadSeen.Store(true)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.sink = write
@@ -289,7 +291,7 @@ func (p *goldenResponsePacer) hasPayload() bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.started || len(p.pending) > 0
+	return p.payloadSeen.Load() || p.started || len(p.pending) > 0
 }
 
 func (p *goldenResponsePacer) waitAndFlush() error {
@@ -662,11 +664,12 @@ func (r *countingReadCloser) Read(p []byte) (int, error) {
 
 type countingResponseWriter struct {
 	http.ResponseWriter
-	observer   *observer
-	meta       requestEvidence
-	statusCode int
-	context    context.Context
-	pacer      *goldenResponsePacer
+	observer         *observer
+	meta             requestEvidence
+	statusCode       int
+	context          context.Context
+	pacer            *goldenResponsePacer
+	websocketUpgrade bool
 }
 
 func (w *countingResponseWriter) WriteHeader(statusCode int) {
@@ -737,16 +740,24 @@ func (w *countingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	w.recordFinalStatus(http.StatusSwitchingProtocols)
 	// ReverseProxy writes the HTTP 101 control response through buffered. The
 	// wrapped connection sees only post-handshake WebSocket frame bytes.
-	return &countingConn{Conn: connection, observer: w.observer, meta: w.meta, context: w.context, pacer: w.pacer}, buffered, nil
+	var websocketPacer *goldenWebSocketPacer
+	if w.websocketUpgrade {
+		websocketPacer = newGoldenWebSocketPacer(w.pacer)
+	}
+	return &countingConn{
+		Conn: connection, observer: w.observer, meta: w.meta, context: w.context,
+		pacer: w.pacer, websocketPacer: websocketPacer,
+	}, buffered, nil
 }
 
 type countingConn struct {
 	net.Conn
-	observer *observer
-	meta     requestEvidence
-	context  context.Context
-	pacer    *goldenResponsePacer
-	closed   atomic.Bool
+	observer       *observer
+	meta           requestEvidence
+	context        context.Context
+	pacer          *goldenResponsePacer
+	websocketPacer *goldenWebSocketPacer
+	closed         atomic.Bool
 }
 
 type countingUpstreamConn struct {
@@ -824,7 +835,7 @@ func (c *countingConn) Read(p []byte) (int, error) {
 }
 
 func (c *countingConn) Write(p []byte) (int, error) {
-	return c.pacer.write(c.context, p, func(chunk []byte) (int, error) {
+	write := func(chunk []byte) (int, error) {
 		n, err := c.Conn.Write(chunk)
 		if n > 0 {
 			event := c.meta.event("response_chunk")
@@ -833,11 +844,23 @@ func (c *countingConn) Write(p []byte) (int, error) {
 			c.observer.emit(event)
 		}
 		return n, err
-	})
+	}
+	if c.websocketPacer != nil {
+		return c.websocketPacer.write(c.context, p, write)
+	}
+	return c.pacer.write(c.context, p, write)
 }
 
 func (c *countingConn) Close() error {
-	if c.pacer != nil {
+	if c.websocketPacer != nil {
+		if !c.websocketPacer.hasPayload() {
+			c.websocketPacer.releaseRequest()
+		}
+		if err := c.websocketPacer.waitAndFlush(); err != nil {
+			_ = c.Conn.Close()
+			return err
+		}
+	} else if c.pacer != nil {
 		if !c.pacer.hasPayload() {
 			c.pacer.releaseRequest()
 		}
@@ -961,6 +984,7 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 		responseWriter := &countingResponseWriter{
 			ResponseWriter: w, observer: observation, meta: meta,
 			context: request.Context(), pacer: responsePacer,
+			websocketUpgrade: meta.transport == "websocket",
 		}
 		proxy.ServeHTTP(responseWriter, request)
 		if responsePacer != nil {

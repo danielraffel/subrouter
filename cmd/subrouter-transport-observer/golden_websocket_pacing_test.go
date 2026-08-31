@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
 func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 	gate := newGoldenResponseGate()
 	base := gate.newResponsePacer("0123456789abcdef0123456789abcdef")
+	delay := &accumulatingObserverDelay{}
+	base.delay = delay
 	pacer := newGoldenWebSocketPacer(base)
 	if pacer == nil {
 		t.Fatal("newGoldenWebSocketPacer returned nil")
@@ -41,6 +47,9 @@ func TestGoldenWebSocketPacerKeepsFramesIntactWhileGateIsHeld(t *testing.T) {
 
 	if len(writes) == 0 {
 		t.Fatal("pacer did not emit any complete frame while the stream was active")
+	}
+	if delay.elapsed == 0 {
+		t.Fatal("pacer did not apply an interval between data frames")
 	}
 	for index, write := range writes {
 		if len(write)%3 != 0 {
@@ -96,11 +105,166 @@ func TestGoldenWebSocketFrameParserSupportsFragmentedExtendedFrames(t *testing.T
 
 func TestGoldenWebSocketFrameParserRejectsInvalidLength(t *testing.T) {
 	parser := goldenWebSocketFrameParser{}
-	_, err := parser.append([]byte{0x82, 0x7f, 0x80, 0, 0, 0, 0, 0, 0})
+	_, err := parser.append([]byte{0x82, 0x7f, 0x80, 0, 0, 0, 0, 0, 0, 0})
 	if err == nil {
 		t.Fatal("parser accepted a frame with the reserved 64-bit length bit set")
 	}
 	if err == io.EOF {
 		t.Fatal("parser reported an incomplete frame instead of invalid length")
+	}
+}
+
+func TestGoldenWebSocketPacerFlushesControlFramesBeforeGateRelease(t *testing.T) {
+	gate := newGoldenResponseGate()
+	base := gate.newResponsePacer("control-frame-test")
+	base.delay = &accumulatingObserverDelay{}
+	pacer := newGoldenWebSocketPacer(base)
+	var writes [][]byte
+	sink := func(payload []byte) (int, error) {
+		writes = append(writes, append([]byte(nil), payload...))
+		return len(payload), nil
+	}
+
+	// A control frame may arrive split across reads and after a held data frame.
+	// The complete data frame must be sent first to preserve wire order, then the
+	// control frame must be sent without waiting for the gate.
+	if _, err := pacer.write(context.Background(), []byte{0x81, 0x01, 'x'}, sink); err != nil {
+		t.Fatalf("data write: %v", err)
+	}
+	if _, err := pacer.write(context.Background(), []byte{0x89}, sink); err != nil {
+		t.Fatalf("partial control write: %v", err)
+	}
+	if len(writes) != 1 || !bytes.Equal(writes[0], []byte{0x81, 0x01, 'x'}) {
+		t.Fatalf("held data was not flushed before a control frame: %x", writes)
+	}
+	if _, err := pacer.write(context.Background(), []byte{0x00}, sink); err != nil {
+		t.Fatalf("control write: %v", err)
+	}
+	if len(writes) != 2 || !bytes.Equal(writes[1], []byte{0x89, 0x00}) {
+		t.Fatalf("control frame was held behind the gate: %x", writes)
+	}
+
+	gate.releasePacing()
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatalf("waitAndFlush: %v", err)
+	}
+}
+
+func TestGoldenWebSocketPacerKeepsCloseFrameInHeldTail(t *testing.T) {
+	gate := newGoldenResponseGate()
+	base := gate.newResponsePacer("close-frame-test")
+	base.delay = &accumulatingObserverDelay{}
+	pacer := newGoldenWebSocketPacer(base)
+	var writes [][]byte
+	sink := func(payload []byte) (int, error) {
+		writes = append(writes, append([]byte(nil), payload...))
+		return len(payload), nil
+	}
+	stream := []byte{0x81, 0x01, 'x', 0x88, 0x00}
+	if _, err := pacer.write(context.Background(), stream, sink); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(writes) != 0 {
+		t.Fatalf("close/data tail was exposed before gate release: %x", writes)
+	}
+	gate.releasePacing()
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatalf("waitAndFlush: %v", err)
+	}
+	var delivered bytes.Buffer
+	for _, write := range writes {
+		_, _ = delivered.Write(write)
+	}
+	if !bytes.Equal(delivered.Bytes(), stream) {
+		t.Fatalf("close frame was not released after gate release: %x", writes)
+	}
+}
+
+func TestGoldenWebSocketFrameParserRejectsOversizedFrames(t *testing.T) {
+	parser := goldenWebSocketFrameParser{}
+	length := uint64(goldenWebSocketMaxFrameBytes)
+	header := []byte{0x82, 0x7f, byte(length >> 56), byte(length >> 48), byte(length >> 40), byte(length >> 32), byte(length >> 24), byte(length >> 16), byte(length >> 8), byte(length)}
+	if _, err := parser.append(header); err == nil {
+		t.Fatal("parser accepted a frame larger than the observer limit")
+	}
+}
+
+func TestGoldenWebSocketPacerRetainsPartialWriteProgress(t *testing.T) {
+	gate := newGoldenResponseGate()
+	base := gate.newResponsePacer("partial-write-test")
+	pacer := newGoldenWebSocketPacer(base)
+	gate.releasePacing()
+	frame := []byte{0x82, 0x03, 'a', 'b', 'c'}
+	var delivered bytes.Buffer
+	first := true
+	sink := func(payload []byte) (int, error) {
+		if first {
+			first = false
+			_, _ = delivered.Write(payload[:2])
+			return 2, io.ErrClosedPipe
+		}
+		return delivered.Write(payload)
+	}
+	if _, err := pacer.write(context.Background(), frame, sink); err == nil {
+		t.Fatal("partial write error was lost")
+	}
+	if err := pacer.waitAndFlush(); err != nil {
+		t.Fatalf("waitAndFlush: %v", err)
+	}
+	if !bytes.Equal(delivered.Bytes(), frame) {
+		t.Fatalf("partial write was duplicated or lost: got %x want %x", delivered.Bytes(), frame)
+	}
+}
+
+type goldenHijackResponseWriter struct {
+	*httptest.ResponseRecorder
+	connection net.Conn
+}
+
+func (w *goldenHijackResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.connection, bufio.NewReadWriter(bufio.NewReader(w.connection), bufio.NewWriter(w.connection)), nil
+}
+
+func TestCountingResponseWriterOnlyUsesWebSocketPacerForWebSocketUpgrade(t *testing.T) {
+	tests := []struct {
+		name      string
+		websocket bool
+		wantPacer bool
+	}{
+		{name: "websocket", websocket: true, wantPacer: true},
+		{name: "other upgrade", websocket: false, wantPacer: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			peer, connection := net.Pipe()
+			defer peer.Close()
+			defer connection.Close()
+			gate := newGoldenResponseGate()
+			observer := newObserver(io.Discard, nil)
+			writer := &countingResponseWriter{
+				ResponseWriter: &goldenHijackResponseWriter{
+					ResponseRecorder: httptest.NewRecorder(), connection: connection,
+				},
+				observer: observer,
+				meta: requestEvidence{
+					transport: "websocket", method: http.MethodGet,
+					path: "/v1/responses", requestID: "request", connectionID: "connection",
+				},
+				context:          context.Background(),
+				pacer:            gate.newResponsePacer("upgrade-test"),
+				websocketUpgrade: test.websocket,
+			}
+			wrapped, _, err := writer.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack: %v", err)
+			}
+			counted, ok := wrapped.(*countingConn)
+			if !ok {
+				t.Fatalf("Hijack returned %T, want *countingConn", wrapped)
+			}
+			if got := counted.websocketPacer != nil; got != test.wantPacer {
+				t.Fatalf("websocket pacer present = %t, want %t", got, test.wantPacer)
+			}
+		})
 	}
 }
