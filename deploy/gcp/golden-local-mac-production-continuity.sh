@@ -417,7 +417,7 @@ if isinstance(account_id, str):
 PY
   )"
 fi
-[[ "${account_id}" =~ ^[A-Za-z0-9._@:+/-]{1,320}$ ]] || {
+[[ "${account_id}" =~ ^[A-Za-z0-9._@:+/-]{1,256}$ ]] || {
   echo "a valid Codex OAuth account ID is required; pass --account-id or use a signed-in Codex home" >&2
   exit 1
 }

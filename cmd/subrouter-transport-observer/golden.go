@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -177,7 +178,7 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 		return options, errors.New("--timeout must be positive")
 	}
 	options.accountID = strings.TrimSpace(options.accountID)
-	if len(options.accountID) > 320 || strings.ContainsAny(options.accountID, "\r\n\x00") {
+	if options.accountID != "" && !validGoldenAccountID(options.accountID) {
 		return options, errors.New("--account-id is invalid")
 	}
 	if !goldenTestHooks.enabled {
@@ -268,7 +269,7 @@ func parseGoldenSlotArgs(args []string) (goldenOptions, error) {
 		return options, errors.New("--timeout must be positive")
 	}
 	options.accountID = strings.TrimSpace(options.accountID)
-	if len(options.accountID) > 320 || strings.ContainsAny(options.accountID, "\r\n\x00") {
+	if options.accountID != "" && !validGoldenAccountID(options.accountID) {
 		return options, errors.New("--account-id is invalid")
 	}
 	if !goldenTestHooks.enabled {
@@ -294,6 +295,18 @@ func parseGoldenSlotArgs(args []string) (goldenOptions, error) {
 		options.evidenceValidator = goldenTestHooks.evidenceValidator
 	}
 	return options, nil
+}
+
+func validGoldenAccountID(value string) bool {
+	if len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return strings.TrimSpace(value) != ""
 }
 
 type jsonlRecorder struct {
