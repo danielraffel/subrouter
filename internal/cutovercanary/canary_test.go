@@ -1419,3 +1419,43 @@ func TestCandidateLogRejectsOldWrongAndOversizeEvidence(t *testing.T) {
 		t.Fatal("oversize append accepted")
 	}
 }
+
+func TestCandidateLogAcceptsDefaultSlogProxyRequest(t *testing.T) {
+	dir := privateDir(t)
+	path := filepath.Join(dir, "default-slog.log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, err := snapshotCandidateLogs([]string{path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerHash := strings.Repeat("a", 64)
+	observed := time.Now()
+	notBefore := observed.Truncate(time.Second).Add(900 * time.Millisecond)
+	line := fmt.Sprintf("%s INFO proxy request agent=codex session=chosen user_hash=\"\" method=POST path=/v1/responses upstream=example.test remote_addr=127.0.0.1 user_agent=codex_exec cutover_marker_hash=%s\n", observed.Format("2006/01/02 15:04:05"), markerHash)
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	matched, err := freshProxyLogEvidence(snapshots, "codex", "chosen", markerHash, notBefore, 4096)
+	if err != nil || !matched {
+		t.Fatalf("default slog line matched=%t err=%v", matched, err)
+	}
+}
+
+func TestDefaultSlogProxyRequestStillRejectsWrongOrOldEvidence(t *testing.T) {
+	markerHash := strings.Repeat("a", 64)
+	now := time.Now()
+	wrongMarker := fmt.Sprintf("%s INFO proxy request agent=codex session=chosen cutover_marker_hash=%s", now.Format("2006/01/02 15:04:05"), strings.Repeat("b", 64))
+	if selected, exact := selectedProxyRequestLine([]byte(wrongMarker), "codex", "chosen", markerHash, now.Add(-time.Second)); !selected || exact {
+		t.Fatalf("wrong marker selected=%t exact=%t", selected, exact)
+	}
+	old := fmt.Sprintf("%s INFO proxy request agent=codex session=chosen cutover_marker_hash=%s", now.Add(-2*time.Second).Format("2006/01/02 15:04:05"), markerHash)
+	if selected, exact := selectedProxyRequestLine([]byte(old), "codex", "chosen", markerHash, now); !selected || exact {
+		t.Fatalf("old line selected=%t exact=%t", selected, exact)
+	}
+	malformed := fmt.Sprintf("%s INFO proxy request agent=codex session=chosen cutover_marker_hash=\"unterminated", now.Format("2006/01/02 15:04:05"))
+	if selected, exact := selectedProxyRequestLine([]byte(malformed), "codex", "chosen", markerHash, now.Add(-time.Second)); selected || exact {
+		t.Fatalf("malformed line selected=%t exact=%t", selected, exact)
+	}
+}
