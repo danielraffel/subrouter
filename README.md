@@ -642,8 +642,9 @@ sr kimi login work
 sr kimi login personal
 sr kimi list
 sr kimi remove personal
-sr kimi
-sr kimi --account work
+sr kimi -p 'Summarize the current changes'
+sr kimi --account work -p 'Review this workspace'
+sr kimi --session <session-id> -p 'Continue the routed session'
 ```
 
 The labels are the management and status names; Subrouter does not infer an
@@ -651,12 +652,12 @@ email or account name from undocumented token contents. Each profile refreshes
 atomically and is independently schedulable; `active` means a persistent session
 is assigned, `rec` is the next eligible profile, and `ready` means authenticated
 with quota but currently idle.
-Plain `kimi` remains direct. Each `sr kimi` launch gets a fresh private
-`KIMI_CODE_HOME` containing only a routed model config, so Kimi does not
-automatically load the user's provider catalog, OAuth token, or other global
-Kimi settings. This is configuration isolation, not an OS sandbox: the child
-still runs as the user and has the user's ordinary filesystem access. The
-child links only the validated `sessions/` directory and
+Plain `kimi` remains direct and interactive. Each routed `sr kimi -p` launch
+gets a fresh private `KIMI_CODE_HOME` containing only a routed model config, so
+Kimi does not automatically load the user's provider catalog, OAuth token, or
+other global Kimi settings. This is configuration isolation, not an OS sandbox:
+the child still runs as the user and has the user's ordinary filesystem access.
+The child links only the validated `sessions/` directory and
 `session_index.jsonl`, so existing and newly written sessions remain resumable
 without copying or rewriting the rest of `~/.kimi-code`. Cleanup removes only
 the child-local tree and never follows those links. Routed Kimi uses the common
@@ -666,9 +667,14 @@ disables auto-update for the child. Credential/provider control,
 migration/update, and long-lived server modes (`login`, `provider`, `migrate`,
 `upgrade`, `update`, `acp`, `web`, and `server`) are rejected;
 use plain `kimi` for those direct operations.
+Kimi 0.39.0 registers credential/provider and server-launching slash commands
+inside the interactive TUI and exposes no supported config or environment
+denylist for them. Routed interactive launches therefore fail closed. Prompt
+mode does not start that TUI dispatcher, so `-p` remains supported for new
+sessions and with an explicit `--session`/`--resume` ID or `--continue`.
 This session-link boundary currently requires macOS or Linux; `sr kimi` fails
 closed on Windows while plain `kimi` remains available there.
-The default launch is pooled and may fail over. `sr kimi --account work` pins
+The default routed prompt is pooled and may fail over. `sr kimi --account work -p ...` pins
 that child to the exact routed profile or key with no account failover; bare
 `--account` opens a pinned-account picker. This per-launch pin does not change
 the global recommendation or the pooled working-directory assignment. `sr kimi

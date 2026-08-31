@@ -1245,13 +1245,27 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 			t.Fatalf("routing override error exposed the supplied target: %v", err)
 		}
 	}
-	for _, args := range [][]string{{"serve"}, {"--safe-mode", "serve"}, {"--acp"}, {"--experimental-acp=true"}} {
+	for _, args := range [][]string{
+		{"serve"},
+		{"--safe-mode", "serve"},
+		{"--approval-mode", "default", "serve"},
+		{"--telemetry-target", "local", "serve"},
+		{"--allowed-tools", "Shell(git status)", "--acp"},
+		{"--acp"},
+		{"--experimental-acp=true"},
+	} {
 		err := (srRunner{}).launchQwenProxy(t.Context(), args)
 		if err == nil || !strings.Contains(err.Error(), "can reload saved credentials and proxies") {
 			t.Fatalf("reload-capable mode %q error = %v", args, err)
 		}
 	}
-	for _, args := range [][]string{{"-p", "serve"}, {"--model", "serve", "--continue"}, {"--", "--acp"}} {
+	for _, args := range [][]string{
+		{"-p", "serve"},
+		{"--model", "serve", "--continue"},
+		{"--system-prompt", "serve"},
+		{"--", "serve"},
+		{"--", "--acp"},
+	} {
 		if qwenProxyReloadCapableMode(args) {
 			t.Fatalf("ordinary Qwen args %q classified as reload-capable", args)
 		}
@@ -1278,6 +1292,55 @@ func TestKimiProxyRejectsCredentialAndServerModesBeforeLaunch(t *testing.T) {
 		if mode := kimiProxyReloadCapableMode(args); mode != "" {
 			t.Fatalf("ordinary Kimi args %q classified as %q", args, mode)
 		}
+	}
+}
+
+func TestKimiProxyFailsClosedWithoutNonInteractivePromptMode(t *testing.T) {
+	for _, args := range [][]string{
+		nil,
+		{"--continue"},
+		{"--session", "session-id"},
+		{"--resume=session-id"},
+		{"--model", "kimi-for-coding"},
+		{"--prompt="},
+		{"-p", ""},
+		{"--"},
+		{"--add-dir", "-p", "--yolo"},
+		{"--model", "-p", "hello"},
+		{"vis", "-p", "hello"},
+		{"-p", "hello", "vis"},
+		{"--future-option", "-p", "hello"},
+	} {
+		if kimiProxyPromptModeRequested(args) {
+			t.Fatalf("interactive Kimi args %q classified as prompt mode", args)
+		}
+		err := (srRunner{}).launchKimiProxy(t.Context(), args)
+		if err == nil || !strings.Contains(err.Error(), "interactive 'sr kimi' is disabled") {
+			t.Fatalf("interactive Kimi args %q error = %v", args, err)
+		}
+	}
+
+	for _, args := range [][]string{
+		{"-p", "hello"},
+		{"--prompt", "/web"},
+		{"--prompt=hello"},
+		{"-p=hello"},
+		{"-phello"},
+		{"--add-dir", "workspace", "-p", "hello"},
+		{"--session", "session-id", "-p", "continue safely"},
+		{"--resume=session-id", "--prompt=continue safely"},
+		{"--continue", "-p", "continue safely"},
+	} {
+		if !kimiProxyPromptModeRequested(args) {
+			t.Fatalf("non-interactive Kimi args %q were rejected", args)
+		}
+	}
+	if kimiProxyPromptModeRequested([]string{"--", "-p", "prompt after vendor delimiter"}) {
+		t.Fatal("prompt flag after Kimi's own option delimiter was accepted")
+	}
+	_, vendorArgs, err := parseNativeProxyLaunchArgs([]string{"--", "-p", "prompt after wrapper delimiter"})
+	if err != nil || !kimiProxyPromptModeRequested(vendorArgs) {
+		t.Fatalf("wrapper-delimited prompt args = %q, %v", vendorArgs, err)
 	}
 }
 

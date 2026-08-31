@@ -39,16 +39,18 @@ Launch agy through the selected Subrouter. Plain 'agy' remains a direct bypass.
 The agy CLI must still have its own local login; Subrouter never copies or changes it.
 Antigravity currently has one router-host login, so --account pinning is not supported.
 `
-	kimiProxyHelp = `Usage: sr kimi [--account [account]] [-- kimi args...]
-       sr kimi proxy [--account [account]] [-- kimi args...]
+	kimiProxyHelp = `Usage: sr kimi [--account [account]] -p <prompt> [kimi args...]
+       sr kimi proxy [--account [account]] -p <prompt> [kimi args...]
 
-Launch Kimi Code through the selected Subrouter pool. Plain 'kimi' remains direct.
+Run a non-interactive Kimi prompt through the selected Subrouter pool.
+Plain 'kimi' remains the direct interactive CLI.
 Omit --account for pooled failover. A named account is pinned with no account failover;
 bare --account opens a pinned-account picker.
 The child gets a private routed-only home while its session store remains linked.
 Kimi credential, migration/update, ACP, web, and server modes require the plain direct CLI.
-Account affinity is stable per working directory, including resumed sessions.
-The session-picker form requires an explicit ID: sr kimi --session <session-id>.
+Interactive routed launches are disabled because Kimi has no enforced slash-command denylist.
+Account affinity is stable per working directory, including prompt-mode resumed sessions.
+Use -p with --session <id>, --resume <id>, or --continue; session pickers are not supported.
 `
 	qwenProxyHelp = `Usage: sr qwen [--account [account]] [-- qwen args...]
        sr qwen proxy [--account [account]] [-- qwen args...]
@@ -121,7 +123,78 @@ func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {
 	if nativeProxyResumePickerRequested(kimiNativeProxy, vendorArgs) {
 		return errors.New("'sr kimi --session' requires an explicit session ID so Subrouter can preserve sticky account routing")
 	}
+	if !kimiProxyPromptModeRequested(vendorArgs) {
+		return errors.New("interactive 'sr kimi' is disabled because Kimi has no supported way to disable routing and server-launching slash commands; use 'sr kimi -p <prompt>' for routed prompt mode or plain 'kimi' for the direct interactive CLI")
+	}
 	return r.launchNativeProxy(ctx, kimiNativeProxy, vendorArgs, options)
+}
+
+func kimiProxyPromptModeRequested(args []string) bool {
+	promptMode := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--":
+			// The main Kimi command has no positional prompt. Anything after its
+			// own delimiter is therefore a subcommand or an invalid positional.
+			return false
+		case arg == "-p" || arg == "--prompt":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return false
+			}
+			promptMode = true
+			i++
+		case strings.HasPrefix(arg, "--prompt="):
+			if strings.TrimSpace(strings.TrimPrefix(arg, "--prompt=")) == "" {
+				return false
+			}
+			promptMode = true
+		case strings.HasPrefix(arg, "-p="):
+			if strings.TrimSpace(strings.TrimPrefix(arg, "-p=")) == "" {
+				return false
+			}
+			promptMode = true
+		case strings.HasPrefix(arg, "-p") && len(arg) > len("-p"):
+			if strings.TrimSpace(strings.TrimPrefix(arg, "-p")) == "" {
+				return false
+			}
+			promptMode = true
+		case arg == "-S" || arg == "--session" || arg == "-r" || arg == "--resume":
+			// Commander consumes an optional session ID only when it is not
+			// another option, so `--session ID -p ...` and `--session -p ...`
+			// retain the same distinction as Kimi itself.
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+			}
+		case strings.HasPrefix(arg, "--session=") || strings.HasPrefix(arg, "--resume=") ||
+			(strings.HasPrefix(arg, "-S") && len(arg) > len("-S")) ||
+			(strings.HasPrefix(arg, "-r") && len(arg) > len("-r")):
+			continue
+		case arg == "-m" || arg == "--model" || arg == "--output-format" ||
+			arg == "--skills-dir" || arg == "--agent" || arg == "--agent-file" || arg == "--add-dir":
+			// Required option values may themselves begin with '-'. Consume them
+			// before looking for -p so a value cannot masquerade as prompt mode.
+			if i+1 >= len(args) {
+				return false
+			}
+			i++
+		case strings.HasPrefix(arg, "--model=") || strings.HasPrefix(arg, "--output-format=") ||
+			strings.HasPrefix(arg, "--skills-dir=") || strings.HasPrefix(arg, "--agent=") ||
+			strings.HasPrefix(arg, "--agent-file=") || strings.HasPrefix(arg, "--add-dir=") ||
+			(strings.HasPrefix(arg, "-m") && len(arg) > len("-m")):
+			continue
+		case arg == "-c" || arg == "--continue" || arg == "-C" ||
+			arg == "-y" || arg == "--yolo" || arg == "--yes" || arg == "--auto-approve" ||
+			arg == "--auto" || arg == "--plan":
+			continue
+		default:
+			// Kimi's main command accepts no positional arguments. This rejects
+			// subcommands (including server-launching `vis`) and unknown flags
+			// instead of guessing how a future CLI release might parse them.
+			return false
+		}
+	}
+	return promptMode
 }
 
 func kimiProxyReloadCapableMode(args []string) string {
@@ -209,19 +282,22 @@ func qwenProxyReloadCapableMode(args []string) bool {
 			arg == "--experimental-acp" || strings.HasPrefix(arg, "--experimental-acp=") {
 			return true
 		}
+		// Scan every pre-delimiter token: a valued global option unknown to
+		// this launcher can otherwise hide a later serve/ACP mode. Consume
+		// only known free-form prompt, model, and session values so a literal
+		// value named "serve" remains ordinary; other ambiguities fail closed.
 		switch arg {
-		case "-m", "--model", "--fallback-model", "-p", "--prompt", "-i", "--prompt-interactive", "-o", "--output-format", "-r", "--resume":
+		case "-m", "--model", "--fallback-model",
+			"-p", "--prompt", "-i", "--prompt-interactive", "--system-prompt", "--append-system-prompt",
+			"-r", "--resume":
 			if i+1 < len(args) {
 				i++
 			}
 			continue
 		}
-		if strings.HasPrefix(arg, "-") {
-			continue
+		if arg == "serve" {
+			return true
 		}
-		// Qwen's first positional argument is its subcommand. Later values are
-		// owned by that command and cannot switch the top-level runtime mode.
-		return arg == "serve"
 	}
 	return false
 }
