@@ -90,7 +90,7 @@ func validateGoldenSlotOnlySummary(summary goldenSummary, testMode bool, bootstr
 	if err != nil {
 		return err
 	}
-	if !summary.FreshLocalLeaseObserved || !summary.LegacyBrokerLeaseObserved || summary.DeploymentEnvironmentRead {
+	if !summary.FreshLocalLeaseObserved || !summary.HostedTenantLeaseObserved || summary.DeploymentEnvironmentRead {
 		return failGolden("golden_evidence_incomplete")
 	}
 	if err := validateGoldenSlotOnlyProcessSnapshots(summary, finalCandidateSocket); err != nil {

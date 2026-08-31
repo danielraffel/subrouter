@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1132,12 +1133,12 @@ func TestGoldenLocalLeaseObserverRejectsHostedResponse(t *testing.T) {
 	}
 }
 
-func TestGoldenLocalLeaseObserverRequiresLegacyPost(t *testing.T) {
+func TestGoldenLocalLeaseObserverRejectsNonPostLease(t *testing.T) {
 	now := time.Now().UTC()
 	stats := newObserverStats()
 	stats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
-		Method: "GET", Path: "/api/subrouter/leases",
+		Method: http.MethodGet, Path: "/_subrouter/leases",
 	})
 	if err := requireGoldenLeaseWindow(
 		&runningGoldenObserver{stats: stats},
@@ -1145,7 +1146,60 @@ func TestGoldenLocalLeaseObserverRequiresLegacyPost(t *testing.T) {
 		now.Add(time.Second),
 		0,
 	); err == nil {
-		t.Fatal("accepted a non-POST v0.1.60 lease request")
+		t.Fatal("accepted a non-POST hosted tenant lease request")
+	}
+}
+
+func TestGoldenLocalLeaseObserverRejectsLegacyPathOnHostedObserver(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: http.MethodPost, Path: "/api/subrouter/leases",
+	})
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err == nil {
+		t.Fatal("accepted a legacy lease path on the hosted observer")
+	}
+}
+
+func TestGoldenLocalLeaseObserverRejectsLegacyPathAfterHostedLease(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	for _, path := range []string{"/_subrouter/leases", "/api/subrouter/leases"} {
+		stats.observe(transportEvent{
+			Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+			Method: http.MethodPost, Path: path,
+		})
+	}
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err == nil {
+		t.Fatal("accepted a legacy lease path after a valid hosted lease")
+	}
+}
+
+func TestGoldenLocalLeaseObserverAcceptsHostedTenantPost(t *testing.T) {
+	now := time.Now().UTC()
+	stats := newObserverStats()
+	stats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: http.MethodPost, Path: "/_subrouter/leases",
+	})
+	if err := requireGoldenLeaseWindow(
+		&runningGoldenObserver{stats: stats},
+		now.Add(-time.Second),
+		now.Add(time.Second),
+		0,
+	); err != nil {
+		t.Fatalf("hosted tenant lease POST was rejected: %v", err)
 	}
 }
 
@@ -1486,7 +1540,7 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		ReleaseChecksumVerified: true, ReleasePlatform: "darwin/arm64", Activation: action, Rollback: rollback,
 		OldGenerationCleanup: cleanup("generation-b", "slot-b", "slot-a", rollback.EvidenceSHA256, strings.Repeat("1", 64), "rollback-rehearsal"),
 		FinalActivation:      action, ProbeFrequencyHz: 10, FreshLocalLeaseObserved: true,
-		LegacyBrokerLeaseObserved: true,
+		HostedTenantLeaseObserved: true,
 		LocalDaemonPeakRSSBytes:   1 << 20, LocalDaemonRSSSamples: 10,
 		LocalDaemonProcessSamples: 10, LocalDaemonMaxSampleGapMS: 50,
 	}
@@ -1575,6 +1629,30 @@ func validGoldenAcceptanceSummary() goldenSummary {
 		DescendantPIDs: []int{1}, ProcessStates: []string{"S"}, SocketIDs: []string{releaseA}, RSSBytes: 1 << 20,
 	})
 	return summary
+}
+
+func TestGoldenSummaryRequiresHostedTenantLeaseEvidence(t *testing.T) {
+	summary := validGoldenAcceptanceSummary()
+	summary.HostedTenantLeaseObserved = false
+	summary.LegacyBrokerLeaseObserved = true
+	if got := fixedGoldenFailure(validateGoldenSummary(summary, true)); got != "golden_evidence_incomplete" {
+		t.Fatalf("failure = %q, want golden_evidence_incomplete", got)
+	}
+}
+
+func TestGoldenLeaseObserversCleanRejectsHostedLegacyLease(t *testing.T) {
+	now := time.Now().UTC()
+	hostedStats := newObserverStats()
+	hostedStats.observe(transportEvent{
+		Kind: "request_started", Timestamp: now.Format(time.RFC3339Nano),
+		Method: http.MethodPost, Path: "/api/subrouter/leases",
+	})
+	if err := requireGoldenLeaseObserversClean(
+		&runningGoldenObserver{stats: hostedStats},
+		&runningGoldenObserver{stats: newObserverStats()},
+	); err == nil {
+		t.Fatal("accepted a legacy lease on the hosted observer")
+	}
 }
 
 func TestGoldenAcceptanceSummaryFixtureIsValid(t *testing.T) {

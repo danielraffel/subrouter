@@ -380,7 +380,7 @@ func TestGoldenLocalEgressBindingPinsRequestLeaseDestinationAndTransport(t *test
 	leaseStats := newObserverStats()
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-1", ConnectionID: strings.Repeat("b", 64),
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-1", ConnectionID: strings.Repeat("b", 64),
 	})
 	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
 	if !ok {
@@ -419,7 +419,7 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	leaseStats := newObserverStats()
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-1",
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-1",
 		ConnectionID: strings.Repeat("d", 64),
 	})
 	socket, ok := newGoldenRemoteSocket("127.0.0.1:42001->203.0.113.10:443")
@@ -454,7 +454,7 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	}
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(4 * time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-2",
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-2",
 		ConnectionID: strings.Repeat("e", 64),
 	})
 	if got := fixedGoldenFailure(runner.bindGoldenLocalEgress(second, leaseObserver, 1, bound, reused)); got != "local_egress_correlation_missing" {
@@ -468,7 +468,7 @@ func TestGoldenLocalEgressBindingAllowsExactHTTPConnectionReuse(t *testing.T) {
 	}
 	leaseStats.observe(transportEvent{
 		Kind: "request_started", Timestamp: now.Add(7 * time.Millisecond).Format(time.RFC3339Nano), Transport: "http",
-		Method: http.MethodPost, Path: "/api/subrouter/leases", RequestID: "lease-3",
+		Method: http.MethodPost, Path: "/_subrouter/leases", RequestID: "lease-3",
 		ConnectionID: strings.Repeat("f", 64),
 	})
 	thirdReuse := reused

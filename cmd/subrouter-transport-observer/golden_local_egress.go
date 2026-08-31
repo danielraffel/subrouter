@@ -79,14 +79,35 @@ func goldenRemoteSocketsByID(evidence goldenProcessEvidence) map[string]goldenRe
 	return result
 }
 
-func goldenLegacyLeaseRequests(stats *observerStats) []transportEvent {
+// goldenLeaseRequestPath recognizes both the legacy broker route and the
+// tenant-scoped hosted route. Team-mode local egress uses the latter, while
+// older clients can still use the former.
+func goldenLeaseRequestPath(path string) bool {
+	return path == "/api/subrouter/leases" || path == "/_subrouter/leases"
+}
+
+func goldenLeaseRequests(stats *observerStats) []transportEvent {
 	if stats == nil {
 		return nil
 	}
 	requests, _, _ := stats.snapshot()
 	result := make([]transportEvent, 0, len(requests))
 	for _, request := range requests {
-		if request.Path == "/api/subrouter/leases" {
+		if goldenLeaseRequestPath(request.Path) {
+			result = append(result, request)
+		}
+	}
+	return result
+}
+
+func goldenHostedLeaseRequests(stats *observerStats) []transportEvent {
+	if stats == nil {
+		return nil
+	}
+	requests, _, _ := stats.snapshot()
+	result := make([]transportEvent, 0, len(requests))
+	for _, request := range requests {
+		if request.Path == "/_subrouter/leases" {
 			result = append(result, request)
 		}
 	}
@@ -126,7 +147,7 @@ func (r *goldenRunner) prepareGoldenLocalEgressBinding(
 	if len(localUpstreamID) != 64 {
 		return nil, false, failGolden("local_egress_binding_invalid")
 	}
-	leases := goldenLegacyLeaseRequests(leaseObserver.stats)
+	leases := goldenHostedLeaseRequests(leaseObserver.stats)
 	if len(leases) < leaseBefore+1 {
 		return nil, false, nil
 	}
@@ -346,7 +367,7 @@ func validateGoldenLocalEgressBinding(session *goldenSession, binding *goldenLoc
 		return failGolden("local_egress_binding_invalid")
 	}
 	foundLease := false
-	for _, lease := range goldenLegacyLeaseRequests(binding.leaseStats) {
+	for _, lease := range goldenLeaseRequests(binding.leaseStats) {
 		if lease.RequestID == binding.LeaseRequestID && lease.ConnectionID == binding.LeaseConnectionID &&
 			lease.Method == http.MethodPost {
 			foundLease = true
