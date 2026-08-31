@@ -227,6 +227,62 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 	}
 }
 
+func TestPooledTeamNativeProxyLaunchDefersAccountSelectionToBroker(t *testing.T) {
+	var accountRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/_subrouter/health":
+			w.WriteHeader(http.StatusOK)
+		case "/":
+			if request.Method != http.MethodHead {
+				t.Errorf("data-plane preflight method = %s", request.Method)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/_subrouter/accounts":
+			accountRequests.Add(1)
+			_, _ = io.WriteString(w, `[]`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		CredentialSource: broker.CredentialSourceTeam,
+		BaseURL:          "https://cmux.com",
+		AccessToken:      "test-access",
+		RefreshToken:     "test-refresh",
+		TeamID:           "test-team",
+		LocalProxyToken:  "test-local-proxy-token",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "qwen"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := srRunner{client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := accountRequests.Load(); got != 0 {
+		t.Fatalf("pooled team launch made %d local account inventory request(s), want broker selection at request time", got)
+	}
+
+	err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{accountSelector: "work"})
+	if err == nil || !strings.Contains(err.Error(), "no routed Qwen apikey account") {
+		t.Fatalf("pinned team launch error = %v, want authoritative inventory failure", err)
+	}
+	if got := accountRequests.Load(); got != 1 {
+		t.Fatalf("pinned team launch made %d account inventory request(s), want 1", got)
+	}
+}
+
 func TestNativeProxyPinnedPickerIsSortedAndBlankCancels(t *testing.T) {
 	inventory := []remoteServerAccount{
 		{ID: "qwen-token:z", Label: "Shared", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},

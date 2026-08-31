@@ -226,9 +226,16 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return fmt.Errorf("secure %s proxy transport: %w", spec.display, err)
 	}
-	inventory, err := r.nativeProxyAccounts(ctx, server, spec)
+	cloudConfig, err := cloudModeConfig()
 	if err != nil {
-		return err
+		return fmt.Errorf("load credential storage: %w", err)
+	}
+	var inventory []remoteServerAccount
+	if nativeProxyNeedsAccountInventory(options, cloudConfig.EffectiveCredentialSource()) {
+		inventory, err = r.nativeProxyAccounts(ctx, server, spec)
+		if err != nil {
+			return err
+		}
 	}
 	forcedAccountID := ""
 	if options.pickPinnedAccount {
@@ -286,6 +293,14 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	cmd.Stderr = r.errOut
 	cmd.Env = env
 	return cmd.Run()
+}
+
+func nativeProxyNeedsAccountInventory(options nativeProxyLaunchOptions, source broker.CredentialSource) bool {
+	// A hard process-local pin must resolve one authoritative account ID before
+	// launching. Pooled team mode is different: the local daemon intentionally
+	// owns no account inventory and obtains a provider-scoped lease from the
+	// credential broker on the first routed request.
+	return options.pickPinnedAccount || strings.TrimSpace(options.accountSelector) != "" || source != broker.CredentialSourceTeam
 }
 
 func nativeProxyServerToken(root string) (string, error) {
