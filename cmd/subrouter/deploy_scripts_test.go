@@ -395,8 +395,8 @@ if [[ "${1:-}" == compute && "${2:-}" == ssh ]]; then
     *"ss -H -lntp"*)
       if [[ "${FAKE_LEGACY_ENABLED:-0}" == 1 ]]; then exit 1; fi
       if [[ "${FAKE_LISTENER_NOISE:-0}" == 1 ]]; then printf '%s\n' 'WARNING: remote login banner'; fi
-      printf '%s\n' '{"verified":true,"service":"subrouter-front.service","port":31415,"pid":1234}'
-      if [[ "${FAKE_LISTENER_NOISE:-0}" == 1 ]]; then printf '%s\n' 'remote command completed'; fi
+      printf '%s\n' 'SUBROUTER_LISTENER_TAKEOVER_PROOF={"verified":true,"service":"subrouter-front.service","port":31415,"pid":1234}'
+      if [[ "${FAKE_LISTENER_NOISE:-0}" == 1 ]]; then printf '%s\n' '{"noise":"after-proof"}'; fi
       ;;
     *MainPID*)
       printf '%s\n' '1234'

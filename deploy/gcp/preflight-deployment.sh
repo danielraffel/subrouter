@@ -213,19 +213,26 @@ else
       assert-ready - "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}")" \
       || die "canary security policy does not satisfy the access boundary"
     listener_takeover_output=""
-    if ! listener_takeover_output="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; ! systemctl is-enabled --quiet subrouter.service; ! systemctl is-enabled --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"{\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"; then
+    if ! listener_takeover_output="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; ! systemctl is-enabled --quiet subrouter.service; ! systemctl is-enabled --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"SUBROUTER_LISTENER_TAKEOVER_PROOF={\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"; then
       die "listener takeover proof command failed"
     fi
     listener_takeover_json=""
+    listener_takeover_records=0
     while IFS= read -r listener_takeover_line; do
       case "${listener_takeover_line}" in
-        \{*\}) listener_takeover_json="${listener_takeover_line}" ;;
+        SUBROUTER_LISTENER_TAKEOVER_PROOF=*)
+          listener_takeover_candidate="${listener_takeover_line#SUBROUTER_LISTENER_TAKEOVER_PROOF=}"
+          if ! jq -e 'type == "object" and .verified == true and .service == "subrouter-front.service" and .port == 31415 and (.pid | type) == "number" and .pid > 1' \
+            <<<"${listener_takeover_candidate}" >/dev/null; then
+            die "listener takeover proof is invalid"
+          fi
+          listener_takeover_json="${listener_takeover_candidate}"
+          listener_takeover_records=$((listener_takeover_records + 1))
+          ;;
       esac
     done <<<"${listener_takeover_output}"
-    [[ -n "${listener_takeover_json}" ]] || die "listener takeover proof is missing"
-    jq -e 'type == "object" and .verified == true and .service == "subrouter-front.service" and .port == 31415 and (.pid | type) == "number" and .pid > 1' \
-      <<<"${listener_takeover_json}" >/dev/null \
-      || die "listener takeover proof is invalid"
+    [[ "${listener_takeover_records}" == 1 && -n "${listener_takeover_json}" ]] \
+      || die "listener takeover proof is missing or duplicated"
     listener_takeover_verified=true
   else
     die "URL map does not describe a supported post-migration route"
