@@ -73,6 +73,42 @@ func TestGoldenOptionsRequirePinnedCandidate(t *testing.T) {
 	}
 }
 
+func TestGoldenSlotOptionsRequirePinnedCandidateAndBootstrap(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = false
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	args := []string{
+		"--predecessor-version", "v0.1.60",
+		"--predecessor-sha256", goldenPinnedPredecessorSHA256,
+		"--candidate-tag", goldenPinnedCandidateTag,
+		"--candidate-sha256", strings.Repeat("b", 64),
+		"--candidate-revision", strings.Repeat("c", 40),
+		"--bootstrap-sha256", goldenPinnedBootstrapLinuxSHA256,
+		"--deploy-evidence-validator", "validator",
+		"--account-id", "test@example.invalid",
+		"--activate", "true",
+		"--rollback", "true",
+		"--old-generation-check", "true",
+	}
+	options, err := parseGoldenSlotArgs(args)
+	if err != nil {
+		t.Fatalf("valid slot-only options were rejected: %v", err)
+	}
+	if options.bootstrapSHA256 != goldenPinnedBootstrapLinuxSHA256 {
+		t.Fatalf("bootstrap checksum = %q, want pinned checksum", options.bootstrapSHA256)
+	}
+	for index := range args {
+		if args[index] == goldenPinnedBootstrapLinuxSHA256 {
+			args[index] = strings.Repeat("d", 64)
+			break
+		}
+	}
+	if _, err := parseGoldenSlotArgs(args); err == nil {
+		t.Fatal("unverified bootstrap checksum was accepted")
+	}
+}
+
 func TestGoldenOptionsPinSparkAndSelectedOAuthAccount(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = true
