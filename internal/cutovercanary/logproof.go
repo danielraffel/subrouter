@@ -113,6 +113,17 @@ func selectedProxyRequestLine(line []byte, agent, sessionID, markerHash string, 
 		observed, ok := parseLogTime(object["time"])
 		return true, ok && !observed.Before(notBefore) && object["cutover_marker_hash"] == markerHash
 	}
+	if fields, observed, ok := parseDefaultSlogProxyRequest(string(line)); ok {
+		selected := fields["agent"] == agent && fields["session"] == sessionID
+		if !selected {
+			return false, false
+		}
+		// The standard library default handler timestamps to whole seconds. The
+		// file-identity snapshot and cryptographic marker still prove that this
+		// line was appended by the challenged request, so compare at the
+		// timestamp's actual precision instead of rejecting a same-second turn.
+		return true, !observed.Before(notBefore.Truncate(time.Second)) && fields["cutover_marker_hash"] == markerHash
+	}
 	fields, ok := parseSlogText(string(line))
 	if !ok {
 		return false, false
@@ -132,6 +143,25 @@ func parseLogTime(value any) (time.Time, bool) {
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, raw)
 	return parsed, err == nil
+}
+
+func parseDefaultSlogProxyRequest(line string) (map[string]string, time.Time, bool) {
+	const (
+		layout = "2006/01/02 15:04:05"
+		prefix = " INFO proxy request "
+	)
+	if len(line) <= len(layout) || !strings.HasPrefix(line[len(layout):], prefix) {
+		return nil, time.Time{}, false
+	}
+	observed, err := time.ParseInLocation(layout, line[:len(layout)], time.Local)
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	fields, ok := parseSlogText(line[len(layout)+len(prefix):])
+	if !ok {
+		return nil, time.Time{}, false
+	}
+	return fields, observed, true
 }
 
 func parseSlogText(line string) (map[string]string, bool) {
