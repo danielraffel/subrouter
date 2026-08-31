@@ -301,12 +301,13 @@ func TestServeDoesNotMigrateLegacyCodexOAuthOnStartup(t *testing.T) {
 	}
 
 	err := serve([]string{
-		"--addr", "invalid:::",
+		"--bedrock",
+		"--bedrock-region", "",
 		"--fetch-usage=false",
 		"--sr-switch-interval=0",
 	})
-	if err == nil || !strings.Contains(err.Error(), "listen") {
-		t.Fatalf("serve error = %v, want listen failure after startup", err)
+	if err == nil || !strings.Contains(err.Error(), "no AWS regions configured") {
+		t.Fatalf("serve error = %v, want post-store validation failure", err)
 	}
 
 	migrated := filepath.Join(stateDir, "codex", "accounts", "legacy@example.test.json")
