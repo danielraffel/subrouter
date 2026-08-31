@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -360,7 +361,7 @@ func (s *observerStats) observe(event transportEvent) {
 		s.requests = append(s.requests, event)
 	case "request_chunk", "response_chunk":
 		s.chunks = append(s.chunks, event)
-	case "upstream_connection_opened", "upstream_request_chunk", "upstream_response_chunk", "upstream_connection_closed":
+	case "upstream_connection_opened", "upstream_connection_used", "upstream_request_chunk", "upstream_response_chunk", "upstream_connection_closed":
 		s.upstream = append(s.upstream, event)
 	case "connection_closed":
 		s.closed = append(s.closed, event)
@@ -405,13 +406,15 @@ func (s *observerStats) upstreamSnapshot() []transportEvent {
 }
 
 type observer struct {
-	recorder      *eventRecorder
-	stats         *observerStats
-	requests      *observerRequestLifecycle
-	requestSeq    atomic.Uint64
-	connectionSeq atomic.Uint64
-	connectionsMu sync.Mutex
-	connections   map[string]string
+	recorder              *eventRecorder
+	stats                 *observerStats
+	requests              *observerRequestLifecycle
+	requestSeq            atomic.Uint64
+	connectionSeq         atomic.Uint64
+	connectionsMu         sync.Mutex
+	connections           map[string]string
+	upstreamConnectionsMu sync.Mutex
+	upstreamConnections   map[string]*countingUpstreamConn
 }
 
 type observerRequestLifecycle struct {
@@ -465,10 +468,11 @@ func newObserver(events io.Writer, stats *observerStats) *observer {
 		stats = newObserverStats()
 	}
 	return &observer{
-		recorder:    &eventRecorder{writer: events},
-		stats:       stats,
-		requests:    newObserverRequestLifecycle(),
-		connections: make(map[string]string),
+		recorder:            &eventRecorder{writer: events},
+		stats:               stats,
+		requests:            newObserverRequestLifecycle(),
+		connections:         make(map[string]string),
+		upstreamConnections: make(map[string]*countingUpstreamConn),
 	}
 }
 
@@ -481,6 +485,58 @@ func (o *observer) emit(event transportEvent) {
 		return
 	}
 	o.stats.observe(event)
+}
+
+func (o *observer) registerUpstreamConnection(connection net.Conn, meta requestEvidence) *countingUpstreamConn {
+	if connection == nil || connection.LocalAddr() == nil {
+		return nil
+	}
+	id := goldenSocketEndpointID(connection.LocalAddr().String())
+	if id == "" {
+		return nil
+	}
+	wrapped := &countingUpstreamConn{Conn: connection, observer: o, id: id}
+	o.upstreamConnectionsMu.Lock()
+	o.upstreamConnections[id] = wrapped
+	o.upstreamConnectionsMu.Unlock()
+	if meta.requestID != "" {
+		event := meta.event("upstream_connection_opened")
+		event.ConnectionID = id
+		o.emit(event)
+	}
+	return wrapped
+}
+
+func (o *observer) bindUpstreamConnection(connection net.Conn, meta requestEvidence) *countingUpstreamConn {
+	if connection == nil || connection.LocalAddr() == nil {
+		return nil
+	}
+	id := goldenSocketEndpointID(connection.LocalAddr().String())
+	if id == "" {
+		return nil
+	}
+	o.upstreamConnectionsMu.Lock()
+	wrapped := o.upstreamConnections[id]
+	o.upstreamConnectionsMu.Unlock()
+	if wrapped == nil {
+		return nil
+	}
+	wrapped.bind(meta)
+	event := meta.event("upstream_connection_used")
+	event.ConnectionID = id
+	o.emit(event)
+	return wrapped
+}
+
+func (o *observer) forgetUpstreamConnection(id string, connection *countingUpstreamConn) {
+	if id == "" || connection == nil {
+		return
+	}
+	o.upstreamConnectionsMu.Lock()
+	if o.upstreamConnections[id] == connection {
+		delete(o.upstreamConnections, id)
+	}
+	o.upstreamConnectionsMu.Unlock()
 }
 
 func (o *observer) requestID() string {
@@ -696,19 +752,17 @@ type countingConn struct {
 type countingUpstreamConn struct {
 	net.Conn
 	observer *observer
-	meta     requestEvidence
 	id       string
+	metaMu   sync.RWMutex
+	meta     requestEvidence
+	bound    bool
 	closed   atomic.Bool
 }
 
 func (c *countingUpstreamConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		event := c.meta.event("upstream_response_chunk")
-		event.ConnectionID = c.id
-		event.Direction = "upstream_to_observer"
-		event.Bytes = int64(n)
-		c.observer.emit(event)
+		c.emitChunk("upstream_response_chunk", "upstream_to_observer", n)
 	}
 	return n, err
 }
@@ -716,18 +770,46 @@ func (c *countingUpstreamConn) Read(p []byte) (int, error) {
 func (c *countingUpstreamConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if n > 0 {
-		event := c.meta.event("upstream_request_chunk")
-		event.ConnectionID = c.id
-		event.Direction = "observer_to_upstream"
-		event.Bytes = int64(n)
-		c.observer.emit(event)
+		c.emitChunk("upstream_request_chunk", "observer_to_upstream", n)
 	}
 	return n, err
 }
 
 func (c *countingUpstreamConn) Close() error {
-	c.closed.CompareAndSwap(false, true)
+	if c.closed.CompareAndSwap(false, true) {
+		c.observer.forgetUpstreamConnection(c.id, c)
+	}
 	return c.Conn.Close()
+}
+
+func (c *countingUpstreamConn) bind(meta requestEvidence) {
+	c.metaMu.Lock()
+	c.meta = meta
+	c.bound = true
+	c.metaMu.Unlock()
+}
+
+func (c *countingUpstreamConn) unbind(requestID string) {
+	c.metaMu.Lock()
+	if c.bound && c.meta.requestID == requestID {
+		c.meta = requestEvidence{}
+		c.bound = false
+	}
+	c.metaMu.Unlock()
+}
+
+func (c *countingUpstreamConn) emitChunk(kind, direction string, bytes int) {
+	c.metaMu.RLock()
+	meta, bound := c.meta, c.bound
+	c.metaMu.RUnlock()
+	if !bound {
+		return
+	}
+	event := meta.event(kind)
+	event.ConnectionID = c.id
+	event.Direction = direction
+	event.Bytes = int64(bytes)
+	c.observer.emit(event)
 }
 
 func (c *countingConn) Read(p []byte) (int, error) {
@@ -783,14 +865,25 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 	return newObserverHandlerWithObserverAndGate(upstream, observation, nil)
 }
 
+func newGoldenObserverHTTPTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// The observer records bytes on one physical connection. HTTP/2 can
+	// multiplex unrelated requests on that connection, so constrain this
+	// transport to pooled HTTP/1.1 and bind its metadata at GotConn time.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	return transport
+}
+
 func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *observer, gate *goldenResponseGate) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// ReverseProxy resets the outbound request's Close flag, so a per-request
-	// observer context cannot safely identify events on a reused connection.
-	// Keep each upstream exchange on its own connection so evidence remains
-	// attributable to the request that produced it.
-	transport.DisableKeepAlives = true
+	transport := newGoldenObserverHTTPTransport()
 	dialer := &net.Dialer{}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		connection, err := dialer.DialContext(ctx, network, address)
@@ -809,13 +902,15 @@ func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *obser
 				}
 			}
 		}
-		id := goldenSocketEndpointID(connection.LocalAddr().String())
-		event := meta.event("upstream_connection_opened")
-		event.ConnectionID = id
-		observation.emit(event)
-		return &countingUpstreamConn{Conn: connection, observer: observation, meta: meta, id: id}, nil
+		if wrapped := observation.registerUpstreamConnection(connection, meta); wrapped != nil {
+			return wrapped, nil
+		}
+		return connection, nil
 	}
-	proxy.Transport = &goldenResponseAttemptHeaderStripTransport{base: transport}
+	proxy.Transport = &goldenUpstreamEvidenceTransport{
+		base:        &goldenResponseAttemptHeaderStripTransport{base: transport},
+		observation: observation,
+	}
 	if goldenTestHooks.enabled {
 		proxy.Transport = &goldenRequestWriteTransport{
 			base:   proxy.Transport,
@@ -892,6 +987,99 @@ type goldenResponseAttemptHeaderStripTransport struct {
 func (transport *goldenResponseAttemptHeaderStripTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	request.Header.Del(goldenResponseAttemptTokenHeader)
 	return transport.base.RoundTrip(request)
+}
+
+type goldenUpstreamEvidenceTransport struct {
+	base        http.RoundTripper
+	observation *observer
+}
+
+func (transport *goldenUpstreamEvidenceTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	meta, ok := request.Context().Value(requestEvidenceContextKey{}).(requestEvidence)
+	if !ok || transport.observation == nil {
+		return transport.base.RoundTrip(request)
+	}
+	var bound *countingUpstreamConn
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		if bound != nil {
+			bound.unbind(meta.requestID)
+		}
+		bound = transport.observation.bindUpstreamConnection(info.Conn, meta)
+	}}
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
+	response, err := transport.base.RoundTrip(request)
+	if err != nil {
+		if bound != nil {
+			bound.unbind(meta.requestID)
+		}
+		return nil, err
+	}
+	if bound == nil || response == nil || response.Body == nil {
+		if bound != nil {
+			bound.unbind(meta.requestID)
+		}
+		return response, nil
+	}
+	binding := &goldenUpstreamEvidenceBinding{connection: bound, requestID: meta.requestID}
+	if body, ok := response.Body.(io.ReadWriteCloser); ok {
+		response.Body = &goldenUpstreamReadWriteCloser{ReadWriteCloser: body, binding: binding}
+	} else {
+		response.Body = &goldenUpstreamReadCloser{ReadCloser: response.Body, binding: binding}
+	}
+	return response, nil
+}
+
+type goldenUpstreamEvidenceBinding struct {
+	connection *countingUpstreamConn
+	requestID  string
+	once       sync.Once
+}
+
+func (binding *goldenUpstreamEvidenceBinding) release() {
+	if binding == nil || binding.connection == nil {
+		return
+	}
+	binding.once.Do(func() {
+		binding.connection.unbind(binding.requestID)
+	})
+}
+
+type goldenUpstreamReadCloser struct {
+	io.ReadCloser
+	binding *goldenUpstreamEvidenceBinding
+}
+
+func (body *goldenUpstreamReadCloser) Read(p []byte) (int, error) {
+	n, err := body.ReadCloser.Read(p)
+	if err != nil {
+		body.binding.release()
+	}
+	return n, err
+}
+
+func (body *goldenUpstreamReadCloser) Close() error {
+	err := body.ReadCloser.Close()
+	body.binding.release()
+	return err
+}
+
+type goldenUpstreamReadWriteCloser struct {
+	io.ReadWriteCloser
+	binding *goldenUpstreamEvidenceBinding
+}
+
+func (body *goldenUpstreamReadWriteCloser) Read(p []byte) (int, error) {
+	n, err := body.ReadWriteCloser.Read(p)
+	if err != nil {
+		body.binding.release()
+	}
+	return n, err
+}
+
+func (body *goldenUpstreamReadWriteCloser) Close() error {
+	err := body.ReadWriteCloser.Close()
+	body.binding.release()
+	return err
 }
 
 func goldenResponseAttemptToken(header http.Header) string {

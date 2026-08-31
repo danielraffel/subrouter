@@ -3770,7 +3770,7 @@ func requireGoldenLocalObserverPath(session *goldenSession) error {
 			continue
 		}
 		switch event.Kind {
-		case "upstream_connection_opened":
+		case "upstream_connection_opened", "upstream_connection_used":
 			if opened != "" && opened != event.ConnectionID {
 				return failGolden("local_upstream_socket_changed")
 			}
