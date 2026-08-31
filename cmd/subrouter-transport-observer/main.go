@@ -852,27 +852,26 @@ func (c *countingConn) Write(p []byte) (int, error) {
 }
 
 func (c *countingConn) Close() error {
+	var pacingErr error
 	if c.websocketPacer != nil {
 		if !c.websocketPacer.hasPayload() {
 			c.websocketPacer.releaseRequest()
 		}
-		if err := c.websocketPacer.waitAndFlush(); err != nil {
-			_ = c.Conn.Close()
-			return err
-		}
+		pacingErr = c.websocketPacer.waitAndFlush()
 	} else if c.pacer != nil {
 		if !c.pacer.hasPayload() {
 			c.pacer.releaseRequest()
 		}
-		if err := c.pacer.waitAndFlush(); err != nil {
-			_ = c.Conn.Close()
-			return err
-		}
+		pacingErr = c.pacer.waitAndFlush()
 	}
 	if c.closed.CompareAndSwap(false, true) {
 		c.observer.emit(transportEvent{Kind: "connection_closed", ConnectionID: c.meta.connectionID})
 	}
-	return c.Conn.Close()
+	closeErr := c.Conn.Close()
+	if pacingErr != nil {
+		return pacingErr
+	}
+	return closeErr
 }
 
 func newObserverHandler(upstream *url.URL, events io.Writer) http.Handler {

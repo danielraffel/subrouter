@@ -158,11 +158,9 @@ func (p *goldenWebSocketPacer) write(
 		}
 		p.pending = append(p.pending, frame)
 		p.pendingBytes += len(frame)
-		if err := p.flushEligibleLocked(ctx); err != nil {
-			p.base.releaseRequest()
-			return 0, err
-		}
 	}
+	// Queue the whole parser batch before deciding whether to pace. A control
+	// frame later in this read must also make preceding data frames immediate.
 	if err := p.flushEligibleLocked(ctx); err != nil {
 		p.base.releaseRequest()
 		return 0, err
