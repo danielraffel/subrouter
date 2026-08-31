@@ -121,7 +121,32 @@ if [[ "${MODE}" == migrate-front ]]; then
       generation:$generation,checksum:$checksum,active_connections:$active,
       inactive_connections:$inactive},candidate_differs_from_active:true}')"
 else
-  [[ "${legacy_refs}" == 0 && "${front_refs}" == 1 ]] || die "URL map is not exactly on the front backend"
+  # After the listener handoff, the public URL map still names the legacy
+  # backend. That backend's :31415 named port is now owned by the stable front,
+  # while the front backend remains referenced by the protected canary host.
+  # A routine slot deployment must accept that deliberate state and prove the
+  # listener owner. Keep accepting the direct-front shape for fresh topology
+  # and older installations.
+  routing_current=""
+  listener_takeover_verified=false
+  listener_takeover_json='null'
+  if [[ "${legacy_refs}" == 0 && "${front_refs}" == 1 ]]; then
+    routing_current="front"
+  elif [[ "${legacy_refs}" == 1 && "${front_refs}" == 1 ]]; then
+    routing_current="front-listener"
+    listener_takeover_json="$(gcloud_ssh "set -eu
+      front_pid=\$(systemctl show subrouter-front.service -p MainPID --value)
+      test \"\${front_pid}\" -gt 1
+      systemctl is-active --quiet subrouter-front.service
+      ! systemctl is-active --quiet subrouter.service
+      ! systemctl is-active --quiet subrouter.socket
+      sudo ss -H -lntp \"sport = :31415\" | grep -F \"pid=\${front_pid},\" >/dev/null
+      jq -nc --argjson pid \"\${front_pid}\" \
+        '{verified:true,service:"subrouter-front.service",port:31415,pid:\$pid}'")"
+    listener_takeover_verified=true
+  else
+    die "URL map does not describe a supported post-migration route"
+  fi
   front_status="$(gcloud_ssh "systemctl is-active --quiet subrouter-front.service; sudo curl -fsS --unix-socket /var/lib/subrouter/front.sock http://localhost/_subrouter/front-status")"
   active_slot="$(jq -r '.active.id // empty' < <(stream_shell_value "${front_status}"))"
   [[ "${active_slot}" == slot-a || "${active_slot}" == slot-b ]] || die "front active slot is invalid"
@@ -141,14 +166,18 @@ else
     || die "front topology checksum is invalid"
   [[ "${worker_checksum}" != "${EXPECTED_SHA256}" ]] || die "slot candidate is already active"
   [[ "${slot_memory}" == 201326592 && "${front_memory}" == 134217728 ]] || die "front topology MemoryMax is incorrect"
-  topology="$(jq -nc --arg kind front-slots --arg current front --arg slot "${active_slot}" \
+  topology="$(jq -nc --arg kind front-slots --arg current "${routing_current}" --arg slot "${active_slot}" \
     --arg generation "${slot_generation}" --arg worker "${worker_checksum}" \
     --arg control "${control_checksum}" --arg front "${front_checksum}" \
     --argjson inactive "${slot_inactive_connections}" \
+    --argjson listener_takeover_verified "${listener_takeover_verified}" \
+    --argjson listener_takeover "${listener_takeover_json}" \
     '{kind:$kind,routing_current:$current,front:{service_active:true,active_slot:$slot,
       checksum:$front,memory_max_bytes:134217728},slot:{service_active:true,
       generation:$generation,worker_checksum:$worker,control_checksum:$control,
-      inactive_connections:$inactive,memory_max_bytes:201326592},candidate_differs_from_active:true}')"
+      inactive_connections:$inactive,memory_max_bytes:201326592},
+      listener_takeover_verified:$listener_takeover_verified,
+      listener_takeover:$listener_takeover,candidate_differs_from_active:true}')"
 fi
 
 emitted_at="$(utc_now)"

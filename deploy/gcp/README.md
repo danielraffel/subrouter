@@ -64,6 +64,10 @@ with an environment, an existing `v...` release tag, and one operation:
   GitHub release, verifies the checksum and tag commit provenance, retains the
   binary under `/opt/subrouter/releases/<tag>/`, and starts it in the inactive
   loopback supervisor slot. The same bytes run the slot supervisor and worker.
+  After the listener handoff, the URL map intentionally still names the legacy
+  backend for port `31415`; the stable front owns that listener, while the
+  front backend remains the protected canary route. The preflight proves this
+  ownership before a slot change.
 
 Routine deployment starts unpaused real Codex WebSocket and HTTP sessions
 through the public hostname. It enables the candidate slot, atomically persists

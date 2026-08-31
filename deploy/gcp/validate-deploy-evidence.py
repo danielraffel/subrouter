@@ -1263,10 +1263,41 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
         exact(integer(field(legacy, "inactive_connections", "topology.legacy"),
                       "topology.legacy.inactive_connections"), 0, "topology.legacy.inactive_connections")
     else:
-        exact(legacy_refs, 0, "routing.legacy_backend_references")
-        exact(front_refs, 1, "routing.front_backend_references")
         exact(field(topology, "kind", "topology"), "front-slots", "topology.kind")
-        exact(field(topology, "routing_current", "topology"), "front", "topology.routing_current")
+        routing_current = text(field(topology, "routing_current", "topology"), "topology.routing_current")
+        if (legacy_refs, front_refs) == (0, 1):
+            exact(routing_current, "front", "topology.routing_current")
+        elif (legacy_refs, front_refs) == (1, 1):
+            # The migration keeps the legacy backend as the URL-map route so
+            # existing connections remain addressable. The stable front owns
+            # its :31415 listener through descriptor takeover, and the front
+            # backend is still present as the protected canary route.
+            exact(routing_current, "front-listener", "topology.routing_current")
+            exact(
+                boolean(
+                    field(topology, "listener_takeover_verified", "topology"),
+                    "topology.listener_takeover_verified",
+                ),
+                True,
+                "topology.listener_takeover_verified",
+            )
+            takeover = obj(field(topology, "listener_takeover", "topology"), "topology.listener_takeover")
+            exact(boolean(field(takeover, "verified", "topology.listener_takeover"),
+                          "topology.listener_takeover.verified"), True,
+                  "topology.listener_takeover.verified")
+            exact(text(field(takeover, "service", "topology.listener_takeover"),
+                       "topology.listener_takeover.service"),
+                  "subrouter-front.service", "topology.listener_takeover.service")
+            exact(integer(field(takeover, "port", "topology.listener_takeover"),
+                          "topology.listener_takeover.port"), 31415,
+                  "topology.listener_takeover.port")
+            integer(field(takeover, "pid", "topology.listener_takeover"),
+                    "topology.listener_takeover.pid", minimum=2)
+        else:
+            fail(
+                "slot preflight URL-map references must be legacy=0/front=1 "
+                "or listener-takeover legacy=1/front=1"
+            )
         front = obj(field(topology, "front", "topology"), "topology.front")
         exact(boolean(field(front, "service_active", "topology.front"), "topology.front.service_active"), True,
               "topology.front.service_active")
