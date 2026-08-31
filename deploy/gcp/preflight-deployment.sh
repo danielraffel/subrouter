@@ -50,6 +50,7 @@ case "${INSTANCE}" in
     ACTIVE_MATCHER="__root__"
     CANARY_MATCHER="subrouter-front-canary"
     CANARY_HOST="front-canary.sr.cmux.internal"
+    CANARY_SECURITY_POLICY="subrouter-front-canary-policy"
     ;;
   subrouter-staging)
     LEGACY_BACKEND_SERVICE="${SUBROUTER_GCP_BACKEND_SERVICE:-subrouter-staging-backend}"
@@ -58,6 +59,7 @@ case "${INSTANCE}" in
     ACTIVE_MATCHER="staging-subrouter"
     CANARY_MATCHER="staging-subrouter-front-canary"
     CANARY_HOST="front-canary.staging.sr.cmux.internal"
+    CANARY_SECURITY_POLICY="subrouter-staging-front-canary-policy"
     ;;
   *)
     LEGACY_BACKEND_SERVICE="${SUBROUTER_GCP_BACKEND_SERVICE:?set SUBROUTER_GCP_BACKEND_SERVICE}"
@@ -66,6 +68,7 @@ case "${INSTANCE}" in
     ACTIVE_MATCHER="${SUBROUTER_GCP_ACTIVE_MATCHER:?set SUBROUTER_GCP_ACTIVE_MATCHER}"
     CANARY_MATCHER="${SUBROUTER_GCP_CANARY_MATCHER:?set SUBROUTER_GCP_CANARY_MATCHER}"
     CANARY_HOST="${SUBROUTER_GCP_CANARY_HOST:?set SUBROUTER_GCP_CANARY_HOST}"
+    CANARY_SECURITY_POLICY="${SUBROUTER_GCP_CANARY_SECURITY_POLICY:?set SUBROUTER_GCP_CANARY_SECURITY_POLICY}"
     ;;
 esac
 
@@ -110,6 +113,7 @@ active_backend_url=""
 canary_backend_url="${front_backend_url}"
 route_assignments_verified=false
 canary_present=false
+canary_access_control_json='null'
 
 if [[ "${MODE}" == migrate-front ]]; then
   [[ "${legacy_refs}" == 1 && "${front_refs}" == 0 ]] || die "URL map is not exactly on the legacy backend"
@@ -195,13 +199,25 @@ else
             .active_backends == [$legacy_url]
             and (.canary_rules | length) == 1
             and .canary_rules[0].hosts == [$canary_host]
+            and ((.canary_rules[0] | keys | sort) == ["hosts", "pathMatcher"])
             and (.canary_matchers | length) == 1
             and .canary_matchers[0].defaultService == $front_url
+            and ((.canary_matchers[0] | keys | sort) == ["defaultService", "name"])
           )
         | {verified:true,active_backend:$legacy_url,canary_backend:$front_url}
       ' < <(stream_shell_value "${url_map_json}"))" \
       || die "URL map active and canary assignments do not match the post-migration route"
     route_assignments_verified=true
+    expected_policy_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/securityPolicies/${CANARY_SECURITY_POLICY}"
+    backend_policy_json="$("${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
+      --project "${PROJECT_ID}" --global --format=json)"
+    [[ "$(jq -r '.securityPolicy // empty' < <(stream_shell_value "${backend_policy_json}"))" == "${expected_policy_url}" ]] \
+      || die "front backend is not attached to the expected canary security policy"
+    policy_json="$("${GCLOUD_BINARY}" compute security-policies describe "${CANARY_SECURITY_POLICY}" \
+      --project "${PROJECT_ID}" --global --format=json)"
+    canary_access_control_json="$(printf '%s\n' "${policy_json}" | python3 "${SCRIPT_DIR}/canary-security-policy.py" \
+      assert-ready - "${CANARY_SECURITY_POLICY}" "${CANARY_HOST}")" \
+      || die "canary security policy does not satisfy the access boundary"
     listener_takeover_json="$(gcloud_ssh "set -eu; front_pid=\$(systemctl show subrouter-front.service -p MainPID --value); test \"\${front_pid}\" -gt 1; systemctl is-active --quiet subrouter-front.service; ! systemctl is-active --quiet subrouter.service; ! systemctl is-active --quiet subrouter.socket; ! systemctl is-enabled --quiet subrouter.service; ! systemctl is-enabled --quiet subrouter.socket; sudo ss -H -lntp 'sport = :31415' | grep -F \"pid=\${front_pid},\" >/dev/null; printf '%s\\n' \"{\\\"verified\\\":true,\\\"service\\\":\\\"subrouter-front.service\\\",\\\"port\\\":31415,\\\"pid\\\":\${front_pid}}\"")"
     listener_takeover_verified=true
   else
@@ -256,6 +272,7 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type deploy
   --arg legacy_backend_url "${legacy_backend_url}" --arg front_backend_url "${front_backend_url}" \
   --arg canary_matcher "${CANARY_MATCHER}" --arg canary_host "${CANARY_HOST}" \
   --arg canary_backend_url "${canary_backend_url}" \
+  --argjson canary_access_control "${canary_access_control_json}" \
   --argjson legacy_refs "${legacy_refs}" --argjson front_refs "${front_refs}" \
   --argjson route_assignments_verified "${route_assignments_verified}" \
   --argjson canary_present "${canary_present}" \
@@ -270,7 +287,8 @@ jq -n --arg schema 'subrouter.gcp.deploy-evidence/v1' --arg evidence_type deploy
       active_backend_url:$active_backend_url,legacy_backend_url:$legacy_backend_url,
       front_backend_url:$front_backend_url,route_assignments_verified:$route_assignments_verified,
       canary:{present:$canary_present,host:$canary_host,matcher:$canary_matcher,
-        backend_url:$canary_backend_url}},topology:$topology,evidence_emitted_at:$emitted_at}' \
+        backend_url:$canary_backend_url,access_control:$canary_access_control}},
+      topology:$topology,evidence_emitted_at:$emitted_at}' \
   >"${evidence_tmp}"
 python3 "${SCRIPT_DIR}/validate-deploy-evidence.py" --expect deployment-preflight "${evidence_tmp}" >/dev/null
 chmod 0600 "${evidence_tmp}"

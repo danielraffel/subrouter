@@ -1272,11 +1272,39 @@ def validate_preflight_routing(
     else:
         fail("preflight URL-map reference shape is unsupported")
     exact(active_backend_url, expected_active_url, "routing.active_backend_url")
-    exact(
-        boolean(field(canary, "present", "routing.canary"), "routing.canary.present"),
-        expected_canary_present,
-        "routing.canary.present",
-    )
+    canary_present = boolean(field(canary, "present", "routing.canary"), "routing.canary.present")
+    exact(canary_present, expected_canary_present, "routing.canary.present")
+    access_value = field(canary, "access_control", "routing.canary")
+    if canary_present:
+        access = obj(access_value, "routing.canary.access_control")
+        expected_policy = {
+            "subrouter-team": "subrouter-front-canary-policy",
+            "subrouter-staging": "subrouter-staging-front-canary-policy",
+        }.get(run["instance"])
+        if expected_policy is not None:
+            exact(field(access, "name", "routing.canary.access_control"), expected_policy,
+                  "routing.canary.access_control.name")
+        exact(field(access, "type", "routing.canary.access_control"), "CLOUD_ARMOR",
+              "routing.canary.access_control.type")
+        exact(boolean(field(access, "attached", "routing.canary.access_control"),
+                      "routing.canary.access_control.attached"), True,
+              "routing.canary.access_control.attached")
+        for name, expected in (
+            ("allow_priority", 900),
+            ("deny_priority", 1000),
+            ("unauthorized_status", 403),
+            ("authorized_status", 400),
+        ):
+            exact(integer(field(access, name, "routing.canary.access_control"),
+                          f"routing.canary.access_control.{name}"), expected,
+                  f"routing.canary.access_control.{name}")
+        exact(boolean(field(access, "key_redacted_before_backend", "routing.canary.access_control"),
+                      "routing.canary.access_control.key_redacted_before_backend"), True,
+              "routing.canary.access_control.key_redacted_before_backend")
+        sha(field(access, "key_fingerprint_sha256", "routing.canary.access_control"),
+            "routing.canary.access_control.key_fingerprint_sha256")
+    else:
+        exact(access_value, None, "routing.canary.access_control")
 
 
 def validate_deployment_preflight(document: dict[str, Any]) -> None:
