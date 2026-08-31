@@ -605,8 +605,8 @@ authentication paths, not additional selectable OAuth profiles
 [headless auth](https://antigravity.google/docs/cli/headless/),
 [enterprise](https://antigravity.google/docs/enterprise/)).
 
-Plain `agy` remains the vendor's direct CLI. `sr agy proxy` (also
-`sr antigravity proxy`) launches that CLI locally while sending model traffic
+Plain `agy` remains the vendor's direct CLI. `sr agy` (also
+`sr antigravity`) launches that CLI locally while sending model traffic
 through the selected Subrouter and its Antigravity credential. The local CLI
 login is used only to satisfy the CLI's own bootstrap; its bearer credential is
 removed by a loopback relay and is never copied to the selected server. A
@@ -617,7 +617,9 @@ no local-to-remote Antigravity token import: the
 CLI exposes neither a safe independent profile format nor a supported
 account-selector workflow. `sr status` reports the router credential as
 `ready`, `active`, or `error`, and says quota is not exposed instead of polling
-an unsupported quota endpoint.
+an unsupported quota endpoint. `sr agy proxy` remains an explicit launcher
+alias. Antigravity currently has one router-host OAuth login, so its launcher
+does not advertise `--account` pinning.
 
 Native proxy launchers preflight the selected router before starting the vendor
 CLI. Hosted or otherwise lease-required routers are rejected until Subrouter has
@@ -640,7 +642,8 @@ sr kimi login work
 sr kimi login personal
 sr kimi list
 sr kimi remove personal
-sr kimi proxy
+sr kimi
+sr kimi --account work
 ```
 
 The labels are the management and status names; Subrouter does not infer an
@@ -648,9 +651,15 @@ email or account name from undocumented token contents. Each profile refreshes
 atomically and is independently schedulable; `active` means a persistent session
 is assigned, `rec` is the next eligible profile, and `ready` means authenticated
 with quota but currently idle.
-Plain `kimi` remains direct. `sr kimi proxy` uses a process-only model override
+Plain `kimi` remains direct. `sr kimi` uses a process-only model override
 for the selected Subrouter, including resumed sessions, without rewriting
 `~/.kimi-code` or changing its global OAuth login.
+The default launch is pooled and may fail over. `sr kimi --account work` pins
+that child to the exact routed profile or key with no account failover; bare
+`--account` opens a pinned-account picker. This per-launch pin does not change
+the global recommendation or the pooled working-directory assignment. `sr kimi
+proxy` remains an explicit alias. Put
+vendor arguments after `--` when they could be confused with wrapper options.
 Kimi Code subscription API keys can also be added with
 `sr add-key --provider kimi`. Kimi documents that every device and API key under
 one membership shares the same quota, so extra keys are failover credentials,
@@ -703,8 +712,9 @@ store from the running daemon.
 Launch Qwen Code through the selected Token Plan pool with:
 
 ```bash
-sr qwen proxy
-sr qwen proxy --model qwen3.8-max
+sr qwen
+sr qwen --model qwen3.8-max
+sr qwen --account large-plan
 ```
 
 Plain `qwen` remains direct. The proxy launcher keeps the normal Qwen home,
@@ -718,7 +728,11 @@ plan key. If Qwen system-policy files or their path environment variables are
 present, the launcher fails closed instead of hiding administrator policy.
 When Alibaba returns a 429 for one plan account, Subrouter replays the
 generation request with another stored Qwen account and moves that sticky
-session to the successful account.
+session to the successful account. A launch with `--account` instead pins the
+exact plan account and returns that account's error rather than failing over;
+bare `--account` opens a clearly labeled pinned picker. `sr qwen proxy` remains
+an explicit alias. Account-scoped pinned session identities keep parallel pins
+from replacing the pooled working-directory assignment.
 
 Standalone local status probes use the documented vendor default upstream;
 custom serving upstreams are not persisted into the CLI configuration.

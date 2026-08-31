@@ -1623,9 +1623,15 @@ Usage:
   %[1]s status             Show usage across all configured providers (non-interactive)
   %[1]s qwen login [--console-account <email-or-label>] <account>
                            Authorize live Qwen Token Plan quota status
-  %[1]s qwen proxy [args]  Launch Qwen Code through the selected Token Plan pool
+  %[1]s qwen [args]        Launch Qwen Code through the selected Token Plan pool
+  %[1]s qwen --account [account] [-- args]
+                           Pin one Qwen account with no account failover
+  %[1]s qwen proxy [args]  Explicit launcher alias for %[1]s qwen
   %[1]s kimi login <label> Add an isolated Kimi subscription account
-  %[1]s kimi proxy [args]  Launch Kimi Code through the selected Kimi pool
+  %[1]s kimi [args]        Launch Kimi Code through the selected Kimi pool
+  %[1]s kimi --account [account] [-- args]
+                           Pin one Kimi account with no account failover
+  %[1]s kimi proxy [args]  Explicit launcher alias for %[1]s kimi
   %[1]s kimi list          List Kimi CLI and managed subscription accounts
   %[1]s kimi remove <label>
                            Remove one managed Kimi subscription account
@@ -1681,7 +1687,8 @@ Usage:
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
-  %[1]s agy proxy [args]   Launch Antigravity through Subrouter (plain agy stays direct)
+  %[1]s agy [args]         Launch Antigravity through Subrouter (plain agy stays direct)
+  %[1]s agy proxy [args]   Explicit launcher alias for %[1]s agy
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles (routing scaffold only)
 

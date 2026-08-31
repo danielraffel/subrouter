@@ -9,12 +9,12 @@ its ordinary name uses Subrouter.
 |---|---|---|---|---|---|---|---|---|
 | Codex OAuth and API key | `sr codex`; Responses at `/v1` | Isolated OAuth accounts and API keys | ChatGPT OAuth or OpenAI bearer selected per account; client placeholder removed | Plain `codex` | Per thread; quota, auth, and transport failover across eligible accounts | 5h/7d, reset credits, dollars, and named windows only when exposed | Full routing, credential isolation, retry, and launcher suites | User-tested |
 | Claude OAuth and API key | `sr claude proxy`; Anthropic Messages at router root | Isolated Claude profiles and API keys | Client auth removed; selected bearer and required beta headers added | Plain `claude` or `sr claude-direct` | Per conversation; pooled profile failover, with optional pinned launch | Plan, session, weekly, model-specific, and extra windows when exposed | Full routing, profile isolation, retry, and launcher suites | User-tested |
-| Kimi OAuth subscription | `sr kimi proxy`; `/kimi/v1/messages` | Isolated managed Kimi profiles | Client auth removed; selected OAuth bearer and Kimi headers added | Plain `kimi` | Per process/session; failover across managed profiles | Plan plus 5h/weekly windows; active/ready/recommended state | H1, H2, H3 | User-tested |
-| Kimi API key | `sr kimi proxy`; `/kimi/v1/messages` | Labeled API-key accounts | Client auth removed; selected bearer and `x-api-key` added | Plain `kimi` or direct vendor URL | Per session; 429/auth failover across keys and eligible Kimi accounts | Key health; subscription windows only when the default Kimi authority exposes them | H1, H2, H3 | Server route user-tested; distinct-key ownership is label-based |
+| Kimi OAuth subscription | `sr kimi` (`proxy` alias); `/kimi/v1/messages` | Isolated managed Kimi profiles | Client auth removed; selected OAuth bearer and Kimi headers added | Plain `kimi` | Pooled per-session failover by default; `--account` is a hard per-launch pin with no account failover | Plan plus 5h/weekly windows; active/ready/recommended state | H1, H2, H3 | User-tested |
+| Kimi API key | `sr kimi` (`proxy` alias); `/kimi/v1/messages` | Labeled API-key accounts | Client auth removed; selected bearer and `x-api-key` added | Plain `kimi` or direct vendor URL | Pooled 429/auth failover by default; `--account` is a hard per-launch pin | Key health; subscription windows only when the default Kimi authority exposes them | H1, H2, H3 | Server route user-tested; distinct-key ownership is label-based |
 | Qwen Coding Plan API key | OpenAI-compatible client at `/qwen/v1` | Labeled Coding Plan keys | Client auth removed; selected bearer added | Plain `qwen` with its normal provider | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live generation canary recorded |
-| Qwen Token Plan, OpenAI protocol | `sr qwen proxy`; `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Per session; failover across keys; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
+| Qwen Token Plan, OpenAI protocol | `sr qwen` (`proxy` alias); `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Pooled key failover by default; `--account` is a hard per-launch pin; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
 | Qwen Token Plan, Anthropic protocol | Anthropic client at `/qwen-anthropic` | Same Token Plan pool as OpenAI route | Client auth removed; selected plan bearer and Anthropic version added | Direct vendor Anthropic endpoint | Same sticky account and exhaustion state as `/qwen-token` | Same shared account and console telemetry | H1, H2 | No live generation canary recorded |
-| Antigravity / AGY OAuth | `sr agy proxy` or `sr antigravity proxy`; `/antigravity` | One `agy` keychain login on a local/single-tenant router host; not inherited by hosted tenant pools | Local CLI auth is stripped by loopback relay; router OAuth bearer added | Plain `agy` | Sticky session; no multi-account OAuth selector is claimed | Safe token identity claim when present, otherwise router-login label; ready/active/error; quota not exposed | H1, H3, H4 | Local login user-tested; proxy generation canary required after deployment |
+| Antigravity / AGY OAuth | `sr agy` or `sr antigravity` (`proxy` aliases); `/antigravity` | One `agy` keychain login on a local/single-tenant router host; not inherited by hosted tenant pools | Local CLI auth is stripped by loopback relay; router OAuth bearer added | Plain `agy` | Sticky session; `--account` is explicitly unsupported because there is no multi-account OAuth selector | Safe token identity claim when present, otherwise router-login label; ready/active/error; quota not exposed | H1, H3, H4 | Local login user-tested; proxy generation canary required after deployment |
 | Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
 | OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | Live auth and routed generation canaries recorded |
@@ -38,26 +38,32 @@ Hermetic coverage key:
   sticky placement, 429/auth failover, and the shared Token Plan pool.
 - **H3 — native launch:** `cmd/subrouter/sr_native_proxy_test.go` proves local
   relay composition, credential scrubbing, process-only Kimi/Qwen routing,
-  system-policy refusal, and direct-home preservation.
+  system-policy refusal, direct-home preservation, and strict per-launch pins.
 - **H4 — OAuth lifecycle:** `internal/proxy/oauth_source_test.go`,
   `internal/proxy/scoreaccounts_test.go`, and provider-store tests prove refresh
   behavior and suppression of unsupported quota polling.
 
 ## Native launcher boundary
 
-The dedicated launchers are deliberately explicit:
+The dedicated launchers are explicit `sr` commands while the plain vendor
+commands remain direct:
 
 ```text
 sr codex
 sr claude proxy
-sr kimi proxy
-sr qwen proxy
-sr agy proxy
+sr kimi
+sr qwen
+sr agy
 ```
 
-The corresponding plain vendor commands remain direct. This preserves a usable
-bypass when Subrouter is unavailable and prevents installation from silently
-capturing unrelated CLI traffic.
+The older `sr kimi proxy`, `sr qwen proxy`, and `sr agy proxy` spellings remain
+aliases. Kimi and Qwen default to the router's pooled scheduler. A leading
+`--account <selector>` pins only that launched child to the exact account and
+disables account failover; bare `--account` opens a pinned picker. The option is
+wrapper-owned only before the first vendor argument or `--`, so vendor arguments
+remain unambiguous. Antigravity rejects `--account` because it exposes only the
+single router-host OAuth login. None of these choices changes the global
+recommendation.
 
 Kimi and Qwen launchers preserve their normal session stores. Kimi uses its
 documented in-memory model override and forces that model for resumed sessions.
@@ -67,10 +73,13 @@ run when an existing system policy is configured rather than masking that
 policy. The Antigravity relay similarly leaves the local keychain untouched and
 removes the local bearer before forwarding to the selected router.
 
-Native launcher account affinity is provider-and-working-directory scoped. The
-initial launch, continue, and explicit resume therefore retain one router
-assignment without inspecting or persisting vendor session files. Parallel
-native sessions in the same working directory deliberately share that account.
+Pooled native-launcher account affinity is provider-and-working-directory
+scoped. The initial launch, continue, and explicit resume therefore retain one
+router assignment without inspecting or persisting vendor session files. A
+hard-pinned launch carries the forced account only through the short-lived local
+relay and uses an account-scoped session identity. The router never falls back
+to a different account, parallel pins do not fight over one assignment, and a
+pin does not replace the pooled working-directory assignment.
 
 Before starting the child, every native launcher performs an authenticated
 `HEAD` preflight against the exact data-plane root. Lease-required/hosted

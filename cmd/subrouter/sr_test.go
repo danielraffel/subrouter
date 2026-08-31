@@ -687,21 +687,21 @@ func TestFetchUsageRowsExcludesKimiCLICredentialWithoutRefreshingIt(t *testing.T
 	}
 	var out bytes.Buffer
 	printKimiCLIOnlyStatusHint(&out, nil)
-	if !strings.Contains(out.String(), "plain 'kimi' login is direct") || !strings.Contains(out.String(), "sr kimi proxy") {
+	if !strings.Contains(out.String(), "plain 'kimi' login is direct") || !strings.Contains(out.String(), "sr kimi") {
 		t.Fatalf("status hint is not actionable: %q", out.String())
 	}
 	out.Reset()
 	printKimiCLIOnlyStatusHint(&out, []srUsageRow{{
 		email: "kimi-code", provider: accounts.ProviderKimi, authMode: accounts.AuthModeOAuth,
 	}})
-	if !strings.Contains(out.String(), "Plain 'kimi' uses the local direct login") || !strings.Contains(out.String(), "sr kimi proxy") || strings.Contains(out.String(), "sr kimi login") {
+	if !strings.Contains(out.String(), "Plain 'kimi' uses the local direct login") || !strings.Contains(out.String(), "sr kimi") || strings.Contains(out.String(), "sr kimi login") {
 		t.Fatalf("status did not distinguish direct and managed Kimi launchers: %q", out.String())
 	}
 	out.Reset()
 	printKimiCLIOnlyStatusHint(&out, []srUsageRow{{
 		email: "kimi:key", provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey,
 	}})
-	if !strings.Contains(out.String(), "routed Subrouter Kimi key pool") || !strings.Contains(out.String(), "sr kimi proxy") || strings.Contains(out.String(), "sr kimi login") {
+	if !strings.Contains(out.String(), "routed Subrouter Kimi key pool") || !strings.Contains(out.String(), "sr kimi") || strings.Contains(out.String(), "sr kimi login") {
 		t.Fatalf("status did not recognize an API-key-only Kimi pool: %q", out.String())
 	}
 }

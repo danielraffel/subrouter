@@ -20,8 +20,10 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		fmt.Fprintln(r.out, "Usage: sr kimi login <label>")
 		fmt.Fprintln(r.out, "       sr kimi list")
 		fmt.Fprintln(r.out, "       sr kimi remove <label>")
-		fmt.Fprintln(r.out, "       sr kimi proxy [kimi args...]")
-		fmt.Fprintln(r.out, "Managed profiles are routed only by 'sr kimi proxy'; plain 'kimi' remains direct.")
+		fmt.Fprintln(r.out, "       sr kimi [--account [account]] [-- kimi args...]")
+		fmt.Fprintln(r.out, "       sr kimi proxy [--account [account]] [-- kimi args...]  (explicit alias)")
+		fmt.Fprintln(r.out, "Omit --account for pooled failover; a pinned account has no account failover.")
+		fmt.Fprintln(r.out, "Plain 'kimi' remains direct.")
 		return nil
 	}
 	switch args[0] {
@@ -122,7 +124,8 @@ func (r srRunner) kimiRemote(ctx context.Context, server srServerConfig, args []
 		fmt.Fprintln(r.out, "Usage: sr kimi login <label>")
 		fmt.Fprintln(r.out, "       sr kimi list")
 		fmt.Fprintln(r.out, "       sr kimi remove <label>")
-		fmt.Fprintln(r.out, "       sr kimi proxy [kimi args...]")
+		fmt.Fprintln(r.out, "       sr kimi [--account [account]] [-- kimi args...]")
+		fmt.Fprintln(r.out, "       sr kimi proxy [--account [account]] [-- kimi args...]  (explicit alias)")
 		fmt.Fprintf(r.out, "Managed profiles are stored on server %s.\n", server.Name)
 		return nil
 	}

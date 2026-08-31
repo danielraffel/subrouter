@@ -730,6 +730,63 @@ func TestQwenProtocolsShareSchedulerLiveLoadThroughHandler(t *testing.T) {
 	}
 }
 
+func TestForcedQwenAccountOverridesStickyAndDoesNotFailOver(t *testing.T) {
+	var forcedHits, alternateHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("X-Subrouter-Account-ID"); got != "" {
+			t.Fatalf("forced routing header leaked upstream: %q", got)
+		}
+		switch request.Header.Get("Authorization") {
+		case "Bearer forced-key":
+			forcedHits++
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"quota exhausted"}}`)
+		case "Bearer alternate-key":
+			alternateHits++
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"must not be served"}}]}`)
+		default:
+			http.Error(w, "unexpected credential", http.StatusUnauthorized)
+		}
+	}))
+	defer upstream.Close()
+
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("qwen-token", "pinned-native-session", "qwen-token:alternate", ""); err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "qwen-token:forced", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "forced-key"},
+			{ID: "qwen-token:alternate", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey, Token: "alternate-key"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "qwen-token:forced", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+			{AccountID: "qwen-token:alternate", Provider: accounts.ProviderQwenToken, Headroom: 1, ShortHeadroom: 1},
+		})),
+		QwenTokenUpstream: mustParseURL(t, upstream.URL+"/compatible-mode/v1"),
+		MaxBodyBytes:      1024,
+	}
+	request := httptest.NewRequest(http.MethodPost, "/qwen-token/v1/chat/completions", strings.NewReader(`{"model":"qwen3.7-plus","messages":[]}`))
+	request.Header.Set("X-Subrouter-Session", "pinned-native-session")
+	request.Header.Set("X-Subrouter-Account-ID", "qwen-token:forced")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want forced account's 429; body=%s", response.Code, response.Body.String())
+	}
+	if forcedHits != 1 || alternateHits != 0 {
+		t.Fatalf("upstream hits = forced:%d alternate:%d, want 1 and 0", forcedHits, alternateHits)
+	}
+	assignment, ok := store.Get("qwen-token", "pinned-native-session")
+	if !ok || assignment.AccountID != "qwen-token:forced" {
+		t.Fatalf("forced assignment = %+v, %t", assignment, ok)
+	}
+}
+
 func TestFailedQwenAlternateKeepsOriginalStickyAssignment(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.Header.Get("Authorization") {

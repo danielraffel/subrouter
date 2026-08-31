@@ -76,9 +76,15 @@ Usage:
   sr status             Show usage across all configured providers (non-interactive)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
-  sr qwen proxy [args]  Run Qwen Code through the selected Token Plan pool
+  sr qwen [args]        Run Qwen Code through the selected Token Plan pool
+  sr qwen --account [account] [-- args]
+                        Run pinned to one Qwen account with no account failover
+  sr qwen proxy [args]  Explicit launcher alias for sr qwen
   sr kimi login <label> Add an isolated Kimi subscription account
-  sr kimi proxy [args]  Run Kimi Code through the selected Kimi pool
+  sr kimi [args]        Run Kimi Code through the selected Kimi pool
+  sr kimi --account [account] [-- args]
+                        Run pinned to one Kimi account with no account failover
+  sr kimi proxy [args]  Explicit launcher alias for sr kimi
   sr kimi list          List Kimi CLI and managed subscription accounts
   sr kimi remove <label>
                         Remove one managed Kimi subscription account
@@ -138,10 +144,15 @@ Running agents:
   sr claude proxy --account [profile]
                         Run pinned to one Claude profile with no account failover
   sr gemini             Manage Gemini profiles (routing scaffold only)
-  sr antigravity proxy [args]
-  sr agy proxy [args]   Run agy through Subrouter (plain agy stays direct)
-  sr kimi proxy [args]  Run Kimi Code through Subrouter (plain kimi stays direct)
-  sr qwen proxy [args]  Run Qwen Code through Subrouter (plain qwen stays direct)
+  sr antigravity [args]
+  sr agy [args]         Run agy through Subrouter (plain agy stays direct)
+  sr kimi [args]        Run Kimi Code through Subrouter (plain kimi stays direct)
+  sr qwen [args]        Run Qwen Code through Subrouter (plain qwen stays direct)
+  sr <kimi|qwen> --account [account] [-- args]
+                        Pin this process with no account failover
+  sr agy proxy [args]   Explicit launcher alias for sr agy
+  sr kimi proxy [args]  Explicit launcher alias for sr kimi
+  sr qwen proxy [args]  Explicit launcher alias for sr qwen
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
@@ -316,12 +327,26 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 				return r.codexAccount(ctx, args[1:])
 			}
 		case "kimi":
-			if len(args) > 1 && args[1] == "proxy" {
-				return r.launchKimiProxy(ctx, args[2:])
+			if len(args) > 1 && (args[1] == "help" || args[1] == "-h" || args[1] == "--help") {
+				return r.kimiCommand(ctx, args[1:])
+			}
+			if !isKimiManagementCommand(args[1:]) {
+				launchArgs := args[1:]
+				if len(launchArgs) > 0 && launchArgs[0] == "proxy" {
+					launchArgs = launchArgs[1:]
+				}
+				return r.launchKimiProxy(ctx, launchArgs)
 			}
 		case "qwen":
-			if len(args) > 1 && args[1] == "proxy" {
-				return r.launchQwenProxy(ctx, args[2:])
+			if len(args) > 1 && (args[1] == "help" || args[1] == "-h" || args[1] == "--help") {
+				return r.qwen(ctx, args[1:])
+			}
+			if !isQwenManagementCommand(args[1:]) {
+				launchArgs := args[1:]
+				if len(launchArgs) > 0 && launchArgs[0] == "proxy" {
+					launchArgs = launchArgs[1:]
+				}
+				return r.launchQwenProxy(ctx, launchArgs)
 			}
 		case "antigravity", "agy":
 			return r.antigravityCommand(ctx, args[1:])
@@ -489,6 +514,30 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return r.statusOne(ctx, args[0])
 		}
 		return fmt.Errorf("unknown account command %q\n%s", args[0], srHelp)
+	}
+}
+
+func isKimiManagementCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "-h", "--help", "login", "add", "list", "ls", "remove", "rm":
+		return true
+	default:
+		return false
+	}
+}
+
+func isQwenManagementCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "-h", "--help", "login", "label":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1134,19 +1183,19 @@ func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
 		}
 		hasKimiPool = true
 		if row.authMode == accounts.AuthModeOAuth {
-			fmt.Fprintln(out, "Plain 'kimi' uses the local direct login; use 'sr kimi proxy' for the managed Subrouter pool.")
+			fmt.Fprintln(out, "Plain 'kimi' uses the local direct login; use 'sr kimi' for the managed Subrouter pool.")
 			return
 		}
 	}
 	if hasKimiPool {
-		fmt.Fprintln(out, "Plain 'kimi' uses its local direct configuration; use 'sr kimi proxy' for the routed Subrouter Kimi key pool.")
+		fmt.Fprintln(out, "Plain 'kimi' uses its local direct configuration; use 'sr kimi' for the routed Subrouter Kimi key pool.")
 		return
 	}
 	_, ok, err := agentkimi.DefaultStore().ReadLocalCredential(time.Now())
 	if err != nil || !ok {
 		return
 	}
-	fmt.Fprintln(out, "The plain 'kimi' login is direct. Run 'sr kimi login <label>' to add a managed account, then use 'sr kimi proxy'.")
+	fmt.Fprintln(out, "The plain 'kimi' login is direct. Run 'sr kimi login <label>' to add a managed account, then use 'sr kimi'.")
 }
 
 func (r srRunner) statusOne(ctx context.Context, selector string) error {

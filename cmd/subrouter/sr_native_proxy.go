@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,33 +20,44 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 const (
-	antigravityProxyHelp = `Usage: sr antigravity proxy [agy args...]
+	antigravityProxyHelp = `Usage: sr antigravity [agy args...]
+       sr agy [agy args...]
        sr agy proxy [agy args...]
 
 Launch agy through the selected Subrouter. Plain 'agy' remains a direct bypass.
 The agy CLI must still have its own local login; Subrouter never copies or changes it.
+Antigravity currently has one router-host login, so --account pinning is not supported.
 `
-	kimiProxyHelp = `Usage: sr kimi proxy [kimi args...]
+	kimiProxyHelp = `Usage: sr kimi [--account [account]] [-- kimi args...]
+       sr kimi proxy [--account [account]] [-- kimi args...]
 
 Launch Kimi Code through the selected Subrouter pool. Plain 'kimi' remains direct.
+Omit --account for pooled failover. A named account is pinned with no account failover;
+bare --account opens a pinned-account picker.
 The process-scoped model override leaves Kimi's normal login and config unchanged.
 Account affinity is stable per working directory, including resumed sessions.
-The session-picker form requires an explicit ID: sr kimi proxy --session <session-id>.
+The session-picker form requires an explicit ID: sr kimi --session <session-id>.
 `
-	qwenProxyHelp = `Usage: sr qwen proxy [qwen args...]
+	qwenProxyHelp = `Usage: sr qwen [--account [account]] [-- qwen args...]
+       sr qwen proxy [--account [account]] [-- qwen args...]
 
 Launch Qwen Code through the selected Qwen Token Plan pool. Plain 'qwen' remains direct.
+Omit --account for pooled failover. A named account is pinned with no account failover;
+bare --account opens a pinned-account picker.
 The process-only routing overlay preserves Qwen's normal sessions and configuration.
 Account affinity is stable per working directory, including resumed sessions.
-The session-picker form requires an explicit ID: sr qwen proxy --resume <session-id>.
+The session-picker form requires an explicit ID: sr qwen --resume <session-id>.
 `
 )
 
@@ -56,6 +68,11 @@ type nativeProxySpec struct {
 	route    string
 	provider accounts.Provider
 	authMode accounts.AuthMode
+}
+
+type nativeProxyLaunchOptions struct {
+	accountSelector   string
+	pickPinnedAccount bool
 }
 
 var (
@@ -74,44 +91,99 @@ var (
 )
 
 func (r srRunner) antigravityCommand(ctx context.Context, args []string) error {
-	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
 		fmt.Fprint(r.out, antigravityProxyHelp)
 		return nil
 	}
-	if args[0] != "proxy" {
-		return fmt.Errorf("unknown Antigravity command %q; use 'sr agy proxy'", args[0])
+	if len(args) > 0 && args[0] == "proxy" {
+		args = args[1:]
 	}
-	return r.launchNativeProxy(ctx, antigravityNativeProxy, args[1:])
+	if len(args) > 0 && (args[0] == "--account" || strings.HasPrefix(args[0], "--account=")) {
+		return errors.New("Antigravity currently has one router-host login; --account pinning is not supported")
+	}
+	return r.launchNativeProxy(ctx, antigravityNativeProxy, args, nativeProxyLaunchOptions{})
 }
 
 func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {
-	if len(args) > 0 {
-		switch args[0] {
+	options, vendorArgs, err := parseNativeProxyLaunchArgs(args)
+	if err != nil {
+		return err
+	}
+	if len(vendorArgs) > 0 {
+		switch vendorArgs[0] {
 		case "login", "provider":
-			return fmt.Errorf("%q changes Kimi's local credentials; use plain 'kimi %s' for the direct CLI or 'sr kimi login <label>' to manage the routed pool", args[0], args[0])
+			return fmt.Errorf("%q changes Kimi's local credentials; use plain 'kimi %s' for the direct CLI or 'sr kimi login <label>' to manage the routed pool", vendorArgs[0], vendorArgs[0])
 		}
 	}
-	if nativeProxyResumePickerRequested(kimiNativeProxy, args) {
-		return errors.New("'sr kimi proxy --session' requires an explicit session ID so Subrouter can preserve sticky account routing")
+	if nativeProxyResumePickerRequested(kimiNativeProxy, vendorArgs) {
+		return errors.New("'sr kimi --session' requires an explicit session ID so Subrouter can preserve sticky account routing")
 	}
-	return r.launchNativeProxy(ctx, kimiNativeProxy, args)
+	return r.launchNativeProxy(ctx, kimiNativeProxy, vendorArgs, options)
 }
 
 func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--" {
+	options, vendorArgs, err := parseNativeProxyLaunchArgs(args)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < len(vendorArgs); i++ {
+		if vendorArgs[i] == "--" {
 			break
 		}
 		for _, option := range []string{"--auth-type", "--openai-api-key", "--openai-base-url", "--proxy"} {
-			if args[i] == option || strings.HasPrefix(args[i], option+"=") {
-				return fmt.Errorf("%s controls Qwen routing and cannot be used with 'sr qwen proxy'", option)
+			if vendorArgs[i] == option || strings.HasPrefix(vendorArgs[i], option+"=") {
+				return fmt.Errorf("%s controls Qwen routing and cannot be used with 'sr qwen'", option)
 			}
 		}
 	}
-	if nativeProxyResumePickerRequested(qwenNativeProxy, args) {
-		return errors.New("'sr qwen proxy --resume' requires an explicit session ID so Subrouter can preserve sticky account routing")
+	if nativeProxyResumePickerRequested(qwenNativeProxy, vendorArgs) {
+		return errors.New("'sr qwen --resume' requires an explicit session ID so Subrouter can preserve sticky account routing")
 	}
-	return r.launchNativeProxy(ctx, qwenNativeProxy, args)
+	return r.launchNativeProxy(ctx, qwenNativeProxy, vendorArgs, options)
+}
+
+// parseNativeProxyLaunchArgs reserves --account only at the beginning of the
+// sr wrapper's arguments. The first vendor argument ends wrapper parsing, and
+// an explicit -- delimiter makes every following value vendor-owned.
+func parseNativeProxyLaunchArgs(args []string) (nativeProxyLaunchOptions, []string, error) {
+	var options nativeProxyLaunchOptions
+	if len(args) == 0 {
+		return options, nil, nil
+	}
+	if args[0] == "--" {
+		return options, args[1:], nil
+	}
+	if strings.HasPrefix(args[0], "--account=") {
+		options.accountSelector = strings.TrimSpace(strings.TrimPrefix(args[0], "--account="))
+		if options.accountSelector == "" {
+			return options, nil, errors.New("--account= requires a non-empty account selector")
+		}
+		args = args[1:]
+	} else if args[0] == "--account" {
+		if len(args) == 1 {
+			options.pickPinnedAccount = true
+			return options, nil, nil
+		}
+		if args[1] == "--" {
+			options.pickPinnedAccount = true
+			return options, args[2:], nil
+		}
+		if strings.HasPrefix(args[1], "-") {
+			return options, nil, errors.New("--account requires an account selector; use '--account --' to open the picker and pass vendor arguments")
+		}
+		options.accountSelector = strings.TrimSpace(args[1])
+		if options.accountSelector == "" {
+			return options, nil, errors.New("--account requires a non-empty account selector")
+		}
+		args = args[2:]
+	}
+	if len(args) > 0 && (args[0] == "--account" || strings.HasPrefix(args[0], "--account=")) {
+		return options, nil, errors.New("--account may be specified only once; use '--' before a vendor-owned --account option")
+	}
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+	}
+	return options, args, nil
 }
 
 func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool {
@@ -145,7 +217,7 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 	return false
 }
 
-func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, args []string) error {
+func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, args []string, options nativeProxyLaunchOptions) error {
 	server, _, err := r.nativeProxyServer(ctx)
 	if err != nil {
 		return err
@@ -154,12 +226,32 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return fmt.Errorf("secure %s proxy transport: %w", spec.display, err)
 	}
-	if err := r.requireNativeProxyAccount(ctx, server, spec); err != nil {
+	inventory, err := r.nativeProxyAccounts(ctx, server, spec)
+	if err != nil {
 		return err
+	}
+	forcedAccountID := ""
+	if options.pickPinnedAccount {
+		var chosen bool
+		forcedAccountID, chosen, err = r.pickNativeProxyAccount(spec, inventory)
+		if err != nil {
+			return err
+		}
+		if !chosen {
+			return nil
+		}
+	} else if strings.TrimSpace(options.accountSelector) != "" {
+		forcedAccountID, err = resolveNativeProxyAccountSelector(spec, inventory, options.accountSelector)
+		if err != nil {
+			return fmt.Errorf("server %s: %w", server.Name, err)
+		}
 	}
 	sessionID, err := nativeProxySessionID(spec, args)
 	if err != nil {
 		return err
+	}
+	if forcedAccountID != "" {
+		sessionID = nativeProxyPinnedSessionID(sessionID, forcedAccountID)
 	}
 	proxyToken, err := nativeProxyServerToken(server.URL)
 	if err != nil {
@@ -168,7 +260,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err := r.requireNativeProxyDataPlane(ctx, root, proxyToken); err != nil {
 		return err
 	}
-	relay, err := startNativeProxyRelay(root, spec, sessionID, proxyToken)
+	relay, err := startNativeProxyRelay(root, spec, sessionID, proxyToken, forcedAccountID)
 	if err != nil {
 		return fmt.Errorf("start local %s proxy relay: %w", spec.display, err)
 	}
@@ -309,24 +401,207 @@ func secureNativeProxyRoot(ctx context.Context, server srServerConfig) (string, 
 	return secureTenantServerURL(ctx, root, protected)
 }
 
-func (r srRunner) requireNativeProxyAccount(ctx context.Context, server srServerConfig, spec nativeProxySpec) error {
+func (r srRunner) nativeProxyAccounts(ctx context.Context, server srServerConfig, spec nativeProxySpec) ([]remoteServerAccount, error) {
 	inventory, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {
-		return fmt.Errorf("load %s accounts from server %s: %w", spec.display, server.Name, err)
+		return nil, fmt.Errorf("load %s accounts from server %s: %w", spec.display, server.Name, err)
 	}
+	eligible := make([]remoteServerAccount, 0, len(inventory))
 	for _, account := range inventory {
-		if account.Provider != spec.provider {
-			continue
+		if nativeProxyAccountEligible(spec, account) && validNativeProxyAccountID(strings.TrimSpace(account.ID)) {
+			eligible = append(eligible, account)
 		}
-		if spec.authMode == "" || account.AuthMode == spec.authMode {
-			return nil
-		}
+	}
+	if len(eligible) > 0 {
+		return eligible, nil
 	}
 	mode := ""
 	if spec.authMode != "" {
 		mode = " " + string(spec.authMode)
 	}
-	return fmt.Errorf("no routed %s%s account is available on server %s", spec.display, mode, server.Name)
+	return nil, fmt.Errorf("no routed %s%s account is available on server %s", spec.display, mode, server.Name)
+}
+
+func (r srRunner) requireNativeProxyAccount(ctx context.Context, server srServerConfig, spec nativeProxySpec) error {
+	_, err := r.nativeProxyAccounts(ctx, server, spec)
+	return err
+}
+
+func nativeProxyAccountEligible(spec nativeProxySpec, account remoteServerAccount) bool {
+	if account.Provider != spec.provider {
+		return false
+	}
+	if spec.authMode != "" && account.AuthMode != spec.authMode {
+		return false
+	}
+	if spec.provider != accounts.ProviderKimi || account.AuthMode != accounts.AuthModeOAuth {
+		return true
+	}
+	// The singleton credential owned by the plain Kimi CLI is deliberately a
+	// direct bypass. Only Subrouter-managed subscription profiles (or Kimi API
+	// keys, handled above) may enter the routed pool.
+	id := strings.ToLower(strings.TrimSpace(account.ID))
+	source := strings.ToLower(strings.TrimSpace(account.Source))
+	return id != "kimi-code" && !strings.HasPrefix(id, "kimi-code:") && !strings.Contains(source, "kimi-code credentials file")
+}
+
+func validNativeProxyAccountID(accountID string) bool {
+	return accountID != "" && len(accountID) <= 256 && !nativeProxyTerminalControl(accountID)
+}
+
+func nativeProxyTerminalControl(value string) bool {
+	for _, char := range value {
+		if unicode.IsControl(char) || unicode.In(char, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return true
+		}
+	}
+	return false
+}
+
+func nativeProxyAccountSelectorValues(spec nativeProxySpec, account remoteServerAccount) []string {
+	id := strings.TrimSpace(account.ID)
+	values := []string{id, strings.TrimSpace(account.Label), strings.TrimSpace(account.Email)}
+	if prefix := string(spec.provider) + ":"; strings.HasPrefix(strings.ToLower(id), strings.ToLower(prefix)) {
+		values = append(values, strings.TrimSpace(id[len(prefix):]))
+	}
+	if spec.provider == accounts.ProviderKimi {
+		const managedPrefix = "kimi-subscription:"
+		if strings.HasPrefix(strings.ToLower(id), managedPrefix) {
+			values = append(values, strings.TrimSpace(id[len(managedPrefix):]))
+		}
+	}
+	return values
+}
+
+func resolveNativeProxyAccountSelector(spec nativeProxySpec, inventory []remoteServerAccount, selector string) (string, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return "", fmt.Errorf("%s account selector cannot be empty", spec.display)
+	}
+	if nativeProxyTerminalControl(selector) {
+		return "", fmt.Errorf("%s account selector contains a control character", spec.display)
+	}
+	type match struct {
+		account remoteServerAccount
+		rank    int
+	}
+	matches := make([]match, 0)
+	lowerSelector := strings.ToLower(selector)
+	for _, account := range inventory {
+		values := nativeProxyAccountSelectorValues(spec, account)
+		rank := 4
+		if len(values) > 0 && strings.EqualFold(values[0], selector) {
+			rank = 0 // A canonical server routing ID always wins.
+		}
+		for index, value := range values {
+			if value == "" {
+				continue
+			}
+			switch {
+			case index >= 3 && strings.EqualFold(value, selector) && rank > 1:
+				rank = 1 // Provider-prefix-stripped routing ID.
+			case index > 0 && index < 3 && strings.EqualFold(value, selector) && rank > 2:
+				rank = 2 // User-facing label or email.
+			case strings.Contains(strings.ToLower(value), lowerSelector) && rank > 3:
+				rank = 3
+			}
+		}
+		if rank < 4 {
+			matches = append(matches, match{account: account, rank: rank})
+		}
+	}
+	bestRank := 4
+	for _, candidate := range matches {
+		if candidate.rank < bestRank {
+			bestRank = candidate.rank
+		}
+	}
+	if bestRank < 4 {
+		filtered := matches[:0]
+		for _, candidate := range matches {
+			if candidate.rank == bestRank {
+				filtered = append(filtered, candidate)
+			}
+		}
+		matches = filtered
+	}
+	unique := make(map[string]remoteServerAccount, len(matches))
+	for _, candidate := range matches {
+		key := strings.ToLower(string(candidate.account.Provider)) + "\x00" +
+			strings.ToLower(string(candidate.account.AuthMode)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(candidate.account.ID))
+		unique[key] = candidate.account
+	}
+	if len(unique) == 0 {
+		return "", fmt.Errorf("%s account %q was not found in the routed pool", spec.display, selector)
+	}
+	if len(unique) != 1 {
+		return "", fmt.Errorf("%s account selector %q is ambiguous; use the exact account ID or label", spec.display, selector)
+	}
+	var account remoteServerAccount
+	for _, candidate := range unique {
+		account = candidate
+	}
+	if !nativeProxyAccountEligible(spec, account) {
+		return "", fmt.Errorf("account %q is not an eligible routed %s account", selector, spec.display)
+	}
+	accountID := strings.TrimSpace(account.ID)
+	if !validNativeProxyAccountID(accountID) {
+		return "", fmt.Errorf("%s account %q has an invalid server routing ID", spec.display, selector)
+	}
+	return accountID, nil
+}
+
+func nativeProxyAccountDisplay(account remoteServerAccount) string {
+	for _, value := range []string{account.Label, account.Email, account.ID} {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > 256 || nativeProxyTerminalControl(value) {
+			continue
+		}
+		return value
+	}
+	return "account"
+}
+
+func nativeProxyAccountPickerRow(account remoteServerAccount) string {
+	id := strings.TrimSpace(account.ID)
+	display := nativeProxyAccountDisplay(account)
+	mode := strings.TrimSpace(string(account.AuthMode))
+	if !strings.EqualFold(display, id) {
+		return fmt.Sprintf("%s (%s; %s)", display, id, mode)
+	}
+	return fmt.Sprintf("%s (%s)", id, mode)
+}
+
+func (r srRunner) pickNativeProxyAccount(spec nativeProxySpec, inventory []remoteServerAccount) (string, bool, error) {
+	sort.Slice(inventory, func(i, j int) bool {
+		left := strings.ToLower(nativeProxyAccountPickerRow(inventory[i]))
+		right := strings.ToLower(nativeProxyAccountPickerRow(inventory[j]))
+		if left != right {
+			return left < right
+		}
+		return strings.ToLower(inventory[i].ID) < strings.ToLower(inventory[j].ID)
+	})
+	fmt.Fprintf(r.out, "Choose one %s account for this PINNED process. No account failover will occur.\n", spec.display)
+	for i, account := range inventory {
+		fmt.Fprintf(r.out, "  %d) %s\n", i+1, nativeProxyAccountPickerRow(account))
+	}
+	answer, err := promptLine(r.out, bufio.NewReader(r.in), "Launch account (# or exact account): ")
+	if err != nil {
+		return "", false, err
+	}
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return "", false, nil
+	}
+	if index, parseErr := strconv.Atoi(answer); parseErr == nil && index >= 1 && index <= len(inventory) {
+		return inventory[index-1].ID, true, nil
+	}
+	accountID, err := resolveNativeProxyAccountSelector(spec, inventory, answer)
+	if err != nil {
+		return "", false, err
+	}
+	return accountID, true, nil
 }
 
 type nativeProxyRelay struct {
@@ -348,7 +623,7 @@ func nativeProxyRelayTransport(targetRoot string) (*http.Transport, error) {
 	return transport, nil
 }
 
-func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken string) (*nativeProxyRelay, error) {
+func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken, forcedAccountID string) (*nativeProxyRelay, error) {
 	target, err := url.Parse(strings.TrimRight(targetRoot, "/"))
 	if err != nil || target.Scheme == "" || target.Host == "" || target.User != nil || target.Fragment != "" {
 		return nil, errors.New("proxy target must be an absolute URL")
@@ -356,6 +631,10 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 	transport, err := nativeProxyRelayTransport(targetRoot)
 	if err != nil {
 		return nil, fmt.Errorf("secure proxy target transport: %w", err)
+	}
+	forcedAccountID = strings.TrimSpace(forcedAccountID)
+	if forcedAccountID != "" && !validNativeProxyAccountID(forcedAccountID) {
+		return nil, errors.New("pinned account has an invalid server routing ID")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -397,6 +676,9 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 		request.Header.Set("Authorization", "Bearer "+proxyToken)
 		request.Header.Set("X-Subrouter-Agent", spec.agent)
 		request.Header.Set("X-Subrouter-Session", sessionID)
+		if forcedAccountID != "" {
+			request.Header.Set("X-Subrouter-Account-ID", forcedAccountID)
+		}
 	}
 	reverse.ErrorLog = log.New(io.Discard, "", 0)
 	reverse.ErrorHandler = func(response http.ResponseWriter, _ *http.Request, _ error) {
@@ -476,6 +758,11 @@ func nativeProxySessionID(spec nativeProxySpec, args []string) (string, error) {
 	return "sr-native-" + hex.EncodeToString(digest[:16]), nil
 }
 
+func nativeProxyPinnedSessionID(pooledSessionID, accountID string) string {
+	digest := sha256.Sum256([]byte(pooledSessionID + "\x00pinned-account\x00" + accountID))
+	return "sr-native-" + hex.EncodeToString(digest[:16])
+}
+
 var nativeProxyRoutingEnvKeys = []string{
 	"CLOUD_CODE_URL",
 	"GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH",
@@ -496,7 +783,7 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		if conflict, err := antigravityDirectProviderConflict(environ); err != nil {
 			return nil, func() {}, err
 		} else if conflict != "" {
-			return nil, func() {}, fmt.Errorf("Antigravity direct provider %s is configured; remove it before using 'sr agy proxy'", conflict)
+			return nil, func() {}, fmt.Errorf("Antigravity direct provider %s is configured; remove it before using 'sr agy'", conflict)
 		}
 		return upsertEnv(env, "CLOUD_CODE_URL", providerURL), func() {}, nil
 	case accounts.ProviderKimi:

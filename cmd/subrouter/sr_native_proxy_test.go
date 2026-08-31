@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -25,7 +27,7 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}))
 	defer upstream.Close()
 
-	relay, err := startNativeProxyRelay(upstream.URL+"/t/srt_test", kimiNativeProxy, "sr-native-test-session", "local-proxy-token")
+	relay, err := startNativeProxyRelay(upstream.URL+"/t/srt_test", kimiNativeProxy, "sr-native-test-session", "local-proxy-token", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +86,178 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 		case leaked := <-seen:
 			t.Fatalf("forbidden relay path reached upstream: %s", leaked.URL)
 		default:
+		}
+	}
+}
+
+func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
+	seen := make(chan *http.Request, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		seen <- request.Clone(request.Context())
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	relay, err := startNativeProxyRelay(upstream.URL, qwenNativeProxy, "pinned-session", "router-token", "qwen-token:work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	request, err := http.NewRequest(http.MethodPost, relay.URL()+"/qwen-token/v1/chat/completions", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Subrouter-Account-ID", "untrusted-child-account")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	got := <-seen
+	if accountID := got.Header.Get("X-Subrouter-Account-ID"); accountID != "qwen-token:work" {
+		t.Fatalf("pinned account header = %q", accountID)
+	}
+	if got.Header.Get("X-Subrouter-Account") != "" {
+		t.Fatalf("untrusted account alias leaked: %q", got.Header.Get("X-Subrouter-Account"))
+	}
+	if _, err := startNativeProxyRelay(upstream.URL, qwenNativeProxy, "pinned-session", "router-token", "bad\r\nX-Injected: yes"); err == nil {
+		t.Fatal("header-injecting pinned account was accepted")
+	}
+}
+
+func TestParseNativeProxyLaunchArgsOwnsOnlyLeadingAccountOption(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		selector   string
+		picker     bool
+		vendorArgs []string
+		wantErr    string
+	}{
+		{name: "pooled", args: []string{"--model", "x"}, vendorArgs: []string{"--model", "x"}},
+		{name: "pin separate", args: []string{"--account", "work", "--model", "x"}, selector: "work", vendorArgs: []string{"--model", "x"}},
+		{name: "pin equals with delimiter", args: []string{"--account=work", "--", "--account", "vendor"}, selector: "work", vendorArgs: []string{"--account", "vendor"}},
+		{name: "picker", args: []string{"--account"}, picker: true},
+		{name: "picker with delimiter", args: []string{"--account", "--", "prompt"}, picker: true, vendorArgs: []string{"prompt"}},
+		{name: "delimiter makes account vendor owned", args: []string{"--", "--account", "vendor"}, vendorArgs: []string{"--account", "vendor"}},
+		{name: "first vendor arg ends parsing", args: []string{"--model", "x", "--account", "vendor"}, vendorArgs: []string{"--model", "x", "--account", "vendor"}},
+		{name: "empty equals", args: []string{"--account="}, wantErr: "non-empty"},
+		{name: "missing selector", args: []string{"--account", "--model"}, wantErr: "requires an account selector"},
+		{name: "duplicate", args: []string{"--account", "work", "--account=other"}, wantErr: "only once"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options, vendorArgs, err := parseNativeProxyLaunchArgs(test.args)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %v, want %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if options.accountSelector != test.selector || options.pickPinnedAccount != test.picker || !reflect.DeepEqual(vendorArgs, test.vendorArgs) {
+				t.Fatalf("parsed = %+v, %q; want selector=%q picker=%t args=%q", options, vendorArgs, test.selector, test.picker, test.vendorArgs)
+			}
+		})
+	}
+}
+
+func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T) {
+	inventory := []remoteServerAccount{
+		{ID: "kimi-subscription:work", Label: "Work", Email: "member@example.test", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+		{ID: "kimi:metered", Label: "Metered", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "kimi-subscription:collision", Label: "kimi:metered", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+		{ID: "kimi-code", Label: "Direct CLI", Source: "kimi-code credentials file", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
+		{ID: "qwen-token:large", Label: "Large", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "qwen-token:larger", Label: "Larger", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+	}
+	for selector, want := range map[string]string{
+		"WORK":                "kimi-subscription:work",
+		"member@example.test": "kimi-subscription:work",
+		"metered":             "kimi:metered",
+	} {
+		got, err := resolveNativeProxyAccountSelector(kimiNativeProxy, inventory, selector)
+		if err != nil || got != want {
+			t.Fatalf("resolve Kimi %q = %q, %v; want %q", selector, got, err, want)
+		}
+	}
+	if got, err := resolveNativeProxyAccountSelector(qwenNativeProxy, inventory, "large"); err != nil || got != "qwen-token:large" {
+		t.Fatalf("resolve Qwen prefix-stripped ID = %q, %v", got, err)
+	}
+	if got, err := resolveNativeProxyAccountSelector(kimiNativeProxy, inventory, "kimi:metered"); err != nil || got != "kimi:metered" {
+		t.Fatalf("canonical ID did not outrank colliding label: %q, %v", got, err)
+	}
+	for _, test := range []struct {
+		spec     nativeProxySpec
+		selector string
+		wantErr  string
+	}{
+		{spec: kimiNativeProxy, selector: "Direct CLI", wantErr: "not an eligible routed Kimi account"},
+		{spec: kimiNativeProxy, selector: "Large", wantErr: "not an eligible routed Kimi account"},
+		{spec: qwenNativeProxy, selector: "larg", wantErr: "ambiguous"},
+		{spec: qwenNativeProxy, selector: "missing", wantErr: "was not found"},
+		{spec: qwenNativeProxy, selector: "bad\rselector", wantErr: "control character"},
+	} {
+		if _, err := resolveNativeProxyAccountSelector(test.spec, inventory, test.selector); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+			t.Fatalf("resolve %s %q error = %v, want %q", test.spec.display, test.selector, err, test.wantErr)
+		}
+	}
+	injected := append([]remoteServerAccount(nil), inventory...)
+	injected[4].ID = "qwen-token:good\r\nX-Injected: yes"
+	if _, err := resolveNativeProxyAccountSelector(qwenNativeProxy, injected, "Large"); err == nil || !strings.Contains(err.Error(), "invalid server routing ID") {
+		t.Fatalf("header-injecting account ID error = %v", err)
+	}
+}
+
+func TestNativeProxyPinnedPickerIsSortedAndBlankCancels(t *testing.T) {
+	inventory := []remoteServerAccount{
+		{ID: "qwen-token:z", Label: "Shared", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "qwen-token:a", Label: "Shared", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+	}
+	var out bytes.Buffer
+	runner := srRunner{in: strings.NewReader("2\n"), out: &out}
+	got, chosen, err := runner.pickNativeProxyAccount(qwenNativeProxy, inventory)
+	if err != nil || !chosen || got != "qwen-token:z" {
+		t.Fatalf("picked = %q chosen=%t err=%v", got, chosen, err)
+	}
+	if text := out.String(); !strings.Contains(text, "PINNED process") || !strings.Contains(text, "No account failover") ||
+		!strings.Contains(text, "Shared (qwen-token:a; apikey)") || !strings.Contains(text, "Shared (qwen-token:z; apikey)") ||
+		strings.Index(text, "qwen-token:a") > strings.Index(text, "qwen-token:z") {
+		t.Fatalf("picker output = %q", text)
+	}
+	runner.in = strings.NewReader("\n")
+	if got, chosen, err := runner.pickNativeProxyAccount(qwenNativeProxy, inventory); err != nil || chosen || got != "" {
+		t.Fatalf("blank picker = %q chosen=%t err=%v", got, chosen, err)
+	}
+}
+
+func TestNativeProxyDispatchSeparatesManagementFromDefaultLaunch(t *testing.T) {
+	for _, args := range [][]string{nil, {"--model", "x"}, {"proxy"}, {"--account", "work"}} {
+		if isKimiManagementCommand(args) || isQwenManagementCommand(args) {
+			t.Fatalf("launch args %q classified as management", args)
+		}
+	}
+	for _, args := range [][]string{{"login"}, {"help"}, {"--help"}} {
+		if !isKimiManagementCommand(args) || !isQwenManagementCommand(args) {
+			t.Fatalf("management args %q classified as launch", args)
+		}
+	}
+	if !isKimiManagementCommand([]string{"list"}) || isQwenManagementCommand([]string{"list"}) {
+		t.Fatal("provider-specific management verbs were not preserved")
+	}
+	if err := (srRunner{}).antigravityCommand(t.Context(), []string{"--account", "unused"}); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Antigravity pin error = %v", err)
+	}
+	for _, provider := range []string{"kimi", "qwen"} {
+		var out bytes.Buffer
+		runner := srRunner{out: &out}
+		if err := runner.run(t.Context(), []string{provider, "--help"}); err != nil {
+			t.Fatalf("sr %s --help: %v", provider, err)
+		}
+		if !strings.Contains(out.String(), "Plain '") && !strings.Contains(out.String(), "plain ") {
+			t.Fatalf("sr %s --help did not describe the direct bypass: %q", provider, out.String())
 		}
 	}
 }
@@ -329,7 +503,7 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 }
 
 func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
-	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}} {
+	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}, {"--", "--proxy", "http://proxy.invalid"}} {
 		err := (srRunner{}).launchQwenProxy(t.Context(), args)
 		if err == nil || !strings.Contains(err.Error(), "--proxy controls Qwen routing") {
 			t.Fatalf("proxy override %q error = %v", args, err)
@@ -450,6 +624,14 @@ func TestNativeProxySessionIdentitySurvivesInitialLaunchAndResume(t *testing.T) 
 	if qwenID == kimiID {
 		t.Fatal("provider namespaces share a native proxy session ID")
 	}
+	qwenWork := nativeProxyPinnedSessionID(qwenID, "qwen-token:work")
+	qwenPersonal := nativeProxyPinnedSessionID(qwenID, "qwen-token:personal")
+	if qwenWork == qwenID || qwenPersonal == qwenID || qwenWork == qwenPersonal {
+		t.Fatalf("pinned session identities collide: pooled=%q work=%q personal=%q", qwenID, qwenWork, qwenPersonal)
+	}
+	if again := nativeProxyPinnedSessionID(qwenID, "qwen-token:work"); again != qwenWork {
+		t.Fatalf("pinned session identity is not stable: %q != %q", again, qwenWork)
+	}
 }
 
 func TestAntigravityProxyFailsClosedForDirectGeminiConfiguration(t *testing.T) {
@@ -497,7 +679,8 @@ func TestRequireNativeProxyAccountChecksProviderAndAuthMode(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, `[
 			{"id":"antigravity","provider":"antigravity","auth_mode":"oauth"},
-			{"id":"qwen-token:work","provider":"qwen-token","auth_mode":"apikey"}
+			{"id":"qwen-token:work","provider":"qwen-token","auth_mode":"apikey"},
+			{"id":"kimi-code","provider":"kimi","auth_mode":"oauth","source":"kimi-code credentials file"}
 		]`)
 	}))
 	defer server.Close()
