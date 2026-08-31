@@ -42,6 +42,8 @@ MAX_TOTAL_TIMEOUT = 270
 MAX_LEG_OUTPUT = 64 * 1024
 _active_child: subprocess.Popen[bytes] | None = None
 _active_child_token: str | None = None
+_active_child_pgid: int | None = None
+_active_child_identity: str | None = None
 _tracked_child_identities: dict[int, str] = {}
 
 
@@ -698,8 +700,27 @@ def _capture_identity(process: _ProcessInfo) -> str | None:
     return process.identity
 
 
-def _process_group_identities(pgid: int, snapshot: dict[int, _ProcessInfo] | None = None) -> dict[int, str]:
-    snapshot = snapshot or _process_snapshot()
+def _process_group_identities(
+    pgid: int,
+    snapshot: dict[int, _ProcessInfo] | None = None,
+    *,
+    leader_identity: str | None = None,
+) -> dict[int, str]:
+    if snapshot is None:
+        snapshot = _process_snapshot()
+    if leader_identity is not None:
+        leader = snapshot.get(pgid)
+        # A numeric PGID is reusable after its leader exits. Only inspect the
+        # group while its original leader is still the exact process generation
+        # that created it. Detached descendants remain covered by their tracked
+        # identities and inherited marker below.
+        if (
+            leader is None
+            or leader.pid != pgid
+            or leader.pgid != pgid
+            or leader.identity != leader_identity
+        ):
+            return {}
     identities: dict[int, str] = {}
     anchor_raw = os.environ.get("SUBROUTER_BOUNDED_GROUP_ANCHOR_PID", "")
     anchor_pid = int(anchor_raw) if anchor_raw.isdigit() else -1
@@ -712,8 +733,13 @@ def _process_group_identities(pgid: int, snapshot: dict[int, _ProcessInfo] | Non
     return identities
 
 
-def _process_group_exists(pgid: int) -> bool:
-    return bool(_process_group_identities(pgid))
+def _process_group_exists(
+    pgid: int,
+    *,
+    leader_identity: str | None = None,
+    snapshot: dict[int, _ProcessInfo] | None = None,
+) -> bool:
+    return bool(_process_group_identities(pgid, snapshot, leader_identity=leader_identity))
 
 
 def _refresh_tracked_descendants(root_pid: int) -> None:
@@ -825,11 +851,16 @@ def _signal_matching_identities(identities: dict[int, str], sent_signal: signal.
         _signal_process_identity(pid, started, sent_signal)
 
 
-def _terminate_child(child: subprocess.Popen[bytes], child_token: str) -> None:
-    pgid = os.getpgrp()
+def _terminate_child(
+    child: subprocess.Popen[bytes],
+    child_token: str,
+    *,
+    child_pgid: int,
+    child_identity: str,
+) -> None:
     _refresh_tracked_descendants(child.pid)
     members = dict(_tracked_child_identities)
-    members.update(_process_group_identities(pgid))
+    members.update(_process_group_identities(child_pgid, leader_identity=child_identity))
     members.update(_marked_child_identities(child_token))
     _signal_matching_identities(members, signal.SIGTERM)
     deadline = time.monotonic() + 2
@@ -841,7 +872,7 @@ def _terminate_child(child: subprocess.Popen[bytes], child_token: str) -> None:
         members.update(_tracked_child_identities)
         members.update(_marked_child_identities(child_token))
         time.sleep(0.02)
-    members.update(_process_group_identities(pgid))
+    members.update(_process_group_identities(child_pgid, leader_identity=child_identity))
     _signal_matching_identities(members, signal.SIGKILL)
     if child.poll() is None:
         child.wait()
@@ -849,13 +880,23 @@ def _terminate_child(child: subprocess.Popen[bytes], child_token: str) -> None:
 
 
 def _signal_handler(signum: int, _frame: object) -> None:
-    if _active_child is not None and _active_child_token is not None:
-        _terminate_child(_active_child, _active_child_token)
+    if (
+        _active_child is not None
+        and _active_child_token is not None
+        and _active_child_pgid is not None
+        and _active_child_identity is not None
+    ):
+        _terminate_child(
+            _active_child,
+            _active_child_token,
+            child_pgid=_active_child_pgid,
+            child_identity=_active_child_identity,
+        )
     raise CanarySignal(f"interrupted by signal {signum}")
 
 
 def _run_leg(leg: dict[str, object], run_id: str, total_deadline: float) -> dict[str, object]:
-    global _active_child, _active_child_token
+    global _active_child, _active_child_token, _active_child_pgid, _active_child_identity
     _check_total_deadline(total_deadline)
     name = str(leg["name"])
     executable = _secure_file(leg["executable"], f"leg {name} executable", executable=True)
@@ -879,6 +920,7 @@ def _run_leg(leg: dict[str, object], run_id: str, total_deadline: float) -> dict
                 stdout=stdout_file,
                 stderr=stderr_file,
                 env=_child_environment(name, str(pinned_config), run_id, child_token),
+                start_new_session=True,
             )
             _tracked_child_identities.clear()
             child_identity = _process_start_identity(child.pid)
@@ -886,9 +928,22 @@ def _run_leg(leg: dict[str, object], run_id: str, total_deadline: float) -> dict
                 child.kill()
                 child.wait()
                 _fail(f"leg {name} process identity unavailable")
+            try:
+                child_pgid = os.getpgid(child.pid)
+            except ProcessLookupError:
+                # The Popen handle still owns this unreaped process. If it
+                # exited before inspection, its detached descendants remain
+                # discoverable through the start identity and marker paths.
+                child_pgid = child.pid
+            if child_pgid != child.pid:
+                _signal_matching_identities({child.pid: child_identity}, signal.SIGKILL)
+                child.wait()
+                _fail(f"leg {name} process did not create an isolated process group")
             _tracked_child_identities[child.pid] = child_identity
             _active_child = child
             _active_child_token = child_token
+            _active_child_pgid = child_pgid
+            _active_child_identity = child_identity
             timed_out = False
             total_timed_out = False
             oversized = False
@@ -898,37 +953,65 @@ def _run_leg(leg: dict[str, object], run_id: str, total_deadline: float) -> dict
                     _refresh_tracked_descendants(child.pid)
                     if os.fstat(stdout_file.fileno()).st_size + os.fstat(stderr_file.fileno()).st_size > MAX_LEG_OUTPUT:
                         oversized = True
-                        _terminate_child(child, child_token)
+                        _terminate_child(
+                            child,
+                            child_token,
+                            child_pgid=child_pgid,
+                            child_identity=child_identity,
+                        )
                         break
                     if time.monotonic() >= deadline:
                         timed_out = True
                         total_timed_out = time.monotonic() >= total_deadline
-                        _terminate_child(child, child_token)
+                        _terminate_child(
+                            child,
+                            child_token,
+                            child_pgid=child_pgid,
+                            child_identity=child_identity,
+                        )
                         break
                     time.sleep(0.02)
                 if child.poll() is None:
                     timed_out = True
                     total_timed_out = time.monotonic() >= total_deadline
-                    _terminate_child(child, child_token)
-            finally:
-                _refresh_tracked_descendants(child.pid)
-                marked_descendants = _marked_child_identities(child_token)
-                snapshot = _process_snapshot()
-                descendants_remained = (
-                    _process_group_exists(os.getpgrp())
-                    or any(
-                        _identity_exists(pid, started, snapshot)
-                        for pid, started in _tracked_child_identities.items()
+                    _terminate_child(
+                        child,
+                        child_token,
+                        child_pgid=child_pgid,
+                        child_identity=child_identity,
                     )
-                    or bool(marked_descendants)
-                )
-                if descendants_remained:
-                    _tracked_child_identities.update(marked_descendants)
-                    _terminate_child(child, child_token)
-                else:
-                    _tracked_child_identities.clear()
-                _active_child = None
-                _active_child_token = None
+            finally:
+                try:
+                    _refresh_tracked_descendants(child.pid)
+                    marked_descendants = _marked_child_identities(child_token)
+                    snapshot = _process_snapshot()
+                    descendants_remained = (
+                        _process_group_exists(
+                            child_pgid,
+                            leader_identity=child_identity,
+                            snapshot=snapshot,
+                        )
+                        or any(
+                            _identity_exists(pid, started, snapshot)
+                            for pid, started in _tracked_child_identities.items()
+                        )
+                        or bool(marked_descendants)
+                    )
+                    if descendants_remained:
+                        _tracked_child_identities.update(marked_descendants)
+                        _terminate_child(
+                            child,
+                            child_token,
+                            child_pgid=child_pgid,
+                            child_identity=child_identity,
+                        )
+                    else:
+                        _tracked_child_identities.clear()
+                finally:
+                    _active_child = None
+                    _active_child_token = None
+                    _active_child_pgid = None
+                    _active_child_identity = None
             if timed_out:
                 if total_timed_out:
                     _fail("functional canary total timeout exceeded")

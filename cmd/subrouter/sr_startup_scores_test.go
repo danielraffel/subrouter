@@ -175,6 +175,45 @@ func TestStartupScoresFailedSweepRunsOneBatchAndReturnsError(t *testing.T) {
 	release()
 }
 
+func TestStartupScoresRetriesFailedSweepUntilProviderRecovers(t *testing.T) {
+	store := newSRUsageScoreStore(t.TempDir())
+	all := []accounts.Account{{ID: "account@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "secret"}}
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	ref.AdvanceAccountGeneration(1)
+	var fetches atomic.Int32
+	err := ensureStartupScores(context.Background(), startupScoreConfig{
+		Interval:         time.Minute,
+		AccountsSnapshot: func() ([]accounts.Account, uint64) { return all, 1 },
+		SchedulerRef:     ref,
+		FetchScores: func(context.Context, []accounts.Account) ([]selectacct.Score, int) {
+			if fetches.Add(1) == 1 {
+				return nil, 0
+			}
+			return []selectacct.Score{{
+				AccountID: "account@example.com", Provider: accounts.ProviderCodex,
+				Headroom: .9, ShortHeadroom: .9, Fresh: true,
+			}}, 1
+		},
+		Store:            store,
+		PollInterval:     time.Millisecond,
+		RetryFailedSweep: true,
+		RetryInterval:    time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("startup sweeps = %d, want one retry after the failed sweep", got)
+	}
+	if got := ref.Get().ScoreFor(accounts.ProviderCodex, "account@example.com").Headroom; got != .9 {
+		t.Fatalf("recovered score headroom = %v, want .9", got)
+	}
+	snapshot, ok, err := store.read(codexScoreGenerationKey(1, all), time.Minute)
+	if err != nil || !ok || snapshot.Failed {
+		t.Fatalf("recovered snapshot = %+v, present=%v, err=%v", snapshot, ok, err)
+	}
+}
+
 func TestStartupScoreKernelLockPreventsStaleOwnerDeletingReplacement(t *testing.T) {
 	store := newSRUsageScoreStore(t.TempDir())
 	oldRelease, claimed, err := store.tryLock()

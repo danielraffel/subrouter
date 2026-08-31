@@ -834,9 +834,10 @@ func serve(args []string) error {
 					)
 					return nil
 				},
-				SchedulerRef: schedulerRef,
-				FetchScores:  fetchScores,
-				Store:        sharedScoreStore,
+				SchedulerRef:     schedulerRef,
+				FetchScores:      fetchScores,
+				Store:            sharedScoreStore,
+				RetryFailedSweep: true,
 			}); err != nil && activeGenerationCtx.Err() == nil {
 				slog.Error("startup Codex usage scores unavailable", "error", err)
 				return

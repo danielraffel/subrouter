@@ -212,6 +212,21 @@ type startupScoreConfig struct {
 	FetchScores     func(context.Context, []accounts.Account) ([]selectacct.Score, int)
 	Store           *srUsageScoreStore
 	PollInterval    time.Duration
+	// RetryFailedSweep keeps the readiness gate alive when a provider is
+	// temporarily unavailable. A failed snapshot still coordinates overlapping
+	// workers, but the owner retries it after RetryInterval instead of treating
+	// the first outage as permanent for this process.
+	RetryFailedSweep bool
+	RetryInterval    time.Duration
+}
+
+const defaultStartupScoreRetryInterval = 5 * time.Second
+
+func startupScoreRetryInterval(cfg startupScoreConfig) time.Duration {
+	if cfg.RetryInterval > 0 {
+		return cfg.RetryInterval
+	}
+	return defaultStartupScoreRetryInterval
 }
 
 func ensureStartupScores(ctx context.Context, cfg startupScoreConfig) error {
@@ -225,6 +240,7 @@ func ensureStartupScores(ctx context.Context, cfg startupScoreConfig) error {
 	if pollInterval <= 0 {
 		pollInterval = 25 * time.Millisecond
 	}
+	retryFailedSnapshot := false
 	for {
 		all, generation := cfg.AccountsSnapshot()
 		candidates := codexOAuthAccounts(all)
@@ -232,7 +248,14 @@ func ensureStartupScores(ctx context.Context, cfg startupScoreConfig) error {
 			return nil
 		}
 		generationKey := codexScoreGenerationKey(generation, candidates)
-		if loaded, err := loadStartupScoreSnapshot(cfg, generation, generationKey); err != nil {
+		if loaded, err := loadStartupScoreSnapshot(cfg, generation, generationKey, retryFailedSnapshot); err != nil {
+			if errors.Is(err, errStartupScoreSweepFailed) && cfg.RetryFailedSweep {
+				if err := waitStartupScorePoll(ctx, startupScoreRetryInterval(cfg)); err != nil {
+					return err
+				}
+				retryFailedSnapshot = true
+				continue
+			}
 			return err
 		} else if loaded {
 			return nil
@@ -262,7 +285,7 @@ func ensureStartupScores(ctx context.Context, cfg startupScoreConfig) error {
 				}
 				generationKey = codexScoreGenerationKey(generation, candidates)
 			}
-			if loaded, err := loadStartupScoreSnapshot(cfg, generation, generationKey); err != nil || loaded {
+			if loaded, err := loadStartupScoreSnapshot(cfg, generation, generationKey, retryFailedSnapshot); err != nil || loaded {
 				return err
 			}
 			scores, successful := cfg.FetchScores(ctx, candidates)
@@ -297,7 +320,7 @@ func ensureStartupScores(ctx context.Context, cfg startupScoreConfig) error {
 			if err := cfg.Store.write(snapshot); err != nil {
 				return err
 			}
-			loaded, err := loadStartupScoreSnapshot(cfg, currentGeneration, currentKey)
+			loaded, err := loadStartupScoreSnapshot(cfg, currentGeneration, currentKey, false)
 			if err != nil {
 				return err
 			}
@@ -312,6 +335,13 @@ func ensureStartupScores(ctx context.Context, cfg startupScoreConfig) error {
 		if errors.Is(resultErr, errStartupScoreGenerationChanged) || errors.Is(resultErr, errStartupScorePublishConflict) {
 			continue
 		}
+		if errors.Is(resultErr, errStartupScoreSweepFailed) && cfg.RetryFailedSweep {
+			if err := waitStartupScorePoll(ctx, startupScoreRetryInterval(cfg)); err != nil {
+				return err
+			}
+			retryFailedSnapshot = true
+			continue
+		}
 		return fmt.Errorf("startup usage score sweep: %w", resultErr)
 	}
 }
@@ -322,13 +352,16 @@ var (
 	errStartupScoreSweepFailed       = errors.New("no fresh OAuth usage scores available")
 )
 
-func loadStartupScoreSnapshot(cfg startupScoreConfig, generation uint64, generationKey string) (bool, error) {
+func loadStartupScoreSnapshot(cfg startupScoreConfig, generation uint64, generationKey string, ignoreFailed bool) (bool, error) {
 	snapshot, ok, err := cfg.Store.read(generationKey, cfg.Interval)
 	if err != nil || !ok {
 		return false, err
 	}
 	if snapshot.Failed {
-		return false, errStartupScoreSweepFailed
+		if !ignoreFailed {
+			return false, errStartupScoreSweepFailed
+		}
+		return false, nil
 	}
 	for attempt := 0; attempt < srAutoSwitchPublishAttempts; attempt++ {
 		revision := cfg.SchedulerRef.ScoreRevision()
