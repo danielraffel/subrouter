@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -57,6 +58,8 @@ const (
 	goldenFakeStreamReleaseTokenEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_TOKEN"
 	goldenFakeStreamReleaseStateEnv           = "SUBROUTER_GOLDEN_FAKE_STREAM_RELEASE_STATE"
 )
+
+var goldenCandidateTagPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$`)
 
 // goldenTestHooks are set only by same-package deterministic tests. Production
 // binaries have no environment or command-line switch that enables them.
@@ -193,9 +196,9 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 		if options.accountID == "" {
 			return options, errors.New("--account-id is required for a deterministic golden credential")
 		}
-		if strings.TrimSpace(options.candidateTag) != goldenPinnedCandidateTag || !validGoldenSHA256(options.candidateSHA256) ||
-			len(strings.TrimSpace(options.candidateRevision)) != 40 {
-			return options, fmt.Errorf("the golden candidate must be the verified immutable %s release", goldenPinnedCandidateTag)
+		if !validGoldenCandidateTag(options.candidateTag) || !validGoldenSHA256(options.candidateSHA256) ||
+			!validGoldenRevision(strings.TrimSpace(options.candidateRevision)) {
+			return options, errors.New("the golden candidate must be a versioned release with verified SHA-256 and source revision")
 		}
 	} else if options.evidenceValidator == "" {
 		options.evidenceValidator = goldenTestHooks.evidenceValidator
@@ -287,9 +290,9 @@ func parseGoldenSlotArgs(args []string) (goldenOptions, error) {
 		if strings.TrimSpace(options.bootstrapSHA256) != goldenPinnedBootstrapLinuxSHA256 {
 			return options, errors.New("the active slot worker must be the verified v0.1.63 bootstrap")
 		}
-		if strings.TrimSpace(options.candidateTag) != goldenPinnedCandidateTag || !validGoldenSHA256(options.candidateSHA256) ||
-			len(strings.TrimSpace(options.candidateRevision)) != 40 {
-			return options, fmt.Errorf("the golden candidate must be the verified immutable %s release", goldenPinnedCandidateTag)
+		if !validGoldenCandidateTag(options.candidateTag) || !validGoldenSHA256(options.candidateSHA256) ||
+			!validGoldenRevision(strings.TrimSpace(options.candidateRevision)) {
+			return options, errors.New("the golden candidate must be a versioned release with verified SHA-256 and source revision")
 		}
 	} else if options.evidenceValidator == "" {
 		options.evidenceValidator = goldenTestHooks.evidenceValidator
@@ -655,10 +658,14 @@ func runGoldenOptions(options goldenOptions) (runErr error) {
 			options.candidateTag, options.candidateSHA256, options.candidateRevision); err != nil {
 			return err
 		}
-	} else if err := validateGoldenSummary(summary, testMode); err != nil {
+	} else if err := validateGoldenSummaryForCandidate(summary, testMode, options.candidateTag); err != nil {
 		return err
 	}
 	return nil
+}
+
+func validGoldenCandidateTag(value string) bool {
+	return goldenCandidateTagPattern.MatchString(strings.TrimSpace(value))
 }
 
 func fixedGoldenFailure(err error) string {
@@ -4860,6 +4867,10 @@ func hashGoldenValue(value string) string {
 }
 
 func validateGoldenSummary(summary goldenSummary, testMode bool) error {
+	return validateGoldenSummaryForCandidate(summary, testMode, goldenPinnedCandidateTag)
+}
+
+func validateGoldenSummaryForCandidate(summary goldenSummary, testMode bool, candidateTag string) error {
 	if summary.ReleasedVersion == "" || len(summary.ReleasedSHA256) != 64 || !summary.ReleaseChecksumVerified || summary.ReleasePlatform != "darwin/arm64" {
 		return failGolden("release_evidence_incomplete")
 	}
@@ -4874,7 +4885,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 	if !testMode && summary.ReleasedVersion == "test-override" {
 		return failGolden("candidate_client_forbidden")
 	}
-	if err := validateGoldenMigrationSummary(summary, testMode); err != nil {
+	if err := validateGoldenMigrationSummaryForCandidate(summary, testMode, candidateTag); err != nil {
 		return err
 	}
 	if err := validateGoldenTransitionAction(summary.Activation, true); err != nil {
