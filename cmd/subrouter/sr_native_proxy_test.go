@@ -227,8 +227,9 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 	}
 }
 
-func TestPooledTeamNativeProxyLaunchDefersAccountSelectionToBroker(t *testing.T) {
+func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	var accountRequests atomic.Int32
+	var pinnedRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health":
@@ -241,30 +242,53 @@ func TestPooledTeamNativeProxyLaunchDefersAccountSelectionToBroker(t *testing.T)
 		case "/_subrouter/accounts":
 			accountRequests.Add(1)
 			_, _ = io.WriteString(w, `[]`)
+		case "/qwen-token/v1/chat/completions":
+			if got := request.Header.Get("X-Subrouter-Account-ID"); got != "qwen-token:work" {
+				t.Errorf("pinned request account = %q", got)
+			}
+			if got := request.Header.Get("Authorization"); got != "Bearer test-local-proxy-token" {
+				t.Errorf("pinned request authorization = %q", got)
+			}
+			pinnedRequests.Add(1)
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, request)
 		}
 	}))
 	defer server.Close()
+	var teamAccountRequests atomic.Int32
+	brokerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/subrouter/accounts" {
+			http.NotFound(w, request)
+			return
+		}
+		teamAccountRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"teamId":"test-team","accounts":[{"id":"qwen-token:work","kind":"qwen-token","label":"Work"}]}`)
+	}))
+	defer brokerServer.Close()
 
 	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	if err := broker.SaveConfig(cloudPath, broker.Config{
 		CredentialSource: broker.CredentialSourceTeam,
-		BaseURL:          "https://cmux.com",
+		BaseURL:          brokerServer.URL,
 		AccessToken:      "test-access",
 		RefreshToken:     "test-refresh",
 		TeamID:           "test-team",
 		LocalProxyToken:  "test-local-proxy-token",
+		HostedURL:        brokerServer.URL,
+		TenantKey:        testTenantKey,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	binDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(binDir, "qwen"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(binDir, "qwen"), []byte("#!/bin/sh\nif [ \"${SUBROUTER_TEST_QWEN_HELPER:-}\" = 1 ]; then\n  exec \"$SUBROUTER_TEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- \"$@\"\nfi\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("SUBROUTER_TEST_BINARY", os.Args[0])
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := srRunner{client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{}); err != nil {
@@ -283,12 +307,42 @@ func TestPooledTeamNativeProxyLaunchDefersAccountSelectionToBroker(t *testing.T)
 		t.Fatalf("unsupported team launch made %d account inventory request(s), want pre-exec rejection", got)
 	}
 
-	err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{accountSelector: "work"})
-	if err == nil || !strings.Contains(err.Error(), "no routed Qwen apikey account") {
-		t.Fatalf("pinned team launch error = %v, want authoritative inventory failure", err)
+	t.Setenv("SUBROUTER_TEST_QWEN_HELPER", "1")
+	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{accountSelector: "work"}); err != nil {
+		t.Fatalf("named pinned team launch: %v", err)
 	}
-	if got := accountRequests.Load(); got != 1 {
-		t.Fatalf("pinned team launch made %d account inventory request(s), want 1", got)
+	runner.in = strings.NewReader("1\n")
+	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{pickPinnedAccount: true}); err != nil {
+		t.Fatalf("picker pinned team launch: %v", err)
+	}
+	if got := teamAccountRequests.Load(); got != 2 {
+		t.Fatalf("pinned team launches made %d broker inventory request(s), want 2", got)
+	}
+	if got := accountRequests.Load(); got != 0 {
+		t.Fatalf("team launches made %d local account inventory request(s), want broker authority only", got)
+	}
+	if got := pinnedRequests.Load(); got != 2 {
+		t.Fatalf("pinned team launches routed %d forced request(s), want 2", got)
+	}
+}
+
+func TestTeamNativeProxyQwenChild(t *testing.T) {
+	if os.Getenv("SUBROUTER_TEST_QWEN_HELPER") != "1" {
+		return
+	}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, strings.TrimRight(os.Getenv("OPENAI_BASE_URL"), "/")+"/chat/completions", strings.NewReader(`{"model":"test"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+os.Getenv("OPENAI_API_KEY"))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("routed Qwen request status = %d", response.StatusCode)
 	}
 }
 
@@ -529,6 +583,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		"PATH=/usr/bin", "KEEP_ME=yes", "KIMI_CODE_HOME=/custom/kimi-home", "QWEN_HOME=/custom/qwen-home",
 		"OPENAI_API_KEY=real-openai-secret", "OPENAI_BASE_URL=https://vendor.invalid/v1",
 		"OPENAI_ORG_ID=direct-org-secret", "OPENAI_PROJECT_ID=direct-project-secret",
+		"BAILIAN_CODING_PLAN_API_KEY=real-coding-plan-secret",
 		"BAILIAN_TOKEN_PLAN_API_KEY=real-bailian-secret", "KIMI_MODEL_API_KEY=real-kimi-secret",
 		"KIMI_CODE_CUSTOM_HEADERS=X-Direct-Gateway-Secret: custom-header-secret",
 		"HTTP_PROXY=http://credential-sink.invalid", "https_proxy=http://credential-sink.invalid",
@@ -542,7 +597,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	}
 	defer qwenCleanup()
 	joined := strings.Join(qwenEnv, "\n")
-	for _, secret := range []string{"real-openai-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "vendor.invalid", "credential-sink.invalid"} {
+	for _, secret := range []string{"real-openai-secret", "real-coding-plan-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "vendor.invalid", "credential-sink.invalid"} {
 		if strings.Contains(joined, secret) {
 			t.Fatalf("Qwen child environment leaked %q:\n%s", secret, joined)
 		}
@@ -553,13 +608,22 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	if got := testEnvValue(qwenEnv, "QWEN_HOME"); got != "/custom/qwen-home" {
 		t.Fatalf("QWEN_HOME changed from its normal value: %q", got)
 	}
+	for _, key := range []string{"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"} {
+		if got := testEnvValue(qwenEnv, key); got != "subrouter" {
+			t.Fatalf("Qwen child %s = %q, want a non-secret sentinel", key, got)
+		}
+	}
 	settings := testEnvValue(qwenEnv, "QWEN_CODE_SYSTEM_SETTINGS_PATH")
 	body, err := os.ReadFile(settings)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var overlay struct {
-		Proxy          *string `json:"proxy"`
+		Proxy         *string           `json:"proxy"`
+		Env           map[string]string `json:"env"`
+		SlashCommands struct {
+			Disabled []string `json:"disabled"`
+		} `json:"slashCommands"`
 		ModelProviders map[string][]struct {
 			ID      string `json:"id"`
 			BaseURL string `json:"baseUrl"`
@@ -569,11 +633,19 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		t.Fatal(err)
 	}
 	providers := overlay.ModelProviders["openai"]
-	if len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != qwenProviderURL {
+	if len(overlay.ModelProviders) != 1 || len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != qwenProviderURL {
 		t.Fatalf("Qwen overlay = %+v", overlay)
 	}
 	if overlay.Proxy == nil || *overlay.Proxy != "" {
 		t.Fatalf("Qwen overlay proxy = %v, want an explicit process-only disable", overlay.Proxy)
+	}
+	for _, key := range []string{"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"} {
+		if value, exists := overlay.Env[key]; !exists || value != "subrouter" {
+			t.Fatalf("Qwen overlay env[%q] = %q exists=%t, want a non-secret sentinel", key, value, exists)
+		}
+	}
+	if !reflect.DeepEqual(overlay.SlashCommands.Disabled, []string{"auth", "model"}) {
+		t.Fatalf("Qwen disabled slash commands = %q, want auth and model only", overlay.SlashCommands.Disabled)
 	}
 	if got := testEnvValue(qwenEnv, "NO_PROXY"); got != "127.0.0.1,localhost,::1" {
 		t.Fatalf("Qwen NO_PROXY = %q", got)

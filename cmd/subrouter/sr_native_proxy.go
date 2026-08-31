@@ -236,7 +236,11 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	}
 	var inventory []remoteServerAccount
 	if nativeProxyNeedsAccountInventory(options, credentialSource) {
-		inventory, err = r.nativeProxyAccounts(ctx, server, spec)
+		if credentialSource == broker.CredentialSourceTeam {
+			inventory, err = nativeProxyTeamAccounts(ctx, cloudConfig, spec)
+		} else {
+			inventory, err = r.nativeProxyAccounts(ctx, server, spec)
+		}
 		if err != nil {
 			return err
 		}
@@ -474,6 +478,38 @@ func (r srRunner) nativeProxyAccounts(ctx context.Context, server srServerConfig
 		mode = " " + string(spec.authMode)
 	}
 	return nil, fmt.Errorf("no routed %s%s account is available on server %s", spec.display, mode, server.Name)
+}
+
+func nativeProxyTeamAccounts(ctx context.Context, config broker.Config, spec nativeProxySpec) ([]remoteServerAccount, error) {
+	shared, err := broker.NewClient(config).ListAccounts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load %s accounts from the selected team: %w", spec.display, err)
+	}
+	eligible := make([]remoteServerAccount, 0, len(shared))
+	for _, item := range shared {
+		if item.Kind != string(spec.provider) {
+			continue
+		}
+		account := remoteServerAccount{
+			ID:       strings.TrimSpace(item.ID),
+			Provider: spec.provider,
+			AuthMode: spec.authMode,
+			Label:    strings.TrimSpace(item.Label),
+			Email:    strings.TrimSpace(item.Email),
+			Source:   "team vault",
+		}
+		if nativeProxyAccountEligible(spec, account) && validNativeProxyAccountID(account.ID) {
+			eligible = append(eligible, account)
+		}
+	}
+	if len(eligible) > 0 {
+		return eligible, nil
+	}
+	mode := ""
+	if spec.authMode != "" {
+		mode = " " + string(spec.authMode)
+	}
+	return nil, fmt.Errorf("no routed %s%s account is available in the selected team", spec.display, mode)
 }
 
 func (r srRunner) requireNativeProxyAccount(ctx context.Context, server srServerConfig, spec nativeProxySpec) error {
@@ -826,7 +862,7 @@ var nativeProxyRoutingEnvKeys = []string{
 	"KIMI_WEB_FETCH_BASE_URL", "KIMI_WEB_FETCH_API_KEY",
 	"QWEN_OAUTH", "QWEN_MODEL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
 	"OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
-	"BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY",
+	"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY",
 }
 
 func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, args []string) ([]string, func(), error) {
@@ -868,7 +904,14 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 			"OPENAI_API_KEY":                 "subrouter",
 			"OPENAI_BASE_URL":                providerURL + "/v1",
 			"OPENAI_MODEL":                   model,
-			"NO_PROXY":                       "127.0.0.1,localhost,::1",
+			// Qwen loads .qwen/.env and settings.env only when a process key is
+			// absent. Non-empty sentinels prevent either source from restoring a
+			// direct Alibaba credential. The forced --auth-type=openai argument
+			// and single-provider system overlay remain the routing authority.
+			"BAILIAN_CODING_PLAN_API_KEY": "subrouter",
+			"BAILIAN_TOKEN_PLAN_API_KEY":  "subrouter",
+			"DASHSCOPE_API_KEY":           "subrouter",
+			"NO_PROXY":                    "127.0.0.1,localhost,::1",
 		} {
 			env = upsertEnv(env, key, value)
 		}
@@ -1014,6 +1057,14 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 		// loopback URL. System settings merge last, so an explicit empty value
 		// disables that process only without rewriting the user's configuration.
 		"proxy": "",
+		"env": map[string]string{
+			"BAILIAN_CODING_PLAN_API_KEY": "subrouter",
+			"BAILIAN_TOKEN_PLAN_API_KEY":  "subrouter",
+			"DASHSCOPE_API_KEY":           "subrouter",
+		},
+		"slashCommands": map[string]any{
+			"disabled": []string{"auth", "model"},
+		},
 		"modelProviders": map[string]any{
 			"openai": []any{map[string]any{
 				"id":      model,

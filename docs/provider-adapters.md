@@ -70,8 +70,10 @@ documented in-memory model override and forces that model for resumed sessions.
 Qwen uses a temporary highest-precedence provider overlay because saved
 `modelProviders` outrank a simple base-URL environment variable. It refuses to
 run when an existing system policy is configured rather than masking that
-policy. The Antigravity relay similarly leaves the local keychain untouched and
-removes the local bearer before forwarding to the selected router.
+policy. The overlay disables Qwen's `/auth` and `/model` provider switches and
+shadows direct Alibaba credentials with non-secret process sentinels. The
+Antigravity relay similarly leaves the local keychain untouched and removes the
+local bearer before forwarding to the selected router.
 
 Pooled native-launcher account affinity is provider-and-working-directory
 scoped. The initial launch, continue, and explicit resume therefore retain one
