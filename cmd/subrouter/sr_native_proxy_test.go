@@ -108,6 +108,10 @@ func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *te
 	if selectedLoopbackToken, err := nativeProxyServerToken(root + "/selected-server"); err != nil || selectedLoopbackToken != "local-daemon-secret" {
 		t.Fatalf("selected loopback token = %q err=%v", selectedLoopbackToken, err)
 	}
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "http://localhost:43213")
+	if pinnedLoopbackToken, err := nativeProxyServerToken("http://127.0.0.1:43213"); err != nil || pinnedLoopbackToken != "local-daemon-secret" {
+		t.Fatalf("pinned loopback token = %q err=%v", pinnedLoopbackToken, err)
+	}
 	env, cleanup, err := nativeProxyEnvironment(kimiNativeProxy, "http://127.0.0.1:43214/capability", os.Environ(), nil)
 	cleanup()
 	if err != nil {
@@ -221,7 +225,7 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 }
 
 func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
-	for _, args := range [][]string{{"--resume"}, {"-r"}, {"--resume", "--model", "qwen-test"}} {
+	for _, args := range [][]string{{"--resume"}, {"-r"}, {"--resume="}, {"--resume", "--model", "qwen-test"}} {
 		if !nativeProxyResumePickerRequested(qwenNativeProxy, args) {
 			t.Fatalf("picker resume %q was not detected", args)
 		}
@@ -234,7 +238,7 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 	if err := (srRunner{}).launchQwenProxy(t.Context(), []string{"--resume"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
 		t.Fatalf("picker launch error = %v", err)
 	}
-	for _, args := range [][]string{{"--session"}, {"-S"}, {"--session", "--model", "kimi-test"}} {
+	for _, args := range [][]string{{"--session"}, {"-S"}, {"--session="}, {"--session", "--model", "kimi-test"}} {
 		if !nativeProxyResumePickerRequested(kimiNativeProxy, args) {
 			t.Fatalf("Kimi picker resume %q was not detected", args)
 		}
@@ -301,52 +305,29 @@ func TestKimiNativeProxyArgsForceEphemeralModelOnNewAndResumedSessions(t *testin
 	}
 }
 
-func TestNativeProxySessionIdentitySurvivesExplicitResume(t *testing.T) {
-	for _, test := range []struct {
-		spec nativeProxySpec
-		args []string
-	}{
-		{spec: kimiNativeProxy, args: []string{"--session", "kimi-session-id"}},
-		{spec: kimiNativeProxy, args: []string{"--session=kimi-session-id"}},
-		{spec: qwenNativeProxy, args: []string{"--resume", "qwen-session-id"}},
-		{spec: qwenNativeProxy, args: []string{"--resume=qwen-session-id"}},
-		{spec: qwenNativeProxy, args: []string{"--session-id", "qwen-session-id"}},
-		{spec: antigravityNativeProxy, args: []string{"--conversation", "agy-conversation-id"}},
-	} {
-		first, err := nativeProxySessionID(test.spec, test.args)
+func TestNativeProxySessionIdentitySurvivesInitialLaunchAndResume(t *testing.T) {
+	for _, spec := range []nativeProxySpec{kimiNativeProxy, qwenNativeProxy, antigravityNativeProxy} {
+		first, err := nativeProxySessionID(spec, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		second, err := nativeProxySessionID(test.spec, test.args)
-		if err != nil {
-			t.Fatal(err)
+		for _, args := range [][]string{{"--resume", "native-id"}, {"--session", "native-id"}, {"--conversation", "native-id"}, {"--continue"}} {
+			resumed, resumeErr := nativeProxySessionID(spec, args)
+			if resumeErr != nil {
+				t.Fatal(resumeErr)
+			}
+			if resumed != first {
+				t.Fatalf("%s initial session %q changed on resume %q to %q", spec.provider, first, args, resumed)
+			}
 		}
-		if first != second || !strings.HasPrefix(first, "sr-native-") || strings.Contains(first, "session-id") {
-			t.Fatalf("resume session identity = %q then %q", first, second)
+		if !strings.HasPrefix(first, "sr-native-") {
+			t.Fatalf("workspace session identity = %q", first)
 		}
 	}
-	qwenID, _ := nativeProxySessionID(qwenNativeProxy, []string{"--resume", "same-id"})
-	kimiID, _ := nativeProxySessionID(kimiNativeProxy, []string{"--session", "same-id"})
+	qwenID, _ := nativeProxySessionID(qwenNativeProxy, nil)
+	kimiID, _ := nativeProxySessionID(kimiNativeProxy, nil)
 	if qwenID == kimiID {
 		t.Fatal("provider namespaces share a native proxy session ID")
-	}
-}
-
-func TestNativeProxyContinueAliasesAvoidKimiPromptAlias(t *testing.T) {
-	for _, test := range []struct {
-		spec nativeProxySpec
-		args []string
-		want bool
-	}{
-		{spec: kimiNativeProxy, args: []string{"-c"}, want: true},
-		{spec: kimiNativeProxy, args: []string{"--continue"}, want: true},
-		{spec: kimiNativeProxy, args: []string{"-c", "prompt text"}, want: false},
-		{spec: antigravityNativeProxy, args: []string{"--continue"}, want: true},
-	} {
-		got := nativeProxyResumeIdentity(test.spec, test.args) != ""
-		if got != test.want {
-			t.Fatalf("resume identity for %s %q = %t, want %t", test.spec.provider, test.args, got, test.want)
-		}
 	}
 }
 

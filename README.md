@@ -622,7 +622,9 @@ an unsupported quota endpoint.
 Native proxy launchers preflight the selected router before starting the vendor
 CLI. Hosted or otherwise lease-required routers are rejected until Subrouter has
 a native-launcher session-lease client; local and ordinary self-hosted routers
-remain supported.
+remain supported. Their account affinity is stable per provider and working
+directory, so initial and resumed sessions stay together without reading vendor
+session files.
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that

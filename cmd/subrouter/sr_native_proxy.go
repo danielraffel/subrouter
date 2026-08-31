@@ -36,13 +36,15 @@ The agy CLI must still have its own local login; Subrouter never copies or chang
 
 Launch Kimi Code through the selected Subrouter pool. Plain 'kimi' remains direct.
 The process-scoped model override leaves Kimi's normal login and config unchanged.
-For sticky resume, pass an explicit ID: sr kimi proxy --session <session-id>.
+Account affinity is stable per working directory, including resumed sessions.
+The session-picker form requires an explicit ID: sr kimi proxy --session <session-id>.
 `
 	qwenProxyHelp = `Usage: sr qwen proxy [qwen args...]
 
 Launch Qwen Code through the selected Qwen Token Plan pool. Plain 'qwen' remains direct.
 The process-only routing overlay preserves Qwen's normal sessions and configuration.
-For sticky resume, pass an explicit ID: sr qwen proxy --resume <session-id>.
+Account affinity is stable per working directory, including resumed sessions.
+The session-picker form requires an explicit ID: sr qwen proxy --resume <session-id>.
 `
 )
 
@@ -128,7 +130,12 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 		}
 		matched := false
 		for _, flag := range pickerFlags {
-			matched = matched || args[i] == flag
+			if args[i] == flag {
+				matched = true
+			}
+			if strings.HasPrefix(args[i], flag+"=") && strings.TrimSpace(strings.TrimPrefix(args[i], flag+"=")) == "" {
+				return true
+			}
 		}
 		if !matched {
 			continue
@@ -154,7 +161,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return err
 	}
-	proxyToken, err := nativeProxyServerToken(root)
+	proxyToken, err := nativeProxyServerToken(server.URL)
 	if err != nil {
 		return err
 	}
@@ -190,17 +197,39 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 }
 
 func nativeProxyServerToken(root string) (string, error) {
-	if !loopbackEndpoint(root) || !sameEndpoint(root, localBaseURL()) {
+	if !sameLocalProxyEndpoint(root, localBaseURL()) {
 		return "subrouter", nil
 	}
 	config, err := cloudModeConfig()
 	if err != nil {
 		return "", fmt.Errorf("load local Subrouter client credential: %w", err)
 	}
-	if token := cloudClientProxyToken(config, root); token != "" {
+	if token := cloudServerProxyToken(config); token != "" {
 		return token, nil
 	}
 	return "subrouter", nil
+}
+
+func sameLocalProxyEndpoint(left, right string) bool {
+	if sameEndpoint(left, right) {
+		return true
+	}
+	leftURL, leftErr := url.Parse(strings.TrimSpace(left))
+	rightURL, rightErr := url.Parse(strings.TrimSpace(right))
+	if leftErr != nil || rightErr != nil || !loopbackEndpoint(left) || !loopbackEndpoint(right) ||
+		!strings.EqualFold(leftURL.Scheme, rightURL.Scheme) {
+		return false
+	}
+	port := func(parsed *url.URL) string {
+		if value := parsed.Port(); value != "" {
+			return value
+		}
+		if strings.EqualFold(parsed.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return port(leftURL) == port(rightURL)
 }
 
 func (r srRunner) requireNativeProxyDataPlane(ctx context.Context, root, proxyToken string) error {
@@ -392,58 +421,17 @@ func newNativeProxyToken() (string, error) {
 }
 
 func nativeProxySessionID(spec nativeProxySpec, args []string) (string, error) {
-	if identity := nativeProxyResumeIdentity(spec, args); identity != "" {
-		digest := sha256.Sum256([]byte(string(spec.provider) + "\x00" + identity))
-		return "sr-native-" + hex.EncodeToString(digest[:16]), nil
+	_ = args
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve native proxy workspace: %w", err)
 	}
-	return newNativeProxySessionID()
-}
-
-func nativeProxyResumeIdentity(spec nativeProxySpec, args []string) string {
-	var idFlags []string
-	var continueFlags []string
-	switch spec.provider {
-	case accounts.ProviderAntigravity:
-		idFlags = []string{"--conversation"}
-		continueFlags = []string{"-c", "--continue"}
-	case accounts.ProviderKimi:
-		idFlags = []string{"-S", "--session"}
-		continueFlags = []string{"-c", "--continue"}
-	case accounts.ProviderQwenToken:
-		idFlags = []string{"-r", "--resume", "--session-id"}
-		continueFlags = []string{"-c", "--continue"}
-	default:
-		return ""
+	cwd = filepath.Clean(cwd)
+	if resolved, resolveErr := filepath.EvalSymlinks(cwd); resolveErr == nil {
+		cwd = resolved
 	}
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--" {
-			break
-		}
-		for _, flag := range idFlags {
-			if strings.HasPrefix(args[i], flag+"=") {
-				if value := strings.TrimSpace(strings.TrimPrefix(args[i], flag+"=")); value != "" {
-					return "resume:" + value
-				}
-			}
-			if args[i] == flag && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				return "resume:" + strings.TrimSpace(args[i+1])
-			}
-		}
-		for _, flag := range continueFlags {
-			// Kimi has used -c both as a boolean continue alias and, in newer
-			// releases, as a prompt alias. Only treat a short flag as continue
-			// when it does not consume a following value; the long form is stable.
-			shortWithValue := len(flag) == 2 && args[i] == flag && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-")
-			if !shortWithValue && (args[i] == flag || args[i] == flag+"=true") {
-				cwd, err := os.Getwd()
-				if err != nil {
-					cwd = "."
-				}
-				return "continue:" + filepath.Clean(cwd)
-			}
-		}
-	}
-	return ""
+	digest := sha256.Sum256([]byte(string(spec.provider) + "\x00workspace\x00" + cwd))
+	return "sr-native-" + hex.EncodeToString(digest[:16]), nil
 }
 
 var nativeProxyRoutingEnvKeys = []string{

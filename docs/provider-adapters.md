@@ -67,6 +67,11 @@ run when an existing system policy is configured rather than masking that
 policy. The Antigravity relay similarly leaves the local keychain untouched and
 removes the local bearer before forwarding to the selected router.
 
+Native launcher account affinity is provider-and-working-directory scoped. The
+initial launch, continue, and explicit resume therefore retain one router
+assignment without inspecting or persisting vendor session files. Parallel
+native sessions in the same working directory deliberately share that account.
+
 Before starting the child, every native launcher performs an authenticated
 `HEAD` preflight against the exact data-plane root. Lease-required/hosted
 routers fail closed; the current launchers support local and ordinary
