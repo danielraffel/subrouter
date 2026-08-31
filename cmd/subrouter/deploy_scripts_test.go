@@ -284,6 +284,12 @@ func TestGCPPreflightAcceptsPostMigrationListenerTakeoverRoute(t *testing.T) {
 set -euo pipefail
 command_line="$*"
 if [[ "${command_line}" == *"compute url-maps describe"* ]]; then
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == reversed ]]; then
+    cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","name":"subrouter-front-canary"}]}
+JSON
+    exit 0
+  fi
   cat <<'JSON'
 {"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","name":"subrouter-front-canary"}]}
 JSON
@@ -310,6 +316,7 @@ if [[ "${1:-}" == compute && "${2:-}" == ssh ]]; then
       printf '%s\n' '{"accepting":true,"retiring":false,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","connections":0}]}'
       ;;
     *"ss -H -lntp"*)
+      if [[ "${FAKE_LEGACY_ENABLED:-0}" == 1 ]]; then exit 1; fi
       printf '%s\n' '{"verified":true,"service":"subrouter-front.service","port":31415,"pid":1234}'
       ;;
     *MainPID*)
@@ -393,6 +400,26 @@ exit 1
 	}
 	if evidence.Topology.Current != "front-listener" || !evidence.Topology.Verified {
 		t.Fatalf("listener takeover evidence = %+v, want verified front-listener", evidence.Topology)
+	}
+
+	reversed := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "reversed.json"),
+	)
+	reversed.Env = append(command.Env, "FAKE_ROUTE_STATE=reversed")
+	if output, err := reversed.CombinedOutput(); err == nil {
+		t.Fatalf("reversed active/canary route was accepted:\n%s", output)
+	}
+
+	enabled := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "enabled.json"),
+	)
+	enabled.Env = append(command.Env, "FAKE_LEGACY_ENABLED=1")
+	if output, err := enabled.CombinedOutput(); err == nil {
+		t.Fatalf("enabled legacy unit was accepted:\n%s", output)
 	}
 }
 
