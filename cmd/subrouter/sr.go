@@ -72,7 +72,7 @@ Usage:
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  sr remove <account>   Remove an account (for example qwen-token:large-plan)
+  sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
@@ -1087,11 +1087,20 @@ func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
 	if out == nil {
 		return
 	}
+	hasKimiPool := false
 	for _, row := range rows {
-		if row.provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+		if row.provider != accounts.ProviderKimi {
+			continue
+		}
+		hasKimiPool = true
+		if row.authMode == accounts.AuthModeOAuth {
 			fmt.Fprintln(out, "Plain 'kimi' uses the local direct login; use 'sr kimi proxy' for the managed Subrouter pool.")
 			return
 		}
+	}
+	if hasKimiPool {
+		fmt.Fprintln(out, "Plain 'kimi' uses its local direct configuration; use 'sr kimi proxy' for the routed Subrouter Kimi key pool.")
+		return
 	}
 	_, ok, err := agentkimi.DefaultStore().ReadLocalCredential(time.Now())
 	if err != nil || !ok {

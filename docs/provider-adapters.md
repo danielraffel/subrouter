@@ -14,10 +14,10 @@ its ordinary name uses Subrouter.
 | Qwen Coding Plan API key | OpenAI-compatible client at `/qwen/v1` | Labeled Coding Plan keys | Client auth removed; selected bearer added | Plain `qwen` with its normal provider | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live generation canary recorded |
 | Qwen Token Plan, OpenAI protocol | `sr qwen proxy`; `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Per session; failover across keys; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
 | Qwen Token Plan, Anthropic protocol | Anthropic client at `/qwen-anthropic` | Same Token Plan pool as OpenAI route | Client auth removed; selected plan bearer and Anthropic version added | Direct vendor Anthropic endpoint | Same sticky account and exhaustion state as `/qwen-token` | Same shared account and console telemetry | H1, H2 | No live generation canary recorded |
-| Antigravity / AGY OAuth | `sr agy proxy` or `sr antigravity proxy`; `/antigravity` | One `agy` keychain login on the router host | Local CLI auth is stripped by loopback relay; router OAuth bearer added | Plain `agy` | Sticky session; no multi-account OAuth selector is claimed | Safe token identity claim when present, otherwise router-login label; ready/active/error; quota not exposed | H1, H3, H4 | Local login user-tested; proxy generation canary required after deployment |
+| Antigravity / AGY OAuth | `sr agy proxy` or `sr antigravity proxy`; `/antigravity` | One `agy` keychain login on a local/single-tenant router host; not inherited by hosted tenant pools | Local CLI auth is stripped by loopback relay; router OAuth bearer added | Plain `agy` | Sticky session; no multi-account OAuth selector is claimed | Safe token identity claim when present, otherwise router-login label; ready/active/error; quota not exposed | H1, H3, H4 | Local login user-tested; proxy generation canary required after deployment |
 | Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
-| OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | Planned after an operator configures a key; not yet recorded |
+| OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | Live auth and routed generation canaries recorded |
 | DeepSeek API key | OpenAI-compatible client at `/deepseek/v1` | Labeled DeepSeek keys | Client auth removed; selected bearer added | Direct DeepSeek URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Together API key | OpenAI-compatible client at `/together/v1` | Labeled Together keys | Client auth removed; selected bearer added | Direct Together URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Fireworks API key | OpenAI-compatible client at `/fireworks/v1` | Labeled Fireworks keys | Client auth removed; selected bearer added | Direct Fireworks URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
@@ -71,9 +71,17 @@ removes the local bearer before forwarding to the selected router.
 
 Kimi has an explicit managed-profile login flow and can safely keep multiple
 router-owned subscriptions. Antigravity does not expose an equivalent profile
-or account selector: a remote router must be signed in with `agy` under the
-daemon account, and Subrouter does not copy the workstation's keychain token to
-that server. This is a product limitation, not missing quota telemetry.
+or account selector: a local or single-tenant router must be signed in with
+`agy` under the daemon account, and Subrouter does not copy the workstation's
+keychain token to that server or expose it through a tenant pool. This is a
+product limitation, not missing quota telemetry.
+
+Implemented and hermetically tested, but not yet live-account tested, are Grok,
+DeepSeek, Together, Fireworks, OpenCode Zen, Z.AI, Qwen Coding Plan, the Qwen
+Token Plan Anthropic protocol, and declared custom OpenAI-compatible routes.
+Operators with those accounts are invited to run an exact routed canary and
+record the result. Gemini is excluded from that list because it is only a
+namespace/store scaffold, not a routed adapter.
 
 Live validation should be recorded only after a real request crosses the exact
 launcher and selected router. A successful status probe or local vendor login

@@ -1619,7 +1619,7 @@ Usage:
   %[1]s g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   %[1]s gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
-  %[1]s remove <account>   Remove an account (for example qwen-token:large-plan)
+  %[1]s remove <account>   Remove from an explicitly bound local state; selected-server removal is not yet supported
   %[1]s status             Show usage across all configured providers (non-interactive)
   %[1]s qwen login [--console-account <email-or-label>] <account>
                            Authorize live Qwen Token Plan quota status

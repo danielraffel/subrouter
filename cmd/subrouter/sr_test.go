@@ -697,6 +697,13 @@ func TestFetchUsageRowsExcludesKimiCLICredentialWithoutRefreshingIt(t *testing.T
 	if !strings.Contains(out.String(), "Plain 'kimi' uses the local direct login") || !strings.Contains(out.String(), "sr kimi proxy") || strings.Contains(out.String(), "sr kimi login") {
 		t.Fatalf("status did not distinguish direct and managed Kimi launchers: %q", out.String())
 	}
+	out.Reset()
+	printKimiCLIOnlyStatusHint(&out, []srUsageRow{{
+		email: "kimi:key", provider: accounts.ProviderKimi, authMode: accounts.AuthModeAPIKey,
+	}})
+	if !strings.Contains(out.String(), "routed Subrouter Kimi key pool") || !strings.Contains(out.String(), "sr kimi proxy") || strings.Contains(out.String(), "sr kimi login") {
+		t.Fatalf("status did not recognize an API-key-only Kimi pool: %q", out.String())
+	}
 }
 
 func (f fakeKimiUsageStore) ListAccounts(context.Context) ([]baseaccount.Account, error) {

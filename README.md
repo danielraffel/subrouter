@@ -610,8 +610,10 @@ Plain `agy` remains the vendor's direct CLI. `sr agy proxy` (also
 through the selected Subrouter and its Antigravity credential. The local CLI
 login is used only to satisfy the CLI's own bootstrap; its bearer credential is
 removed by a loopback relay and is never copied to the selected server. A
-remote router therefore needs its own `agy` login in the account running the
-daemon. There is deliberately no local-to-remote Antigravity token import: the
+selected single-tenant router therefore needs its own `agy` login in the account
+running the daemon. Tenant-scoped/hosted pools do not inherit a host keychain
+login and are not advertised as Antigravity OAuth routes. There is deliberately
+no local-to-remote Antigravity token import: the
 CLI exposes neither a safe independent profile format nor a supported
 account-selector workflow. `sr status` reports the router credential as
 `ready`, `active`, or `error`, and says quota is not exposed instead of polling
@@ -683,8 +685,13 @@ provider-qualified saved labels as other Subrouter accounts:
 
 ```bash
 sr list
-sr remove qwen-token:small-plan
 ```
+
+Adding a key targets the selected serving server. Removing an account from a
+selected server is not implemented yet; `sr remove` is only available when the
+operator explicitly binds the command to the exact local state with
+`SUBROUTER_STATE_DIR`. This avoids reporting success after editing a different
+store from the running daemon.
 
 Launch Qwen Code through the selected Token Plan pool with:
 
