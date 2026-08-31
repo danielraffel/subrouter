@@ -655,6 +655,98 @@ class FunctionalCanaryTest(unittest.TestCase):
         else:
             self.fail("timed-out descendant process remained alive")
 
+    def test_timeout_does_not_kill_sibling_in_shared_runner_group(self) -> None:
+        """A bounded callback may share its outer anchor group, not its leg groups."""
+        hanging = self.root / "shared-group-hanging.py"
+        hanging.write_text(
+            f"#!{sys.executable}\n"
+            "import time\n"
+            "time.sleep(30)\n"
+        )
+        hanging.chmod(0o700)
+        manifest = self.manifest(hanging, timeout=1, total_timeout=6)
+        sibling_file = self.root / "sibling.pid"
+        sibling_state = self.root / "sibling.state"
+        runner_state = self.root / "runner.state"
+        release = self.root / "release"
+        wrapper = self.root / "shared-group-wrapper.py"
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import os, pathlib, signal, sys, time\n"
+            "runner, manifest, sibling_file, sibling_state, runner_state, release = sys.argv[1:]\n"
+            "anchor_pid = os.getpid()\n"
+            "sibling_pid = os.fork()\n"
+            "if sibling_pid == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    pathlib.Path(sibling_file).write_text(str(os.getpid()))\n"
+            "    while True:\n"
+            "        time.sleep(1)\n"
+            "runner_pid = os.fork()\n"
+            "if runner_pid == 0:\n"
+            "    environment = dict(os.environ)\n"
+            "    environment['SUBROUTER_BOUNDED_GROUP_ANCHOR_PID'] = str(anchor_pid)\n"
+            "    os.execve(sys.executable, [sys.executable, runner, '--manifest', manifest], environment)\n"
+            "_, runner_status = os.waitpid(runner_pid, 0)\n"
+            "pathlib.Path(runner_state).write_text(str(runner_status))\n"
+            "try:\n"
+            "    waited, _ = os.waitpid(sibling_pid, os.WNOHANG)\n"
+            "    pathlib.Path(sibling_state).write_text('alive' if waited == 0 else 'dead')\n"
+            "except ChildProcessError:\n"
+            "    pathlib.Path(sibling_state).write_text('dead')\n"
+            "while not pathlib.Path(release).exists():\n"
+            "    time.sleep(0.01)\n"
+            "try:\n"
+            "    os.kill(sibling_pid, signal.SIGTERM)\n"
+            "except ProcessLookupError:\n"
+            "    pass\n"
+            "time.sleep(0.05)\n"
+            "try:\n"
+            "    os.kill(sibling_pid, signal.SIGKILL)\n"
+            "except ProcessLookupError:\n"
+            "    pass\n"
+            "try:\n"
+            "    os.waitpid(sibling_pid, 0)\n"
+            "except ChildProcessError:\n"
+            "    pass\n"
+            "sys.exit(os.WEXITSTATUS(runner_status) if os.WIFEXITED(runner_status) else 125)\n"
+        )
+        wrapper.chmod(0o700)
+        environment = dict(
+            os.environ,
+            SUBROUTER_CANARY_TRANSACTION_WORKER_PATH=str(self.success),
+            SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256=hashlib.sha256(
+                self.success.read_bytes()
+            ).hexdigest(),
+        )
+        process = subprocess.Popen(
+            [sys.executable, str(wrapper), str(RUNNER), str(manifest), str(sibling_file),
+             str(sibling_state), str(runner_state), str(release)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.root,
+            env=environment,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not sibling_file.exists():
+                time.sleep(0.02)
+            self.assertTrue(sibling_file.exists(), "shared-group sibling did not start")
+            while time.monotonic() < deadline and not runner_state.exists():
+                time.sleep(0.02)
+            self.assertTrue(runner_state.exists(), "runner did not finish its timed-out leg")
+            while time.monotonic() < deadline and not sibling_state.exists():
+                time.sleep(0.02)
+            self.assertEqual(sibling_state.read_text(), "alive")
+            release.write_text("done\n")
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertNotEqual(process.returncode, 0, stdout + stderr)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+
     def test_exited_leg_leader_cannot_leave_descendant(self) -> None:
         pid_file = self.root / "detached.pid"
         leaking = self.root / "leaking.py"
