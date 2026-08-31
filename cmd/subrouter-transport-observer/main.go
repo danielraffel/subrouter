@@ -786,6 +786,11 @@ func newObserverHandlerWithObserver(upstream *url.URL, observation *observer) ht
 func newObserverHandlerWithObserverAndGate(upstream *url.URL, observation *observer, gate *goldenResponseGate) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// ReverseProxy resets the outbound request's Close flag, so a per-request
+	// observer context cannot safely identify events on a reused connection.
+	// Keep each upstream exchange on its own connection so evidence remains
+	// attributable to the request that produced it.
+	transport.DisableKeepAlives = true
 	dialer := &net.Dialer{}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		connection, err := dialer.DialContext(ctx, network, address)
