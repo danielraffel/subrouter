@@ -283,9 +283,14 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 	if err := (srRunner{}).launchQwenProxy(t.Context(), []string{"--resume"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
 		t.Fatalf("picker launch error = %v", err)
 	}
-	for _, args := range [][]string{{"--session"}, {"-S"}, {"--session="}, {"--session", ""}, {"-S", "   "}, {"--session", "--model", "kimi-test"}} {
+	for _, args := range [][]string{{"--session"}, {"-S"}, {"--resume"}, {"-r"}, {"--session="}, {"--resume="}, {"--session", ""}, {"-r", "   "}, {"--session", "--model", "kimi-test"}} {
 		if !nativeProxyResumePickerRequested(kimiNativeProxy, args) {
 			t.Fatalf("Kimi picker resume %q was not detected", args)
+		}
+	}
+	for _, args := range [][]string{{"--session", "session-id"}, {"-S", "session-id"}, {"--resume", "session-id"}, {"-r", "session-id"}, {"--resume=session-id"}} {
+		if nativeProxyResumePickerRequested(kimiNativeProxy, args) {
+			t.Fatalf("explicit Kimi resume %q was rejected", args)
 		}
 	}
 	if err := (srRunner{}).launchKimiProxy(t.Context(), []string{"--session"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {

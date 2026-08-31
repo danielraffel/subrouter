@@ -596,7 +596,7 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "pick":
 		return r.pickRemoteAccount(ctx, server)
 	case "reset":
-		return r.reset(ctx, args[1:])
+		return r.resetAgainstServer(ctx, args[1:], &server)
 	case "qwen":
 		return r.qwenRemote(ctx, server, args[1:])
 	case "kimi":

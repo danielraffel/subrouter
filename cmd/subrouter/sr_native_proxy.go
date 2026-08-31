@@ -117,8 +117,7 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 	var pickerFlags []string
 	switch spec.provider {
 	case accounts.ProviderKimi:
-		// Kimi Code 0.39 exposes -S/--session (not -r/--resume).
-		pickerFlags = []string{"-S", "--session"}
+		pickerFlags = []string{"-S", "--session", "-r", "--resume"}
 	case accounts.ProviderQwenToken:
 		pickerFlags = []string{"-r", "--resume"}
 	default:

@@ -1210,6 +1210,41 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	}
 }
 
+func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: "apikey:disk-only", AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "disk-placeholder"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var requested atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/reset-credits" {
+			http.NotFound(w, request)
+			return
+		}
+		requested.Store(true)
+		_, _ = io.WriteString(w, `{"accounts":[{"email":"server-authority","count":1,"credits":[{"status":"available"}]}]}`)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, useServingAPI: true, out: &out, errOut: &out, client: server.Client()}
+	if err := runner.run(t.Context(), []string{"reset", "--list"}); err != nil {
+		t.Fatal(err)
+	}
+	if !requested.Load() || !strings.Contains(out.String(), "server-authority") {
+		t.Fatalf("reset did not stay on the resolved serving API: requested=%t output=%q", requested.Load(), out.String())
+	}
+}
+
 func TestSRAddKeyForAnotherProviderDoesNotImportActiveCodexAuth(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
