@@ -614,6 +614,18 @@ wait_for_pid_gone() {
   done
 }
 
+wait_for_crash_released_mutation_lease() {
+  local lock_file="$1" attempts=0
+  while ! /usr/bin/lockf -s -k -t 0 "$lock_file" /usr/bin/true 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 1000 ] || {
+      echo "crashed migration did not release mutation lease $lock_file" >&2
+      return 1
+    }
+    sleep 0.01
+  done
+}
+
 export PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOME="$TMP/home"
 export FAKE_LAUNCHD_STATE="$TMP/state"
@@ -938,6 +950,7 @@ for hard_phase in candidate_plist_installing candidate_bootstrap_requested; do
     echo "hard fault injection at $hard_phase unexpectedly succeeded" >&2
     exit 1
   fi
+  wait_for_crash_released_mutation_lease "$mutation_lock"
   [ -d "${plist}.supervisor-transaction" ]
   [ "$(cat "${plist}.supervisor-transaction/phase")" = "$hard_phase" ]
   if [ "$hard_phase" = candidate_plist_installing ]; then
@@ -969,6 +982,7 @@ for mutation in candidate_plist_restore candidate_bootstrap; do
     echo "post-mutation hard fault at $mutation unexpectedly succeeded" >&2
     exit 1
   fi
+  wait_for_crash_released_mutation_lease "$mutation_lock"
   [ -d "${plist}.supervisor-transaction" ]
   [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
   if [ "$mutation" = candidate_plist_restore ]; then
@@ -1554,6 +1568,7 @@ kill -KILL "$orphan_migration_pid"
 wait "$orphan_migration_pid" 2>/dev/null || true
 wait_for_pid_gone "$orphan_leader_pid"
 wait_for_pid_gone "$orphan_descendant_pid"
+wait_for_crash_released_mutation_lease "$mutation_lock"
 if SUBROUTER_CANARY_MANIFEST_FILE="$functional_canary_manifest" \
   SUBROUTER_CANARY_CALLBACK="$functional_canary_runner" \
   "$MIGRATE" --activate \
@@ -1709,6 +1724,7 @@ if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP
   echo "wrapper-backed hard fault unexpectedly succeeded" >&2
   exit 1
 fi
+wait_for_crash_released_mutation_lease "$mutation_lock"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
 if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
   "$MIGRATE" --activate --public-addr 127.0.0.1:43199 \
