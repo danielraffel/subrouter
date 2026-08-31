@@ -592,7 +592,10 @@ func serve(args []string) error {
 		return err
 	}
 
-	codexStore := accounts.DefaultCodexStore()
+	// Serving must not perform the account manager's one-time legacy-store
+	// migration. Account-manager commands own that import, while a daemon
+	// startup may only inspect the effective source and enforce isolation.
+	codexStore := accounts.DefaultCodexStoreForReadOnlyInspection()
 	// Serving traffic is credential-read-only with respect to the daemon user's
 	// interactive Codex login. Stored credentials may refresh for proxy routing,
 	// but only explicit account-manager commands may replace auth.json.
@@ -602,7 +605,7 @@ func serve(args []string) error {
 	// provide the explicit isolated re-enrollment path for both local and shared
 	// stores, so serve fails closed until each legacy account is re-added.
 	codexStore.RequireIsolatedOAuth = true
-	claudeStore := agentclaude.DefaultStore()
+	claudeStore := agentclaude.DefaultStoreForReadOnlyInspection()
 	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64

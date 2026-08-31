@@ -214,6 +214,18 @@ func DefaultStore() Store {
 	return Store{Dir: storepath.CodexDir(), SharedStateDir: shared}
 }
 
+// DefaultStoreForReadOnlyInspection uses the same effective account root as
+// DefaultStore without importing the legacy Codex store. Serving processes use
+// this constructor so daemon startup cannot copy interactive credentials.
+func DefaultStoreForReadOnlyInspection() Store {
+	home, _ := os.UserHomeDir()
+	shared := ""
+	if home != "" {
+		shared = filepath.Join(home, ".claude")
+	}
+	return Store{Dir: storepath.CodexDirForReadOnlyInspection(), SharedStateDir: shared}
+}
+
 func (s Store) ProfilesPath() string {
 	return filepath.Join(s.Dir, "claude.json")
 }
