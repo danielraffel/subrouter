@@ -274,6 +274,263 @@ pathMatchers:
 	}
 }
 
+func TestGCPPreflightAcceptsPostMigrationListenerTakeoverRoute(t *testing.T) {
+	requireDeployScriptTools(t, "bash", "python3", "jq", "sha256sum")
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	fakeBin := t.TempDir()
+	writeExecutableTestFile(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 0\n")
+	fakeGcloud := filepath.Join(fakeBin, "gcloud")
+	writeExecutableTestFile(t, fakeGcloud, `#!/usr/bin/env bash
+set -euo pipefail
+command_line="$*"
+if [[ "${command_line}" == *"compute url-maps export"* ]]; then
+  destination=""
+  for ((index = 1; index <= $#; index++)); do
+    if [[ "${!index}" == "--destination" ]]; then
+      next=$((index + 1))
+      destination="${!next}"
+      break
+    fi
+  done
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == reversed ]]; then
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+  name: subrouter-front-canary
+YAML
+  elif [[ "${FAKE_ROUTE_STATE:-valid}" == path-override ]]; then
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+  name: subrouter-front-canary
+  pathRules:
+  - paths:
+    - /override
+    service: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/other-backend
+YAML
+  else
+    cat >"${destination}" <<'YAML'
+defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend
+hostRules:
+- hosts:
+  - front-canary.sr.cmux.internal
+  pathMatcher: subrouter-front-canary
+pathMatchers:
+- defaultService: https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend
+  name: subrouter-front-canary
+YAML
+  fi
+  exit 0
+fi
+if [[ "${command_line}" == *"compute url-maps describe"* ]]; then
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == reversed ]]; then
+    cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","name":"subrouter-front-canary"}]}
+JSON
+    exit 0
+  fi
+  if [[ "${FAKE_ROUTE_STATE:-valid}" == path-override ]]; then
+    cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","name":"subrouter-front-canary","pathRules":[{"paths":["/override"],"service":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/other-backend"}]}]}
+JSON
+    exit 0
+  fi
+  cat <<'JSON'
+{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-backend","hostRules":[{"hosts":["front-canary.sr.cmux.internal"],"pathMatcher":"subrouter-front-canary"}],"pathMatchers":[{"defaultService":"https://www.googleapis.com/compute/v1/projects/test-project/global/backendServices/subrouter-front-backend","name":"subrouter-front-canary"}]}
+JSON
+  exit 0
+fi
+if [[ "${command_line}" == *"compute instance-groups describe"* ]]; then
+  printf '%s\n' '{"namedPorts":[{"name":"http","port":31415},{"name":"front","port":31416}]}'
+  exit 0
+fi
+if [[ "${command_line}" == *"compute backend-services describe"* ]]; then
+  if [[ "${command_line}" == *"subrouter-backend"* ]]; then
+    if [[ "${FAKE_BACKEND_STATE:-valid}" == wrong-port ]]; then
+      printf '%s\n' '{"name":"subrouter-backend","portName":"https","protocol":"HTTP","backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone/instanceGroups/subrouter-ig"}]}'
+      exit 0
+    fi
+    printf '%s\n' '{"name":"subrouter-backend","portName":"http","protocol":"HTTP","backends":[{"group":"https://www.googleapis.com/compute/v1/projects/test-project/zones/test-zone/instanceGroups/subrouter-ig"}]}'
+    exit 0
+  fi
+  if [[ "${FAKE_POLICY_STATE:-valid}" == detached ]]; then
+    printf '%s\n' '{"securityPolicy":"https://www.googleapis.com/compute/v1/projects/test-project/global/securityPolicies/other-policy"}'
+    exit 0
+  fi
+  printf '%s\n' '{"securityPolicy":"https://www.googleapis.com/compute/v1/projects/test-project/global/securityPolicies/subrouter-front-canary-policy"}'
+  exit 0
+fi
+if [[ "${command_line}" == *"compute security-policies describe"* ]]; then
+  cat <<'JSON'
+{"name":"subrouter-front-canary-policy","description":"Subrouter front migration canary access boundary","type":"CLOUD_ARMOR","rules":[{"action":"allow","description":"allow authenticated Subrouter front migration canary","headerAction":{"requestHeadersToAdds":[{"headerName":"X-Subrouter-Canary-Token","headerValue":"canary-authorized"}]},"match":{"expr":{"expression":"has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.sr.cmux.internal' && has(request.headers['x-subrouter-canary-token']) && request.headers['x-subrouter-canary-token'] == 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"}},"preview":false,"priority":900},{"action":"deny(403)","description":"deny unauthenticated Subrouter front migration canary","match":{"expr":{"expression":"has(request.headers['host']) && request.headers['host'].lower() == 'front-canary.sr.cmux.internal'"}},"preview":false,"priority":1000},{"action":"allow","description":"default rule","match":{"config":{"srcIpRanges":["*"]},"versionedExpr":"SRC_IPS_V1"},"preview":false,"priority":2147483647}]}
+JSON
+  exit 0
+fi
+if [[ "${1:-}" == compute && "${2:-}" == ssh ]]; then
+  remote_command=""
+  for ((index = 1; index <= $#; index++)); do
+    if [[ "${!index}" == "--command" ]]; then
+      next=$((index + 1))
+      remote_command="${!next}"
+      break
+    fi
+  done
+  case "${remote_command}" in
+    *front-status*)
+      printf '%s\n' '{"active":{"id":"slot-a","network":"tcp","address":"127.0.0.1:31417"},"backends":[{"id":"slot-a","connections":0,"active":true}]}'
+      ;;
+    *supervisor-status*)
+      printf '%s\n' '{"accepting":true,"retiring":false,"active":{"id":"generation-a"},"backends":[{"id":"generation-a","connections":0}]}'
+      ;;
+    *"ss -H -lntp"*)
+      if [[ "${FAKE_LEGACY_ENABLED:-0}" == 1 ]]; then exit 1; fi
+      printf '%s\n' '{"verified":true,"service":"subrouter-front.service","port":31415,"pid":1234}'
+      ;;
+    *MainPID*)
+      printf '%s\n' '1234'
+      ;;
+    *MemoryMax*)
+      if [[ "${remote_command}" == *"subrouter-front.service"* ]]; then printf '%s\n' '134217728'; else printf '%s\n' '201326592'; fi
+      ;;
+    *"/opt/subrouter/slots/slot-a/worker"*)
+      printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      ;;
+    *"/opt/subrouter/control/subrouter"*)
+      printf '%s\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+      ;;
+    *"/opt/subrouter/front/subrouter"*)
+      printf '%s\n' 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+      ;;
+    *)
+      printf '%s\n' 'true'
+      ;;
+  esac
+  exit 0
+fi
+echo "unexpected fake gcloud invocation: ${command_line}" >&2
+exit 1
+`)
+	candidate := filepath.Join(t.TempDir(), "candidate")
+	candidateBody := []byte("candidate release bytes\n")
+	if err := os.WriteFile(candidate, candidateBody, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(candidateBody))
+	checksum := filepath.Join(t.TempDir(), "candidate.sha256")
+	if err := os.WriteFile(checksum, []byte(digest+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(t.TempDir(), "evidence.json")
+	command := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", artifact,
+	)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"SUBROUTER_GCP_PROJECT=test-project",
+		"SUBROUTER_GCP_ZONE=test-zone",
+		"SUBROUTER_GCP_INSTANCE=subrouter-team",
+		"SUBROUTER_PREFLIGHT_TOPOLOGY=slot",
+		"SUBROUTER_RELEASE_TAG=v0.1.128",
+		"SUBROUTER_DEPLOY_BINARY="+candidate,
+		"SUBROUTER_RELEASE_SHA256_FILE="+checksum,
+		"SUBROUTER_DEPLOY_REVISION="+strings.Repeat("d", 40),
+		"SUBROUTER_RELEASE_TAG_ON_MAIN=true",
+		"SUBROUTER_RELEASE_ATTESTATION_VERIFIED=true",
+		"SUBROUTER_RELEASE_IMMUTABLE=true",
+		"SUBROUTER_PUBLIC_BASE_URL=https://example.test",
+		"SUBROUTER_DEPLOY_ARTIFACT_DIR="+filepath.Dir(artifact),
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("listener-takeover preflight failed: %v\n%s", err, output)
+	}
+	var evidence struct {
+		Routing struct {
+			Legacy int `json:"legacy_backend_references"`
+			Front  int `json:"front_backend_references"`
+		} `json:"routing"`
+		Topology struct {
+			Current  string `json:"routing_current"`
+			Verified bool   `json:"listener_takeover_verified"`
+		} `json:"topology"`
+	}
+	body, err := os.ReadFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.Routing.Legacy != 1 || evidence.Routing.Front != 1 {
+		t.Fatalf("route references = %+v, want legacy=1/front=1", evidence.Routing)
+	}
+	if evidence.Topology.Current != "front-listener" || !evidence.Topology.Verified {
+		t.Fatalf("listener takeover evidence = %+v, want verified front-listener", evidence.Topology)
+	}
+
+	reversed := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "reversed.json"),
+	)
+	reversed.Env = append(command.Env, "FAKE_ROUTE_STATE=reversed")
+	if output, err := reversed.CombinedOutput(); err == nil {
+		t.Fatalf("reversed active/canary route was accepted:\n%s", output)
+	}
+
+	enabled := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "enabled.json"),
+	)
+	enabled.Env = append(command.Env, "FAKE_LEGACY_ENABLED=1")
+	if output, err := enabled.CombinedOutput(); err == nil {
+		t.Fatalf("enabled legacy unit was accepted:\n%s", output)
+	}
+
+	pathOverride := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "path-override.json"),
+	)
+	pathOverride.Env = append(command.Env, "FAKE_ROUTE_STATE=path-override")
+	if output, err := pathOverride.CombinedOutput(); err == nil {
+		t.Fatalf("canary path override was accepted:\n%s", output)
+	}
+
+	detachedPolicy := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "detached-policy.json"),
+	)
+	detachedPolicy.Env = append(command.Env, "FAKE_POLICY_STATE=detached")
+	if output, err := detachedPolicy.CombinedOutput(); err == nil {
+		t.Fatalf("detached canary policy was accepted:\n%s", output)
+	}
+
+	wrongBackend := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "wrong-backend.json"),
+	)
+	wrongBackend.Env = append(command.Env, "FAKE_BACKEND_STATE=wrong-port")
+	if output, err := wrongBackend.CombinedOutput(); err == nil {
+		t.Fatalf("legacy backend with the wrong port name was accepted:\n%s", output)
+	}
+}
+
 func TestGCPCanarySecurityPolicyRequiresAnAuthenticatedHeader(t *testing.T) {
 	requireDeployScriptTools(t, "python3")
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
