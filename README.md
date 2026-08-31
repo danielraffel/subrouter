@@ -731,18 +731,22 @@ sr qwen --model qwen3.8-max
 sr qwen --account large-plan
 ```
 
-Plain `qwen` remains direct. The proxy launcher keeps the normal Qwen home,
-sessions, skills, and extensions, but overlays routing only for the child
-process. This is stronger than setting `OPENAI_BASE_URL`: a saved Qwen
-`modelProviders` entry otherwise has higher precedence and can silently send a
-resumed session direct. It also disables any saved Qwen outbound proxy for that
-child, rejects `--proxy`, and disables the in-session `/auth` and `/model`
-provider switches, keeping the capability-bearing loopback URL out of another
-process. Direct Alibaba keys are replaced with non-secret process sentinels so
-Qwen cannot restore them from `.env` or saved settings. The overlay is removed
-when Qwen exits and contains no real plan key. If Qwen system-policy files or
-their path environment variables are present, the launcher fails closed instead
-of hiding administrator policy. Qwen's `serve` and ACP modes can reload saved
+Plain `qwen` remains direct. The proxy launcher keeps the normal Qwen session
+store but forces Qwen's `--bare` mode for the routed child, so saved settings,
+extensions, skills, and MCP servers are not loaded. This is stronger than
+setting `OPENAI_BASE_URL`: Qwen deep-merges arbitrary custom `modelProviders`
+catalogs through `providerProtocol` and has separate fast, advisor, vision,
+compaction, image, voice, and fallback selectors. Bare mode removes that saved
+catalog and selector surface; the routed launcher also rejects
+`--fallback-model` and `--proxy` and disables the in-session `/auth` and
+`/model` provider switches. Qwen can restore a recorded provider when a session
+resumes, including its built-in OAuth catalog, so `sr qwen` rejects `--continue`
+and `--resume`; use a new routed session or plain `qwen` for that existing
+direct session. Direct Alibaba keys are replaced with non-secret process
+sentinels so Qwen cannot restore them from `.env`. The process overlay is
+removed when Qwen exits and contains no real plan key. If Qwen system-policy
+files or their path environment variables are present, the launcher fails
+closed instead of hiding administrator policy. Qwen's `serve` and ACP modes can reload saved
 environment routing while they run, so the routed wrapper refuses those modes;
 use plain `qwen` when that direct behavior is required.
 When Alibaba returns a 429 for one plan account, Subrouter replays the

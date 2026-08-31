@@ -794,6 +794,8 @@ if ! SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$WORKER_BIN" \
   die "functional canary failed; legacy LaunchAgent restored"
 fi
 set_phase canary_completed
+# A prior shadow rehearsal reduces candidate risk; it does not prove this live
+# process identity or session continuity. Keep rollback armed through both.
 post_canary_failure=""
 post_canary_active_worker_fingerprint=""
 if ! verify_file_sha256 "$PLIST" "$candidate_plist_sha"; then
@@ -822,6 +824,8 @@ if [ -n "$post_canary_failure" ]; then
   rollback
   die "candidate acceptance changed during canary; legacy LaunchAgent restored"
 fi
+# Disarm only after the same live candidate remains structurally and
+# functionally accepted after the canary transaction.
 set_phase accepted
 rm -f "$UPGRADE_INHIBIT_FILE"
 transaction_active=0

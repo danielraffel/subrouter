@@ -56,9 +56,10 @@ The session-picker form requires an explicit ID: sr kimi --session <session-id>.
 Launch Qwen Code through the selected Qwen Token Plan pool. Plain 'qwen' remains direct.
 Omit --account for pooled failover. A named account is pinned with no account failover;
 bare --account opens a pinned-account picker.
-The process-only routing overlay preserves Qwen's normal sessions and configuration.
-Account affinity is stable per working directory, including resumed sessions.
-The session-picker form requires an explicit ID: sr qwen --resume <session-id>.
+The process-only routing launcher preserves Qwen's normal session store.
+It forces Qwen's bare mode, so saved settings, extensions, skills, and MCP servers are not loaded.
+Account affinity is stable per working directory for new routed sessions.
+Qwen resume/continue can restore a saved direct provider route, so routed launches reject them.
 Qwen serve/ACP can reload saved environment routing, so use plain 'qwen' for those modes.
 `
 )
@@ -158,11 +159,14 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 	if qwenProxyReloadCapableMode(vendorArgs) {
 		return errors.New("Qwen serve/ACP modes can reload saved credentials and proxies; use plain 'qwen' for those modes")
 	}
+	if qwenProxyPersistentSessionRequested(vendorArgs) {
+		return errors.New("Qwen resume/continue can restore a saved direct provider route and cannot be used with 'sr qwen'; start a new routed session or use plain 'qwen' for the existing direct session")
+	}
 	for i := 0; i < len(vendorArgs); i++ {
 		if vendorArgs[i] == "--" {
 			break
 		}
-		for _, option := range []string{"--auth-type", "--openai-api-key", "--openai-base-url", "--proxy"} {
+		for _, option := range []string{"--auth-type", "--openai-api-key", "--openai-base-url", "--proxy", "--fallback-model"} {
 			if vendorArgs[i] == option || strings.HasPrefix(vendorArgs[i], option+"=") {
 				return fmt.Errorf("%s controls Qwen routing and cannot be used with 'sr qwen'", option)
 			}
@@ -172,6 +176,27 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 		return errors.New("'sr qwen --resume' requires an explicit session ID so Subrouter can preserve sticky account routing")
 	}
 	return r.launchNativeProxy(ctx, qwenNativeProxy, vendorArgs, options)
+}
+
+func qwenProxyPersistentSessionRequested(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		if arg == "-c" || arg == "--continue" || strings.HasPrefix(arg, "--continue=") ||
+			arg == "-r" || arg == "--resume" || strings.HasPrefix(arg, "-r=") || strings.HasPrefix(arg, "--resume=") {
+			return true
+		}
+		switch arg {
+		case "-m", "--model", "--fallback-model", "-p", "--prompt", "-i", "--prompt-interactive",
+			"-o", "--output-format", "--auth-type", "--openai-api-key", "--openai-base-url", "--proxy":
+			if i+1 < len(args) {
+				i++
+			}
+		}
+	}
+	return false
 }
 
 func qwenProxyReloadCapableMode(args []string) bool {
@@ -940,7 +965,8 @@ var nativeProxyRoutingEnvKeys = []string{
 	"KIMI_SECONDARY_MODEL", "KIMI_SECONDARY_EFFORT",
 	"KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY",
 	"KIMI_WEB_FETCH_BASE_URL", "KIMI_WEB_FETCH_API_KEY",
-	"QWEN_OAUTH", "QWEN_MODEL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
+	"QWEN_OAUTH", "QWEN_MODEL", "QWEN_CODE_SIMPLE", "QWEN_DISABLED_SLASH_COMMANDS",
+	"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
 	"OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
 	"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY",
 }
@@ -994,6 +1020,8 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		for key, value := range map[string]string{
 			"QWEN_CODE_SYSTEM_SETTINGS_PATH": overlay.settings,
 			"QWEN_CODE_SYSTEM_DEFAULTS_PATH": overlay.defaults,
+			"QWEN_CODE_SIMPLE":               "1",
+			"QWEN_DISABLED_SLASH_COMMANDS":   "auth,model",
 			"OPENAI_API_KEY":                 "subrouter",
 			"OPENAI_BASE_URL":                providerURL + "/v1",
 			"OPENAI_MODEL":                   model,
@@ -1287,10 +1315,11 @@ func qwenProxyModel(args []string) string {
 }
 
 func qwenNativeProxyArgs(args []string, model string) []string {
-	out := make([]string, 0, len(args)+6)
+	out := make([]string, 0, len(args)+7)
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" {
 			out = append(out,
+				"--bare",
 				"--auth-type", "openai",
 				"--model", model,
 				"--openai-api-key", "subrouter",
@@ -1298,16 +1327,23 @@ func qwenNativeProxyArgs(args []string, model string) []string {
 			return append(out, args[i:]...)
 		}
 		switch {
+		case args[i] == "--bare" || args[i] == "--no-bare" || strings.HasPrefix(args[i], "--bare="):
 		case args[i] == "-m" || args[i] == "--model":
 			if i+1 < len(args) {
 				i++
 			}
 		case strings.HasPrefix(args[i], "--model=") || strings.HasPrefix(args[i], "-m="):
+		case args[i] == "--fallback-model":
+			if i+1 < len(args) {
+				i++
+			}
+		case strings.HasPrefix(args[i], "--fallback-model="):
 		default:
 			out = append(out, args[i])
 		}
 	}
 	return append(out,
+		"--bare",
 		"--auth-type", "openai",
 		"--model", model,
 		"--openai-api-key", "subrouter",
@@ -1341,6 +1377,21 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 		return qwenProxyOverlay{}, func() {}, fmt.Errorf("create temporary Qwen proxy overlay: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
+	routedModel := map[string]any{
+		"id":      model,
+		"name":    "Qwen Token Plan via Subrouter",
+		"baseUrl": baseURL,
+		"generationConfig": map[string]any{
+			"customHeaders": map[string]string{"X-Subrouter-Agent": "qwen-token"},
+		},
+	}
+	modelProviders := map[string]any{
+		"openai":     []any{routedModel},
+		"anthropic":  []any{},
+		"gemini":     []any{},
+		"vertex-ai":  []any{},
+		"qwen-oauth": []any{},
+	}
 	payload := map[string]any{
 		// A saved Qwen proxy would otherwise receive the capability-bearing
 		// loopback URL. This truthy value wins the settings merge but Qwen's
@@ -1363,16 +1414,18 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 		"slashCommands": map[string]any{
 			"disabled": []string{"auth", "model"},
 		},
-		"modelProviders": map[string]any{
-			"openai": []any{map[string]any{
-				"id":      model,
-				"name":    "Qwen Token Plan via Subrouter",
-				"baseUrl": baseURL,
-				"generationConfig": map[string]any{
-					"customHeaders": map[string]string{"X-Subrouter-Agent": "qwen-token"},
-				},
-			}},
-		},
+		// Qwen 0.22 deep-merges provider keys. Clear known built-ins as defense
+		// in depth beneath the complete forced-bare boundary.
+		"modelProviders": modelProviders,
+		// Clear saved alternate roles as defense in depth; bare mode prevents the
+		// persisted settings from loading at all.
+		"fastModel":       "",
+		"advisorModel":    "",
+		"visionModel":     "",
+		"compactionModel": "",
+		"imageModel":      "",
+		"voiceModel":      "",
+		"modelFallbacks":  "",
 	}
 	body, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {

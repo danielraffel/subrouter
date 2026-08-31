@@ -133,6 +133,24 @@ one of three credential layouts:
    `sr codex migrate-isolation` when required. This avoids a second inventory,
    but it does not provide an independent credential rollback guarantee.
 
+#### Optional shadow rehearsal before activation
+
+For a sensitive or heavily used deployment, first run the exact candidate
+binary and candidate state as a disposable shadow on a non-live listener. This
+adds a few minutes, but catches provider-auth, routing, pin/failover, resume,
+and configuration errors without interrupting existing sessions. Record the
+candidate SHA and hashes, run the same authenticated functional legs intended
+for activation, then stop the shadow and prove its process, listener, temporary
+state, and logs are absent.
+
+Shadow rehearsal and live rollback are complementary, not substitutes. A
+passing shadow is the prerequisite for activation; the preserved legacy
+service and rollback bundle still remain armed until the live candidate passes
+health/readiness, authenticated routed traffic, and an existing idle session's
+next turn. Put deployment-specific peers, accounts, sessions, and transports in
+private canary configs rather than source so the procedure works with or
+without a tailnet and never hardcodes one operator's fleet.
+
 Use a separate candidate state root when rollback must preserve an independently
 usable legacy service. Re-enroll every served OAuth account into that root so
 the candidate and legacy service never share a rotating refresh-token chain:

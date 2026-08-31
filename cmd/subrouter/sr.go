@@ -387,10 +387,17 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	if r.useServingAPI && (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && servingAPIAccountCommand(args[0]) && !explicitLocalStateAuthority() {
 		var server srServerConfig
 		var err error
+		routeToServingAPI := true
 		if source == broker.CredentialSourceLocal {
 			server, err = r.readyLocalServingServer(ctx, defaultDaemonStarter())
 			if err != nil {
 				return err
+			}
+			// A stock per-user daemon shares the local store but has no protected
+			// import credential. Keep onboarding off an unattested loopback process;
+			// an explicitly credentialed local daemon remains authoritative below.
+			if localOnboardingCommand(args) && !serverHasAccountImportCredential(server) {
+				routeToServingAPI = false
 			}
 		} else {
 			var ok bool
@@ -405,7 +412,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 				}
 			}
 		}
-		return r.runRemoteAccountCommand(ctx, server, args)
+		if routeToServingAPI {
+			return r.runRemoteAccountCommand(ctx, server, args)
+		}
 	}
 	switch args[0] {
 	case "add":
@@ -524,6 +533,22 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return r.statusOne(ctx, args[0])
 		}
 		return fmt.Errorf("unknown account command %q\n%s", args[0], srHelp)
+	}
+}
+
+func localOnboardingCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "add", "add-key", "add-api-key":
+		return true
+	case "kimi":
+		return isKimiManagementCommand(args[1:])
+	case "qwen":
+		return isQwenManagementCommand(args[1:])
+	default:
+		return false
 	}
 }
 

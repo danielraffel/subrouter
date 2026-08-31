@@ -722,6 +722,11 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	if got := testEnvValue(qwenEnv, "QWEN_HOME"); got != "/custom/qwen-home" {
 		t.Fatalf("QWEN_HOME changed from its normal value: %q", got)
 	}
+	for key, want := range map[string]string{"QWEN_CODE_SIMPLE": "1", "QWEN_DISABLED_SLASH_COMMANDS": "auth,model"} {
+		if got := testEnvValue(qwenEnv, key); got != want {
+			t.Fatalf("Qwen child %s = %q, want %q", key, got, want)
+		}
+	}
 	for _, key := range []string{"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"} {
 		if got := testEnvValue(qwenEnv, key); got != "subrouter" {
 			t.Fatalf("Qwen child %s = %q, want a non-secret sentinel", key, got)
@@ -742,9 +747,16 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		t.Fatal(err)
 	}
 	var overlay struct {
-		Proxy         *string           `json:"proxy"`
-		Env           map[string]string `json:"env"`
-		SlashCommands struct {
+		Proxy           *string           `json:"proxy"`
+		Env             map[string]string `json:"env"`
+		FastModel       string            `json:"fastModel"`
+		AdvisorModel    string            `json:"advisorModel"`
+		VisionModel     string            `json:"visionModel"`
+		CompactionModel string            `json:"compactionModel"`
+		ImageModel      string            `json:"imageModel"`
+		VoiceModel      string            `json:"voiceModel"`
+		ModelFallbacks  string            `json:"modelFallbacks"`
+		SlashCommands   struct {
 			Disabled []string `json:"disabled"`
 		} `json:"slashCommands"`
 		ModelProviders map[string][]struct {
@@ -756,8 +768,17 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		t.Fatal(err)
 	}
 	providers := overlay.ModelProviders["openai"]
-	if len(overlay.ModelProviders) != 1 || len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != qwenProviderURL {
+	if len(overlay.ModelProviders) != 5 || len(providers) != 1 || providers[0].ID != "qwen-test-model" || providers[0].BaseURL != qwenProviderURL {
 		t.Fatalf("Qwen overlay = %+v", overlay)
+	}
+	for _, provider := range []string{"anthropic", "gemini", "vertex-ai", "qwen-oauth"} {
+		if models, exists := overlay.ModelProviders[provider]; !exists || len(models) != 0 {
+			t.Fatalf("Qwen overlay provider %q = %+v exists=%t, want an explicit empty catalog", provider, models, exists)
+		}
+	}
+	if overlay.FastModel != "" || overlay.AdvisorModel != "" || overlay.VisionModel != "" ||
+		overlay.CompactionModel != "" || overlay.ImageModel != "" || overlay.VoiceModel != "" || overlay.ModelFallbacks != "" {
+		t.Fatalf("Qwen overlay retained an alternate model selector: %+v", overlay)
 	}
 	if overlay.Proxy == nil || *overlay.Proxy != " " {
 		t.Fatalf("Qwen overlay proxy = %v, want truthy whitespace that Qwen normalizes to disabled", overlay.Proxy)
@@ -1081,10 +1102,12 @@ func TestQwenNativeProxyArgsForceRoutingAndPreserveChosenModel(t *testing.T) {
 		input []string
 		model string
 	}{
-		{input: []string{"--continue"}, model: defaultQwenProxyModel},
-		{input: []string{"--resume", "session-id", "--model", "qwen-custom"}, model: "qwen-custom"},
+		{input: nil, model: defaultQwenProxyModel},
+		{input: []string{"--model", "qwen-custom"}, model: "qwen-custom"},
 		{input: []string{"-p", "hello", "--model=qwen-equals"}, model: "qwen-equals"},
 		{input: []string{"-m=qwen-short-equals"}, model: "qwen-short-equals"},
+		{input: []string{"--fallback-model", "direct-model"}, model: defaultQwenProxyModel},
+		{input: []string{"--no-bare"}, model: defaultQwenProxyModel},
 	} {
 		model := qwenProxyModel(test.input)
 		if model != test.model {
@@ -1092,7 +1115,7 @@ func TestQwenNativeProxyArgsForceRoutingAndPreserveChosenModel(t *testing.T) {
 		}
 		got := qwenNativeProxyArgs(test.input, model)
 		joined := strings.Join(got, " ")
-		for _, want := range []string{"--auth-type openai", "--openai-api-key subrouter", "--model " + model} {
+		for _, want := range []string{"--bare", "--auth-type openai", "--openai-api-key subrouter", "--model " + model} {
 			if !strings.Contains(joined, want) {
 				t.Fatalf("qwen proxy args %q do not contain %q", got, want)
 			}
@@ -1102,6 +1125,89 @@ func TestQwenNativeProxyArgsForceRoutingAndPreserveChosenModel(t *testing.T) {
 		}
 		if strings.Count(joined, "--model") != 1 || strings.Contains(joined, "-m=") {
 			t.Fatalf("qwen proxy args retained a competing model: %q", got)
+		}
+		if strings.Contains(joined, "fallback-model") || strings.Contains(joined, "direct-model") {
+			t.Fatalf("qwen proxy args retained a fallback route: %q", got)
+		}
+		if strings.Contains(joined, "no-bare") || strings.Count(joined, "--bare") != 1 {
+			t.Fatalf("qwen proxy args did not force bare mode: %q", got)
+		}
+	}
+}
+
+func TestQwenProxyOverlayOverridesSavedProviderCatalogAndModelRoles(t *testing.T) {
+	baseURL := "http://127.0.0.1:43210/private-relay-capability/qwen-token/v1"
+	overlay, cleanup, err := prepareQwenProxyOverlay(baseURL, "qwen-routed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	body, err := os.ReadFile(overlay.settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var system map[string]any
+	if err := json.Unmarshal(body, &system); err != nil {
+		t.Fatal(err)
+	}
+	saved := map[string]any{
+		"modelProviders": map[string]any{
+			"openai":     []any{map[string]any{"id": "direct-openai", "baseUrl": "https://openai.invalid/v1", "envKey": "DIRECT_OPENAI_KEY"}},
+			"anthropic":  []any{map[string]any{"id": "direct-anthropic", "baseUrl": "https://anthropic.invalid", "envKey": "DIRECT_ANTHROPIC_KEY"}},
+			"gemini":     []any{map[string]any{"id": "direct-gemini", "baseUrl": "https://gemini.invalid", "envKey": "DIRECT_GEMINI_KEY"}},
+			"vertex-ai":  []any{map[string]any{"id": "direct-vertex"}},
+			"qwen-oauth": []any{map[string]any{"id": "direct-qwen"}},
+			"private":    []any{map[string]any{"id": "direct-private", "baseUrl": "https://private.invalid/v1", "envKey": "DIRECT_PRIVATE_KEY"}},
+		},
+		"providerProtocol": map[string]any{"private": "openai"},
+		"fastModel":        "gemini:direct-gemini",
+		"advisorModel":     "anthropic:direct-anthropic",
+		"visionModel":      "gemini:direct-gemini",
+		"compactionModel":  "qwen-oauth:direct-qwen",
+		"imageModel":       "vertex-ai:direct-vertex",
+		"voiceModel":       "openai:direct-openai",
+		"modelFallbacks":   "anthropic:direct-anthropic,gemini:direct-gemini",
+	}
+	merged := mergeQwenSettingsForTest(saved, system)
+	mergedProviders := merged["modelProviders"].(map[string]any)
+	if custom, ok := mergedProviders["private"].([]any); !ok || len(custom) != 1 {
+		t.Fatalf("hostile custom provider did not survive Qwen's deep merge: %#v", mergedProviders["private"])
+	}
+	// Qwen 0.22's --bare startup calls createMinimalSettings instead of
+	// loadSettings, so none of the merged persistent catalog is effective. The
+	// only effective provider/model inputs are the forced CLI arguments.
+	effective := loadQwenSettingsForTest(true, saved, system)
+	if len(effective) != 0 {
+		t.Fatalf("bare Qwen settings = %#v, want no persisted settings", effective)
+	}
+	forced := strings.Join(qwenNativeProxyArgs(nil, "qwen-routed"), " ")
+	for _, want := range []string{"--bare", "--auth-type openai", "--model qwen-routed", "--openai-api-key subrouter"} {
+		if !strings.Contains(forced, want) {
+			t.Fatalf("forced Qwen route %q does not contain %q", forced, want)
+		}
+	}
+
+	// The system overlay remains defense in depth for every built-in provider
+	// and selector if Qwen ever consults settings despite the forced bare flag.
+	effective = mergeQwenSettingsForTest(saved, system)
+	providers := effective["modelProviders"].(map[string]any)
+	for _, provider := range []string{"anthropic", "gemini", "vertex-ai", "qwen-oauth"} {
+		models, ok := providers[provider].([]any)
+		if !ok || len(models) != 0 {
+			t.Fatalf("effective %s catalog = %#v, want explicit empty replacement", provider, providers[provider])
+		}
+	}
+	openAI, ok := providers["openai"].([]any)
+	if !ok || len(openAI) != 1 {
+		t.Fatalf("effective openai catalog = %#v", providers["openai"])
+	}
+	routed := openAI[0].(map[string]any)
+	if routed["id"] != "qwen-routed" || routed["baseUrl"] != baseURL {
+		t.Fatalf("effective routed model = %#v", routed)
+	}
+	for _, selector := range []string{"fastModel", "advisorModel", "visionModel", "compactionModel", "imageModel", "voiceModel", "modelFallbacks"} {
+		if got, exists := effective[selector]; !exists || got != "" {
+			t.Fatalf("effective %s = %#v exists=%t, want explicit empty override", selector, got, exists)
 		}
 	}
 }
@@ -1130,13 +1236,13 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 }
 
 func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
-	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}, {"--", "--proxy", "http://proxy.invalid"}} {
+	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}, {"--", "--proxy", "http://proxy.invalid"}, {"--fallback-model", "direct-model"}, {"--fallback-model=direct-model"}} {
 		err := (srRunner{}).launchQwenProxy(t.Context(), args)
-		if err == nil || !strings.Contains(err.Error(), "--proxy controls Qwen routing") {
-			t.Fatalf("proxy override %q error = %v", args, err)
+		if err == nil || !strings.Contains(err.Error(), "controls Qwen routing") {
+			t.Fatalf("routing override %q error = %v", args, err)
 		}
-		if strings.Contains(err.Error(), "proxy.invalid") {
-			t.Fatalf("proxy override error exposed the supplied URL: %v", err)
+		if strings.Contains(err.Error(), "proxy.invalid") || strings.Contains(err.Error(), "direct-model") {
+			t.Fatalf("routing override error exposed the supplied target: %v", err)
 		}
 	}
 	for _, args := range [][]string{{"serve"}, {"--safe-mode", "serve"}, {"--acp"}, {"--experimental-acp=true"}} {
@@ -1186,8 +1292,18 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 			t.Fatalf("explicit/non-option resume %q was rejected", args)
 		}
 	}
-	if err := (srRunner{}).launchQwenProxy(t.Context(), []string{"--resume"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
-		t.Fatalf("picker launch error = %v", err)
+	for _, args := range [][]string{{"--resume"}, {"--resume", "session-id"}, {"--resume=session-id"}, {"-r=session-id"}, {"--continue"}, {"--continue=true"}, {"-c"}} {
+		if !qwenProxyPersistentSessionRequested(args) {
+			t.Fatalf("persistent session %q was not detected", args)
+		}
+		if err := (srRunner{}).launchQwenProxy(t.Context(), args); err == nil || !strings.Contains(err.Error(), "restore a saved direct provider route") {
+			t.Fatalf("persistent session %q launch error = %v", args, err)
+		}
+	}
+	for _, args := range [][]string{{"-p", "--continue"}, {"--", "--resume", "session-id"}} {
+		if qwenProxyPersistentSessionRequested(args) {
+			t.Fatalf("non-option session text %q was rejected", args)
+		}
 	}
 	for _, args := range [][]string{{"--session"}, {"-S"}, {"--resume"}, {"-r"}, {"--session="}, {"--resume="}, {"--session", ""}, {"-r", "   "}, {"--session", "--model", "kimi-test"}} {
 		if !nativeProxyResumePickerRequested(kimiNativeProxy, args) {
@@ -1360,6 +1476,42 @@ func TestRequireNativeProxyAccountChecksProviderAndAuthMode(t *testing.T) {
 	if err := runner.requireNativeProxyAccount(context.Background(), config, wrong); err == nil || !strings.Contains(err.Error(), "no routed Kimi oauth account") {
 		t.Fatalf("wrong-mode error = %v", err)
 	}
+}
+
+// mergeQwenSettingsForTest matches Qwen Code 0.22's effective merge behavior
+// for the object/array/scalar settings used by the routed overlay: objects are
+// merged recursively and arrays or scalars replace the lower-precedence value.
+func mergeQwenSettingsForTest(sources ...map[string]any) map[string]any {
+	merged := make(map[string]any)
+	var merge func(map[string]any, map[string]any)
+	merge = func(target, source map[string]any) {
+		for key, sourceValue := range source {
+			sourceMap, sourceIsMap := sourceValue.(map[string]any)
+			targetMap, targetIsMap := target[key].(map[string]any)
+			if sourceIsMap && targetIsMap {
+				merge(targetMap, sourceMap)
+				continue
+			}
+			if sourceIsMap {
+				targetMap = make(map[string]any)
+				merge(targetMap, sourceMap)
+				target[key] = targetMap
+				continue
+			}
+			target[key] = sourceValue
+		}
+	}
+	for _, source := range sources {
+		merge(merged, source)
+	}
+	return merged
+}
+
+func loadQwenSettingsForTest(bare bool, sources ...map[string]any) map[string]any {
+	if bare {
+		return map[string]any{}
+	}
+	return mergeQwenSettingsForTest(sources...)
 }
 
 func testEnvValue(environ []string, key string) string {

@@ -1219,6 +1219,61 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	}
 }
 
+func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		nonHealthRequests.Add(1)
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
+		client: server.Client(),
+	}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("fresh local onboarding sent %d request(s) to an uncredentialed serving API", nonHealthRequests.Load())
+	}
+	stored, ok, err := store.FindStored("openrouter:work")
+	if err != nil || !ok {
+		t.Fatalf("local onboarding account found=%t err=%v", ok, err)
+	}
+	if stored.Provider != accounts.ProviderOpenRouter || stored.Auth.OpenAIAPIKey != "sk-or-v1-test" {
+		t.Fatalf("local onboarding stored provider=%q key_matches=%t", stored.Provider, stored.Auth.OpenAIAPIKey == "sk-or-v1-test")
+	}
+	out.Reset()
+	if err := runner.run(t.Context(), []string{"kimi", "list"}); err != nil {
+		t.Fatal(err)
+	}
+	if nonHealthRequests.Load() != 0 || !strings.Contains(out.String(), "No Kimi subscription accounts configured") {
+		t.Fatalf("fresh local Kimi management contacted serving API or missed local state: requests=%d output=%q", nonHealthRequests.Load(), out.String())
+	}
+}
+
 func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
 	var usageRequests atomic.Int32
 	var accountRequests atomic.Int32
@@ -1341,6 +1396,28 @@ func TestServingAPIAccountCommandDoesNotCaptureLocalOnlyCommands(t *testing.T) {
 	for _, command := range []string{"switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "import", "usage", "trace", "breadcrumbs", "why", "add-admin-key", "list-admin-keys", "remove-admin-key", "attach-project"} {
 		if servingAPIAccountCommand(command) {
 			t.Fatalf("local-only command %q was captured by the serving API", command)
+		}
+	}
+}
+
+func TestLocalOnboardingCommandIncludesFreshDaemonManagement(t *testing.T) {
+	for _, args := range [][]string{
+		{"add", "codex"},
+		{"add-key"},
+		{"add-api-key"},
+		{"kimi", "login", "work"},
+		{"kimi", "list"},
+		{"kimi", "remove", "work"},
+		{"qwen", "login", "work"},
+		{"qwen", "label", "work", "alice@example.com"},
+	} {
+		if !localOnboardingCommand(args) {
+			t.Fatalf("local onboarding command %q was not retained", strings.Join(args, " "))
+		}
+	}
+	for _, args := range [][]string{{"status"}, {"reset"}, {"qwen", "--account", "work"}, {"kimi", "--account", "work"}} {
+		if localOnboardingCommand(args) {
+			t.Fatalf("serving command %q was captured as local onboarding", strings.Join(args, " "))
 		}
 	}
 }
