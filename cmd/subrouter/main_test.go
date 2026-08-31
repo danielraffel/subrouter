@@ -285,6 +285,39 @@ func TestServeKeepsHostedLoginCompatibleWithoutTenantDeleteToken(t *testing.T) {
 	}
 }
 
+func TestServeDoesNotMigrateLegacyCodexOAuthOnStartup(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	stateDir := filepath.Join(root, "state")
+	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+
+	legacyStore := accounts.CodexStore{Dir: filepath.Join(home, ".codex-accounts", "accounts")}
+	if err := legacyStore.SaveStored(accounts.StoredCodexAccount{
+		Email: "legacy@example.test",
+		Auth:  testCodexAuth("legacy@example.test", "acct-legacy"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := serve([]string{
+		"--addr", "invalid:::",
+		"--fetch-usage=false",
+		"--sr-switch-interval=0",
+	})
+	if err == nil || !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("serve error = %v, want listen failure after startup", err)
+	}
+
+	migrated := filepath.Join(stateDir, "codex", "accounts", "legacy@example.test.json")
+	if _, err := os.Stat(migrated); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("serve copied legacy OAuth credential to %s: %v", migrated, err)
+	}
+	if _, err := os.Stat(filepath.Join(legacyStore.Dir, "legacy@example.test.json")); err != nil {
+		t.Fatalf("legacy OAuth credential disappeared: %v", err)
+	}
+}
+
 func TestSystemdListenFDsParsesCurrentProcess(t *testing.T) {
 	env := map[string]string{
 		"LISTEN_PID": "123",
