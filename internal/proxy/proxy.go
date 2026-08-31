@@ -1217,6 +1217,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 			status.AuthMode = accounts.AuthModeAPIKey
 			status.KeyFingerprint = accounts.APIKeyFingerprint(stored.Auth.OpenAIAPIKey)
 			status.PlanType = apiKeyPlanType(provider)
+			if metering := ProviderMetering(provider); metering != "" {
+				status.PlanType = metering
+			}
 			requestedEntry, keyedProvider := keyedProviderForName(string(provider))
 			if keyedProvider {
 				status.Provider = accountProviderFor(requestedEntry.Provider)

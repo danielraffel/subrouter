@@ -1118,6 +1118,91 @@ func TestSRAddKeyStoresRegistryProviderInLocalStorage(t *testing.T) {
 	}
 }
 
+func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
+	t.Setenv("COLUMNS", "80")
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
+	if err := store.SaveStored(accounts.StoredCodexAccount{
+		Email: "openrouter:disk-only", Provider: accounts.ProviderOpenRouter, AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "disk-placeholder"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var imported atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/_subrouter/account-import":
+			if request.Header.Get("Authorization") != "Bearer import-token" {
+				http.Error(w, "missing import credential", http.StatusUnauthorized)
+				return
+			}
+			if request.Method == http.MethodGet {
+				_, _ = io.WriteString(w, `{"ok":true,"providers":["openrouter"]}`)
+				return
+			}
+			var input serverAccountImportRequest
+			if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			if input.Provider != accounts.ProviderOpenRouter || input.Codex == nil || input.Codex.Email != "openrouter:network" {
+				http.Error(w, "wrong import payload", http.StatusBadRequest)
+				return
+			}
+			imported.Store(true)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case "/_subrouter/usage-status":
+			_, _ = io.WriteString(w, `[{
+				"id":"openrouter:network","provider":"openrouter","auth_mode":"apikey",
+				"plan_type":"credits, per token","provider_health":"auth ok",
+				"auth_checked":true,"auth_valid":true,"quota_status":"live","quota_usage_known":true,
+				"windows":[{"Name":"monthly","UsedPercent":25,"LimitWindowSeconds":2592000}],
+				"credits":{"has_credits":true,"balance":"150"}
+			}]`)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serverStore := defaultSRServerStore(store)
+	if err := serverStore.update(func(file *srServerFile) error {
+		file.Default = "local-candidate"
+		file.Servers = []srServerConfig{{Name: "local-candidate", URL: server.URL, AccountImportToken: "import-token"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{store: store, in: strings.NewReader("network\napi-key-placeholder\n"), out: &out, errOut: &out, client: server.Client()}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	if !imported.Load() {
+		t.Fatal("selected serving API did not receive the account import")
+	}
+	if _, ok, err := store.FindStored("openrouter:network"); err != nil || ok {
+		t.Fatalf("CLI disk store received serving account: found=%t err=%v", ok, err)
+	}
+	out.Reset()
+	if err := runner.run(t.Context(), []string{"status"}); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{"network", "credits", "75% left", "$150"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("server-authoritative status omits %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "disk-only") || strings.Contains(text, "Codex isolation:") {
+		t.Fatalf("server-authoritative status leaked local disk state:\n%s", text)
+	}
+}
+
 func TestSRAddKeyForAnotherProviderDoesNotImportActiveCodexAuth(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))

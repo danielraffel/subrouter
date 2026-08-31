@@ -859,6 +859,43 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	return server, true, nil
 }
 
+// localServingServer describes the daemon selected at the built-in loopback
+// endpoint. A CLI process without SUBROUTER_STATE_DIR has no proof that its
+// default disk store is the daemon's store, so account commands use the HTTP
+// control plane. Reuse a uniquely matching registered server credential when
+// available; otherwise protected mutations fail closed at the server.
+func (r srRunner) localServingServer() (srServerConfig, error) {
+	server := srServerConfig{Name: "local", URL: localBaseURL()}
+	var err error
+	server.AccountImportToken, err = secretFromEnvironment("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return srServerConfig{}, fmt.Errorf("load local account-import credential: %w", err)
+	}
+	server.AdminToken, err = secretFromEnvironment("SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE")
+	if err != nil {
+		return srServerConfig{}, fmt.Errorf("load local admin credential: %w", err)
+	}
+	file, err := defaultSRServerStore(r.store).load()
+	if err != nil {
+		return srServerConfig{}, err
+	}
+	var matching []srServerConfig
+	for _, candidate := range file.Servers {
+		if strings.TrimSpace(candidate.TenantKey) == "" && sameEndpoint(candidate.URL, server.URL) {
+			matching = append(matching, candidate)
+		}
+	}
+	if len(matching) == 1 {
+		if server.AccountImportToken == "" {
+			server.AccountImportToken = matching[0].AccountImportToken
+		}
+		if server.AdminToken == "" {
+			server.AdminToken = matching[0].AdminToken
+		}
+	}
+	return server, nil
+}
+
 func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
 	server, ok, err := store.find(name)
 	if err != nil {
@@ -947,6 +984,10 @@ func (r srRunner) serverStatus(ctx context.Context, store srServerStore, name st
 	if err != nil {
 		return err
 	}
+	return r.serverStatusFor(ctx, server)
+}
+
+func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) error {
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
 		return err
@@ -1391,11 +1432,14 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
 			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
-		} else if status.AuthMode == accounts.AuthModeAPIKey &&
-			(status.Provider == accounts.ProviderQwenToken || status.Provider == accounts.ProviderKimi) && status.QuotaUsageKnown {
+		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
 			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			if status.QuotaStatus == "exhausted" {
+				row.cooked = true
+				row.cookedReason = "provider quota exhausted"
+			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey {
 			row.score = selectacct.Score{AccountID: email, Headroom: 0.01, ShortHeadroom: 0.01}
 			if row.planType == "" {

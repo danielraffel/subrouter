@@ -24,7 +24,7 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}))
 	defer upstream.Close()
 
-	relay, err := startNativeProxyRelay(upstream.URL+"/t/srt_test", kimiNativeProxy, "sr-native-test-session")
+	relay, err := startNativeProxyRelay(upstream.URL+"/t/srt_test", kimiNativeProxy, "sr-native-test-session", "local-proxy-token")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,8 +50,8 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	if got.URL.Path != "/t/srt_test/kimi/v1/messages" || got.URL.RawQuery != "stream=1" {
 		t.Fatalf("upstream URL = %s, want tenant + provider path", got.URL.String())
 	}
-	if authorization := got.Header.Get("Authorization"); authorization != "Bearer subrouter" {
-		t.Fatalf("Authorization = %q, want placeholder", authorization)
+	if authorization := got.Header.Get("Authorization"); authorization != "Bearer local-proxy-token" {
+		t.Fatalf("Authorization = %q, want local proxy token", authorization)
 	}
 	if key := got.Header.Get("X-Api-Key"); key != "" {
 		t.Fatalf("X-Api-Key leaked through relay: %q", key)
@@ -64,6 +64,54 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}
 	if got.Host != strings.TrimPrefix(upstream.URL, "http://") {
 		t.Fatalf("upstream Host = %q, want target host", got.Host)
+	}
+
+	for _, forbidden := range []string{
+		"http://" + relay.listener.Addr().String() + "/kimi/v1/messages",
+		relay.URL() + "/_subrouter/accounts",
+		relay.URL() + "/qwen-token/v1/chat/completions",
+	} {
+		response, err := http.Get(forbidden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("forbidden relay path %q returned %d", forbidden, response.StatusCode)
+		}
+		select {
+		case leaked := <-seen:
+			t.Fatalf("forbidden relay path reached upstream: %s", leaked.URL)
+		default:
+		}
+	}
+}
+
+func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *testing.T) {
+	root := "http://127.0.0.1:43213"
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", root)
+	configPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", configPath)
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local","localProxyToken":"local-daemon-secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	token, err := nativeProxyServerToken(root+"/tenantless", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "local-daemon-secret" {
+		t.Fatalf("local daemon token selected = %q", token)
+	}
+	if remoteToken, err := nativeProxyServerToken(root, true); err != nil || remoteToken != "subrouter" {
+		t.Fatalf("remote placeholder = %q err=%v", remoteToken, err)
+	}
+	env, cleanup, err := nativeProxyEnvironment(kimiNativeProxy, "http://127.0.0.1:43214/capability", os.Environ(), nil)
+	cleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(env, "\n"), "local-daemon-secret") {
+		t.Fatal("local daemon token leaked into the vendor child environment")
 	}
 }
 
@@ -208,6 +256,8 @@ func TestNativeProxySessionIdentitySurvivesExplicitResume(t *testing.T) {
 		{spec: kimiNativeProxy, args: []string{"--session=kimi-session-id"}},
 		{spec: qwenNativeProxy, args: []string{"--resume", "qwen-session-id"}},
 		{spec: qwenNativeProxy, args: []string{"--resume=qwen-session-id"}},
+		{spec: qwenNativeProxy, args: []string{"--session-id", "qwen-session-id"}},
+		{spec: antigravityNativeProxy, args: []string{"--conversation", "agy-conversation-id"}},
 	} {
 		first, err := nativeProxySessionID(test.spec, test.args)
 		if err != nil {
@@ -225,6 +275,62 @@ func TestNativeProxySessionIdentitySurvivesExplicitResume(t *testing.T) {
 	kimiID, _ := nativeProxySessionID(kimiNativeProxy, []string{"--session", "same-id"})
 	if qwenID == kimiID {
 		t.Fatal("provider namespaces share a native proxy session ID")
+	}
+}
+
+func TestNativeProxyContinueAliasesAvoidKimiPromptAlias(t *testing.T) {
+	for _, test := range []struct {
+		spec nativeProxySpec
+		args []string
+		want bool
+	}{
+		{spec: kimiNativeProxy, args: []string{"-c"}, want: true},
+		{spec: kimiNativeProxy, args: []string{"--continue"}, want: true},
+		{spec: kimiNativeProxy, args: []string{"-c", "prompt text"}, want: false},
+		{spec: antigravityNativeProxy, args: []string{"--continue"}, want: true},
+	} {
+		got := nativeProxyResumeIdentity(test.spec, test.args) != ""
+		if got != test.want {
+			t.Fatalf("resume identity for %s %q = %t, want %t", test.spec.provider, test.args, got, test.want)
+		}
+	}
+}
+
+func TestAntigravityProxyFailsClosedForDirectGeminiConfiguration(t *testing.T) {
+	home := t.TempDir()
+	settingsDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(settingsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"modelProvider":"gemini"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, environ := range [][]string{
+		{"HOME=" + home},
+		{"HOME=" + t.TempDir(), "GEMINI_API_KEY=direct-secret"},
+		{"HOME=" + t.TempDir(), "GOOGLE_GEMINI_BASE_URL=https://direct.invalid"},
+		{"HOME=" + t.TempDir(), "AGY_ADC_AUTH=1"},
+	} {
+		_, cleanup, err := nativeProxyEnvironment(antigravityNativeProxy, "http://127.0.0.1:43212", environ, nil)
+		cleanup()
+		if err == nil || !strings.Contains(err.Error(), "direct provider") {
+			t.Fatalf("direct Gemini configuration error = %v", err)
+		}
+		if strings.Contains(err.Error(), "direct-secret") {
+			t.Fatal("direct Gemini error exposed the credential")
+		}
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env, cleanup, err := nativeProxyEnvironment(antigravityNativeProxy, "http://127.0.0.1:43212", []string{"HOME=" + home}, nil)
+	cleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testEnvValue(env, "CLOUD_CODE_URL"); got != "http://127.0.0.1:43212/antigravity" {
+		t.Fatalf("CLOUD_CODE_URL = %q", got)
 	}
 }
 

@@ -349,10 +349,18 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	if source == broker.CredentialSourceLegacy && shouldRouteSRCommand(args[0]) {
-		if handled, err := r.runSelectedRemoteAccountCommand(ctx, args); handled {
+	if (source == broker.CredentialSourceLocal || source == broker.CredentialSourceLegacy) && shouldRouteSRCommand(args[0]) && !explicitLocalStateAuthority() {
+		server, ok, err := r.selectedRemoteServer()
+		if err != nil {
 			return err
 		}
+		if !ok || (source == broker.CredentialSourceLocal && !sameEndpoint(server.URL, localBaseURL())) {
+			server, err = r.localServingServer()
+			if err != nil {
+				return err
+			}
+		}
+		return r.runRemoteAccountCommand(ctx, server, args)
 	}
 	switch args[0] {
 	case "add":
@@ -1038,25 +1046,26 @@ func (r srRunner) status(ctx context.Context) error {
 		return err
 	}
 	source := config.EffectiveCredentialSource()
-	localStoreServing := source == broker.CredentialSourceLocal
 	switch source {
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
-	case broker.CredentialSourceLegacy:
+	case broker.CredentialSourceLocal, broker.CredentialSourceLegacy:
+		if explicitLocalStateAuthority() {
+			break
+		}
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
-		} else if ok {
-			// The selected server owns the serving state. Even when its endpoint
-			// is loopback, the daemon may use a different SUBROUTER_STATE_DIR;
-			// inspecting this CLI process's local store would report stale warnings.
-			return r.serverStatus(ctx, defaultSRServerStore(r.store), server.Name)
+		} else if ok && (source == broker.CredentialSourceLegacy || sameEndpoint(server.URL, localBaseURL())) {
+			return r.serverStatusFor(ctx, server)
 		}
-		localStoreServing = true
-	}
-	if localStoreServing {
-		if err := printCodexIsolationStatus(r.out, r.store); err != nil {
+		server, err := r.localServingServer()
+		if err != nil {
 			return err
 		}
+		return r.serverStatusFor(ctx, server)
+	}
+	if err := printCodexIsolationStatus(r.out, r.store); err != nil {
+		return err
 	}
 	if err := r.autoImportIfEmpty(ctx); err != nil {
 		return err
@@ -1068,6 +1077,10 @@ func (r srRunner) status(ctx context.Context) error {
 	displayUsageRows(r.out, rows, false)
 	printKimiCLIOnlyStatusHint(r.out, rows)
 	return nil
+}
+
+func explicitLocalStateAuthority() bool {
+	return strings.TrimSpace(os.Getenv("SUBROUTER_STATE_DIR")) != ""
 }
 
 func printKimiCLIOnlyStatusHint(out io.Writer, rows []srUsageRow) {
@@ -2414,8 +2427,10 @@ func displayRecommendedForNewSession(row srUsageRow) bool {
 		return false
 	}
 	if isKeyedProviderSection(usageProvider(row)) {
+		quotaUsable := !row.quotaUsageKnown ||
+			(row.quotaStatus != "exhausted" && usableForNewSession(row.score))
 		return row.err == nil && row.authMode == accounts.AuthModeAPIKey &&
-			row.providerHealth == "auth ok" && !row.cooked && !row.tempCooked
+			row.providerHealth == "auth ok" && quotaUsable && !row.cooked && !row.tempCooked
 	}
 	return recommendedForNewSession(row)
 }
@@ -2845,6 +2860,9 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		// API-key providers without a quota API use the same compact account,
 		// plan, routing-state, and use vocabulary as the subscription tables.
 		// Do not substitute model/endpoint inventory for unavailable quota data.
+		if usageGridRowsHaveValue(rows, "Credits") {
+			columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
+		}
 	} else {
 		columns = append(columns,
 			usageGridColumn{Key: "5h", Title: "5h", Width: windowWidth},
@@ -3234,6 +3252,9 @@ func usageGridState(row srUsageRow) string {
 		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
 			states = append(states, "active")
 		}
+		if row.quotaStatus == "exhausted" {
+			states = append(states, "exhausted")
+		}
 		if row.gtoRecommended {
 			states = append(states, "rec")
 		}
@@ -3326,13 +3347,16 @@ func compactPickReason(row srUsageRow) string {
 	if row.err != nil {
 		return "usage unavailable"
 	}
+	if isKeyedProviderSection(usageProvider(row)) && row.quotaStatus == "exhausted" {
+		return "0% left, cannot start"
+	}
 	if row.cooked {
 		return "cooked, cannot switch"
 	}
 	if row.tempCooked {
 		return "temp cooked, cannot start"
 	}
-	if usageProvider(row) == accounts.ProviderQwenToken && row.quotaUsageKnown && len(row.windows) > 0 {
+	if isKeyedProviderSection(usageProvider(row)) && row.quotaUsageKnown && len(row.windows) > 0 {
 		return fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
 	}
 	if isKeyedProviderSection(usageProvider(row)) {

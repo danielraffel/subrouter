@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -103,7 +104,7 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 }
 
 func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, args []string) error {
-	server, _, err := r.nativeProxyServer(ctx)
+	server, remote, err := r.nativeProxyServer(ctx)
 	if err != nil {
 		return err
 	}
@@ -118,7 +119,11 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return err
 	}
-	relay, err := startNativeProxyRelay(root, spec, sessionID)
+	proxyToken, err := nativeProxyServerToken(root, remote)
+	if err != nil {
+		return err
+	}
+	relay, err := startNativeProxyRelay(root, spec, sessionID, proxyToken)
 	if err != nil {
 		return fmt.Errorf("start local %s proxy relay: %w", spec.display, err)
 	}
@@ -144,6 +149,20 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	cmd.Stderr = r.errOut
 	cmd.Env = env
 	return cmd.Run()
+}
+
+func nativeProxyServerToken(root string, remote bool) (string, error) {
+	if remote {
+		return "subrouter", nil
+	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		return "", fmt.Errorf("load local Subrouter client credential: %w", err)
+	}
+	if token := cloudClientProxyToken(config, root); token != "" {
+		return token, nil
+	}
+	return "subrouter", nil
 }
 
 func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, error) {
@@ -199,7 +218,7 @@ type nativeProxyRelay struct {
 	baseURL  string
 }
 
-func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID string) (*nativeProxyRelay, error) {
+func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken string) (*nativeProxyRelay, error) {
 	target, err := url.Parse(strings.TrimRight(targetRoot, "/"))
 	if err != nil || target.Scheme == "" || target.Host == "" || target.User != nil || target.Fragment != "" {
 		return nil, errors.New("proxy target must be an absolute URL")
@@ -215,6 +234,17 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID st
 			return nil, err
 		}
 	}
+	relayToken, err := newNativeProxyToken()
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	proxyToken = strings.TrimSpace(proxyToken)
+	if proxyToken == "" {
+		proxyToken = "subrouter"
+	}
+	relayPrefix := "/" + relayToken
+	providerPrefix := relayPrefix + "/" + spec.route
 	reverse := httputil.NewSingleHostReverseProxy(target)
 	originalDirector := reverse.Director
 	reverse.Director = func(request *http.Request) {
@@ -229,7 +259,7 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID st
 			request.Header.Del(header)
 		}
 		request.Host = target.Host
-		request.Header.Set("Authorization", "Bearer subrouter")
+		request.Header.Set("Authorization", "Bearer "+proxyToken)
 		request.Header.Set("X-Subrouter-Agent", spec.agent)
 		request.Header.Set("X-Subrouter-Session", sessionID)
 	}
@@ -237,10 +267,24 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID st
 	reverse.ErrorHandler = func(response http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(response, "Subrouter relay could not reach the selected server", http.StatusBadGateway)
 	}
+	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		// The random path is a process-local capability: other local processes
+		// cannot turn this short-lived relay into a tenant-wide proxy merely by
+		// discovering its port. Restrict it to the one advertised provider too.
+		requestPath := request.URL.Path
+		if request.URL.RawPath != "" || pathpkg.Clean(requestPath) != requestPath ||
+			(requestPath != providerPrefix && !strings.HasPrefix(requestPath, providerPrefix+"/")) {
+			http.NotFound(response, request)
+			return
+		}
+		request.URL.Path = strings.TrimPrefix(requestPath, relayPrefix)
+		request.URL.RawPath = ""
+		reverse.ServeHTTP(response, request)
+	})
 	relay := &nativeProxyRelay{
 		listener: listener,
-		server:   &http.Server{Handler: reverse, ReadHeaderTimeout: 10 * time.Second},
-		baseURL:  "http://" + listener.Addr().String(),
+		server:   &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second},
+		baseURL:  "http://" + listener.Addr().String() + relayPrefix,
 	}
 	go func() { _ = relay.server.Serve(listener) }()
 	return relay, nil
@@ -271,6 +315,14 @@ func newNativeProxySessionID() (string, error) {
 	return "sr-native-" + hex.EncodeToString(body[:]), nil
 }
 
+func newNativeProxyToken() (string, error) {
+	var body [32]byte
+	if _, err := rand.Read(body[:]); err != nil {
+		return "", fmt.Errorf("create local proxy capability: %w", err)
+	}
+	return hex.EncodeToString(body[:]), nil
+}
+
 func nativeProxySessionID(spec nativeProxySpec, args []string) (string, error) {
 	if identity := nativeProxyResumeIdentity(spec, args); identity != "" {
 		digest := sha256.Sum256([]byte(string(spec.provider) + "\x00" + identity))
@@ -283,11 +335,14 @@ func nativeProxyResumeIdentity(spec nativeProxySpec, args []string) string {
 	var idFlags []string
 	var continueFlags []string
 	switch spec.provider {
+	case accounts.ProviderAntigravity:
+		idFlags = []string{"--conversation"}
+		continueFlags = []string{"-c", "--continue"}
 	case accounts.ProviderKimi:
 		idFlags = []string{"-S", "--session"}
 		continueFlags = []string{"-c", "--continue"}
 	case accounts.ProviderQwenToken:
-		idFlags = []string{"-r", "--resume"}
+		idFlags = []string{"-r", "--resume", "--session-id"}
 		continueFlags = []string{"-c", "--continue"}
 	default:
 		return ""
@@ -307,7 +362,11 @@ func nativeProxyResumeIdentity(spec nativeProxySpec, args []string) string {
 			}
 		}
 		for _, flag := range continueFlags {
-			if args[i] == flag || args[i] == flag+"=true" {
+			// Kimi has used -c both as a boolean continue alias and, in newer
+			// releases, as a prompt alias. Only treat a short flag as continue
+			// when it does not consume a following value; the long form is stable.
+			shortWithValue := len(flag) == 2 && args[i] == flag && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-")
+			if !shortWithValue && (args[i] == flag || args[i] == flag+"=true") {
 				cwd, err := os.Getwd()
 				if err != nil {
 					cwd = "."
@@ -321,6 +380,7 @@ func nativeProxyResumeIdentity(spec nativeProxySpec, args []string) string {
 
 var nativeProxyRoutingEnvKeys = []string{
 	"CLOUD_CODE_URL",
+	"GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH",
 	"KIMI_CODE_BASE_URL", "KIMI_API_KEY", "KIMI_BASE_URL",
 	"KIMI_MODEL_NAME", "KIMI_MODEL_API_KEY", "KIMI_MODEL_BASE_URL", "KIMI_MODEL_PROVIDER_TYPE",
 	"KIMI_MODEL_MAX_CONTEXT_SIZE", "KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY",
@@ -335,6 +395,11 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 	providerURL := strings.TrimRight(relayRoot, "/") + "/" + spec.route
 	switch spec.provider {
 	case accounts.ProviderAntigravity:
+		if conflict, err := antigravityDirectProviderConflict(environ); err != nil {
+			return nil, func() {}, err
+		} else if conflict != "" {
+			return nil, func() {}, fmt.Errorf("Antigravity direct provider %s is configured; remove it before using 'sr agy proxy'", conflict)
+		}
 		return upsertEnv(env, "CLOUD_CODE_URL", providerURL), func() {}, nil
 	case accounts.ProviderKimi:
 		for key, value := range map[string]string{
@@ -370,6 +435,50 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 	default:
 		return nil, func() {}, fmt.Errorf("unsupported native proxy provider %s", spec.provider)
 	}
+}
+
+func antigravityDirectProviderConflict(environ []string) (string, error) {
+	for _, key := range []string{"GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH"} {
+		if strings.TrimSpace(envValue(environ, key)) != "" {
+			return key, nil
+		}
+	}
+	home := strings.TrimSpace(envValue(environ, "HOME"))
+	if home == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("locate Antigravity settings: %w", err)
+		}
+	}
+	settingsPath := filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")
+	body, err := os.ReadFile(settingsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read Antigravity settings: %w", err)
+	}
+	if len(body) > 1<<20 {
+		return "", errors.New("Antigravity settings are too large to validate safely")
+	}
+	var settings struct {
+		ModelProvider json.RawMessage `json:"modelProvider"`
+	}
+	if err := json.Unmarshal(body, &settings); err != nil {
+		return "", fmt.Errorf("parse Antigravity settings: %w", err)
+	}
+	if len(settings.ModelProvider) == 0 || string(settings.ModelProvider) == "null" {
+		return "", nil
+	}
+	var provider string
+	if err := json.Unmarshal(settings.ModelProvider, &provider); err != nil {
+		return "", errors.New("Antigravity settings contain an unsupported modelProvider value")
+	}
+	if strings.TrimSpace(provider) != "" {
+		return "modelProvider", nil
+	}
+	return "", nil
 }
 
 func kimiNativeProxyArgs(args []string) []string {

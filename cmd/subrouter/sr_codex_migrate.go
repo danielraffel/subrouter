@@ -389,16 +389,10 @@ func codexIsolationDoctorCheck(store accounts.CodexStore) doctorCheck {
 }
 
 func localCodexStoreServesLegacy(store accounts.CodexStore) bool {
-	runner := srRunner{store: store}
-	server, selected, err := runner.defaultRemoteServer()
-	if err != nil {
-		return false
-	}
-	if selected {
-		return sameEndpoint(server.URL, localBaseURL())
-	}
-	configured, err := defaultCodexBaseURLForHealth()
-	return err == nil && (configured == "" || sameEndpoint(configured, localBaseURL()))
+	// A matching loopback origin proves which daemon receives traffic, not which
+	// disk directory that daemon opened. Only an explicit state root binds this
+	// CLI process to the serving store; otherwise use the server control plane.
+	return explicitLocalStateAuthority() && strings.TrimSpace(store.StoreDir()) != ""
 }
 
 func printCodexIsolationStatus(out io.Writer, store accounts.CodexStore) error {
