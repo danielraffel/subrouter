@@ -1129,6 +1129,8 @@ func main() {
 		err = runProxy(args)
 	case "golden":
 		err = runGolden(args)
+	case "golden-slot":
+		err = runGoldenSlot(args)
 	default:
 		err = fmt.Errorf("unknown command %q", command)
 	}

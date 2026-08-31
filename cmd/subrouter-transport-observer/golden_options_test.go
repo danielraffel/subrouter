@@ -73,6 +73,93 @@ func TestGoldenOptionsRequirePinnedCandidate(t *testing.T) {
 	}
 }
 
+func TestGoldenSlotOptionsRequirePinnedCandidateAndBootstrap(t *testing.T) {
+	previousHooks := goldenTestHooks
+	goldenTestHooks.enabled = false
+	t.Cleanup(func() { goldenTestHooks = previousHooks })
+
+	args := []string{
+		"--predecessor-version", "v0.1.60",
+		"--predecessor-sha256", goldenPinnedPredecessorSHA256,
+		"--candidate-tag", goldenPinnedCandidateTag,
+		"--candidate-sha256", strings.Repeat("b", 64),
+		"--candidate-revision", strings.Repeat("c", 40),
+		"--bootstrap-sha256", goldenPinnedBootstrapLinuxSHA256,
+		"--deploy-evidence-validator", "validator",
+		"--account-id", "test@example.invalid",
+		"--activate", "true",
+		"--rollback", "true",
+		"--old-generation-check", "true",
+	}
+	options, err := parseGoldenSlotArgs(args)
+	if err != nil {
+		t.Fatalf("valid slot-only options were rejected: %v", err)
+	}
+	if options.bootstrapSHA256 != goldenPinnedBootstrapLinuxSHA256 {
+		t.Fatalf("bootstrap checksum = %q, want pinned checksum", options.bootstrapSHA256)
+	}
+	for index := range args {
+		if args[index] == goldenPinnedBootstrapLinuxSHA256 {
+			args[index] = strings.Repeat("d", 64)
+			break
+		}
+	}
+	if _, err := parseGoldenSlotArgs(args); err == nil {
+		t.Fatal("unverified bootstrap checksum was accepted")
+	}
+}
+
+func TestGoldenSlotOnlySummaryFixtureIsValid(t *testing.T) {
+	summary := validGoldenSlotOnlyAcceptanceSummary()
+	if err := validateGoldenSlotOnlySummary(summary, false, goldenPinnedBootstrapLinuxSHA256,
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40)); err != nil {
+		t.Fatalf("valid slot-only fixture rejected: %v", err)
+	}
+}
+
+func validGoldenSlotOnlyAcceptanceSummary() goldenSummary {
+	summary := validGoldenAcceptanceSummary()
+	filteredSessions := summary.Sessions[:0]
+	for _, session := range summary.Sessions {
+		if !strings.HasPrefix(session.Label, "migration-") {
+			filteredSessions = append(filteredSessions, session)
+		}
+	}
+	summary.Sessions = filteredSessions
+	filteredSnapshots := summary.ProcessSnapshots[:0]
+	for _, snapshot := range summary.ProcessSnapshots {
+		if !strings.HasPrefix(snapshot.Phase, "migration-") {
+			filteredSnapshots = append(filteredSnapshots, snapshot)
+		}
+	}
+	summary.ProcessSnapshots = filteredSnapshots
+	summary.MigrationPreparation = goldenActionSummary{}
+	summary.MigrationFinalCutover = goldenActionSummary{}
+	summary.LegacyCleanup = goldenActionSummary{}
+	return summary
+}
+
+func TestGoldenSlotOnlySummaryRejectsUnverifiedBootstrap(t *testing.T) {
+	summary := validGoldenSlotOnlyAcceptanceSummary()
+	if got := fixedGoldenFailure(validateGoldenSlotOnlySummary(summary, false, strings.Repeat("d", 64),
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40))); got != "deployment_provenance_mismatch" {
+		t.Fatalf("failure = %q, want deployment_provenance_mismatch", got)
+	}
+}
+
+func TestGoldenSlotOnlySummaryRejectsChunkGapAboveAllowed(t *testing.T) {
+	summary := validGoldenSlotOnlyAcceptanceSummary()
+	for index := range summary.Sessions {
+		if summary.Sessions[index].Label == "rehearsal-direct-websocket" {
+			summary.Sessions[index].MaxChunkGapMillis = summary.Sessions[index].AllowedChunkGapMillis + 1
+		}
+	}
+	if got := fixedGoldenFailure(validateGoldenSlotOnlySummary(summary, false, goldenPinnedBootstrapLinuxSHA256,
+		goldenPinnedCandidateTag, strings.Repeat("b", 64), strings.Repeat("c", 40))); got != "session_evidence_incomplete" {
+		t.Fatalf("failure = %q, want session_evidence_incomplete", got)
+	}
+}
+
 func TestGoldenOptionsPinSparkAndSelectedOAuthAccount(t *testing.T) {
 	previousHooks := goldenTestHooks
 	goldenTestHooks.enabled = true

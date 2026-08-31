@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -84,11 +85,13 @@ func goldenProbeScheduleToleranceForRun() time.Duration {
 }
 
 type goldenOptions struct {
+	slotOnly          bool
 	cloudConfig       string
 	codexHome         string
 	codexBinary       string
 	releasedVersion   string
 	predecessorSHA256 string
+	bootstrapSHA256   string
 	candidateTag      string
 	candidateSHA256   string
 	candidateRevision string
@@ -175,7 +178,7 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 		return options, errors.New("--timeout must be positive")
 	}
 	options.accountID = strings.TrimSpace(options.accountID)
-	if len(options.accountID) > 320 || strings.ContainsAny(options.accountID, "\r\n\x00") {
+	if options.accountID != "" && !validGoldenAccountID(options.accountID) {
 		return options, errors.New("--account-id is invalid")
 	}
 	if !goldenTestHooks.enabled {
@@ -198,6 +201,112 @@ func parseGoldenArgs(args []string) (goldenOptions, error) {
 		options.evidenceValidator = goldenTestHooks.evidenceValidator
 	}
 	return options, nil
+}
+
+// parseGoldenSlotArgs is the post-listener-handoff variant of the continuity
+// gate. It keeps the historical client and the two slot transitions, while
+// omitting the one-time legacy migration actions that cannot run again after
+// the listener descriptor has moved to the stable front.
+func parseGoldenSlotArgs(args []string) (goldenOptions, error) {
+	var options goldenOptions
+	options.slotOnly = true
+	actionNames := []string{"--activate", "--rollback", "--old-generation-check"}
+	positions := make(map[string]int, len(actionNames))
+	for index, arg := range args {
+		for _, name := range actionNames {
+			if arg == name {
+				if _, exists := positions[name]; exists {
+					return options, fmt.Errorf("%s may appear only once", name)
+				}
+				positions[name] = index
+			}
+		}
+	}
+	previous := -1
+	for index, name := range actionNames {
+		position, ok := positions[name]
+		if !ok || position <= previous || (index+1 < len(actionNames) && position+1 == positions[actionNames[index+1]]) ||
+			(index+1 == len(actionNames) && position+1 == len(args)) {
+			return options, errors.New("slot-only golden actions must be supplied in canonical order with a command")
+		}
+		previous = position
+	}
+	flags := flag.NewFlagSet("golden-slot", flag.ContinueOnError)
+	flags.StringVar(&options.cloudConfig, "cloud-config", "", "source cmux.com cloud config")
+	flags.StringVar(&options.codexHome, "codex-home", "", "source Codex home containing auth.json")
+	flags.StringVar(&options.codexBinary, "codex-bin", "codex", "Codex CLI binary")
+	flags.StringVar(&options.releasedVersion, "predecessor-version", "", "explicit predecessor Subrouter release version")
+	flags.StringVar(&options.releasedVersion, "released-version", "", "deprecated alias for --predecessor-version")
+	flags.StringVar(&options.predecessorSHA256, "predecessor-sha256", "", "expected predecessor release asset SHA-256")
+	flags.StringVar(&options.bootstrapSHA256, "bootstrap-sha256", "", "verified active slot worker SHA-256")
+	flags.StringVar(&options.candidateTag, "candidate-tag", "", "immutable candidate release tag")
+	flags.StringVar(&options.candidateSHA256, "candidate-sha256", "", "verified Linux candidate asset SHA-256")
+	flags.StringVar(&options.candidateRevision, "candidate-revision", "", "verified candidate source revision")
+	flags.StringVar(&options.evidenceValidator, "deploy-evidence-validator", "", "canonical deployment evidence validator")
+	flags.StringVar(&options.predecessorClient, "predecessor-client", "", "locally verified pinned predecessor release asset")
+	flags.StringVar(&options.releasedClient, "released-client", "", "test-only released client override")
+	flags.StringVar(&options.artifactDir, "artifact-dir", "", "content-blind evidence directory")
+	flags.StringVar(&options.model, "model", "gpt-5.3-codex-spark", "Codex model")
+	flags.StringVar(&options.accountID, "account-id", "", "Subrouter OAuth account selected for every golden Codex session")
+	flags.IntVar(&options.streamLines, "stream-lines", 400, "numbered lines requested from each continuity turn")
+	flags.DurationVar(&options.timeout, "timeout", 20*time.Minute, "overall golden gate timeout")
+	if err := flags.Parse(args[:positions[actionNames[0]]]); err != nil {
+		return options, err
+	}
+	if flags.NArg() != 0 {
+		return options, fmt.Errorf("unexpected golden-slot arguments")
+	}
+	activationStart, activationEnd := positions[actionNames[0]]+1, positions[actionNames[1]]
+	rollbackStart, rollbackEnd := positions[actionNames[1]]+1, positions[actionNames[2]]
+	oldGenerationStart := positions[actionNames[2]] + 1
+	options.activation = append([]string(nil), args[activationStart:activationEnd]...)
+	options.rollback = append([]string(nil), args[rollbackStart:rollbackEnd]...)
+	options.oldGenerationTest = append([]string(nil), args[oldGenerationStart:]...)
+	if options.streamLines < 100 && !goldenTestHooks.enabled {
+		return options, errors.New("--stream-lines must be at least 100")
+	}
+	if options.timeout <= 0 {
+		return options, errors.New("--timeout must be positive")
+	}
+	options.accountID = strings.TrimSpace(options.accountID)
+	if options.accountID != "" && !validGoldenAccountID(options.accountID) {
+		return options, errors.New("--account-id is invalid")
+	}
+	if !goldenTestHooks.enabled {
+		version := strings.TrimPrefix(strings.TrimSpace(options.releasedVersion), "v")
+		if version != goldenPinnedPredecessorVersion ||
+			strings.ToLower(strings.TrimSpace(options.predecessorSHA256)) != goldenPinnedPredecessorSHA256 {
+			return options, errors.New("the golden predecessor must be pinned v0.1.60 with its Darwin SHA-256")
+		}
+		if strings.TrimSpace(options.evidenceValidator) == "" {
+			return options, errors.New("--deploy-evidence-validator is required")
+		}
+		if options.accountID == "" {
+			return options, errors.New("--account-id is required for a deterministic golden credential")
+		}
+		if strings.TrimSpace(options.bootstrapSHA256) != goldenPinnedBootstrapLinuxSHA256 {
+			return options, errors.New("the active slot worker must be the verified v0.1.63 bootstrap")
+		}
+		if strings.TrimSpace(options.candidateTag) != goldenPinnedCandidateTag || !validGoldenSHA256(options.candidateSHA256) ||
+			len(strings.TrimSpace(options.candidateRevision)) != 40 {
+			return options, fmt.Errorf("the golden candidate must be the verified immutable %s release", goldenPinnedCandidateTag)
+		}
+	} else if options.evidenceValidator == "" {
+		options.evidenceValidator = goldenTestHooks.evidenceValidator
+	}
+	return options, nil
+}
+
+func validGoldenAccountID(value string) bool {
+	if len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return strings.TrimSpace(value) != ""
 }
 
 type jsonlRecorder struct {
@@ -448,6 +557,18 @@ func runGolden(args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
+	return runGoldenOptions(options)
+}
+
+func runGoldenSlot(args []string) (runErr error) {
+	options, err := parseGoldenSlotArgs(args)
+	if err != nil {
+		return err
+	}
+	return runGoldenOptions(options)
+}
+
+func runGoldenOptions(options goldenOptions) (runErr error) {
 	testMode := goldenTestHooks.enabled
 	if !testMode && (runtime.GOOS != "darwin" || runtime.GOARCH != "arm64") {
 		return errors.New("golden continuity gate must run locally on macOS arm64")
@@ -526,7 +647,12 @@ func runGolden(args []string) (runErr error) {
 	if err := runner.run(ctx); err != nil {
 		return err
 	}
-	if err := validateGoldenSummary(summary, testMode); err != nil {
+	if options.slotOnly {
+		if err := validateGoldenSlotOnlySummary(summary, testMode, options.bootstrapSHA256,
+			options.candidateTag, options.candidateSHA256, options.candidateRevision); err != nil {
+			return err
+		}
+	} else if err := validateGoldenSummary(summary, testMode); err != nil {
 		return err
 	}
 	return nil
@@ -550,11 +676,13 @@ func (e *goldenFailure) Error() string { return e.code }
 func failGolden(code string) error { return &goldenFailure{code: code} }
 
 type goldenRunner struct {
-	options     goldenOptions
-	artifactDir string
-	privateRoot string
-	summary     *goldenSummary
-	testMode    bool
+	options             goldenOptions
+	artifactDir         string
+	privateRoot         string
+	summary             *goldenSummary
+	testMode            bool
+	goldenCodexShimPath string
+	rawCodexBinary      string
 
 	mu                  sync.Mutex
 	observers           []*runningGoldenObserver
@@ -675,10 +803,54 @@ func goldenPredecessorDirectCredentialSource() string {
 	return "legacy"
 }
 
+// prepareGoldenCodexShim keeps the per-response attempt token in the child
+// environment while adding it after the pinned Subrouter client has finished
+// sanitizing provider-owned Codex overrides. The raw Codex binary is resolved
+// before the private shim is written, so the shim cannot recurse through the
+// Subrouter client.
+func (r *goldenRunner) prepareGoldenCodexShim() error {
+	raw, err := exec.LookPath(r.options.codexBinary)
+	if err != nil {
+		return failGolden("required_command_missing")
+	}
+	shimPath := filepath.Join(r.privateRoot, "golden-codex-shim")
+	contents := []byte("#!/bin/sh\n" +
+		"set -eu\n" +
+		": \"${SUBROUTER_GOLDEN_RAW_CODEX_BIN:?}\"\n" +
+		"case \"${SUBROUTER_GOLDEN_TRANSPORT:-websocket}\" in\n" +
+		"  http)\n" +
+		"    exec \"${SUBROUTER_GOLDEN_RAW_CODEX_BIN}\" \"$@\" \\\n" +
+		"      -c 'model_providers.subrouter.supports_websockets=false' \\\n" +
+		"      -c 'model_providers.subrouter.env_http_headers={\"" + goldenResponseAttemptTokenHeader + "\"=\"" + goldenResponseRequestTokenEnv + "\"}'\n" +
+		"    ;;\n" +
+		"  websocket)\n" +
+		"    exec \"${SUBROUTER_GOLDEN_RAW_CODEX_BIN}\" \"$@\" \\\n" +
+		"      -c 'model_providers.subrouter.env_http_headers={\"" + goldenResponseAttemptTokenHeader + "\"=\"" + goldenResponseRequestTokenEnv + "\"}'\n" +
+		"    ;;\n" +
+		"  *)\n" +
+		"    exit 64\n" +
+		"    ;;\n" +
+		"esac\n")
+	if err := os.WriteFile(shimPath, contents, 0o700); err != nil {
+		return failGolden("golden_codex_shim_failed")
+	}
+	if err := os.Chmod(shimPath, 0o700); err != nil {
+		return failGolden("golden_codex_shim_failed")
+	}
+	r.goldenCodexShimPath = shimPath
+	r.rawCodexBinary = raw
+	return nil
+}
+
 func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	for _, command := range []string{"lsof", "pgrep", "ps", r.options.codexBinary} {
 		if _, err := exec.LookPath(command); err != nil {
 			return failGolden("required_command_missing")
+		}
+	}
+	if !r.testMode {
+		if err := r.prepareGoldenCodexShim(); err != nil {
+			return err
 		}
 	}
 	evidenceFile, err := os.OpenFile(filepath.Join(r.artifactDir, "gate-events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -786,6 +958,15 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	}
 	r.probeStats = probeStats
 	defer probeStats.stop(probeCancel)
+	cycleInputs := goldenCycleInputs{
+		name: "", clientPath: client.path, authData: authData, cloud: cloudConfig,
+		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
+		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
+		localDaemonPID: localDaemon.Process.Pid,
+	}
+	if r.options.slotOnly {
+		return r.runSlotOnlyHarness(ctx, cycleInputs, probeCancel, probeStats, cancelLocalRSS, localRSSDone, &localRSSStopped, localDaemon, &localDaemonStopped)
+	}
 	migration, err := r.runMigrationCycle(ctx, goldenCycleInputs{
 		name: "migration", clientPath: client.path, authData: authData, cloud: cloudConfig,
 		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
@@ -881,6 +1062,79 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	)
 	r.summary.Sessions = append(
 		r.summary.Sessions,
+		buildGoldenSessionSummaries(final.initial, final.resumes, final.fresh, final.before, final.after)...,
+	)
+	return nil
+}
+
+func (r *goldenRunner) runSlotOnlyHarness(
+	ctx context.Context,
+	inputs goldenCycleInputs,
+	probeCancel context.CancelFunc,
+	probeStats *goldenProbeStats,
+	cancelLocalRSS context.CancelFunc,
+	localRSSDone <-chan struct{},
+	localRSSStopped *bool,
+	localDaemon *exec.Cmd,
+	localDaemonStopped *bool,
+) error {
+	inputs.name = "rehearsal"
+	rehearsal, err := r.runRehearsalCycle(ctx, inputs)
+	if err != nil {
+		return err
+	}
+	r.summary.Activation = rehearsal.activation
+	r.summary.Rollback = rehearsal.rollback
+	r.summary.OldGenerationCleanup = rehearsal.cleanup
+	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
+		return err
+	}
+
+	inputs.name = "final"
+	final, err := r.runFinalCycle(ctx, inputs, rehearsal.activation)
+	if err != nil {
+		return err
+	}
+	r.summary.FinalActivation = final.activation
+	r.summary.FinalOldGenerationCleanup = final.cleanup
+	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
+		return err
+	}
+	if observerRequestCount(inputs.leaseObserver.stats, "/v1/responses") != 0 ||
+		observerRequestCount(inputs.leaseObserver.stats, "/responses") != 0 ||
+		observerRequestCount(inputs.leaseObserver.stats, "/_subrouter/leases") != 0 {
+		return failGolden("local_route_bypassed_daemon")
+	}
+	probeStats.stop(probeCancel)
+	r.summary.Health = probeStats.summaries()
+	cancelLocalRSS()
+	<-localRSSDone
+	*localRSSStopped = true
+	if err := r.stopSamplingEvidenceWriter(); err != nil {
+		return err
+	}
+	if r.evidence.failure() != nil || probeStats.record.failure() != nil {
+		return failGolden("evidence_write_failed")
+	}
+	if err := probeStats.validateInterval(probeStats.startedAt, parseSummaryTime(r.summary.FinalOldGenerationCleanup.FinishedAt)); err != nil {
+		return err
+	}
+	if err := r.finalizeLocalDaemonRSS(); err != nil {
+		return err
+	}
+	stopAndWaitCommand(localDaemon)
+	*localDaemonStopped = true
+	if err := r.waitGoldenLocalDaemonStderr(); err != nil {
+		return err
+	}
+	if err := r.requireGoldenLocalDaemonTransportClean(); err != nil {
+		return err
+	}
+	if err := r.finalizeObservers(ctx); err != nil {
+		return err
+	}
+	r.summary.Sessions = append(
+		buildGoldenSessionSummaries(rehearsal.initial, rehearsal.resumes, rehearsal.fresh, rehearsal.before, rehearsal.after),
 		buildGoldenSessionSummaries(final.initial, final.resumes, final.fresh, final.before, final.after)...,
 	)
 	return nil
@@ -1044,7 +1298,7 @@ func (r *goldenRunner) runRehearsalCycle(ctx context.Context, inputs goldenCycle
 	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
 		return result, err
 	}
-	if err := validateGoldenProvenance(r.summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256, result.activation); err != nil {
+	if err := validateGoldenProvenance(r.bootstrapForActivation(result.activation), result.activation); err != nil {
 		return result, err
 	}
 	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
@@ -1206,7 +1460,7 @@ func (r *goldenRunner) runFinalCycle(ctx context.Context, inputs goldenCycleInpu
 	if err := validateGoldenTransitionAction(result.activation, true); err != nil {
 		return result, err
 	}
-	if err := validateGoldenProvenance(r.summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256, result.activation); err != nil {
+	if err := validateGoldenProvenance(r.bootstrapForActivation(result.activation), result.activation); err != nil {
 		return result, err
 	}
 	if err := r.validateGoldenSlotCandidate(result.activation); err != nil {
@@ -1464,6 +1718,29 @@ func validateGoldenProvenance(predecessorSHA string, activation goldenActionSumm
 		return failGolden("deployment_provenance_mismatch")
 	}
 	return nil
+}
+
+func (r *goldenRunner) expectedGoldenBootstrapSHA256() string {
+	if value := strings.TrimSpace(r.options.bootstrapSHA256); value != "" {
+		return value
+	}
+	if r.summary != nil && r.summary.MigrationPreparation.migrationCanonical != nil {
+		return r.summary.MigrationPreparation.migrationCanonical.Bootstrap.SHA256
+	}
+	return ""
+}
+
+func (r *goldenRunner) bootstrapForActivation(activation goldenActionSummary) string {
+	if expected := r.expectedGoldenBootstrapSHA256(); expected != "" {
+		return expected
+	}
+	if r.testMode {
+		// Deterministic fixtures can carry their bootstrap identity in the
+		// activation evidence itself. Production parsing always supplies the
+		// pinned bootstrap checksum before a cycle can start.
+		return activation.FromReleaseSHA256
+	}
+	return ""
 }
 
 func (r *goldenRunner) runRetirementCheck(
@@ -2432,12 +2709,13 @@ type goldenProbeEvent struct {
 }
 
 type goldenProbeStats struct {
-	mu       sync.Mutex
-	events   []goldenProbeEvent
-	record   *jsonlRecorder
-	loops    sync.WaitGroup
-	samples  sync.WaitGroup
-	finished chan struct{}
+	startedAt time.Time
+	mu        sync.Mutex
+	events    []goldenProbeEvent
+	record    *jsonlRecorder
+	loops     sync.WaitGroup
+	samples   sync.WaitGroup
+	finished  chan struct{}
 }
 
 func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigin *url.URL) (*goldenProbeStats, error) {
@@ -2449,7 +2727,7 @@ func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigi
 		file.Close()
 		return nil, failGolden("health_evidence_protect_failed")
 	}
-	stats := &goldenProbeStats{record: &jsonlRecorder{writer: file}, finished: make(chan struct{})}
+	stats := &goldenProbeStats{startedAt: time.Now().UTC(), record: &jsonlRecorder{writer: file}, finished: make(chan struct{})}
 	targets := []struct {
 		label string
 		url   string
@@ -2765,6 +3043,11 @@ func (r *goldenRunner) launchSession(ctx context.Context, clientPath string, ses
 		"SUBROUTER_DISABLE_FALLBACK":  "1",
 		"SUBROUTER_STATE_DIR":         filepath.Join(session.home, ".subrouter"),
 		goldenResponseRequestTokenEnv: session.streamReleaseToken,
+		"SUBROUTER_GOLDEN_TRANSPORT":  session.transport,
+	}
+	if r.goldenCodexShimPath != "" {
+		overrides["SUBROUTER_CODEX_BIN"] = r.goldenCodexShimPath
+		overrides["SUBROUTER_GOLDEN_RAW_CODEX_BIN"] = r.rawCodexBinary
 	}
 	if r.options.accountID != "" {
 		overrides["SUBROUTER_CODEX_ACCOUNT_ID"] = r.options.accountID
@@ -4654,6 +4937,7 @@ func validateGoldenSummary(summary goldenSummary, testMode bool) error {
 			session.DuplicateMarkerCount != 0 || session.PeakRSSBytes <= 0 || session.PeakRSSBytes > goldenCodexRSSLimitBytes ||
 			session.RSSSamples == 0 || session.ProcessSamples == 0 || session.PausedProcessSamples != 0 ||
 			session.MaxProcessSampleGapMS > goldenProcessSampleMaxGap.Milliseconds() ||
+			session.MaxChunkGapMillis > session.AllowedChunkGapMillis ||
 			session.AllowedChunkGapMillis < goldenChunkGapFloor.Milliseconds() ||
 			session.DeployMaxChunkGapMillis > session.AllowedChunkGapMillis {
 			return fmt.Errorf("%w: invalid session %q", failGolden("session_evidence_incomplete"), session.Label)
