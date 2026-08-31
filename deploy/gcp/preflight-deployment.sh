@@ -99,6 +99,24 @@ gcloud_ssh() {
   "${GCLOUD_BINARY}" compute ssh "${INSTANCE}" --project "${PROJECT_ID}" --zone "${ZONE}" \
     --tunnel-through-iap --quiet --command "$1"
 }
+verify_legacy_backend_port() {
+  local backend_json expected_group_url
+  backend_json="$("${GCLOUD_BINARY}" compute backend-services describe "${LEGACY_BACKEND_SERVICE}" \
+    --project "${PROJECT_ID}" --global --format=json)"
+  expected_group_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/zones/${ZONE}/instanceGroups/${INSTANCE_GROUP}"
+  jq -e --arg group_url "${expected_group_url}" \
+    '.portName == "http" and .protocol == "HTTP" and
+     (.backends | type == "array" and length == 1) and
+     .backends[0].group == $group_url' \
+    < <(stream_shell_value "${backend_json}") >/dev/null \
+    || die "legacy backend is not pinned to the http:31415 listener"
+  jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' \
+    < <(stream_shell_value "${group_json}") >/dev/null \
+    || die "instance group http:31415 mapping is missing"
+  backend_port_verified=true
+  legacy_backend_port_name="http"
+  instance_group_http_port=31415
+}
 utc_now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 
 curl -fsS --max-time 10 "${PUBLIC_BASE_URL}/_subrouter/health" >/dev/null || die "public health failed"
@@ -129,11 +147,7 @@ if [[ "${MODE}" == migrate-front ]]; then
   [[ "${active_backend_url}" == "${legacy_backend_url}" ]] \
     || die "URL map active route does not point to the legacy backend"
   route_assignments_verified=true
-  jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' < <(stream_shell_value "${group_json}") >/dev/null \
-    || die "legacy named port http:31415 is missing"
-  backend_port_verified=true
-  legacy_backend_port_name="http"
-  instance_group_http_port=31415
+  verify_legacy_backend_port
   front_state="$(gcloud_ssh "if systemctl is-active --quiet subrouter-front.service || sudo test -S /var/lib/subrouter/front.sock; then echo present; else echo absent; fi" | tail -n 1)"
   [[ "${front_state}" == absent ]] || die "front topology already exists; use a slot preflight or finish the existing migration"
   legacy_status="$(gcloud_ssh "systemctl is-active --quiet subrouter.service; sudo curl -fsS --unix-socket /var/lib/subrouter/supervisor.sock http://localhost/_subrouter/supervisor-status")"
@@ -180,21 +194,7 @@ else
     active_backend_url="${legacy_backend_url}"
     route_assignments_verified=true
     [[ -n "${CANARY_SECURITY_POLICY}" ]] || die "canary security policy is not configured for the listener-takeover route"
-    backend_json="$("${GCLOUD_BINARY}" compute backend-services describe "${LEGACY_BACKEND_SERVICE}" \
-      --project "${PROJECT_ID}" --global --format=json)"
-    expected_group_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/zones/${ZONE}/instanceGroups/${INSTANCE_GROUP}"
-    jq -e --arg group_url "${expected_group_url}" \
-      '.portName == "http" and .protocol == "HTTP" and
-       (.backends | type == "array" and length == 1) and
-       .backends[0].group == $group_url' \
-      < <(stream_shell_value "${backend_json}") >/dev/null \
-      || die "legacy backend is not pinned to the http:31415 listener"
-    jq -e '[.namedPorts[]? | select(.name == "http" and .port == 31415)] | length == 1' \
-      < <(stream_shell_value "${group_json}") >/dev/null \
-      || die "instance group http:31415 mapping is missing"
-    backend_port_verified=true
-    legacy_backend_port_name="http"
-    instance_group_http_port=31415
+    verify_legacy_backend_port
     expected_policy_url="https://www.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/securityPolicies/${CANARY_SECURITY_POLICY}"
     backend_policy_json="$("${GCLOUD_BINARY}" compute backend-services describe "${FRONT_BACKEND_SERVICE}" \
       --project "${PROJECT_ID}" --global --format=json)"
