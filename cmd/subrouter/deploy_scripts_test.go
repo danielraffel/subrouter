@@ -394,7 +394,9 @@ if [[ "${1:-}" == compute && "${2:-}" == ssh ]]; then
       ;;
     *"ss -H -lntp"*)
       if [[ "${FAKE_LEGACY_ENABLED:-0}" == 1 ]]; then exit 1; fi
-      printf '%s\n' '{"verified":true,"service":"subrouter-front.service","port":31415,"pid":1234}'
+      if [[ "${FAKE_LISTENER_NOISE:-0}" == 1 ]]; then printf '%s\n' 'WARNING: remote login banner'; fi
+      printf '%s\n' 'SUBROUTER_LISTENER_TAKEOVER_PROOF={"verified":true,"service":"subrouter-front.service","port":31415,"pid":1234}'
+      if [[ "${FAKE_LISTENER_NOISE:-0}" == 1 ]]; then printf '%s\n' '{"noise":"after-proof"}'; fi
       ;;
     *MainPID*)
       printf '%s\n' '1234'
@@ -478,6 +480,16 @@ exit 1
 	}
 	if evidence.Topology.Current != "front-listener" || !evidence.Topology.Verified {
 		t.Fatalf("listener takeover evidence = %+v, want verified front-listener", evidence.Topology)
+	}
+
+	noisy := exec.Command(
+		mustLookPath(t, "bash"),
+		filepath.Join(repoRoot, "deploy", "gcp", "preflight-deployment.sh"),
+		"--evidence-json", filepath.Join(t.TempDir(), "noisy.json"),
+	)
+	noisy.Env = append(command.Env, "FAKE_LISTENER_NOISE=1")
+	if output, err := noisy.CombinedOutput(); err != nil {
+		t.Fatalf("listener-takeover preflight rejected harmless remote output: %v\n%s", err, output)
 	}
 
 	reversed := exec.Command(
