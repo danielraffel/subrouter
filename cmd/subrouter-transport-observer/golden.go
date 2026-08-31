@@ -901,7 +901,13 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return failGolden("broker_url_invalid")
 	}
-	leaseObserver, err := r.startObserver("local-lease", brokerOrigin)
+	// Keep the legacy broker origin available for non-lease control calls, but
+	// observe team-mode leases at the same tenant endpoint the client uses.
+	legacyLeaseObserver, err := r.startObserver("local-lease-legacy", brokerOrigin)
+	if err != nil {
+		return err
+	}
+	leaseObserver, err := r.startObserver("local-lease", hostedOrigin)
 	if err != nil {
 		return err
 	}
@@ -915,7 +921,7 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	if err := writeGoldenConfig(directConfigPath, cloudConfig.Raw, goldenPredecessorDirectCredentialSource(), cloudConfig.HostedURL, cloudConfig.BrokerURL); err != nil {
 		return failGolden("private_config_write_failed")
 	}
-	if err := writeGoldenConfig(teamConfigPath, cloudConfig.Raw, "team", cloudConfig.HostedURL, leaseObserver.baseURL); err != nil {
+	if err := writeGoldenConfig(teamConfigPath, cloudConfig.Raw, "team", leaseObserver.baseURL, legacyLeaseObserver.baseURL); err != nil {
 		return failGolden("private_config_write_failed")
 	}
 
@@ -962,7 +968,8 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		name: "", clientPath: client.path, authData: authData, cloud: cloudConfig,
 		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
 		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
-		localDaemonPID: localDaemon.Process.Pid,
+		legacyLeaseObserver: legacyLeaseObserver,
+		localDaemonPID:      localDaemon.Process.Pid,
 	}
 	if r.options.slotOnly {
 		return r.runSlotOnlyHarness(ctx, cycleInputs, probeCancel, probeStats, cancelLocalRSS, localRSSDone, &localRSSStopped, localDaemon, &localDaemonStopped)
@@ -971,7 +978,8 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		name: "migration", clientPath: client.path, authData: authData, cloud: cloudConfig,
 		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
 		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
-		localDaemonPID: localDaemon.Process.Pid,
+		legacyLeaseObserver: legacyLeaseObserver,
+		localDaemonPID:      localDaemon.Process.Pid,
 	})
 	if err != nil {
 		return err
@@ -990,7 +998,8 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		name: "rehearsal", clientPath: client.path, authData: authData, cloud: cloudConfig,
 		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
 		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
-		localDaemonPID: localDaemon.Process.Pid,
+		legacyLeaseObserver: legacyLeaseObserver,
+		localDaemonPID:      localDaemon.Process.Pid,
 	})
 	if err != nil {
 		return err
@@ -1013,7 +1022,8 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 		name: "final", clientPath: client.path, authData: authData, cloud: cloudConfig,
 		directConfigPath: directConfigPath, teamConfigPath: teamConfigPath,
 		hostedOrigin: hostedOrigin, localOrigin: localOrigin, leaseObserver: leaseObserver,
-		localDaemonPID: localDaemon.Process.Pid,
+		legacyLeaseObserver: legacyLeaseObserver,
+		localDaemonPID:      localDaemon.Process.Pid,
 	}, rehearsal.activation)
 	if err != nil {
 		return err
@@ -1023,10 +1033,8 @@ func (r *goldenRunner) run(ctx context.Context) (runErr error) {
 	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
 		return err
 	}
-	if observerRequestCount(leaseObserver.stats, "/v1/responses") != 0 ||
-		observerRequestCount(leaseObserver.stats, "/responses") != 0 ||
-		observerRequestCount(leaseObserver.stats, "/_subrouter/leases") != 0 {
-		return failGolden("local_route_bypassed_daemon")
+	if err := requireGoldenLeaseObserversClean(leaseObserver, legacyLeaseObserver); err != nil {
+		return err
 	}
 	probeStats.stop(probeCancel)
 	r.summary.Health = probeStats.summaries()
@@ -1100,10 +1108,8 @@ func (r *goldenRunner) runSlotOnlyHarness(
 	if err := validateGoldenCounterContinuity(*r.summary); err != nil {
 		return err
 	}
-	if observerRequestCount(inputs.leaseObserver.stats, "/v1/responses") != 0 ||
-		observerRequestCount(inputs.leaseObserver.stats, "/responses") != 0 ||
-		observerRequestCount(inputs.leaseObserver.stats, "/_subrouter/leases") != 0 {
-		return failGolden("local_route_bypassed_daemon")
+	if err := requireGoldenLeaseObserversClean(inputs.leaseObserver, inputs.legacyLeaseObserver); err != nil {
+		return err
 	}
 	probeStats.stop(probeCancel)
 	r.summary.Health = probeStats.summaries()
@@ -1153,6 +1159,7 @@ type goldenCycleInputs struct {
 	directConfigPath, teamConfigPath string
 	hostedOrigin, localOrigin        *url.URL
 	leaseObserver                    *runningGoldenObserver
+	legacyLeaseObserver              *runningGoldenObserver
 	localDaemonPID                   int
 }
 
@@ -1192,7 +1199,7 @@ func (r *goldenRunner) startCycleInitialSessions(ctx context.Context, inputs gol
 			if err != nil {
 				return nil, err
 			}
-			leaseBefore = observerRequestCount(inputs.leaseObserver.stats, "/api/subrouter/leases")
+			leaseBefore = len(goldenLeaseRequests(inputs.leaseObserver.stats))
 		}
 		observation, err := r.startObserver(label, upstream)
 		if err != nil {
@@ -3704,14 +3711,11 @@ func requireGoldenLeaseWindow(leaseObserver *runningGoldenObserver, requestStart
 		if request.Path == "/v1/responses" || request.Path == "/responses" {
 			return failGolden("local_route_bypassed_daemon")
 		}
-		if request.Path == "/_subrouter/leases" {
-			return failGolden("candidate_lease_endpoint_substituted")
-		}
-		if request.Path != "/api/subrouter/leases" {
+		if !goldenLeaseRequestPath(request.Path) {
 			continue
 		}
 		if request.Method != http.MethodPost {
-			return failGolden("legacy_lease_method_invalid")
+			return failGolden("lease_method_invalid")
 		}
 		leaseCount++
 		stamp, _ := time.Parse(time.RFC3339Nano, request.Timestamp)
@@ -3720,6 +3724,24 @@ func requireGoldenLeaseWindow(leaseObserver *runningGoldenObserver, requestStart
 		}
 	}
 	return failGolden("activation_fresh_local_lease_missing")
+}
+
+// requireGoldenLeaseObserversClean keeps response traffic on the intended
+// observer and rejects a team-mode lease fallback to the legacy broker route.
+func requireGoldenLeaseObserversClean(hosted, legacy *runningGoldenObserver) error {
+	if hosted == nil || hosted.stats == nil || legacy == nil || legacy.stats == nil {
+		return failGolden("lease_observer_missing")
+	}
+	if observerRequestCount(hosted.stats, "/v1/responses") != 0 ||
+		observerRequestCount(hosted.stats, "/responses") != 0 ||
+		observerRequestCount(legacy.stats, "/v1/responses") != 0 ||
+		observerRequestCount(legacy.stats, "/responses") != 0 {
+		return failGolden("local_route_bypassed_daemon")
+	}
+	if len(goldenLeaseRequests(legacy.stats)) != 0 {
+		return failGolden("candidate_lease_endpoint_substituted")
+	}
+	return nil
 }
 
 func requireGoldenLocalObserverPath(session *goldenSession) error {
@@ -3850,7 +3872,7 @@ func (r *goldenRunner) startSpanningLocalSession(
 		"kind": "local_egress_baseline", "timestamp": baseline.Timestamp,
 		"phase": phase, "remote_socket_ids": baseline.RemoteSocketIDs,
 	})
-	leaseBefore := observerRequestCount(inputs.leaseObserver.stats, "/api/subrouter/leases")
+	leaseBefore := len(goldenLeaseRequests(inputs.leaseObserver.stats))
 	session, err := r.startActivationSession(
 		ctx, inputs.name+"-candidate-local", "local-egress", inputs.clientPath, inputs.authData,
 		inputs.cloud, inputs.directConfigPath, inputs.teamConfigPath, inputs.hostedOrigin, inputs.localOrigin,

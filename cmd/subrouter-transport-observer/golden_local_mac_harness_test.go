@@ -264,6 +264,16 @@ esac
 		t.Fatalf("retry summary accepted=%t rejected_present=%t", retryAccepted, rejectedPresent)
 	}
 	allEvidence := readGoldenArtifacts(t, artifacts)
+	if !strings.Contains(allEvidence, `"path":"/_subrouter/leases"`) {
+		t.Fatal("team-mode hosted lease request was not observed")
+	}
+	legacyLeaseEvidence, err := os.ReadFile(filepath.Join(artifacts, "transport-local-lease-legacy.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacyLeaseEvidence), `"path":"/api/subrouter/leases"`) {
+		t.Fatal("team-mode lease unexpectedly used the legacy broker observer")
+	}
 	for _, forbidden := range []string{
 		"ACCESS_TOKEN_SECRET", "REFRESH_TOKEN_SECRET", "LOCAL_PROXY_SECRET", "CODEX_AUTH_SECRET",
 		"DEPLOY_ENV_VALUE_SECRET", "REQUEST_BODY_SECRET", "REQUEST_HEADER_SECRET",
