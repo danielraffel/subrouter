@@ -214,6 +214,89 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         self.assertFalse(workspace.exists())
         self.assertFalse(_listening(port))
 
+    def test_replacing_canary_path_after_pinning_cannot_change_executed_callback(self) -> None:
+        prepare_entered = self.root / "prepare-entered"
+        release_prepare = self.root / "release-prepare"
+        replacement_witness = self.root / "replacement-canary.txt"
+        blocking_prepare = self._script(
+            "blocking-prepare.py",
+            """
+import os
+import time
+from pathlib import Path
+state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"])
+(state / "prepared").write_text("yes")
+Path(os.environ["TEST_PREPARE_ENTERED"]).write_text("yes")
+while not Path(os.environ["TEST_RELEASE_PREPARE"]).exists():
+    time.sleep(0.01)
+""",
+        )
+        replacement_canary = self._script(
+            "replacement-canary.py",
+            """
+import os
+from pathlib import Path
+Path(os.environ["TEST_REPLACEMENT_WITNESS"]).write_text("replacement-ran")
+""",
+        )
+        port = _free_port()
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "TEST_WORKSPACE_WITNESS": str(self.workspace_witness),
+                "TEST_CANARY_WITNESS": str(self.canary_witness),
+                "TEST_CHALLENGE_WITNESS": str(self.challenge_witness),
+                "TEST_CANDIDATE_ADDR_WITNESS": str(self.candidate_addr_witness),
+                "TEST_CALLBACK_ADDR_WITNESS": str(self.callback_addr_witness),
+                "TEST_PREPARE_ENTERED": str(prepare_entered),
+                "TEST_RELEASE_PREPARE": str(release_prepare),
+                "TEST_REPLACEMENT_WITNESS": str(replacement_witness),
+            }
+        )
+        runner = subprocess.Popen(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--candidate",
+                str(self.candidate),
+                "--candidate-sha256",
+                hashlib.sha256(self.candidate.read_bytes()).hexdigest(),
+                "--addr",
+                f"127.0.0.1:{port}",
+                "--prepare-callback",
+                str(blocking_prepare),
+                "--canary-callback",
+                str(self.canary),
+                "--startup-timeout-seconds",
+                "5",
+                "--callback-timeout-seconds",
+                "5",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not prepare_entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(prepare_entered.exists(), "runner never entered pinned prepare callback")
+            os.replace(replacement_canary, self.canary)
+            release_prepare.write_text("yes")
+            stdout, stderr = runner.communicate(timeout=15)
+        finally:
+            if runner.poll() is None:
+                runner.terminate()
+                runner.communicate(timeout=5)
+
+        self.assertEqual(runner.returncode, 0, stderr + stdout)
+        evidence = json.loads(stdout)
+        self.assertTrue(evidence["ok"])
+        self.assertEqual(self.canary_witness.read_text(), "passed")
+        self.assertFalse(replacement_witness.exists())
+        self.assertFalse(_listening(port))
+
     def test_hash_mismatch_fails_before_prepare_or_listener(self) -> None:
         port = _free_port()
         result = self._run(port, candidate_hash="0" * 64)

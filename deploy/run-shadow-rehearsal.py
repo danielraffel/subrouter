@@ -105,6 +105,73 @@ def _copy_candidate(source: Path, destination: Path, expected_hash: str) -> None
         _fail("candidate sha256 does not match")
 
 
+def _pin_callback(raw_path: str, destination: Path, description: str) -> Path:
+    if not raw_path or not os.path.isabs(raw_path):
+        _fail(f"{description} must be an absolute path")
+    source = Path(raw_path)
+    try:
+        named_before = source.lstat()
+    except OSError:
+        _fail(f"{description} is unavailable")
+    if not stat.S_ISREG(named_before.st_mode) or stat.S_ISLNK(named_before.st_mode):
+        _fail(f"{description} must be a regular non-symlink")
+    if not named_before.st_mode & 0o111:
+        _fail(f"{description} must be executable")
+
+    source_fd = -1
+    output_fd = -1
+    try:
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(source_fd)
+        named_opened = source.lstat()
+        expected_identity = (named_before.st_dev, named_before.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(named_opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != expected_identity
+            or (named_opened.st_dev, named_opened.st_ino) != expected_identity
+        ):
+            _fail(f"{description} identity changed while pinning")
+
+        source_fingerprint = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        output_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+        os.fchmod(output_fd, 0o700)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(output_fd, view) :]
+        os.fsync(output_fd)
+        finished = os.fstat(source_fd)
+        finished_fingerprint = (
+            finished.st_dev,
+            finished.st_ino,
+            finished.st_mode,
+            finished.st_size,
+            finished.st_mtime_ns,
+            finished.st_ctime_ns,
+        )
+        if finished_fingerprint != source_fingerprint:
+            _fail(f"{description} changed while pinning")
+    except OSError:
+        _fail(f"{description} could not be pinned")
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if output_fd >= 0:
+            os.close(output_fd)
+    return destination
+
+
 def _parse_loopback_addr(value: str) -> tuple[str, int, str]:
     try:
         parsed = urllib.parse.urlsplit(f"//{value}")
@@ -411,8 +478,6 @@ def main() -> int:
         if arguments.callback_timeout_seconds < 1 or arguments.callback_timeout_seconds > 600:
             _fail("callback timeout must be 1..600 seconds")
         candidate = _secure_file(arguments.candidate, "candidate", executable=True)
-        prepare = _secure_file(arguments.prepare_callback, "prepare callback", executable=True)
-        canary = _secure_file(arguments.canary_callback, "canary callback", executable=True)
         serve_args = _load_serve_args(arguments.serve_args_json)
         host, port, base_url = _parse_loopback_addr(arguments.addr)
         resolved_addr = f"{host}:{port}"
@@ -423,6 +488,20 @@ def main() -> int:
         workspace.chmod(0o700)
         state_dir = workspace / "state"
         state_dir.mkdir(mode=0o700)
+        prepare_dir = workspace / "prepare-callback"
+        prepare_dir.mkdir(mode=0o700)
+        canary_dir = workspace / "canary-callback"
+        canary_dir.mkdir(mode=0o700)
+        prepare = _pin_callback(
+            arguments.prepare_callback,
+            prepare_dir / Path(arguments.prepare_callback).name,
+            "prepare callback",
+        )
+        canary = _pin_callback(
+            arguments.canary_callback,
+            canary_dir / Path(arguments.canary_callback).name,
+            "canary callback",
+        )
         prepare_candidate = workspace / "candidate-prepare"
         candidate_log = workspace / "candidate.log"
         _copy_candidate(candidate, prepare_candidate, candidate_sha256)
