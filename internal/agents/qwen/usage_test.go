@@ -163,7 +163,7 @@ func TestSubscriptionRecognizesPersonalTokenPlanTiersAndFieldAliases(t *testing.
 	}{
 		{name: "lite", body: `{"specCode":"lite"}`, plan: "Lite"},
 		{name: "standard", body: `{"spec_code":"standard"}`, plan: "Standard"},
-		{name: "pro", body: `{"planName":"pro","status":"VALID"}`, plan: "Pro"},
+		{name: "pro", body: `{"planName":"pro","instanceCode":"instance"}`, plan: "Pro"},
 		{name: "max", body: `{"plan_name":"max","instance_code":"instance"}`, plan: "Max"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -206,6 +206,7 @@ func TestSubscriptionSpecCodeWinsOverUnrelatedNestedPlanNames(t *testing.T) {
 func TestSubscriptionRejectsUnshapedOrUnknownPlanName(t *testing.T) {
 	for _, body := range []string{
 		`{"planName":"pro"}`,
+		`{"planName":"pro","status":"VALID"}`,
 		`{"planName":"Enterprise","status":"VALID"}`,
 	} {
 		var payload any
@@ -215,6 +216,24 @@ func TestSubscriptionRejectsUnshapedOrUnknownPlanName(t *testing.T) {
 		if _, err := findSubscriptionDetails(payload); err == nil {
 			t.Fatalf("unsafe planName fallback accepted from %s", body)
 		}
+	}
+}
+
+func TestSubscriptionPlanNameIgnoresMetadataStatusAndUsesRealInstance(t *testing.T) {
+	body := `{
+		"metadata":{"planName":"Pro","status":"VALID"},
+		"subscription":{"planName":"Max","status":"VALID","instanceCode":"instance-max"}
+	}`
+	var payload any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatal(err)
+	}
+	details, err := findSubscriptionDetails(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Plan != "Max" || details.InstanceCode != "instance-max" {
+		t.Fatalf("subscription = %+v, want real Max instance", details)
 	}
 }
 

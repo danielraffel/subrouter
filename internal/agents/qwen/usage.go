@@ -426,7 +426,7 @@ func findSubscriptionDetailsByKeys(value any, planKeys []string, requireKnownPer
 }
 
 func subscriptionShaped(object map[string]any) bool {
-	for _, key := range []string{"status", "instanceCode", "instance_code", "startTime", "endTime"} {
+	for _, key := range []string{"instanceCode", "instance_code", "startTime", "endTime"} {
 		if _, ok := object[key]; ok {
 			return true
 		}
