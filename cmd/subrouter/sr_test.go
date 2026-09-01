@@ -1232,7 +1232,11 @@ func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) 
 	var nonHealthRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/_subrouter/health" {
-			w.WriteHeader(http.StatusOK)
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q}`, authorityID)
 			return
 		}
 		nonHealthRequests.Add(1)
@@ -1271,6 +1275,51 @@ func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) 
 	}
 	if nonHealthRequests.Load() != 0 || !strings.Contains(out.String(), "No Kimi subscription accounts configured") {
 		t.Fatalf("fresh local Kimi management contacted serving API or missed local state: requests=%d output=%q", nonHealthRequests.Load(), out.String())
+	}
+}
+
+func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	otherStore := accounts.CodexStore{Dir: filepath.Join(home, "daemon-state", "codex", "accounts")}
+	otherAuthority, err := accounts.StoreAuthorityID(otherStore.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q}`, otherAuthority)
+			return
+		}
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-test\n"), out: &out, errOut: &out,
+		client: server.Client(),
+	}
+	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
+	if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+		t.Fatalf("unattested onboarding error = %v", err)
+	}
+	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
+		t.Fatalf("unattested onboarding mutated CLI store: found=%t err=%v", ok, findErr)
 	}
 }
 

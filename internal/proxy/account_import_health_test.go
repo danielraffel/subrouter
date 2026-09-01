@@ -22,7 +22,8 @@ func TestHealthReportsAccountImportState(t *testing.T) {
 		{name: "import token", importToken: "secret", want: AccountImportEnabled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+			store := accounts.CodexStore{Dir: t.TempDir()}
+			ref := NewAccountRef(store, nil, nil)
 			ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
 			handler := Server{
 				AccountRef:         ref,
@@ -39,8 +40,9 @@ func TestHealthReportsAccountImportState(t *testing.T) {
 				t.Fatalf("status = %d, want 200", resp.Code)
 			}
 			var body struct {
-				OK            bool   `json:"ok"`
-				AccountImport string `json:"account_import"`
+				OK             bool   `json:"ok"`
+				AccountImport  string `json:"account_import"`
+				AccountStoreID string `json:"account_store_id"`
 			}
 			if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
 				t.Fatalf("decode health: %v (%s)", err, resp.Body.String())
@@ -50,6 +52,13 @@ func TestHealthReportsAccountImportState(t *testing.T) {
 			}
 			if body.AccountImport != tc.want {
 				t.Fatalf("account_import = %q, want %q", body.AccountImport, tc.want)
+			}
+			wantStoreID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if body.AccountStoreID != wantStoreID {
+				t.Fatalf("account_store_id = %q, want %q", body.AccountStoreID, wantStoreID)
 			}
 		})
 	}

@@ -144,11 +144,12 @@ for activation, then stop the shadow and prove its process, listener, temporary
 state, and logs are absent.
 
 Shadow rehearsal and live rollback are complementary, not substitutes. A
-passing shadow is the prerequisite for activation; the preserved legacy
+passing shadow is a recommended high-assurance activation gate for sensitive
+deployments, not a universal requirement. When used, the preserved legacy
 service and rollback bundle still remain armed until the live candidate passes
 health/readiness, authenticated routed traffic, and an existing idle session's
-next turn. Put deployment-specific peers, accounts, sessions, and transports in
-private canary configs rather than source so the procedure works with or
+next turn. Put deployment-specific peers, accounts, sessions, and transports
+in private canary configs rather than source so the procedure works with or
 without a tailnet and never hardcodes one operator's fleet.
 
 Use a separate candidate state root when rollback must preserve an independently

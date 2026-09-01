@@ -372,11 +372,15 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	}
 
 	binDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(binDir, "qwen"), []byte("#!/bin/sh\nif [ \"${SUBROUTER_TEST_QWEN_HELPER:-}\" = 1 ]; then\n  exec \"$SUBROUTER_TEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- \"$@\"\nfi\nexit 0\n"), 0o700); err != nil {
+	// Qwen 0.22.3's production cli-entry replaces its real argv whenever this
+	// inherited variable is non-empty. Model that boundary in an actual child:
+	// the escape marker runs only if Subrouter failed to scrub the variable.
+	if err := os.WriteFile(filepath.Join(binDir, "qwen"), []byte("#!/bin/sh\nif [ \"${SUBROUTER_TEST_QWEN_HELPER:-}\" = 1 ]; then\n  if [ -n \"${QWEN_CODE_RELAUNCH_ARGS:-}\" ]; then\n    exec \"$SUBROUTER_TEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- relaunch-escape\n  fi\n  exec \"$SUBROUTER_TEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- \"$@\"\nfi\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SUBROUTER_TEST_BINARY", os.Args[0])
 	t.Setenv("SUBROUTER_TEST_TOOL_URL", toolServer.URL+"/tool-check")
+	t.Setenv("QWEN_CODE_RELAUNCH_ARGS", `["--model","direct-relaunch-model","--openai-api-key","direct-relaunch-secret"]`)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := srRunner{client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{}); err != nil {
@@ -423,6 +427,20 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 func TestTeamNativeProxyQwenChild(t *testing.T) {
 	if os.Getenv("SUBROUTER_TEST_QWEN_HELPER") != "1" {
 		return
+	}
+	if relaunch := os.Getenv("QWEN_CODE_RELAUNCH_ARGS"); relaunch != "" {
+		t.Fatalf("QWEN_CODE_RELAUNCH_ARGS reached the Qwen child: %q", relaunch)
+	}
+	childArgs := "\x00" + strings.Join(os.Args, "\x00") + "\x00"
+	for _, want := range []string{"\x00--bare\x00", "\x00--auth-type\x00openai\x00", "\x00--model\x00" + defaultQwenProxyModel + "\x00", "\x00--openai-api-key\x00subrouter\x00"} {
+		if !strings.Contains(childArgs, want) {
+			t.Fatalf("Qwen child argv %q does not contain forced routing sequence %q", os.Args, want)
+		}
+	}
+	for _, escaped := range []string{"relaunch-escape", "direct-relaunch-model", "direct-relaunch-secret"} {
+		if strings.Contains(childArgs, escaped) {
+			t.Fatalf("Qwen child argv was replaced by inherited relaunch data: %q", os.Args)
+		}
 	}
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, strings.TrimRight(os.Getenv("OPENAI_BASE_URL"), "/")+"/chat/completions", strings.NewReader(`{"model":"test"}`))
 	if err != nil {
@@ -692,6 +710,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	kimiSourceHome = prepareKimiTestSessionHome(t, kimiSourceHome)
 	original := []string{
 		"PATH=/usr/bin", "KEEP_ME=yes", "KIMI_CODE_HOME=" + kimiSourceHome, "QWEN_HOME=/custom/qwen-home",
+		`QWEN_CODE_RELAUNCH_ARGS=["--model","direct-relaunch-model","--openai-api-key","direct-relaunch-secret"]`,
 		"OPENAI_API_KEY=real-openai-secret", "OPENAI_BASE_URL=https://vendor.invalid/v1",
 		"OPENAI_ORG_ID=direct-org-secret", "OPENAI_PROJECT_ID=direct-project-secret",
 		"BAILIAN_CODING_PLAN_API_KEY=real-coding-plan-secret",
@@ -699,6 +718,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		"KIMI_MODEL_MAX_CONTEXT_SIZE=999999", "KIMI_MODEL_CAPABILITIES=direct-tools",
 		"KIMI_SECONDARY_MODEL=direct/secondary", "KIMI_CODE_OAUTH_HOST=https://oauth.invalid",
 		"KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=0",
+		"KIMI_CODE_LEGACY_FLAG=1",
 		"KIMI_CODE_CUSTOM_HEADERS=X-Direct-Gateway-Secret: custom-header-secret",
 		"HTTP_PROXY=http://credential-sink.invalid", "https_proxy=http://credential-sink.invalid",
 		"ALL_PROXY=socks5://credential-sink.invalid", "NO_PROXY=vendor.invalid",
@@ -711,10 +731,13 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	}
 	defer qwenCleanup()
 	joined := strings.Join(qwenEnv, "\n")
-	for _, secret := range []string{"real-openai-secret", "real-coding-plan-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "vendor.invalid", "credential-sink.invalid"} {
+	for _, secret := range []string{"real-openai-secret", "real-coding-plan-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "direct-relaunch-model", "direct-relaunch-secret", "vendor.invalid", "credential-sink.invalid"} {
 		if strings.Contains(joined, secret) {
 			t.Fatalf("Qwen child environment leaked %q:\n%s", secret, joined)
 		}
+	}
+	if got, exists := testEnvEntry(qwenEnv, "QWEN_CODE_RELAUNCH_ARGS"); exists {
+		t.Fatalf("Qwen child QWEN_CODE_RELAUNCH_ARGS = %q, want removed", got)
 	}
 	if got := testEnvValue(qwenEnv, "OPENAI_BASE_URL"); got != qwenProviderURL {
 		t.Fatalf("OPENAI_BASE_URL = %q", got)
@@ -806,6 +829,9 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		t.Fatal(err)
 	}
 	defer kimiCleanup()
+	if got, exists := testEnvEntry(kimiEnv, "KIMI_CODE_LEGACY_FLAG"); exists {
+		t.Fatalf("Kimi child KIMI_CODE_LEGACY_FLAG = %q, want removed so Kimi 0.39 uses its resumable v2 engine", got)
+	}
 	kimiChildHome := testEnvValue(kimiEnv, "KIMI_CODE_HOME")
 	if kimiChildHome == "" || kimiChildHome == kimiSourceHome || !strings.HasPrefix(filepath.Base(kimiChildHome), "subrouter-kimi-proxy-") {
 		t.Fatalf("KIMI_CODE_HOME = %q, want a fresh routed child home distinct from %q", kimiChildHome, kimiSourceHome)
@@ -946,11 +972,34 @@ func TestKimiProxyCleanupNeverFollowsChildSymlinks(t *testing.T) {
 		cleanup()
 		t.Fatal(err)
 	}
+	nested := filepath.Join(localDir, "child-created", "sealed")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "private"), []byte("ephemeral"), 0o600); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(nested, "outside")); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.Chmod(nested, 0); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Dir(nested), 0); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
 	if err := os.Chmod(overlay.home, 0o500); err != nil {
 		cleanup()
 		t.Fatal(err)
 	}
-	cleanup()
+	if err := cleanup(); err != nil {
+		t.Fatalf("clean nested child-created directories: %v", err)
+	}
 	if got, err := os.ReadFile(externalMarker); err != nil || string(got) != "safe" {
 		t.Fatalf("child cleanup followed an external symlink: %q, %v", got, err)
 	}
@@ -982,12 +1031,26 @@ func TestKimiProxyCleanupDoesNotFollowReplacedRoot(t *testing.T) {
 	if err := os.Symlink(external, overlay.home); err != nil {
 		t.Fatal(err)
 	}
-	cleanup()
+	if err := cleanup(); err != nil {
+		t.Fatalf("remove replaced root link: %v", err)
+	}
 	if got, err := os.ReadFile(marker); err != nil || string(got) != "safe" {
 		t.Fatalf("cleanup followed a replaced root: %q, %v", got, err)
 	}
 	if _, err := os.Lstat(overlay.home); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("replacement link survived cleanup: %v", err)
+	}
+}
+
+func TestNativeProxyLaunchSurfacesCleanupFailure(t *testing.T) {
+	runErr := errors.New("child failed")
+	cleanupErr := errors.New("cleanup failed")
+	err := joinNativeProxyRunAndCleanupErrors("Kimi", runErr, func() error { return cleanupErr })
+	if !errors.Is(err, runErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("joined error = %v, want child and cleanup failures", err)
+	}
+	if !strings.Contains(err.Error(), "clean up temporary Kimi proxy home") {
+		t.Fatalf("cleanup error lacks context: %v", err)
 	}
 }
 
@@ -1009,7 +1072,7 @@ func TestKimiProxyHomesAreUniqueAcrossConcurrentLaunches(t *testing.T) {
 	source = prepareKimiTestSessionHome(t, source)
 	type result struct {
 		overlay kimiProxyOverlay
-		cleanup func()
+		cleanup func() error
 		err     error
 	}
 	results := make(chan result, 2)
@@ -1256,6 +1319,13 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 		{"--allowed-tools", "Shell(git status)", "--acp"},
 		{"--acp"},
 		{"--experimental-acp=true"},
+		{"channel", "start"},
+		{"--approval-mode", "default", "channel", "start"},
+		{"channel", "daemon-worker", "--channel", "work"},
+		{"channel", "reload"},
+		{"channel", "--telemetry-target", "local", "reload"},
+		{"--telemetry-target", "local", "channel", "reload"},
+		{"channel", "set", "work"},
 	} {
 		err := (srRunner{}).launchQwenProxy(t.Context(), args)
 		if err == nil || !strings.Contains(err.Error(), "can reload saved credentials and proxies") {
@@ -1264,8 +1334,16 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 	}
 	for _, args := range [][]string{
 		{"-p", "serve"},
+		{"-p", "channel"},
+		{"-p", "start"},
+		{"-p", "channel start"},
+		{"--model", "channel", "-p", "start"},
 		{"--model", "serve", "--continue"},
 		{"--system-prompt", "serve"},
+		{"channel", "stop"},
+		{"channel", "status"},
+		{"channel", "pairing", "list", "work"},
+		{"channel", "configure-weixin", "status"},
 		{"--", "serve"},
 		{"--", "--acp"},
 	} {

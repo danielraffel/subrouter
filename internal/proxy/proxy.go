@@ -1731,6 +1731,11 @@ func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"account_import": s.AccountImportState(),
 		"auth":           s.AuthMode(),
 	}
+	if s.AccountRef != nil {
+		if authorityID, err := accounts.StoreAuthorityID(s.AccountRef.store.Dir); err == nil {
+			payload["account_store_id"] = authorityID
+		}
+	}
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.

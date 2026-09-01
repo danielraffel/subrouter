@@ -4,7 +4,7 @@ package main
 
 import "os"
 
-func removePrivateProxyHome(path string) {
+func removePrivateProxyHome(path string) error {
 	_ = os.Chmod(path, 0o700)
-	_ = os.RemoveAll(path)
+	return os.RemoveAll(path)
 }

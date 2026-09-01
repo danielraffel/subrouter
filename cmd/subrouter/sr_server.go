@@ -905,6 +905,36 @@ func (r srRunner) readyLocalServingServer(ctx context.Context, start daemonStart
 	return r.localServingServer()
 }
 
+func (r srRunner) localServingStoreMatches(ctx context.Context, server srServerConfig) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(server.URL, "/")+"/_subrouter/health", nil)
+	if err != nil {
+		return false, fmt.Errorf("build local proxy store-attestation request: %w", err)
+	}
+	client := r.client
+	if client == nil {
+		client = fallbackHTTPClient()
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return false, fmt.Errorf("read local proxy store attestation: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("local proxy store attestation failed: %s", response.Status)
+	}
+	var payload struct {
+		AccountStoreID string `json:"account_store_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&payload); err != nil {
+		return false, fmt.Errorf("decode local proxy store attestation: %w", err)
+	}
+	expected, err := accounts.StoreAuthorityID(r.store.Dir)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(payload.AccountStoreID) != "" && payload.AccountStoreID == expected, nil
+}
+
 func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
 	server, ok, err := store.find(name)
 	if err != nil {

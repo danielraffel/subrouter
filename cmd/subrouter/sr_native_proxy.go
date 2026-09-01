@@ -62,7 +62,8 @@ The process-only routing launcher preserves Qwen's normal session store.
 It forces Qwen's bare mode, so saved settings, extensions, skills, and MCP servers are not loaded.
 Account affinity is stable per working directory for new routed sessions.
 Qwen resume/continue can restore a saved direct provider route, so routed launches reject them.
-Qwen serve/ACP can reload saved environment routing, so use plain 'qwen' for those modes.
+Qwen serve/ACP and model-bearing channel-service modes can reload saved environment routing,
+so use plain 'qwen' for those modes.
 `
 )
 
@@ -230,7 +231,7 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 		return err
 	}
 	if qwenProxyReloadCapableMode(vendorArgs) {
-		return errors.New("Qwen serve/ACP modes can reload saved credentials and proxies; use plain 'qwen' for those modes")
+		return errors.New("Qwen serve/ACP/channel-service modes can reload saved credentials and proxies; use plain 'qwen' for those modes")
 	}
 	if qwenProxyPersistentSessionRequested(vendorArgs) {
 		return errors.New("Qwen resume/continue can restore a saved direct provider route and cannot be used with 'sr qwen'; start a new routed session or use plain 'qwen' for the existing direct session")
@@ -289,7 +290,7 @@ func qwenProxyReloadCapableMode(args []string) bool {
 		switch arg {
 		case "-m", "--model", "--fallback-model",
 			"-p", "--prompt", "-i", "--prompt-interactive", "--system-prompt", "--append-system-prompt",
-			"-r", "--resume":
+			"-r", "--resume", "--channel":
 			if i+1 < len(args) {
 				i++
 			}
@@ -297,6 +298,38 @@ func qwenProxyReloadCapableMode(args []string) bool {
 		}
 		if arg == "serve" {
 			return true
+		}
+		if arg == "channel" && qwenProxyChannelServiceMode(args[i+1:]) {
+			return true
+		}
+	}
+	return false
+}
+
+func qwenProxyChannelServiceMode(args []string) bool {
+	// Qwen 0.22.3's start/daemon-worker commands host model-backed channel
+	// sessions; set and reload can create or replace the same worker in a daemon.
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		switch arg {
+		case "--telemetry-target", "--telemetry-otlp-endpoint", "--telemetry-otlp-protocol",
+			"--telemetry-outfile", "--proxy", "--daemon-url", "--token", "--timeout", "--channel":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		switch arg {
+		case "start", "daemon-worker", "reload", "set":
+			return true
+		case "stop", "status", "pairing", "configure-weixin":
+			return false
 		}
 	}
 	return false
@@ -449,7 +482,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer func() { _ = cleanup() }()
 	if spec.provider == accounts.ProviderKimi {
 		args = kimiNativeProxyArgs(args)
 	} else if spec.provider == accounts.ProviderQwenToken {
@@ -460,7 +493,16 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
 	cmd.Env = env
-	return cmd.Run()
+	runErr := cmd.Run()
+	return joinNativeProxyRunAndCleanupErrors(spec.display, runErr, cleanup)
+}
+
+func joinNativeProxyRunAndCleanupErrors(display string, runErr error, cleanup func() error) error {
+	cleanupErr := cleanup()
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("clean up temporary %s proxy home: %w", display, cleanupErr)
+	}
+	return errors.Join(runErr, cleanupErr)
 }
 
 func nativeProxyNeedsAccountInventory(options nativeProxyLaunchOptions, source broker.CredentialSource) bool {
@@ -1029,7 +1071,7 @@ func nativeProxyPinnedSessionID(pooledSessionID, accountID string) string {
 var nativeProxyRoutingEnvKeys = []string{
 	"CLOUD_CODE_URL",
 	"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH",
-	"KIMI_CODE_HOME", "KIMI_CODE_NO_AUTO_UPDATE",
+	"KIMI_CODE_HOME", "KIMI_CODE_NO_AUTO_UPDATE", "KIMI_CODE_LEGACY_FLAG",
 	"KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL",
 	"KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST", "KIMI_CODE_PASSWORD", "KIMI_REGISTRY_API_KEY",
 	"KIMI_CODE_BASE_URL", "KIMI_CODE_CUSTOM_HEADERS", "KIMI_API_KEY", "KIMI_BASE_URL",
@@ -1041,28 +1083,28 @@ var nativeProxyRoutingEnvKeys = []string{
 	"KIMI_SECONDARY_MODEL", "KIMI_SECONDARY_EFFORT",
 	"KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY",
 	"KIMI_WEB_FETCH_BASE_URL", "KIMI_WEB_FETCH_API_KEY",
-	"QWEN_OAUTH", "QWEN_MODEL", "QWEN_CODE_SIMPLE", "QWEN_DISABLED_SLASH_COMMANDS",
+	"QWEN_OAUTH", "QWEN_MODEL", "QWEN_CODE_SIMPLE", "QWEN_CODE_RELAUNCH_ARGS", "QWEN_DISABLED_SLASH_COMMANDS",
 	"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
 	"OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
 	"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY",
 }
 
-func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, args []string) ([]string, func(), error) {
+func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, args []string) ([]string, func() error, error) {
 	env := envWithout(environ, nativeProxyRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, relayRoot)
 	providerURL := strings.TrimRight(relayRoot, "/") + "/" + spec.route
 	switch spec.provider {
 	case accounts.ProviderAntigravity:
 		if conflict, err := antigravityDirectProviderConflict(environ); err != nil {
-			return nil, func() {}, err
+			return nil, func() error { return nil }, err
 		} else if conflict != "" {
-			return nil, func() {}, fmt.Errorf("Antigravity direct provider %s is configured; remove it before using 'sr agy'", conflict)
+			return nil, func() error { return nil }, fmt.Errorf("Antigravity direct provider %s is configured; remove it before using 'sr agy'", conflict)
 		}
-		return upsertEnv(env, "CLOUD_CODE_URL", providerURL), func() {}, nil
+		return upsertEnv(env, "CLOUD_CODE_URL", providerURL), func() error { return nil }, nil
 	case accounts.ProviderKimi:
 		overlay, cleanup, err := prepareKimiProxyHome(environ)
 		if err != nil {
-			return nil, func() {}, err
+			return nil, func() error { return nil }, err
 		}
 		for key, value := range map[string]string{
 			"KIMI_CODE_HOME":                         overlay.home,
@@ -1086,12 +1128,12 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		model := qwenProxyModel(args)
 		overlay, cleanup, err := prepareQwenProxyOverlay(providerURL+"/v1", model, environ)
 		if err != nil {
-			return nil, func() {}, err
+			return nil, func() error { return nil }, err
 		}
 		proxyGuard, err := nativeProxyLoopbackGuardURL(relayRoot)
 		if err != nil {
 			cleanup()
-			return nil, func() {}, err
+			return nil, func() error { return nil }, err
 		}
 		for key, value := range map[string]string{
 			"QWEN_CODE_SYSTEM_SETTINGS_PATH": overlay.settings,
@@ -1126,9 +1168,9 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		} {
 			env = upsertEnv(env, key, value)
 		}
-		return env, cleanup, nil
+		return env, func() error { cleanup(); return nil }, nil
 	default:
-		return nil, func() {}, fmt.Errorf("unsupported native proxy provider %s", spec.provider)
+		return nil, func() error { return nil }, fmt.Errorf("unsupported native proxy provider %s", spec.provider)
 	}
 }
 
@@ -1143,46 +1185,41 @@ type kimiProxyOverlay struct {
 	home string
 }
 
-func prepareKimiProxyHome(environ []string) (kimiProxyOverlay, func(), error) {
+func prepareKimiProxyHome(environ []string) (kimiProxyOverlay, func() error, error) {
 	if err := kimiProxySessionLinksSupported(runtime.GOOS); err != nil {
-		return kimiProxyOverlay{}, func() {}, err
+		return kimiProxyOverlay{}, func() error { return nil }, err
 	}
 	sourceHome, err := kimiSourceHome(environ)
 	if err != nil {
-		return kimiProxyOverlay{}, func() {}, err
+		return kimiProxyOverlay{}, func() error { return nil }, err
 	}
 	sessions, sessionIndex, err := ensureKimiSessionSource(sourceHome)
 	if err != nil {
-		return kimiProxyOverlay{}, func() {}, err
+		return kimiProxyOverlay{}, func() error { return nil }, err
 	}
 	home, err := os.MkdirTemp("", "subrouter-kimi-proxy-")
 	if err != nil {
-		return kimiProxyOverlay{}, func() {}, fmt.Errorf("create temporary Kimi proxy home: %w", err)
+		return kimiProxyOverlay{}, func() error { return nil }, fmt.Errorf("create temporary Kimi proxy home: %w", err)
 	}
-	// os.RemoveAll removes symlinks rather than following them and uses the
-	// platform's race-resistant directory removal implementation. The path is
-	// generated here, never accepted from user input.
-	cleanup := func() { removePrivateProxyHome(home) }
+	// Cleanup walks from directory descriptors without following child-created
+	// links. The root path is generated here, never accepted from user input.
+	cleanup := func() error { return removePrivateProxyHome(home) }
 	if err := os.Chmod(home, 0o700); err != nil {
-		cleanup()
-		return kimiProxyOverlay{}, func() {}, fmt.Errorf("lock temporary Kimi proxy home: %w", err)
+		return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(cleanup, fmt.Errorf("lock temporary Kimi proxy home: %w", err))
 	}
 	configPath := filepath.Join(home, "config.toml")
 	if err := writeFileAtomic(configPath, []byte(kimiProxyConfig), 0o600); err != nil {
-		cleanup()
-		return kimiProxyOverlay{}, func() {}, fmt.Errorf("write temporary Kimi proxy config: %w", err)
+		return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(cleanup, fmt.Errorf("write temporary Kimi proxy config: %w", err))
 	}
 	if err := os.Chmod(configPath, 0o600); err != nil {
-		cleanup()
-		return kimiProxyOverlay{}, func() {}, fmt.Errorf("lock temporary Kimi proxy config: %w", err)
+		return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(cleanup, fmt.Errorf("lock temporary Kimi proxy config: %w", err))
 	}
 	// Kimi initializes its logger and query cache before the first request.
 	// Keep both child-local and writable. Kimi also needs its private root to
 	// remain writable for the workspace catalog it atomically updates below.
 	for _, name := range []string{"logs", "cache"} {
 		if err := os.Mkdir(filepath.Join(home, name), 0o700); err != nil {
-			cleanup()
-			return kimiProxyOverlay{}, func() {}, fmt.Errorf("create temporary Kimi %s directory: %w", name, err)
+			return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(cleanup, fmt.Errorf("create temporary Kimi %s directory: %w", name, err))
 		}
 	}
 	for name, target := range map[string]string{
@@ -1190,13 +1227,11 @@ func prepareKimiProxyHome(environ []string) (kimiProxyOverlay, func(), error) {
 		"session_index.jsonl": sessionIndex,
 	} {
 		if err := os.Symlink(target, filepath.Join(home, name)); err != nil {
-			cleanup()
-			return kimiProxyOverlay{}, func() {}, fmt.Errorf("link Kimi %s into routed home: %w", name, err)
+			return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(cleanup, fmt.Errorf("link Kimi %s into routed home: %w", name, err))
 		}
 	}
 	if err := os.Chmod(configPath, 0o400); err != nil {
-		cleanup()
-		return kimiProxyOverlay{}, func() {}, fmt.Errorf("restrict temporary Kimi proxy config: %w", err)
+		return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(cleanup, fmt.Errorf("restrict temporary Kimi proxy config: %w", err))
 	}
 	// Keep the private root writable only to this child/user. Kimi 0.39
 	// atomically rewrites workspaces.json on every startup and cannot run in a
@@ -1204,6 +1239,13 @@ func prepareKimiProxyHome(environ []string) (kimiProxyOverlay, func(), error) {
 	// removed with the child, any Kimi-managed in-session reconfiguration remains
 	// ephemeral instead of being loaded from or written to the real Kimi config.
 	return kimiProxyOverlay{home: home}, cleanup, nil
+}
+
+func kimiProxySetupFailure(cleanup func() error, setupErr error) error {
+	if cleanupErr := cleanup(); cleanupErr != nil {
+		return errors.Join(setupErr, fmt.Errorf("clean up incomplete temporary Kimi proxy home: %w", cleanupErr))
+	}
+	return setupErr
 }
 
 func kimiProxySessionLinksSupported(goos string) error {
@@ -1440,19 +1482,19 @@ func nativeProxyLoopbackGuardURL(baseURL string) (string, error) {
 	return parsed.Scheme + "://" + parsed.Host, nil
 }
 
-func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxyOverlay, func(), error) {
+func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxyOverlay, func() error, error) {
 	if conflict := qwenSystemPolicyConflict(environ, runtime.GOOS); conflict != "" {
-		return qwenProxyOverlay{}, func() {}, fmt.Errorf("Qwen system policy %s is configured; refusing a proxy overlay that could bypass it", conflict)
+		return qwenProxyOverlay{}, func() error { return nil }, fmt.Errorf("Qwen system policy %s is configured; refusing a proxy overlay that could bypass it", conflict)
 	}
 	proxyGuard, err := nativeProxyLoopbackGuardURL(baseURL)
 	if err != nil {
-		return qwenProxyOverlay{}, func() {}, err
+		return qwenProxyOverlay{}, func() error { return nil }, err
 	}
 	dir, err := os.MkdirTemp("", "subrouter-qwen-proxy-")
 	if err != nil {
-		return qwenProxyOverlay{}, func() {}, fmt.Errorf("create temporary Qwen proxy overlay: %w", err)
+		return qwenProxyOverlay{}, func() error { return nil }, fmt.Errorf("create temporary Qwen proxy overlay: %w", err)
 	}
-	cleanup := func() { _ = os.RemoveAll(dir) }
+	cleanup := func() error { return removePrivateProxyHome(dir) }
 	routedModel := map[string]any{
 		"id":      model,
 		"name":    "Qwen Token Plan via Subrouter",
@@ -1505,19 +1547,16 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 	}
 	body, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
-		cleanup()
-		return qwenProxyOverlay{}, func() {}, fmt.Errorf("encode Qwen proxy overlay: %w", err)
+		return qwenProxyOverlay{}, func() error { return nil }, errors.Join(fmt.Errorf("encode Qwen proxy overlay: %w", err), cleanup())
 	}
 	body = append(body, '\n')
 	settings := filepath.Join(dir, "settings.json")
 	defaults := filepath.Join(dir, "system-defaults.json")
 	if err := writeFileAtomic(settings, body, 0o600); err != nil {
-		cleanup()
-		return qwenProxyOverlay{}, func() {}, fmt.Errorf("write Qwen proxy overlay: %w", err)
+		return qwenProxyOverlay{}, func() error { return nil }, errors.Join(fmt.Errorf("write Qwen proxy overlay: %w", err), cleanup())
 	}
 	if err := writeFileAtomic(defaults, []byte("{}\n"), 0o600); err != nil {
-		cleanup()
-		return qwenProxyOverlay{}, func() {}, fmt.Errorf("write Qwen proxy defaults: %w", err)
+		return qwenProxyOverlay{}, func() error { return nil }, errors.Join(fmt.Errorf("write Qwen proxy defaults: %w", err), cleanup())
 	}
 	return qwenProxyOverlay{settings: settings, defaults: defaults}, cleanup, nil
 }

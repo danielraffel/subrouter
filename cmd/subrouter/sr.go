@@ -394,9 +394,16 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 				return err
 			}
 			// A stock per-user daemon shares the local store but has no protected
-			// import credential. Keep onboarding off an unattested loopback process;
+			// import credential. Keep onboarding off an unrelated loopback process;
 			// an explicitly credentialed local daemon remains authoritative below.
 			if localOnboardingCommand(args) && !serverHasAccountImportCredential(server) {
+				matches, matchErr := r.localServingStoreMatches(ctx, server)
+				if matchErr != nil {
+					return matchErr
+				}
+				if !matches {
+					return fmt.Errorf("local proxy account store does not match this CLI; configure a protected account-import credential or set SUBROUTER_STATE_DIR to the daemon's state root")
+				}
 				routeToServingAPI = false
 			}
 		} else {
