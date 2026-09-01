@@ -36,6 +36,39 @@ SERVING_STORE_BINDING_BACKUP_SHA256=""
 SERVING_STORE_BINDING_BACKUP_MODE=""
 SERVING_STORE_BINDING_WAS_ABSENT=0
 EXPECTED_SERVING_STORE_BINDING_SHA256=""
+TRANSACTION_DIR="${SUBROUTER_TRANSACTION_DIR:-}"
+
+set_rollback_phase() {
+  [ -n "$TRANSACTION_DIR" ] || return 0
+  python3 - "$TRANSACTION_DIR" "$1" <<'PY'
+import os
+import sys
+
+directory, phase = sys.argv[1:]
+if not os.path.isdir(directory):
+    raise SystemExit("rollback transaction directory disappeared")
+next_path = os.path.join(directory, "phase.rollback-next")
+descriptor = os.open(next_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(descriptor, (phase + "\n").encode())
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+os.replace(next_path, os.path.join(directory, "phase"))
+directory_descriptor = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
+  if [ "${SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_PHASE:-}" = "$1" ]; then
+    kill -KILL $$
+  fi
+  if [ "${SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_OWNER_PHASE:-}" = "$1" ]; then
+    kill -KILL "$PPID"
+    kill -KILL $$
+  fi
+}
 
 usage() {
   local status="${1:-2}" destination=/dev/stderr
@@ -448,9 +481,6 @@ fi
 validate_public_addr "$public_addr"
 wait_for_full_absence "$service" "$captured_pid" "$public_addr"
 
-serving_store_binding_transaction restore \
-  || launchagent_die "serving-store binding changed while removing the candidate; rollback withheld"
-
 trap 'exit 130' INT
 trap 'exit 143' TERM
 for index in "${!ROLLBACK_ARTIFACTS[@]}"; do
@@ -494,6 +524,7 @@ if ! serving_store_binding_transaction check; then
   launchagent_die "serving-store binding changed immediately before legacy bootstrap; rollback withheld"
 fi
 
+set_rollback_phase rollback_legacy_bootstrap_requested
 bootstrap_with_retry "$DOMAIN" "$PLIST" "$service" "$public_addr" \
   || launchagent_die "rollback LaunchAgent failed to bootstrap"
 restored_pid="$(capture_loaded_identity "$service" "$rollback_program")" \
@@ -508,6 +539,15 @@ health_url="${SUBROUTER_HEALTH_URL:-http://${health_host}/_subrouter/health}"
 ready_url="${SUBROUTER_READY_URL:-http://${health_host}/_subrouter/ready}"
 wait_for_http_acceptance "$health_url" "$ready_url" \
   || launchagent_die "rollback LaunchAgent failed health/readiness acceptance"
+set_rollback_phase rollback_legacy_accepted
+
+# Keep new launches fail-closed on the candidate binding until the legacy
+# process has proved its own executable identity and health. Candidate traffic
+# is unavailable after full absence; a failed legacy bootstrap never publishes
+# an unproved rollback binding.
+serving_store_binding_transaction restore \
+  || launchagent_die "serving-store binding changed before post-acceptance restore; healthy legacy retained and binding rollback withheld"
+set_rollback_phase rollback_binding_restored
 
 echo "restored $BACKUP as $PLIST"
 echo "rollback LaunchAgent healthy and ready (pid $restored_pid)"

@@ -7,6 +7,7 @@ ROLLBACK="$ROOT/deploy/macos/rollback-launchagent-supervisor.sh"
 TRANSITION_LIB="$ROOT/deploy/macos/launchagent-transition-lib.sh"
 MUTATION_LIB="$ROOT/deploy/macos/mutation-lease-lib.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/subrouter-launchagent-test.XXXXXX")"
+export TMP
 cleanup_launchagent_test() {
   local status=$? pid_file pid command
   if [ -f "$TMP/state" ]; then
@@ -38,6 +39,9 @@ cleanup_launchagent_test() {
   else
     rm -rf "$TMP"
   fi
+  case "${SUBROUTER_LOCAL_DATA_SOCKET:-}" in
+    /private/tmp/srlt-*/data.sock) rm -rf "$(dirname "$SUBROUTER_LOCAL_DATA_SOCKET")" ;;
+  esac
   return "$status"
 }
 trap cleanup_launchagent_test EXIT INT TERM
@@ -52,6 +56,36 @@ echo "PASS rollback --help is self-describing and exits zero"
 mkdir -p "$TMP/bin" "$TMP/home/Library/LaunchAgents" \
   "$TMP/home/.subrouter/codex/accounts" \
   "$TMP/home/.subrouter-retiring/codex/accounts"
+
+cat >"$TMP/fake-supervisor-listener.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import signal
+import socket
+import sys
+import time
+
+path = sys.argv[1]
+os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+if os.path.lexists(path):
+    os.unlink(path)
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(path)
+os.chmod(path, 0o600)
+listener.listen()
+stopping = False
+def stop(*_):
+    global stopping
+    stopping = True
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+while not stopping:
+    time.sleep(0.05)
+listener.close()
+if os.path.lexists(path):
+    os.unlink(path)
+PY
+chmod 0700 "$TMP/fake-supervisor-listener.py"
 
 cat >"$TMP/bin/launchctl" <<'SH'
 #!/usr/bin/env bash
@@ -115,7 +149,11 @@ case "$1" in
         printf 'callback traffic overlapped rollback\n' >"$FAKE_ROLLBACK_OVERLAP_SENTINEL"
       fi
     fi
-    sleep 300 9>&- &
+    if [ "$program" = "$SUBROUTER_SUPERVISOR_BIN" ]; then
+      "$TMP/fake-supervisor-listener.py" "$SUBROUTER_LOCAL_DATA_SOCKET" 9>&- &
+    else
+      sleep 300 9>&- &
+    fi
     printf '%s|%s\n' "$program" "$!" >"$FAKE_LAUNCHD_STATE"
     [ "$program" != "$SUBROUTER_SUPERVISOR_BIN" ] || : >"$SUBROUTER_CONTROL_SOCKET"
     ;;
@@ -279,19 +317,23 @@ case "${1:-}" in
   daemon)
     [ "${2:-}" = bind-state ] || exit 64
     [ -z "${SUBROUTER_STATE_DIR+x}" ] || exit 65
-    python3 - "$HOME/.subrouter/codex/.local-serving-store.json" "${3:-}" <<'PY'
+    [ "${4:-}" = --local-data-socket ] || exit 66
+    python3 - "$HOME/.subrouter/codex/.local-serving-store.json" "${3:-}" "${5:-}" <<'PY'
 import json
 import os
 import sys
 
-path, state_dir = sys.argv[1:]
+path, state_dir, local_data_socket = sys.argv[1:]
+socket_stat = os.stat(local_data_socket, follow_symlinks=False)
 os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
 temporary = path + ".next"
 with open(temporary, "w", encoding="utf-8") as output:
     json.dump(
         {
-            "schema": "subrouter.local-serving-store/v1",
+            "schema": "subrouter.local-serving-store/v2",
             "accounts_dir": os.path.realpath(os.path.join(state_dir, "codex", "accounts")),
+            "local_data_socket": local_data_socket,
+            "local_data_socket_identity": f"unix:{socket_stat.st_dev}:{socket_stat.st_ino}",
         },
         output,
         separators=(",", ":"),
@@ -328,9 +370,13 @@ path, state_dir = sys.argv[1:]
 with open(path, encoding="utf-8") as source:
     binding = json.load(source)
 expected = os.path.realpath(os.path.join(state_dir, "codex", "accounts"))
+socket = os.environ["SUBROUTER_LOCAL_DATA_SOCKET"]
+socket_stat = os.stat(socket, follow_symlinks=False)
 if binding != {
-    "schema": "subrouter.local-serving-store/v1",
+    "schema": "subrouter.local-serving-store/v2",
     "accounts_dir": expected,
+    "local_data_socket": socket,
+    "local_data_socket_identity": f"unix:{socket_stat.st_dev}:{socket_stat.st_ino}",
 }:
     raise SystemExit(82)
 PY
@@ -568,7 +614,10 @@ def write_private(path, document):
 order_file = os.path.join(root, "order")
 descriptor = os.open(order_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 os.close(descriptor)
-timeout = 30 if scenario == "timeout" else 5
+# Process creation on a busy developer Mac can occasionally take more than five
+# seconds even for this no-op fixture. Keep the semantic timeout test explicit
+# while giving success legs enough scheduling headroom to avoid a false red.
+timeout = 30 if scenario == "timeout" else 15
 manifest_legs = []
 for index, name in enumerate(legs):
     mode = "success"
@@ -723,6 +772,8 @@ export SUBROUTER_PLIST="$plist"
 export SUBROUTER_BIN="$worker"
 export SUBROUTER_SUPERVISOR_BIN="$supervisor"
 export SUBROUTER_STATE_DIR="$TMP/home/.subrouter"
+export SUBROUTER_LOCAL_DATA_SOCKET="/private/tmp/srlt-$$/data.sock"
+mkdir -m 0700 "$(dirname "$SUBROUTER_LOCAL_DATA_SOCKET")"
 export SUBROUTER_CONTROL_SOCKET="$TMP/home/.subrouter/supervisor.sock"
 export FAKE_EXPECTED_CANDIDATE_STATE="$SUBROUTER_STATE_DIR"
 export SUBROUTER_ABSENCE_ATTEMPTS=10 SUBROUTER_ABSENCE_INTERVAL=0.01
@@ -819,8 +870,7 @@ fi
 grep -q 'functional canary timeout must be a positive integer' "$TMP/invalid-timeout.err"
 echo "PASS invalid callback timeout was rejected before activation"
 
-if FAKE_REQUIRE_BINDING_ABSENT_BEFORE_LEGACY_BOOTSTRAP=1 \
-  SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
+if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
   "$MIGRATE" --activate >"$TMP/migrate.out" 2>"$TMP/migrate.err"; then
   echo "canary failure unexpectedly accepted" >&2
   exit 1
@@ -832,6 +882,21 @@ identity_manifest="$(find "$(dirname "$plist")" -maxdepth 2 -name 'legacy.plist.
 grep -Fq "  $legacy_dependency  " "$identity_manifest"
 [ ! -e "$TMP/home/.subrouter/codex/.local-serving-store.json" ]
 echo "PASS canary failure automatically restored the exact legacy plist and absent serving-store binding"
+
+for rollback_phase in rollback_legacy_bootstrap_requested rollback_legacy_accepted rollback_binding_restored; do
+  reset_legacy
+  rollback_snapshot="$TMP/rollback-phase-$rollback_phase.plist"
+  cp -p "$plist" "$rollback_snapshot"
+  if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
+    SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_PHASE="$rollback_phase" \
+    "$MIGRATE" --activate >"$TMP/rollback-phase-$rollback_phase.out" \
+    2>"$TMP/rollback-phase-$rollback_phase.err"; then
+    echo "rollback hard fault at $rollback_phase unexpectedly succeeded" >&2
+    exit 1
+  fi
+  assert_exact_legacy_rollback "$rollback_snapshot"
+done
+echo "PASS rollback hard faults after legacy bootstrap and before pointer restore recovered exact healthy legacy"
 
 reset_legacy
 prior_serving_store_binding="$TMP/prior-serving-store-binding.json"
@@ -855,8 +920,7 @@ with open(path, "w", encoding="utf-8") as output:
 os.chmod(path, 0o400)
 PY
 cp -p "$TMP/home/.subrouter/codex/.local-serving-store.json" "$prior_serving_store_binding"
-if FAKE_EXPECTED_BINDING_BEFORE_LEGACY_BOOTSTRAP="$prior_serving_store_binding" \
-  SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
+if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
   "$MIGRATE" --activate >"$TMP/prior-binding-rollback.out" \
   2>"$TMP/prior-binding-rollback.err"; then
   echo "canary failure with a prior serving-store binding unexpectedly accepted" >&2
@@ -865,6 +929,24 @@ fi
 cmp -s "$prior_serving_store_binding" "$TMP/home/.subrouter/codex/.local-serving-store.json"
 [ "$(stat -f '%Lp' "$TMP/home/.subrouter/codex/.local-serving-store.json")" = 400 ]
 echo "PASS canary failure restored the exact prior serving-store binding bytes and mode"
+
+for rollback_phase in rollback_legacy_bootstrap_requested rollback_legacy_accepted rollback_binding_restored; do
+  reset_legacy
+  cp -p "$prior_serving_store_binding" "$TMP/home/.subrouter/codex/.local-serving-store.json"
+  rollback_snapshot="$TMP/prior-binding-phase-$rollback_phase.plist"
+  cp -p "$plist" "$rollback_snapshot"
+  if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-fail" \
+    SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_PHASE="$rollback_phase" \
+    "$MIGRATE" --activate >"$TMP/prior-binding-phase-$rollback_phase.out" \
+    2>"$TMP/prior-binding-phase-$rollback_phase.err"; then
+    echo "prior-binding rollback hard fault at $rollback_phase unexpectedly succeeded" >&2
+    exit 1
+  fi
+  assert_exact_legacy_rollback "$rollback_snapshot"
+  cmp -s "$prior_serving_store_binding" "$TMP/home/.subrouter/codex/.local-serving-store.json"
+  [ "$(stat -f '%Lp' "$TMP/home/.subrouter/codex/.local-serving-store.json")" = 400 ]
+done
+echo "PASS rollback hard faults restored exact prior binding bytes and mode at every post-bootstrap phase"
 
 if PYTHONOPTIMIZE=1 \
   FAKE_ACTIVE_WORKER_CDHASH=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
@@ -876,6 +958,50 @@ fi
 [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]
 grep -q 'supervised agent failed structural acceptance' "$TMP/worker-identity-mismatch.err"
 echo "PASS active worker kernel identity mismatch restored exact legacy before canary"
+
+for rollback_phase in rollback_legacy_bootstrap_requested rollback_legacy_accepted rollback_binding_restored; do
+  reset_legacy
+  rollback_snapshot="$TMP/pre-candidate-rollback-phase-$rollback_phase.plist"
+  cp -p "$plist" "$rollback_snapshot"
+  if FAKE_ACTIVE_WORKER_CDHASH=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+    SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_PHASE="$rollback_phase" \
+    "$MIGRATE" --activate >"$TMP/pre-candidate-rollback-phase-$rollback_phase.out" \
+    2>"$TMP/pre-candidate-rollback-phase-$rollback_phase.err"; then
+    echo "pre-candidate rollback hard fault at $rollback_phase unexpectedly succeeded" >&2
+    exit 1
+  fi
+  assert_exact_legacy_rollback "$rollback_snapshot"
+done
+echo "PASS pre-candidate rollback hard faults selected the initial recovery generation"
+
+for rollback_phase in rollback_legacy_bootstrap_requested rollback_legacy_accepted rollback_binding_restored; do
+  reset_legacy
+  rollback_snapshot="$TMP/pre-candidate-fresh-reentry-$rollback_phase.plist"
+  cp -p "$plist" "$rollback_snapshot"
+  if FAKE_ACTIVE_WORKER_CDHASH=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+    SUBROUTER_ROLLBACK_FAULT_INJECT_HARD_OWNER_PHASE="$rollback_phase" \
+    "$MIGRATE" --activate >"$TMP/pre-candidate-fresh-reentry-$rollback_phase.out" \
+    2>"$TMP/pre-candidate-fresh-reentry-$rollback_phase.err"; then
+    echo "pre-candidate owner hard fault at $rollback_phase unexpectedly succeeded" >&2
+    exit 1
+  fi
+  wait_for_crash_released_mutation_lease "$mutation_lock"
+  [ -d "${plist}.supervisor-transaction" ]
+  [ "$(cat "${plist}.supervisor-transaction/phase")" = "$rollback_phase" ]
+  [ "$(cat "${plist}.supervisor-transaction/recovery-generation")" = initial ]
+  if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
+    "$MIGRATE" --activate >"$TMP/pre-candidate-fresh-reentry-$rollback_phase.reentry.out" \
+    2>"$TMP/pre-candidate-fresh-reentry-$rollback_phase.reentry.err"; then
+    echo "fresh reentry at pre-candidate rollback phase $rollback_phase unexpectedly continued activation" >&2
+    exit 1
+  fi
+  grep -q "recovered interrupted transaction phase $rollback_phase to legacy" \
+    "$TMP/pre-candidate-fresh-reentry-$rollback_phase.reentry.err"
+  assert_exact_legacy_rollback "$rollback_snapshot"
+done
+echo "PASS fresh-process reentry selected initial recovery at every pre-candidate rollback phase"
 
 reset_legacy
 control_attempt_file="$TMP/control-socket-attempts"
@@ -897,6 +1023,10 @@ with open(sys.argv[1], encoding="utf-8") as source:
 assert binding["accounts_dir"] == os.path.realpath(
     os.path.join(sys.argv[2], "codex", "accounts")
 )
+assert binding["schema"] == "subrouter.local-serving-store/v2"
+assert binding["local_data_socket"] == os.environ["SUBROUTER_LOCAL_DATA_SOCKET"]
+socket_stat = os.stat(binding["local_data_socket"], follow_symlinks=False)
+assert binding["local_data_socket_identity"] == f"unix:{socket_stat.st_dev}:{socket_stat.st_ino}"
 PY
 echo "PASS supervisor acceptance published the default-shell candidate binding before a state-unset canary"
 
@@ -924,7 +1054,7 @@ if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP
   echo "concurrent binding recovery unexpectedly continued activation" >&2
   exit 1
 fi
-grep -q 'recovered interrupted transaction phase structural_accepted to legacy' \
+grep -q 'recovered interrupted transaction phase recovery_candidate_committed to legacy' \
   "$TMP/concurrent-binding-recovery.err"
 [ ! -e "$concurrent_binding" ]
 echo "PASS activation refused a concurrent pointer change without clobbering it and retained recoverable journal state"
@@ -1175,7 +1305,7 @@ rm -f "$plist"
 grep -q 'rollback LaunchAgent healthy and ready' "$TMP/missing-plist.out"
 echo "PASS standalone rollback recovered after installed plist absence"
 
-for fault_phase in candidate_plist_installing candidate_plist_installed legacy_bootout_requested legacy_absent candidate_bootstrap_requested candidate_bootstrapped structural_accepted serving_store_binding_requested serving_store_bound canary_completed; do
+for fault_phase in candidate_plist_installing candidate_plist_installed legacy_bootout_requested legacy_absent candidate_bootstrap_requested candidate_bootstrapped structural_accepted recovery_candidate_committed serving_store_binding_requested serving_store_bound canary_completed; do
   reset_legacy
   if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
     SUBROUTER_FAULT_INJECT_PHASE="$fault_phase" "$MIGRATE" --activate \
@@ -1190,7 +1320,7 @@ for fault_phase in candidate_plist_installing candidate_plist_installed legacy_b
 done
 echo "PASS TERM injection at every live transaction boundary restored healthy legacy"
 
-for hard_phase in candidate_plist_installing candidate_bootstrap_requested serving_store_binding_requested; do
+for hard_phase in candidate_plist_installing candidate_bootstrap_requested recovery_candidate_committed serving_store_binding_requested; do
   reset_legacy
   if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
     SUBROUTER_FAULT_INJECT_HARD_PHASE="$hard_phase" "$MIGRATE" --activate \
@@ -1216,6 +1346,13 @@ for hard_phase in candidate_plist_installing candidate_bootstrap_requested servi
     serving_store_binding_requested)
       [ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$supervisor" ]
       [ ! -e "$TMP/home/.subrouter/codex/.local-serving-store.json" ]
+      ;;
+    recovery_candidate_committed)
+      [ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$supervisor" ]
+      candidate_artifact="$(find "$(dirname "$plist")" -maxdepth 2 -name local-serving-store.candidate.json -print | tail -n 1)"
+      [ -n "$candidate_artifact" ]
+      printf '%s\n' 'operator-selected-third-binding' >"$candidate_artifact"
+      chmod 0600 "$candidate_artifact"
       ;;
   esac
   if SUBROUTER_PREFLIGHT_CALLBACK="$TMP/preflight" SUBROUTER_CANARY_CALLBACK="$TMP/canary-ok" \
@@ -2014,9 +2151,9 @@ wrapper_prepared="${plist}.supervised"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$wrapper_prepared")" = "$supervisor" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$wrapper_prepared")" = supervise ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$wrapper_prepared")" = 127.0.0.1:43199 ]
-[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:8' "$wrapper_prepared")" = --upgrade-inhibit-file ]
-[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:9' "$wrapper_prepared")" = "${plist}.supervisor-transaction/upgrade-inhibited" ]
-[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:11' "$wrapper_prepared")" = --quota-mode ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:10' "$wrapper_prepared")" = --upgrade-inhibit-file ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:11' "$wrapper_prepared")" = "${plist}.supervisor-transaction/upgrade-inhibited" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:13' "$wrapper_prepared")" = --quota-mode ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_TOKEN_FILE' "$wrapper_prepared")" = "$private_token_file" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:LEGACY_ONLY' "$wrapper_prepared")" = preserved ]
 if /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:SUBROUTER_TOKEN_FILE' "$plist" >/dev/null 2>&1; then

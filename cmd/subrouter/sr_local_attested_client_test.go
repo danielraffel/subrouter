@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,12 +16,14 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 type localAttestationConnectionKey struct{}
 
 func TestLocalStoreAttestedClientAttestsEveryConnectionBeforeRequest(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	initializeLocalDataTestStore(t, store)
 	var nextConnection atomic.Int64
 	var mu sync.Mutex
 	requests := map[int64][]string{}
@@ -31,7 +35,7 @@ func TestLocalStoreAttestedClientAttestsEveryConnectionBeforeRequest(t *testing.
 		requests[connectionID] = append(requests[connectionID], request.URL.Path)
 		mu.Unlock()
 		switch request.URL.Path {
-		case "/_subrouter/health":
+		case "/_subrouter/health", proxy.StoreHandshakePath:
 			if authorization := request.Header.Get("Authorization"); authorization != "" {
 				healthAuthorization.Store(authorization)
 			}
@@ -52,8 +56,9 @@ func TestLocalStoreAttestedClientAttestsEveryConnectionBeforeRequest(t *testing.
 	}
 	server.Start()
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server)
 
-	client, err := newLocalStoreAttestedClient(server.Client(), server.URL, store)
+	client, err := newLocalDataClient(server.Client(), server.URL, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,28 +86,19 @@ func TestLocalStoreAttestedClientAttestsEveryConnectionBeforeRequest(t *testing.
 		t.Fatalf("connection request sequences = %#v, want two connections", requests)
 	}
 	for connectionID, sequence := range requests {
-		if got := strings.Join(sequence, ","); got != "/_subrouter/health,/_subrouter/accounts" {
-			t.Fatalf("connection %d request sequence = %q, want health before accounts", connectionID, got)
+		if got := strings.Join(sequence, ","); got != proxy.StoreHandshakePath+",/_subrouter/accounts" {
+			t.Fatalf("connection %d request sequence = %q, want handshake before protected request", connectionID, got)
 		}
 	}
 }
 
-func TestLocalStoreAttestedClientReattestsBeforeCredentialAfterConnectionClose(t *testing.T) {
+func TestLocalStoreAttestedClientFailsClosedWhenSocketBecomesUnsafe(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
-	var validProof atomic.Bool
-	validProof.Store(true)
+	initializeLocalDataTestStore(t, store)
 	var protectedRequests atomic.Int32
-	var credentialOnRejectedConnection atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/_subrouter/health" {
-			if request.Header.Get("Authorization") != "" && !validProof.Load() {
-				credentialOnRejectedConnection.Store(true)
-			}
-			if validProof.Load() {
-				writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
-			} else {
-				_, _ = io.WriteString(w, `{"ok":true,"account_store_id":"replacement","account_store_proof":"wrong"}`)
-			}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == proxy.StoreHandshakePath {
+			writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
 			return
 		}
 		protectedRequests.Add(1)
@@ -113,9 +109,11 @@ func TestLocalStoreAttestedClientReattestsBeforeCredentialAfterConnectionClose(t
 		w.Header().Set("Connection", "close")
 		_, _ = io.WriteString(w, `[]`)
 	}))
+	server.Start()
 	defer server.Close()
+	socket := attachPrivateLocalTestListener(t, server)
 
-	client, err := newLocalStoreAttestedClient(server.Client(), server.URL, store)
+	client, err := newLocalDataClient(server.Client(), server.URL, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,59 +125,194 @@ func TestLocalStoreAttestedClientReattestsBeforeCredentialAfterConnectionClose(t
 	}
 	response.Body.Close()
 
-	validProof.Store(false)
 	client.Transport.(*http.Transport).CloseIdleConnections()
+	if err := os.Chmod(socket, 0o666); err != nil {
+		t.Fatal(err)
+	}
 	request, _ = http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/_subrouter/accounts", nil)
 	request.Header.Set("Authorization", "Bearer protected")
-	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "account store does not match") {
-		t.Fatalf("replacement-listener error = %v, want store mismatch", err)
-	}
-	if credentialOnRejectedConnection.Load() {
-		t.Fatal("replacement listener received a credential during attestation")
+	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "mode-0600") {
+		t.Fatalf("unsafe-socket error = %v, want private socket rejection", err)
 	}
 	if protectedRequests.Load() != 1 {
 		t.Fatalf("protected requests = %d, want only the pre-replacement request", protectedRequests.Load())
 	}
 }
 
-func TestLocalStoreAttestedClientRejectsNonPersistentHealth(t *testing.T) {
+func TestLocalStoreAttestedClientRejectsUnsafeSocketBeforeCredential(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	initializeLocalDataTestStore(t, store)
 	var protectedRequests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/_subrouter/health" {
-			w.Header().Set("Connection", "close")
-			writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
-			return
-		}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		protectedRequests.Add(1)
 		_, _ = io.WriteString(w, `[]`)
 	}))
+	server.Start()
 	defer server.Close()
+	socket := attachPrivateLocalTestListener(t, server)
+	if err := os.Chmod(socket, 0o666); err != nil {
+		t.Fatal(err)
+	}
 
-	client, err := newLocalStoreAttestedClient(server.Client(), server.URL, store)
+	client, err := newLocalDataClient(server.Client(), server.URL, store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+"/_subrouter/accounts", nil)
 	request.Header.Set("Authorization", "Bearer must-not-be-sent")
-	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "did not preserve its connection") {
-		t.Fatalf("non-persistent attestation error = %v", err)
+	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "mode-0600") {
+		t.Fatalf("unsafe socket error = %v", err)
 	}
 	if protectedRequests.Load() != 0 {
 		t.Fatalf("non-persistent listener received %d protected request(s)", protectedRequests.Load())
 	}
 }
 
+func TestLocalDataClientRejectsPrivateSocketReplacementAfterBinding(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	initializeLocalDataTestStore(t, store)
+	socketDir, err := os.MkdirTemp("/private/tmp", "sr-replace-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	socket := filepath.Join(socketDir, "data.sock")
+	legitimate, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := localDataSocketIdentity(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingPath := localServingStoreBindingPath(store)
+	if err := os.MkdirAll(filepath.Dir(bindingPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(localServingStoreBinding{
+		Schema: localServingStoreSchema, AccountsDir: store.Dir,
+		LocalDataSocket: socket, LocalDataSocketIdentity: identity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bindingPath, append(payload, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := legitimate.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(socket)
+	var received atomic.Int32
+	replacement, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		received.Add(1)
+		http.Error(w, "credential sink", http.StatusUnauthorized)
+	})}
+	go func() { _ = server.Serve(replacement) }()
+	defer server.Close()
+
+	client, err := newLocalDataClient(&http.Client{}, "http://127.0.0.1:31415", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:31415/_subrouter/accounts", nil)
+	request.Header.Set("Authorization", "Bearer must-not-leak")
+	if _, err := client.Do(request); err == nil || !strings.Contains(err.Error(), "identity does not match") {
+		t.Fatalf("replacement error = %v, want binding identity rejection", err)
+	}
+	if received.Load() != 0 {
+		t.Fatalf("replacement received %d request(s)", received.Load())
+	}
+}
+
+func TestLocalDataClientUsesBoundServingStoreForHandshake(t *testing.T) {
+	home := t.TempDir()
+	bindingStore := accounts.CodexStore{Dir: filepath.Join(home, "cli", "codex", "accounts")}
+	servingStore := accounts.CodexStore{Dir: filepath.Join(home, "candidate", "codex", "accounts")}
+	initializeLocalDataTestStore(t, bindingStore)
+	initializeLocalDataTestStore(t, servingStore)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == proxy.StoreHandshakePath {
+			writeLocalStoreAuthorityHealth(t, w, request, servingStore, "enabled")
+			return
+		}
+		if request.URL.Path == "/_subrouter/accounts" {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer server.Close()
+	attachPrivateLocalTestListener(t, server)
+
+	client, err := newLocalDataClientWithStoreResolvers(
+		server.Client(), server.URL,
+		func() (accounts.CodexStore, error) { return bindingStore, nil },
+		func() (accounts.CodexStore, error) { return servingStore, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get(server.URL + "/_subrouter/accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("accounts status = %d", response.StatusCode)
+	}
+}
+
+func TestLocalDataSocketForExplicitStateUsesSupervisorDefault(t *testing.T) {
+	stateDir, err := os.MkdirTemp("/private/tmp", "sr-state-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
+	t.Setenv("SUBROUTER_STATE_DIR", stateDir)
+	socket := filepath.Join(stateDir, "local-data.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := localDataSocketForStore(accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != socket {
+		t.Fatalf("explicit-state socket = %q, want %q", got, socket)
+	}
+}
+
 func TestReadyLocalServingServerDoesNotLoadOrSendAdminToken(t *testing.T) {
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}
+	initializeLocalDataTestStore(t, store)
 	var unexpectedAuthorization atomic.Value
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if authorization := request.Header.Get("Authorization"); authorization != "" {
 			unexpectedAuthorization.Store(authorization)
 		}
 		switch request.URL.Path {
-		case "/_subrouter/health":
+		case "/_subrouter/health", proxy.StoreHandshakePath:
 			writeLocalStoreAuthorityHealth(t, w, request, store, "disabled")
 		case "/_subrouter/accounts":
 			_, _ = io.WriteString(w, `[]`)
@@ -188,6 +321,7 @@ func TestReadyLocalServingServerDoesNotLoadOrSendAdminToken(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	t.Setenv("SUBROUTER_ADMIN_TOKEN", "environment-admin-must-not-load")
 	t.Setenv("SUBROUTER_ADMIN_TOKEN_FILE", filepath.Join(home, "missing-admin-token"))
@@ -239,6 +373,24 @@ func TestLocalServingStoreAuthorityRemovesAPIPathForHealth(t *testing.T) {
 
 func writeLocalStoreAuthorityHealth(t *testing.T, w http.ResponseWriter, request *http.Request, store accounts.CodexStore, importState string) {
 	t.Helper()
+	if request.URL.Path == proxy.StoreHandshakePath {
+		nonce := request.Header.Get(accounts.StoreHandshakeNonceHeader)
+		verified, err := accounts.VerifyStoreHandshakeRequest(store.Dir, nonce, request.Header.Get(accounts.StoreHandshakeRequestHeader))
+		if err != nil || !verified {
+			http.NotFound(w, request)
+			return
+		}
+		authorityID, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := accounts.ExistingStoreHandshakeResponseProof(store.Dir, nonce)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"account_store_id": authorityID, "account_store_proof": proof})
+		return
+	}
 	authorityID, err := accounts.StoreAuthorityID(store.Dir)
 	if err != nil {
 		t.Error(err)
@@ -256,4 +408,56 @@ func writeLocalStoreAuthorityHealth(t *testing.T, w http.ResponseWriter, request
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":%q,"account_store_id":%q,"account_store_proof":%q}`, importState, authorityID, proof)
+}
+
+func attachPrivateLocalTestListener(t *testing.T, server *httptest.Server, stores ...accounts.CodexStore) string {
+	t.Helper()
+	if len(stores) > 1 {
+		t.Fatal("attach private local test listener accepts at most one account store")
+	}
+	if len(stores) == 1 {
+		initializeLocalDataTestStore(t, stores[0])
+	}
+	directory, err := os.MkdirTemp("/private/tmp", "sr-local-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	socket := filepath.Join(directory, "local-data.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socket, 0o600); err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_LOCAL_DATA_SOCKET", socket)
+	if len(stores) == 1 {
+		handler := server.Config.Handler
+		store := stores[0]
+		go func() {
+			_ = http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == proxy.StoreHandshakePath {
+					writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
+					return
+				}
+				handler.ServeHTTP(w, request)
+			}))
+		}()
+	} else {
+		go func() { _ = server.Config.Serve(listener) }()
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(socket)
+	})
+	return socket
+}
+
+func initializeLocalDataTestStore(t *testing.T, store accounts.CodexStore) {
+	t.Helper()
+	if _, err := accounts.StoreAuthorityProof(store.Dir, strings.Repeat("00", 32)); err != nil {
+		t.Fatal(err)
+	}
 }

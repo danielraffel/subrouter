@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 func TestLocalServingStoreBindingSelectsSeparateDaemonState(t *testing.T) {
@@ -79,7 +80,7 @@ func TestLocalServingStoreBindingCommandsRejectExplicitState(t *testing.T) {
 	}
 }
 
-func TestLocalServingStoreResolverFollowsBindingOnEveryNewConnection(t *testing.T) {
+func TestLegacyV1ServingBindingFailsClosedForCredentialChannel(t *testing.T) {
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
 	stateA := filepath.Join(home, "state-a")
@@ -95,10 +96,6 @@ func TestLocalServingStoreResolverFollowsBindingOnEveryNewConnection(t *testing.
 		t.Fatal(err)
 	}
 	writeLocalServingStoreBinding(t, store, stateB)
-	storeB, err := localServingStore(store)
-	if err != nil {
-		t.Fatal(err)
-	}
 	writeLocalServingStoreBinding(t, store, stateA)
 	var active atomic.Value
 	active.Store(storeA)
@@ -115,23 +112,12 @@ func TestLocalServingStoreResolverFollowsBindingOnEveryNewConnection(t *testing.
 		http.NotFound(w, request)
 	}))
 	defer server.Close()
-	client, err := newLocalStoreAttestedClientWithResolver(server.Client(), server.URL, localServingStoreResolver(store))
+	client, err := newLocalDataClientWithResolver(server.Client(), server.URL, localServingStoreResolver(store))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index, next := range []accounts.CodexStore{storeA, storeB} {
-		if index == 1 {
-			writeLocalServingStoreBinding(t, store, stateB)
-			active.Store(storeB)
-		}
-		response, requestErr := client.Get(server.URL + "/protected")
-		if requestErr != nil {
-			t.Fatalf("request %d: %v", index, requestErr)
-		}
-		_ = response.Body.Close()
-		if next.Dir != active.Load().(accounts.CodexStore).Dir {
-			t.Fatalf("request %d used wrong store", index)
-		}
+	if _, requestErr := client.Get(server.URL + "/protected"); requestErr == nil || !strings.Contains(requestErr.Error(), "published private local data socket") {
+		t.Fatalf("legacy v1 request error = %v, want fail-closed socket requirement", requestErr)
 	}
 }
 
@@ -147,6 +133,34 @@ func TestLocalServingStoreRejectsUnsafeBinding(t *testing.T) {
 	}
 	if _, err := localServingStore(store); err == nil || !strings.Contains(err.Error(), "private regular file") {
 		t.Fatalf("unsafe binding error = %v", err)
+	}
+}
+
+func TestLocalServingStoreRejectsSchemaSocketMismatch(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	accountsDir := filepath.Join(home, "served", "codex", "accounts")
+	if err := os.MkdirAll(accountsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(localServingStoreBindingPath(store)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"v1 with socket", fmt.Sprintf(`{"schema":%q,"accounts_dir":%q,"local_data_socket":"/private/tmp/data.sock"}`, localServingStoreSchemaV1, accountsDir)},
+		{"v2 without socket", fmt.Sprintf(`{"schema":%q,"accounts_dir":%q}`, localServingStoreSchema, accountsDir)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(localServingStoreBindingPath(store), []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := localServingStore(store); err == nil || !strings.Contains(err.Error(), "schema/socket") {
+				t.Fatalf("mismatch error = %v", err)
+			}
+		})
 	}
 }
 
@@ -257,14 +271,18 @@ func TestBindLocalServingStoreProvesDaemonBeforePublishing(t *testing.T) {
 		t.Fatal(err)
 	}
 	servingStore := accounts.CodexStore{Dir: accountsDir}
+	if _, err := accounts.StoreAuthorityProof(servingStore.Dir, strings.Repeat("00", 32)); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/_subrouter/health" {
+		if request.URL.Path != "/_subrouter/health" && request.URL.Path != proxy.StoreHandshakePath {
 			http.NotFound(w, request)
 			return
 		}
 		writeLocalStoreAuthorityHealth(t, w, request, servingStore, "enabled")
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL+"/v1")
 
 	var out bytes.Buffer
@@ -325,9 +343,15 @@ func TestBindLocalServingStoreRejectsWrongDaemonWithoutPublishing(t *testing.T) 
 		}
 	}
 	wrongStore := accounts.CodexStore{Dir: filepath.Join(wrongState, "codex", "accounts")}
+	candidateStore := accounts.CodexStore{Dir: filepath.Join(stateDir, "codex", "accounts")}
+	for _, keyed := range []accounts.CodexStore{wrongStore, candidateStore} {
+		if _, err := accounts.StoreAuthorityProof(keyed.Dir, strings.Repeat("00", 32)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var protected atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/_subrouter/health" {
+		if request.URL.Path == "/_subrouter/health" || request.URL.Path == proxy.StoreHandshakePath {
 			writeLocalStoreAuthorityHealth(t, w, request, wrongStore, "enabled")
 			return
 		}
@@ -335,10 +359,11 @@ func TestBindLocalServingStoreRejectsWrongDaemonWithoutPublishing(t *testing.T) 
 		http.Error(w, "credential sink", http.StatusUnauthorized)
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 
 	err := bindLocalServingStore(stateDir, store, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "does not match this CLI") {
+	if err == nil || !strings.Contains(err.Error(), "handshake failed") {
 		t.Fatalf("wrong-daemon binding error = %v", err)
 	}
 	if protected.Load() != 0 {
@@ -367,10 +392,14 @@ func TestBindLocalServingStoreComparesPriorBindingUnderLock(t *testing.T) {
 	}
 	priorHash := sha256.Sum256(prior)
 	candidateStore := accounts.CodexStore{Dir: filepath.Join(candidateState, "codex", "accounts")}
+	if _, err := accounts.StoreAuthorityProof(candidateStore.Dir, strings.Repeat("00", 32)); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		writeLocalStoreAuthorityHealth(t, w, request, candidateStore, "enabled")
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 
 	wrong := localServingStoreExpectation{SHA256: strings.Repeat("0", 64), Mode: 0o600}
@@ -491,7 +520,7 @@ func writeLocalServingStoreBinding(t *testing.T, store accounts.CodexStore, stat
 	if _, err := accounts.StoreAuthorityProof(accountsDir, strings.Repeat("00", 32)); err != nil {
 		t.Fatal(err)
 	}
-	body := fmt.Sprintf(`{"schema":%q,"accounts_dir":%q}`+"\n", localServingStoreSchema, accountsDir)
+	body := fmt.Sprintf(`{"schema":%q,"accounts_dir":%q}`+"\n", localServingStoreSchemaV1, accountsDir)
 	if err := os.WriteFile(localServingStoreBindingPath(store), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

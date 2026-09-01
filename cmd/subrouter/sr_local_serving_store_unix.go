@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -123,4 +124,23 @@ func syncLocalServingStoreBindingDirectory(path string) error {
 	}
 	defer directory.Close()
 	return directory.Sync()
+}
+
+func validatePrivateLocalDataSocket(path string) (string, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if !filepath.IsAbs(path) || path == string(filepath.Separator) {
+		return "", errors.New("local data socket must be an absolute non-root path")
+	}
+	parent, err := validatePrivateLocalServingStorePath(filepath.Dir(path), true)
+	if err != nil || parent != filepath.Dir(path) {
+		return "", errors.New("local data socket parent must be canonical, current-user-owned, and private")
+	}
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil {
+		return "", err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFSOCK || stat.Mode&0o077 != 0 || int(stat.Uid) != os.Geteuid() {
+		return "", errors.New("local data socket must be a current-user-owned mode-0600 Unix socket")
+	}
+	return path, nil
 }

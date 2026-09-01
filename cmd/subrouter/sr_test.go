@@ -1182,6 +1182,7 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
@@ -1261,6 +1262,7 @@ func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) 
 		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	cloudPath := filepath.Join(home, "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
@@ -1348,7 +1350,7 @@ func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
 		client: server.Client(),
 	}
 	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
-	if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
 		t.Fatalf("unattested onboarding error = %v", err)
 	}
 	if nonHealthRequests.Load() != 0 {
@@ -1394,7 +1396,7 @@ func TestLegacyLocalServingDaemonRejectsUnattestedOnboardingBeforeCredentials(t 
 	}
 	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
 		// No selected remote: this entry exists only to prove a matching legacy
-		// credential is not sent before local store attestation.
+		// credential is not sent before the private local channel is established.
 		file.Servers = []srServerConfig{{Name: "unselected-local", URL: server.URL, AdminToken: "must-not-be-sent"}}
 		return nil
 	}); err != nil {
@@ -1407,7 +1409,7 @@ func TestLegacyLocalServingDaemonRejectsUnattestedOnboardingBeforeCredentials(t 
 		client: server.Client(),
 	}
 	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
-	if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
 		t.Fatalf("unattested legacy-local onboarding error = %v", err)
 	}
 	if nonHealthRequests.Load() != 0 {
@@ -1449,6 +1451,7 @@ func TestLegacyLocalServingDaemonKeepsUnprotectedOnboardingOnLocalStore(t *testi
 		_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"disabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	cloudPath := filepath.Join(home, "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
@@ -1511,6 +1514,7 @@ func TestProtectedLocalServingDaemonKeepsOnboardingOnHTTPAuthority(t *testing.T)
 		}
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	cloudPath := filepath.Join(home, "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
@@ -1566,6 +1570,7 @@ func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
@@ -1617,6 +1622,7 @@ func TestReadyLocalServingServerStartsColdDaemon(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 
 	var starts atomic.Int32
@@ -1667,7 +1673,7 @@ func TestLocalServingCommandsRejectUnattestedListenerBeforeAdminCredential(t *te
 				client: server.Client(),
 			}
 			err := runner.run(t.Context(), args)
-			if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+			if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
 				t.Fatalf("unattested local command %q error = %v", args, err)
 			}
 			if authenticatedRequests.Load() != 0 {
@@ -1709,6 +1715,7 @@ func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,7 +21,7 @@ Usage:
   sr daemon restart
   sr daemon status
   sr daemon logs
-  sr daemon bind-state <absolute-state-dir> [--if-current-absent]
+  sr daemon bind-state <absolute-state-dir> --local-data-socket PATH [--if-current-absent]
                        [--if-current-sha256 SHA --if-current-mode MODE]
   sr daemon unbind-state
 `
@@ -48,11 +49,14 @@ func runDaemonCommand(
 		return followDaemonLogs(ctx, out, errOut)
 	case "bind-state":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: sr daemon bind-state <absolute-state-dir> [--if-current-absent | --if-current-sha256 SHA --if-current-mode MODE]")
+			return fmt.Errorf("usage: sr daemon bind-state <absolute-state-dir> --local-data-socket PATH [--if-current-absent | --if-current-sha256 SHA --if-current-mode MODE]")
 		}
 		expectation, err := parseLocalServingStoreExpectation(args[2:])
 		if err != nil {
 			return err
+		}
+		if expectation.LocalDataSocket == "" {
+			return errors.New("bind-state requires --local-data-socket")
 		}
 		return bindLocalServingStoreIfCurrent(ctx, args[1], store, out, expectation)
 	case "unbind-state":

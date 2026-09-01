@@ -3,10 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -917,11 +915,29 @@ func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, star
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
 	}
-	attestedClient, err := newLocalStoreAttestedClient(baseClient, localBaseURL(), servingStore)
+	binding, found, err := readLocalServingStoreBinding(r.store)
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
 	}
-	bare := srServerConfig{Name: "local", URL: localBaseURL(), requestClient: attestedClient}
+	var localClient *http.Client
+	privateOverride := strings.TrimSpace(os.Getenv("SUBROUTER_LOCAL_DATA_SOCKET")) != ""
+	explicitState := strings.TrimSpace(os.Getenv("SUBROUTER_STATE_DIR")) != ""
+	if privateOverride || explicitState || (found && binding.Schema == localServingStoreSchema) {
+		localClient, err = newLocalDataClientWithStoreResolvers(
+			baseClient, localBaseURL(),
+			func() (accounts.CodexStore, error) { return r.store, nil },
+			func() (accounts.CodexStore, error) { return servingStore, nil },
+		)
+	} else {
+		// v1 bindings and direct/unbound daemons predate the private Unix data
+		// channel. Preserve their per-connection loopback attestation during a
+		// rolling upgrade; v2 never falls back to the public listener.
+		localClient, err = newLegacyLocalStoreAttestedClient(baseClient, localBaseURL(), servingStore)
+	}
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	bare := srServerConfig{Name: "local", URL: localBaseURL(), requestClient: localClient}
 	authority, err := r.localServingStoreAuthorityForStore(ctx, bare, servingStore)
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
@@ -933,7 +949,7 @@ func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, star
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
 	}
-	server.requestClient = attestedClient
+	server.requestClient = localClient
 	return server, authority, nil
 }
 
@@ -951,11 +967,6 @@ func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServe
 }
 
 func (r srRunner) localServingStoreAuthorityForStore(ctx context.Context, server srServerConfig, servingStore accounts.CodexStore) (localServingStoreAuthority, error) {
-	var challengeBytes [32]byte
-	if _, err := rand.Read(challengeBytes[:]); err != nil {
-		return localServingStoreAuthority{}, fmt.Errorf("create local proxy store challenge: %w", err)
-	}
-	challenge := hex.EncodeToString(challengeBytes[:])
 	healthURL, err := healthURLFor(server.URL)
 	if err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation URL: %w", err)
@@ -964,7 +975,6 @@ func (r srRunner) localServingStoreAuthorityForStore(ctx context.Context, server
 	if err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation request: %w", err)
 	}
-	request.Header.Set(accounts.StoreAuthorityChallengeHeader, challenge)
 	client := server.requestClient
 	if client == nil {
 		client = r.client
@@ -981,28 +991,14 @@ func (r srRunner) localServingStoreAuthorityForStore(ctx context.Context, server
 		return localServingStoreAuthority{}, fmt.Errorf("local proxy store attestation failed: %s", response.Status)
 	}
 	var payload struct {
-		AccountStoreID    string `json:"account_store_id"`
-		AccountStoreProof string `json:"account_store_proof"`
-		AccountImport     string `json:"account_import"`
+		AccountImport string `json:"account_import"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&payload); err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("decode local proxy store attestation: %w", err)
 	}
-	expected, err := accounts.StoreAuthorityID(servingStore.Dir)
-	if err != nil {
-		return localServingStoreAuthority{}, err
-	}
-	if strings.TrimSpace(payload.AccountStoreID) == "" || payload.AccountStoreID != expected {
-		return localServingStoreAuthority{storeMatches: false}, nil
-	}
-	expectedProof, err := accounts.ExistingStoreAuthorityProof(servingStore.Dir, challenge)
-	if err != nil {
-		return localServingStoreAuthority{}, err
-	}
-	proofMatches := hmac.Equal([]byte(strings.TrimSpace(payload.AccountStoreProof)), []byte(expectedProof))
 	return localServingStoreAuthority{
-		storeMatches:         proofMatches,
-		accountImportEnabled: proofMatches && payload.AccountImport == proxy.AccountImportEnabled,
+		storeMatches:         true,
+		accountImportEnabled: payload.AccountImport == proxy.AccountImportEnabled,
 	}, nil
 }
 

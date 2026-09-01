@@ -1730,8 +1730,9 @@ func TestSRClaudeProxyRejectsPreviouslyStoredRemoteHTTPTenant(t *testing.T) {
 func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	initializeLocalDataTestStore(t, store)
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/_subrouter/health" {
+		if request.URL.Path == "/_subrouter/health" || request.URL.Path == proxy.StoreHandshakePath {
 			writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
 			return
 		}
@@ -1742,6 +1743,7 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 		http.NotFound(w, request)
 	}))
 	defer local.Close()
+	attachPrivateLocalTestListener(t, local)
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud.json"))
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
@@ -2204,7 +2206,7 @@ func TestLocalClaudeRejectsWrongStoreBeforeAccountInventory(t *testing.T) {
 
 	runner := srRunner{store: store, client: server.Client(), out: io.Discard, errOut: io.Discard}
 	err := runner.proxyClaudeSelectedRemote(t.Context(), nil, claudeProxyLaunchOptions{accountSelector: "profile"})
-	if err == nil || !strings.Contains(err.Error(), "does not match this CLI") {
+	if err == nil || !strings.Contains(err.Error(), "local proxy account store does not match this CLI") {
 		t.Fatalf("wrong-store Claude launch error = %v", err)
 	}
 	if got := inventoryRequests.Load(); got != 0 {

@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,22 +19,27 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 const (
-	localServingStoreSchema       = "subrouter.local-serving-store/v1"
+	localServingStoreSchemaV1     = "subrouter.local-serving-store/v1"
+	localServingStoreSchema       = "subrouter.local-serving-store/v2"
 	localServingStoreProbeTimeout = 10 * time.Second
 )
 
 type localServingStoreBinding struct {
-	Schema      string `json:"schema"`
-	AccountsDir string `json:"accounts_dir"`
+	Schema                  string `json:"schema"`
+	AccountsDir             string `json:"accounts_dir"`
+	LocalDataSocket         string `json:"local_data_socket,omitempty"`
+	LocalDataSocketIdentity string `json:"local_data_socket_identity,omitempty"`
 }
 
 type localServingStoreExpectation struct {
-	Absent bool
-	SHA256 string
-	Mode   os.FileMode
+	Absent          bool
+	SHA256          string
+	Mode            os.FileMode
+	LocalDataSocket string
 }
 
 func localServingStoreBindingPath(store accounts.CodexStore) string {
@@ -38,56 +47,84 @@ func localServingStoreBindingPath(store accounts.CodexStore) string {
 }
 
 // localServingStore keeps the ordinary CLI state independent from a separately
-// enrolled supervised daemon while still letting the CLI prove the exact store
-// behind the loopback listener. An explicit SUBROUTER_STATE_DIR remains the
-// highest authority and never consults the binding.
+// enrolled supervised daemon. The private binding names both the serving store
+// and its Unix data socket. An explicit SUBROUTER_STATE_DIR remains the highest
+// store authority and never consults the binding.
 func localServingStore(store accounts.CodexStore) (accounts.CodexStore, error) {
+	binding, found, err := readLocalServingStoreBinding(store)
+	if err != nil || !found {
+		return store, err
+	}
+	return accounts.CodexStore{Dir: binding.AccountsDir}, nil
+}
+
+func readLocalServingStoreBinding(store accounts.CodexStore) (localServingStoreBinding, bool, error) {
 	if explicitLocalStateAuthority() {
-		return store, nil
+		return localServingStoreBinding{}, false, nil
 	}
 	path := localServingStoreBindingPath(store)
 	_, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return store, nil
+		return localServingStoreBinding{}, false, nil
 	}
 	if err != nil {
-		return accounts.CodexStore{}, fmt.Errorf("inspect local serving-store binding: %w", err)
+		return localServingStoreBinding{}, false, fmt.Errorf("inspect local serving-store binding: %w", err)
 	}
 	if _, err := validatePrivateLocalServingStorePath(filepath.Dir(path), true); err != nil {
-		return accounts.CodexStore{}, fmt.Errorf("validate local serving-store binding directory: %w", err)
+		return localServingStoreBinding{}, false, fmt.Errorf("validate local serving-store binding directory: %w", err)
 	}
 	file, err := openPrivateLocalServingStoreBinding(path)
 	if err != nil {
-		return accounts.CodexStore{}, fmt.Errorf("open local serving-store binding: %w", err)
+		return localServingStoreBinding{}, false, fmt.Errorf("open local serving-store binding: %w", err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || info.Size() > 4096 {
-		return accounts.CodexStore{}, errors.New("local serving-store binding is too large")
+		return localServingStoreBinding{}, false, errors.New("local serving-store binding is too large")
 	}
 	var binding localServingStoreBinding
 	decoder := json.NewDecoder(io.LimitReader(file, 4097))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&binding); err != nil {
-		return accounts.CodexStore{}, fmt.Errorf("decode local serving-store binding: %w", err)
+		return localServingStoreBinding{}, false, fmt.Errorf("decode local serving-store binding: %w", err)
 	}
 	if err := ensureLocalServingStoreJSONEOF(decoder); err != nil {
-		return accounts.CodexStore{}, fmt.Errorf("decode local serving-store binding: %w", err)
+		return localServingStoreBinding{}, false, fmt.Errorf("decode local serving-store binding: %w", err)
 	}
 	accountsDir := filepath.Clean(strings.TrimSpace(binding.AccountsDir))
-	if binding.Schema != localServingStoreSchema || !filepath.IsAbs(accountsDir) || accountsDir == string(filepath.Separator) {
-		return accounts.CodexStore{}, errors.New("local serving-store binding is invalid")
+	if (binding.Schema != localServingStoreSchema && binding.Schema != localServingStoreSchemaV1) || !filepath.IsAbs(accountsDir) || accountsDir == string(filepath.Separator) {
+		return localServingStoreBinding{}, false, errors.New("local serving-store binding is invalid")
+	}
+	socket := strings.TrimSpace(binding.LocalDataSocket)
+	socketIdentity := strings.TrimSpace(binding.LocalDataSocketIdentity)
+	if (binding.Schema == localServingStoreSchemaV1 && (socket != "" || socketIdentity != "")) || (binding.Schema == localServingStoreSchema && (socket == "" || socketIdentity == "")) {
+		return localServingStoreBinding{}, false, errors.New("local serving-store binding has an invalid schema/socket combination")
+	}
+	if socket != "" {
+		canonicalSocket, err := validatePrivateLocalDataSocket(socket)
+		if err != nil || canonicalSocket != socket {
+			return localServingStoreBinding{}, false, errors.New("local serving data socket must be an existing canonical private socket")
+		}
+		binding.LocalDataSocket = canonicalSocket
+		currentIdentity, err := localDataSocketIdentity(canonicalSocket)
+		if err != nil || currentIdentity != socketIdentity {
+			return localServingStoreBinding{}, false, errors.New("local serving data socket identity does not match its binding")
+		}
+		binding.LocalDataSocketIdentity = socketIdentity
 	}
 	canonicalAccountsDir, err := validatePrivateLocalServingStorePath(accountsDir, true)
 	if err != nil || canonicalAccountsDir != accountsDir {
-		return accounts.CodexStore{}, errors.New("local serving account store must be an existing canonical private directory")
+		return localServingStoreBinding{}, false, errors.New("local serving account store must be an existing canonical private directory")
 	}
-	authorityKey, err := openPrivateLocalServingStoreBinding(filepath.Join(filepath.Dir(accountsDir), ".store-authority-key"))
-	if err != nil {
-		return accounts.CodexStore{}, fmt.Errorf("validate local serving-store authority key: %w", err)
+	if binding.Schema == localServingStoreSchemaV1 {
+		authorityKey, err := openPrivateLocalServingStoreBinding(filepath.Join(filepath.Dir(accountsDir), ".store-authority-key"))
+		if err != nil {
+			return localServingStoreBinding{}, false, fmt.Errorf("validate local serving-store authority key: %w", err)
+		}
+		_ = authorityKey.Close()
 	}
-	_ = authorityKey.Close()
-	return accounts.CodexStore{Dir: accountsDir}, nil
+	binding.AccountsDir = accountsDir
+	return binding, true, nil
 }
 
 func ensureLocalServingStoreJSONEOF(decoder *json.Decoder) error {
@@ -131,7 +168,6 @@ func bindLocalServingStoreIfCurrent(
 	if err != nil {
 		return errors.New("serving account store must be an existing private directory")
 	}
-	servingStore := accounts.CodexStore{Dir: accountsDir}
 	path := localServingStoreBindingPath(store)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create serving-store binding directory: %w", err)
@@ -147,9 +183,23 @@ func bindLocalServingStoreIfCurrent(
 	if err := validateLocalServingStoreExpectation(path, expectation); err != nil {
 		return err
 	}
-	client, err := newLocalStoreAttestedClient(
-		&http.Client{Timeout: localServingStoreProbeTimeout}, localBaseURL(), servingStore,
-	)
+	effectiveSocket := expectation.LocalDataSocket
+	if effectiveSocket == "" {
+		effectiveSocket = strings.TrimSpace(os.Getenv("SUBROUTER_LOCAL_DATA_SOCKET"))
+		if effectiveSocket != "" {
+			effectiveSocket, err = validatePrivateLocalDataSocket(effectiveSocket)
+			if err != nil {
+				return fmt.Errorf("validate local data socket override: %w", err)
+			}
+		}
+	}
+	var client *http.Client
+	servingStore := accounts.CodexStore{Dir: accountsDir}
+	if effectiveSocket != "" {
+		client, err = newPrivateLocalDataClient(&http.Client{Timeout: localServingStoreProbeTimeout}, effectiveSocket, servingStore)
+	} else {
+		client, err = newLegacyLocalStoreAttestedClient(&http.Client{Timeout: localServingStoreProbeTimeout}, localBaseURL(), servingStore)
+	}
 	if err != nil {
 		return err
 	}
@@ -169,12 +219,18 @@ func bindLocalServingStoreIfCurrent(
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("verify local serving state: %s", response.Status)
 	}
-	if authorityKey, err := openPrivateLocalServingStoreBinding(filepath.Join(filepath.Dir(accountsDir), ".store-authority-key")); err != nil {
-		return fmt.Errorf("validate local serving-store authority key: %w", err)
-	} else {
-		_ = authorityKey.Close()
+	schema := localServingStoreSchemaV1
+	if effectiveSocket != "" {
+		schema = localServingStoreSchema
 	}
-	payload, err := json.Marshal(localServingStoreBinding{Schema: localServingStoreSchema, AccountsDir: accountsDir})
+	socketIdentity := ""
+	if effectiveSocket != "" {
+		socketIdentity, err = localDataSocketIdentity(effectiveSocket)
+		if err != nil {
+			return fmt.Errorf("capture local data socket identity: %w", err)
+		}
+	}
+	payload, err := json.Marshal(localServingStoreBinding{Schema: schema, AccountsDir: accountsDir, LocalDataSocket: effectiveSocket, LocalDataSocketIdentity: socketIdentity})
 	if err != nil {
 		return err
 	}
@@ -206,6 +262,56 @@ func bindLocalServingStoreIfCurrent(
 		return fmt.Errorf("sync serving-store binding directory: %w", err)
 	}
 	fmt.Fprintf(out, "Local CLI bound to serving state %s\n", canonicalStateDir)
+	return nil
+}
+
+func authenticateLocalDataStore(ctx context.Context, client *http.Client, baseURL string, store accounts.CodexStore) error {
+	var nonceBytes [32]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		return err
+	}
+	nonce := hex.EncodeToString(nonceBytes[:])
+	requestProof, err := accounts.ExistingStoreHandshakeRequestProof(store.Dir, nonce)
+	if err != nil {
+		return err
+	}
+	target, err := url.Parse(baseURL)
+	if err != nil {
+		return err
+	}
+	target.Path = proxy.StoreHandshakePath
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set(accounts.StoreHandshakeNonceHeader, nonce)
+	request.Header.Set(accounts.StoreHandshakeRequestHeader, requestProof)
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("store handshake failed: %s", response.Status)
+	}
+	var payload struct {
+		StoreID string `json:"account_store_id"`
+		Proof   string `json:"account_store_proof"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&payload); err != nil {
+		return err
+	}
+	expectedID, err := accounts.StoreAuthorityID(store.Dir)
+	if err != nil {
+		return err
+	}
+	expectedProof, err := accounts.ExistingStoreHandshakeResponseProof(store.Dir, nonce)
+	if err != nil {
+		return err
+	}
+	if payload.StoreID != expectedID || !hmac.Equal([]byte(payload.Proof), []byte(expectedProof)) {
+		return errors.New("local data socket serves a different account store")
+	}
 	return nil
 }
 
@@ -265,6 +371,16 @@ func parseLocalServingStoreExpectation(args []string) (localServingStoreExpectat
 				return expectation, errors.New("--if-current-mode must be an octal private-file mode")
 			}
 			expectation.Mode = os.FileMode(mode)
+		case "--local-data-socket":
+			if index+1 >= len(args) {
+				return expectation, errors.New("--local-data-socket requires a value")
+			}
+			index++
+			socket, err := validatePrivateLocalDataSocket(args[index])
+			if err != nil {
+				return expectation, fmt.Errorf("--local-data-socket: %w", err)
+			}
+			expectation.LocalDataSocket = socket
 		default:
 			return expectation, fmt.Errorf("unknown bind-state option %q", args[index])
 		}

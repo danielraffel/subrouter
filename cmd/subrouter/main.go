@@ -321,6 +321,7 @@ func isDirectSRCommand(command string) bool {
 func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := flags.String("addr", "127.0.0.1:31415", "listen address")
+	localDataSocket := flags.String("local-data-socket", "", "private mode-0600 Unix socket for local credential-bearing requests")
 	upstreamRaw := flags.String("upstream", "", "force one upstream base URL for all accounts")
 	codexUpstreamRaw := flags.String("codex-upstream", "https://chatgpt.com/backend-api/codex", "Codex subscription upstream base URL")
 	apiUpstreamRaw := flags.String("api-upstream", "https://api.openai.com", "OpenAI API-key upstream base URL")
@@ -779,6 +780,7 @@ func serve(args []string) error {
 		QwenTokenUpstream:        qwenTokenUpstream,
 		QwenAnthropicUpstream:    qwenAnthropicUpstream,
 		AntigravityUpstream:      antigravityUpstream,
+		LegacyStoreAttestation:   strings.TrimSpace(*localDataSocket) == "" && !envTrue("SUBROUTER_PRIVATE_DATA_ROUTER"),
 		Accounts:                 nil,
 		AccountRef:               accountRef,
 		CredentialBroker:         credentialBroker,
@@ -957,6 +959,7 @@ func serve(args []string) error {
 	httpServer := &http.Server{
 		Addr:              *addr,
 		Handler:           multiTenantHandler.Handler(server.Handler()),
+		ConnContext:       proxy.LocalDataConnContext,
 		ReadHeaderTimeout: 10 * time.Second,
 		// Bound how long an idle client connection can pin this worker. The
 		// supervisor's drain waits for a retired generation's connections to
@@ -976,7 +979,7 @@ func serve(args []string) error {
 	} else {
 		slog.Info("subrouter listening", "addr", *addr, "codex_upstream", codexUpstream.String(), "api_upstream", apiUpstream.String(), "claude_upstream", claudeUpstream.String(), "codex_accounts", len(codexAccounts), "claude_accounts", len(claudeAccounts), "cloud_team", cloudConfig.TeamID, "transcripts", *transcriptDir, "transcript_gcs_uri", *transcriptGCSURI)
 	}
-	return listenAndServeWithSignals(httpServer, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
+	return listenAndServeWithSignalsAndLocalSocket(httpServer, *localDataSocket, server.Lifecycle, *shutdownTimeout, slog.Default(), stopActiveGenerationTasks)
 }
 
 func schedulerAccountsByProvider(all []accounts.Account) (codex, claude []accounts.Account) {
@@ -1233,7 +1236,86 @@ func numericAWSProfileSuffix(name string) (int, bool) {
 // Retired generations still drain once their load-balancer connections expire.
 const workerIdleTimeout = 620 * time.Second
 
+func listenAndServeWithSignalsAndLocalSocket(server *http.Server, socket string, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, stopActiveGenerationTasks ...func()) error {
+	socket = filepath.Clean(strings.TrimSpace(socket))
+	if socket == "." || socket == "" {
+		return listenAndServeWithSignals(server, lifecycle, shutdownTimeout, logger, stopActiveGenerationTasks...)
+	}
+	listener, err := openPrivateLocalDataListener(socket)
+	if err != nil {
+		return fmt.Errorf("local-data-socket: %w", err)
+	}
+	defer func() {
+		_ = listener.Close()
+	}()
+	localErrCh := make(chan error, 1)
+	go func() {
+		serveErr := server.Serve(listener)
+		if errors.Is(serveErr, http.ErrServerClosed) || errors.Is(serveErr, net.ErrClosed) {
+			serveErr = nil
+		}
+		localErrCh <- serveErr
+	}()
+	return listenAndServeWithSignalsExtra(server, lifecycle, shutdownTimeout, logger, localErrCh, stopActiveGenerationTasks...)
+}
+
+func openPrivateLocalDataListener(socket string) (net.Listener, error) {
+	if !filepath.IsAbs(socket) || socket == string(filepath.Separator) {
+		return nil, errors.New("path must be absolute")
+	}
+	parent, err := validatePrivateLocalServingStorePath(filepath.Dir(socket), true)
+	if err != nil || parent != filepath.Dir(socket) {
+		return nil, errors.New("parent must be canonical, current-user-owned, and not group/world writable")
+	}
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := acquireLocalDataSocketLease(socket)
+	if err != nil {
+		return nil, err
+	}
+	releaseLease := true
+	defer func() {
+		if releaseLease {
+			_ = lease.Close()
+		}
+	}()
+	if !lease.parentMatches(parentInfo) {
+		return nil, errors.New("local data socket parent changed during lease acquisition")
+	}
+	if err := lease.removeStaleSocket(); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		return nil, err
+	}
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
+	if currentParent, err := os.Stat(parent); err != nil || !lease.parentMatches(currentParent) {
+		_ = listener.Close()
+		return nil, errors.New("local data socket parent changed during listener creation")
+	}
+	if err := unixFchmodatLocalDataSocket(lease, 0o600); err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	owned, err := wrapOwnedLocalDataListener(listener, socket, lease)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	releaseLease = false
+	return owned, nil
+}
+
 func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, stopActiveGenerationTasks ...func()) error {
+	return listenAndServeWithSignalsExtra(server, lifecycle, shutdownTimeout, logger, nil, stopActiveGenerationTasks...)
+}
+
+func listenAndServeWithSignalsExtra(server *http.Server, lifecycle *proxy.Lifecycle, shutdownTimeout time.Duration, logger *slog.Logger, extraErrCh <-chan error, stopActiveGenerationTasks ...func()) error {
 	errCh := make(chan error, 1)
 	go func() {
 		err := listenAndServeHTTP(server, logger)
@@ -1255,6 +1337,12 @@ func listenAndServeWithSignals(server *http.Server, lifecycle *proxy.Lifecycle, 
 		select {
 		case err := <-errCh:
 			return err
+		case err := <-extraErrCh:
+			if err != nil {
+				_ = server.Close()
+				return fmt.Errorf("private local data listener: %w", err)
+			}
+			return nil
 		case sig := <-sigCh:
 			if retireSignal != nil && sig == retireSignal {
 				// Retired by the supervisor: a newer generation now owns new
@@ -1734,7 +1822,7 @@ Usage:
   %[1]s gemini             Manage Gemini profiles (routing scaffold only)
 
   %[1]s serve [--addr 127.0.0.1:31415] [--fetch-usage=true] [--multi-tenant] [--codex-upstream URL] [--claude-upstream URL] [--kimi-upstream URL] [--zai-upstream URL] [--openrouter-upstream URL] [--deepseek-upstream URL] [--together-upstream URL] [--fireworks-upstream URL] [--opencode-zen-upstream URL] [--grok-upstream URL] [--grok-subscription-upstream URL] [--qwen-upstream URL] [--qwen-token-upstream URL] [--qwen-anthropic-upstream URL] [--antigravity-upstream URL] [--openai-compatible name=URL] [--transcripts DIR] [--transcript-gcs-uri gs://bucket/prefix] [--transcript-gcs-sync-timeout 30m] [--transcript-local-retention 24h] [--transcript-max-local-bytes 2GiB]
-  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
+  %[1]s supervise --worker-bin PATH [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-supervisor.sock] [--local-data-socket PATH] [--upgrade-inhibit-file PATH] [--expect-proxy-protocol] [--drain-timeout 10m] [--worker-stop-grace 30s] -- [serve flags]
   %[1]s front --backend-id ID --backend-address ADDRESS [--backend-network tcp|unix] [--addr 127.0.0.1:31415] [--control-socket /var/run/subrouter-front.sock] [--listener-transfer-socket /var/run/subrouter-front-listener.sock]
   %[1]s probe [--url http://127.0.0.1:31415]
   %[1]s accounts

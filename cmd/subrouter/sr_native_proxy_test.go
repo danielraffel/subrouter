@@ -22,6 +22,7 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
 
 func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testing.T) {
@@ -33,6 +34,7 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer upstream.Close()
+	attachPrivateLocalTestListener(t, upstream)
 
 	relay, err := startNativeProxyRelay(upstream.URL+"/t/srt_test", kimiNativeProxy, "sr-native-test-session", "local-proxy-token", "")
 	if err != nil {
@@ -212,10 +214,15 @@ func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
 
 func TestLocalStoreAttestedProxyRelayKeepsDurableTokenOutOfChildAndReattests(t *testing.T) {
 	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	initializeLocalDataTestStore(t, store)
 	var attestations atomic.Int32
 	var routed atomic.Int32
 	const durableToken = "durable-local-proxy-token-must-not-reach-child"
 	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == proxy.StoreHandshakePath {
+			writeLocalStoreAuthorityHealth(t, response, request, store, "enabled")
+			return
+		}
 		if request.URL.Path == "/_subrouter/health" {
 			challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader)
 			proof, err := accounts.StoreAuthorityProof(store.Dir, challenge)
@@ -241,9 +248,6 @@ func TestLocalStoreAttestedProxyRelayKeepsDurableTokenOutOfChildAndReattests(t *
 			http.NotFound(response, request)
 			return
 		}
-		if got, want := attestations.Load(), routed.Load()+1; got < want {
-			t.Errorf("credential-bearing request arrived before connection attestation: attestations=%d routed=%d", got, routed.Load())
-		}
 		if got := request.Header.Get("Authorization"); got != "Bearer "+durableToken {
 			t.Errorf("upstream authorization = %q", got)
 		}
@@ -261,6 +265,7 @@ func TestLocalStoreAttestedProxyRelayKeepsDurableTokenOutOfChildAndReattests(t *
 		response.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
+	attachPrivateLocalTestListener(t, upstream)
 
 	relay, err := startLocalStoreAttestedProxyRelay(
 		upstream.URL, "v1", "claude", "", durableToken, "", "claude-preferred", store,
@@ -292,8 +297,8 @@ func TestLocalStoreAttestedProxyRelayKeepsDurableTokenOutOfChildAndReattests(t *
 	if got := routed.Load(); got != 2 {
 		t.Fatalf("routed requests = %d, want 2", got)
 	}
-	if got := attestations.Load(); got != 2 {
-		t.Fatalf("store attestations = %d, want one per upstream connection", got)
+	if got := attestations.Load(); got != 0 {
+		t.Fatalf("private data channel unexpectedly requested %d public proof(s)", got)
 	}
 	relay.Close()
 	if _, err := http.Post(childURL, "application/json", strings.NewReader(`{}`)); err == nil {
@@ -393,6 +398,7 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 
 func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	localStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "local-state", "codex", "accounts")}
+	initializeLocalDataTestStore(t, localStore)
 	var accountRequests atomic.Int32
 	var pinnedRequests atomic.Int32
 	var credentialSinkRequests atomic.Int32
@@ -408,6 +414,8 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	t.Setenv("no_proxy", "")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
+		case proxy.StoreHandshakePath:
+			writeLocalStoreAuthorityHealth(t, w, request, localStore, "enabled")
 		case "/_subrouter/health":
 			authorityID, err := accounts.StoreAuthorityID(localStore.Dir)
 			if err != nil {
@@ -443,6 +451,7 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	attachPrivateLocalTestListener(t, server)
 	var toolRequests atomic.Int32
 	toolServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/tool-check" {
@@ -826,6 +835,7 @@ func TestNativeProxyServerIgnoresStaleRemoteDefaultForLocalStorage(t *testing.T)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer local.Close()
+	attachPrivateLocalTestListener(t, local)
 	var staleRequests atomic.Int32
 	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		staleRequests.Add(1)
@@ -910,6 +920,7 @@ func TestNativeProxyServerUsesReadyLocalServingAuthorityForUnselectedLegacy(t *t
 		_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 	}))
 	defer local.Close()
+	attachPrivateLocalTestListener(t, local, store)
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL)
 	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
@@ -967,7 +978,7 @@ func TestNativeProxyRejectsUnattestedLocalAuthorityBeforeInventoryOrToken(t *tes
 
 	runner := srRunner{store: store, client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	err = runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{})
-	if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+	if err == nil || (!strings.Contains(err.Error(), "published private local data socket") && !strings.Contains(err.Error(), "data-plane preflight failed")) {
 		t.Fatalf("unattested local launcher error = %v", err)
 	}
 	if nonHealthRequests.Load() != 0 {

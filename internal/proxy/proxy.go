@@ -44,6 +44,7 @@ import (
 
 // Account import states reported by /_subrouter/health.
 const (
+	StoreHandshakePath    = "/_subrouter/store-handshake"
 	AccountImportEnabled  = "enabled"
 	AccountImportDisabled = "disabled"
 
@@ -54,6 +55,30 @@ const (
 	ShadowHealthProofField      = "shadow_candidate_proof"
 	shadowHealthDomain          = "subrouter-shadow-health-v1\x00"
 )
+
+type localDataConnectionContextKey struct{}
+
+type localDataConnectionState struct {
+	authorized atomic.Bool
+}
+
+// LocalDataConnContext gives one HTTP connection a mutable authorization
+// state. A successful store handshake marks only that connection; no bearer
+// credential is copied into the launching CLI process.
+func LocalDataConnContext(ctx context.Context, _ net.Conn) context.Context {
+	return context.WithValue(ctx, localDataConnectionContextKey{}, &localDataConnectionState{})
+}
+
+func authorizeLocalDataConnection(request *http.Request) {
+	if state, ok := request.Context().Value(localDataConnectionContextKey{}).(*localDataConnectionState); ok && state != nil {
+		state.authorized.Store(true)
+	}
+}
+
+func localDataConnectionAuthorized(request *http.Request) bool {
+	state, ok := request.Context().Value(localDataConnectionContextKey{}).(*localDataConnectionState)
+	return ok && state != nil && state.authorized.Load()
+}
 
 type CredentialBroker interface {
 	Lease(context.Context, broker.LeaseRequest) (broker.Lease, error)
@@ -82,12 +107,15 @@ type Server struct {
 	// AntigravityUpstream fronts Google's cloudcode-pa endpoint, which the
 	// Antigravity CLI reaches when CLOUD_CODE_URL points at this proxy.
 	AntigravityUpstream *url.URL
-	Accounts            []accounts.Account
-	AccountRef          *AccountRef
-	Sessions            *session.Store
-	Scheduler           selectacct.Scheduler
-	SchedulerRef        *selectacct.SchedulerRef
-	UsageScoreTTL       time.Duration
+	// LegacyStoreAttestation keeps v1/direct loopback clients compatible. A
+	// supervisor with a private v2 data socket disables this public proof path.
+	LegacyStoreAttestation bool
+	Accounts               []accounts.Account
+	AccountRef             *AccountRef
+	Sessions               *session.Store
+	Scheduler              selectacct.Scheduler
+	SchedulerRef           *selectacct.SchedulerRef
+	UsageScoreTTL          time.Duration
 	// ReadyCheck gates supervisor readiness on asynchronous startup state that
 	// must be coherent before this worker may receive traffic.
 	ReadyCheck    func() error
@@ -1769,6 +1797,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/internal/v1/session-leases", s.requireSessionLeaseAdmin(s.handleSessionLeases))
 	mux.HandleFunc("/internal/v1/session-leases/", s.requireSessionLeaseAdmin(s.handleSessionLease))
 	mux.HandleFunc("/_subrouter/health", s.handleHealth)
+	mux.HandleFunc(StoreHandshakePath, s.handleStoreHandshake)
 	mux.HandleFunc("/_subrouter/ready", s.handleReady)
 	mux.HandleFunc("/_subrouter/stream-stats", s.handleStreamStats)
 	mux.HandleFunc("/_subrouter/drain", s.requireAdmin(s.handleDrain))
@@ -1811,7 +1840,10 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		"account_import": s.AccountImportState(),
 		"auth":           s.AuthMode(),
 	}
-	if s.AccountRef != nil {
+	// Compatibility for v1 bindings and direct local daemons. v2 clients use
+	// the mutually authenticated private-socket handshake and never accept this
+	// legacy proof as a private-channel response.
+	if s.LegacyStoreAttestation && s.AccountRef != nil {
 		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
 			if proof, err := accounts.StoreAuthorityProof(s.AccountRef.store.Dir, challenge); err == nil {
 				if authorityID, idErr := accounts.StoreAuthorityID(s.AccountRef.store.Dir); idErr == nil {
@@ -1831,6 +1863,33 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		payload["azure_codex"] = names
 	}
 	writeJSON(w, payload)
+}
+
+func (s Server) handleStoreHandshake(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost || s.AccountRef == nil {
+		http.NotFound(w, request)
+		return
+	}
+	nonce := request.Header.Get(accounts.StoreHandshakeNonceHeader)
+	verified, err := accounts.VerifyStoreHandshakeRequest(
+		s.AccountRef.store.Dir, nonce, request.Header.Get(accounts.StoreHandshakeRequestHeader),
+	)
+	if err != nil || !verified {
+		http.NotFound(w, request)
+		return
+	}
+	storeID, err := accounts.StoreAuthorityID(s.AccountRef.store.Dir)
+	if err != nil {
+		http.NotFound(w, request)
+		return
+	}
+	proof, err := accounts.ExistingStoreHandshakeResponseProof(s.AccountRef.store.Dir, nonce)
+	if err != nil {
+		http.NotFound(w, request)
+		return
+	}
+	authorizeLocalDataConnection(request)
+	writeJSON(w, map[string]string{"account_store_id": storeID, "account_store_proof": proof})
 }
 
 func (s Server) shadowHealthProof(challengeHex string) (string, bool) {
@@ -3623,6 +3682,10 @@ func (s Server) requireAccountImportAuth(next func(http.ResponseWriter, *http.Re
 			next(w, r)
 			return
 		}
+		if localDataConnectionAuthorized(r) {
+			next(w, r)
+			return
+		}
 		if s.matchesConfiguredAccountImportToken(r) || s.matchesConfiguredAdminToken(r) {
 			next(w, r)
 			return
@@ -3664,7 +3727,7 @@ func matchesConfiguredBearerToken(r *http.Request, configuredToken, dedicatedHea
 }
 
 func (s Server) authorizeAdmin(r *http.Request) bool {
-	if isLoopbackRemote(r.RemoteAddr) {
+	if isLoopbackRemote(r.RemoteAddr) || localDataConnectionAuthorized(r) {
 		return true
 	}
 	if _, ok := s.authorizeTailnet(r); ok {

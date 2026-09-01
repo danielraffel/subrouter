@@ -26,3 +26,7 @@ func validatePrivateLocalServingStorePath(string, bool) (string, error) {
 func syncLocalServingStoreBindingDirectory(string) error {
 	return errors.New("local serving-store bindings are not supported on Windows")
 }
+
+func validatePrivateLocalDataSocket(string) (string, error) {
+	return "", errors.New("local data sockets are not supported on Windows")
+}

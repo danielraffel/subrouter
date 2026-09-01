@@ -13,7 +13,13 @@ import (
 	"strings"
 )
 
-const StoreAuthorityChallengeHeader = "X-Subrouter-Store-Challenge"
+const (
+	StoreAuthorityChallengeHeader = "X-Subrouter-Store-Challenge"
+	StoreHandshakeNonceHeader     = "X-Subrouter-Store-Nonce"
+	StoreHandshakeRequestHeader   = "X-Subrouter-Store-Request-Proof"
+	storeHandshakeRequestDomain   = "subrouter-store-handshake-request-v1\x00"
+	storeHandshakeResponseDomain  = "subrouter-store-handshake-response-v1\x00"
+)
 
 const storeAuthorityKeyFilename = ".store-authority-key"
 
@@ -97,6 +103,49 @@ func ExistingStoreAuthorityProof(path, challenge string) (string, error) {
 	}
 	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write(challengeBytes)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+func ExistingStoreHandshakeRequestProof(path, nonce string) (string, error) {
+	return existingStoreHandshakeProof(path, nonce, storeHandshakeRequestDomain)
+}
+
+func ExistingStoreHandshakeResponseProof(path, nonce string) (string, error) {
+	return existingStoreHandshakeProof(path, nonce, storeHandshakeResponseDomain)
+}
+
+func VerifyStoreHandshakeRequest(path, nonce, proof string) (bool, error) {
+	expected, err := ExistingStoreHandshakeRequestProof(path, nonce)
+	if err != nil {
+		return false, err
+	}
+	provided, err := hex.DecodeString(strings.TrimSpace(proof))
+	if err != nil {
+		return false, nil
+	}
+	expectedBytes, _ := hex.DecodeString(expected)
+	return hmac.Equal(provided, expectedBytes), nil
+}
+
+func existingStoreHandshakeProof(path, nonce, domain string) (string, error) {
+	nonceBytes, err := hex.DecodeString(strings.TrimSpace(nonce))
+	if err != nil || len(nonceBytes) != 32 {
+		return "", fmt.Errorf("invalid account-store handshake nonce")
+	}
+	resolved, err := resolveStoreAuthorityPath(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve account store authority: %w", err)
+	}
+	key, err := readStoreAuthorityKey(filepath.Join(filepath.Dir(resolved), storeAuthorityKeyFilename))
+	if err != nil {
+		return "", fmt.Errorf("read account store authority: %w", err)
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(domain))
+	storeDigest := sha256.Sum256([]byte("subrouter-account-store-v1\x00" + resolved))
+	_, _ = mac.Write([]byte(hex.EncodeToString(storeDigest[:])))
+	_, _ = mac.Write([]byte("\x00POST\x00/_subrouter/store-handshake\x00"))
+	_, _ = mac.Write(nonceBytes)
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
