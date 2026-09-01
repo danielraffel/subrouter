@@ -388,6 +388,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		var server srServerConfig
 		var err error
 		routeToServingAPI := true
+		localServingAuthority := source == broker.CredentialSourceLocal
 		if source == broker.CredentialSourceLocal {
 			server, err = r.readyLocalServingServer(ctx, defaultDaemonStarter())
 			if err != nil {
@@ -423,6 +424,16 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 				if err != nil {
 					return err
 				}
+				localServingAuthority = true
+			}
+		}
+		if localServingAuthority && source == broker.CredentialSourceLegacy && localOnboardingCommand(args) {
+			authority, matchErr := r.localServingStoreAuthority(ctx, server)
+			if matchErr != nil {
+				return matchErr
+			}
+			if !authority.storeMatches {
+				return fmt.Errorf("local proxy account store does not match this CLI; set SUBROUTER_STATE_DIR to the daemon's state root or select it as a named authenticated remote")
 			}
 		}
 		if routeToServingAPI {

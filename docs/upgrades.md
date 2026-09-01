@@ -135,13 +135,35 @@ one of three credential layouts:
 
 #### Optional shadow rehearsal before activation
 
-For a sensitive or heavily used deployment, first run the exact candidate
-binary and candidate state as a disposable shadow on a non-live listener. This
-adds a few minutes, but catches provider-auth, routing, pin/failover, resume,
-and configuration errors without interrupting existing sessions. Record the
-candidate SHA and hashes, run the same authenticated functional legs intended
-for activation, then stop the shadow and prove its process, listener, temporary
-state, and logs are absent.
+For a sensitive or heavily used deployment, first run the exact candidate as a
+disposable shadow on an unused loopback listener. The host-neutral helper pins
+the candidate by SHA-256 into a private temporary workspace, gives a preparation
+callback that workspace's isolated state directory, starts `serve`, waits for
+health and readiness, and runs the authenticated canary callback. It then stops
+the complete process group, removes its state and logs, proves the process,
+listener, and workspace are absent, and prints one bounded JSON evidence record:
+
+```bash
+candidate=/absolute/path/subrouter
+candidate_sha256="$(shasum -a 256 "$candidate" | awk '{print $1}')"
+deploy/run-shadow-rehearsal.py \
+  --candidate "$candidate" \
+  --candidate-sha256 "$candidate_sha256" \
+  --addr 127.0.0.1:UNUSED_PORT \
+  --prepare-callback /private/prepare-shadow-state \
+  --canary-callback /private/run-shadow-canary \
+  --serve-args-json /private/shadow-serve-args.json
+```
+
+Both callbacks are invoked directly without a shell. They receive
+`SUBROUTER_SHADOW_WORKSPACE`, `SUBROUTER_SHADOW_STATE_DIR`,
+`SUBROUTER_SHADOW_CANDIDATE_PATH`, `SUBROUTER_SHADOW_BASE_URL`, and the exact
+candidate SHA in `SUBROUTER_SHADOW_CANDIDATE_SHA256`. The optional serve-args
+file is a JSON array of argument strings after `serve`; it cannot replace
+`serve` or `--addr`. Success requires `"ok":true` and every field under
+`"teardown"` to be true. A callback failure or signal still runs teardown and
+returns nonzero evidence. SIGKILL cannot run any userspace cleanup handler, so
+after an unclean host interruption verify the recorded listener before retrying.
 
 Shadow rehearsal and live rollback are complementary, not substitutes. A
 passing shadow is a recommended high-assurance activation gate for sensitive

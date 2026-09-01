@@ -239,6 +239,9 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 	if model := qwenProxyModel(vendorArgs); strings.Contains(model, ":") {
 		return errors.New("provider-qualified Qwen models can bypass the routed Token Plan provider; use an unqualified Token Plan model ID")
 	}
+	if qwenProxyBundledShortOptionRequested(vendorArgs, "s") {
+		return errors.New("-s controls Qwen routing and cannot be used with 'sr qwen'")
+	}
 	for i := 0; i < len(vendorArgs); i++ {
 		if vendorArgs[i] == "--" {
 			break
@@ -256,6 +259,9 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 }
 
 func qwenProxyPersistentSessionRequested(args []string) bool {
+	if qwenProxyBundledShortOptionRequested(args, "cr") {
+		return true
+	}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -271,6 +277,58 @@ func qwenProxyPersistentSessionRequested(args []string) bool {
 			if i+1 < len(args) {
 				i++
 			}
+		}
+	}
+	return false
+}
+
+// Qwen 0.22.3 uses yargs short-option groups, so tokens such as -cy and
+// -sc activate --continue/--sandbox even though neither token equals the
+// individual alias. Scan only pre-delimiter option tokens and preserve the
+// value-skipping behavior used by the launcher argument scanners.
+func qwenProxyBundledShortOptionRequested(args []string, restricted string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		if qwenBundledShortOptionContains(arg, restricted) {
+			return true
+		}
+		switch arg {
+		case "-m", "--model", "--fallback-model", "-p", "--prompt", "-i", "--prompt-interactive",
+			"-o", "--output-format", "--auth-type", "--openai-api-key", "--openai-base-url", "--proxy":
+			if i+1 < len(args) {
+				i++
+			}
+		}
+	}
+	return false
+}
+
+func qwenBundledShortOptionContains(arg, restricted string) bool {
+	if len(arg) <= 2 || arg[0] != '-' || arg[1] == '-' {
+		return false
+	}
+	bundle := arg[1:]
+	if separator := strings.IndexByte(bundle, '='); separator >= 0 {
+		bundle = bundle[:separator]
+	}
+	if len(bundle) <= 1 {
+		return false
+	}
+	for i := 0; i < len(bundle); i++ {
+		option := bundle[i]
+		if strings.ContainsRune(restricted, rune(option)) {
+			return true
+		}
+		// Qwen's value-taking short aliases consume the remaining bytes as their
+		// attached value. Do not interpret model/prompt/format text such as the
+		// "s" in -mstream as another boolean option. Resume is checked above
+		// when it is restricted; otherwise its session ID likewise ends the group.
+		switch option {
+		case 'm', 'p', 'i', 'o', 'r':
+			return false
 		}
 	}
 	return false
@@ -414,9 +472,18 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 }
 
 func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, args []string, options nativeProxyLaunchOptions) error {
-	server, _, err := r.nativeProxyServer(ctx)
+	server, remote, err := r.nativeProxyServer(ctx)
 	if err != nil {
 		return err
+	}
+	if !remote {
+		authority, authorityErr := r.localServingStoreAuthority(ctx, server)
+		if authorityErr != nil {
+			return fmt.Errorf("verify local %s proxy authority: %w", spec.display, authorityErr)
+		}
+		if !authority.storeMatches {
+			return fmt.Errorf("local proxy account store does not match this CLI; no %s account inventory or proxy credential was sent", spec.display)
+		}
 	}
 	root, err := secureNativeProxyRoot(ctx, server)
 	if err != nil {

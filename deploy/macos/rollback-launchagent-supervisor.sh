@@ -28,8 +28,19 @@ ROLLBACK_ARTIFACT_SHAS=()
 ROLLBACK_ARTIFACT_MODES=()
 
 usage() {
-  echo "usage: $0 --backup PLIST --backup-sha256 SHA --rollback-artifact DEST ARTIFACT SHA MODE [--public-addr HOST:PORT] [--expected-program PATH] [--expected-running-program PATH]" >&2
-  exit 2
+  local status="${1:-2}" destination=/dev/stderr
+  [ "$status" -ne 0 ] || destination=/dev/stdout
+  cat >"$destination" <<EOF
+usage: $0 --backup PLIST --backup-sha256 SHA \\
+  --rollback-artifact DEST ARTIFACT SHA MODE [--rollback-artifact ...] \\
+  [--public-addr HOST:PORT] [--expected-program PATH] \\
+  [--expected-running-program PATH]
+
+Restore the identity-checked legacy LaunchAgent only after proving the loaded
+service, captured process, and public listener are absent. Use the complete
+command printed by a successful supervised activation.
+EOF
+  exit "$status"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -47,7 +58,7 @@ while [ "$#" -gt 0 ]; do
     --public-addr) [ "$#" -ge 2 ] || usage; PUBLIC_ADDR_OVERRIDE="$2"; shift 2 ;;
     --expected-running-program)
       [ "$#" -ge 2 ] || usage; EXPECTED_RUNNING_PROGRAM="$2"; shift 2 ;;
-    -h|--help) usage ;;
+    -h|--help) usage 0 ;;
     *) usage ;;
   esac
 done

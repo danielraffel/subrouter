@@ -1359,6 +1359,65 @@ func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
 	}
 }
 
+func TestLegacyLocalServingDaemonRejectsUnattestedOnboardingBeforeCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	otherStore := accounts.CodexStore{Dir: filepath.Join(home, "rogue-state", "codex", "accounts")}
+	otherAuthority, err := accounts.StoreAuthorityID(otherStore.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			nonHealthRequests.Add(1)
+			http.Error(w, "credential sink", http.StatusUnauthorized)
+			return
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			var proofErr error
+			proof, proofErr = accounts.StoreAuthorityProof(otherStore.Dir, challenge)
+			if proofErr != nil {
+				t.Fatal(proofErr)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, otherAuthority, proof)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
+		// No selected remote: this entry exists only to prove a matching legacy
+		// credential is not sent before local store attestation.
+		file.Servers = []srServerConfig{{Name: "unselected-local", URL: server.URL, AdminToken: "must-not-be-sent"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-must-not-be-sent\n"), out: io.Discard, errOut: io.Discard,
+		client: server.Client(),
+	}
+	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
+	if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+		t.Fatalf("unattested legacy-local onboarding error = %v", err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("unattested legacy-local listener received %d credential-bearing request(s)", nonHealthRequests.Load())
+	}
+	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
+		t.Fatalf("unattested legacy-local onboarding mutated CLI store: found=%t err=%v", ok, findErr)
+	}
+}
+
 func TestProtectedLocalServingDaemonKeepsOnboardingOnHTTPAuthority(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -295,6 +296,7 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 }
 
 func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
+	localStore := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "local-state", "codex", "accounts")}
 	var accountRequests atomic.Int32
 	var pinnedRequests atomic.Int32
 	var credentialSinkRequests atomic.Int32
@@ -311,7 +313,18 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health":
-			w.WriteHeader(http.StatusOK)
+			authorityID, err := accounts.StoreAuthorityID(localStore.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(localStore.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 		case "/":
 			if request.Method != http.MethodHead {
 				t.Errorf("data-plane preflight method = %s", request.Method)
@@ -383,7 +396,7 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	t.Setenv("SUBROUTER_TEST_TOOL_URL", toolServer.URL+"/tool-check")
 	t.Setenv("QWEN_CODE_RELAUNCH_ARGS", `["--model","direct-relaunch-model","--openai-api-key","direct-relaunch-secret"]`)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	runner := srRunner{client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	runner := srRunner{store: localStore, client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -672,6 +685,52 @@ func TestNativeProxyServerUsesReadyLocalServingAuthorityForUnselectedLegacy(t *t
 	}
 	if localRequests.Load() == 0 {
 		t.Fatal("unselected legacy authority did not health-check the local daemon")
+	}
+}
+
+func TestNativeProxyRejectsUnattestedLocalAuthorityBeforeInventoryOrToken(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	otherStore := accounts.CodexStore{Dir: filepath.Join(home, "rogue-state", "codex", "accounts")}
+	otherAuthority, err := accounts.StoreAuthorityID(otherStore.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			nonHealthRequests.Add(1)
+			http.Error(w, "credential sink", http.StatusUnauthorized)
+			return
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			var proofErr error
+			proof, proofErr = accounts.StoreAuthorityProof(otherStore.Dir, challenge)
+			if proofErr != nil {
+				t.Fatal(proofErr)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, otherAuthority, proof)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+		LocalProxyToken:  "must-not-be-sent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{store: store, client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	err = runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{})
+	if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+		t.Fatalf("unattested local launcher error = %v", err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("unattested local listener received %d inventory or credential-bearing request(s)", nonHealthRequests.Load())
 	}
 }
 
@@ -1334,7 +1393,7 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 }
 
 func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
-	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}, {"--", "--proxy", "http://proxy.invalid"}, {"--fallback-model", "direct-model"}, {"--fallback-model=direct-model"}, {"-s"}, {"--sandbox"}, {"--sandbox=true"}} {
+	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}, {"--", "--proxy", "http://proxy.invalid"}, {"--fallback-model", "direct-model"}, {"--fallback-model=direct-model"}, {"-s"}, {"-sy"}, {"-ys"}, {"--sandbox"}, {"--sandbox=true"}} {
 		err := (srRunner{}).launchQwenProxy(t.Context(), args)
 		if err == nil || !strings.Contains(err.Error(), "controls Qwen routing") {
 			t.Fatalf("routing override %q error = %v", args, err)
@@ -1387,6 +1446,37 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 	} {
 		if qwenProxyReloadCapableMode(args) {
 			t.Fatalf("ordinary Qwen args %q classified as reload-capable", args)
+		}
+	}
+}
+
+func TestQwenProxyBundledShortOptionsRespectAttachedValuesAndDelimiter(t *testing.T) {
+	for _, test := range []struct {
+		args       []string
+		restricted string
+	}{
+		{args: []string{"-cy"}, restricted: "cr"},
+		{args: []string{"-sc"}, restricted: "s"},
+		{args: []string{"-ys"}, restricted: "s"},
+		{args: []string{"-yrsession-id"}, restricted: "cr"},
+		{args: []string{"-smstream"}, restricted: "s"},
+	} {
+		if !qwenProxyBundledShortOptionRequested(test.args, test.restricted) {
+			t.Fatalf("bundled Qwen option %q did not activate one of %q", test.args, test.restricted)
+		}
+	}
+
+	for _, args := range [][]string{
+		{"-mstream"},
+		{"-pfancy"},
+		{"-icontinue"},
+		{"-ostream"},
+		{"-ymstream"},
+		{"-p", "-cy"},
+		{"--", "-cy"},
+	} {
+		if qwenProxyBundledShortOptionRequested(args, "scr") {
+			t.Fatalf("Qwen attached value or post-delimiter data %q was treated as a bundled routing option", args)
 		}
 	}
 }
@@ -1474,7 +1564,7 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 			t.Fatalf("explicit/non-option resume %q was rejected", args)
 		}
 	}
-	for _, args := range [][]string{{"--resume"}, {"--resume", "session-id"}, {"--resume=session-id"}, {"-r=session-id"}, {"--continue"}, {"--continue=true"}, {"-c"}} {
+	for _, args := range [][]string{{"--resume"}, {"--resume", "session-id"}, {"--resume=session-id"}, {"-r=session-id"}, {"--continue"}, {"--continue=true"}, {"-c"}, {"-cy"}, {"-yc"}, {"-sc"}, {"-cs"}, {"-yr"}} {
 		if !qwenProxyPersistentSessionRequested(args) {
 			t.Fatalf("persistent session %q was not detected", args)
 		}
@@ -1482,7 +1572,7 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 			t.Fatalf("persistent session %q launch error = %v", args, err)
 		}
 	}
-	for _, args := range [][]string{{"-p", "--continue"}, {"--", "--resume", "session-id"}} {
+	for _, args := range [][]string{{"-p", "--continue"}, {"-p", "-cy"}, {"--prompt=-cy"}, {"--", "--resume", "session-id"}, {"--", "-cy"}} {
 		if qwenProxyPersistentSessionRequested(args) {
 			t.Fatalf("non-option session text %q was rejected", args)
 		}

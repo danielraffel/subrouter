@@ -42,14 +42,21 @@ func removePrivateProxyEntryAt(parentFD int, name string) error {
 		return nil
 	}
 
-	// The CLI may create mode-000 directories. Restore owner access without
-	// following a last-component symlink, then open the directory the same way.
-	if err := unix.Fchmodat(parentFD, name, 0o700, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("restore private proxy directory %q: %w", name, err)
-	}
 	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 	if err != nil {
-		return fmt.Errorf("open private proxy directory %q: %w", name, err)
+		// A child may create a mode-000 directory. Only that exceptional path
+		// needs a name-relative permission repair; ordinary cleanup must not
+		// depend on Linux's newer fchmodat2 implementation.
+		if !errors.Is(err, unix.EACCES) && !errors.Is(err, unix.EPERM) {
+			return fmt.Errorf("open private proxy directory %q: %w", name, err)
+		}
+		if chmodErr := unix.Fchmodat(parentFD, name, 0o700, unix.AT_SYMLINK_NOFOLLOW); chmodErr != nil {
+			return fmt.Errorf("restore private proxy directory %q: %w", name, chmodErr)
+		}
+		fd, err = unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return fmt.Errorf("open repaired private proxy directory %q: %w", name, err)
+		}
 	}
 	var opened unix.Stat_t
 	if err := unix.Fstat(fd, &opened); err != nil {
@@ -59,6 +66,10 @@ func removePrivateProxyEntryAt(parentFD int, name string) error {
 	if !samePrivateProxyNode(before, opened) {
 		unix.Close(fd)
 		return fmt.Errorf("private proxy directory %q changed during cleanup", name)
+	}
+	if err := unix.Fchmod(fd, 0o700); err != nil {
+		unix.Close(fd)
+		return fmt.Errorf("restore opened private proxy directory %q: %w", name, err)
 	}
 	if err := removePrivateProxyDirectoryContents(fd); err != nil {
 		return fmt.Errorf("remove private proxy directory %q: %w", name, err)

@@ -41,6 +41,13 @@ cleanup_launchagent_test() {
 }
 trap cleanup_launchagent_test EXIT INT TERM
 
+rollback_help="$($ROLLBACK --help)"
+case "$rollback_help" in
+  *'--rollback-artifact DEST ARTIFACT SHA MODE'*'identity-checked legacy LaunchAgent'*) ;;
+  *) echo "rollback --help did not describe the required identity inputs" >&2; exit 1 ;;
+esac
+echo "PASS rollback --help is self-describing and exits zero"
+
 mkdir -p "$TMP/bin" "$TMP/home/Library/LaunchAgents" "$TMP/home/.subrouter" "$TMP/home/.subrouter-retiring"
 
 cat >"$TMP/bin/launchctl" <<'SH'
