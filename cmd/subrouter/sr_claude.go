@@ -528,11 +528,9 @@ func (r srRunner) proxyClaudeArgsTo(
 		if upstreamToken == "" {
 			upstreamToken = "subrouter"
 		}
-		relay, relayErr := startLocalStoreAttestedProxyRelayWithResolvers(
+		relay, relayErr := startLocalServingProxyRelay(
 			codexProxyRootURL(baseURL), "v1", "claude", "", upstreamToken,
-			accountID, preferredAccountID,
-			func() (accounts.CodexStore, error) { return r.store, nil },
-			localServingStoreResolver(r.store),
+			accountID, preferredAccountID, r.store,
 		)
 		if relayErr != nil {
 			return fmt.Errorf("start local Claude proxy relay: %w", relayErr)

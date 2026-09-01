@@ -612,11 +612,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 		// Build the connection-attesting transport before the durable local
 		// data-plane token is loaded. Its DialContext proves every connection
 		// before a credential-bearing request can leave this process.
-		relayTransport, err = localStoreAttestedRelayTransportWithResolvers(
-			root,
-			func() (accounts.CodexStore, error) { return r.store, nil },
-			localServingStoreResolver(r.store),
-		)
+		relayTransport, err = localServingRelayTransport(root, r.store)
 	}
 	if err != nil {
 		return fmt.Errorf("secure %s proxy relay transport: %w", spec.display, err)
@@ -1133,6 +1129,34 @@ func localServingStoreResolver(store accounts.CodexStore) func() (accounts.Codex
 	return func() (accounts.CodexStore, error) { return localServingStore(store) }
 }
 
+func localServingRelayTransport(targetRoot string, bindingStore accounts.CodexStore) (*http.Transport, error) {
+	binding, found, err := readLocalServingStoreBinding(bindingStore)
+	if err != nil {
+		return nil, err
+	}
+	private := strings.TrimSpace(os.Getenv("SUBROUTER_LOCAL_DATA_SOCKET")) != "" ||
+		strings.TrimSpace(os.Getenv("SUBROUTER_STATE_DIR")) != "" ||
+		(found && binding.Schema == localServingStoreSchema)
+	if private {
+		return localStoreAttestedRelayTransportWithResolvers(
+			targetRoot,
+			func() (accounts.CodexStore, error) { return bindingStore, nil },
+			localServingStoreResolver(bindingStore),
+		)
+	}
+	client, err := newLegacyLocalStoreAttestedClientWithResolver(
+		&http.Client{Timeout: 15 * time.Second}, targetRoot, localServingStoreResolver(bindingStore),
+	)
+	if err != nil {
+		return nil, err
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		return nil, errors.New("legacy local proxy relay requires a direct attested HTTP transport")
+	}
+	return transport, nil
+}
+
 func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken, forcedAccountID string) (*nativeProxyRelay, error) {
 	transport, err := nativeProxyRelayTransport(targetRoot)
 	if err != nil {
@@ -1185,6 +1209,23 @@ func startLocalStoreAttestedProxyRelayWithResolvers(
 	resolveServingStore func() (accounts.CodexStore, error),
 ) (*nativeProxyRelay, error) {
 	transport, err := localStoreAttestedRelayTransportWithResolvers(targetRoot, resolveBindingStore, resolveServingStore)
+	if err != nil {
+		return nil, fmt.Errorf("secure local proxy target transport: %w", err)
+	}
+	return startProxyRelay(targetRoot, route, agent, sessionID, proxyToken, forcedAccountID, preferredAccountID, "", "", transport)
+}
+
+func startLocalServingProxyRelay(
+	targetRoot string,
+	route string,
+	agent string,
+	sessionID string,
+	proxyToken string,
+	forcedAccountID string,
+	preferredAccountID string,
+	bindingStore accounts.CodexStore,
+) (*nativeProxyRelay, error) {
+	transport, err := localServingRelayTransport(targetRoot, bindingStore)
 	if err != nil {
 		return nil, fmt.Errorf("secure local proxy target transport: %w", err)
 	}

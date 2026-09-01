@@ -121,6 +121,45 @@ func TestLegacyV1ServingBindingFailsClosedForCredentialChannel(t *testing.T) {
 	}
 }
 
+func TestLocalServingRelayUsesLegacyAttestationForV1Binding(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	stateDir := filepath.Join(home, "legacy-state")
+	if err := os.MkdirAll(filepath.Join(stateDir, "codex", "accounts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalServingStoreBinding(t, store, stateDir)
+	servingStore, err := localServingStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			writeLocalStoreAuthorityHealth(t, w, request, servingStore, "enabled")
+			return
+		}
+		if request.URL.Path == "/protected" {
+			_, _ = io.WriteString(w, "ok")
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer server.Close()
+
+	transport, err := localServingRelayTransport(server.URL, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := (&http.Client{Transport: transport}).Get(server.URL + "/protected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("legacy relay status = %d", response.StatusCode)
+	}
+}
+
 func TestLocalServingStoreRejectsUnsafeBinding(t *testing.T) {
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}

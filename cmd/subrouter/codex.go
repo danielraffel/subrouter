@@ -58,11 +58,8 @@ func codex(args []string) error {
 		// Construct the store-attesting transport before reading the durable
 		// daemon credential. Its DialContext proves every connection before the
 		// relay can send a credential-bearing request on that connection.
-		defaultStore := accounts.DefaultCodexStore()
-		localRelayTransport, err = localStoreAttestedRelayTransportWithResolvers(
-			codexProxyRootURL(baseURL),
-			func() (accounts.CodexStore, error) { return defaultStore, nil },
-			localServingStoreResolver(defaultStore),
+		localRelayTransport, err = localServingRelayTransport(
+			codexProxyRootURL(baseURL), accounts.DefaultCodexStore(),
 		)
 		if err != nil {
 			return fmt.Errorf("secure local Codex relay transport: %w", err)
