@@ -152,6 +152,26 @@ func TestAntigravityMissingModelPoolRemainsOptimisticallyEligible(t *testing.T) 
 	}
 }
 
+func TestHasModelPoolForScopesIdenticalPoolNamesByProvider(t *testing.T) {
+	claude := ScoreFromLimitWindows("claude", 0, []LimitWindow{{Name: "model", Feature: "claude-sonnet-4.5"}})
+	claude.Provider = account.ProviderClaude
+	agy := ScoreFromLimitWindows("agy", 0, []LimitWindow{{Name: "family", Feature: "claude-gpt"}})
+	agy.Provider = account.ProviderAntigravity
+	scheduler := NewScheduler([]Score{claude, agy})
+	if !scheduler.HasModelPool("claude-sonnet-4.5") {
+		t.Fatal("existing global HasModelPool behavior changed")
+	}
+	if !scheduler.HasModelPoolFor(account.ProviderClaude, "claude-sonnet-4.5") {
+		t.Fatal("Claude exact pool was not found")
+	}
+	if scheduler.HasModelPoolFor(account.ProviderAntigravity, "claude-sonnet-4.5") {
+		t.Fatal("Claude exact pool leaked into Antigravity")
+	}
+	if !scheduler.HasModelPoolFor(account.ProviderAntigravity, "claude-gpt") {
+		t.Fatal("Antigravity family pool was not found")
+	}
+}
+
 func TestScoreExcludesFeatureWindowsFromBase(t *testing.T) {
 	// An exhausted Spark pool must not drag down the base score used for regular
 	// models. This is an intended behavior change to the regular selection path.

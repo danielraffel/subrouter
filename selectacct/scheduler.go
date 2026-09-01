@@ -132,6 +132,28 @@ func (s Scheduler) HasModelPool(model string) bool {
 	return key != "" && s.hasModelScore(key)
 }
 
+// HasModelPoolFor reports whether a model pool is present within one provider's
+// scores. Pool names are not globally authoritative: two providers can expose
+// the same model spelling while grouping quota differently.
+func (s Scheduler) HasModelPoolFor(provider account.Provider, model string) bool {
+	if provider == "" {
+		provider = account.ProviderCodex
+	}
+	key := ModelKey(model)
+	if key == "" {
+		return false
+	}
+	for _, score := range s.scores {
+		if score.Provider != provider {
+			continue
+		}
+		if _, ok := score.ModelScores[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s Scheduler) hasModelScore(key string) bool {
 	for _, score := range s.scores {
 		if _, ok := score.ModelScores[key]; ok {

@@ -203,6 +203,33 @@ func TestAntigravityLegacyModelMissingOnOneAccountRemainsUnknown(t *testing.T) {
 	}
 }
 
+func TestAntigravityPoolMappingIgnoresClaudeExactPoolCollision(t *testing.T) {
+	claude := scoreFromUsageWindows(accounts.ProviderClaude, "claude", []accounts.UsageWindow{
+		{Name: "sonnet", Feature: "claude-sonnet-4.5", UsedPercent: 10},
+	})
+	exhausted := scoreFromUsageWindows(accounts.ProviderAntigravity, "agy-exhausted", []accounts.UsageWindow{
+		{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 18000},
+	})
+	healthy := scoreFromUsageWindows(accounts.ProviderAntigravity, "agy-healthy", []accounts.UsageWindow{
+		{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 20, LimitWindowSeconds: 18000},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{claude, exhausted, healthy})
+	pool := antigravityPoolModel(scheduler, "claude-sonnet-4.5")
+	if pool != "claude-gpt" {
+		t.Fatalf("AGY pool = %q, want family despite Claude exact pool", pool)
+	}
+	picked, err := scheduler.ForModel(pool).Pick([]accounts.Account{
+		{ID: "agy-exhausted", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+		{ID: "agy-healthy", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil || picked.ID != "agy-healthy" {
+		t.Fatalf("picked %+v err=%v, want healthy family account", picked, err)
+	}
+	if got := tenantCredentialLeasePoolModel(accounts.ProviderAntigravity, "claude-sonnet-4.5", scheduler); got != selectacct.ModelKey("claude-gpt") {
+		t.Fatalf("tenant pool = %q, want AGY family", got)
+	}
+}
+
 func TestAuthOnlyOAuthRefreshPreservesRequestTimeExhaustion(t *testing.T) {
 	account := accounts.Account{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity,

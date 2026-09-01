@@ -1554,7 +1554,7 @@ func antigravityFamilyPoolModel(model string) string {
 }
 
 func antigravityPoolModel(scheduler selectacct.Scheduler, model string) string {
-	if scheduler.HasModelPool(model) {
+	if scheduler.HasModelPoolFor(accounts.ProviderAntigravity, model) {
 		return model
 	}
 	return antigravityFamilyPoolModel(model)
