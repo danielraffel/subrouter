@@ -481,11 +481,11 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 	// Qwen 0.22.3's production cli-entry replaces its real argv whenever this
 	// inherited variable is non-empty. Model that boundary in an actual child:
 	// the escape marker runs only if Subrouter failed to scrub the variable.
-	if err := os.WriteFile(filepath.Join(binDir, "qwen"), []byte("#!/bin/sh\nif [ \"${SUBROUTER_TEST_QWEN_HELPER:-}\" = 1 ]; then\n  if [ -n \"${QWEN_CODE_RELAUNCH_ARGS:-}\" ]; then\n    exec \"$SUBROUTER_TEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- relaunch-escape\n  fi\n  exec \"$SUBROUTER_TEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- \"$@\"\nfi\nexit 0\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(binDir, "qwen"), []byte("#!/bin/sh\nif [ \"${SRTEST_QWEN_HELPER:-}\" = 1 ]; then\n  if [ -n \"${QWEN_CODE_RELAUNCH_ARGS:-}\" ]; then\n    exec \"$SRTEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- relaunch-escape\n  fi\n  exec \"$SRTEST_BINARY\" -test.run=^TestTeamNativeProxyQwenChild$ -- \"$@\"\nfi\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SUBROUTER_TEST_BINARY", os.Args[0])
-	t.Setenv("SUBROUTER_TEST_TOOL_URL", toolServer.URL+"/tool-check")
+	t.Setenv("SRTEST_BINARY", os.Args[0])
+	t.Setenv("SRTEST_TOOL_URL", toolServer.URL+"/tool-check")
 	t.Setenv("QWEN_CODE_RELAUNCH_ARGS", `["--model","direct-relaunch-model","--openai-api-key","direct-relaunch-secret"]`)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := srRunner{store: localStore, client: server.Client(), in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
@@ -505,7 +505,7 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 		t.Fatalf("unsupported team launch made %d account inventory request(s), want pre-exec rejection", got)
 	}
 
-	t.Setenv("SUBROUTER_TEST_QWEN_HELPER", "1")
+	t.Setenv("SRTEST_QWEN_HELPER", "1")
 	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{accountSelector: "work"}); err != nil {
 		t.Fatalf("named pinned team launch: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestTeamNativeProxyLaunchUsesBrokerForPooledAndPinnedQwen(t *testing.T) {
 }
 
 func TestTeamNativeProxyQwenChild(t *testing.T) {
-	if os.Getenv("SUBROUTER_TEST_QWEN_HELPER") != "1" {
+	if os.Getenv("SRTEST_QWEN_HELPER") != "1" {
 		return
 	}
 	if relaunch := os.Getenv("QWEN_CODE_RELAUNCH_ARGS"); relaunch != "" {
@@ -562,7 +562,7 @@ func TestTeamNativeProxyQwenChild(t *testing.T) {
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("routed Qwen request status = %d", response.StatusCode)
 	}
-	toolResponse, err := http.Get(os.Getenv("SUBROUTER_TEST_TOOL_URL"))
+	toolResponse, err := http.Get(os.Getenv("SRTEST_TOOL_URL"))
 	if err != nil {
 		t.Fatalf("direct Qwen tool request: %v", err)
 	}
