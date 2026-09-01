@@ -1138,7 +1138,18 @@ func TestSelectedLoopbackServingAPIWinsOverUnattestedLocalDisk(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health":
-			w.WriteHeader(http.StatusOK)
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 		case "/_subrouter/account-import":
 			if request.Header.Get("Authorization") != "Bearer import-token" {
 				http.Error(w, "missing import credential", http.StatusUnauthorized)
@@ -1236,7 +1247,14 @@ func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"disabled","account_store_id":%q}`, authorityID)
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"disabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 			return
 		}
 		nonHealthRequests.Add(1)
@@ -1249,7 +1267,6 @@ func TestFreshLocalServingDaemonKeepsOnboardingOnLocalCommandPath(t *testing.T) 
 	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
 	var out bytes.Buffer
 	runner := srRunner{
 		store: store, useServingAPI: true,
@@ -1293,11 +1310,21 @@ func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var nonHealthRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/_subrouter/health" {
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"disabled","account_store_id":%q}`, otherAuthority)
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				var proofErr error
+				proof, proofErr = accounts.StoreAuthorityProof(otherStore.Dir, challenge)
+				if proofErr != nil {
+					t.Fatal(proofErr)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, otherAuthority, proof)
 			return
 		}
+		nonHealthRequests.Add(1)
 		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
 	}))
 	defer server.Close()
@@ -1305,6 +1332,12 @@ func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
 	cloudPath := filepath.Join(home, "cloud.json")
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
 	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultSRServerStore(store).update(func(file *srServerFile) error {
+		file.Servers = []srServerConfig{{Name: "unattested-loopback", URL: server.URL, AccountImportToken: "must-not-be-sent"}}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1317,6 +1350,9 @@ func TestFreshLocalServingDaemonRejectsUnattestedOnboardingStore(t *testing.T) {
 	err = runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"})
 	if err == nil || !strings.Contains(err.Error(), "account store does not match") {
 		t.Fatalf("unattested onboarding error = %v", err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("unattested loopback received %d credential-bearing request(s)", nonHealthRequests.Load())
 	}
 	if _, ok, findErr := store.FindStored("openrouter:work"); findErr != nil || ok {
 		t.Fatalf("unattested onboarding mutated CLI store: found=%t err=%v", ok, findErr)
@@ -1341,7 +1377,15 @@ func TestProtectedLocalServingDaemonKeepsOnboardingOnHTTPAuthority(t *testing.T)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health":
-			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q}`, authorityID)
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				var proofErr error
+				proof, proofErr = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if proofErr != nil {
+					t.Fatal(proofErr)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"enabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 		case serverAccountImportPath:
 			importRequests.Add(1)
 			http.Error(w, "protected account import credential required", http.StatusUnauthorized)

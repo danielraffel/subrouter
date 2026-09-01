@@ -236,11 +236,14 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 	if qwenProxyPersistentSessionRequested(vendorArgs) {
 		return errors.New("Qwen resume/continue can restore a saved direct provider route and cannot be used with 'sr qwen'; start a new routed session or use plain 'qwen' for the existing direct session")
 	}
+	if model := qwenProxyModel(vendorArgs); strings.Contains(model, ":") {
+		return errors.New("provider-qualified Qwen models can bypass the routed Token Plan provider; use an unqualified Token Plan model ID")
+	}
 	for i := 0; i < len(vendorArgs); i++ {
 		if vendorArgs[i] == "--" {
 			break
 		}
-		for _, option := range []string{"--auth-type", "--openai-api-key", "--openai-base-url", "--proxy", "--fallback-model"} {
+		for _, option := range []string{"-s", "--sandbox", "--auth-type", "--openai-api-key", "--openai-base-url", "--proxy", "--fallback-model"} {
 			if vendorArgs[i] == option || strings.HasPrefix(vendorArgs[i], option+"=") {
 				return fmt.Errorf("%s controls Qwen routing and cannot be used with 'sr qwen'", option)
 			}
@@ -1083,7 +1086,7 @@ var nativeProxyRoutingEnvKeys = []string{
 	"KIMI_SECONDARY_MODEL", "KIMI_SECONDARY_EFFORT",
 	"KIMI_WEB_SEARCH_BASE_URL", "KIMI_WEB_SEARCH_API_KEY",
 	"KIMI_WEB_FETCH_BASE_URL", "KIMI_WEB_FETCH_API_KEY",
-	"QWEN_OAUTH", "QWEN_MODEL", "QWEN_CODE_SIMPLE", "QWEN_CODE_RELAUNCH_ARGS", "QWEN_DISABLED_SLASH_COMMANDS",
+	"QWEN_OAUTH", "QWEN_MODEL", "QWEN_SANDBOX", "QWEN_CODE_SIMPLE", "QWEN_CODE_RELAUNCH_ARGS", "QWEN_DISABLED_SLASH_COMMANDS",
 	"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
 	"OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
 	"BAILIAN_CODING_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY",

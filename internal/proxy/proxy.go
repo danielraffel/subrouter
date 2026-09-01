@@ -1725,7 +1725,7 @@ func normalizedCredentialBroker(value CredentialBroker) CredentialBroker {
 	return value
 }
 
-func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	payload := map[string]any{
 		"ok":             true,
 		"account_import": s.AccountImportState(),
@@ -1734,6 +1734,11 @@ func (s Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	if s.AccountRef != nil {
 		if authorityID, err := accounts.StoreAuthorityID(s.AccountRef.store.Dir); err == nil {
 			payload["account_store_id"] = authorityID
+		}
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			if proof, err := accounts.StoreAuthorityProof(s.AccountRef.store.Dir, challenge); err == nil {
+				payload["account_store_proof"] = proof
+			}
 		}
 	}
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a

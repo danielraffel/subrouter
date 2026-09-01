@@ -32,6 +32,8 @@ func TestHealthReportsAccountImportState(t *testing.T) {
 			}.Handler()
 
 			req := httptest.NewRequest(http.MethodGet, "/_subrouter/health", nil)
+			challenge := "0000000000000000000000000000000000000000000000000000000000000000"
+			req.Header.Set(accounts.StoreAuthorityChallengeHeader, challenge)
 			req.RemoteAddr = "100.64.0.20:4321"
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
@@ -40,9 +42,10 @@ func TestHealthReportsAccountImportState(t *testing.T) {
 				t.Fatalf("status = %d, want 200", resp.Code)
 			}
 			var body struct {
-				OK             bool   `json:"ok"`
-				AccountImport  string `json:"account_import"`
-				AccountStoreID string `json:"account_store_id"`
+				OK                bool   `json:"ok"`
+				AccountImport     string `json:"account_import"`
+				AccountStoreID    string `json:"account_store_id"`
+				AccountStoreProof string `json:"account_store_proof"`
 			}
 			if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
 				t.Fatalf("decode health: %v (%s)", err, resp.Body.String())
@@ -59,6 +62,13 @@ func TestHealthReportsAccountImportState(t *testing.T) {
 			}
 			if body.AccountStoreID != wantStoreID {
 				t.Fatalf("account_store_id = %q, want %q", body.AccountStoreID, wantStoreID)
+			}
+			wantProof, err := accounts.StoreAuthorityProof(store.Dir, challenge)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if body.AccountStoreProof != wantProof {
+				t.Fatalf("account_store_proof = %q, want %q", body.AccountStoreProof, wantProof)
 			}
 		})
 	}

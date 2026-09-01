@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -911,10 +913,16 @@ type localServingStoreAuthority struct {
 }
 
 func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServerConfig) (localServingStoreAuthority, error) {
+	var challengeBytes [32]byte
+	if _, err := rand.Read(challengeBytes[:]); err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("create local proxy store challenge: %w", err)
+	}
+	challenge := hex.EncodeToString(challengeBytes[:])
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(server.URL, "/")+"/_subrouter/health", nil)
 	if err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation request: %w", err)
 	}
+	request.Header.Set(accounts.StoreAuthorityChallengeHeader, challenge)
 	client := r.client
 	if client == nil {
 		client = fallbackHTTPClient()
@@ -928,8 +936,9 @@ func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServe
 		return localServingStoreAuthority{}, fmt.Errorf("local proxy store attestation failed: %s", response.Status)
 	}
 	var payload struct {
-		AccountStoreID string `json:"account_store_id"`
-		AccountImport  string `json:"account_import"`
+		AccountStoreID    string `json:"account_store_id"`
+		AccountStoreProof string `json:"account_store_proof"`
+		AccountImport     string `json:"account_import"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&payload); err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("decode local proxy store attestation: %w", err)
@@ -938,9 +947,14 @@ func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServe
 	if err != nil {
 		return localServingStoreAuthority{}, err
 	}
+	expectedProof, err := accounts.StoreAuthorityProof(r.store.Dir, challenge)
+	if err != nil {
+		return localServingStoreAuthority{}, err
+	}
+	proofMatches := hmac.Equal([]byte(strings.TrimSpace(payload.AccountStoreProof)), []byte(expectedProof))
 	return localServingStoreAuthority{
-		storeMatches:         strings.TrimSpace(payload.AccountStoreID) != "" && payload.AccountStoreID == expected,
-		accountImportEnabled: payload.AccountImport == proxy.AccountImportEnabled,
+		storeMatches:         proofMatches && strings.TrimSpace(payload.AccountStoreID) != "" && payload.AccountStoreID == expected,
+		accountImportEnabled: proofMatches && payload.AccountImport == proxy.AccountImportEnabled,
 	}, nil
 }
 

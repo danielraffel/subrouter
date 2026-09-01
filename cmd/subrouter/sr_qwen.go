@@ -43,7 +43,7 @@ Qwen console commands attach plan and quota metadata to an existing account:
   sr qwen proxy [qwen args...]
                            Backward-compatible explicit launcher alias
                            (plain qwen remains direct)
-  Qwen serve/ACP and model-bearing channel-service modes intentionally remain direct.
+  Qwen serve/ACP, model-bearing channel-service, and container sandbox modes intentionally remain direct.
 `)
 		return nil
 	}

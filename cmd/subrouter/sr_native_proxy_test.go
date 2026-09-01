@@ -712,6 +712,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	original := []string{
 		"PATH=/usr/bin", "KEEP_ME=yes", "KIMI_CODE_HOME=" + kimiSourceHome, "QWEN_HOME=/custom/qwen-home",
 		`QWEN_CODE_RELAUNCH_ARGS=["--model","direct-relaunch-model","--openai-api-key","direct-relaunch-secret"]`,
+		"QWEN_SANDBOX=1",
 		"OPENAI_API_KEY=real-openai-secret", "OPENAI_BASE_URL=https://vendor.invalid/v1",
 		"OPENAI_ORG_ID=direct-org-secret", "OPENAI_PROJECT_ID=direct-project-secret",
 		"BAILIAN_CODING_PLAN_API_KEY=real-coding-plan-secret",
@@ -739,6 +740,9 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	}
 	if got, exists := testEnvEntry(qwenEnv, "QWEN_CODE_RELAUNCH_ARGS"); exists {
 		t.Fatalf("Qwen child QWEN_CODE_RELAUNCH_ARGS = %q, want removed", got)
+	}
+	if got, exists := testEnvEntry(qwenEnv, "QWEN_SANDBOX"); exists {
+		t.Fatalf("Qwen child QWEN_SANDBOX = %q, want removed", got)
 	}
 	if got := testEnvValue(qwenEnv, "OPENAI_BASE_URL"); got != qwenProviderURL {
 		t.Fatalf("OPENAI_BASE_URL = %q", got)
@@ -1330,13 +1334,19 @@ func TestQwenProxyOverlayRefusesExistingSystemPolicy(t *testing.T) {
 }
 
 func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
-	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}, {"--", "--proxy", "http://proxy.invalid"}, {"--fallback-model", "direct-model"}, {"--fallback-model=direct-model"}} {
+	for _, args := range [][]string{{"--proxy", "http://proxy.invalid"}, {"--proxy=http://proxy.invalid"}, {"--", "--proxy", "http://proxy.invalid"}, {"--fallback-model", "direct-model"}, {"--fallback-model=direct-model"}, {"-s"}, {"--sandbox"}, {"--sandbox=true"}} {
 		err := (srRunner{}).launchQwenProxy(t.Context(), args)
 		if err == nil || !strings.Contains(err.Error(), "controls Qwen routing") {
 			t.Fatalf("routing override %q error = %v", args, err)
 		}
 		if strings.Contains(err.Error(), "proxy.invalid") || strings.Contains(err.Error(), "direct-model") {
 			t.Fatalf("routing override error exposed the supplied target: %v", err)
+		}
+	}
+	for _, args := range [][]string{{"--model", "qwen-oauth:coder-model"}, {"--model=openai:direct-model"}, {"-m=qwen-oauth:coder-model"}} {
+		err := (srRunner{}).launchQwenProxy(t.Context(), args)
+		if err == nil || !strings.Contains(err.Error(), "provider-qualified Qwen models") {
+			t.Fatalf("provider-qualified model %q error = %v", args, err)
 		}
 	}
 	for _, args := range [][]string{
