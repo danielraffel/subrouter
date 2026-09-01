@@ -280,6 +280,9 @@ def _callback_environment(
 
 
 def _run_callback(path: Path, environment: dict[str, str], log_path: Path, timeout: int) -> None:
+    # Callbacks are trusted deployment code, not a security sandbox. The marker
+    # closes accidental daemonization and ordinary setsid escapes; code that
+    # deliberately clears it already has the callback's authorized privileges.
     callback_environment = dict(environment)
     callback_run_id = secrets.token_hex(32)
     callback_environment[CALLBACK_RUN_ENV] = callback_run_id
@@ -521,8 +524,8 @@ def main() -> int:
     parser.add_argument("--candidate", required=True, help="absolute candidate executable path")
     parser.add_argument("--candidate-sha256", required=True, help="expected lowercase SHA-256")
     parser.add_argument("--addr", required=True, help="unused IPv4 loopback HOST:PORT")
-    parser.add_argument("--prepare-callback", required=True, help="absolute executable run before shadow start")
-    parser.add_argument("--canary-callback", required=True, help="absolute executable run after readiness")
+    parser.add_argument("--prepare-callback", required=True, help="trusted absolute executable run before shadow start")
+    parser.add_argument("--canary-callback", required=True, help="trusted absolute executable run after readiness")
     parser.add_argument(
         "--serve-args-json",
         help="optional JSON array of non-credential, non-persistent serve arguments",

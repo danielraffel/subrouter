@@ -74,6 +74,34 @@ func TestHealthReportsAccountImportState(t *testing.T) {
 	}
 }
 
+func TestHealthDoesNotPublishStoreIdentityWithoutAValidChallenge(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	ref := NewAccountRef(store, nil, nil)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	handler := Server{AccountRef: ref}.Handler()
+
+	for _, challenge := range []string{"", "not-a-valid-challenge"} {
+		req := httptest.NewRequest(http.MethodGet, "/_subrouter/health", nil)
+		if challenge != "" {
+			req.Header.Set(accounts.StoreAuthorityChallengeHeader, challenge)
+		}
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("challenge %q status = %d, want 200", challenge, resp.Code)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"account_store_id", "account_store_proof"} {
+			if _, ok := body[field]; ok {
+				t.Fatalf("challenge %q exposed %s: %s", challenge, field, resp.Body.String())
+			}
+		}
+	}
+}
+
 // A disabled report must mean the endpoint actually rejects imports, so the
 // health field and the authorization rule cannot drift apart.
 func TestHealthAccountImportStateMatchesAuthorization(t *testing.T) {

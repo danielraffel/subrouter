@@ -1743,12 +1743,12 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		"auth":           s.AuthMode(),
 	}
 	if s.AccountRef != nil {
-		if authorityID, err := accounts.StoreAuthorityID(s.AccountRef.store.Dir); err == nil {
-			payload["account_store_id"] = authorityID
-		}
 		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
 			if proof, err := accounts.StoreAuthorityProof(s.AccountRef.store.Dir, challenge); err == nil {
-				payload["account_store_proof"] = proof
+				if authorityID, idErr := accounts.StoreAuthorityID(s.AccountRef.store.Dir); idErr == nil {
+					payload["account_store_id"] = authorityID
+					payload["account_store_proof"] = proof
+				}
 			}
 		}
 	}

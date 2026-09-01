@@ -185,6 +185,11 @@ credential separately rather than exposing it to a disposable rehearsal.
 Callbacks run with a one-use descendant marker. Teardown drains both their
 original process group and any marked child that detached into another group;
 leaving a descendant makes the rehearsal fail.
+Callbacks are trusted deployment programs, not sandboxed input. A callback can
+already use its authorized credentials and can deliberately evade cooperative
+descendant marking by sanitizing its environment; review callback bytes and
+ownership with the same care as the candidate. The marker protects against
+ordinary and accidental daemonization, not hostile callback code.
 
 The helper creates its own one-run health key in the private workspace and gives
 only the candidate its file path. Each ownership probe sends a fresh random
