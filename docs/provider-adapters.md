@@ -14,7 +14,7 @@ its ordinary name uses Subrouter.
 | Qwen Coding Plan API key | OpenAI-compatible client at `/qwen/v1` | Labeled Coding Plan keys | Client auth removed; selected bearer added | Plain `qwen` with its normal provider | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live generation canary recorded |
 | Qwen Token Plan, OpenAI protocol | `sr qwen` (`proxy` alias); `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Pooled key failover by default; `--account` is a hard per-launch pin; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
 | Qwen Token Plan, Anthropic protocol | Anthropic client at `/qwen-anthropic` | Same Token Plan pool as OpenAI route | Client auth removed; selected plan bearer and Anthropic version added | Direct vendor Anthropic endpoint | Same sticky account and exhaustion state as `/qwen-token` | Same shared account and console telemetry | H1, H2 | No live generation canary recorded |
-| Antigravity / AGY OAuth | `sr agy` or `sr antigravity` (`proxy` aliases); `/antigravity` | Isolated profiles explicitly imported from the CLI's fixed Keychain slot with `sr agy add <label>` | Local CLI auth is stripped by loopback relay; selected router OAuth bearer added | Plain `agy` | Pooled sticky-session failover by default; `--account` is a hard per-launch pin | User label; ready/active/error; quota not exposed | H1, H2, H3, H4 | Multi-profile path hermetically tested; live multi-account canary still required |
+| Antigravity / AGY OAuth | `sr agy` or `sr antigravity` (`proxy` aliases); `/antigravity` | Isolated profiles explicitly imported from the CLI's fixed Keychain slot with `sr agy add <label>` | Local CLI auth is stripped by loopback relay; selected router OAuth bearer added | Plain `agy` | Pooled sticky-session failover by default; `--account` is a hard per-launch pin | Verified email and plan when exposed; independent Gemini and Claude/GPT 5h/weekly pools; ready/active/error | H1, H2, H3, H4 | Multi-profile and quota paths hermetically tested; live multi-account generation canary still required |
 | Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
 | OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | No auditable in-repository live canary recorded |
@@ -24,7 +24,7 @@ its ordinary name uses Subrouter.
 | OpenCode Zen API key | OpenAI-compatible client at `/opencode-zen/v1` | Labeled OpenCode Zen keys | Client auth removed; selected bearer added | Direct OpenCode Zen URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Z.AI API key | OpenAI-compatible client at `/zai/v1` | Labeled Z.AI keys | Client auth removed; selected bearer added | Direct Z.AI URL | Per session; key failover | Key health/model count; quota not inferred | H1 | No live-account canary recorded |
 | Declared OpenAI-compatible API key | OpenAI-compatible client at `/<declared-name>/v1` | Labeled keys for a startup-declared provider | Client auth removed; selected bearer added | Direct declared upstream | Per session; key failover | Account/routing state; vendor quota not inferred | H1, H2 | No live-account canary recorded |
-| Gemini | None | None | None | Plain Gemini tooling | None | Profile management scaffold only | CLI help and namespace-exclusion tests; profile store untested | Not routed; not a canary target |
+| Legacy Gemini CLI scaffold (not Antigravity) | None | None | None | Plain Gemini tooling | None | Profile management scaffold only | CLI help and namespace-exclusion tests; profile store untested | Not routed; not a canary target |
 
 Hermetic coverage key:
 
@@ -39,9 +39,10 @@ Hermetic coverage key:
 - **H3 — native launch:** `cmd/subrouter/sr_native_proxy_test.go` proves local
   relay composition, credential scrubbing, process-only Kimi/Qwen routing,
   system-policy refusal, direct-home preservation, and strict per-launch pins.
-- **H4 — OAuth lifecycle:** `internal/proxy/oauth_source_test.go`,
-  `internal/proxy/scoreaccounts_test.go`, and provider-store tests prove refresh
-  behavior and suppression of unsupported quota polling.
+- **H4 — OAuth lifecycle and quota:** `internal/proxy/oauth_source_test.go`,
+  `internal/proxy/scoreaccounts_test.go`, and provider-store/usage tests prove
+  refresh behavior, verified telemetry, model-family isolation, and safe
+  handling of missing quota buckets.
 
 ## Native launcher boundary
 
@@ -103,9 +104,9 @@ live-account canary, are OpenRouter, Grok, DeepSeek, Together, Fireworks,
 OpenCode Zen, Z.AI, Qwen Coding Plan, the Qwen Token Plan Anthropic protocol,
 and declared custom OpenAI-compatible routes. Operators with those accounts
 are invited to run an exact routed canary and record a credential-free result
-or artifact reference. Gemini is excluded from that list because it is only a
-namespace/store scaffold, not a routed adapter; its profile store does not yet
-have direct tests.
+or artifact reference. The legacy Gemini CLI namespace is excluded from that
+list because it is only a store scaffold, not the Antigravity adapter described
+above; its profile store does not yet have direct tests.
 
 Live validation should be recorded only after a real request crosses the exact
 launcher and selected router. A successful status probe or local vendor login
