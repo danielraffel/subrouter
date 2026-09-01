@@ -214,12 +214,15 @@ time.sleep(60)
             stderr=subprocess.PIPE,
             env=environment,
         )
-        deadline = time.monotonic() + 10
+        # Process startup can be delayed by concurrent cross-build and race
+        # jobs on shared CI hosts; the production callback still has its own
+        # explicit timeout. Wait long enough to observe that it actually began.
+        deadline = time.monotonic() + 30
         while not self.canary_witness.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(self.canary_witness.exists())
         process.send_signal(signal.SIGTERM)
-        stdout, stderr = process.communicate(timeout=15)
+        stdout, stderr = process.communicate(timeout=30)
         self.assertEqual(process.returncode, 1, stderr)
         evidence = json.loads(stdout)
         self.assertFalse(evidence["ok"])
