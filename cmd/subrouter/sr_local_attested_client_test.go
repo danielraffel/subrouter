@@ -110,6 +110,7 @@ func TestLocalStoreAttestedClientReattestsBeforeCredentialAfterConnectionClose(t
 			http.Error(w, "missing credential", http.StatusUnauthorized)
 			return
 		}
+		w.Header().Set("Connection", "close")
 		_, _ = io.WriteString(w, `[]`)
 	}))
 	defer server.Close()
