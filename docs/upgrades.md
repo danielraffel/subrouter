@@ -179,7 +179,12 @@ The helper always injects a private `--sessions` path, pins
 inherited transcript-sync settings. It also rejects `--bedrock-autobump`, so a
 rehearsal cannot request a real external quota change. The private account root
 is sealed before either callback runs, preventing compatibility fallback to a
-live legacy account directory under the invoking user's home.
+live legacy account directory under the invoking user's home. Shadow serve also
+disables the fixed-service Antigravity Keychain source; validate that live
+credential separately rather than exposing it to a disposable rehearsal.
+Callbacks run with a one-use descendant marker. Teardown drains both their
+original process group and any marked child that detached into another group;
+leaving a descendant makes the rehearsal fail.
 
 The helper creates its own one-run health key in the private workspace and gives
 only the candidate its file path. Each ownership probe sends a fresh random

@@ -66,7 +66,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("command")
 parser.add_argument("--addr", required=True)
 parser.add_argument("--sessions", required=True)
+parser.add_argument("--antigravity-local-credential", required=True)
 args = parser.parse_args()
+assert args.antigravity_local_credential == "false"
 host, port = args.addr.rsplit(":", 1)
 Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
 Path(os.environ["TEST_CANDIDATE_ADDR_WITNESS"]).write_text(args.addr)
@@ -142,9 +144,11 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         port: int,
         *,
         candidate_hash: str | None = None,
+        prepare: Path | None = None,
         canary: Path | None = None,
         serve_args: Path | None = None,
         addr_host: str = "127.0.0.1",
+        environment_overrides: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
         environment["TEST_WORKSPACE_WITNESS"] = str(self.workspace_witness)
@@ -157,6 +161,8 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
         environment["HOME"] = str(self.test_home)
         environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = "must-not-reach-callback"
+        if environment_overrides:
+            environment.update(environment_overrides)
         command = [
             sys.executable,
             str(RUNNER),
@@ -167,7 +173,7 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
             "--addr",
             f"{addr_host}:{port}",
             "--prepare-callback",
-            str(self.prepare),
+            str(prepare or self.prepare),
             "--canary-callback",
             str(canary or self.canary),
             "--startup-timeout-seconds",
@@ -189,7 +195,7 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
     def test_success_proves_process_listener_and_workspace_absence(self) -> None:
         port = _free_port()
         result = self._run(port)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         evidence = json.loads(result.stdout)
         self.assertTrue(evidence["ok"])
         self.assertEqual(
@@ -239,6 +245,59 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         workspace = Path(self.workspace_witness.read_text())
         self.assertFalse(workspace.exists())
         self.assertFalse(_listening(port))
+
+    def test_prepare_cannot_reenable_legacy_account_fallback(self) -> None:
+        cleaning_prepare = self._script(
+            "cleaning-prepare.py",
+            """
+import os
+import shutil
+from pathlib import Path
+codex = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"]) / "codex"
+shutil.rmtree(codex)
+codex.mkdir()
+(codex.parent / "prepared").write_text("yes")
+""",
+        )
+        result = self._run(_free_port(), prepare=cleaning_prepare)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertEqual(self.candidate_codex_state_witness.read_text(), "shadow-isolated-root")
+        self.assertEqual(self.legacy_witness.read_text(), "live-legacy-state")
+
+    def test_detached_callback_descendant_is_terminated(self) -> None:
+        detached_pid = self.root / "detached.pid"
+        escaping_prepare = self._script(
+            "escaping-prepare.py",
+            """
+import os
+import subprocess
+import sys
+from pathlib import Path
+body = "import os,time; from pathlib import Path; Path(os.environ['TEST_DETACHED_PID']).write_text(str(os.getpid())); time.sleep(60)"
+subprocess.Popen([sys.executable, "-c", body], start_new_session=True)
+""",
+        )
+        result = self._run(
+            _free_port(),
+            prepare=escaping_prepare,
+            environment_overrides={"TEST_DETACHED_PID": str(detached_pid)},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        evidence = json.loads(result.stdout)
+        self.assertEqual(evidence["failure"], "shadow callback left descendant processes")
+        self.assertTrue(detached_pid.exists())
+        process_id = int(detached_pid.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"detached callback process {process_id} survived teardown")
+        self.assertTrue(all(evidence["teardown"].values()))
 
     def test_replacing_canary_path_after_pinning_cannot_change_executed_callback(self) -> None:
         prepare_entered = self.root / "prepare-entered"
@@ -684,6 +743,25 @@ time.sleep(60)
                 self.assertEqual(
                     evidence["failure"],
                     "serve args JSON must not contain --bedrock-autobump; shadow rehearsals must not trigger external mutations",
+                )
+                self.assertFalse(self.workspace_witness.exists())
+
+    def test_shadow_controlled_serve_arguments_are_rejected_before_prepare(self) -> None:
+        for spelling in (
+            "--antigravity-local-credential",
+            "-antigravity-local-credential",
+            "--antigravity-local-credential=true",
+            "-antigravity-local-credential=true",
+        ):
+            with self.subTest(spelling=spelling):
+                serve_args = self.root / "serve-args.json"
+                serve_args.write_text(json.dumps([spelling]))
+                result = self._run(_free_port(), serve_args=serve_args)
+                self.assertEqual(result.returncode, 1)
+                evidence = json.loads(result.stdout)
+                self.assertEqual(
+                    evidence["failure"],
+                    "serve args JSON must not override shadow-controlled --antigravity-local-credential",
                 )
                 self.assertFalse(self.workspace_witness.exists())
 

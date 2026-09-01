@@ -27,6 +27,7 @@ SCHEMA = "subrouter.shadow-rehearsal-evidence/v1"
 SHADOW_CHALLENGE_HEADER = "X-Subrouter-Shadow-Challenge"
 SHADOW_PROOF_FIELD = "shadow_candidate_proof"
 SHADOW_HEALTH_DOMAIN = b"subrouter-shadow-health-v1\x00"
+CALLBACK_RUN_ENV = "SUBROUTER_SHADOW_CALLBACK_RUN_ID"
 
 CREDENTIAL_SERVE_OPTIONS = {
     "admin-token": "SUBROUTER_ADMIN_TOKEN_FILE",
@@ -46,6 +47,7 @@ PERSISTENT_SERVE_OPTIONS = (
 )
 
 SIDE_EFFECT_SERVE_OPTIONS = ("bedrock-autobump",)
+SHADOW_CONTROLLED_SERVE_OPTIONS = ("antigravity-local-credential",)
 
 
 class ShadowError(Exception):
@@ -278,29 +280,78 @@ def _callback_environment(
 
 
 def _run_callback(path: Path, environment: dict[str, str], log_path: Path, timeout: int) -> None:
+    callback_environment = dict(environment)
+    callback_run_id = secrets.token_hex(32)
+    callback_environment[CALLBACK_RUN_ENV] = callback_run_id
     with log_path.open("wb") as output:
         process = subprocess.Popen(
             [str(path)],
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,
-            env=environment,
+            env=callback_environment,
             start_new_session=True,
         )
+        failure = ""
         try:
             try:
                 return_code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                _terminate_group(process)
-                _fail("shadow callback timed out")
+                return_code = -1
+                failure = "shadow callback timed out"
             if return_code != 0:
-                _fail("shadow callback failed")
-            if _group_exists(process.pid):
-                _terminate_group(process)
-                _fail("shadow callback left descendant processes")
-        except BaseException:
-            _terminate_group(process)
-            raise
+                failure = failure or "shadow callback failed"
+        finally:
+            group_remained = _group_exists(process.pid)
+            group_absent = _terminate_group(process)
+            detached, detached_absent = _drain_marked_callback_processes(callback_run_id)
+        if not group_absent or not detached_absent:
+            _fail("shadow callback descendants could not be terminated")
+        if failure:
+            _fail(failure)
+        if group_remained or detached:
+            _fail("shadow callback left descendant processes")
+
+
+def _marked_callback_process_ids(callback_run_id: str) -> set[int]:
+    marker = f"{CALLBACK_RUN_ENV}={callback_run_id}"
+    result = subprocess.run(
+        ["ps", "eww", "-axo", "pid=,command="],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
+    )
+    if result.returncode != 0:
+        _fail("could not inspect shadow callback descendants")
+    process_ids: set[int] = set()
+    for line in result.stdout.splitlines():
+        pid_text, separator, command = line.strip().partition(" ")
+        if separator and marker in command:
+            try:
+                process_ids.add(int(pid_text))
+            except ValueError:
+                _fail("could not parse shadow callback descendant identity")
+    return process_ids
+
+
+def _drain_marked_callback_processes(callback_run_id: str) -> tuple[set[int], bool]:
+    observed: set[int] = set()
+    for sent_signal, timeout in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 1.0)):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = _marked_callback_process_ids(callback_run_id)
+            if not current:
+                return observed, True
+            observed.update(current)
+            for process_id in current:
+                try:
+                    os.kill(process_id, sent_signal)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(0.05)
+    return observed, not _marked_callback_process_ids(callback_run_id)
 
 
 def _load_serve_args(raw_path: str | None) -> list[str]:
@@ -358,6 +409,15 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
                     f"serve args JSON must not contain {option}; "
                     "shadow rehearsals must not trigger external mutations"
                 )
+        for option_name in SHADOW_CONTROLLED_SERVE_OPTIONS:
+            option = "--" + option_name
+            short_option = "-" + option_name
+            if (
+                argument in (option, short_option)
+                or argument.startswith(option + "=")
+                or argument.startswith(short_option + "=")
+            ):
+                _fail(f"serve args JSON must not override shadow-controlled {option}")
     return parsed
 
 
@@ -417,9 +477,18 @@ def _write_shadow_health_key(path: Path, key: bytes) -> None:
 
 def _seal_shadow_state_against_legacy_fallback(state_dir: Path) -> None:
     codex_dir = state_dir / "codex"
-    codex_dir.mkdir(mode=0o700)
+    codex_dir.mkdir(mode=0o700, exist_ok=True)
+    directory_info = codex_dir.lstat()
+    if not stat.S_ISDIR(directory_info.st_mode) or stat.S_ISLNK(directory_info.st_mode):
+        _fail("shadow account root must remain a private directory")
     sentinel = codex_dir / "shadow-isolated-root"
-    descriptor = os.open(sentinel, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        descriptor = os.open(sentinel, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        sentinel_info = sentinel.lstat()
+        if not stat.S_ISREG(sentinel_info.st_mode) or stat.S_ISLNK(sentinel_info.st_mode):
+            _fail("shadow account-root sentinel is invalid")
+        return
     try:
         os.write(descriptor, b"isolated\n")
         os.fsync(descriptor)
@@ -542,6 +611,7 @@ def main() -> int:
         _run_callback(
             prepare, environment, workspace / "prepare.log", arguments.callback_timeout_seconds
         )
+        _seal_shadow_state_against_legacy_fallback(state_dir)
         phases["prepared"] = True
 
         # Pin a fresh server copy after preparation. A vendor account command
@@ -564,6 +634,7 @@ def main() -> int:
                     resolved_addr,
                     "--sessions",
                     str(state_dir / "sessions.json"),
+                    "--antigravity-local-credential=false",
                     *serve_args,
                 ],
                 stdin=subprocess.DEVNULL,

@@ -340,6 +340,7 @@ func serve(args []string) error {
 	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenToken), "Alibaba Model Studio Token Plan upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)")
 	qwenUpstreamRaw := flags.String("qwen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwen), "Alibaba Model Studio Coding Plan upstream base URL (Beijing: https://coding.dashscope.aliyuncs.com/v1)")
 	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
+	antigravityLocalCredential := flags.Bool("antigravity-local-credential", true, "serve the invoking user's Antigravity CLI credential")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
 	transcriptGCSURI := flags.String("transcript-gcs-uri", "", "optional gs:// bucket/prefix for background transcript sync")
@@ -639,7 +640,10 @@ func serve(args []string) error {
 	// stores, so serve fails closed until each legacy account is re-added.
 	codexStore.RequireIsolatedOAuth = true
 	claudeStore := agentclaude.DefaultStoreForReadOnlyInspection()
-	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), &agentantigravity.Store{}, agentgrok.DefaultStore()}
+	oauthSources := []proxy.OAuthAccountSource{agentkimi.ServingStore(), agentgrok.DefaultStore()}
+	if *antigravityLocalCredential {
+		oauthSources = append(oauthSources, &agentantigravity.Store{})
+	}
 	var accountRef *proxy.AccountRef
 	var accountGeneration uint64
 	var credentialRevision uint64

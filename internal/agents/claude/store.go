@@ -2968,30 +2968,61 @@ func DetectCLI() (string, bool) {
 }
 
 func EnvForConfigDir(instancePath string) []string {
-	remove := map[string]bool{
-		"ANTHROPIC_API_KEY":        true,
-		"ANTHROPIC_AUTH_TOKEN":     true,
-		"ANTHROPIC_BASE_URL":       true,
-		"ANTHROPIC_CUSTOM_HEADERS": true,
-		"CLAUDE_CODE_OAUTH_TOKEN":  true,
-		"CLAUDE_CONFIG_DIR":        true,
-		"CLAUDE_CODE_API_KEY":      true,
-		"CLAUDE_CODE_AUTH_TOKEN":   true,
-		"CLAUDE_CODE_BASE_URL":     true,
-		"CLAUDE_CODE_CONFIG_DIR":   true,
-		"CLAUDE_CODE_USE_BEDROCK":  true,
-		"CLAUDE_CODE_USE_VERTEX":   true,
-		"ANTHROPIC_VERTEX_PROJECT": true,
+	remove := make(map[string]bool, len(claudeRoutingEnvKeys))
+	for _, key := range claudeRoutingEnvKeys {
+		remove[strings.ToUpper(key)] = true
 	}
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, item := range os.Environ() {
 		key, _, ok := strings.Cut(item, "=")
-		if ok && (remove[key] || isSubrouterEnvName(key)) {
+		if ok && (remove[strings.ToUpper(key)] || isSubrouterEnvName(key)) {
 			continue
 		}
 		env = append(env, item)
 	}
 	return append(env, "CLAUDE_CONFIG_DIR="+instancePath)
+}
+
+// RoutingEnvKeys returns every known environment selector that can redirect a
+// Claude process away from its intended login or gateway.
+func RoutingEnvKeys() []string {
+	return append([]string(nil), claudeRoutingEnvKeys...)
+}
+
+var claudeRoutingEnvKeys = []string{
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"CLAUDE_CONFIG_DIR",
+	"CLAUDE_CODE_CONFIG_DIR",
+	"CLAUDE_CODE_OAUTH_TOKEN",
+	"CLAUDE_CODE_API_KEY",
+	"CLAUDE_CODE_AUTH_TOKEN",
+	"CLAUDE_CODE_BASE_URL",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+	"CLAUDE_CODE_USE_VERTEX",
+	"ANTHROPIC_VERTEX_BASE_URL",
+	"ANTHROPIC_VERTEX_PROJECT",
+	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"ANTHROPIC_FOUNDRY_BASE_URL",
+	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+	"CLAUDE_CODE_USE_MANTLE",
+	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+	"ANTHROPIC_AWS_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+	"CLAUDE_CODE_USE_GATEWAY",
+	"ANTHROPIC_GATEWAY_BASE_URL",
+	"CLAUDE_CODE_GATEWAY_BASE_URL",
+	"CLAUDE_CODE_SKIP_GATEWAY_AUTH",
 }
 
 func isSubrouterEnvName(name string) bool {

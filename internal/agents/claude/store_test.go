@@ -194,12 +194,10 @@ func TestProfileInstancePathsAliasUsesPlatformCaseRulesForMissingPaths(t *testin
 }
 
 func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "api-key")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
-	t.Setenv("ANTHROPIC_BASE_URL", "http://stale-proxy:31415")
-	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: Bearer stale")
-	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
-	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
+	for _, key := range RoutingEnvKeys() {
+		t.Setenv(key, "must-not-survive")
+	}
+	t.Setenv("claude_code_use_foundry", "lowercase-must-not-survive")
 	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
 	t.Setenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE", "/private/import-token")
 	t.Setenv("SUBROUTER_FUTURE_SECRET", "future-secret")
@@ -213,18 +211,17 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 			seen[key] = value
 		}
 	}
-	for _, key := range []string{
-		"ANTHROPIC_API_KEY",
-		"ANTHROPIC_AUTH_TOKEN",
-		"ANTHROPIC_BASE_URL",
-		"ANTHROPIC_CUSTOM_HEADERS",
-		"CLAUDE_CODE_OAUTH_TOKEN",
+	for _, key := range append(RoutingEnvKeys(),
 		"SUBROUTER_ADMIN_TOKEN",
 		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
 		"SUBROUTER_FUTURE_SECRET",
 		"SUBROUTER_CLOUD_CONFIG",
 		"SUBROUTER_STATE_DIR",
-	} {
+		"claude_code_use_foundry",
+	) {
+		if key == "CLAUDE_CONFIG_DIR" {
+			continue
+		}
 		if _, ok := seen[key]; ok {
 			t.Fatalf("%s was inherited by Claude", key)
 		}

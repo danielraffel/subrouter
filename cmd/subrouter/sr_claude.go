@@ -1750,39 +1750,9 @@ func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 	return cmd.Run()
 }
 
-// claudeRoutingEnvKeys are the env vars that could route Claude Code through a
-// proxy or cloud gateway instead of Anthropic directly.
-var claudeRoutingEnvKeys = []string{
-	"ANTHROPIC_BASE_URL",
-	"ANTHROPIC_AUTH_TOKEN",
-	"ANTHROPIC_API_KEY",
-	"ANTHROPIC_CUSTOM_HEADERS",
-	"CLAUDE_CONFIG_DIR",
-	"CLAUDE_CODE_CONFIG_DIR",
-	"CLAUDE_CODE_OAUTH_TOKEN",
-	"CLAUDE_CODE_API_KEY",
-	"CLAUDE_CODE_AUTH_TOKEN",
-	"CLAUDE_CODE_BASE_URL",
-	"CLAUDE_CODE_USE_BEDROCK",
-	"ANTHROPIC_BEDROCK_BASE_URL",
-	"CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-	"CLAUDE_CODE_USE_VERTEX",
-	"ANTHROPIC_VERTEX_BASE_URL",
-	"CLAUDE_CODE_SKIP_VERTEX_AUTH",
-	"CLAUDE_CODE_USE_FOUNDRY",
-	"ANTHROPIC_FOUNDRY_BASE_URL",
-	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-	"CLAUDE_CODE_USE_MANTLE",
-	"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-	"CLAUDE_CODE_SKIP_MANTLE_AUTH",
-	"CLAUDE_CODE_USE_ANTHROPIC_AWS",
-	"ANTHROPIC_AWS_BASE_URL",
-	"CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
-	"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-	"ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
-	"CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
-	"CLAUDE_CODE_USE_GATEWAY",
-}
+// claudeRoutingEnvKeys is shared with managed login/auth-status launches so
+// every Claude child applies the same routing boundary.
+var claudeRoutingEnvKeys = claude.RoutingEnvKeys()
 
 // envWithout returns environ with the named keys removed (case-insensitive).
 func envWithout(environ []string, keys []string) []string {
