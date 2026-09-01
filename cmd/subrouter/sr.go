@@ -435,6 +435,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			if !authority.storeMatches {
 				return fmt.Errorf("local proxy account store does not match this CLI; set SUBROUTER_STATE_DIR to the daemon's state root or select it as a named authenticated remote")
 			}
+			if !serverHasAccountImportCredential(server) && !authority.accountImportEnabled {
+				routeToServingAPI = false
+			}
 		}
 		if routeToServingAPI {
 			return r.runRemoteAccountCommand(ctx, server, args)

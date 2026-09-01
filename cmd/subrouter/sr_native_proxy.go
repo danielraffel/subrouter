@@ -317,21 +317,10 @@ func qwenBundledShortOptionContains(arg, restricted string) bool {
 	if len(bundle) <= 1 {
 		return false
 	}
-	for i := 0; i < len(bundle); i++ {
-		option := bundle[i]
-		if strings.ContainsRune(restricted, rune(option)) {
-			return true
-		}
-		// Qwen's value-taking short aliases consume the remaining bytes as their
-		// attached value. Do not interpret model/prompt/format text such as the
-		// "s" in -mstream as another boolean option. Resume is checked above
-		// when it is restricted; otherwise its session ID likewise ends the group.
-		switch option {
-		case 'm', 'p', 'i', 'o', 'r':
-			return false
-		}
-	}
-	return false
+	// Qwen 0.22.3's yargs parser expands every byte in an attached short token:
+	// -mc activates -c and -ms activates -s. Equals and separate-value forms
+	// are handled before this point and must not be scanned as bundles.
+	return strings.ContainsAny(bundle, restricted)
 }
 
 func qwenProxyReloadCapableMode(args []string) bool {

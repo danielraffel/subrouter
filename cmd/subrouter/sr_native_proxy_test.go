@@ -1450,7 +1450,7 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 	}
 }
 
-func TestQwenProxyBundledShortOptionsRespectAttachedValuesAndDelimiter(t *testing.T) {
+func TestQwenProxyBundledShortOptionsMatchYargsGrammar(t *testing.T) {
 	for _, test := range []struct {
 		args       []string
 		restricted string
@@ -1460,6 +1460,13 @@ func TestQwenProxyBundledShortOptionsRespectAttachedValuesAndDelimiter(t *testin
 		{args: []string{"-ys"}, restricted: "s"},
 		{args: []string{"-yrsession-id"}, restricted: "cr"},
 		{args: []string{"-smstream"}, restricted: "s"},
+		{args: []string{"-mc"}, restricted: "cr"},
+		{args: []string{"-ms"}, restricted: "s"},
+		{args: []string{"-mstream"}, restricted: "scr"},
+		{args: []string{"-pfancy"}, restricted: "cr"},
+		{args: []string{"-icontinue"}, restricted: "cr"},
+		{args: []string{"-ostream"}, restricted: "scr"},
+		{args: []string{"-ymstream"}, restricted: "scr"},
 	} {
 		if !qwenProxyBundledShortOptionRequested(test.args, test.restricted) {
 			t.Fatalf("bundled Qwen option %q did not activate one of %q", test.args, test.restricted)
@@ -1467,11 +1474,12 @@ func TestQwenProxyBundledShortOptionsRespectAttachedValuesAndDelimiter(t *testin
 	}
 
 	for _, args := range [][]string{
-		{"-mstream"},
-		{"-pfancy"},
-		{"-icontinue"},
-		{"-ostream"},
-		{"-ymstream"},
+		{"-m=stream"},
+		{"-p=-cy"},
+		{"-i=-sc"},
+		{"-o=stream"},
+		{"--model=-sc"},
+		{"-m", "-cy"},
 		{"-p", "-cy"},
 		{"--", "-cy"},
 	} {

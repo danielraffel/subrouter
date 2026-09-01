@@ -1418,6 +1418,64 @@ func TestLegacyLocalServingDaemonRejectsUnattestedOnboardingBeforeCredentials(t 
 	}
 }
 
+func TestLegacyLocalServingDaemonKeepsUnprotectedOnboardingOnLocalStore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	var nonHealthRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			nonHealthRequests.Add(1)
+			http.Error(w, "account import is disabled", http.StatusUnauthorized)
+			return
+		}
+		authorityID, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_import":"disabled","account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := srRunner{
+		store: store, useServingAPI: true,
+		in: strings.NewReader("work\nsk-or-v1-local-only\n"), out: io.Discard, errOut: io.Discard,
+		client: server.Client(),
+	}
+	if err := runner.run(t.Context(), []string{"add-key", "--provider", "openrouter"}); err != nil {
+		t.Fatal(err)
+	}
+	if nonHealthRequests.Load() != 0 {
+		t.Fatalf("unprotected legacy-local onboarding sent %d HTTP mutation request(s)", nonHealthRequests.Load())
+	}
+	stored, ok, err := store.FindStored("openrouter:work")
+	if err != nil || !ok {
+		t.Fatalf("legacy-local onboarding account found=%t err=%v", ok, err)
+	}
+	if stored.Provider != accounts.ProviderOpenRouter || stored.Auth.OpenAIAPIKey != "sk-or-v1-local-only" {
+		t.Fatalf("legacy-local onboarding stored provider=%q key_matches=%t", stored.Provider, stored.Auth.OpenAIAPIKey == "sk-or-v1-local-only")
+	}
+}
+
 func TestProtectedLocalServingDaemonKeepsOnboardingOnHTTPAuthority(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

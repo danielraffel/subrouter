@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -44,6 +45,13 @@ import (
 const (
 	AccountImportEnabled  = "enabled"
 	AccountImportDisabled = "disabled"
+
+	// ShadowHealthChallengeHeader is an opt-in challenge used by the disposable
+	// shadow rehearsal helper to prove that it reached the candidate it started.
+	// Ordinary health clients do not send it and see no shadow-only fields.
+	ShadowHealthChallengeHeader = "X-Subrouter-Shadow-Challenge"
+	ShadowHealthProofField      = "shadow_candidate_proof"
+	shadowHealthDomain          = "subrouter-shadow-health-v1\x00"
 )
 
 type CredentialBroker interface {
@@ -104,6 +112,9 @@ type Server struct {
 	StreamDrops *StreamDropStats
 	Lifecycle   *Lifecycle
 	AdminToken  string
+	// ShadowHealthKey is an ephemeral, per-process attestation key used only by
+	// the optional shadow rehearsal. Nil keeps the normal health response.
+	ShadowHealthKey []byte
 	// AccountImportToken authorizes only the protected account-import endpoint.
 	// It is intentionally distinct from AdminToken, which can read operational
 	// state and transcripts.
@@ -1741,6 +1752,9 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 			}
 		}
 	}
+	if proof, ok := s.shadowHealthProof(request.Header.Get(ShadowHealthChallengeHeader)); ok {
+		payload[ShadowHealthProofField] = proof
+	}
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.
@@ -1748,6 +1762,20 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		payload["azure_codex"] = names
 	}
 	writeJSON(w, payload)
+}
+
+func (s Server) shadowHealthProof(challengeHex string) (string, bool) {
+	if len(s.ShadowHealthKey) != sha256.Size || len(challengeHex) != hex.EncodedLen(sha256.Size) {
+		return "", false
+	}
+	challenge, err := hex.DecodeString(challengeHex)
+	if err != nil || len(challenge) != sha256.Size {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, s.ShadowHealthKey)
+	_, _ = mac.Write([]byte(shadowHealthDomain))
+	_, _ = mac.Write(challenge)
+	return hex.EncodeToString(mac.Sum(nil)), true
 }
 
 // AccountImportState reports whether this server can accept `sr add` uploads.

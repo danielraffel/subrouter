@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -130,6 +131,32 @@ func secretValue(explicit, valueName, fileName string) (string, error) {
 		return explicit, nil
 	}
 	return secretFromEnvironment(valueName, fileName)
+}
+
+func shadowHealthKeyFromEnvironment() ([]byte, error) {
+	const fileName = "SUBROUTER_SHADOW_HEALTH_KEY_FILE"
+	path := strings.TrimSpace(os.Getenv(fileName))
+	if path == "" {
+		return nil, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", fileName, err)
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, maxSecretFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", fileName, err)
+	}
+	if len(body) > maxSecretFileBytes {
+		return nil, fmt.Errorf("read %s: key exceeds %d bytes", fileName, maxSecretFileBytes)
+	}
+	value := strings.TrimSpace(string(body))
+	key, err := hex.DecodeString(value)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("read %s: key must be exactly 32 bytes encoded as hexadecimal", fileName)
+	}
+	return key, nil
 }
 
 func run(args []string) error {
@@ -375,6 +402,10 @@ func serve(args []string) error {
 		return err
 	}
 	*accountImportToken, err = secretValue(*accountImportToken, "SUBROUTER_ACCOUNT_IMPORT_TOKEN", "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE")
+	if err != nil {
+		return err
+	}
+	shadowHealthKey, err := shadowHealthKeyFromEnvironment()
 	if err != nil {
 		return err
 	}
@@ -755,6 +786,7 @@ func serve(args []string) error {
 		Logger:                   slog.Default(),
 		Lifecycle:                proxy.NewLifecycle(),
 		AdminToken:               *adminToken,
+		ShadowHealthKey:          shadowHealthKey,
 		AccountImportToken:       *accountImportToken,
 		TailnetAuth:              tailnetAuthorizer,
 		RequireSessionLease:      *requireSessionLeases || envTrue("SUBROUTER_REQUIRE_SESSION_LEASES"),

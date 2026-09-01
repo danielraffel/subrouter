@@ -22,12 +22,43 @@ func StoreAuthorityID(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("resolve account store: path is empty")
 	}
-	resolved, err := filepath.Abs(path)
+	resolved, err := resolveStoreAuthorityPath(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve account store: %w", err)
 	}
-	digest := sha256.Sum256([]byte("subrouter-account-store-v1\x00" + filepath.Clean(resolved)))
+	digest := sha256.Sum256([]byte("subrouter-account-store-v1\x00" + resolved))
 	return hex.EncodeToString(digest[:]), nil
+}
+
+// resolveStoreAuthorityPath resolves every existing symlinked ancestor while
+// preserving a not-yet-created account-store suffix. A daemon and CLI may name
+// the same state root through different stable aliases; the shared authority
+// key and store ID must agree in that case.
+func resolveStoreAuthorityPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(absolute)
+	missing := make([]string, 0, 2)
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(current)
+		if resolveErr == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(resolveErr, os.ErrNotExist) {
+			return "", resolveErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", resolveErr
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 // StoreAuthorityProof proves that a process can read the same account-store

@@ -3,6 +3,7 @@ package accounts
 import (
 	"crypto/hmac"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -49,6 +50,44 @@ func TestStoreAuthorityProofIsSharedOnlyByTheSameStore(t *testing.T) {
 	}
 	if hmac.Equal([]byte(first), []byte(other)) {
 		t.Fatal("different account stores produced the same proof")
+	}
+}
+
+func TestStoreAuthorityUsesResolvedSymlinkedStateRoot(t *testing.T) {
+	root := t.TempDir()
+	realState := filepath.Join(root, "real-state")
+	if err := os.MkdirAll(filepath.Join(realState, "codex"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "state-alias")
+	if err := os.Symlink(realState, alias); err != nil {
+		t.Skipf("symlinked state-root test unavailable: %v", err)
+	}
+	realStore := filepath.Join(realState, "codex", "accounts")
+	aliasStore := filepath.Join(alias, "codex", "accounts")
+
+	realID, err := StoreAuthorityID(realStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasID, err := StoreAuthorityID(aliasStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realID != aliasID {
+		t.Fatalf("symlinked store authority IDs differ: %q != %q", realID, aliasID)
+	}
+	challenge := hex.EncodeToString(make([]byte, 32))
+	realProof, err := StoreAuthorityProof(realStore, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasProof, err := StoreAuthorityProof(aliasStore, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hmac.Equal([]byte(realProof), []byte(aliasProof)) {
+		t.Fatal("symlinked state roots produced different store proofs")
 	}
 }
 

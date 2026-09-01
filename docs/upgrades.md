@@ -139,13 +139,16 @@ For a sensitive or heavily used deployment, first run the exact candidate as a
 disposable shadow on an unused loopback listener. The host-neutral helper pins
 the candidate by SHA-256 into a private temporary workspace, gives a preparation
 callback that workspace's isolated state directory, starts `serve`, waits for
-health and readiness, and runs the authenticated canary callback. It then stops
-the complete process group, removes its state and logs, proves the process,
-listener, and workspace are absent, and prints one bounded JSON evidence record:
+health and readiness from that exact candidate, and runs the authenticated
+canary callback. It then re-proves candidate ownership and readiness, stops the
+complete process group, removes its state and logs, proves the process, listener,
+and workspace are absent, and prints one bounded JSON evidence record:
 
 ```bash
 candidate=/absolute/path/subrouter
 candidate_sha256="$(shasum -a 256 "$candidate" | awk '{print $1}')"
+SUBROUTER_ADMIN_TOKEN_FILE=/private/shadow-admin-token \
+SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/shadow-import-token \
 deploy/run-shadow-rehearsal.py \
   --candidate "$candidate" \
   --candidate-sha256 "$candidate_sha256" \
@@ -160,10 +163,30 @@ Both callbacks are invoked directly without a shell. They receive
 `SUBROUTER_SHADOW_CANDIDATE_PATH`, `SUBROUTER_SHADOW_BASE_URL`, and the exact
 candidate SHA in `SUBROUTER_SHADOW_CANDIDATE_SHA256`. The optional serve-args
 file is a JSON array of argument strings after `serve`; it cannot replace
-`serve` or `--addr`. Success requires `"ok":true` and every field under
-`"teardown"` to be true. A callback failure or signal still runs teardown and
-returns nonzero evidence. SIGKILL cannot run any userspace cleanup handler, so
-after an unclean host interruption verify the recorded listener before retrying.
+`serve` or `--addr`. Raw credential flags (`--admin-token`,
+`--account-import-token`, Stack keys and tenant secrets, and the Bedrock gateway
+token) are also rejected because command arguments are externally observable.
+Set the corresponding `SUBROUTER_*_FILE` variable in the helper environment
+where one exists; both callbacks and the candidate inherit that environment.
+The Bedrock gateway currently has only `SUBROUTER_BEDROCK_GATEWAY_TOKEN`, which
+is still safer than a process argument. Keep every referenced credential file
+private and outside the disposable workspace so teardown does not remove it.
+
+The helper creates its own one-run health key in the private workspace and gives
+only the candidate its file path. Each ownership probe sends a fresh random
+challenge and requires the candidate's HMAC proof, once before and once after
+the canary. A different process that wins the listener race therefore cannot
+make the rehearsal pass by returning generic healthy JSON. The key is never an
+argument, is removed as soon as the candidate has loaded it, and is not given to
+either callback. Ordinary health requests remain unchanged; the proof field is
+present only when this private key is configured and a valid explicit challenge
+header is supplied.
+
+Success requires `"ok":true` and every field under `"teardown"` to be true. A
+callback failure, SIGINT, SIGTERM, or—on platforms that provide them—SIGHUP or
+SIGQUIT still runs teardown and returns nonzero evidence. SIGKILL cannot run any
+userspace cleanup handler, so after an unclean host interruption verify the
+recorded listener before retrying.
 
 Shadow rehearsal and live rollback are complementary, not substitutes. A
 passing shadow is a recommended high-assurance activation gate for sensitive

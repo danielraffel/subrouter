@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -22,6 +24,18 @@ from pathlib import Path
 
 
 SCHEMA = "subrouter.shadow-rehearsal-evidence/v1"
+SHADOW_CHALLENGE_HEADER = "X-Subrouter-Shadow-Challenge"
+SHADOW_PROOF_FIELD = "shadow_candidate_proof"
+SHADOW_HEALTH_DOMAIN = b"subrouter-shadow-health-v1\x00"
+
+CREDENTIAL_SERVE_OPTIONS = {
+    "admin-token": "SUBROUTER_ADMIN_TOKEN_FILE",
+    "account-import-token": "SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+    "stack-publishable-client-key": "SUBROUTER_STACK_PUBLISHABLE_CLIENT_KEY",
+    "stack-tenant-key-secret": "SUBROUTER_STACK_TENANT_KEY_SECRET_FILE",
+    "stack-tenant-delete-token": "SUBROUTER_STACK_TENANT_DELETE_TOKEN_FILE",
+    "bedrock-gateway-token": "SUBROUTER_BEDROCK_GATEWAY_TOKEN",
+}
 
 
 class ShadowError(Exception):
@@ -166,6 +180,7 @@ def _callback_environment(
     candidate_log: Path,
 ) -> dict[str, str]:
     environment = dict(os.environ)
+    environment.pop("SUBROUTER_SHADOW_HEALTH_KEY_FILE", None)
     environment.update(
         {
             "SUBROUTER_STATE_DIR": str(state_dir),
@@ -220,6 +235,18 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
     for argument in parsed:
         if "\x00" in argument or argument == "serve" or argument == "--addr" or argument.startswith("--addr="):
             _fail("serve args JSON must not override serve or --addr")
+        for option_name, environment_name in CREDENTIAL_SERVE_OPTIONS.items():
+            option = "--" + option_name
+            short_option = "-" + option_name
+            if (
+                argument in (option, short_option)
+                or argument.startswith(option + "=")
+                or argument.startswith(short_option + "=")
+            ):
+                _fail(
+                    f"serve args JSON must not contain {option}; "
+                    f"use {environment_name} in the helper environment"
+                )
     return parsed
 
 
@@ -235,15 +262,46 @@ def _probe(base_url: str, path: str) -> bool:
         return False
 
 
-def _wait_ready(process: subprocess.Popen[bytes], base_url: str, timeout: int) -> None:
+def _owned_health(base_url: str, key: bytes) -> bool:
+    challenge = secrets.token_bytes(32)
+    request = urllib.request.Request(
+        base_url + "/_subrouter/health",
+        headers={SHADOW_CHALLENGE_HEADER: challenge.hex()},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5) as response:
+            if response.status != 200:
+                return False
+            body = response.read(4096)
+        parsed = json.loads(body)
+        proof = parsed.get(SHADOW_PROOF_FIELD)
+        expected = hmac.new(key, SHADOW_HEALTH_DOMAIN + challenge, hashlib.sha256).hexdigest()
+        return parsed.get("ok") is True and isinstance(proof, str) and hmac.compare_digest(proof, expected)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _wait_ready(process: subprocess.Popen[bytes], base_url: str, key: bytes, timeout: int) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
             _fail("shadow candidate exited before readiness")
-        if _probe(base_url, "/_subrouter/health") and _probe(base_url, "/_subrouter/ready"):
+        if _owned_health(base_url, key) and _probe(base_url, "/_subrouter/ready"):
             return
         time.sleep(0.05)
     _fail("shadow candidate did not become healthy and ready")
+
+
+def _write_shadow_health_key(path: Path, key: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        body = key.hex().encode("ascii")
+        view = memoryview(body)
+        while view:
+            view = view[os.write(descriptor, view) :]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _signal_handler(signum: int, _frame: object) -> None:
@@ -272,13 +330,21 @@ def main() -> int:
     parser.add_argument("--addr", required=True, help="unused IPv4 loopback HOST:PORT")
     parser.add_argument("--prepare-callback", required=True, help="absolute executable run before shadow start")
     parser.add_argument("--canary-callback", required=True, help="absolute executable run after readiness")
-    parser.add_argument("--serve-args-json", help="optional JSON array of additional serve arguments")
+    parser.add_argument(
+        "--serve-args-json",
+        help="optional JSON array of non-credential serve arguments",
+    )
     parser.add_argument("--startup-timeout-seconds", type=int, default=30)
     parser.add_argument("--callback-timeout-seconds", type=int, default=120)
     arguments = parser.parse_args()
 
     candidate_sha256 = arguments.candidate_sha256
-    phases = {"prepared": False, "healthy_ready": False, "canary": False}
+    phases = {
+        "prepared": False,
+        "healthy_ready": False,
+        "canary": False,
+        "post_canary_owned_ready": False,
+    }
     teardown = {
         "process_group_absent": True,
         "listener_absent": True,
@@ -294,9 +360,14 @@ def main() -> int:
     host = "127.0.0.1"
     port = 0
 
+    handled_signals = [signal.SIGINT, signal.SIGTERM]
+    for signal_name in ("SIGHUP", "SIGQUIT"):
+        optional_signal = getattr(signal, signal_name, None)
+        if optional_signal is not None and optional_signal not in handled_signals:
+            handled_signals.append(optional_signal)
     prior_handlers = {
         sent_signal: signal.signal(sent_signal, _signal_handler)
-        for sent_signal in (signal.SIGINT, signal.SIGTERM)
+        for sent_signal in handled_signals
     }
     try:
         if not _valid_sha256(candidate_sha256):
@@ -334,21 +405,39 @@ def main() -> int:
         pinned_candidate = workspace / "candidate-serve"
         _copy_candidate(candidate, pinned_candidate, candidate_sha256)
         environment["SUBROUTER_SHADOW_CANDIDATE_PATH"] = str(pinned_candidate)
+        shadow_health_key = secrets.token_bytes(32)
+        shadow_health_key_file = workspace / "shadow-health-key"
+        _write_shadow_health_key(shadow_health_key_file, shadow_health_key)
+        candidate_environment = dict(environment)
+        candidate_environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = str(shadow_health_key_file)
         with candidate_log.open("wb") as output:
             candidate_process = subprocess.Popen(
                 [str(pinned_candidate), "serve", "--addr", arguments.addr, *serve_args],
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                env=environment,
+                env=candidate_environment,
                 start_new_session=True,
             )
-            _wait_ready(candidate_process, base_url, arguments.startup_timeout_seconds)
+            _wait_ready(
+                candidate_process,
+                base_url,
+                shadow_health_key,
+                arguments.startup_timeout_seconds,
+            )
             phases["healthy_ready"] = True
+            shadow_health_key_file.unlink()
             _run_callback(
                 canary, environment, workspace / "canary.log", arguments.callback_timeout_seconds
             )
             phases["canary"] = True
+            if candidate_process.poll() is not None:
+                _fail("shadow candidate exited during canary")
+            if not _owned_health(base_url, shadow_health_key) or not _probe(
+                base_url, "/_subrouter/ready"
+            ):
+                _fail("shadow candidate lost ownership or readiness after canary")
+            phases["post_canary_owned_ready"] = True
     except ShadowError as error:
         failure = str(error)
     except Exception:
