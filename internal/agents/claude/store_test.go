@@ -515,6 +515,40 @@ func TestClaudeConfigDirFallsBackWhenAliasMissing(t *testing.T) {
 	}
 }
 
+func TestPrepareSharedStateDirSharesHistoryButNotCredentials(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "shared")
+	configDir := filepath.Join(root, "proxy")
+	store := Store{Dir: filepath.Join(root, "store"), SharedStateDir: shared}
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte("proxy-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareSharedStateDir(configDir); err != nil {
+		t.Fatal(err)
+	}
+	projects := filepath.Join(configDir, "projects")
+	info, err := os.Lstat(projects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("projects mode = %v, want symlink", info.Mode())
+	}
+	credential, err := os.ReadFile(filepath.Join(configDir, ".credentials.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(credential) != "proxy-secret" {
+		t.Fatalf("credential changed: %q", credential)
+	}
+	if _, err := os.Stat(filepath.Join(shared, ".credentials.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("credential leaked into shared state: %v", err)
+	}
+}
+
 func TestImportProfileCredentialUsesPreferredRealLegacyPath(t *testing.T) {
 	home := t.TempDir()
 	store := Store{Dir: filepath.Join(home, ".subrouter", "codex")}

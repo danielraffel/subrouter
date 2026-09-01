@@ -41,6 +41,7 @@ Usage:
   sr claude pick                Switch to the profile with the most quota left
   sr claude proxy [options] [args...]
                                 Launch Claude profilelessly through the selected server pool
+    sr claude proxy --resume ID Resume a direct or pooled session through the server pool
     --account [ACCOUNT]         Pin to one profile with no account failover; omit ACCOUNT for a picker
     --sr-expect-scope SCOPE --  Atomically bind launch to an opaque proxy scope (must be last option)
                                 Wrapper options must precede Claude args; args at/after -- are literal
@@ -512,6 +513,9 @@ func (r srRunner) proxyClaudeArgsTo(
 	if err := os.Chmod(configDir, 0o700); err != nil {
 		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
 	}
+	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
+		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
+	}
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -531,6 +535,9 @@ func (r srRunner) proxyClaudeArgsToServer(
 	if err := os.Chmod(configDir, 0o700); err != nil {
 		return fmt.Errorf("secure isolated Claude proxy config: %w", err)
 	}
+	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
+		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
+	}
 	return r.runProxyClaudeForServerAccount(ctx, args, server, proxyToken, configDir, accountID, preferredAccountID)
 }
 
@@ -541,6 +548,15 @@ func claudeProxyConfigDir(storeDir, scope, accountID string) string {
 	}
 	scopeHash := sha256.Sum256([]byte(identity))
 	return filepath.Join(storeDir, "claude-proxy", fmt.Sprintf("%x", scopeHash[:12]))
+}
+
+func prepareClaudeProxySharedState(configDir, storeDir string) error {
+	defaultStore := claude.DefaultStore()
+	if filepath.Clean(storeDir) != filepath.Clean(defaultStore.Dir) {
+		// Hermetic/test stores must never attach to the user's real Claude home.
+		return nil
+	}
+	return defaultStore.PrepareSharedStateDir(configDir)
 }
 
 func (r srRunner) runProxyClaudeForServer(ctx context.Context, args []string, server srServerConfig, proxyToken, configDir string) error {
@@ -1303,7 +1319,7 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		return fmt.Errorf("check local Claude profile %q login: %w", profile.Name, err)
 	}
 	if auth == nil || !auth.LoggedIn {
-		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Use sr claude proxy --account %s for the server-pool account, or 'sr claude add <new-name>' to create a logged-in local profile", profile.Name, shellQuote(profile.Name))
+		return fmt.Errorf("local managed Claude profile %q is not logged in; server-pool availability is separate. Resume through the pool with 'sr claude proxy --resume <session-id>', pin the server-pool account with 'sr claude proxy --account %s', or create a logged-in local profile with 'sr claude add <new-name>'", profile.Name, shellQuote(profile.Name))
 	}
 	// Login is accepted; profile preparation and the remaining launch mutations
 	// are now allowed.

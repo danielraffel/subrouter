@@ -2153,6 +2153,7 @@ func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
 	}
 	for _, want := range []string{
 		"sr claude proxy [options] [args...]",
+		"sr claude proxy --resume ID",
 		"--account [ACCOUNT]",
 		"Pin to one profile with no account failover",
 		"args at/after -- are literal",

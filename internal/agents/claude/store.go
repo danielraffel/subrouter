@@ -252,6 +252,14 @@ func (s Store) ClaudeConfigDir(name string) string {
 	return path
 }
 
+// PrepareSharedStateDir gives a credential-isolated Claude config home access
+// to the same conversation history as direct and managed-profile launches.
+// Only high-growth, non-credential state is shared; authentication and routing
+// files remain private to configDir.
+func (s Store) PrepareSharedStateDir(configDir string) error {
+	return s.prepareSharedState(configDir)
+}
+
 func (s Store) PreferredInstancePath(instancePath string) string {
 	cleanInstance := filepath.Clean(instancePath)
 	candidate, ok := s.legacyInstancePath(cleanInstance)
