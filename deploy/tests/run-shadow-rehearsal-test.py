@@ -444,6 +444,17 @@ time.sleep(60)
                         self.assertFalse(self.workspace_witness.exists())
                         self.assertFalse(_listening(port))
 
+    def test_single_or_double_dash_address_override_is_rejected_before_prepare(self) -> None:
+        for arguments in (["--addr", "0.0.0.0:1"], ["--addr=0.0.0.0:1"], ["-addr", "0.0.0.0:1"], ["-addr=0.0.0.0:1"]):
+            with self.subTest(arguments=arguments):
+                serve_args = self.root / "serve-args.json"
+                serve_args.write_text(json.dumps(arguments))
+                result = self._run(_free_port(), serve_args=serve_args)
+                self.assertEqual(result.returncode, 1)
+                evidence = json.loads(result.stdout)
+                self.assertEqual(evidence["failure"], "serve args JSON must not override serve or --addr")
+                self.assertFalse(self.workspace_witness.exists())
+
     def test_help_is_self_describing(self) -> None:
         result = subprocess.run(
             [sys.executable, str(RUNNER), "--help"],

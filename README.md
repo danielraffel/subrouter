@@ -752,7 +752,7 @@ direct session. Direct Alibaba keys are replaced with non-secret process
 sentinels so Qwen cannot restore them from `.env`. The process overlay is
 removed when Qwen exits and contains no real plan key. If Qwen system-policy
 files or their path environment variables are present, the launcher fails
-closed instead of hiding administrator policy. Qwen's `serve`, ACP, and
+closed instead of hiding administrator policy. Qwen's `serve`, ACP, `review`, and
 model-bearing channel-service modes can reload saved environment routing while
 they run, and container sandbox relaunches cannot reach the loopback relay or
 retain all routing guards. The routed wrapper therefore refuses those modes,

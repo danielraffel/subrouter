@@ -81,10 +81,11 @@ func ensureStoreAuthorityKey(path string) ([]byte, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("resolve account store authority: path is empty")
 	}
-	parent, err := filepath.Abs(filepath.Dir(path))
+	resolved, err := resolveStoreAuthorityPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve account store authority: %w", err)
 	}
+	parent := filepath.Dir(resolved)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, fmt.Errorf("create account store authority directory: %w", err)
 	}

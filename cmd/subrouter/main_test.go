@@ -460,6 +460,7 @@ func TestParseByteSize(t *testing.T) {
 func TestRunAcceptsDirectSRCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(home, ".subrouter"))
 
 	if err := run([]string{"list"}); err != nil {
 		t.Fatal(err)
@@ -477,6 +478,7 @@ func TestSRDefaultRunsAccountPicker(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, ".pi", "agent"))
+	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(home, ".subrouter"))
 
 	store := accounts.DefaultCodexStore()
 	if err := store.SaveStored(accounts.StoredCodexAccount{

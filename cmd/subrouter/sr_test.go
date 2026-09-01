@@ -1539,10 +1539,22 @@ func TestProtectedLocalServingDaemonKeepsOnboardingOnHTTPAuthority(t *testing.T)
 func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
 	var usageRequests atomic.Int32
 	var accountRequests atomic.Int32
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health":
-			w.WriteHeader(http.StatusOK)
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 		case "/_subrouter/usage-status":
 			usageRequests.Add(1)
 			_, _ = io.WriteString(w, `[]`)
@@ -1560,7 +1572,6 @@ func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
 	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
 	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1582,6 +1593,7 @@ func TestLocalServingAPIIgnoresMalformedOptionalServerRegistry(t *testing.T) {
 
 func TestReadyLocalServingServerStartsColdDaemon(t *testing.T) {
 	var healthy atomic.Bool
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/_subrouter/health" {
 			http.NotFound(w, request)
@@ -1591,13 +1603,24 @@ func TestReadyLocalServingServerStartsColdDaemon(t *testing.T) {
 			http.Error(w, "cold", http.StatusServiceUnavailable)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		authorityID, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 	}))
 	defer server.Close()
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 
 	var starts atomic.Int32
-	runner := srRunner{store: accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "cli-state")}, errOut: io.Discard}
+	runner := srRunner{store: store, errOut: io.Discard, client: server.Client()}
 	resolved, err := runner.readyLocalServingServer(t.Context(), func() error {
 		starts.Add(1)
 		healthy.Store(true)
@@ -1608,6 +1631,49 @@ func TestReadyLocalServingServerStartsColdDaemon(t *testing.T) {
 	}
 	if starts.Load() != 1 || !sameEndpoint(resolved.URL, server.URL) {
 		t.Fatalf("ready local server = %+v starts=%d", resolved, starts.Load())
+	}
+}
+
+func TestLocalServingCommandsRejectUnattestedListenerBeforeAdminCredential(t *testing.T) {
+	for _, args := range [][]string{nil, {"list"}, {"status"}, {"reset"}} {
+		t.Run(fmt.Sprint(args), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("SUBROUTER_ADMIN_TOKEN", "must-not-be-sent")
+			t.Setenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN", "must-not-be-sent")
+			t.Setenv("SUBROUTER_STATE_DIR", "")
+			cloudPath := filepath.Join(home, "cloud.json")
+			t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+			if err := os.WriteFile(cloudPath, []byte(`{"version":1,"credentialSource":"local"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var authenticatedRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.Header.Get("Authorization") != "" || request.Header.Get("X-Subrouter-Account-Import-Token") != "" {
+					authenticatedRequests.Add(1)
+				}
+				if request.URL.Path == "/_subrouter/health" {
+					_, _ = io.WriteString(w, `{"ok":true,"account_store_id":"spoof","account_store_proof":"spoof"}`)
+					return
+				}
+				http.Error(w, "unexpected authenticated request", http.StatusForbidden)
+			}))
+			defer server.Close()
+			t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+
+			runner := srRunner{
+				store:         accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")},
+				useServingAPI: true, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+				client: server.Client(),
+			}
+			err := runner.run(t.Context(), args)
+			if err == nil || !strings.Contains(err.Error(), "account store does not match") {
+				t.Fatalf("unattested local command %q error = %v", args, err)
+			}
+			if authenticatedRequests.Load() != 0 {
+				t.Fatalf("unattested local command %q sent %d credentialed request(s)", args, authenticatedRequests.Load())
+			}
+		})
 	}
 }
 
@@ -1623,7 +1689,18 @@ func TestServingAPIRemoteResetKeepsResolvedLoopbackServer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/_subrouter/health":
-			w.WriteHeader(http.StatusOK)
+			authorityID, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := ""
+			if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+				proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 		case "/_subrouter/reset-credits":
 			requested.Store(true)
 			_, _ = io.WriteString(w, `{"accounts":[{"email":"server-authority","count":1,"credits":[{"status":"available"}]}]}`)

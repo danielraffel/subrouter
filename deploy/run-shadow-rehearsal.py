@@ -233,7 +233,13 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
     if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
         _fail("serve args JSON must be an array of strings")
     for argument in parsed:
-        if "\x00" in argument or argument == "serve" or argument == "--addr" or argument.startswith("--addr="):
+        if (
+            "\x00" in argument
+            or argument == "serve"
+            or argument in ("--addr", "-addr")
+            or argument.startswith("--addr=")
+            or argument.startswith("-addr=")
+        ):
             _fail("serve args JSON must not override serve or --addr")
         for option_name, environment_name in CREDENTIAL_SERVE_OPTIONS.items():
             option = "--" + option_name

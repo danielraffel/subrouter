@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -660,13 +661,25 @@ func TestNativeProxyServerHonorsExplicitLocalOverLegacyStorage(t *testing.T) {
 
 func TestNativeProxyServerUsesReadyLocalServingAuthorityForUnselectedLegacy(t *testing.T) {
 	var localRequests atomic.Int32
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		localRequests.Add(1)
 		if request.URL.Path != "/_subrouter/health" {
 			http.NotFound(w, request)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		authorityID, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof := ""
+		if challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader); challenge != "" {
+			proof, err = accounts.StoreAuthorityProof(store.Dir, challenge)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, _ = fmt.Fprintf(w, `{"ok":true,"account_store_id":%q,"account_store_proof":%q}`, authorityID, proof)
 	}))
 	defer local.Close()
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL)
@@ -676,7 +689,7 @@ func TestNativeProxyServerUsesReadyLocalServingAuthorityForUnselectedLegacy(t *t
 		t.Fatal(err)
 	}
 
-	server, remote, err := (srRunner{store: accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}, errOut: io.Discard}).nativeProxyServer(t.Context())
+	server, remote, err := (srRunner{store: store, errOut: io.Discard, client: local.Client()}).nativeProxyServer(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1266,7 +1279,10 @@ func TestQwenNativeProxyArgsForceRoutingAndPreserveChosenModel(t *testing.T) {
 		{input: []string{"--fallback-model", "direct-model"}, model: defaultQwenProxyModel},
 		{input: []string{"--no-bare"}, model: defaultQwenProxyModel},
 	} {
-		model := qwenProxyModel(test.input)
+		model, err := qwenProxyModel(test.input)
+		if err != nil {
+			t.Fatalf("qwenProxyModel(%q): %v", test.input, err)
+		}
 		if model != test.model {
 			t.Fatalf("qwenProxyModel(%q) = %q, want %q", test.input, model, test.model)
 		}
@@ -1415,7 +1431,9 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 		{"--telemetry-target", "local", "serve"},
 		{"--allowed-tools", "Shell(git status)", "--acp"},
 		{"--acp"},
+		{"--model", "--acp"},
 		{"--experimental-acp=true"},
+		{"review", "run"},
 		{"channel", "start"},
 		{"--approval-mode", "default", "channel", "start"},
 		{"channel", "daemon-worker", "--channel", "work"},
@@ -1436,6 +1454,7 @@ func TestQwenProxyRejectsClientProxyOverrideBeforeLaunch(t *testing.T) {
 		{"-p", "channel start"},
 		{"--model", "channel", "-p", "start"},
 		{"--model", "serve", "--continue"},
+		{"-p", "review"},
 		{"--system-prompt", "serve"},
 		{"channel", "stop"},
 		{"channel", "status"},
@@ -1467,6 +1486,8 @@ func TestQwenProxyBundledShortOptionsMatchYargsGrammar(t *testing.T) {
 		{args: []string{"-icontinue"}, restricted: "cr"},
 		{args: []string{"-ostream"}, restricted: "scr"},
 		{args: []string{"-ymstream"}, restricted: "scr"},
+		{args: []string{"-m", "-cy"}, restricted: "cr"},
+		{args: []string{"-p", "-sc"}, restricted: "s"},
 	} {
 		if !qwenProxyBundledShortOptionRequested(test.args, test.restricted) {
 			t.Fatalf("bundled Qwen option %q did not activate one of %q", test.args, test.restricted)
@@ -1479,13 +1500,14 @@ func TestQwenProxyBundledShortOptionsMatchYargsGrammar(t *testing.T) {
 		{"-i=-sc"},
 		{"-o=stream"},
 		{"--model=-sc"},
-		{"-m", "-cy"},
-		{"-p", "-cy"},
 		{"--", "-cy"},
 	} {
 		if qwenProxyBundledShortOptionRequested(args, "scr") {
 			t.Fatalf("Qwen attached value or post-delimiter data %q was treated as a bundled routing option", args)
 		}
+	}
+	if err := (srRunner{}).launchQwenProxy(t.Context(), []string{"-p", "-sc"}); err == nil {
+		t.Fatal("dash-prefixed Qwen prompt follower restored sandbox/session routing")
 	}
 }
 
@@ -1572,7 +1594,7 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 			t.Fatalf("explicit/non-option resume %q was rejected", args)
 		}
 	}
-	for _, args := range [][]string{{"--resume"}, {"--resume", "session-id"}, {"--resume=session-id"}, {"-r=session-id"}, {"--continue"}, {"--continue=true"}, {"-c"}, {"-cy"}, {"-yc"}, {"-sc"}, {"-cs"}, {"-yr"}} {
+	for _, args := range [][]string{{"--resume"}, {"--resume", "session-id"}, {"--resume=session-id"}, {"-r=session-id"}, {"--continue"}, {"--continue=true"}, {"-c"}, {"-cy"}, {"-yc"}, {"-sc"}, {"-cs"}, {"-yr"}, {"-p", "--continue"}, {"-p", "-cy"}} {
 		if !qwenProxyPersistentSessionRequested(args) {
 			t.Fatalf("persistent session %q was not detected", args)
 		}
@@ -1580,9 +1602,17 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 			t.Fatalf("persistent session %q launch error = %v", args, err)
 		}
 	}
-	for _, args := range [][]string{{"-p", "--continue"}, {"-p", "-cy"}, {"--prompt=-cy"}, {"--", "--resume", "session-id"}, {"--", "-cy"}} {
+	for _, args := range [][]string{{"--prompt=-cy"}, {"--", "--resume", "session-id"}, {"--", "-cy"}} {
 		if qwenProxyPersistentSessionRequested(args) {
 			t.Fatalf("non-option session text %q was rejected", args)
+		}
+	}
+	for _, args := range [][]string{{"-m"}, {"--model"}, {"-m", "-cy"}, {"--model", "--acp"}, {"-m="}, {"--model="}} {
+		if _, err := qwenProxyModel(args); err == nil {
+			t.Fatalf("invalid Qwen model args %q were accepted", args)
+		}
+		if err := (srRunner{}).launchQwenProxy(t.Context(), args); err == nil {
+			t.Fatalf("invalid Qwen model launch %q was accepted", args)
 		}
 	}
 	for _, args := range [][]string{{"--session"}, {"-S"}, {"--resume"}, {"-r"}, {"--session="}, {"--resume="}, {"--session", ""}, {"-r", "   "}, {"--session", "--model", "kimi-test"}} {
@@ -1624,6 +1654,18 @@ func TestNativeProxyDataPlanePreflightRejectsLeaseRequiredRouter(t *testing.T) {
 	}
 }
 
+func TestNativeProxyAccountInventoryIsRequiredOnlyForHardPins(t *testing.T) {
+	if nativeProxyNeedsAccountInventory(nativeProxyLaunchOptions{}) {
+		t.Fatal("pooled native launch unexpectedly requires admin account inventory")
+	}
+	if !nativeProxyNeedsAccountInventory(nativeProxyLaunchOptions{pickPinnedAccount: true}) {
+		t.Fatal("pinned-account picker did not require account inventory")
+	}
+	if !nativeProxyNeedsAccountInventory(nativeProxyLaunchOptions{accountSelector: "work"}) {
+		t.Fatal("named hard pin did not require account inventory")
+	}
+}
+
 func TestQwenDefaultSystemPolicyPathsCoverSupportedPlatforms(t *testing.T) {
 	for _, test := range []struct {
 		goos string
@@ -1646,6 +1688,8 @@ func TestKimiNativeProxyArgsForceEphemeralModelOnNewAndResumedSessions(t *testin
 		{"--session", "session-id", "--model", "direct/model"},
 		{"-p", "hello", "-m", "direct-model"},
 		{"-m=direct-equals-model"},
+		{"-p", "--model=prompt-text"},
+		{"--agent", "--model=agent-name", "-p", "hello"},
 	} {
 		got := kimiNativeProxyArgs(input)
 		joined := strings.Join(got, " ")
@@ -1654,6 +1698,9 @@ func TestKimiNativeProxyArgsForceEphemeralModelOnNewAndResumedSessions(t *testin
 		}
 		if strings.Contains(joined, "direct-model") || strings.Contains(joined, "direct/model") || strings.Contains(joined, "direct-equals-model") {
 			t.Fatalf("direct model survived proxy args: %q", got)
+		}
+		if len(input) > 1 && (input[0] == "-p" || input[0] == "--agent") && !slices.Contains(got, input[1]) {
+			t.Fatalf("required Kimi option value %q was rewritten: %q", input[1], got)
 		}
 	}
 }

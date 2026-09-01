@@ -91,6 +91,42 @@ func TestStoreAuthorityUsesResolvedSymlinkedStateRoot(t *testing.T) {
 	}
 }
 
+func TestStoreAuthorityUsesResolvedSymlinkedStoreDirectory(t *testing.T) {
+	root := t.TempDir()
+	realStore := filepath.Join(root, "real", "accounts")
+	if err := os.MkdirAll(realStore, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasStore := filepath.Join(root, "accounts-alias")
+	if err := os.Symlink(realStore, aliasStore); err != nil {
+		t.Skipf("symlinked account-store test unavailable: %v", err)
+	}
+
+	realID, err := StoreAuthorityID(realStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasID, err := StoreAuthorityID(aliasStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realID != aliasID {
+		t.Fatalf("symlinked store authority IDs differ: %q != %q", realID, aliasID)
+	}
+	challenge := hex.EncodeToString(make([]byte, 32))
+	realProof, err := StoreAuthorityProof(realStore, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasProof, err := StoreAuthorityProof(aliasStore, challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hmac.Equal([]byte(realProof), []byte(aliasProof)) {
+		t.Fatal("symlinked account-store directories produced different proofs")
+	}
+}
+
 func TestStoreAuthorityProofRejectsMalformedChallenge(t *testing.T) {
 	if _, err := StoreAuthorityProof(filepath.Join(t.TempDir(), "accounts"), "short"); err == nil {
 		t.Fatal("malformed account-store challenge unexpectedly succeeded")

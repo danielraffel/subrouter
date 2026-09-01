@@ -62,7 +62,7 @@ The process-only routing launcher preserves Qwen's normal session store.
 It forces Qwen's bare mode, so saved settings, extensions, skills, and MCP servers are not loaded.
 Account affinity is stable per working directory for new routed sessions.
 Qwen resume/continue can restore a saved direct provider route, so routed launches reject them.
-Qwen serve/ACP and model-bearing channel-service modes can reload saved environment routing,
+Qwen serve/ACP, review, and model-bearing channel-service modes can reload saved environment routing,
 so use plain 'qwen' for those modes.
 `
 )
@@ -231,12 +231,16 @@ func (r srRunner) launchQwenProxy(ctx context.Context, args []string) error {
 		return err
 	}
 	if qwenProxyReloadCapableMode(vendorArgs) {
-		return errors.New("Qwen serve/ACP/channel-service modes can reload saved credentials and proxies; use plain 'qwen' for those modes")
+		return errors.New("Qwen serve/ACP/review/channel-service modes can reload saved credentials and proxies; use plain 'qwen' for those modes")
 	}
 	if qwenProxyPersistentSessionRequested(vendorArgs) {
 		return errors.New("Qwen resume/continue can restore a saved direct provider route and cannot be used with 'sr qwen'; start a new routed session or use plain 'qwen' for the existing direct session")
 	}
-	if model := qwenProxyModel(vendorArgs); strings.Contains(model, ":") {
+	model, err := qwenProxyModel(vendorArgs)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(model, ":") {
 		return errors.New("provider-qualified Qwen models can bypass the routed Token Plan provider; use an unqualified Token Plan model ID")
 	}
 	if qwenProxyBundledShortOptionRequested(vendorArgs, "s") {
@@ -274,7 +278,7 @@ func qwenProxyPersistentSessionRequested(args []string) bool {
 		switch arg {
 		case "-m", "--model", "--fallback-model", "-p", "--prompt", "-i", "--prompt-interactive",
 			"-o", "--output-format", "--auth-type", "--openai-api-key", "--openai-base-url", "--proxy":
-			if i+1 < len(args) {
+			if qwenOptionConsumesNext(args, i) {
 				i++
 			}
 		}
@@ -298,7 +302,7 @@ func qwenProxyBundledShortOptionRequested(args []string, restricted string) bool
 		switch arg {
 		case "-m", "--model", "--fallback-model", "-p", "--prompt", "-i", "--prompt-interactive",
 			"-o", "--output-format", "--auth-type", "--openai-api-key", "--openai-base-url", "--proxy":
-			if i+1 < len(args) {
+			if qwenOptionConsumesNext(args, i) {
 				i++
 			}
 		}
@@ -323,6 +327,10 @@ func qwenBundledShortOptionContains(arg, restricted string) bool {
 	return strings.ContainsAny(bundle, restricted)
 }
 
+func qwenOptionConsumesNext(args []string, index int) bool {
+	return index+1 < len(args) && args[index+1] != "--" && !strings.HasPrefix(args[index+1], "-")
+}
+
 func qwenProxyReloadCapableMode(args []string) bool {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -341,12 +349,15 @@ func qwenProxyReloadCapableMode(args []string) bool {
 		case "-m", "--model", "--fallback-model",
 			"-p", "--prompt", "-i", "--prompt-interactive", "--system-prompt", "--append-system-prompt",
 			"-r", "--resume", "--channel":
-			if i+1 < len(args) {
+			if qwenOptionConsumesNext(args, i) {
 				i++
 			}
 			continue
 		}
 		if arg == "serve" {
+			return true
+		}
+		if arg == "review" {
 			return true
 		}
 		if arg == "channel" && qwenProxyChannelServiceMode(args[i+1:]) {
@@ -487,7 +498,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 		return fmt.Errorf("team credential storage cannot lease %s accounts; use local or legacy storage for 'sr %s'", spec.display, spec.command)
 	}
 	var inventory []remoteServerAccount
-	if nativeProxyNeedsAccountInventory(options, credentialSource) {
+	if nativeProxyNeedsAccountInventory(options) {
 		if credentialSource == broker.CredentialSourceTeam {
 			inventory, err = nativeProxyTeamAccounts(ctx, cloudConfig, spec)
 		} else {
@@ -545,7 +556,11 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if spec.provider == accounts.ProviderKimi {
 		args = kimiNativeProxyArgs(args)
 	} else if spec.provider == accounts.ProviderQwenToken {
-		args = qwenNativeProxyArgs(args, qwenProxyModel(args))
+		model, modelErr := qwenProxyModel(args)
+		if modelErr != nil {
+			return modelErr
+		}
+		args = qwenNativeProxyArgs(args, model)
 	}
 	cmd := exec.CommandContext(ctx, commandPath, args...)
 	cmd.Stdin = r.in
@@ -564,12 +579,11 @@ func joinNativeProxyRunAndCleanupErrors(display string, runErr error, cleanup fu
 	return errors.Join(runErr, cleanupErr)
 }
 
-func nativeProxyNeedsAccountInventory(options nativeProxyLaunchOptions, source broker.CredentialSource) bool {
+func nativeProxyNeedsAccountInventory(options nativeProxyLaunchOptions) bool {
 	// A hard process-local pin must resolve one authoritative account ID before
-	// launching. Pooled team mode is different: the local daemon intentionally
-	// owns no account inventory and obtains a provider-scoped lease from the
-	// credential broker on the first routed request.
-	return options.pickPinnedAccount || strings.TrimSpace(options.accountSelector) != "" || source != broker.CredentialSourceTeam
+	// launching. Pooled mode leaves account selection to the server on the first
+	// routed request and therefore needs no admin inventory credential.
+	return options.pickPinnedAccount || strings.TrimSpace(options.accountSelector) != ""
 }
 
 func nativeProxyBrokerLeaseSupported(spec nativeProxySpec) bool {
@@ -1184,7 +1198,10 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		}
 		return env, cleanup, nil
 	case accounts.ProviderQwenToken:
-		model := qwenProxyModel(args)
+		model, err := qwenProxyModel(args)
+		if err != nil {
+			return nil, func() error { return nil }, err
+		}
 		overlay, cleanup, err := prepareQwenProxyOverlay(providerURL+"/v1", model, environ)
 		if err != nil {
 			return nil, func() error { return nil }, err
@@ -1459,6 +1476,13 @@ func kimiNativeProxyArgs(args []string) []string {
 			continue
 		case strings.HasPrefix(args[i], "--model=") || strings.HasPrefix(args[i], "-m="):
 			continue
+		case args[i] == "-p" || args[i] == "--prompt" || args[i] == "--output-format" ||
+			args[i] == "--skills-dir" || args[i] == "--agent" || args[i] == "--agent-file" || args[i] == "--add-dir":
+			out = append(out, args[i])
+			if i+1 < len(args) {
+				i++
+				out = append(out, args[i])
+			}
 		default:
 			out = append(out, args[i])
 		}
@@ -1468,26 +1492,29 @@ func kimiNativeProxyArgs(args []string) []string {
 
 const defaultQwenProxyModel = "qwen3.7-plus"
 
-func qwenProxyModel(args []string) string {
+func qwenProxyModel(args []string) (string, error) {
 	model := defaultQwenProxyModel
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" {
 			break
 		}
 		switch {
-		case (args[i] == "-m" || args[i] == "--model") && i+1 < len(args):
-			if candidate := strings.TrimSpace(args[i+1]); candidate != "" {
-				model = candidate
+		case args[i] == "-m" || args[i] == "--model":
+			if !qwenOptionConsumesNext(args, i) || strings.TrimSpace(args[i+1]) == "" {
+				return "", errors.New("Qwen -m/--model requires a non-option model value")
 			}
+			model = strings.TrimSpace(args[i+1])
 			i++
 		case strings.HasPrefix(args[i], "--model=") || strings.HasPrefix(args[i], "-m="):
 			separator := strings.IndexByte(args[i], '=')
-			if candidate := strings.TrimSpace(args[i][separator+1:]); candidate != "" {
-				model = candidate
+			candidate := strings.TrimSpace(args[i][separator+1:])
+			if candidate == "" {
+				return "", errors.New("Qwen -m/--model requires a non-empty model value")
 			}
+			model = candidate
 		}
 	}
-	return model
+	return model, nil
 }
 
 func qwenNativeProxyArgs(args []string, model string) []string {

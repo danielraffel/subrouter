@@ -901,10 +901,29 @@ func (r srRunner) localServingServer() (srServerConfig, error) {
 }
 
 func (r srRunner) readyLocalServingServer(ctx context.Context, start daemonStarter) (srServerConfig, error) {
+	server, _, err := r.readyLocalServingServerWithAuthority(ctx, start)
+	return server, err
+}
+
+func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, start daemonStarter) (srServerConfig, localServingStoreAuthority, error) {
 	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), start, r.errOut) {
-		return srServerConfig{}, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
+		return srServerConfig{}, localServingStoreAuthority{}, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
 	}
-	return r.localServingServer()
+	// Prove the loopback listener owns this CLI's private account store before
+	// loading any credential that could later be attached to an HTTP request.
+	bare := srServerConfig{Name: "local", URL: localBaseURL()}
+	authority, err := r.localServingStoreAuthority(ctx, bare)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	if !authority.storeMatches {
+		return srServerConfig{}, localServingStoreAuthority{}, fmt.Errorf("local proxy account store does not match this CLI; set SUBROUTER_STATE_DIR to the daemon's state root or select it as a named authenticated remote")
+	}
+	server, err := r.localServingServer()
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	return server, authority, nil
 }
 
 type localServingStoreAuthority struct {
