@@ -45,6 +45,7 @@ class ShadowRehearsalTest(unittest.TestCase):
         self.candidate_cloud_config_witness = self.root / "candidate-cloud-config.txt"
         self.candidate_codex_state_witness = self.root / "candidate-codex-state.txt"
         self.callback_addr_witness = self.root / "callback-addr.txt"
+        self.oversized_ready_witness = self.root / "oversized-ready.txt"
         self.test_home = self.root / "home"
         legacy_accounts = self.test_home / ".codex-accounts" / "accounts"
         legacy_accounts.mkdir(parents=True)
@@ -117,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
                 hashlib.sha256,
             ).hexdigest()
         body = json.dumps(payload).encode()
+        if self.path == "/_subrouter/ready" and (workspace / "oversized-ready-witness").exists():
+            (workspace / "oversized-ready-witness").write_text(str(len(body)))
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -199,6 +202,7 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         environment["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"] = str(self.candidate_cloud_config_witness)
         environment["TEST_CANDIDATE_CODEX_STATE_WITNESS"] = str(self.candidate_codex_state_witness)
         environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
+        environment["TEST_OVERSIZED_READY_WITNESS"] = str(self.oversized_ready_witness)
         environment["HOME"] = str(self.test_home)
         environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = "must-not-reach-callback"
         environment["SUBROUTER_ADMIN_TOKEN_FILE"] = "/must-not-reach-candidate/admin-token"
@@ -379,17 +383,25 @@ state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"])
 workspace = Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
 Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(str(workspace))
 (workspace / "oversized-ready-response").write_text("yes")
+ready_witness = Path(os.environ["TEST_OVERSIZED_READY_WITNESS"])
+ready_witness.write_text("not-served")
+os.symlink(ready_witness, workspace / "oversized-ready-witness")
 """,
         )
         port = _free_port()
-        result = self._run(
-            port,
-            prepare=oversized_response_prepare,
-            startup_timeout_seconds=1,
-        )
+        result = self._run(port, prepare=oversized_response_prepare)
         self.assertEqual(result.returncode, 1, result.stderr)
         evidence = json.loads(result.stdout)
         self.assertEqual(evidence["failure"], "shadow candidate did not become healthy and ready")
+        oversized_ready_bytes = self.oversized_ready_witness.read_text()
+        self.assertTrue(
+            oversized_ready_bytes.isdigit(),
+            "candidate never served the oversized ready response",
+        )
+        self.assertGreater(
+            int(oversized_ready_bytes),
+            4096,
+        )
         self.assertTrue(all(evidence["teardown"].values()))
         self.assertFalse(Path(self.workspace_witness.read_text()).exists())
         self.assertFalse(_listening(port))
