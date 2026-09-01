@@ -108,11 +108,11 @@ func TestAntigravityFamilyQuotaRoutesWithoutCollapsingOtherFamily(t *testing.T) 
 		}),
 	}
 	scheduler := selectacct.NewScheduler(scores)
-	gemini, err := scheduler.ForModel(antigravityPoolModel("gemini-3.1-pro")).Pick([]accounts.Account{accountA, accountB})
+	gemini, err := scheduler.ForModel(antigravityPoolModel(scheduler, "gemini-3.1-pro")).Pick([]accounts.Account{accountA, accountB})
 	if err != nil || gemini.ID != accountB.ID {
 		t.Fatalf("Gemini picked %+v err=%v, want %s", gemini, err, accountB.ID)
 	}
-	claude, err := scheduler.ForModel(antigravityPoolModel("claude-sonnet-4.5")).Pick([]accounts.Account{accountA, accountB})
+	claude, err := scheduler.ForModel(antigravityPoolModel(scheduler, "claude-sonnet-4.5")).Pick([]accounts.Account{accountA, accountB})
 	if err != nil || claude.ID != accountA.ID {
 		t.Fatalf("Claude picked %+v err=%v, want %s", claude, err, accountA.ID)
 	}
@@ -131,13 +131,75 @@ func TestAntigravityPoolModelAndTenantLeaseUseSameFamilies(t *testing.T) {
 		{"gpt-oss-120b", "claude-gpt"},
 		{"future-model", "future-model"},
 	} {
-		if got := antigravityPoolModel(test.model); got != test.want {
-			t.Fatalf("antigravityPoolModel(%q) = %q, want %q", test.model, got, test.want)
+		if got := antigravityFamilyPoolModel(test.model); got != test.want {
+			t.Fatalf("antigravityFamilyPoolModel(%q) = %q, want %q", test.model, got, test.want)
 		}
 		wantLease := selectacct.ModelKey(test.want)
 		if got := tenantCredentialLeasePoolModel(accounts.ProviderAntigravity, test.model); got != wantLease {
 			t.Fatalf("tenant pool(%q) = %q, want %q", test.model, got, wantLease)
 		}
+	}
+}
+
+func TestAntigravityPartialFamilyTelemetryKeepsMissingFamilyEligible(t *testing.T) {
+	partial := scoreFromUsageWindows(accounts.ProviderAntigravity, "partial", []accounts.UsageWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20, LimitWindowSeconds: 18000},
+	})
+	complete := scoreFromUsageWindows(accounts.ProviderAntigravity, "complete", []accounts.UsageWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 10, LimitWindowSeconds: 18000},
+		{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 90, LimitWindowSeconds: 18000},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{partial, complete})
+	claudePool := scheduler.ForModel(antigravityPoolModel(scheduler, "claude-sonnet-4.5"))
+	if claudePool.Exhausted(accounts.ProviderAntigravity, "partial") {
+		t.Fatal("missing Claude/GPT telemetry was converted to exhausted")
+	}
+	picked, err := claudePool.Pick([]accounts.Account{
+		{ID: "complete", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+		{ID: "partial", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
+	})
+	if err != nil || picked.ID != "partial" {
+		t.Fatalf("picked %+v err=%v, want optimistic partial account", picked, err)
+	}
+}
+
+func TestAntigravityLegacyModelsUseExactPoolsWithinOneFamily(t *testing.T) {
+	score := scoreFromUsageWindows(accounts.ProviderAntigravity, "mixed", []accounts.UsageWindow{
+		{Name: "claude-sonnet-4.5", Feature: "claude-sonnet-4.5", UsedPercent: 100},
+		{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 10},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{score})
+	if got := antigravityPoolModel(scheduler, "claude-sonnet-4.5"); got != "claude-sonnet-4.5" {
+		t.Fatalf("Sonnet pool = %q", got)
+	}
+	if !scheduler.ForModel("claude-sonnet-4.5").Exhausted(accounts.ProviderAntigravity, "mixed") {
+		t.Fatal("exhausted exact Sonnet pool appeared usable")
+	}
+	if scheduler.ForModel("claude-opus-4.1").Exhausted(accounts.ProviderAntigravity, "mixed") {
+		t.Fatal("Sonnet exhaustion collapsed healthy exact Opus pool")
+	}
+	if got := tenantCredentialLeasePoolModel(accounts.ProviderAntigravity, "claude-opus-4.1", scheduler); got != selectacct.ModelKey("claude-opus-4.1") {
+		t.Fatalf("tenant exact pool = %q", got)
+	}
+}
+
+func TestAntigravityLegacyModelMissingOnOneAccountRemainsUnknown(t *testing.T) {
+	partialAccount := accounts.Account{ID: "partial", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	observedAccount := accounts.Account{ID: "observed", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	partial := scoreFromUsageWindows(accounts.ProviderAntigravity, partialAccount.ID, []accounts.UsageWindow{
+		{Name: "claude-sonnet-4.5", Feature: "claude-sonnet-4.5", UsedPercent: 20},
+	})
+	observed := scoreFromUsageWindows(accounts.ProviderAntigravity, observedAccount.ID, []accounts.UsageWindow{
+		{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 95},
+	})
+	scheduler := selectacct.NewScheduler([]selectacct.Score{partial, observed})
+	pool := scheduler.ForModel(antigravityPoolModel(scheduler, "claude-opus-4.1"))
+	if pool.Exhausted(accounts.ProviderAntigravity, partialAccount.ID) {
+		t.Fatal("missing exact legacy model was treated as exhausted")
+	}
+	picked, err := pool.Pick([]accounts.Account{observedAccount, partialAccount})
+	if err != nil || picked.ID != partialAccount.ID {
+		t.Fatalf("picked %+v err=%v, want unknown partial account", picked, err)
 	}
 }
 

@@ -134,13 +134,37 @@ func TestFetchUsageFallsBackToPerFamilyModelQuotaWithoutInventingCadence(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if details.Email != "" || details.Plan != "Free" || len(details.Windows) != 2 {
+	if details.Email != "" || details.Plan != "Free" || len(details.Windows) != 3 {
 		t.Fatalf("details = %+v", details)
 	}
 	for _, window := range details.Windows {
 		if strings.Contains(window.Name, "5h") || strings.Contains(window.Name, "weekly") || window.LimitWindowSeconds != 0 {
 			t.Fatalf("invented cadence: %+v", window)
 		}
+	}
+}
+
+func TestLegacyModelQuotaPreservesExactModelPools(t *testing.T) {
+	var payload any
+	if err := json.Unmarshal([]byte(`{"models":{
+		"claude-sonnet-4.5":{"quotaInfo":{"remainingFraction":0}},
+		"claude-opus-4.1":{"quotaInfo":{"remainingFraction":0.8}}
+	}}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	windows := modelQuotaWindows(payload, time.Now())
+	if len(windows) != 2 {
+		t.Fatalf("windows = %+v", windows)
+	}
+	used := map[string]float64{}
+	for _, window := range windows {
+		if window.Name != window.Feature {
+			t.Fatalf("window lost exact identity: %+v", window)
+		}
+		used[window.Feature] = window.UsedPercent
+	}
+	if used["claude-sonnet-4.5"] != 100 || math.Abs(used["claude-opus-4.1"]-20) > 0.0001 {
+		t.Fatalf("exact pools = %+v", used)
 	}
 }
 

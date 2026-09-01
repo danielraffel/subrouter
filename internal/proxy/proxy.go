@@ -1541,7 +1541,7 @@ func claudePoolModel(model string) string {
 // antigravityPoolModel maps vendor model names onto the two independent quota
 // families published by Antigravity. Unknown names stay unpooled so a future
 // model cannot be denied merely because this client has not learned its name.
-func antigravityPoolModel(model string) string {
+func antigravityFamilyPoolModel(model string) string {
 	lower := strings.ToLower(strings.TrimSpace(model))
 	switch {
 	case strings.Contains(lower, "gemini"):
@@ -1551,6 +1551,13 @@ func antigravityPoolModel(model string) string {
 	default:
 		return model
 	}
+}
+
+func antigravityPoolModel(scheduler selectacct.Scheduler, model string) string {
+	if scheduler.HasModelPool(model) {
+		return model
+	}
+	return antigravityFamilyPoolModel(model)
 }
 
 func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow {
@@ -6138,7 +6145,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if provider == accounts.ProviderClaude {
 		poolModel = claudePoolModel(model)
 	} else if provider == accounts.ProviderAntigravity {
-		poolModel = antigravityPoolModel(model)
+		poolModel = antigravityPoolModel(base, model)
 	}
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))

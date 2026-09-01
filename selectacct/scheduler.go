@@ -110,7 +110,15 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
+			if score.Provider == account.ProviderAntigravity {
+				// Antigravity omits disabled, unavailable, and sometimes merely
+				// unreported buckets. Absence is unknown, not proof that this
+				// account cannot serve a pool another account happened to expose.
+				modelScore = score
+				modelScore.ModelScores = nil
+			} else {
+				modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
+			}
 		}
 		next.scores[scoreKey] = modelScore
 	}

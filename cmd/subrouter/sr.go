@@ -3011,12 +3011,22 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		usageGridColumn{Key: "Pick", Title: "Use", Width: pickWidth},
 	)
 	if provider == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
-		for _, candidate := range []usageGridColumn{
+		candidates := []usageGridColumn{
 			{Key: "AG Gemini 5h", Title: "G 5h", Width: 9},
-			{Key: "AG Gemini wk", Title: "G wk", Width: 9},
 			{Key: "AG 3P 5h", Title: "C/G 5h", Width: 9},
+			{Key: "AG Gemini wk", Title: "G wk", Width: 9},
 			{Key: "AG 3P wk", Title: "C/G wk", Width: 9},
-		} {
+		}
+		available := 0
+		for _, candidate := range candidates {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				available++
+			}
+		}
+		if termWidth <= 110 && available >= 3 {
+			columns = dropUsageGridColumn(columns, "Pick")
+		}
+		for _, candidate := range candidates {
 			if usageGridRowsHaveValue(rows, candidate.Key) {
 				columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
 			}

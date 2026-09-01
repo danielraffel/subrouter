@@ -4810,7 +4810,7 @@ func TestAntigravityStatusUsesAuthAndSessionTruthWithoutFakeQuota(t *testing.T) 
 }
 
 func TestAntigravityStatusPreservesIndependentFamilyQuotaAtRealisticWidth(t *testing.T) {
-	t.Setenv("COLUMNS", "120")
+	t.Setenv("COLUMNS", "100")
 	statuses := []remoteServerUsageStatus{{
 		ID: "antigravity-subscription:work", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
 		AccountIdentity: "verified@example.com", PlanType: "Google AI Pro", AuthChecked: true, AuthValid: true,
@@ -4832,6 +4832,9 @@ func TestAntigravityStatusPreservesIndependentFamilyQuotaAtRealisticWidth(t *tes
 			t.Fatalf("columns = %+v, missing %s", columns, key)
 		}
 	}
+	if keys["Pick"] {
+		t.Fatalf("columns = %+v, constrained four-lane layout should drop Use", columns)
+	}
 	var out bytes.Buffer
 	displayUsageRows(&out, rows, false)
 	got := out.String()
@@ -4843,7 +4846,7 @@ func TestAntigravityStatusPreservesIndependentFamilyQuotaAtRealisticWidth(t *tes
 			t.Fatalf("Antigravity status missing %q:\n%s", want, got)
 		}
 	}
-	assertUsageGridLineWidths(t, got, 120)
+	assertUsageGridLineWidths(t, got, 100)
 }
 
 func TestAntigravityStatusHidesUnavailableFamilyColumns(t *testing.T) {

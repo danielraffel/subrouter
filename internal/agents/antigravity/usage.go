@@ -295,11 +295,11 @@ func modelQuotaWindows(payload any, now time.Time) []accounts.UsageWindow {
 		if !known {
 			continue
 		}
-		family := quotaFamily(modelID + " " + firstString(model, "displayName", "label"))
-		if family == "" {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
 			continue
 		}
-		windows = append(windows, usageWindow(family, family, 0, remaining, firstString(quota, "resetTime"), now))
+		windows = append(windows, usageWindow(modelID, modelID, 0, remaining, firstString(quota, "resetTime"), now))
 	}
 	return mostConstrainedByName(windows)
 }

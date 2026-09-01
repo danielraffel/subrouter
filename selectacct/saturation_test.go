@@ -129,6 +129,29 @@ func TestSchedulerGeneralizesToAnyMeteredFeature(t *testing.T) {
 	}
 }
 
+func TestAntigravityMissingModelPoolRemainsOptimisticallyEligible(t *testing.T) {
+	partial := ScoreFromLimitWindows("partial", 0, []LimitWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20},
+	})
+	partial.Provider = account.ProviderAntigravity
+	complete := ScoreFromLimitWindows("complete", 0, []LimitWindow{
+		{Name: "gemini 5h", Feature: "gemini", UsedPercent: 10},
+		{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 90},
+	})
+	complete.Provider = account.ProviderAntigravity
+	scheduler := NewScheduler([]Score{partial, complete}).ForModel("claude-opus-4.1")
+	if scheduler.Exhausted(account.ProviderAntigravity, "partial") {
+		t.Fatal("missing Antigravity model bucket was treated as unsupported")
+	}
+	picked, err := scheduler.Pick([]account.Account{
+		{ID: "complete", Provider: account.ProviderAntigravity, AuthMode: account.AuthModeOAuth},
+		{ID: "partial", Provider: account.ProviderAntigravity, AuthMode: account.AuthModeOAuth},
+	})
+	if err != nil || picked.ID != "partial" {
+		t.Fatalf("picked %+v err=%v, want optimistic partial account", picked, err)
+	}
+}
+
 func TestScoreExcludesFeatureWindowsFromBase(t *testing.T) {
 	// An exhausted Spark pool must not drag down the base score used for regular
 	// models. This is an intended behavior change to the regular selection path.
