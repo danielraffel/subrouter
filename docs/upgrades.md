@@ -205,7 +205,7 @@ Success requires `"ok":true` and every field under `"teardown"` to be true. A
 callback failure, SIGINT, SIGTERM, or—on platforms that provide them—SIGHUP or
 SIGQUIT still runs teardown and returns nonzero evidence. SIGKILL cannot run any
 userspace cleanup handler, so after an unclean host interruption verify the
-recorded listener before retrying.
+configured listener port is free before retrying.
 
 Shadow rehearsal and live rollback are complementary, not substitutes. A
 passing shadow is a recommended high-assurance activation gate for sensitive

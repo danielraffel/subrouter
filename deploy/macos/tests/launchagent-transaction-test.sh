@@ -44,7 +44,7 @@ trap cleanup_launchagent_test EXIT INT TERM
 
 rollback_help="$($ROLLBACK --help)"
 case "$rollback_help" in
-  *'--rollback-artifact DEST ARTIFACT SHA MODE'*'identity-checked legacy LaunchAgent'*) ;;
+  *'--rollback-artifact DEST ARTIFACT SHA MODE'*'--expected-file-sha256 PATH SHA'*'identity-checked legacy LaunchAgent'*) ;;
   *) echo "rollback --help did not describe the required identity inputs" >&2; exit 1 ;;
 esac
 echo "PASS rollback --help is self-describing and exits zero"

@@ -29,6 +29,7 @@ SHADOW_PROOF_FIELD = "shadow_candidate_proof"
 SHADOW_HEALTH_DOMAIN = b"subrouter-shadow-health-v1\x00"
 CALLBACK_RUN_ENV = "SUBROUTER_SHADOW_CALLBACK_RUN_ID"
 CANDIDATE_RUN_ENV = "SUBROUTER_SHADOW_CANDIDATE_RUN_ID"
+PROBE_RESPONSE_MAX_BYTES = 4096
 
 CREDENTIAL_SERVE_OPTIONS = {
     "admin-token": "SUBROUTER_ADMIN_TOKEN_FILE",
@@ -53,6 +54,12 @@ SHADOW_CONTROLLED_SERVE_OPTIONS = ("antigravity-local-credential",)
 
 class ShadowError(Exception):
     pass
+
+
+class CallbackError(ShadowError):
+    def __init__(self, message: str, diagnostic: dict[str, object]) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 def _fail(message: str) -> None:
@@ -319,7 +326,33 @@ def _candidate_environment(
     }
 
 
-def _run_callback(path: Path, environment: dict[str, str], log_path: Path, timeout: int) -> None:
+def _callback_diagnostic(
+    log_path: Path,
+    phase: str,
+    return_code: int | None,
+    timed_out: bool,
+) -> dict[str, object]:
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        size = 0
+    return {
+        "phase": phase,
+        "exit_code": return_code,
+        "timed_out": timed_out,
+        # Callback logs can contain file-backed credentials that no generic
+        # redactor can identify safely. Report only metadata before teardown.
+        "output_bytes": size,
+    }
+
+
+def _run_callback(
+    path: Path,
+    environment: dict[str, str],
+    log_path: Path,
+    timeout: int,
+    phase: str,
+) -> None:
     # Callbacks are trusted deployment code, not a security sandbox. The marker
     # closes accidental daemonization and ordinary setsid escapes; code that
     # deliberately clears it already has the callback's authorized privileges.
@@ -336,11 +369,13 @@ def _run_callback(path: Path, environment: dict[str, str], log_path: Path, timeo
             start_new_session=True,
         )
         failure = ""
+        timed_out = False
         try:
             try:
                 return_code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                return_code = -1
+                return_code = None
+                timed_out = True
                 failure = "shadow callback timed out"
             if return_code != 0:
                 failure = failure or "shadow callback failed"
@@ -351,7 +386,15 @@ def _run_callback(path: Path, environment: dict[str, str], log_path: Path, timeo
         if not group_absent or not detached_absent:
             _fail("shadow callback descendants could not be terminated")
         if failure:
-            _fail(failure)
+            raise CallbackError(
+                failure,
+                _callback_diagnostic(
+                    log_path,
+                    phase,
+                    return_code,
+                    timed_out,
+                ),
+            )
         if group_remained or detached:
             _fail("shadow callback left descendant processes")
 
@@ -476,7 +519,9 @@ def _probe(base_url: str, path: str) -> bool:
         with urllib.request.urlopen(base_url + path, timeout=0.5) as response:
             if response.status != 200:
                 return False
-            body = response.read(1024)
+            body = response.read(PROBE_RESPONSE_MAX_BYTES + 1)
+            if len(body) > PROBE_RESPONSE_MAX_BYTES:
+                return False
         parsed = json.loads(body)
         return parsed.get("ok") is True and (path != "/_subrouter/ready" or parsed.get("draining") is not True)
     except (OSError, urllib.error.URLError, json.JSONDecodeError, AttributeError):
@@ -551,7 +596,14 @@ def _ignore_signals(handled_signals: list[signal.Signals]) -> None:
         signal.signal(handled_signal, signal.SIG_IGN)
 
 
-def _evidence(ok: bool, candidate_sha256: str, phases: dict[str, bool], teardown: dict[str, bool], failure: str = "") -> str:
+def _evidence(
+    ok: bool,
+    candidate_sha256: str,
+    phases: dict[str, bool],
+    teardown: dict[str, bool],
+    failure: str = "",
+    callback_diagnostic: dict[str, object] | None = None,
+) -> str:
     body: dict[str, object] = {
         "schema": SCHEMA,
         "ok": ok,
@@ -561,6 +613,8 @@ def _evidence(ok: bool, candidate_sha256: str, phases: dict[str, bool], teardown
     }
     if failure:
         body["failure"] = failure
+    if callback_diagnostic is not None:
+        body["callback_diagnostic"] = callback_diagnostic
     return json.dumps(body, sort_keys=True, separators=(",", ":"))
 
 
@@ -596,6 +650,7 @@ def main() -> int:
         "logs_absent": True,
     }
     failure = ""
+    callback_diagnostic: dict[str, object] | None = None
     workspace: Path | None = None
     state_dir: Path | None = None
     candidate_log: Path | None = None
@@ -660,7 +715,11 @@ def main() -> int:
             workspace, state_dir, prepare_candidate, candidate_sha256, resolved_addr, base_url, candidate_log
         )
         _run_callback(
-            prepare, environment, workspace / "prepare.log", arguments.callback_timeout_seconds
+            prepare,
+            environment,
+            workspace / "prepare.log",
+            arguments.callback_timeout_seconds,
+            "prepare",
         )
         _seal_shadow_state_against_legacy_fallback(state_dir)
         phases["prepared"] = True
@@ -713,7 +772,11 @@ def main() -> int:
             phases["healthy_ready"] = True
             shadow_health_key_file.unlink()
             _run_callback(
-                canary, environment, workspace / "canary.log", arguments.callback_timeout_seconds
+                canary,
+                environment,
+                workspace / "canary.log",
+                arguments.callback_timeout_seconds,
+                "canary",
             )
             phases["canary"] = True
             if candidate_process.poll() is not None:
@@ -723,6 +786,9 @@ def main() -> int:
             ):
                 _fail("shadow candidate lost ownership or readiness after canary")
             phases["post_canary_owned_ready"] = True
+    except CallbackError as error:
+        failure = str(error)
+        callback_diagnostic = error.diagnostic
     except ShadowError as error:
         failure = str(error)
     except Exception:
@@ -753,7 +819,7 @@ def main() -> int:
     ok = not failure and all(phases.values()) and all(teardown.values())
     if not ok and not failure:
         failure = "shadow teardown proof failed"
-    print(_evidence(ok, candidate_sha256, phases, teardown, failure))
+    print(_evidence(ok, candidate_sha256, phases, teardown, failure, callback_diagnostic))
     return 0 if ok else 1
 
 

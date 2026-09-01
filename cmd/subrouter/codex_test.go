@@ -303,7 +303,7 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 		t.Fatal(err)
 	}
 	if got := string(body); got != "login --help\n" {
-		t.Fatalf("utility launch record = %q", got)
+		t.Fatal("utility launch published routing metadata or durable environment")
 	}
 }
 
@@ -733,18 +733,18 @@ func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 		subrouterCodexResumeCommandEnv + "=old resume",
 	}, "local-secret", "subrouter")
 	joined := strings.Join(got, "\n")
-	for _, want := range []string{
+	for i, want := range []string{
 		subrouterCodexLauncherEnv + "=subrouter codex",
 		subrouterCodexResumeCommandEnv + "=subrouter codex resume",
 		"SUBROUTER_CODEX_DUMMY_API_KEY=local-secret",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("missing %q in:\n%s", want, joined)
+			t.Fatalf("required child environment entry %d is missing", i)
 		}
 	}
-	for _, forbidden := range []string{"admin-secret", "/private/future", "/private/cloud-config", "/private/state"} {
+	for i, forbidden := range []string{"admin-secret", "/private/future", "/private/cloud-config", "/private/state"} {
 		if strings.Contains(joined, forbidden) {
-			t.Fatalf("retained durable Subrouter secret %q in:\n%s", forbidden, joined)
+			t.Fatalf("durable Subrouter secret entry %d was retained", i)
 		}
 	}
 }

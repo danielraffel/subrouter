@@ -75,12 +75,14 @@ shadows direct Alibaba credentials with non-secret process sentinels. The
 Antigravity relay similarly leaves the local keychain untouched and removes the
 local bearer before forwarding to the selected router.
 
-Pooled native-launcher account affinity for new sessions and continue operations
-is provider-and-working-directory scoped. An explicit Kimi session ID is instead
-provider-and-session scoped, so it retains one router assignment across working
-directories without inspecting or persisting vendor session files. A
-hard-pinned launch carries the forced account only through the short-lived local
-relay and uses an account-scoped session identity. The router never falls back
+Pooled native-launcher account affinity for new sessions is
+provider-and-working-directory scoped. Kimi's workspace-relative `--continue`
+operations keep that same affinity; Qwen deliberately rejects continue and
+resume operations. An explicit Kimi session ID is instead provider-and-session
+scoped, so it retains one router assignment across working directories without
+inspecting or persisting vendor session files. A hard-pinned launch carries the
+forced account only through the short-lived local relay and uses an
+account-scoped session identity. The router never falls back
 to a different account, parallel pins do not fight over one assignment, and a
 pin does not replace the corresponding pooled session assignment.
 

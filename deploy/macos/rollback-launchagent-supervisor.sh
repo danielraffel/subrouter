@@ -44,6 +44,7 @@ usage: $0 --backup PLIST --backup-sha256 SHA \\
      --serving-store-binding-absent) \\
     --expected-serving-store-binding-sha256 SHA] \\
   [--public-addr HOST:PORT] [--expected-program PATH] \\
+  [--expected-file-sha256 PATH SHA] \\
   [--expected-running-program PATH]
 
 Restore the identity-checked legacy LaunchAgent only after proving the loaded

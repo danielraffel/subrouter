@@ -102,6 +102,10 @@ if (workspace / "spawn-detached-candidate").exists():
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         payload = {"ok": True, "draining": False}
+        if self.path == "/_subrouter/ready" and (workspace / "large-ready-response").exists():
+            payload["padding"] = "x" * 2048
+        if self.path == "/_subrouter/ready" and (workspace / "oversized-ready-response").exists():
+            payload["padding"] = "x" * 8192
         challenge_hex = self.headers.get("X-Subrouter-Shadow-Challenge")
         if self.path == "/_subrouter/health" and challenge_hex:
             challenge = bytes.fromhex(challenge_hex)
@@ -183,6 +187,8 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         serve_args: Path | None = None,
         addr_host: str = "127.0.0.1",
         environment_overrides: dict[str, str] | None = None,
+        startup_timeout_seconds: int = 5,
+        callback_timeout_seconds: int = 5,
     ) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
         environment["TEST_WORKSPACE_WITNESS"] = str(self.workspace_witness)
@@ -215,9 +221,9 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
             "--canary-callback",
             str(canary or self.canary),
             "--startup-timeout-seconds",
-            "5",
+            str(startup_timeout_seconds),
             "--callback-timeout-seconds",
-            "5",
+            str(callback_timeout_seconds),
         ]
         if serve_args is not None:
             command.extend(["--serve-args-json", str(serve_args)])
@@ -272,16 +278,120 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         self.assertNotIn("localhost", result.stdout + result.stderr)
 
     def test_failed_canary_still_proves_teardown(self) -> None:
-        failing = self._script("failing.py", "raise SystemExit(7)\n")
+        secret = "callback-secret-must-not-leak"
+        failing = self._script(
+            "failing.py",
+            """
+import os
+print("x" * 4096, flush=True)
+print("canary could not reach staged account", flush=True)
+print("TEST_CALLBACK_SECRET=" + os.environ["TEST_CALLBACK_SECRET"], flush=True)
+print("AWS_ACCESS_KEY_ID=" + os.environ["AWS_ACCESS_KEY_ID"], flush=True)
+print("Bearer file-backed-secret", flush=True)
+raise SystemExit(7)
+""",
+        )
         port = _free_port()
-        result = self._run(port, canary=failing)
+        result = self._run(
+            port,
+            canary=failing,
+            environment_overrides={
+                "TEST_CALLBACK_SECRET": secret,
+                "AWS_ACCESS_KEY_ID": "standard-access-key-must-not-leak",
+            },
+        )
         self.assertEqual(result.returncode, 1)
         evidence = json.loads(result.stdout)
         self.assertFalse(evidence["ok"])
         self.assertEqual(evidence["failure"], "shadow callback failed")
+        diagnostic = evidence["callback_diagnostic"]
+        self.assertEqual(diagnostic["phase"], "canary")
+        self.assertEqual(diagnostic["exit_code"], 7)
+        self.assertFalse(diagnostic["timed_out"])
+        self.assertGreater(diagnostic["output_bytes"], 4096)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertNotIn("standard-access-key-must-not-leak", result.stdout + result.stderr)
+        self.assertNotIn("file-backed-secret", result.stdout + result.stderr)
         self.assertTrue(all(evidence["teardown"].values()))
         workspace = Path(self.workspace_witness.read_text())
         self.assertFalse(workspace.exists())
+        self.assertFalse(_listening(port))
+
+    def test_timed_out_prepare_preserves_safe_diagnostic_metadata_after_teardown(self) -> None:
+        secret = "prepare-secret-must-not-leak"
+        sleeping = self._script(
+            "sleeping-prepare.py",
+            """
+import os
+import time
+from pathlib import Path
+Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
+print("prepare is waiting for provider readiness", flush=True)
+print("authorization=" + os.environ["TEST_CALLBACK_SECRET"], flush=True)
+time.sleep(60)
+""",
+        )
+        port = _free_port()
+        result = self._run(
+            port,
+            prepare=sleeping,
+            environment_overrides={"TEST_CALLBACK_SECRET": secret},
+            callback_timeout_seconds=1,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        evidence = json.loads(result.stdout)
+        self.assertEqual(evidence["failure"], "shadow callback timed out")
+        diagnostic = evidence["callback_diagnostic"]
+        self.assertEqual(diagnostic["phase"], "prepare")
+        self.assertIsNone(diagnostic["exit_code"])
+        self.assertTrue(diagnostic["timed_out"])
+        self.assertGreater(diagnostic["output_bytes"], 0)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertTrue(all(evidence["teardown"].values()))
+        self.assertFalse(Path(self.workspace_witness.read_text()).exists())
+        self.assertFalse(_listening(port))
+
+    def test_probe_accepts_complete_json_larger_than_old_read_limit(self) -> None:
+        large_response_prepare = self._script(
+            "large-response-prepare.py",
+            """
+import os
+from pathlib import Path
+state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"])
+(state / "prepared").write_text("yes")
+workspace = Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
+Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(str(workspace))
+(workspace / "large-ready-response").write_text("yes")
+""",
+        )
+        result = self._run(_free_port(), prepare=large_response_prepare)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+
+    def test_probe_rejects_oversized_json_response(self) -> None:
+        oversized_response_prepare = self._script(
+            "oversized-response-prepare.py",
+            """
+import os
+from pathlib import Path
+state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"])
+(state / "prepared").write_text("yes")
+workspace = Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
+Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(str(workspace))
+(workspace / "oversized-ready-response").write_text("yes")
+""",
+        )
+        port = _free_port()
+        result = self._run(
+            port,
+            prepare=oversized_response_prepare,
+            startup_timeout_seconds=1,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        evidence = json.loads(result.stdout)
+        self.assertEqual(evidence["failure"], "shadow candidate did not become healthy and ready")
+        self.assertTrue(all(evidence["teardown"].values()))
+        self.assertFalse(Path(self.workspace_witness.read_text()).exists())
         self.assertFalse(_listening(port))
 
     def test_prepare_cannot_reenable_legacy_account_fallback(self) -> None:
