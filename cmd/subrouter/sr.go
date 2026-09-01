@@ -3031,6 +3031,24 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 				columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
 			}
 		}
+		legacyCandidates := []usageGridColumn{
+			{Key: "AG Gemini model", Title: "Gemini", Width: 11},
+			{Key: "AG 3P model", Title: "Claude/GPT", Width: 11},
+		}
+		legacyAvailable := 0
+		for _, candidate := range legacyCandidates {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				legacyAvailable++
+			}
+		}
+		if termWidth <= 110 && legacyAvailable >= 2 {
+			columns = dropUsageGridColumn(columns, "Pick")
+		}
+		for _, candidate := range legacyCandidates {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
+			}
+		}
 	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
 		columns = dropUsageGridColumn(columns, "Pick")
 		columns = dropUsageGridColumn(columns, "Plan")
@@ -3214,6 +3232,12 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"AG 3P wk": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "claude-gpt", true)
 		}),
+		"AG Gemini model": usageGridMostConstrainedWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityLegacyFamilyWindow(window, "gemini")
+		}),
+		"AG 3P model": usageGridMostConstrainedWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityLegacyFamilyWindow(window, "claude-gpt")
+		}),
 	}
 }
 
@@ -3228,6 +3252,21 @@ func isAntigravityFamilyWindow(window accounts.UsageWindow, family string, weekl
 		return isWeekly
 	}
 	return isFiveHour && !isWeekly
+}
+
+func isAntigravityLegacyFamilyWindow(window accounts.UsageWindow, family string) bool {
+	feature := strings.ToLower(strings.TrimSpace(window.Feature))
+	if feature == "" || feature == "gemini" || feature == "claude-gpt" || window.LimitWindowSeconds != 0 {
+		return false
+	}
+	switch family {
+	case "gemini":
+		return strings.Contains(feature, "gemini")
+	case "claude-gpt":
+		return strings.Contains(feature, "claude") || strings.Contains(feature, "gpt") || strings.Contains(feature, "openai") || strings.Contains(feature, "oss")
+	default:
+		return false
+	}
 }
 
 func usageGridPlan(row srUsageRow) string {
@@ -3769,6 +3808,25 @@ func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.Usa
 		}
 	}
 	return usageGridCell{}
+}
+
+func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) usageGridCell {
+	var selected *accounts.UsageWindow
+	for i := range windows {
+		window := &windows[i]
+		if !match(*window) || isSparkWindow(*window) {
+			continue
+		}
+		if selected == nil || window.UsedPercent > selected.UsedPercent ||
+			(window.UsedPercent == selected.UsedPercent && window.ResetAfterSeconds > selected.ResetAfterSeconds) ||
+			(window.UsedPercent == selected.UsedPercent && window.ResetAfterSeconds == selected.ResetAfterSeconds && window.Name < selected.Name) {
+			selected = window
+		}
+	}
+	if selected == nil {
+		return usageGridCell{}
+	}
+	return usageGridWindowStatusCell(*selected)
 }
 
 func usageGridNamedWindowCell(windows []accounts.UsageWindow, weekly bool) usageGridCell {

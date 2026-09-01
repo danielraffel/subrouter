@@ -134,7 +134,7 @@ func TestFetchUsageFallsBackToPerFamilyModelQuotaWithoutInventingCadence(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if details.Email != "" || details.Plan != "Free" || len(details.Windows) != 3 {
+	if details.Email != "" || details.Plan != "Starter" || len(details.Windows) != 3 {
 		t.Fatalf("details = %+v", details)
 	}
 	for _, window := range details.Windows {

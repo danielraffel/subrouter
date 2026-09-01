@@ -4893,6 +4893,31 @@ func TestAntigravityLegacyModelQuotaUseDoesNotClaimBaseHundredPercent(t *testing
 	}
 }
 
+func TestAntigravityLegacyModelQuotaProducesCadenceNeutralFamilyColumns(t *testing.T) {
+	t.Setenv("COLUMNS", "80")
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		accountIdentity: "verified@example.com", planType: "Starter", authChecked: true, authValid: true,
+		quotaUsageKnown: true,
+		windows: []accounts.UsageWindow{
+			{Name: "gemini-3.1-pro-high", Feature: "gemini-3.1-pro-high", UsedPercent: 0, ResetAfterSeconds: 604800},
+			{Name: "gemini-3.1-pro-low", Feature: "gemini-3.1-pro-low", UsedPercent: 25, ResetAfterSeconds: 432000},
+			{Name: "openai-o3", Feature: "openai-o3", UsedPercent: 20, ResetAfterSeconds: 432000},
+		},
+	}
+	columns := usageGridColumns(&bytes.Buffer{}, false, row)
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+	}
+	if !keys["AG Gemini model"] || !keys["AG 3P model"] || keys["AG Gemini wk"] || keys["AG 3P wk"] || keys["AG Gemini 5h"] || keys["AG 3P 5h"] {
+		t.Fatalf("legacy Antigravity columns = %+v", columns)
+	}
+	if got := usageGridValues(row, "")["AG Gemini model"].Text; got != "75%/5d" {
+		t.Fatalf("Gemini model family = %q, want most constrained quota", got)
+	}
+}
+
 func TestAntigravityStatusSurfacesFailedAuth(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,

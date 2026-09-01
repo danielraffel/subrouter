@@ -196,19 +196,18 @@ func usagePlan(plan *struct {
 	if tier == nil {
 		return "subscription"
 	}
-	if name := strings.TrimSpace(tier.Name); name != "" {
-		return name
-	}
 	switch strings.ToLower(strings.TrimSpace(tier.ID)) {
 	case "standard-tier":
 		return "Paid"
 	case "free-tier":
-		return "Free"
+		return "Starter"
 	case "legacy-tier":
 		return "Legacy"
-	default:
-		return "subscription"
 	}
+	if name := strings.TrimSpace(tier.Name); name != "" {
+		return name
+	}
+	return "subscription"
 }
 
 func projectID(raw json.RawMessage) string {
