@@ -643,31 +643,34 @@ func TestNativeProxyUsesConfiguredLocalDaemonTokenWithoutExposingItToChild(t *te
 	if err := os.WriteFile(configPath, []byte(`{"version":1,"baseUrl":"https://cmux.com","credentialSource":"local","localProxyToken":"local-daemon-secret"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	token, err := nativeProxyServerToken(root + "/tenantless")
+	token, err := nativeProxyServerToken(srServerConfig{URL: root + "/tenantless"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token != "local-daemon-secret" {
 		t.Fatalf("local daemon token selected = %q", token)
 	}
-	if remoteToken, err := nativeProxyServerToken("https://router.example.test"); err != nil || remoteToken != "subrouter" {
+	if remoteToken, err := nativeProxyServerToken(srServerConfig{URL: "https://router.example.test"}, true); err != nil || remoteToken != "subrouter" {
 		t.Fatalf("remote placeholder = %q err=%v", remoteToken, err)
 	}
-	if selectedLoopbackToken, err := nativeProxyServerToken(root + "/selected-server"); err != nil || selectedLoopbackToken != "local-daemon-secret" {
+	if tenantToken, err := nativeProxyServerToken(srServerConfig{URL: "https://router.example.test", TenantKey: "srt_selected_tenant"}, true); err != nil || tenantToken != "srt_selected_tenant" {
+		t.Fatalf("remote tenant token = %q err=%v", tenantToken, err)
+	}
+	if selectedLoopbackToken, err := nativeProxyServerToken(srServerConfig{URL: root + "/selected-server"}, false); err != nil || selectedLoopbackToken != "local-daemon-secret" {
 		t.Fatalf("selected loopback token = %q err=%v", selectedLoopbackToken, err)
 	}
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "http://localhost:43213")
-	if pinnedLoopbackToken, err := nativeProxyServerToken("http://127.0.0.1:43213"); err != nil || pinnedLoopbackToken != "local-daemon-secret" {
+	if pinnedLoopbackToken, err := nativeProxyServerToken(srServerConfig{URL: "http://127.0.0.1:43213"}, false); err != nil || pinnedLoopbackToken != "local-daemon-secret" {
 		t.Fatalf("pinned loopback token = %q err=%v", pinnedLoopbackToken, err)
 	}
-	if otherLoopbackToken, err := nativeProxyServerToken("http://127.0.0.2:43213"); err != nil || otherLoopbackToken != "subrouter" {
+	if otherLoopbackToken, err := nativeProxyServerToken(srServerConfig{URL: "http://127.0.0.2:43213"}, true); err != nil || otherLoopbackToken != "subrouter" {
 		t.Fatalf("other loopback token = %q err=%v, want remote placeholder", otherLoopbackToken, err)
 	}
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "https://router.example.test")
 	if sameLocalProxyEndpoint("https://router.example.test/t/opaque", "https://router.example.test") {
 		t.Fatal("matching non-loopback endpoints were treated as the local daemon")
 	}
-	if remoteOverrideToken, err := nativeProxyServerToken("https://router.example.test/t/opaque"); err != nil || remoteOverrideToken != "subrouter" {
+	if remoteOverrideToken, err := nativeProxyServerToken(srServerConfig{URL: "https://router.example.test/t/opaque"}, true); err != nil || remoteOverrideToken != "subrouter" {
 		t.Fatalf("non-loopback local override token = %q err=%v", remoteOverrideToken, err)
 	}
 	env, cleanup, err := nativeProxyEnvironment(kimiNativeProxy, "http://127.0.0.1:43214/capability", os.Environ(), nil)

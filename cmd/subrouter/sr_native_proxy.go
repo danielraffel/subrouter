@@ -610,7 +610,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return fmt.Errorf("secure %s proxy relay transport: %w", spec.display, err)
 	}
-	proxyToken, err := nativeProxyServerToken(server.URL)
+	proxyToken, err := nativeProxyServerToken(server, remote)
 	if err != nil {
 		return err
 	}
@@ -669,7 +669,14 @@ func nativeProxyBrokerLeaseSupported(spec nativeProxySpec) bool {
 	return spec.provider == accounts.ProviderQwenToken && spec.authMode == accounts.AuthModeAPIKey
 }
 
-func nativeProxyServerToken(root string) (string, error) {
+func nativeProxyServerToken(server srServerConfig, remote bool) (string, error) {
+	if remote {
+		if token := strings.TrimSpace(server.TenantKey); token != "" {
+			return token, nil
+		}
+		return "subrouter", nil
+	}
+	root := server.URL
 	if !sameLocalProxyEndpoint(root, localBaseURL()) {
 		return "subrouter", nil
 	}
