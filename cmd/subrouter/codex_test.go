@@ -1,11 +1,17 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestCodexArgsUsesAuthenticatedSubrouterProviderByDefault(t *testing.T) {
@@ -233,6 +239,67 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	}
 	if got := string(body); got != "login --help\n" {
 		t.Fatalf("utility launch record = %q", got)
+	}
+}
+
+func TestCodexLocalLaunchKeepsDurableProxyTokenInShortLivedRelay(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader)
+		if challenge == "" {
+			_, _ = fmt.Fprint(response, `{"status":"ok"}`)
+			return
+		}
+		id, err := accounts.StoreAuthorityID(store.Dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := accounts.StoreAuthorityProof(store.Dir, challenge)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fmt.Fprintf(response, `{"account_store_id":%q,"account_store_proof":%q}`, id, proof)
+	}))
+	defer upstream.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", upstream.URL+"/v1")
+
+	const durableToken = "durable-codex-local-token-must-not-reach-child"
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+		LocalProxyToken:  durableToken,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, "codex-fake")
+	record := filepath.Join(home, "record")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep '^SUBROUTER_CODEX_DUMMY_API_KEY=' >> " + shellQuote(record) + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_BIN", bin)
+	if err := codex([]string{"exec", "prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if strings.Contains(got, durableToken) || strings.Contains(got, upstream.URL) {
+		t.Fatalf("Codex child received durable local routing material:\n%s", got)
+	}
+	if !strings.Contains(got, "SUBROUTER_CODEX_DUMMY_API_KEY=") ||
+		!strings.Contains(got, `model_providers.subrouter.base_url="http://127.0.0.1:`) {
+		t.Fatalf("Codex child did not receive a loopback relay capability:\n%s", got)
 	}
 }
 

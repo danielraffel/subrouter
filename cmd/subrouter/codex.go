@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -45,6 +46,17 @@ func codex(args []string) error {
 	if err != nil {
 		return err
 	}
+	localTarget := sameLocalProxyEndpoint(baseURL, localBaseURL())
+	var localRelayTransport *http.Transport
+	if localTarget {
+		// Construct the store-attesting transport before reading the durable
+		// daemon credential. Its DialContext proves every connection before the
+		// relay can send a credential-bearing request on that connection.
+		localRelayTransport, err = localStoreAttestedRelayTransport(codexProxyRootURL(baseURL), accounts.DefaultCodexStore())
+		if err != nil {
+			return fmt.Errorf("secure local Codex relay transport: %w", err)
+		}
+	}
 	cloudConfig, err := cloudModeConfig()
 	if err != nil {
 		return err
@@ -59,17 +71,40 @@ func codex(args []string) error {
 			return fmt.Errorf("SUBROUTER_CODEX_USER_EMAIL must be a valid email address; use SUBROUTER_CODEX_ACCOUNT_ID to force an account such as team-codex-1")
 		}
 	}
+	childBaseURL := baseURL
+	childProxyToken := localProxyToken
+	childUserEmail := userEmail
+	childAccountID := accountID
+	var relay *nativeProxyRelay
+	if localTarget {
+		upstreamToken := strings.TrimSpace(localProxyToken)
+		if upstreamToken == "" {
+			upstreamToken = "subrouter"
+		}
+		relay, err = startProxyRelay(
+			codexProxyRootURL(baseURL), "v1", "codex", "", upstreamToken,
+			accountID, "", userEmail, codexModelArg(args), localRelayTransport,
+		)
+		if err != nil {
+			return fmt.Errorf("start local Codex proxy relay: %w", err)
+		}
+		defer relay.Close()
+		childBaseURL = relay.URL() + "/v1"
+		childProxyToken = relay.Credential()
+		childUserEmail = ""
+		childAccountID = ""
+	}
 
 	return runCodexCommand(
 		bin,
 		codexArgsWithLocalProxyToken(
 			args,
-			baseURL,
-			userEmail,
-			accountID,
-			localProxyToken,
+			childBaseURL,
+			childUserEmail,
+			childAccountID,
+			childProxyToken,
 		),
-		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), localProxyToken, programBase()), baseURL),
+		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
 	)
 }
 

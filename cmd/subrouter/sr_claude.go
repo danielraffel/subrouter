@@ -516,6 +516,23 @@ func (r srRunner) proxyClaudeArgsTo(
 	if err := prepareClaudeProxySharedState(configDir, r.store.StoreDir()); err != nil {
 		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
 	}
+	if sameLocalProxyEndpoint(baseURL, localBaseURL()) {
+		upstreamToken := strings.TrimSpace(proxyToken)
+		if upstreamToken == "" {
+			upstreamToken = "subrouter"
+		}
+		relay, relayErr := startLocalStoreAttestedProxyRelay(
+			codexProxyRootURL(baseURL), "v1", "claude", "", upstreamToken,
+			accountID, preferredAccountID, r.store,
+		)
+		if relayErr != nil {
+			return fmt.Errorf("start local Claude proxy relay: %w", relayErr)
+		}
+		defer relay.Close()
+		// The durable local token and authoritative account choice stay in the
+		// relay. Claude receives only its short-lived process capability.
+		return r.runProxyClaude(ctx, args, relay.URL(), relay.Credential(), configDir, "", "")
+	}
 	return r.runProxyClaude(ctx, args, baseURL, proxyToken, configDir, accountID, preferredAccountID)
 }
 

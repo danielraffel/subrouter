@@ -210,6 +210,90 @@ func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
 	}
 }
 
+func TestLocalStoreAttestedProxyRelayKeepsDurableTokenOutOfChildAndReattests(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	var attestations atomic.Int32
+	var routed atomic.Int32
+	const durableToken = "durable-local-proxy-token-must-not-reach-child"
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			challenge := request.Header.Get(accounts.StoreAuthorityChallengeHeader)
+			proof, err := accounts.StoreAuthorityProof(store.Dir, challenge)
+			if err != nil {
+				t.Errorf("store proof: %v", err)
+				http.Error(response, "proof", http.StatusInternalServerError)
+				return
+			}
+			id, err := accounts.StoreAuthorityID(store.Dir)
+			if err != nil {
+				t.Errorf("store id: %v", err)
+				http.Error(response, "id", http.StatusInternalServerError)
+				return
+			}
+			attestations.Add(1)
+			response.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(response).Encode(map[string]string{
+				"account_store_id": id, "account_store_proof": proof,
+			})
+			return
+		}
+		if request.URL.Path != "/v1/messages" {
+			http.NotFound(response, request)
+			return
+		}
+		if got, want := attestations.Load(), routed.Load()+1; got < want {
+			t.Errorf("credential-bearing request arrived before connection attestation: attestations=%d routed=%d", got, routed.Load())
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer "+durableToken {
+			t.Errorf("upstream authorization = %q", got)
+		}
+		if got := request.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "claude-preferred" {
+			t.Errorf("preferred account = %q", got)
+		}
+		routed.Add(1)
+		response.Header().Set("Connection", "close")
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	relay, err := startLocalStoreAttestedProxyRelay(
+		upstream.URL, "v1", "claude", "", durableToken, "", "claude-preferred", store,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childURL := relay.URL() + "/v1/messages"
+	childCredential := relay.Credential()
+	if childCredential == "" || childCredential == durableToken || strings.Contains(childURL, durableToken) {
+		t.Fatalf("child capability exposed durable token: url=%q credential=%q", childURL, childCredential)
+	}
+	for range 2 {
+		request, err := http.NewRequest(http.MethodPost, childURL, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+childCredential)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("relay status = %d", response.StatusCode)
+		}
+	}
+	if got := routed.Load(); got != 2 {
+		t.Fatalf("routed requests = %d, want 2", got)
+	}
+	if got := attestations.Load(); got != 2 {
+		t.Fatalf("store attestations = %d, want one per upstream connection", got)
+	}
+	relay.Close()
+	if _, err := http.Post(childURL, "application/json", strings.NewReader(`{}`)); err == nil {
+		t.Fatal("closed relay still accepted a child request")
+	}
+}
+
 func TestParseNativeProxyLaunchArgsOwnsOnlyLeadingAccountOption(t *testing.T) {
 	tests := []struct {
 		name       string

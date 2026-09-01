@@ -544,14 +544,26 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if forcedAccountID != "" {
 		sessionID = nativeProxyPinnedSessionID(sessionID, forcedAccountID)
 	}
+	var relayTransport *http.Transport
+	if remote {
+		relayTransport, err = nativeProxyRelayTransport(root)
+	} else {
+		// Build the connection-attesting transport before the durable local
+		// data-plane token is loaded. Its DialContext proves every connection
+		// before a credential-bearing request can leave this process.
+		relayTransport, err = localStoreAttestedRelayTransport(root, r.store)
+	}
+	if err != nil {
+		return fmt.Errorf("secure %s proxy relay transport: %w", spec.display, err)
+	}
 	proxyToken, err := nativeProxyServerToken(server.URL)
 	if err != nil {
 		return err
 	}
-	if err := r.requireNativeProxyDataPlane(ctx, root, proxyToken); err != nil {
+	if err := r.requireNativeProxyDataPlaneWithClient(ctx, root, proxyToken, &http.Client{Timeout: 15 * time.Second, Transport: relayTransport}); err != nil {
 		return err
 	}
-	relay, err := startNativeProxyRelay(root, spec, sessionID, proxyToken, forcedAccountID)
+	relay, err := startProxyRelay(root, spec.route, spec.agent, sessionID, proxyToken, forcedAccountID, "", "", "", relayTransport)
 	if err != nil {
 		return fmt.Errorf("start local %s proxy relay: %w", spec.display, err)
 	}
@@ -655,16 +667,20 @@ func sameLocalProxyEndpoint(left, right string) bool {
 }
 
 func (r srRunner) requireNativeProxyDataPlane(ctx context.Context, root, proxyToken string) error {
+	client := r.client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	return r.requireNativeProxyDataPlaneWithClient(ctx, root, proxyToken, client)
+}
+
+func (r srRunner) requireNativeProxyDataPlaneWithClient(ctx context.Context, root, proxyToken string, client *http.Client) error {
 	probeURL := strings.TrimRight(root, "/") + "/"
 	request, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
 	if err != nil {
 		return errors.New("build native proxy data-plane preflight")
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(proxyToken))
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
 	secured, err := securedServerRequestClient(client, root)
 	if err != nil {
 		return errors.New("selected router data-plane transport is not safe for a native proxy launcher; no vendor CLI was started")
@@ -991,10 +1007,11 @@ func (r srRunner) pickNativeProxyAccount(spec nativeProxySpec, inventory []remot
 }
 
 type nativeProxyRelay struct {
-	listener  net.Listener
-	server    *http.Server
-	transport *http.Transport
-	baseURL   string
+	listener   net.Listener
+	server     *http.Server
+	transport  *http.Transport
+	baseURL    string
+	credential string
 }
 
 func nativeProxyRelayTransport(targetRoot string) (*http.Transport, error) {
@@ -1009,18 +1026,85 @@ func nativeProxyRelayTransport(targetRoot string) (*http.Transport, error) {
 	return transport, nil
 }
 
-func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken, forcedAccountID string) (*nativeProxyRelay, error) {
-	target, err := url.Parse(strings.TrimRight(targetRoot, "/"))
-	if err != nil || target.Scheme == "" || target.Host == "" || target.User != nil || target.Fragment != "" {
-		return nil, errors.New("proxy target must be an absolute URL")
+func localStoreAttestedRelayTransport(targetRoot string, store accounts.CodexStore) (*http.Transport, error) {
+	client, err := newLocalStoreAttestedClient(&http.Client{Timeout: 15 * time.Second}, targetRoot, store)
+	if err != nil {
+		return nil, err
 	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		return nil, errors.New("local proxy relay requires a direct attested HTTP transport")
+	}
+	return transport, nil
+}
+
+func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken, forcedAccountID string) (*nativeProxyRelay, error) {
 	transport, err := nativeProxyRelayTransport(targetRoot)
 	if err != nil {
 		return nil, fmt.Errorf("secure proxy target transport: %w", err)
 	}
+	return startProxyRelay(targetRoot, spec.route, spec.agent, sessionID, proxyToken, forcedAccountID, "", "", "", transport)
+}
+
+func startLocalStoreAttestedProxyRelay(
+	targetRoot string,
+	route string,
+	agent string,
+	sessionID string,
+	proxyToken string,
+	forcedAccountID string,
+	preferredAccountID string,
+	store accounts.CodexStore,
+) (*nativeProxyRelay, error) {
+	transport, err := localStoreAttestedRelayTransport(targetRoot, store)
+	if err != nil {
+		return nil, fmt.Errorf("secure local proxy target transport: %w", err)
+	}
+	return startProxyRelay(targetRoot, route, agent, sessionID, proxyToken, forcedAccountID, preferredAccountID, "", "", transport)
+}
+
+func startProxyRelay(
+	targetRoot string,
+	route string,
+	agent string,
+	sessionID string,
+	proxyToken string,
+	forcedAccountID string,
+	preferredAccountID string,
+	userEmail string,
+	model string,
+	transport *http.Transport,
+) (*nativeProxyRelay, error) {
+	target, err := url.Parse(strings.TrimRight(targetRoot, "/"))
+	if err != nil || target.Scheme == "" || target.Host == "" || target.User != nil || target.Fragment != "" {
+		return nil, errors.New("proxy target must be an absolute URL")
+	}
+	if transport == nil {
+		return nil, errors.New("proxy relay requires a direct HTTP transport")
+	}
 	forcedAccountID = strings.TrimSpace(forcedAccountID)
 	if forcedAccountID != "" && !validNativeProxyAccountID(forcedAccountID) {
 		return nil, errors.New("pinned account has an invalid server routing ID")
+	}
+	preferredAccountID = strings.TrimSpace(preferredAccountID)
+	if preferredAccountID != "" && !validNativeProxyAccountID(preferredAccountID) {
+		return nil, errors.New("preferred account has an invalid server routing ID")
+	}
+	if forcedAccountID != "" && preferredAccountID != "" {
+		return nil, errors.New("pinned and preferred accounts are mutually exclusive")
+	}
+	userEmail = strings.TrimSpace(userEmail)
+	model = strings.TrimSpace(model)
+	if nativeProxyTerminalControl(userEmail) || nativeProxyTerminalControl(model) {
+		return nil, errors.New("proxy relay routing metadata is invalid")
+	}
+	route = strings.Trim(strings.TrimSpace(route), "/")
+	if route == "" || strings.Contains(route, "..") || strings.ContainsAny(route, "?#\\") {
+		return nil, errors.New("proxy relay route is invalid")
+	}
+	agent = strings.TrimSpace(agent)
+	if agent == "" || nativeProxyTerminalControl(agent) {
+		return nil, errors.New("proxy relay agent is invalid")
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1043,7 +1127,7 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 		proxyToken = "subrouter"
 	}
 	relayPrefix := "/" + relayToken
-	providerPrefix := relayPrefix + "/" + spec.route
+	providerPrefix := relayPrefix + "/" + route
 	relayHost := listener.Addr().String()
 	reverse := &httputil.ReverseProxy{Transport: transport}
 	reverse.Rewrite = func(proxyRequest *httputil.ProxyRequest) {
@@ -1061,10 +1145,20 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 		}
 		request.Host = target.Host
 		request.Header.Set("Authorization", "Bearer "+proxyToken)
-		request.Header.Set("X-Subrouter-Agent", spec.agent)
-		request.Header.Set("X-Subrouter-Session", sessionID)
+		request.Header.Set("X-Subrouter-Agent", agent)
+		if sessionID != "" {
+			request.Header.Set("X-Subrouter-Session", sessionID)
+		}
 		if forcedAccountID != "" {
 			request.Header.Set("X-Subrouter-Account-ID", forcedAccountID)
+		} else if preferredAccountID != "" {
+			request.Header.Set("X-Subrouter-Preferred-Account-ID", preferredAccountID)
+		}
+		if userEmail != "" {
+			request.Header.Set("X-Subrouter-User-Email", userEmail)
+		}
+		if model != "" {
+			request.Header.Set("X-Subrouter-Model", model)
 		}
 	}
 	reverse.ErrorLog = log.New(io.Discard, "", 0)
@@ -1090,13 +1184,21 @@ func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, p
 		reverse.ServeHTTP(response, request)
 	})
 	relay := &nativeProxyRelay{
-		listener:  listener,
-		server:    &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second},
-		transport: transport,
-		baseURL:   "http://" + listener.Addr().String() + relayPrefix,
+		listener:   listener,
+		server:     &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second},
+		transport:  transport,
+		baseURL:    "http://" + listener.Addr().String() + relayPrefix,
+		credential: relayToken,
 	}
 	go func() { _ = relay.server.Serve(listener) }()
 	return relay, nil
+}
+
+func (r *nativeProxyRelay) Credential() string {
+	if r == nil {
+		return ""
+	}
+	return r.credential
 }
 
 func (r *nativeProxyRelay) URL() string {

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1782,8 +1783,11 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	if err := json.Unmarshal(settingsBody, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if overlay.Env["ANTHROPIC_BASE_URL"] != local.URL ||
-		overlay.Env["ANTHROPIC_AUTH_TOKEN"] != "subrouter" ||
+	relayURL, relayErr := url.Parse(overlay.Env["ANTHROPIC_BASE_URL"])
+	if relayErr != nil || relayURL.Scheme != "http" || !isLoopbackServerHost(relayURL.Hostname()) ||
+		sameEndpoint(overlay.Env["ANTHROPIC_BASE_URL"], local.URL) ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "" ||
+		overlay.Env["ANTHROPIC_AUTH_TOKEN"] == "subrouter" ||
 		overlay.Env["ANTHROPIC_CUSTOM_HEADERS"] != "X-Subrouter-Agent: claude" {
 		t.Fatalf("local proxy authoritative settings = %+v", overlay.Env)
 	}
