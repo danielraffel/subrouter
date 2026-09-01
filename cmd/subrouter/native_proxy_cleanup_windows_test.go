@@ -13,6 +13,29 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func TestPrivateProxyParentAllowACETypeClassification(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		aceType     uint8
+		standard    bool
+		unsupported bool
+	}{
+		{name: "standard allow", aceType: windows.ACCESS_ALLOWED_ACE_TYPE, standard: true},
+		{name: "compound allow", aceType: 0x4, unsupported: true},
+		{name: "object allow", aceType: 0x5, unsupported: true},
+		{name: "callback allow", aceType: 0x9, unsupported: true},
+		{name: "callback object allow", aceType: 0xb, unsupported: true},
+		{name: "deny", aceType: windows.ACCESS_DENIED_ACE_TYPE},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			standard, unsupported := privateProxyParentAllowACEType(test.aceType)
+			if standard != test.standard || unsupported != test.unsupported {
+				t.Fatalf("classification = (%t, %t), want (%t, %t)", standard, unsupported, test.standard, test.unsupported)
+			}
+		})
+	}
+}
+
 func TestRemovePrivateProxyHomeClearsReadonlyRegularFile(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "private-home")
 	if err := os.Mkdir(home, 0o700); err != nil {

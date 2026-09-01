@@ -238,8 +238,14 @@ func validatePrivateProxyParentSecurity(path string) error {
 		if err := windows.GetAce(dacl, index, &ace); err != nil {
 			return fmt.Errorf("inspect private proxy home parent ACL entry: %w", err)
 		}
-		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
-			ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || ace.Mask&writeMask == 0 {
+		if ace == nil || ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || ace.Mask&writeMask == 0 {
+			continue
+		}
+		standard, unsupported := privateProxyParentAllowACEType(ace.Header.AceType)
+		if unsupported {
+			return fmt.Errorf("private proxy home parent has unsupported allow ACE type %d", ace.Header.AceType)
+		}
+		if !standard {
 			continue
 		}
 		aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
@@ -255,6 +261,24 @@ func validatePrivateProxyParentSecurity(path string) error {
 		}
 	}
 	return nil
+}
+
+func privateProxyParentAllowACEType(aceType uint8) (standard, unsupported bool) {
+	const (
+		accessAllowedCompoundACEType       = 0x4
+		accessAllowedObjectACEType         = 0x5
+		accessAllowedCallbackACEType       = 0x9
+		accessAllowedCallbackObjectACEType = 0xb
+	)
+	switch aceType {
+	case windows.ACCESS_ALLOWED_ACE_TYPE:
+		return true, false
+	case accessAllowedCompoundACEType, accessAllowedObjectACEType,
+		accessAllowedCallbackACEType, accessAllowedCallbackObjectACEType:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func removePrivateProxyEntryInRoot(parent *os.Root, name string) error {

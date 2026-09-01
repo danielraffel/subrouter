@@ -202,8 +202,14 @@ func validateStoreAuthorityACL(handle windows.Handle, user *windows.SID, trusted
 		if err := windows.GetAce(dacl, index, &ace); err != nil {
 			return fmt.Errorf("inspect account store authority %s ACL entry: %w", kind, err)
 		}
-		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
-			ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || ace.Mask&rejectMask == 0 {
+		if ace == nil || ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || ace.Mask&rejectMask == 0 {
+			continue
+		}
+		standard, unsupported := storeAuthorityAllowACEType(ace.Header.AceType)
+		if unsupported {
+			return fmt.Errorf("account store authority %s has unsupported allow ACE type %d", kind, ace.Header.AceType)
+		}
+		if !standard {
 			continue
 		}
 		aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
@@ -222,6 +228,24 @@ func validateStoreAuthorityACL(handle windows.Handle, user *windows.SID, trusted
 		}
 	}
 	return nil
+}
+
+func storeAuthorityAllowACEType(aceType uint8) (standard, unsupported bool) {
+	const (
+		accessAllowedCompoundACEType       = 0x4
+		accessAllowedObjectACEType         = 0x5
+		accessAllowedCallbackACEType       = 0x9
+		accessAllowedCallbackObjectACEType = 0xb
+	)
+	switch aceType {
+	case windows.ACCESS_ALLOWED_ACE_TYPE:
+		return true, false
+	case accessAllowedCompoundACEType, accessAllowedObjectACEType,
+		accessAllowedCallbackACEType, accessAllowedCallbackObjectACEType:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func verifyStoreAuthorityRootIdentity(root *os.Root, pinned windows.Handle) error {

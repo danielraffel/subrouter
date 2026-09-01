@@ -3,6 +3,8 @@
 package accounts
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,83 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+func TestStoreAuthorityAllowACETypeClassification(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		aceType     uint8
+		standard    bool
+		unsupported bool
+	}{
+		{name: "standard allow", aceType: windows.ACCESS_ALLOWED_ACE_TYPE, standard: true},
+		{name: "compound allow", aceType: 0x4, unsupported: true},
+		{name: "object allow", aceType: 0x5, unsupported: true},
+		{name: "callback allow", aceType: 0x9, unsupported: true},
+		{name: "callback object allow", aceType: 0xb, unsupported: true},
+		{name: "deny", aceType: windows.ACCESS_DENIED_ACE_TYPE},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			standard, unsupported := storeAuthorityAllowACEType(test.aceType)
+			if standard != test.standard || unsupported != test.unsupported {
+				t.Fatalf("classification = (%t, %t), want (%t, %t)", standard, unsupported, test.standard, test.unsupported)
+			}
+		})
+	}
+}
+
+func TestOpenPrivateStoreAuthorityKeyAcceptsProtectedCurrentUserOnlyAccess(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "private-parent")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte{0x5a}, 32)
+	path := filepath.Join(parent, "authority-key")
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+		AccessPermissions: windows.GENERIC_ALL,
+		AccessMode:        windows.GRANT_ACCESS,
+		Trustee: windows.TRUSTEE{
+			TrusteeForm:  windows.TRUSTEE_IS_SID,
+			TrusteeType:  windows.TRUSTEE_IS_USER,
+			TrusteeValue: windows.TrusteeValueFromSID(user.User.Sid),
+		},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{parent, path} {
+		if err := windows.SetNamedSecurityInfo(
+			target,
+			windows.SE_FILE_OBJECT,
+			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+			nil,
+			nil,
+			acl,
+			nil,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	file, err := openPrivateStoreAuthorityKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("authority key = %x, want %x", got, want)
+	}
+}
 
 func TestOpenPrivateStoreAuthorityKeyRejectsUntrustedAllowedAccess(t *testing.T) {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
