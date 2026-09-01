@@ -2081,57 +2081,26 @@ func TestKimiExplicitSessionIdentityIsStableAcrossWorkspaces(t *testing.T) {
 	}
 }
 
-func TestAntigravityProxyFailsClosedForDirectGeminiConfiguration(t *testing.T) {
-	home := t.TempDir()
-	settingsDir := filepath.Join(home, ".gemini", "antigravity-cli")
-	if err := os.MkdirAll(settingsDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	settingsPath := filepath.Join(settingsDir, "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{"modelProvider":"gemini"}`), 0o600); err != nil {
-		t.Fatal(err)
+func TestAntigravityProxyFailsClosedWithoutTransparentProxyHook(t *testing.T) {
+	runner := srRunner{out: io.Discard}
+	for _, args := range [][]string{nil, {"proxy"}, {"--account", "work"}, {"proxy", "--account", "work"}} {
+		err := runner.antigravityCommand(context.Background(), args)
+		if err == nil || !strings.Contains(err.Error(), "no transparent proxy hook") {
+			t.Fatalf("sr agy args %q error = %v", args, err)
+		}
 	}
 	for _, environ := range [][]string{
-		{"HOME=" + home},
+		{"HOME=" + t.TempDir()},
 		{"HOME=" + t.TempDir(), "GEMINI_API_KEY=direct-secret"},
-		{"HOME=" + t.TempDir(), "GOOGLE_API_KEY=direct-secret"},
-		{"HOME=" + t.TempDir(), "GOOGLE_GEMINI_BASE_URL=https://direct.invalid"},
-		{"HOME=" + t.TempDir(), "AGY_ADC_AUTH=1"},
 	} {
 		_, cleanup, err := nativeProxyEnvironment(antigravityNativeProxy, "http://127.0.0.1:43212", environ, nil)
 		cleanup()
-		if err == nil || !strings.Contains(err.Error(), "direct provider") {
-			t.Fatalf("direct Gemini configuration error = %v", err)
+		if err == nil || !strings.Contains(err.Error(), "no transparent proxy hook") {
+			t.Fatalf("unsupported Antigravity proxy error = %v", err)
 		}
 		if strings.Contains(err.Error(), "direct-secret") {
-			t.Fatal("direct Gemini error exposed the credential")
+			t.Fatal("unsupported Antigravity error exposed the credential")
 		}
-	}
-	if err := os.WriteFile(settingsPath, []byte(`{}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	env, cleanup, err := nativeProxyEnvironment(antigravityNativeProxy, "http://127.0.0.1:43212", []string{"HOME=" + home}, nil)
-	cleanup()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := testEnvValue(env, "CLOUD_CODE_URL"); got != "http://127.0.0.1:43212/antigravity" {
-		t.Fatalf("CLOUD_CODE_URL = %q", got)
-	}
-}
-
-func TestAntigravityProxyRejectsOversizedSettings(t *testing.T) {
-	home := t.TempDir()
-	settingsDir := filepath.Join(home, ".gemini", "antigravity-cli")
-	if err := os.MkdirAll(settingsDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	settingsPath := filepath.Join(settingsDir, "settings.json")
-	if err := os.WriteFile(settingsPath, bytes.Repeat([]byte(" "), (1<<20)+1), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := antigravityDirectProviderConflict([]string{"HOME=" + home}); err == nil || !strings.Contains(err.Error(), "too large") {
-		t.Fatalf("oversized Antigravity settings error = %v", err)
 	}
 }
 

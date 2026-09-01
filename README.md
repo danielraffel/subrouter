@@ -606,11 +606,12 @@ authentication paths, not additional selectable OAuth profiles
 [headless auth](https://antigravity.google/docs/cli/headless/),
 [enterprise](https://antigravity.google/docs/enterprise/)).
 
-Plain `agy` remains the vendor's direct CLI. `sr agy` (also
-`sr antigravity`) launches that CLI locally while sending model traffic
-through the selected Subrouter and its Antigravity credential. The local CLI
-login is used only to satisfy the CLI's own bootstrap; its bearer credential is
-removed by a loopback relay. Only the explicit `sr agy add` command transfers a
+Plain `agy` remains the vendor's supported direct CLI. The current AGY release
+does not expose a transparent proxy hook: explicitly setting its only endpoint
+override changes the vendor request behavior and fails even when that override
+names Google's normal endpoint. `sr agy` and `sr antigravity` therefore fail
+closed with that explanation rather than launching a session that looks routed
+but cannot generate. Only the explicit `sr agy add` command transfers a
 validated credential to the selected self-hosted router through its protected
 account-import endpoint. `sr status` reports each managed profile as
 `ready`, `active`, or `error`. When Google's read-only OAuth services expose
@@ -622,11 +623,11 @@ other. Older accounts that expose only per-model quota retain each exact model
 as its own routing pool; compact Use names the most constrained known model
 without guessing it into a 5-hour or weekly cadence. Telemetry is
 bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
-managed profile to an unrelated host language-server login. `sr agy proxy`
-remains an explicit launcher
-alias. Pooled launches fail over between eligible profiles; `--account` pins
-one launch without changing the global pool. Plain `agy` remains a direct
-bypass using the current Keychain login.
+managed profile to an unrelated host language-server login. The server adapter
+retains isolated account selection, family-aware scheduling, OAuth refresh, and
+hard-pin semantics for a future compatible client, but current AGY CLI pooling
+and pinning are intentionally unavailable. Plain `agy` uses the current
+Keychain login directly.
 
 For backward compatibility, a router with no managed Antigravity profiles
 continues serving its historical host Keychain login. The first successful

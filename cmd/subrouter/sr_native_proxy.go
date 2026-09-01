@@ -31,14 +31,14 @@ import (
 )
 
 const (
-	antigravityProxyHelp = `Usage: sr antigravity [--account [account]] [agy args...]
-       sr agy [agy args...]
-       sr agy proxy [agy args...]
+	antigravityProxyHelp = `Usage: sr antigravity
+       sr agy
 
-Launch agy through the selected Subrouter. Plain 'agy' remains a direct bypass.
-The agy CLI must still have its own local login; Subrouter never copies or changes it.
-Omit --account for pooled failover. A named account is pinned with no account failover;
-bare --account opens a pinned-account picker.
+Show this Antigravity routing notice. Plain 'agy' remains the supported direct CLI.
+Subrouter can securely import multiple Antigravity OAuth accounts and report their
+identity, plan, and model-family quotas, but the current agy CLI does not expose a
+transparent proxy hook. Routed pooling and pinning therefore fail closed instead of
+silently changing provider behavior.
 `
 	kimiProxyHelp = `Usage: sr kimi [--account [account]] -p <prompt> [kimi args...]
        sr kimi proxy [--account [account]] -p <prompt> [kimi args...]
@@ -103,14 +103,7 @@ func (r srRunner) antigravityCommand(ctx context.Context, args []string) error {
 		fmt.Fprint(r.out, antigravityProxyHelp)
 		return nil
 	}
-	if len(args) > 0 && args[0] == "proxy" {
-		args = args[1:]
-	}
-	options, vendorArgs, err := parseNativeProxyLaunchArgs(args)
-	if err != nil {
-		return err
-	}
-	return r.launchNativeProxy(ctx, antigravityNativeProxy, vendorArgs, options)
+	return errors.New("routed Antigravity is unavailable: the current agy CLI has no transparent proxy hook; use plain 'agy' for direct OAuth access")
 }
 
 func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {
@@ -1443,12 +1436,7 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 	providerURL := strings.TrimRight(relayRoot, "/") + "/" + spec.route
 	switch spec.provider {
 	case accounts.ProviderAntigravity:
-		if conflict, err := antigravityDirectProviderConflict(environ); err != nil {
-			return nil, func() error { return nil }, err
-		} else if conflict != "" {
-			return nil, func() error { return nil }, fmt.Errorf("Antigravity direct provider %s is configured; remove it before using 'sr agy'", conflict)
-		}
-		return upsertEnv(env, "CLOUD_CODE_URL", providerURL), func() error { return nil }, nil
+		return nil, func() error { return nil }, errors.New("routed Antigravity is unavailable: the current agy CLI has no transparent proxy hook; use plain 'agy' for direct OAuth access")
 	case accounts.ProviderKimi:
 		overlay, cleanup, err := prepareKimiProxyHome(environ)
 		if err != nil {
@@ -1694,56 +1682,6 @@ func ensureKimiSessionIndex(path string) error {
 		return errors.New("Kimi session index must be a direct regular file, not a link or other file")
 	}
 	return nil
-}
-
-func antigravityDirectProviderConflict(environ []string) (string, error) {
-	for _, key := range []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "AGY_ADC_AUTH"} {
-		if strings.TrimSpace(envValue(environ, key)) != "" {
-			return key, nil
-		}
-	}
-	home := strings.TrimSpace(envValue(environ, "HOME"))
-	if home == "" {
-		var err error
-		home, err = os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("locate Antigravity settings: %w", err)
-		}
-	}
-	settingsPath := filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")
-	settingsFile, err := os.Open(settingsPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("read Antigravity settings: %w", err)
-	}
-	defer settingsFile.Close()
-	const maxSettingsSize = 1 << 20
-	body, err := io.ReadAll(io.LimitReader(settingsFile, maxSettingsSize+1))
-	if err != nil {
-		return "", fmt.Errorf("read Antigravity settings: %w", err)
-	}
-	if len(body) > maxSettingsSize {
-		return "", errors.New("Antigravity settings are too large to validate safely")
-	}
-	var settings struct {
-		ModelProvider json.RawMessage `json:"modelProvider"`
-	}
-	if err := json.Unmarshal(body, &settings); err != nil {
-		return "", fmt.Errorf("parse Antigravity settings: %w", err)
-	}
-	if len(settings.ModelProvider) == 0 || string(settings.ModelProvider) == "null" {
-		return "", nil
-	}
-	var provider string
-	if err := json.Unmarshal(settings.ModelProvider, &provider); err != nil {
-		return "", errors.New("Antigravity settings contain an unsupported modelProvider value")
-	}
-	if strings.TrimSpace(provider) != "" {
-		return "modelProvider", nil
-	}
-	return "", nil
 }
 
 func kimiNativeProxyArgs(args []string) []string {

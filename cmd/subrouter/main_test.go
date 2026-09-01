@@ -595,6 +595,24 @@ func TestAntigravityNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T
 	}
 }
 
+func TestAntigravityHelpDoesNotAdvertiseUnavailableRouting(t *testing.T) {
+	for name, text := range map[string]string{
+		"sr help":         srHelp,
+		"subrouter help":  usageText("subrouter"),
+		"management help": antigravityManagementHelp,
+		"routing notice":  antigravityProxyHelp,
+	} {
+		for _, stale := range []string{"Launch pooled Antigravity", "Run agy through Subrouter", "Omit --account for pooled failover", "agy proxy"} {
+			if strings.Contains(text, stale) {
+				t.Fatalf("%s still advertises unsupported AGY routing with %q", name, stale)
+			}
+		}
+		if !strings.Contains(strings.ToLower(text), "unavailable") && !strings.Contains(strings.ToLower(text), "transparent proxy hook") {
+			t.Fatalf("%s does not explain unavailable AGY routing", name)
+		}
+	}
+}
+
 func TestSRAccountsAliasUsesTheSelectedTeamVault(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(

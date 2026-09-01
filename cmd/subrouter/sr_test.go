@@ -2226,10 +2226,13 @@ func TestHelpDistinguishesNativeProxyLaunchersFromDirectCLIs(t *testing.T) {
 		"sr":        srHelp,
 		"subrouter": usageText("subrouter"),
 	} {
-		for _, command := range []string{"qwen proxy", "kimi proxy", "agy proxy"} {
+		for _, command := range []string{"qwen proxy", "kimi proxy"} {
 			if !strings.Contains(help, command) {
 				t.Errorf("%s help omits %q", name, command)
 			}
+		}
+		if strings.Contains(help, "agy proxy") || !strings.Contains(help, "routed launch is unavailable") && !strings.Contains(help, "routing unavailable") {
+			t.Errorf("%s help does not fail closed for AGY routing", name)
 		}
 		if !strings.Contains(help, "Gemini profiles (routing scaffold only)") {
 			t.Errorf("%s help does not disclose Gemini's scaffold-only state", name)
@@ -4893,6 +4896,34 @@ func TestAntigravityLegacyModelQuotaUseDoesNotClaimBaseHundredPercent(t *testing
 	}
 }
 
+func TestAntigravityUnknownModelQuotaDoesNotPrintPlaceholderLabel(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		quotaUsageKnown: true,
+		windows:         []accounts.UsageWindow{{Name: "model", UsedPercent: 0, ResetAfterSeconds: 604800}},
+	}
+	if got := compactPickReason(row); got != "100% left/7d" {
+		t.Fatalf("generic compact Use = %q", got)
+	}
+}
+
+func TestAntigravityFamilyColumnsOmitRedundantUseAtWideWidth(t *testing.T) {
+	t.Setenv("COLUMNS", "180")
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		quotaUsageKnown: true,
+		windows: []accounts.UsageWindow{
+			{Name: "gemini-3.1-pro", Feature: "gemini-3.1-pro", UsedPercent: 1, ResetAfterSeconds: 604800},
+			{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 3, ResetAfterSeconds: 604800},
+		},
+	}
+	for _, column := range usageGridColumns(&bytes.Buffer{}, false, row) {
+		if column.Key == "Pick" {
+			t.Fatal("wide Antigravity family table retained redundant Use column")
+		}
+	}
+}
+
 func TestAntigravityLegacyModelQuotaProducesCadenceNeutralFamilyColumns(t *testing.T) {
 	t.Setenv("COLUMNS", "80")
 	row := srUsageRow{
@@ -4912,6 +4943,9 @@ func TestAntigravityLegacyModelQuotaProducesCadenceNeutralFamilyColumns(t *testi
 	}
 	if !keys["AG Gemini model"] || !keys["AG 3P model"] || keys["AG Gemini wk"] || keys["AG 3P wk"] || keys["AG Gemini 5h"] || keys["AG 3P 5h"] {
 		t.Fatalf("legacy Antigravity columns = %+v", columns)
+	}
+	if keys["Pick"] {
+		t.Fatalf("legacy Antigravity columns = %+v, redundant Use should be omitted", columns)
 	}
 	if got := usageGridValues(row, "")["AG Gemini model"].Text; got != "75%/5d" {
 		t.Fatalf("Gemini model family = %q, want most constrained quota", got)

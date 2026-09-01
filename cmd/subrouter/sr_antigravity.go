@@ -14,12 +14,12 @@ import (
 const antigravityManagementHelp = `Usage: sr agy add <label>
        sr agy list
        sr agy remove <label>
-       sr agy [--account [account]] [-- agy args...]
 
 Add imports the current plain 'agy' OAuth login into an isolated Subrouter profile.
 Repeat after signing plain 'agy' into each account. The Keychain item is never changed.
-Omit --account for pooled failover; a pinned account has no account failover.
-Plain 'agy' remains direct.
+Status can report each imported identity, plan, and model-family quota. The current
+agy CLI has no transparent proxy hook, so routed pooling and pinning are unavailable.
+Use plain 'agy' for direct OAuth access.
 `
 
 func (r srRunner) antigravityManage(ctx context.Context, args []string) error {

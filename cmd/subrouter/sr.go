@@ -148,13 +148,12 @@ Running agents:
   sr claude proxy --account [profile]
                         Run pinned to one Claude profile with no account failover
   sr gemini             Manage Gemini profiles (routing scaffold only)
-  sr antigravity [args]
-  sr agy [args]         Run agy through Subrouter (plain agy stays direct)
+  sr antigravity        Manage imported AGY OAuth accounts (routing unavailable)
+  sr agy                Manage imported AGY OAuth accounts (plain agy stays direct)
   sr kimi [args]        Run Kimi Code through Subrouter (plain kimi stays direct)
   sr qwen [args]        Run Qwen Code through Subrouter (plain qwen stays direct)
   sr <kimi|qwen> --account [account] [-- args]
                         Pin this process with no account failover
-  sr agy proxy [args]   Explicit launcher alias for sr agy
   sr kimi proxy [args]  Explicit launcher alias for sr kimi
   sr qwen proxy [args]  Explicit launcher alias for sr qwen
 
@@ -3023,7 +3022,7 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 				available++
 			}
 		}
-		if termWidth <= 110 && available >= 3 {
+		if available > 0 {
 			columns = dropUsageGridColumn(columns, "Pick")
 		}
 		for _, candidate := range candidates {
@@ -3041,7 +3040,7 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 				legacyAvailable++
 			}
 		}
-		if termWidth <= 110 && legacyAvailable >= 2 {
+		if legacyAvailable > 0 {
 			columns = dropUsageGridColumn(columns, "Pick")
 		}
 		for _, candidate := range legacyCandidates {
@@ -3719,8 +3718,6 @@ func compactAntigravityWindowLabel(window accounts.UsageWindow) string {
 		return "Gemini"
 	case strings.Contains(feature, "gpt") || strings.Contains(feature, "openai"):
 		return "GPT"
-	case strings.TrimSpace(window.Name) != "":
-		return "model"
 	default:
 		return ""
 	}

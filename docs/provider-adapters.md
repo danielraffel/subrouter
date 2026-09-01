@@ -14,7 +14,7 @@ its ordinary name uses Subrouter.
 | Qwen Coding Plan API key | OpenAI-compatible client at `/qwen/v1` | Labeled Coding Plan keys | Client auth removed; selected bearer added | Plain `qwen` with its normal provider | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live generation canary recorded |
 | Qwen Token Plan, OpenAI protocol | `sr qwen` (`proxy` alias); `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Pooled key failover by default; `--account` is a hard per-launch pin; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
 | Qwen Token Plan, Anthropic protocol | Anthropic client at `/qwen-anthropic` | Same Token Plan pool as OpenAI route | Client auth removed; selected plan bearer and Anthropic version added | Direct vendor Anthropic endpoint | Same sticky account and exhaustion state as `/qwen-token` | Same shared account and console telemetry | H1, H2 | No live generation canary recorded |
-| Antigravity / AGY OAuth | `sr agy` or `sr antigravity` (`proxy` aliases); `/antigravity` | Isolated profiles explicitly imported from the CLI's fixed Keychain slot with `sr agy add <label>` | Local CLI auth is stripped by loopback relay; selected router OAuth bearer added | Plain `agy` | Pooled sticky-session failover by default; `--account` is a hard per-launch pin | Verified email and plan when exposed; independent Gemini and Claude/GPT 5h/weekly pools; ready/active/error | H1, H2, H3, H4 | Multi-profile and quota paths hermetically tested; live multi-account generation canary still required |
+| Antigravity / AGY OAuth | No supported native launcher in the current AGY release; future-compatible server route at `/antigravity` | Isolated profiles explicitly imported from the CLI's fixed Keychain slot with `sr agy add <label>` | Server adapter replaces client auth with the selected router OAuth bearer | Plain `agy` | Server adapter has pooled family-aware failover and hard pins; current `sr agy` fails closed because AGY's endpoint override changes request behavior | Verified email and plan when exposed; independent Gemini and Claude/GPT quota families; ready/active/error | H1, H2, H4; H3 proves launcher refusal | Import, identity, quota, and server route tested; current AGY CLI routed generation is unsupported |
 | Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
 | OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | No auditable in-repository live canary recorded |
@@ -54,11 +54,10 @@ sr codex
 sr claude proxy
 sr kimi
 sr qwen
-sr agy
 ```
 
-The older `sr kimi proxy`, `sr qwen proxy`, and `sr agy proxy` spellings remain
-aliases. Kimi, Qwen, and Antigravity default to the router's pooled scheduler. A leading
+The older `sr kimi proxy` and `sr qwen proxy` spellings remain aliases. Kimi
+and Qwen default to the router's pooled scheduler. A leading
 `--account <selector>` pins only that launched child to the exact account and
 disables account failover; bare `--account` opens a pinned picker. The option is
 wrapper-owned only before the first vendor argument or `--`, so vendor arguments
@@ -70,9 +69,12 @@ Qwen uses a temporary highest-precedence provider overlay because saved
 `modelProviders` outrank a simple base-URL environment variable. It refuses to
 run when an existing system policy is configured rather than masking that
 policy. The overlay disables Qwen's `/auth` and `/model` provider switches and
-shadows direct Alibaba credentials with non-secret process sentinels. The
-Antigravity relay similarly leaves the local keychain untouched and removes the
-local bearer before forwarding to the selected router.
+shadows direct Alibaba credentials with non-secret process sentinels.
+
+AGY exposes only `CLOUD_CODE_URL` as an endpoint override, and setting it changes
+vendor behavior even when it names the normal Google endpoint. Because no
+supported transparent routing hook exists, `sr agy` fails closed and points to
+plain `agy`; imports and read-only status remain available.
 
 Pooled native-launcher account affinity for new sessions is
 provider-and-working-directory scoped. Kimi's workspace-relative `--continue`

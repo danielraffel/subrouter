@@ -1811,13 +1811,10 @@ Usage:
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
-  %[1]s agy [args]         Launch pooled Antigravity through Subrouter (plain agy stays direct)
-  %[1]s agy --account [account] [-- args]
-                           Pin one Antigravity account with no account failover
+  %[1]s agy                Manage imported Antigravity accounts; routed launch is unavailable
   %[1]s agy add <label>    Import the current plain agy OAuth login as an isolated account
   %[1]s agy list           List isolated Antigravity accounts
   %[1]s agy remove <label> Remove one isolated Antigravity account
-  %[1]s agy proxy [args]   Explicit launcher alias for %[1]s agy
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles (routing scaffold only)
 
