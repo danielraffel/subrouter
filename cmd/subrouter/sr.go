@@ -397,14 +397,20 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			// import credential. Keep onboarding off an unrelated loopback process;
 			// an explicitly credentialed local daemon remains authoritative below.
 			if localOnboardingCommand(args) && !serverHasAccountImportCredential(server) {
-				matches, matchErr := r.localServingStoreMatches(ctx, server)
+				authority, matchErr := r.localServingStoreAuthority(ctx, server)
 				if matchErr != nil {
 					return matchErr
 				}
-				if !matches {
-					return fmt.Errorf("local proxy account store does not match this CLI; configure a protected account-import credential or set SUBROUTER_STATE_DIR to the daemon's state root")
+				if authority.accountImportEnabled {
+					// The daemon owns a protected import path (for example through
+					// tailnet identity) even though this CLI carries no token. Keep
+					// the mutation on HTTP so authorization succeeds or fails there.
+				} else {
+					if !authority.storeMatches {
+						return fmt.Errorf("local proxy account store does not match this CLI; configure a protected account-import credential or set SUBROUTER_STATE_DIR to the daemon's state root")
+					}
+					routeToServingAPI = false
 				}
-				routeToServingAPI = false
 			}
 		} else {
 			var ok bool

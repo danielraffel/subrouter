@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1051,6 +1052,33 @@ func TestNativeProxyLaunchSurfacesCleanupFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "clean up temporary Kimi proxy home") {
 		t.Fatalf("cleanup error lacks context: %v", err)
+	}
+}
+
+func TestQwenProxyEnvironmentReturnsCleanupFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows directory permissions do not provide the Unix cleanup failure used by this regression")
+	}
+	tempParent := t.TempDir()
+	t.Setenv("TMPDIR", tempParent)
+	env, cleanup, err := nativeProxyEnvironment(qwenNativeProxy, "http://127.0.0.1:43123", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlayRoot := filepath.Dir(testEnvValue(env, "QWEN_CODE_SYSTEM_SETTINGS_PATH"))
+	if overlayRoot == "." || !strings.HasPrefix(filepath.Base(overlayRoot), "subrouter-qwen-proxy-") {
+		t.Fatalf("Qwen overlay root = %q", overlayRoot)
+	}
+	if err := os.Chmod(tempParent, 0); err != nil {
+		t.Fatal(err)
+	}
+	cleanupErr := cleanup()
+	if err := os.Chmod(tempParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = removePrivateProxyHome(overlayRoot) })
+	if cleanupErr == nil {
+		t.Fatal("Qwen environment swallowed its private-overlay cleanup failure")
 	}
 }
 

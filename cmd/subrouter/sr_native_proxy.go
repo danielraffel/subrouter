@@ -1132,8 +1132,7 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		}
 		proxyGuard, err := nativeProxyLoopbackGuardURL(relayRoot)
 		if err != nil {
-			cleanup()
-			return nil, func() error { return nil }, err
+			return nil, func() error { return nil }, errors.Join(err, cleanup())
 		}
 		for key, value := range map[string]string{
 			"QWEN_CODE_SYSTEM_SETTINGS_PATH": overlay.settings,
@@ -1168,7 +1167,7 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 		} {
 			env = upsertEnv(env, key, value)
 		}
-		return env, func() error { cleanup(); return nil }, nil
+		return env, cleanup, nil
 	default:
 		return nil, func() error { return nil }, fmt.Errorf("unsupported native proxy provider %s", spec.provider)
 	}

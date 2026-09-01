@@ -905,10 +905,15 @@ func (r srRunner) readyLocalServingServer(ctx context.Context, start daemonStart
 	return r.localServingServer()
 }
 
-func (r srRunner) localServingStoreMatches(ctx context.Context, server srServerConfig) (bool, error) {
+type localServingStoreAuthority struct {
+	storeMatches         bool
+	accountImportEnabled bool
+}
+
+func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServerConfig) (localServingStoreAuthority, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(server.URL, "/")+"/_subrouter/health", nil)
 	if err != nil {
-		return false, fmt.Errorf("build local proxy store-attestation request: %w", err)
+		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation request: %w", err)
 	}
 	client := r.client
 	if client == nil {
@@ -916,23 +921,27 @@ func (r srRunner) localServingStoreMatches(ctx context.Context, server srServerC
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return false, fmt.Errorf("read local proxy store attestation: %w", err)
+		return localServingStoreAuthority{}, fmt.Errorf("read local proxy store attestation: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("local proxy store attestation failed: %s", response.Status)
+		return localServingStoreAuthority{}, fmt.Errorf("local proxy store attestation failed: %s", response.Status)
 	}
 	var payload struct {
 		AccountStoreID string `json:"account_store_id"`
+		AccountImport  string `json:"account_import"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&payload); err != nil {
-		return false, fmt.Errorf("decode local proxy store attestation: %w", err)
+		return localServingStoreAuthority{}, fmt.Errorf("decode local proxy store attestation: %w", err)
 	}
 	expected, err := accounts.StoreAuthorityID(r.store.Dir)
 	if err != nil {
-		return false, err
+		return localServingStoreAuthority{}, err
 	}
-	return strings.TrimSpace(payload.AccountStoreID) != "" && payload.AccountStoreID == expected, nil
+	return localServingStoreAuthority{
+		storeMatches:         strings.TrimSpace(payload.AccountStoreID) != "" && payload.AccountStoreID == expected,
+		accountImportEnabled: payload.AccountImport == proxy.AccountImportEnabled,
+	}, nil
 }
 
 func (r srRunner) namedRemoteServer(ctx context.Context, store srServerStore, name string) (srServerConfig, error) {
