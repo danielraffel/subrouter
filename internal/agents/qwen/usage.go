@@ -221,6 +221,9 @@ func callConsole(ctx context.Context, client *http.Client, config consoleConfig,
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		_, _ = io.CopyN(io.Discard, res.Body, 4096)
+		if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+			return ErrConsoleLoginRequired
+		}
 		return fmt.Errorf("Qwen Token Plan console returned HTTP %d", res.StatusCode)
 	}
 	bodyBytes, err := io.ReadAll(io.LimitReader(res.Body, (1<<20)+1))
@@ -379,10 +382,10 @@ func findSubscriptionDetails(value any) (SubscriptionDetails, error) {
 			}
 			return SubscriptionDetails{}, fmt.Errorf("Qwen Token Plan console error: %s", code)
 		}
-		spec, _ := object["specCode"].(string)
+		spec := firstSubscriptionString(object, "specCode", "spec_code", "planName", "plan_name")
 		if spec != "" {
-			status, _ := object["status"].(string)
-			instanceCode, _ := object["instanceCode"].(string)
+			status := firstSubscriptionString(object, "status")
+			instanceCode := firstSubscriptionString(object, "instanceCode", "instance_code")
 			return SubscriptionDetails{
 				Plan:         displayPlan(spec),
 				Status:       strings.ToLower(strings.TrimSpace(status)),
@@ -394,6 +397,17 @@ func findSubscriptionDetails(value any) (SubscriptionDetails, error) {
 		queue = appendConsoleChildren(queue, object)
 	}
 	return SubscriptionDetails{}, fmt.Errorf("Qwen Token Plan subscription response contained no plan")
+}
+
+func firstSubscriptionString(object map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := object[key].(string); ok {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func appendConsoleChildren(queue []any, object map[string]any) []any {

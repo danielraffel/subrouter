@@ -2601,9 +2601,9 @@ func displayRecommendedForNewSession(row srUsageRow) bool {
 	if usageProvider(row) == accounts.ProviderQwenToken {
 		healthUsable := row.providerHealth == "auth ok" ||
 			(row.providerHealth == "" && (row.quotaStatus == "live" || row.quotaStatus == "partial"))
-		return row.err == nil && row.authMode == accounts.AuthModeAPIKey &&
-			healthUsable && row.quotaUsageKnown &&
-			!row.cooked && !row.tempCooked && usableForNewSession(row.score)
+		quotaUsable := !row.quotaUsageKnown || usableForNewSession(row.score)
+		return row.authMode == accounts.AuthModeAPIKey && healthUsable && quotaUsable &&
+			!row.cooked && !row.tempCooked && (row.err == nil || qwenTelemetryOnlyFailure(row))
 	}
 	if usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth {
 		// Grok currently exposes no live status/usage probe. A locally refreshable
@@ -3403,12 +3403,9 @@ func usageGridState(row srUsageRow) string {
 		}
 		return strings.Join(states, ", ")
 	}
-	if usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus != "" {
+	if usageProvider(row) == accounts.ProviderQwenToken && row.authMode == accounts.AuthModeAPIKey {
 		if row.providerHealth != "" && row.providerHealth != "auth ok" {
 			return row.providerHealth
-		}
-		if row.quotaStatus != "live" && row.quotaStatus != "partial" {
-			return row.quotaStatus
 		}
 		var states []string
 		if row.active || (row.sessionsKnown && row.assignedSessions > 0) {
@@ -3417,7 +3414,7 @@ func usageGridState(row srUsageRow) string {
 		if row.gtoRecommended {
 			states = append(states, "rec")
 		}
-		if row.err != nil {
+		if row.err != nil && !qwenTelemetryOnlyFailure(row) {
 			states = append(states, "error")
 		}
 		if len(states) > 0 {
@@ -3426,7 +3423,13 @@ func usageGridState(row srUsageRow) string {
 		if row.providerHealth == "auth ok" {
 			return "ready"
 		}
-		return "quota live"
+		if row.quotaStatus == "live" || row.quotaStatus == "partial" {
+			return "quota live"
+		}
+		if row.quotaStatus != "" {
+			return row.quotaStatus
+		}
+		return "unchecked"
 	}
 	if isKeyedProviderSection(usageProvider(row)) && row.authMode == accounts.AuthModeAPIKey {
 		if row.providerHealth != "" && row.providerHealth != "auth ok" {
@@ -3483,6 +3486,12 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
+	case qwenTelemetryOnlyFailure(row) && row.gtoRecommended:
+		return ansiGreen
+	case qwenTelemetryOnlyFailure(row) && (row.active || (row.sessionsKnown && row.assignedSessions > 0)):
+		return ansiCyan
+	case qwenTelemetryOnlyFailure(row):
+		return ""
 	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "error":
 		return ansiRed
 	case usageProvider(row) == accounts.ProviderQwenToken && row.quotaStatus == "live" && row.providerHealth == "":
@@ -3506,7 +3515,7 @@ func usageGridStateColor(row srUsageRow) string {
 
 func usageGridPickColor(row srUsageRow) string {
 	switch {
-	case row.err != nil || row.cooked:
+	case (row.err != nil && !qwenTelemetryOnlyFailure(row)) || row.cooked:
 		return ansiRed
 	case row.tempCooked || !displayRecommendedForNewSession(row):
 		if usageProvider(row) == accounts.ProviderClaude {
@@ -3528,6 +3537,14 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if qwenTelemetryOnlyFailure(row) {
+		switch row.quotaStatus {
+		case "login needed":
+			return "quota login needed"
+		case "error":
+			return "quota unavailable"
+		}
+	}
 	if row.err != nil {
 		return "usage unavailable"
 	}
@@ -3568,6 +3585,14 @@ func compactPickReason(row srUsageRow) string {
 		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
 	return left + suffix
+}
+
+// A successful model-key probe is authoritative for routing. Console quota is
+// optional, independently authenticated telemetry, so its failure must not
+// turn a working Qwen account red or make it ineligible for routing.
+func qwenTelemetryOnlyFailure(row srUsageRow) bool {
+	return usageProvider(row) == accounts.ProviderQwenToken &&
+		row.authMode == accounts.AuthModeAPIKey && row.providerHealth == "auth ok" && row.err != nil
 }
 
 // exhaustedModelSuffix names any per-model quota pools that are fully consumed

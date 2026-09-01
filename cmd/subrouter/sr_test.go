@@ -4930,6 +4930,70 @@ func TestQwenRemoteStatusStillShowsQuotaStateWithoutLocalHealthProbe(t *testing.
 	}
 }
 
+func TestQwenValidatedKeyStaysReadyWhenConsoleLoginExpires(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "auth ok", quotaStatus: "login needed",
+		err: errors.New("Qwen console login needed"),
+	}
+	if !displayRecommendedForNewSession(row) {
+		t.Fatal("valid Qwen routing key became ineligible when optional telemetry expired")
+	}
+	if got := usageGridState(row); got != "ready" {
+		t.Fatalf("state = %q, want ready", got)
+	}
+	if got := compactPickReason(row); got != "quota login needed" {
+		t.Fatalf("Use = %q, want quota login needed", got)
+	}
+	if got := usageGridStateColor(row); got == ansiRed {
+		t.Fatal("telemetry-only failure rendered valid routing key red")
+	}
+
+	row.active = true
+	row.gtoRecommended = true
+	if got := usageGridState(row); got != "active, rec" {
+		t.Fatalf("active state = %q, want active, rec", got)
+	}
+}
+
+func TestQwenValidatedKeyWithoutTelemetryIsReadyButKnownExhaustionBlocks(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "auth ok",
+	}
+	if usageGridState(row) != "ready" || compactPickReason(row) != "quota not exposed" ||
+		!displayRecommendedForNewSession(row) {
+		t.Fatalf("missing optional telemetry contaminated routing status: %+v", row)
+	}
+
+	row.quotaUsageKnown = true
+	row.quotaStatus = "live"
+	row.windows = []accounts.UsageWindow{{
+		Name: "7d", UsedPercent: 100,
+		LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second),
+	}}
+	row.score = scoreFromWindows("qwen-token:work", row.windows)
+	if displayRecommendedForNewSession(row) {
+		t.Fatal("known exhausted Qwen quota remained eligible")
+	}
+}
+
+func TestRemoteQwenValidatedKeyKeepsTelemetryFailureSeparate(t *testing.T) {
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+		ID: "qwen-token:work", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey,
+		AuthChecked: true, AuthValid: true, QuotaStatus: "login needed",
+		Error: "Qwen console login needed",
+	}})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v", rows)
+	}
+	row := rows[0]
+	if row.providerHealth != "auth ok" || usageGridState(row) != "rec" ||
+		!displayRecommendedForNewSession(row) || compactPickReason(row) != "quota login needed" {
+		t.Fatalf("remote Qwen telemetry failure contaminated routing status: %+v", row)
+	}
+}
+
 func TestLocalQwenStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())

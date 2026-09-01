@@ -107,6 +107,52 @@ func TestConsoleRequestClassifiesExpiredLoginResponse(t *testing.T) {
 	}
 }
 
+func TestConsoleRequestClassifiesUnauthorizedHTTPAsExpiredLogin(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: status,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("login required")),
+				Request:    req,
+			}, nil
+		})}
+		err := callConsole(context.Background(), client, consoleConfig{
+			AccessToken: "expired-console-token", ConsoleRegion: defaultRegion, ConsoleSite: defaultSite,
+		}, usageAPI, nil, new(any))
+		if !errors.Is(err, ErrConsoleLoginRequired) {
+			t.Fatalf("HTTP %d error = %v, want ErrConsoleLoginRequired", status, err)
+		}
+	}
+}
+
+func TestSubscriptionRecognizesPersonalTokenPlanTiersAndFieldAliases(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		plan string
+	}{
+		{name: "lite", body: `{"specCode":"lite"}`, plan: "Lite"},
+		{name: "standard", body: `{"spec_code":"standard"}`, plan: "Standard"},
+		{name: "pro", body: `{"planName":"pro"}`, plan: "Pro"},
+		{name: "max", body: `{"plan_name":"max"}`, plan: "Max"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var payload any
+			if err := json.Unmarshal([]byte(test.body), &payload); err != nil {
+				t.Fatal(err)
+			}
+			details, err := findSubscriptionDetails(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if details.Plan != test.plan {
+				t.Fatalf("plan = %q, want %q", details.Plan, test.plan)
+			}
+		})
+	}
+}
+
 func TestConsoleRequestDoesNotClassifyLoginMarkerOutsideExactCode(t *testing.T) {
 	for _, body := range []string{
 		`{"code":"Wrapper.BailianGateway.Login.NotLogined","message":"different error"}`,
