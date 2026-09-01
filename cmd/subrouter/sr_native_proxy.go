@@ -31,13 +31,14 @@ import (
 )
 
 const (
-	antigravityProxyHelp = `Usage: sr antigravity [agy args...]
+	antigravityProxyHelp = `Usage: sr antigravity [--account [account]] [agy args...]
        sr agy [agy args...]
        sr agy proxy [agy args...]
 
 Launch agy through the selected Subrouter. Plain 'agy' remains a direct bypass.
 The agy CLI must still have its own local login; Subrouter never copies or changes it.
-Antigravity currently has one router-host login, so --account pinning is not supported.
+Omit --account for pooled failover. A named account is pinned with no account failover;
+bare --account opens a pinned-account picker.
 `
 	kimiProxyHelp = `Usage: sr kimi [--account [account]] -p <prompt> [kimi args...]
        sr kimi proxy [--account [account]] -p <prompt> [kimi args...]
@@ -105,10 +106,11 @@ func (r srRunner) antigravityCommand(ctx context.Context, args []string) error {
 	if len(args) > 0 && args[0] == "proxy" {
 		args = args[1:]
 	}
-	if len(args) > 0 && (args[0] == "--account" || strings.HasPrefix(args[0], "--account=")) {
-		return errors.New("Antigravity currently has one router-host login; --account pinning is not supported")
+	options, vendorArgs, err := parseNativeProxyLaunchArgs(args)
+	if err != nil {
+		return err
 	}
-	return r.launchNativeProxy(ctx, antigravityNativeProxy, args, nativeProxyLaunchOptions{})
+	return r.launchNativeProxy(ctx, antigravityNativeProxy, vendorArgs, options)
 }
 
 func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {

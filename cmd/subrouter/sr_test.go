@@ -1923,6 +1923,15 @@ func TestHostedAddKeyRejectsRegistryProviderInsteadOfReclassifyingIt(t *testing.
 	}
 }
 
+func TestHostedAntigravityManagementFailsClosed(t *testing.T) {
+	for _, command := range []string{"agy", "antigravity"} {
+		handled, err := (srRunner{}).runTeamCredentialCommand(context.Background(), []string{command, "add", "work"})
+		if !handled || err == nil || !strings.Contains(err.Error(), "hosted Antigravity profile management is not available") {
+			t.Fatalf("%s handled=%v err=%v", command, handled, err)
+		}
+	}
+}
+
 func TestUsageRowsKeepProviderAPIKeysOutOfCodexSwitching(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

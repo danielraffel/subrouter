@@ -14,7 +14,7 @@ its ordinary name uses Subrouter.
 | Qwen Coding Plan API key | OpenAI-compatible client at `/qwen/v1` | Labeled Coding Plan keys | Client auth removed; selected bearer added | Plain `qwen` with its normal provider | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live generation canary recorded |
 | Qwen Token Plan, OpenAI protocol | `sr qwen` (`proxy` alias); `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Pooled key failover by default; `--account` is a hard per-launch pin; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
 | Qwen Token Plan, Anthropic protocol | Anthropic client at `/qwen-anthropic` | Same Token Plan pool as OpenAI route | Client auth removed; selected plan bearer and Anthropic version added | Direct vendor Anthropic endpoint | Same sticky account and exhaustion state as `/qwen-token` | Same shared account and console telemetry | H1, H2 | No live generation canary recorded |
-| Antigravity / AGY OAuth | `sr agy` or `sr antigravity` (`proxy` aliases); `/antigravity` | One `agy` keychain login on a local/single-tenant router host; not inherited by hosted tenant pools | Local CLI auth is stripped by loopback relay; router OAuth bearer added | Plain `agy` | Sticky session; `--account` is explicitly unsupported because there is no multi-account OAuth selector | Safe token identity claim when present, otherwise router-login label; ready/active/error; quota not exposed | H1, H3, H4 | Local login user-tested; proxy generation canary required after deployment |
+| Antigravity / AGY OAuth | `sr agy` or `sr antigravity` (`proxy` aliases); `/antigravity` | Isolated profiles explicitly imported from the CLI's fixed Keychain slot with `sr agy add <label>` | Local CLI auth is stripped by loopback relay; selected router OAuth bearer added | Plain `agy` | Pooled sticky-session failover by default; `--account` is a hard per-launch pin | User label; ready/active/error; quota not exposed | H1, H2, H3, H4 | Multi-profile path hermetically tested; live multi-account canary still required |
 | Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
 | OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | No auditable in-repository live canary recorded |
@@ -57,13 +57,11 @@ sr agy
 ```
 
 The older `sr kimi proxy`, `sr qwen proxy`, and `sr agy proxy` spellings remain
-aliases. Kimi and Qwen default to the router's pooled scheduler. A leading
+aliases. Kimi, Qwen, and Antigravity default to the router's pooled scheduler. A leading
 `--account <selector>` pins only that launched child to the exact account and
 disables account failover; bare `--account` opens a pinned picker. The option is
 wrapper-owned only before the first vendor argument or `--`, so vendor arguments
-remain unambiguous. Antigravity rejects `--account` because it exposes only the
-single router-host OAuth login. None of these choices changes the global
-recommendation.
+remain unambiguous. None of these choices changes the global recommendation.
 
 Kimi and Qwen launchers preserve their normal session stores. Kimi uses its
 documented in-memory model override and forces that model for resumed sessions.
@@ -93,12 +91,12 @@ self-hosted routers, not the Cloudmux session-lease contract.
 
 ## Remote OAuth ownership
 
-Kimi has an explicit managed-profile login flow and can safely keep multiple
-router-owned subscriptions. Antigravity does not expose an equivalent profile
-or account selector: a local or single-tenant router must be signed in with
-`agy` under the daemon account, and Subrouter does not copy the workstation's
-keychain token to that server or expose it through a tenant pool. This is a
-product limitation, not missing quota telemetry.
+Kimi has an explicit managed-profile login flow. Antigravity instead uses the
+vendor CLI's fixed Keychain slot as a deliberate one-at-a-time import source:
+sign plain `agy` into an account, run `sr agy add <label>`, then repeat. Import
+validates the refresh chain and binds it to the issuing public OAuth client so
+the selected self-hosted router can refresh it without depending on its own CLI
+binary. Plain `agy` and its Keychain item remain outside Subrouter ownership.
 
 Implemented and hermetically tested, but without an auditable in-repository
 live-account canary, are OpenRouter, Grok, DeepSeek, Together, Fireworks,

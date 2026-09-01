@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -15,12 +16,113 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
+
+func TestAntigravityAccountImportPublishesMultipleManagedProfiles(t *testing.T) {
+	root := t.TempDir()
+	codexStore := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
+	agyStore := (&agentantigravity.Store{ManagedDir: filepath.Join(root, "antigravity")}).ForServing()
+	ref := NewAccountRef(codexStore, nil, nil)
+	ref.oauthSources = []OAuthAccountSource{agyStore}
+	server := Server{
+		AccountRef: ref, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
+		antigravityImportAttestForTest: func(_ context.Context, _ *http.Client, credential agentantigravity.CredentialInfo, _ time.Time) (agentantigravity.CredentialInfo, error) {
+			credential.AccessToken = "attested-" + credential.AccessToken
+			return credential, nil
+		},
+	}
+	for _, label := range []string{"work", "personal"} {
+		credential := agentantigravity.CredentialInfo{
+			AccessToken: "access-" + label, RefreshToken: "refresh-" + label,
+			ExpiresAt: time.Now().Add(time.Hour), OAuthClientID: "client-id", OAuthClientSecret: "client-secret",
+		}
+		id, err := server.installImportedAccount(t.Context(), accountImportRequest{
+			Provider:    accounts.ProviderAntigravity,
+			Antigravity: &antigravityAccountImport{Label: label, Credential: credential},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != "antigravity-subscription:"+label {
+			t.Fatalf("import id = %q", id)
+		}
+	}
+	listed, err := agyStore.ListAccounts(t.Context())
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("managed Antigravity pool = %+v err=%v", listed, err)
+	}
+}
+
+func TestOpenAccountRefConfiguresAntigravityRefreshTransaction(t *testing.T) {
+	root := t.TempDir()
+	store := &agentantigravity.Store{ManagedDir: filepath.Join(root, "antigravity")}
+	ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}, agentclaude.Store{Dir: filepath.Join(root, "claude")}, nil, []OAuthAccountSource{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured, ok := ref.antigravityStore()
+	if !ok || configured.RefreshTransaction == nil {
+		t.Fatal("Antigravity managed refresh is not serialized with account mutations")
+	}
+}
+
+func TestAntigravityImportWithoutExplicitStoreFailsClosed(t *testing.T) {
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+	server := Server{AccountRef: ref}
+	_, err := server.installImportedAccount(t.Context(), accountImportRequest{
+		Provider: accounts.ProviderAntigravity,
+		Antigravity: &antigravityAccountImport{Label: "work", Credential: agentantigravity.CredentialInfo{
+			AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour), OAuthClientID: "client", OAuthClientSecret: "secret",
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not configured for this pool") {
+		t.Fatalf("unconfigured Antigravity import error = %v", err)
+	}
+}
+
+func TestAccountImportPreflightAdvertisesOnlyConfiguredAntigravityStore(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured bool
+	}{
+		{name: "disabled"},
+		{name: "enabled", configured: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, nil)
+			if tc.configured {
+				ref.oauthSources = []OAuthAccountSource{(&agentantigravity.Store{ManagedDir: t.TempDir()}).ForServing()}
+			}
+			handler := Server{AccountRef: ref, AdminToken: "secret"}.Handler()
+			req := httptest.NewRequest(http.MethodGet, "/_subrouter/account-import", nil)
+			req.Header.Set("Authorization", "Bearer secret")
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("preflight status = %d body=%s", resp.Code, resp.Body.String())
+			}
+			var payload struct {
+				Providers []string `json:"providers"`
+			}
+			if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			advertised := false
+			for _, provider := range payload.Providers {
+				advertised = advertised || provider == string(accounts.ProviderAntigravity)
+			}
+			if advertised != tc.configured {
+				t.Fatalf("providers = %v, configured=%v", payload.Providers, tc.configured)
+			}
+		})
+	}
+}
 
 // stubOAuthSource records refresh calls and returns a fixed account.
 type stubOAuthSource struct {
@@ -503,6 +605,38 @@ func TestRefreshSelectedKimiAccountFailsOverOnTerminalCredentialError(t *testing
 	}
 	if assignment, ok := sessions.Get("kimi", "session-1"); ok {
 		t.Fatalf("pre-request refresh committed the provisional Kimi alternate: %+v", assignment)
+	}
+}
+
+func TestRefreshSelectedAntigravityAccountFailsOverOnTerminalCredentialError(t *testing.T) {
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := accounts.Account{ID: "antigravity-subscription:dead", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth, Token: "stale"}
+	healthy := accounts.Account{ID: "antigravity-subscription:healthy", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth, Token: "fresh"}
+	server := Server{Accounts: []accounts.Account{dead, healthy}, Sessions: sessions, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))}
+	var refreshed []string
+	server.RefreshAccountFn = func(_ context.Context, acct accounts.Account) (accounts.Account, error) {
+		refreshed = append(refreshed, acct.ID)
+		if acct.ID == dead.ID {
+			return acct, errors.New("Antigravity OAuth refresh failed: invalid_grant")
+		}
+		return acct, nil
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://subrouter.test/antigravity/v1internal:test", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, pending, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderAntigravity, "antigravity", "session-1", "", request, dead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != healthy.ID || !pending || len(refreshed) != 2 {
+		t.Fatalf("Antigravity refresh failover got=%q pending=%v refreshed=%v", got.ID, pending, refreshed)
+	}
+	if !server.SchedulerRef.Get().Exhausted(accounts.ProviderAntigravity, dead.ID) {
+		t.Fatal("terminal Antigravity refresh failure was not marked exhausted")
 	}
 }
 

@@ -31,6 +31,7 @@ import (
 	"github.com/gorilla/websocket"
 	accountpkg "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentgrok "github.com/manaflow-ai/subrouter/internal/agents/grok"
 	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
@@ -97,11 +98,14 @@ type Server struct {
 	// CredentialBroker selects a team account and returns an access-only,
 	// short-lived lease. When configured, local refresh-token stores and the
 	// local scheduler are bypassed entirely.
-	CredentialBroker    CredentialBroker
-	Transport           http.RoundTripper
-	Logger              *slog.Logger
-	ActiveSessions      *ActiveSessions
-	RequireSessionLease bool
+	CredentialBroker CredentialBroker
+	// antigravityImportAttestForTest is immutable after construction and lets
+	// hermetic import tests replace Google's token endpoint.
+	antigravityImportAttestForTest func(context.Context, *http.Client, agentantigravity.CredentialInfo, time.Time) (agentantigravity.CredentialInfo, error)
+	Transport                      http.RoundTripper
+	Logger                         *slog.Logger
+	ActiveSessions                 *ActiveSessions
+	RequireSessionLease            bool
 	// ForwardSessionHeaders preserves the selected session identity across an
 	// explicitly configured Subrouter-to-Subrouter delegation hop.
 	ForwardSessionHeaders bool
@@ -386,6 +390,17 @@ func (r *AccountRef) kimiStore() agentkimi.Store {
 		}
 	}
 	return agentkimi.ServingStore()
+}
+
+func (r *AccountRef) antigravityStore() (*agentantigravity.Store, bool) {
+	if r != nil {
+		for _, source := range r.oauthSources {
+			if store, ok := source.(*agentantigravity.Store); ok && store != nil {
+				return store, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (r *AccountRef) hasOAuthUsageSource(provider accounts.Provider) bool {
@@ -699,6 +714,12 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 	}
 	for i, source := range configuredSources {
 		switch store := source.(type) {
+		case *agentantigravity.Store:
+			if store != nil {
+				store.ForServing()
+				store.RefreshTransaction = refreshTransaction
+				configuredSources[i] = store
+			}
 		case agentkimi.Store:
 			store = store.ForServing()
 			store.RefreshTransaction = refreshTransaction
@@ -2259,10 +2280,17 @@ const (
 )
 
 type accountImportRequest struct {
-	Provider accounts.Provider            `json:"provider"`
-	Codex    *accounts.StoredCodexAccount `json:"codex,omitempty"`
-	Claude   *claudeAccountImport         `json:"claude,omitempty"`
-	Kimi     *kimiAccountImport           `json:"kimi,omitempty"`
+	Provider    accounts.Provider            `json:"provider"`
+	Codex       *accounts.StoredCodexAccount `json:"codex,omitempty"`
+	Claude      *claudeAccountImport         `json:"claude,omitempty"`
+	Kimi        *kimiAccountImport           `json:"kimi,omitempty"`
+	Antigravity *antigravityAccountImport    `json:"antigravity,omitempty"`
+}
+
+type antigravityAccountImport struct {
+	Label      string                          `json:"label"`
+	Credential agentantigravity.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                            `json:"remove,omitempty"`
 }
 
 type claudeAccountImport struct {
@@ -2283,9 +2311,13 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		providers := append([]string{"codex", "claude"}, keyedProviderNames()...)
+		if _, configured := s.AccountRef.antigravityStore(); configured {
+			providers = append(providers, string(accounts.ProviderAntigravity))
+		}
 		writeJSON(w, map[string]any{
 			"ok":        true,
-			"providers": append([]string{"codex", "claude"}, keyedProviderNames()...),
+			"providers": providers,
 		})
 		return
 	case http.MethodPost:
@@ -2348,6 +2380,10 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		var collisionErr *accounts.StorageKeyCollisionError
 		if errors.As(err, &collisionErr) {
 			http.Error(w, "account identifier conflicts with an existing account", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, agentantigravity.ErrManagedIdentityExists) {
+			http.Error(w, "Antigravity OAuth identity already exists in this account pool", http.StatusConflict)
 			return
 		}
 		if s.Logger != nil {
@@ -2427,8 +2463,62 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 func (s Server) installImportedAccount(ctx context.Context, input accountImportRequest) (accountID string, err error) {
 	return s.installAccountMutation(ctx, func() (string, func() error, error) {
 		switch {
+		case input.Provider == accounts.ProviderAntigravity && input.Antigravity != nil:
+			if input.Codex != nil || input.Claude != nil || input.Kimi != nil {
+				return "", nil, invalidAccountImport("exactly one matching account payload is required")
+			}
+			label, credential, remove, err := validateAntigravityAccountImport(*input.Antigravity)
+			if err != nil {
+				return "", nil, err
+			}
+			store, configured := s.AccountRef.antigravityStore()
+			if !configured {
+				return "", nil, invalidAccountImport("Antigravity account import is not configured for this pool")
+			}
+			id, err := agentantigravity.ManagedAccountID(label)
+			if err != nil {
+				return "", nil, invalidAccountImport("Antigravity account label is invalid")
+			}
+			if remove {
+				exists, err := store.ManagedAccountExists(label)
+				if err != nil {
+					return "", nil, err
+				}
+				if !exists {
+					return "", nil, invalidAccountImport("managed Antigravity account was not found")
+				}
+				return id, func() error {
+					_, ok, err := store.RemoveManagedAccount(label)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return errors.New("managed Antigravity account disappeared during removal")
+					}
+					return nil
+				}, nil
+			}
+			exists, err := store.ManagedAccountExists(label)
+			if err != nil {
+				return "", nil, err
+			}
+			if !exists {
+				if err := s.ensureNewOAuthSourceAccountImportCapacity(ctx, accounts.ProviderAntigravity, id); err != nil {
+					return "", nil, err
+				}
+			}
+			submitted := credential
+			attest := agentantigravity.RefreshCredential
+			if s.antigravityImportAttestForTest != nil {
+				attest = s.antigravityImportAttestForTest
+			}
+			attested, err := attest(ctx, s.AccountRef.client, submitted, time.Now())
+			if err != nil {
+				return "", nil, invalidAccountImport("Antigravity OAuth credential could not be attested by the server")
+			}
+			return id, func() error { _, err := store.SaveManagedCredentialFromGrant(label, attested, submitted); return err }, nil
 		case input.Provider == accounts.ProviderKimi && input.Kimi != nil:
-			if input.Codex != nil || input.Claude != nil {
+			if input.Codex != nil || input.Claude != nil || input.Antigravity != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
 			}
 			label, credential, remove, err := validateKimiAccountImport(*input.Kimi)
@@ -2473,7 +2563,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 				return err
 			}, nil
 		case input.Provider == accounts.ProviderCodex || isKeyedProvider(input.Provider):
-			if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
+			if input.Codex == nil || input.Claude != nil || input.Kimi != nil || input.Antigravity != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
 			}
 			remoteCodexOAuth := input.Provider == accounts.ProviderCodex && !input.Codex.IsAPIKey()
@@ -2502,7 +2592,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 				return s.AccountRef.store.SaveStored(account)
 			}, nil
 		case input.Provider == accounts.ProviderClaude:
-			if input.Claude != nil && input.Codex == nil && input.Kimi == nil {
+			if input.Claude != nil && input.Codex == nil && input.Kimi == nil && input.Antigravity == nil {
 				name, credential, err := validateClaudeAccountImport(*input.Claude)
 				if err != nil {
 					return "", nil, err
@@ -2515,7 +2605,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 					return s.AccountRef.claudeStore.ImportProfileCredential(canonicalName, credential)
 				}, nil
 			}
-			if input.Codex == nil || input.Claude != nil || input.Kimi != nil {
+			if input.Codex == nil || input.Claude != nil || input.Kimi != nil || input.Antigravity != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
 			}
 			account, err := validateStoredAccountImport(input.Provider, *input.Codex)
@@ -2826,6 +2916,29 @@ func validateKimiAccountImport(input kimiAccountImport) (string, agentkimi.Crede
 	}
 	if input.Credential.ExpiresAt.IsZero() || !input.Credential.ExpiresAt.After(time.Now()) {
 		return "", input.Credential, false, invalidAccountImport("Kimi OAuth access token is not fresh")
+	}
+	return label, input.Credential, false, nil
+}
+
+func validateAntigravityAccountImport(input antigravityAccountImport) (string, agentantigravity.CredentialInfo, bool, error) {
+	label := strings.TrimSpace(input.Label)
+	if _, err := agentantigravity.ManagedAccountID(label); err != nil || len(label) > 160 || containsTerminalControl(label) {
+		return "", input.Credential, input.Remove, invalidAccountImport("Antigravity account label is invalid")
+	}
+	if input.Remove {
+		if strings.TrimSpace(input.Credential.AccessToken) != "" || strings.TrimSpace(input.Credential.RefreshToken) != "" {
+			return "", input.Credential, true, invalidAccountImport("Antigravity removal must not include a credential")
+		}
+		return label, input.Credential, true, nil
+	}
+	if strings.TrimSpace(input.Credential.AccessToken) == "" || strings.TrimSpace(input.Credential.RefreshToken) == "" {
+		return "", input.Credential, false, invalidAccountImport("Antigravity OAuth payload is incomplete")
+	}
+	if strings.TrimSpace(input.Credential.OAuthClientID) == "" || strings.TrimSpace(input.Credential.OAuthClientSecret) == "" {
+		return "", input.Credential, false, invalidAccountImport("Antigravity OAuth client binding is missing")
+	}
+	if input.Credential.ExpiresAt.IsZero() || !input.Credential.ExpiresAt.After(time.Now()) {
+		return "", input.Credential, false, invalidAccountImport("Antigravity OAuth access token is not fresh")
 	}
 	return label, input.Credential, false, nil
 }

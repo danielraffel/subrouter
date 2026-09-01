@@ -509,6 +509,36 @@ func TestRefreshCredentialDoesNotRetryInvalidGrantAcrossClients(t *testing.T) {
 	}
 }
 
+func TestPrepareManagedCredentialDiscoversClientAcrossInvalidGrant(t *testing.T) {
+	var attempts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		attempts = append(attempts, r.Form.Get("client_id"))
+		if r.Form.Get("client_id") == "old-client" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh", "refresh_token": "rotated", "expires_in": 3600})
+	}))
+	defer server.Close()
+	stubTokenURL(t, server)
+	stubOAuthClients(t,
+		oauthClient{id: "old-client", secret: "old-secret"},
+		oauthClient{id: "current-client", secret: "current-secret"},
+	)
+
+	credential, err := PrepareManagedCredential(context.Background(), server.Client(), CredentialInfo{RefreshToken: "rt"}, reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 || credential.OAuthClientID != "current-client" || credential.OAuthClientSecret != "current-secret" || credential.RefreshToken != "rotated" {
+		t.Fatalf("prepared credential attempts=%v client=%q secret=%q refresh=%q", attempts, credential.OAuthClientID, credential.OAuthClientSecret, credential.RefreshToken)
+	}
+}
+
 func TestRefreshCredentialUsesCachedClientBeforeDiscoveringCandidates(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh", "expires_in": 3600})

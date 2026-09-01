@@ -348,6 +348,7 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 		{ID: "kimi-code", Label: "Direct CLI", Source: "kimi-code credentials file", Provider: accounts.ProviderKimi, AuthMode: accounts.AuthModeOAuth},
 		{ID: "qwen-token:large", Label: "Large", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
 		{ID: "qwen-token:larger", Label: "Larger", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
+		{ID: "antigravity-subscription:work", Label: "AGY Work", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth},
 	}
 	for selector, want := range map[string]string{
 		"WORK":                "kimi-subscription:work",
@@ -364,6 +365,9 @@ func TestNativeProxyAccountSelectionIsProviderScopedAndFailsClosed(t *testing.T)
 	}
 	if got, err := resolveNativeProxyAccountSelector(kimiNativeProxy, inventory, "kimi:metered"); err != nil || got != "kimi:metered" {
 		t.Fatalf("canonical ID did not outrank colliding label: %q, %v", got, err)
+	}
+	if got, err := resolveNativeProxyAccountSelector(antigravityNativeProxy, inventory, "AGY Work"); err != nil || got != "antigravity-subscription:work" {
+		t.Fatalf("resolve Antigravity label = %q, %v", got, err)
 	}
 	for _, test := range []struct {
 		spec     nativeProxySpec
@@ -724,7 +728,7 @@ func TestNativeProxyPinnedPickerIsSortedAndBlankCancels(t *testing.T) {
 
 func TestNativeProxyDispatchSeparatesManagementFromDefaultLaunch(t *testing.T) {
 	for _, args := range [][]string{nil, {"--model", "x"}, {"proxy"}, {"--account", "work"}} {
-		if isKimiManagementCommand(args) || isQwenManagementCommand(args) {
+		if isKimiManagementCommand(args) || isQwenManagementCommand(args) || isAntigravityManagementCommand(args) {
 			t.Fatalf("launch args %q classified as management", args)
 		}
 	}
@@ -736,8 +740,10 @@ func TestNativeProxyDispatchSeparatesManagementFromDefaultLaunch(t *testing.T) {
 	if !isKimiManagementCommand([]string{"list"}) || isQwenManagementCommand([]string{"list"}) {
 		t.Fatal("provider-specific management verbs were not preserved")
 	}
-	if err := (srRunner{}).antigravityCommand(t.Context(), []string{"--account", "unused"}); err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("Antigravity pin error = %v", err)
+	for _, verb := range []string{"add", "list", "remove"} {
+		if !isAntigravityManagementCommand([]string{verb}) {
+			t.Fatalf("Antigravity management verb %q classified as launch", verb)
+		}
 	}
 	for _, provider := range []string{"kimi", "qwen"} {
 		var out bytes.Buffer

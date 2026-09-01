@@ -22,6 +22,12 @@ type CredentialInfo struct {
 	IDToken      string
 	TokenType    string
 	Scope        string
+	// OAuthClientID and OAuthClientSecret bind an imported refresh-token chain
+	// to the public installed-app client that issued it. The AGY Keychain blob
+	// omits this association, so import discovers it once and persists it with
+	// the managed profile; a router need not have the same CLI binary installed.
+	OAuthClientID     string `json:"oauth_client_id,omitempty"`
+	OAuthClientSecret string `json:"oauth_client_secret,omitempty"`
 	// ExpiresAt is when the access token stops being accepted. Zero means the
 	// stored credential did not say, in which case it is treated as expired so
 	// a refresh happens rather than a request failing upstream.

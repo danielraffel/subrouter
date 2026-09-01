@@ -353,7 +353,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 				return r.launchQwenProxy(ctx, launchArgs)
 			}
 		case "antigravity", "agy":
-			return r.antigravityCommand(ctx, args[1:])
+			if len(args) > 1 && (args[1] == "help" || args[1] == "-h" || args[1] == "--help") {
+				return r.antigravityManage(ctx, args[1:])
+			}
+			if !isAntigravityManagementCommand(args[1:]) {
+				return r.antigravityCommand(ctx, args[1:])
+			}
 		}
 	}
 	if len(args) == 0 {
@@ -483,7 +488,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "kimi":
 		return r.kimiCommand(ctx, args[1:])
 	case "antigravity", "agy":
-		return r.antigravityCommand(ctx, args[1:])
+		return r.antigravityManage(ctx, args[1:])
 	case "pick":
 		return r.pick(ctx, srSwitchOptions{})
 	case "reset":
@@ -565,6 +570,8 @@ func localOnboardingCommand(args []string) bool {
 		return isKimiManagementCommand(args[1:])
 	case "qwen":
 		return isQwenManagementCommand(args[1:])
+	case "agy", "antigravity":
+		return isAntigravityManagementCommand(args[1:])
 	default:
 		return false
 	}
@@ -594,12 +601,24 @@ func isQwenManagementCommand(args []string) bool {
 	}
 }
 
+func isAntigravityManagementCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "-h", "--help", "add", "import", "list", "ls", "remove", "rm":
+		return true
+	default:
+		return false
+	}
+}
+
 // servingAPIAccountCommand is deliberately narrower than shouldRouteSRCommand.
 // Only account-store operations belong to an isolated serving daemon; usage
 // reports, traces, admin-key management, and project attachment stay local.
 func servingAPIAccountCommand(command string) bool {
 	switch command {
-	case "add", "add-key", "add-api-key", "list", "ls", "status", "reset", "qwen", "kimi",
+	case "add", "add-key", "add-api-key", "list", "ls", "status", "reset", "qwen", "kimi", "agy", "antigravity",
 		"remove", "rm":
 		return true
 	default:
@@ -671,6 +690,8 @@ func (r srRunner) runTeamCredentialCommand(
 		return true, r.cloudQwen(ctx, args[1:])
 	case "kimi":
 		return true, fmt.Errorf("hosted Kimi profile management is not available yet; use 'sr remote use local' or a self-hosted server")
+	case "agy", "antigravity":
+		return true, fmt.Errorf("hosted Antigravity profile management is not available yet; use 'sr remote use local' or a self-hosted server")
 	case "remove", "rm":
 		return true, r.cloudAccount(ctx, args)
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use", "pick", "reset":
@@ -716,6 +737,8 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 		return r.qwenRemote(ctx, server, args[1:])
 	case "kimi":
 		return r.kimiRemote(ctx, server, args[1:])
+	case "agy", "antigravity":
+		return r.antigravityRemote(ctx, server, args[1:])
 	case "switch", "use", "g", "gui", "gui-switch", "gui-use":
 		selector, _, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {

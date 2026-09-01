@@ -595,10 +595,11 @@ OAuth subscriptions report their independent 5-hour and weekly windows and
 reset times from Kimi's usage endpoint. The condensed API-key rows report key
 health and only quota data the provider actually exposes.
 
-Antigravity OAuth is intentionally limited to the single CLI login available
-on the router host. The official CLI documents cached keyring sign-in/logout,
-but no token export or account selector, so Subrouter does not advertise binary
-token extraction or multi-account OAuth failover as upstream-ready. Direct
+The Antigravity CLI exposes one fixed Keychain login and no account selector.
+Subrouter turns that slot into an explicit import source: sign plain `agy` into
+an account, run `sr agy add <label>`, and repeat for each account. Each import
+is validated by an OAuth refresh and stored as an isolated, independently
+refreshable router profile; the vendor Keychain item is never changed. Direct
 `GEMINI_API_KEY` and Application Default Credentials are separate supported
 authentication paths, not additional selectable OAuth profiles
 ([install](https://antigravity.google/docs/cli/install/),
@@ -609,17 +610,26 @@ Plain `agy` remains the vendor's direct CLI. `sr agy` (also
 `sr antigravity`) launches that CLI locally while sending model traffic
 through the selected Subrouter and its Antigravity credential. The local CLI
 login is used only to satisfy the CLI's own bootstrap; its bearer credential is
-removed by a loopback relay and is never copied to the selected server. A
-selected single-tenant router therefore needs its own `agy` login in the account
-running the daemon. Tenant-scoped/hosted pools do not inherit a host keychain
-login and are not advertised as Antigravity OAuth routes. There is deliberately
-no local-to-remote Antigravity token import: the
-CLI exposes neither a safe independent profile format nor a supported
-account-selector workflow. `sr status` reports the router credential as
+removed by a loopback relay. Only the explicit `sr agy add` command transfers a
+validated credential to the selected self-hosted router through its protected
+account-import endpoint. `sr status` reports each managed profile as
 `ready`, `active`, or `error`, and says quota is not exposed instead of polling
 an unsupported quota endpoint. `sr agy proxy` remains an explicit launcher
-alias. Antigravity currently has one router-host OAuth login, so its launcher
-does not advertise `--account` pinning.
+alias. Pooled launches fail over between eligible profiles; `--account` pins
+one launch without changing the global pool. Plain `agy` remains a direct
+bypass using the current Keychain login.
+
+For backward compatibility, a router with no managed Antigravity profiles
+continues serving its historical host Keychain login. The first successful
+`sr agy add` retires that singleton from new routing and makes the explicit
+managed inventory authoritative; this avoids adding the same refresh chain to
+the pool twice.
+
+Subrouter rejects the same refresh grant under two labels and preserves that
+grant identity when Google rotates the stored token. It deliberately does not
+trust unsigned JWT claims to decide account identity. Two independently
+authorized grants for the same Google user cannot be proven equivalent from
+AGY's credential format and may therefore be stored under distinct labels.
 
 Native proxy launchers preflight the selected router before starting the vendor
 CLI. Hosted or otherwise lease-required routers are rejected until Subrouter has
