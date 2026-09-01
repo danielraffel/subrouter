@@ -1699,7 +1699,7 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 			t.Fatalf("invalid Qwen model launch %q was accepted", args)
 		}
 	}
-	for _, args := range [][]string{{"--session"}, {"-S"}, {"--resume"}, {"-r"}, {"--session="}, {"--resume="}, {"--session", ""}, {"-r", "   "}, {"--session", "--model", "kimi-test"}} {
+	for _, args := range [][]string{{"--session"}, {"-S"}, {"--resume"}, {"-r"}, {"--session="}, {"--resume="}, {"--session", ""}, {"-r", "   "}, {"--session", "--model", "kimi-test"}, {"--session", "session-id", "--session", "-p", "hello"}} {
 		if !nativeProxyResumePickerRequested(kimiNativeProxy, args) {
 			t.Fatalf("Kimi picker resume %q was not detected", args)
 		}
@@ -1802,20 +1802,18 @@ func TestKimiNativeProxyArgsForceEphemeralModelOnNewAndResumedSessions(t *testin
 	}
 }
 
-func TestNativeProxySessionIdentitySurvivesInitialLaunchAndResume(t *testing.T) {
+func TestNativeProxyWorkspaceSessionIdentityCoversNewAndContinue(t *testing.T) {
 	for _, spec := range []nativeProxySpec{kimiNativeProxy, qwenNativeProxy, antigravityNativeProxy} {
 		first, err := nativeProxySessionID(spec, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, args := range [][]string{{"--resume", "native-id"}, {"--session", "native-id"}, {"--conversation", "native-id"}, {"--continue"}} {
-			resumed, resumeErr := nativeProxySessionID(spec, args)
-			if resumeErr != nil {
-				t.Fatal(resumeErr)
-			}
-			if resumed != first {
-				t.Fatalf("%s initial session %q changed on resume %q to %q", spec.provider, first, args, resumed)
-			}
+		continued, continueErr := nativeProxySessionID(spec, []string{"--continue"})
+		if continueErr != nil {
+			t.Fatal(continueErr)
+		}
+		if continued != first {
+			t.Fatalf("%s initial session %q changed on continue to %q", spec.provider, first, continued)
 		}
 		if !strings.HasPrefix(first, "sr-native-") {
 			t.Fatalf("workspace session identity = %q", first)
@@ -1833,6 +1831,87 @@ func TestNativeProxySessionIdentitySurvivesInitialLaunchAndResume(t *testing.T) 
 	}
 	if again := nativeProxyPinnedSessionID(qwenID, "qwen-token:work"); again != qwenWork {
 		t.Fatalf("pinned session identity is not stable: %q != %q", again, qwenWork)
+	}
+}
+
+func TestKimiExplicitSessionIdentityIsStableAcrossWorkspaces(t *testing.T) {
+	workspaceA := t.TempDir()
+	workspaceB := t.TempDir()
+	t.Chdir(workspaceA)
+
+	workspaceSessionA, err := nativeProxySessionID(kimiNativeProxy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitForms := [][]string{
+		{"--session", "kimi-session-id"},
+		{"-S", "kimi-session-id"},
+		{"--session=kimi-session-id"},
+		{"-Skimi-session-id"},
+		{"-S=kimi-session-id"},
+		{"--resume", "kimi-session-id"},
+		{"-r", "kimi-session-id"},
+		{"--resume=kimi-session-id"},
+		{"-rkimi-session-id"},
+		{"-r=kimi-session-id"},
+	}
+	var explicitIdentity string
+	for _, args := range explicitForms {
+		got, sessionErr := nativeProxySessionID(kimiNativeProxy, args)
+		if sessionErr != nil {
+			t.Fatal(sessionErr)
+		}
+		if explicitIdentity == "" {
+			explicitIdentity = got
+		} else if got != explicitIdentity {
+			t.Fatalf("explicit Kimi session form %q identity = %q, want %q", args, got, explicitIdentity)
+		}
+	}
+	if explicitIdentity == workspaceSessionA {
+		t.Fatal("explicit Kimi session reused the workspace-scoped identity")
+	}
+
+	t.Chdir(workspaceB)
+	workspaceSessionB, err := nativeProxySessionID(kimiNativeProxy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspaceSessionB == workspaceSessionA {
+		t.Fatal("distinct Kimi workspaces shared the new-session identity")
+	}
+	continued, err := nativeProxySessionID(kimiNativeProxy, []string{"--continue"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if continued != workspaceSessionB {
+		t.Fatalf("Kimi continue identity = %q, want workspace identity %q", continued, workspaceSessionB)
+	}
+	resumed, err := nativeProxySessionID(kimiNativeProxy, []string{"--session", "kimi-session-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed != explicitIdentity {
+		t.Fatalf("cross-workspace Kimi resume identity = %q, want %q", resumed, explicitIdentity)
+	}
+	different, err := nativeProxySessionID(kimiNativeProxy, []string{"--session", "different-session-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if different == explicitIdentity {
+		t.Fatal("distinct explicit Kimi session IDs shared one identity")
+	}
+	for _, args := range [][]string{
+		{"-p", "--session"},
+		{"--prompt", "--resume"},
+		{"--agent", "--session", "-p", "hello"},
+	} {
+		got, identityErr := nativeProxySessionID(kimiNativeProxy, args)
+		if identityErr != nil {
+			t.Fatal(identityErr)
+		}
+		if got != workspaceSessionB {
+			t.Fatalf("required option value %q changed Kimi workspace identity to %q", args, got)
+		}
 	}
 }
 

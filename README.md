@@ -624,9 +624,10 @@ does not advertise `--account` pinning.
 Native proxy launchers preflight the selected router before starting the vendor
 CLI. Hosted or otherwise lease-required routers are rejected until Subrouter has
 a native-launcher session-lease client; local and ordinary self-hosted routers
-remain supported. Their account affinity is stable per provider and working
-directory, so initial and resumed sessions stay together without reading vendor
-session files.
+remain supported. New sessions and workspace-relative continue operations keep
+provider-and-working-directory affinity. An explicit Kimi session ID instead
+keeps provider-and-session affinity across working directories, without reading
+vendor session files.
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that
@@ -672,12 +673,14 @@ inside the interactive TUI and exposes no supported config or environment
 denylist for them. Routed interactive launches therefore fail closed. Prompt
 mode does not start that TUI dispatcher, so `-p` remains supported for new
 sessions and with an explicit `--session`/`--resume` ID or `--continue`.
+New sessions and `--continue` use the working-directory assignment; an explicit
+session ID uses the same pooled assignment from any working directory.
 This session-link boundary currently requires macOS or Linux; `sr kimi` fails
 closed on Windows while plain `kimi` remains available there.
 The default routed prompt is pooled and may fail over. `sr kimi --account work -p ...` pins
 that child to the exact routed profile or key with no account failover; bare
 `--account` opens a pinned-account picker. This per-launch pin does not change
-the global recommendation or the pooled working-directory assignment. `sr kimi
+the global recommendation or the corresponding pooled session assignment. `sr kimi
 proxy` remains an explicit alias. Put
 vendor arguments after `--` when they could be confused with wrapper options.
 Kimi Code subscription API keys can also be added with

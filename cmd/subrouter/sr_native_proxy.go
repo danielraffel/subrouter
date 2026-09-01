@@ -49,7 +49,8 @@ bare --account opens a pinned-account picker.
 The child gets a private routed-only home while its session store remains linked.
 Kimi credential, migration/update, ACP, web, and server modes require the plain direct CLI.
 Interactive routed launches are disabled because Kimi has no enforced slash-command denylist.
-Account affinity is stable per working directory, including prompt-mode resumed sessions.
+New sessions and --continue keep working-directory affinity; an explicit session ID keeps
+the same affinity across working directories.
 Use -p with --session <id>, --resume <id>, or --continue; session pickers are not supported.
 `
 	qwenProxyHelp = `Usage: sr qwen [--account [account]] [-- qwen args...]
@@ -479,9 +480,62 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 		if !matched {
 			continue
 		}
-		return i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" || strings.HasPrefix(args[i+1], "-")
+		if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" || strings.HasPrefix(args[i+1], "-") {
+			return true
+		}
+		// Keep scanning after an explicit optional value so a later bare picker
+		// cannot hide behind an earlier valid session ID.
+		i++
 	}
 	return false
+}
+
+func kimiExplicitSessionID(args []string) (string, bool) {
+	var sessionID string
+	found := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		switch arg {
+		case "-m", "--model", "-p", "--prompt", "--output-format",
+			"--skills-dir", "--agent", "--agent-file", "--add-dir":
+			// These Kimi options require a value even when it begins with '-'.
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		case "-S", "--session", "-r", "--resume":
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.TrimSpace(args[i+1]) != "" {
+				sessionID = args[i+1]
+				found = true
+				i++
+			}
+			continue
+		}
+		for _, option := range []string{"--session=", "--resume="} {
+			if strings.HasPrefix(arg, option) {
+				value := strings.TrimPrefix(arg, option)
+				if strings.TrimSpace(value) != "" {
+					sessionID = value
+					found = true
+				}
+				break
+			}
+		}
+		for _, option := range []string{"-S", "-r"} {
+			if strings.HasPrefix(arg, option) && len(arg) > len(option) {
+				value := strings.TrimPrefix(strings.TrimPrefix(arg, option), "=")
+				if strings.TrimSpace(value) != "" {
+					sessionID = value
+					found = true
+				}
+				break
+			}
+		}
+	}
+	return sessionID, found
 }
 
 func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, args []string, options nativeProxyLaunchOptions) error {
@@ -1238,7 +1292,12 @@ func newNativeProxyToken() (string, error) {
 }
 
 func nativeProxySessionID(spec nativeProxySpec, args []string) (string, error) {
-	_ = args
+	if spec.provider == accounts.ProviderKimi {
+		if sessionID, ok := kimiExplicitSessionID(args); ok {
+			digest := sha256.Sum256([]byte(string(spec.provider) + "\x00session\x00" + sessionID))
+			return "sr-native-" + hex.EncodeToString(digest[:16]), nil
+		}
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("resolve native proxy workspace: %w", err)
