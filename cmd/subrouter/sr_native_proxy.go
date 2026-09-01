@@ -454,6 +454,19 @@ func nativeProxyResumePickerRequested(spec nativeProxySpec, args []string) bool 
 		if args[i] == "--" {
 			return false
 		}
+		if spec.provider == accounts.ProviderKimi {
+			switch args[i] {
+			case "-m", "--model", "-p", "--prompt", "--output-format",
+				"--skills-dir", "--agent", "--agent-file", "--add-dir":
+				// Commander consumes required values even when they begin with '-'.
+				// Do not reinterpret a prompt, agent name, or other required value
+				// such as "--resume" as Kimi's optional resume picker.
+				if i+1 < len(args) {
+					i++
+				}
+				continue
+			}
+		}
 		matched := false
 		for _, flag := range pickerFlags {
 			if args[i] == flag {

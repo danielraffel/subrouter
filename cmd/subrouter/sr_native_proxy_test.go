@@ -1625,6 +1625,19 @@ func TestNativeProxyRejectsResumePickerWithoutStickySessionID(t *testing.T) {
 			t.Fatalf("explicit Kimi resume %q was rejected", args)
 		}
 	}
+	for _, args := range [][]string{
+		{"-p", "--resume"},
+		{"--prompt", "--session"},
+		{"--agent", "--resume", "-p", "hello"},
+		{"--add-dir", "--session", "-p", "hello"},
+	} {
+		if nativeProxyResumePickerRequested(kimiNativeProxy, args) {
+			t.Fatalf("required Kimi option value %q was treated as a resume picker", args)
+		}
+		if !kimiProxyPromptModeRequested(args) {
+			t.Fatalf("required Kimi option value %q did not preserve prompt mode", args)
+		}
+	}
 	if err := (srRunner{}).launchKimiProxy(t.Context(), []string{"--session"}); err == nil || !strings.Contains(err.Error(), "explicit session ID") {
 		t.Fatalf("Kimi picker launch error = %v", err)
 	}
