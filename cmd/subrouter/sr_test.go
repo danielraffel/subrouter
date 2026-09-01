@@ -4872,6 +4872,20 @@ func TestAntigravityStatusHidesUnavailableFamilyColumns(t *testing.T) {
 	}
 }
 
+func TestAntigravityLegacyModelQuotaUseDoesNotClaimBaseHundredPercent(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		quotaUsageKnown: true,
+		windows: []accounts.UsageWindow{
+			{Name: "claude-sonnet-4.5", Feature: "claude-sonnet-4.5", UsedPercent: 70, ResetAfterSeconds: 3600},
+			{Name: "claude-opus-4.1", Feature: "claude-opus-4.1", UsedPercent: 20},
+		},
+	}
+	if got := compactPickReason(row); got != "30% left Sonnet/1h" {
+		t.Fatalf("legacy compact Use = %q", got)
+	}
+}
+
 func TestAntigravityStatusSurfacesFailedAuth(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,

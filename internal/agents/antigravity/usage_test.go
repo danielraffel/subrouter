@@ -142,6 +142,13 @@ func TestFetchUsageFallsBackToPerFamilyModelQuotaWithoutInventingCadence(t *test
 			t.Fatalf("invented cadence: %+v", window)
 		}
 	}
+	used := map[string]float64{}
+	for _, window := range details.Windows {
+		used[window.Feature] = window.UsedPercent
+	}
+	if math.Abs(used["claude-sonnet"]-30) > 0.0001 || math.Abs(used["gemini-3-pro"]-80) > 0.0001 || math.Abs(used["other"]-100) > 0.0001 {
+		t.Fatalf("model percentages = %+v", used)
+	}
 }
 
 func TestLegacyModelQuotaPreservesExactModelPools(t *testing.T) {

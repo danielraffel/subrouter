@@ -618,8 +618,9 @@ telemetry for that exact profile, it also reports the provider-verified email
 and plan plus independent Gemini and Claude/GPT quota pools. Named 5-hour and
 weekly buckets retain their own remaining percentage and reset; missing or
 disabled buckets stay unknown, and one exhausted family never collapses the
-other. Older accounts that expose only per-model quota are reported at that
-granularity rather than guessed into a 5-hour or weekly cadence. Telemetry is
+other. Older accounts that expose only per-model quota retain each exact model
+as its own routing pool; compact Use names the most constrained known model
+without guessing it into a 5-hour or weekly cadence. Telemetry is
 bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
 managed profile to an unrelated host language-server login. `sr agy proxy`
 remains an explicit launcher

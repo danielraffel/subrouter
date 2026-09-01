@@ -3596,7 +3596,7 @@ func compactPickReason(row srUsageRow) string {
 	}
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		if row.quotaUsageKnown && len(row.windows) > 0 {
-			return fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
+			return compactAntigravityQuota(row.windows)
 		}
 		if row.quotaStatus == "unavailable" {
 			return "quota unavailable"
@@ -3640,6 +3640,51 @@ func compactPickReason(row srUsageRow) string {
 		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
 	return left + suffix
+}
+
+func compactAntigravityQuota(windows []accounts.UsageWindow) string {
+	if len(windows) == 0 {
+		return "quota not exposed"
+	}
+	mostConstrained := windows[0]
+	for _, window := range windows[1:] {
+		if window.UsedPercent > mostConstrained.UsedPercent {
+			mostConstrained = window
+		}
+	}
+	remaining := int(100 - clampUsagePercent(mostConstrained.UsedPercent) + 0.5)
+	text := fmt.Sprintf("%d%% left", remaining)
+	if label := compactAntigravityWindowLabel(mostConstrained); label != "" {
+		text += " " + label
+	}
+	if mostConstrained.ResetAfterSeconds > 0 {
+		text += "/" + strings.ReplaceAll(formatDuration(mostConstrained.ResetAfterSeconds), " ", "")
+	}
+	return text
+}
+
+func compactAntigravityWindowLabel(window accounts.UsageWindow) string {
+	feature := strings.ToLower(window.Feature)
+	switch {
+	case feature == "gemini":
+		return "Gemini"
+	case feature == "claude-gpt":
+		return "C/G"
+	case strings.Contains(feature, "sonnet"):
+		return "Sonnet"
+	case strings.Contains(feature, "opus"):
+		return "Opus"
+	case strings.Contains(feature, "claude"):
+		return "Claude"
+	case strings.Contains(feature, "gemini"):
+		return "Gemini"
+	case strings.Contains(feature, "gpt") || strings.Contains(feature, "openai"):
+		return "GPT"
+	case strings.TrimSpace(window.Name) != "":
+		return "model"
+	default:
+		return ""
+	}
 }
 
 // A successful model-key probe is authoritative for routing. Console quota is
