@@ -310,8 +310,9 @@ def _write_shadow_health_key(path: Path, key: bytes) -> None:
         os.close(descriptor)
 
 
-def _signal_handler(signum: int, _frame: object) -> None:
-    raise ShadowError(f"shadow rehearsal interrupted by signal {signum}")
+def _ignore_signals(handled_signals: list[signal.Signals]) -> None:
+    for handled_signal in handled_signals:
+        signal.signal(handled_signal, signal.SIG_IGN)
 
 
 def _evidence(ok: bool, candidate_sha256: str, phases: dict[str, bool], teardown: dict[str, bool], failure: str = "") -> str:
@@ -371,8 +372,15 @@ def main() -> int:
         optional_signal = getattr(signal, signal_name, None)
         if optional_signal is not None and optional_signal not in handled_signals:
             handled_signals.append(optional_signal)
+    def interrupt_handler(signum: int, _frame: object) -> None:
+        # A second signal must not interrupt callback or candidate cleanup.
+        # Mask the signal being handled first to close the repeat-signal race.
+        signal.signal(signum, signal.SIG_IGN)
+        _ignore_signals(handled_signals)
+        raise ShadowError(f"shadow rehearsal interrupted by signal {signum}")
+
     prior_handlers = {
-        sent_signal: signal.signal(sent_signal, _signal_handler)
+        sent_signal: signal.signal(sent_signal, interrupt_handler)
         for sent_signal in handled_signals
     }
     try:
@@ -387,6 +395,7 @@ def main() -> int:
         canary = _secure_file(arguments.canary_callback, "canary callback", executable=True)
         serve_args = _load_serve_args(arguments.serve_args_json)
         host, port, base_url = _parse_loopback_addr(arguments.addr)
+        resolved_addr = f"{host}:{port}"
         if _listener_present(host, port):
             _fail("shadow listener is already in use")
 
@@ -398,7 +407,7 @@ def main() -> int:
         candidate_log = workspace / "candidate.log"
         _copy_candidate(candidate, prepare_candidate, candidate_sha256)
         environment = _callback_environment(
-            workspace, state_dir, prepare_candidate, candidate_sha256, arguments.addr, base_url, candidate_log
+            workspace, state_dir, prepare_candidate, candidate_sha256, resolved_addr, base_url, candidate_log
         )
         _run_callback(
             prepare, environment, workspace / "prepare.log", arguments.callback_timeout_seconds
@@ -418,7 +427,7 @@ def main() -> int:
         candidate_environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = str(shadow_health_key_file)
         with candidate_log.open("wb") as output:
             candidate_process = subprocess.Popen(
-                [str(pinned_candidate), "serve", "--addr", arguments.addr, *serve_args],
+                [str(pinned_candidate), "serve", "--addr", resolved_addr, *serve_args],
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.STDOUT,
@@ -449,6 +458,7 @@ def main() -> int:
     except Exception:
         failure = "internal shadow rehearsal failure"
     finally:
+        _ignore_signals(handled_signals)
         if candidate_process is not None:
             teardown["process_group_absent"] = _terminate_group(candidate_process)
         if port:

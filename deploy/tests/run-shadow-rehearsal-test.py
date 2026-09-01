@@ -40,6 +40,8 @@ class ShadowRehearsalTest(unittest.TestCase):
         self.workspace_witness = self.root / "workspace.txt"
         self.canary_witness = self.root / "canary.txt"
         self.challenge_witness = self.root / "challenges.txt"
+        self.candidate_addr_witness = self.root / "candidate-addr.txt"
+        self.callback_addr_witness = self.root / "callback-addr.txt"
         self.candidate = self._script(
             "candidate.py",
             """
@@ -58,6 +60,7 @@ parser.add_argument("--addr", required=True)
 args = parser.parse_args()
 host, port = args.addr.rsplit(":", 1)
 Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
+Path(os.environ["TEST_CANDIDATE_ADDR_WITNESS"]).write_text(args.addr)
 shadow_key = bytes.fromhex(Path(os.environ["SUBROUTER_SHADOW_HEALTH_KEY_FILE"]).read_text().strip())
 
 class Handler(BaseHTTPRequestHandler):
@@ -107,6 +110,7 @@ assert "SUBROUTER_SHADOW_HEALTH_KEY_FILE" not in os.environ
 with urllib.request.urlopen(os.environ["SUBROUTER_SHADOW_BASE_URL"] + "/_subrouter/ready") as response:
     assert json.load(response)["ok"] is True
 Path(os.environ["TEST_CANARY_WITNESS"]).write_text("passed")
+Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_ADDR"])
 """,
         )
 
@@ -126,11 +130,14 @@ Path(os.environ["TEST_CANARY_WITNESS"]).write_text("passed")
         candidate_hash: str | None = None,
         canary: Path | None = None,
         serve_args: Path | None = None,
+        addr_host: str = "127.0.0.1",
     ) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
         environment["TEST_WORKSPACE_WITNESS"] = str(self.workspace_witness)
         environment["TEST_CANARY_WITNESS"] = str(self.canary_witness)
         environment["TEST_CHALLENGE_WITNESS"] = str(self.challenge_witness)
+        environment["TEST_CANDIDATE_ADDR_WITNESS"] = str(self.candidate_addr_witness)
+        environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
         environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = "must-not-reach-callback"
         command = [
             sys.executable,
@@ -140,7 +147,7 @@ Path(os.environ["TEST_CANARY_WITNESS"]).write_text("passed")
             "--candidate-sha256",
             candidate_hash or hashlib.sha256(self.candidate.read_bytes()).hexdigest(),
             "--addr",
-            f"127.0.0.1:{port}",
+            f"{addr_host}:{port}",
             "--prepare-callback",
             str(self.prepare),
             "--canary-callback",
@@ -184,6 +191,15 @@ Path(os.environ["TEST_CANARY_WITNESS"]).write_text("passed")
         workspace = Path(self.workspace_witness.read_text())
         self.assertFalse(workspace.exists())
         self.assertFalse(_listening(port))
+
+    def test_resolved_numeric_address_is_reused_without_hostname_reresolution(self) -> None:
+        port = _free_port()
+        result = self._run(port, addr_host="localhost")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = f"127.0.0.1:{port}"
+        self.assertEqual(self.candidate_addr_witness.read_text(), expected)
+        self.assertEqual(self.callback_addr_witness.read_text(), expected)
+        self.assertNotIn("localhost", result.stdout + result.stderr)
 
     def test_failed_canary_still_proves_teardown(self) -> None:
         failing = self._script("failing.py", "raise SystemExit(7)\n")
@@ -365,6 +381,8 @@ time.sleep(60)
         environment["TEST_WORKSPACE_WITNESS"] = str(self.workspace_witness)
         environment["TEST_CANARY_WITNESS"] = str(self.canary_witness)
         environment["TEST_CHALLENGE_WITNESS"] = str(self.challenge_witness)
+        environment["TEST_CANDIDATE_ADDR_WITNESS"] = str(self.candidate_addr_witness)
+        environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
         process = subprocess.Popen(
             [
                 sys.executable,
@@ -415,6 +433,69 @@ time.sleep(60)
         for sent_signal in handled:
             with self.subTest(signal=sent_signal.name):
                 self._assert_signal_cleans_running_canary_and_candidate(sent_signal)
+
+    def test_repeated_signal_cannot_interrupt_term_resistant_child_cleanup(self) -> None:
+        resistant = self._script(
+            "term-resistant.py",
+            """
+import os
+import signal
+import time
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(os.environ["TEST_CANARY_WITNESS"]).write_text("started")
+time.sleep(60)
+""",
+        )
+        port = _free_port()
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "TEST_WORKSPACE_WITNESS": str(self.workspace_witness),
+                "TEST_CANARY_WITNESS": str(self.canary_witness),
+                "TEST_CHALLENGE_WITNESS": str(self.challenge_witness),
+                "TEST_CANDIDATE_ADDR_WITNESS": str(self.candidate_addr_witness),
+                "TEST_CALLBACK_ADDR_WITNESS": str(self.callback_addr_witness),
+            }
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--candidate",
+                str(self.candidate),
+                "--candidate-sha256",
+                hashlib.sha256(self.candidate.read_bytes()).hexdigest(),
+                "--addr",
+                f"127.0.0.1:{port}",
+                "--prepare-callback",
+                str(self.prepare),
+                "--canary-callback",
+                str(resistant),
+                "--startup-timeout-seconds",
+                "5",
+                "--callback-timeout-seconds",
+                "120",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        deadline = time.monotonic() + 30
+        while not self.canary_witness.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(self.canary_witness.exists(), "runner never entered resistant callback")
+        process.send_signal(signal.SIGTERM)
+        time.sleep(0.1)
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 1, stderr)
+        evidence = json.loads(stdout)
+        self.assertIn("interrupted by signal", evidence["failure"])
+        self.assertTrue(all(evidence["teardown"].values()))
+        self.assertFalse(Path(self.workspace_witness.read_text()).exists())
+        self.assertFalse(_listening(port))
 
     def test_credential_bearing_serve_arguments_are_rejected_before_prepare(self) -> None:
         options = (
