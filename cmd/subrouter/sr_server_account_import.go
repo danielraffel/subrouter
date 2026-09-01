@@ -183,11 +183,7 @@ func (r srRunner) doServerAccountImportRequest(ctx context.Context, server srSer
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, endpoint)
+	secured, err := r.securedRequestClientForServer(server, endpoint, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}

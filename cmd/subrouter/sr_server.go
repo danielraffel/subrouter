@@ -155,6 +155,10 @@ type srServerConfig struct {
 	// base URLs gain a /t/<key> prefix, _subrouter reads go through the
 	// tenant-scoped endpoints, and account uploads land in the tenant dir.
 	TenantKey string `json:"tenantKey,omitempty"`
+	// requestClient is installed only for an attested built-in local server.
+	// It is deliberately process-local and must never be persisted with remote
+	// server configuration.
+	requestClient *http.Client
 }
 
 type srServerFile struct {
@@ -873,10 +877,6 @@ func (r srRunner) localServingServer() (srServerConfig, error) {
 	if err != nil {
 		return srServerConfig{}, fmt.Errorf("load local account-import credential: %w", err)
 	}
-	server.AdminToken, err = secretFromEnvironment("SUBROUTER_ADMIN_TOKEN", "SUBROUTER_ADMIN_TOKEN_FILE")
-	if err != nil {
-		return srServerConfig{}, fmt.Errorf("load local admin credential: %w", err)
-	}
 	file, err := defaultSRServerStore(r.store).load()
 	if err != nil {
 		// The registry is optional credential reuse, not the authority for a
@@ -893,9 +893,6 @@ func (r srRunner) localServingServer() (srServerConfig, error) {
 		if server.AccountImportToken == "" {
 			server.AccountImportToken = matching[0].AccountImportToken
 		}
-		if server.AdminToken == "" {
-			server.AdminToken = matching[0].AdminToken
-		}
 	}
 	return server, nil
 }
@@ -909,9 +906,18 @@ func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, star
 	if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), start, r.errOut) {
 		return srServerConfig{}, localServingStoreAuthority{}, fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
 	}
-	// Prove the loopback listener owns this CLI's private account store before
-	// loading any credential that could later be attached to an HTTP request.
-	bare := srServerConfig{Name: "local", URL: localBaseURL()}
+	// Bind every new connection to a listener that proves this CLI's private
+	// account store before loading any credential that could later be attached
+	// to an HTTP request. The initial authority read also prewarms the transport.
+	baseClient := r.client
+	if baseClient == nil {
+		baseClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	attestedClient, err := newLocalStoreAttestedClient(baseClient, localBaseURL(), r.store)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	bare := srServerConfig{Name: "local", URL: localBaseURL(), requestClient: attestedClient}
 	authority, err := r.localServingStoreAuthority(ctx, bare)
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
@@ -923,6 +929,7 @@ func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, star
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
 	}
+	server.requestClient = attestedClient
 	return server, authority, nil
 }
 
@@ -942,7 +949,10 @@ func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServe
 		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation request: %w", err)
 	}
 	request.Header.Set(accounts.StoreAuthorityChallengeHeader, challenge)
-	client := r.client
+	client := server.requestClient
+	if client == nil {
+		client = r.client
+	}
 	if client == nil {
 		client = fallbackHTTPClient()
 	}
@@ -1339,11 +1349,7 @@ func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServ
 		return nil, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -1385,11 +1391,7 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, statusURL)
+	secured, err := r.securedRequestClientForServer(server, statusURL, 15*time.Second)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1433,11 +1435,7 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	secured, err := securedServerRequestClient(client, baseURL)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1540,6 +1538,11 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 }
 
 func addServerAdminAuth(req *http.Request, server srServerConfig) {
+	// Loopback administration is authorized by the server's RemoteAddr check.
+	// Never expose a reusable administrator credential on the local transport.
+	if server.requestClient != nil {
+		return
+	}
 	if strings.TrimSpace(server.AdminToken) == "" {
 		return
 	}

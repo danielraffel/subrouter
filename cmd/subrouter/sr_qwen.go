@@ -457,11 +457,7 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	}
 	req.Header.Set("Content-Type", "application/json")
 	addServerAccountImportAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	securedClient, err := securedServerRequestClient(client, endpoint)
+	securedClient, err := r.securedRequestClientForServer(server, endpoint, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("sync Qwen console credential to server %s: %w", server.Name, err)
 	}
