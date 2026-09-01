@@ -141,6 +141,11 @@ type stubOAuthUsageSource struct {
 	usageErr error
 }
 
+type stubIdentityOAuthUsageSource struct {
+	stubOAuthUsageSource
+	email string
+}
+
 type concurrentOAuthUsageSource struct {
 	accounts []accounts.Account
 	entered  chan string
@@ -238,6 +243,10 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 
 func (s *stubOAuthUsageSource) FetchUsage(_ context.Context, _ *http.Client, _ accounts.Account) (string, []accounts.UsageWindow, error) {
 	return s.plan, s.windows, s.usageErr
+}
+
+func (s *stubIdentityOAuthUsageSource) FetchUsageIdentity(_ context.Context, _ *http.Client, _ accounts.Account) (string, string, []accounts.UsageWindow, error) {
+	return s.email, s.plan, s.windows, s.usageErr
 }
 
 func (s *stubOAuthSource) Provider() accounts.Provider { return s.provider }
@@ -920,6 +929,30 @@ func TestUsageStatusesIncludesOAuthUsageSources(t *testing.T) {
 	}
 	if len(got.Windows) != 1 || got.Windows[0].UsedPercent != 25 {
 		t.Fatalf("windows = %+v", got.Windows)
+	}
+}
+
+func TestUsageStatusesUsesProviderVerifiedOAuthIdentityWithoutChangingStableID(t *testing.T) {
+	acct := accounts.Account{ID: "antigravity-subscription:work", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth, Label: "work", Token: "access"}
+	source := &stubIdentityOAuthUsageSource{
+		stubOAuthUsageSource: stubOAuthUsageSource{
+			stubOAuthSource: stubOAuthSource{provider: accounts.ProviderAntigravity, listed: []accounts.Account{acct}, refreshed: acct},
+			plan:            "Google AI Ultra",
+			windows:         []accounts.UsageWindow{{Name: "gemini 5h", UsedPercent: 25}},
+		},
+		email: "verified@example.com",
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, nil, http.DefaultClient)
+	ref.claudeStore = agentclaude.Store{Dir: t.TempDir()}
+	ref.oauthSources = []OAuthAccountSource{source}
+
+	statuses := ref.UsageStatuses(context.Background())
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v", statuses)
+	}
+	got := statuses[0]
+	if got.ID != acct.ID || got.Email != "verified@example.com" || got.AccountIdentity != "verified@example.com" || got.PlanType != "Google AI Ultra" {
+		t.Fatalf("status = %+v", got)
 	}
 }
 

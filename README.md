@@ -613,8 +613,16 @@ login is used only to satisfy the CLI's own bootstrap; its bearer credential is
 removed by a loopback relay. Only the explicit `sr agy add` command transfers a
 validated credential to the selected self-hosted router through its protected
 account-import endpoint. `sr status` reports each managed profile as
-`ready`, `active`, or `error`, and says quota is not exposed instead of polling
-an unsupported quota endpoint. `sr agy proxy` remains an explicit launcher
+`ready`, `active`, or `error`. When Google's read-only OAuth services expose
+telemetry for that exact profile, it also reports the provider-verified email
+and plan plus independent Gemini and Claude/GPT quota pools. Named 5-hour and
+weekly buckets retain their own remaining percentage and reset; missing or
+disabled buckets stay unknown, and one exhausted family never collapses the
+other. Older accounts that expose only per-model quota are reported at that
+granularity rather than guessed into a 5-hour or weekly cadence. Telemetry is
+bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
+managed profile to an unrelated host language-server login. `sr agy proxy`
+remains an explicit launcher
 alias. Pooled launches fail over between eligible profiles; `--account` pins
 one launch without changing the global pool. Plain `agy` remains a direct
 bypass using the current Keychain login.

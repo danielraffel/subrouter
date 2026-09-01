@@ -3010,7 +3010,18 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		usageGridColumn{Key: "State", Title: "State", Width: stateWidth},
 		usageGridColumn{Key: "Pick", Title: "Use", Width: pickWidth},
 	)
-	if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
+	if provider == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
+		for _, candidate := range []usageGridColumn{
+			{Key: "AG Gemini 5h", Title: "G 5h", Width: 9},
+			{Key: "AG Gemini wk", Title: "G wk", Width: 9},
+			{Key: "AG 3P 5h", Title: "C/G 5h", Width: 9},
+			{Key: "AG 3P wk", Title: "C/G wk", Width: 9},
+		} {
+			if usageGridRowsHaveValue(rows, candidate.Key) {
+				columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
+			}
+		}
+	} else if provider == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
 		columns = dropUsageGridColumn(columns, "Pick")
 		columns = dropUsageGridColumn(columns, "Plan")
 		columns = append(columns,
@@ -3181,7 +3192,32 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
+		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "gemini", false)
+		}),
+		"AG Gemini wk": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "gemini", true)
+		}),
+		"AG 3P 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "claude-gpt", false)
+		}),
+		"AG 3P wk": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
+			return isAntigravityFamilyWindow(window, "claude-gpt", true)
+		}),
 	}
+}
+
+func isAntigravityFamilyWindow(window accounts.UsageWindow, family string, weekly bool) bool {
+	if !strings.EqualFold(strings.TrimSpace(window.Feature), family) {
+		return false
+	}
+	name := strings.ToLower(window.Name)
+	isWeekly := strings.Contains(name, "weekly") || window.LimitWindowSeconds >= int64((7*24*time.Hour)/time.Second)
+	isFiveHour := strings.Contains(name, "5h") || window.LimitWindowSeconds == int64((5*time.Hour)/time.Second)
+	if weekly {
+		return isWeekly
+	}
+	return isFiveHour && !isWeekly
 }
 
 func usageGridPlan(row srUsageRow) string {
@@ -3547,6 +3583,15 @@ func compactPickReason(row srUsageRow) string {
 	}
 	if row.err != nil {
 		return "usage unavailable"
+	}
+	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
+		if row.quotaUsageKnown && len(row.windows) > 0 {
+			return fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
+		}
+		if row.quotaStatus == "unavailable" {
+			return "quota unavailable"
+		}
+		return "quota not exposed"
 	}
 	if isKeyedProviderSection(usageProvider(row)) && row.quotaStatus == "exhausted" {
 		return "0% left, cannot start"

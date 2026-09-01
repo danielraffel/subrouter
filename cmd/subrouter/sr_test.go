@@ -4809,6 +4809,66 @@ func TestAntigravityStatusUsesAuthAndSessionTruthWithoutFakeQuota(t *testing.T) 
 	}
 }
 
+func TestAntigravityStatusPreservesIndependentFamilyQuotaAtRealisticWidth(t *testing.T) {
+	t.Setenv("COLUMNS", "120")
+	statuses := []remoteServerUsageStatus{{
+		ID: "antigravity-subscription:work", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,
+		AccountIdentity: "verified@example.com", PlanType: "Google AI Pro", AuthChecked: true, AuthValid: true,
+		QuotaUsageKnown: true, Windows: []accounts.UsageWindow{
+			{Name: "gemini 5h", Feature: "gemini", UsedPercent: 25, LimitWindowSeconds: 18000, ResetAfterSeconds: 3600},
+			{Name: "gemini weekly", Feature: "gemini", UsedPercent: 60, LimitWindowSeconds: 604800, ResetAfterSeconds: 172800},
+			{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 18000, ResetAfterSeconds: 1800},
+			{Name: "claude-gpt weekly", Feature: "claude-gpt", UsedPercent: 10, LimitWindowSeconds: 604800, ResetAfterSeconds: 432000},
+		},
+	}}
+	rows := usageRowsFromServerUsageStatuses(statuses)
+	columns := usageGridColumnsForRows(&bytes.Buffer{}, false, rows)
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+	}
+	for _, key := range []string{"AG Gemini 5h", "AG Gemini wk", "AG 3P 5h", "AG 3P wk"} {
+		if !keys[key] {
+			t.Fatalf("columns = %+v, missing %s", columns, key)
+		}
+	}
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	got := out.String()
+	for _, want := range []string{
+		"verified@example.com", "Google AI Pro", "G 5h", "G wk", "C/G 5h", "C/G wk",
+		"75%/1h", "40%/2d", "0%/30m", "90%/5d",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Antigravity status missing %q:\n%s", want, got)
+		}
+	}
+	assertUsageGridLineWidths(t, got, 120)
+}
+
+func TestAntigravityStatusHidesUnavailableFamilyColumns(t *testing.T) {
+	t.Setenv("COLUMNS", "100")
+	row := srUsageRow{
+		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
+		accountIdentity: "verified@example.com", planType: "Paid", authChecked: true, authValid: true,
+		quotaUsageKnown: true,
+		windows:         []accounts.UsageWindow{{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20, LimitWindowSeconds: 18000}},
+	}
+	columns := usageGridColumns(&bytes.Buffer{}, false, row)
+	keys := map[string]bool{}
+	for _, column := range columns {
+		keys[column.Key] = true
+	}
+	if !keys["AG Gemini 5h"] {
+		t.Fatalf("columns = %+v, missing available Gemini 5h", columns)
+	}
+	for _, unavailable := range []string{"AG Gemini wk", "AG 3P 5h", "AG 3P wk"} {
+		if keys[unavailable] {
+			t.Fatalf("columns = %+v, rendered unavailable %s", columns, unavailable)
+		}
+	}
+}
+
 func TestAntigravityStatusSurfacesFailedAuth(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth,

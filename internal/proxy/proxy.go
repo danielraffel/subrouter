@@ -439,6 +439,14 @@ type OAuthUsageSource interface {
 	FetchUsage(ctx context.Context, client *http.Client, account accounts.Account) (planType string, windows []accounts.UsageWindow, err error)
 }
 
+// OAuthIdentityUsageSource optionally returns an identity verified by the
+// provider while fetching usage. It avoids trusting local labels or unsigned
+// token claims when a usage endpoint can identify the exact OAuth principal.
+type OAuthIdentityUsageSource interface {
+	OAuthUsageSource
+	FetchUsageIdentity(ctx context.Context, client *http.Client, account accounts.Account) (email, planType string, windows []accounts.UsageWindow, err error)
+}
+
 type usageStatusSnapshot struct {
 	status AccountUsageStatus
 	at     time.Time
@@ -1466,11 +1474,29 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 						batch[accountIndex] = status
 						return
 					}
-					planType, windows, usageErr := usageSource.FetchUsage(sweepCtx, r.client, refreshed)
+					var planType string
+					var windows []accounts.UsageWindow
+					var usageErr error
+					if identitySource, ok := usageSource.(OAuthIdentityUsageSource); ok {
+						var verifiedEmail string
+						verifiedEmail, planType, windows, usageErr = identitySource.FetchUsageIdentity(sweepCtx, r.client, refreshed)
+						if verifiedEmail != "" {
+							status.Email = verifiedEmail
+							status.AccountIdentity = verifiedEmail
+						}
+						if usageErr != nil {
+							// Identity-aware telemetry is an optional read-only probe.
+							// Credential refresh above remains the routing-health gate.
+							status.QuotaStatus = "unavailable"
+						}
+					} else {
+						planType, windows, usageErr = usageSource.FetchUsage(sweepCtx, r.client, refreshed)
+					}
 					status.PlanType = planType
 					status.Windows = windows
+					status.QuotaUsageKnown = len(windows) > 0
 					status.UsageFresh = usageErr == nil
-					if usageErr != nil {
+					if usageErr != nil && status.QuotaStatus == "" {
 						status.Error = usageErr.Error()
 					}
 					batch[accountIndex] = status
@@ -1510,6 +1536,21 @@ func claudePoolModel(model string) string {
 		return agentclaude.SonnetFeature
 	}
 	return model
+}
+
+// antigravityPoolModel maps vendor model names onto the two independent quota
+// families published by Antigravity. Unknown names stay unpooled so a future
+// model cannot be denied merely because this client has not learned its name.
+func antigravityPoolModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(lower, "gemini"):
+		return "gemini"
+	case strings.Contains(lower, "claude"), strings.Contains(lower, "gpt"), strings.Contains(lower, "openai"):
+		return "claude-gpt"
+	default:
+		return model
+	}
 }
 
 func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow {
@@ -6089,13 +6130,15 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// fallback chain directly.
 		availableAccounts = oauthAccounts(availableAccounts)
 	}
-	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi {
+	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi || provider == accounts.ProviderAntigravity {
 		s.refreshUsageScoresIfStale(r.Context())
 	}
 	base := s.scheduler()
 	poolModel := model
 	if provider == accounts.ProviderClaude {
 		poolModel = claudePoolModel(model)
+	} else if provider == accounts.ProviderAntigravity {
+		poolModel = antigravityPoolModel(model)
 	}
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))

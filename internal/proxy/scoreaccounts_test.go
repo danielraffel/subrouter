@@ -90,6 +90,57 @@ func TestScoreAccountsTreatsAuthOnlyOAuthRefreshAsAuthEvidenceOnly(t *testing.T)
 	}
 }
 
+func TestAntigravityFamilyQuotaRoutesWithoutCollapsingOtherFamily(t *testing.T) {
+	accountA := accounts.Account{ID: "agy-a", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	accountB := accounts.Account{ID: "agy-b", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth}
+	scores := []selectacct.Score{
+		scoreFromUsageWindows(accounts.ProviderAntigravity, accountA.ID, []accounts.UsageWindow{
+			{Name: "gemini 5h", Feature: "gemini", UsedPercent: 100, LimitWindowSeconds: 18000},
+			{Name: "gemini weekly", Feature: "gemini", UsedPercent: 100, LimitWindowSeconds: 604800},
+			{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 10, LimitWindowSeconds: 18000},
+			{Name: "claude-gpt weekly", Feature: "claude-gpt", UsedPercent: 20, LimitWindowSeconds: 604800},
+		}),
+		scoreFromUsageWindows(accounts.ProviderAntigravity, accountB.ID, []accounts.UsageWindow{
+			{Name: "gemini 5h", Feature: "gemini", UsedPercent: 20, LimitWindowSeconds: 18000},
+			{Name: "gemini weekly", Feature: "gemini", UsedPercent: 30, LimitWindowSeconds: 604800},
+			{Name: "claude-gpt 5h", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 18000},
+			{Name: "claude-gpt weekly", Feature: "claude-gpt", UsedPercent: 100, LimitWindowSeconds: 604800},
+		}),
+	}
+	scheduler := selectacct.NewScheduler(scores)
+	gemini, err := scheduler.ForModel(antigravityPoolModel("gemini-3.1-pro")).Pick([]accounts.Account{accountA, accountB})
+	if err != nil || gemini.ID != accountB.ID {
+		t.Fatalf("Gemini picked %+v err=%v, want %s", gemini, err, accountB.ID)
+	}
+	claude, err := scheduler.ForModel(antigravityPoolModel("claude-sonnet-4.5")).Pick([]accounts.Account{accountA, accountB})
+	if err != nil || claude.ID != accountA.ID {
+		t.Fatalf("Claude picked %+v err=%v, want %s", claude, err, accountA.ID)
+	}
+	if scheduler.ForModel("claude-gpt").Exhausted(accounts.ProviderAntigravity, accountA.ID) {
+		t.Fatal("Gemini exhaustion collapsed account A's Claude/GPT pool")
+	}
+	if scheduler.ForModel("gemini").Exhausted(accounts.ProviderAntigravity, accountB.ID) {
+		t.Fatal("Claude/GPT exhaustion collapsed account B's Gemini pool")
+	}
+}
+
+func TestAntigravityPoolModelAndTenantLeaseUseSameFamilies(t *testing.T) {
+	for _, test := range []struct{ model, want string }{
+		{"gemini-3.1-pro", "gemini"},
+		{"claude-sonnet-4.5", "claude-gpt"},
+		{"gpt-oss-120b", "claude-gpt"},
+		{"future-model", "future-model"},
+	} {
+		if got := antigravityPoolModel(test.model); got != test.want {
+			t.Fatalf("antigravityPoolModel(%q) = %q, want %q", test.model, got, test.want)
+		}
+		wantLease := selectacct.ModelKey(test.want)
+		if got := tenantCredentialLeasePoolModel(accounts.ProviderAntigravity, test.model); got != wantLease {
+			t.Fatalf("tenant pool(%q) = %q, want %q", test.model, got, wantLease)
+		}
+	}
+}
+
 func TestAuthOnlyOAuthRefreshPreservesRequestTimeExhaustion(t *testing.T) {
 	account := accounts.Account{
 		ID: "antigravity", Provider: accounts.ProviderAntigravity,

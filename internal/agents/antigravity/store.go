@@ -27,6 +27,7 @@ import (
 	"unicode"
 
 	"github.com/manaflow-ai/subrouter/account"
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
@@ -755,6 +756,25 @@ func (s *Store) RefreshAccount(ctx context.Context, client *http.Client, acct ac
 	s.cached = refreshed
 	s.cachedFromRefresh = true
 	return credentialAccount(accountID, credentialDisplayLabel(refreshed), "antigravity keychain", refreshed), nil
+}
+
+// FetchUsageIdentity implements the proxy's identity-aware OAuth telemetry
+// source. The refreshed account token selects one managed profile; telemetry
+// never reads or mutates the vendor CLI's singleton login.
+func (s *Store) FetchUsageIdentity(ctx context.Context, client *http.Client, acct account.Account) (string, string, []accounts.UsageWindow, error) {
+	details, err := FetchUsage(ctx, client, acct.Token, time.Now())
+	plan := details.Plan
+	if plan == "" {
+		plan = "subscription"
+	}
+	return details.Email, plan, details.Windows, err
+}
+
+// FetchUsage keeps Store compatible with generic OAuth usage consumers. Status
+// callers use FetchUsageIdentity so a provider-verified email can be rendered.
+func (s *Store) FetchUsage(ctx context.Context, client *http.Client, acct account.Account) (string, []accounts.UsageWindow, error) {
+	_, plan, windows, err := s.FetchUsageIdentity(ctx, client, acct)
+	return plan, windows, err
 }
 
 func credentialFingerprint(credential CredentialInfo) string {

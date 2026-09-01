@@ -488,6 +488,8 @@ func tenantCredentialLeasePoolModel(provider accounts.Provider, model string) st
 	}
 	if provider == accounts.ProviderClaude {
 		model = claudePoolModel(model)
+	} else if provider == accounts.ProviderAntigravity {
+		model = antigravityPoolModel(model)
 	}
 	if key := selectacct.ModelKey(model); key != "" {
 		return key
