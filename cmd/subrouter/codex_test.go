@@ -221,7 +221,7 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	home := t.TempDir()
 	bin := filepath.Join(home, "codex-fake")
 	record := filepath.Join(home, "record")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep -E '^(SUBROUTER_CODEX_LAUNCHER|SUBROUTER_CODEX_RESUME_COMMAND|SUBROUTER_CODEX_DUMMY_API_KEY)=' >> " + shellQuote(record) + " || true\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep -E '^(SUBROUTER_CODEX_LAUNCHER|SUBROUTER_CODEX_RESUME_COMMAND|SUBROUTER_CODEX_DUMMY_API_KEY|SUBROUTER_ADMIN_TOKEN|SUBROUTER_FUTURE_KEY_FILE)=' >> " + shellQuote(record) + " || true\n"
 	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -230,6 +230,8 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	t.Setenv(subrouterCodexLauncherEnv, "stale launcher")
 	t.Setenv(subrouterCodexResumeCommandEnv, "stale resume")
 	t.Setenv("SUBROUTER_CODEX_DUMMY_API_KEY", "stale-key")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
+	t.Setenv("SUBROUTER_FUTURE_KEY_FILE", "/private/future-key")
 	if err := codex([]string{"login", "--help"}); err != nil {
 		t.Fatal(err)
 	}
@@ -660,6 +662,8 @@ func TestCodexArgsPlacesAuthoritativeConfigAfterOptionsFirstAndInteractiveOverri
 func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 	got := codexChildEnv([]string{
 		"A=1",
+		"SUBROUTER_ADMIN_TOKEN=admin-secret",
+		"SUBROUTER_FUTURE_SECRET_FILE=/private/future",
 		subrouterCodexLauncherEnv + "=old",
 		subrouterCodexResumeCommandEnv + "=old resume",
 	}, "local-secret", "subrouter")
@@ -671,6 +675,11 @@ func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in:\n%s", want, joined)
+		}
+	}
+	for _, forbidden := range []string{"admin-secret", "/private/future"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("retained durable Subrouter secret %q in:\n%s", forbidden, joined)
 		}
 	}
 }

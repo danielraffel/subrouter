@@ -488,6 +488,8 @@ func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
 		"ANTHROPIC_CUSTOM_HEADERS=X-Subrouter-Agent: stale",
 		"CLAUDE_CODE_USE_BEDROCK=1",
 		"CLAUDE_CONFIG_DIR=/personal/profile",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/import-token",
+		"SUBROUTER_FUTURE_KEY=future-secret",
 	}, "http://127.0.0.1:31415/v1", "/isolated/profile")
 	joined := strings.Join(env, "\n")
 	for _, banned := range []string{
@@ -500,6 +502,8 @@ func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
 		"ANTHROPIC_AUTH_TOKEN=",
 		"ANTHROPIC_CUSTOM_HEADERS=",
 		"/personal/profile",
+		"/private/import-token",
+		"future-secret",
 	} {
 		if strings.Contains(joined, banned) {
 			t.Fatalf("settings-routed Claude env retained %q:\n%s", banned, joined)

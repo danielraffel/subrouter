@@ -200,6 +200,9 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 	t.Setenv("ANTHROPIC_CUSTOM_HEADERS", "Authorization: Bearer stale")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/old/config")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
+	t.Setenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE", "/private/import-token")
+	t.Setenv("SUBROUTER_FUTURE_SECRET", "future-secret")
 
 	seen := make(map[string]string)
 	for _, item := range EnvForConfigDir("/new/config") {
@@ -214,6 +217,9 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 		"ANTHROPIC_BASE_URL",
 		"ANTHROPIC_CUSTOM_HEADERS",
 		"CLAUDE_CODE_OAUTH_TOKEN",
+		"SUBROUTER_ADMIN_TOKEN",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
+		"SUBROUTER_FUTURE_SECRET",
 	} {
 		if _, ok := seen[key]; ok {
 			t.Fatalf("%s was inherited by Claude", key)

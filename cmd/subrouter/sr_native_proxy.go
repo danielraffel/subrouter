@@ -1337,7 +1337,7 @@ var nativeProxyRoutingEnvKeys = []string{
 }
 
 func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, args []string) ([]string, func() error, error) {
-	env := envWithout(environ, nativeProxyRoutingEnvKeys)
+	env := envWithout(envWithoutSubrouterSecrets(environ), nativeProxyRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, relayRoot)
 	providerURL := strings.TrimRight(relayRoot, "/") + "/" + spec.route
 	switch spec.provider {

@@ -711,6 +711,7 @@ func proxyClaudeInvocation(
 }
 
 func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
+	environ = envWithoutSubrouterSecrets(environ)
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, baseURL)
 	if configDir != "" {
@@ -1685,7 +1686,14 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	env := append(os.Environ(),
+	gatewayToken := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN"))
+	env := claudeAWSChildEnvironment(os.Environ(), baseURL, region, model, gatewayToken)
+	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
+	return cmd.Run()
+}
+
+func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken string) []string {
+	env := append(envWithoutSubrouterSecrets(environ),
 		"CLAUDE_CODE_USE_BEDROCK=1",
 		"CLAUDE_CODE_SKIP_BEDROCK_AUTH=1",
 		"ANTHROPIC_BEDROCK_BASE_URL="+baseURL,
@@ -1694,11 +1702,10 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 		"ANTHROPIC_MODEL="+bedrockModelID(model),
 		"ANTHROPIC_SMALL_FAST_MODEL="+bedrockSmallFastModelID,
 	)
-	if token := strings.TrimSpace(os.Getenv("SUBROUTER_BEDROCK_GATEWAY_TOKEN")); token != "" {
-		env = append(env, "ANTHROPIC_AUTH_TOKEN="+token)
+	if gatewayToken != "" {
+		env = append(env, "ANTHROPIC_AUTH_TOKEN="+gatewayToken)
 	}
-	cmd.Env = directPlainHTTPEnvironment(env, baseURL)
-	return cmd.Run()
+	return env
 }
 
 // claudeDirect launches Claude Code straight against Anthropic on the user's own
@@ -1736,7 +1743,7 @@ func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = envWithout(os.Environ(), claudeRoutingEnvKeys)
+	cmd.Env = envWithout(envWithoutSubrouterSecrets(os.Environ()), claudeRoutingEnvKeys)
 	return cmd.Run()
 }
 
@@ -1790,6 +1797,26 @@ func envWithout(environ []string, keys []string) []string {
 			continue
 		}
 		out = append(out, kv)
+	}
+	return out
+}
+
+// envWithoutSubrouterSecrets prevents a routed vendor child from inheriting
+// durable control-plane credentials. Launch-specific short-lived capabilities
+// are added only after this scrub.
+func envWithoutSubrouterSecrets(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, item := range environ {
+		name := item
+		if before, _, ok := strings.Cut(item, "="); ok {
+			name = before
+		}
+		upper := strings.ToUpper(strings.TrimSpace(name))
+		if strings.HasPrefix(upper, "SUBROUTER_") &&
+			(strings.Contains(upper, "TOKEN") || strings.Contains(upper, "SECRET") || strings.Contains(upper, "KEY")) {
+			continue
+		}
+		out = append(out, item)
 	}
 	return out
 }

@@ -878,6 +878,9 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		"KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=0",
 		"KIMI_CODE_LEGACY_FLAG=1",
 		"KIMI_CODE_CUSTOM_HEADERS=X-Direct-Gateway-Secret: custom-header-secret",
+		"SUBROUTER_ADMIN_TOKEN=durable-admin-secret",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/import-token",
+		"SUBROUTER_FUTURE_KEY=future-subrouter-secret",
 		"HTTP_PROXY=http://credential-sink.invalid", "https_proxy=http://credential-sink.invalid",
 		"ALL_PROXY=socks5://credential-sink.invalid", "NO_PROXY=vendor.invalid",
 	}
@@ -889,7 +892,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	}
 	defer qwenCleanup()
 	joined := strings.Join(qwenEnv, "\n")
-	for _, secret := range []string{"real-openai-secret", "real-coding-plan-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "direct-relaunch-model", "direct-relaunch-secret", "vendor.invalid", "credential-sink.invalid"} {
+	for _, secret := range []string{"real-openai-secret", "real-coding-plan-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "direct-relaunch-model", "direct-relaunch-secret", "durable-admin-secret", "/private/import-token", "future-subrouter-secret", "vendor.invalid", "credential-sink.invalid"} {
 		if strings.Contains(joined, secret) {
 			t.Fatalf("Qwen child environment leaked %q:\n%s", secret, joined)
 		}

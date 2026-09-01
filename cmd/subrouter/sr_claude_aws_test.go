@@ -31,6 +31,30 @@ func TestEnvWithoutStripsRoutingVars(t *testing.T) {
 	}
 }
 
+func TestClaudeAWSChildEnvironmentScrubsSubrouterControlSecrets(t *testing.T) {
+	got := claudeAWSChildEnvironment([]string{
+		"PATH=/usr/bin",
+		"SUBROUTER_ADMIN_TOKEN=durable-admin-secret",
+		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/import-token",
+		"SUBROUTER_FUTURE_KEY=future-secret",
+	}, "http://127.0.0.1:31415/bedrock", "us-east-1", "fable", "gateway-capability")
+	joined := strings.Join(got, "\n")
+	for _, forbidden := range []string{"durable-admin-secret", "/private/import-token", "future-secret"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("Claude AWS child retained Subrouter control secret %q:\n%s", forbidden, joined)
+		}
+	}
+	for _, want := range []string{
+		"PATH=/usr/bin",
+		"ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:31415/bedrock",
+		"ANTHROPIC_AUTH_TOKEN=gateway-capability",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("Claude AWS child environment missing %q:\n%s", want, joined)
+		}
+	}
+}
+
 func TestBedrockModelID(t *testing.T) {
 	cases := map[string]string{
 		"":                                 "us.anthropic.claude-fable-5",

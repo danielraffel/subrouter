@@ -2084,7 +2084,7 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	recordPath := filepath.Join(home, "claude-direct.txt")
 	settingsCopyPath := filepath.Join(home, "claude-direct-settings.json")
 	claudePath := filepath.Join(binDir, "claude")
-	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_|CLAUDE_CONFIG_DIR=|CLAUDE_CODE_(USE|API|AUTH|BASE|OAUTH|CONFIG))' || true; } > " + shellQuote(recordPath) + "\nsettings=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --settings ]; then settings=$2; break; fi; shift; done\n[ -n \"$settings\" ] && cat \"$settings\" > " + shellQuote(settingsCopyPath) + "\n"
+	script := "#!/bin/sh\n{ printf 'args=%s\\n' \"$*\"; env | grep -E '^(ANTHROPIC_|SUBROUTER_|CLAUDE_CONFIG_DIR=|CLAUDE_CODE_(USE|API|AUTH|BASE|OAUTH|CONFIG))' || true; } > " + shellQuote(recordPath) + "\nsettings=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --settings ]; then settings=$2; break; fi; shift; done\n[ -n \"$settings\" ] && cat \"$settings\" > " + shellQuote(settingsCopyPath) + "\n"
 	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -2093,6 +2093,8 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "stale-api-key")
 	t.Setenv("CLAUDE_CODE_USE_BEDROCK", "1")
 	t.Setenv("CLAUDE_CONFIG_DIR", "/stale/config")
+	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
+	t.Setenv("SUBROUTER_FUTURE_SECRET_FILE", "/private/future-secret")
 
 	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.claudeDirect(t.Context(), []string{
@@ -2113,7 +2115,7 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	if strings.Contains(got, "user,project,local") {
 		t.Fatalf("direct Claude invocation retained caller setting sources:\n%s", got)
 	}
-	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") {
+	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") || strings.Contains(got, "durable-admin-secret") || strings.Contains(got, "/private/future-secret") {
 		t.Fatalf("direct Claude invocation retained hostile routing:\n%s", got)
 	}
 	for _, key := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_API_KEY=", "CLAUDE_CODE_USE_BEDROCK="} {

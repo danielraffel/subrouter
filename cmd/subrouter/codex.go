@@ -35,7 +35,7 @@ func codex(args []string) error {
 		return runCodexCommand(
 			bin,
 			args,
-			envWithout(os.Environ(), []string{
+			envWithout(envWithoutSubrouterSecrets(os.Environ()), []string{
 				subrouterCodexLauncherEnv,
 				subrouterCodexResumeCommandEnv,
 				"SUBROUTER_CODEX_DUMMY_API_KEY",
@@ -126,6 +126,7 @@ func runCodexCommand(bin string, args, env []string) error {
 }
 
 func codexChildEnv(environ []string, localProxyToken, launcher string) []string {
+	environ = envWithoutSubrouterSecrets(environ)
 	launcher = trustedCodexLauncher(launcher)
 	environ = upsertEnv(environ, subrouterCodexLauncherEnv, launcher+" codex")
 	environ = upsertEnv(environ, subrouterCodexResumeCommandEnv, launcher+" codex resume")
