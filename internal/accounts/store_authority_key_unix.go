@@ -23,7 +23,7 @@ func openPrivateStoreAuthorityKey(path string) (*os.File, error) {
 	if int(parentStat.Uid) != os.Geteuid() || parentStat.Mode&0o022 != 0 {
 		return nil, fmt.Errorf("account store authority directory must be current-user-owned and not group/world writable")
 	}
-	descriptor, err := unix.Openat(parentDescriptor, filepath.Base(path), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	descriptor, err := unix.Openat(parentDescriptor, filepath.Base(path), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}

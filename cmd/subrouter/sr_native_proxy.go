@@ -1480,9 +1480,13 @@ func prepareKimiProxyHome(environ []string) (kimiProxyOverlay, func() error, err
 	if err != nil {
 		return kimiProxyOverlay{}, func() error { return nil }, fmt.Errorf("create temporary Kimi proxy home: %w", err)
 	}
-	// Cleanup walks from directory descriptors without following child-created
-	// links. The root path is generated here, never accepted from user input.
-	cleanup := func() error { return removePrivateProxyHome(home) }
+	cleanup, err := preparePrivateProxyHomeCleanup(home)
+	if err != nil {
+		setupErr := fmt.Errorf("prepare temporary Kimi proxy home cleanup: %w", err)
+		return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(
+			func() error { return removePrivateProxyHome(home) }, setupErr,
+		)
+	}
 	if err := os.Chmod(home, 0o700); err != nil {
 		return kimiProxyOverlay{}, func() error { return nil }, kimiProxySetupFailure(cleanup, fmt.Errorf("lock temporary Kimi proxy home: %w", err))
 	}
@@ -1789,7 +1793,13 @@ func prepareQwenProxyOverlay(baseURL, model string, environ []string) (qwenProxy
 	if err != nil {
 		return qwenProxyOverlay{}, func() error { return nil }, fmt.Errorf("create temporary Qwen proxy overlay: %w", err)
 	}
-	cleanup := func() error { return removePrivateProxyHome(dir) }
+	cleanup, err := preparePrivateProxyHomeCleanup(dir)
+	if err != nil {
+		return qwenProxyOverlay{}, func() error { return nil }, errors.Join(
+			fmt.Errorf("prepare temporary Qwen proxy cleanup: %w", err),
+			removePrivateProxyHome(dir),
+		)
+	}
 	routedModel := map[string]any{
 		"id":      model,
 		"name":    "Qwen Token Plan via Subrouter",

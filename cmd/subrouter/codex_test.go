@@ -368,6 +368,59 @@ func TestCodexLocalLaunchKeepsDurableProxyTokenInShortLivedRelay(t *testing.T) {
 	}
 }
 
+func TestCodexNamedLoopbackServerDoesNotReceiveDurableProxyToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.DefaultCodexStore()
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = fmt.Fprint(response, `{"status":"ok"}`)
+	}))
+	defer upstream.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", upstream.URL+"/v1")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "shadow")
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Servers: []srServerConfig{{Name: "shadow", URL: upstream.URL}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const durableToken = "durable-codex-local-token-must-not-reach-named-server"
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		CredentialSource: broker.CredentialSourceLocal,
+		LocalProxyToken:  durableToken,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, "codex-fake")
+	record := filepath.Join(home, "record")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep '^SUBROUTER_CODEX_DUMMY_API_KEY=' >> " + shellQuote(record) + " || true\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_CODEX_BIN", bin)
+	if err := codex([]string{"exec", "prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if strings.Contains(got, durableToken) || strings.Contains(got, "SUBROUTER_CODEX_DUMMY_API_KEY=") {
+		t.Fatal("named loopback Codex child received the durable local proxy credential")
+	}
+	if !strings.Contains(got, `model_providers.subrouter.base_url="`+upstream.URL+`/v1"`) ||
+		!strings.Contains(got, `experimental_bearer_token="subrouter"`) {
+		t.Fatal("named loopback Codex child did not retain unauthenticated compatibility routing")
+	}
+}
+
 func TestCodexCommandlessUtilityFlagsRunWithoutResolvingProxy(t *testing.T) {
 	home := t.TempDir()
 	bin := filepath.Join(home, "codex-fake")

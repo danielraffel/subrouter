@@ -1,15 +1,18 @@
+//go:build !windows
+
 package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -262,7 +265,7 @@ func TestBindLocalServingStoreProvesDaemonBeforePublishing(t *testing.T) {
 		writeLocalStoreAuthorityHealth(t, w, request, servingStore, "enabled")
 	}))
 	defer server.Close()
-	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL+"/v1")
 
 	var out bytes.Buffer
 	if err := bindLocalServingStore(stateDir, store, &out); err != nil {
@@ -280,6 +283,34 @@ func TestBindLocalServingStoreProvesDaemonBeforePublishing(t *testing.T) {
 	}
 	if _, err := os.Stat(localServingStoreBindingPath(store)); !os.IsNotExist(err) {
 		t.Fatalf("binding still exists: %v", err)
+	}
+}
+
+func TestBindLocalServingStoreHonorsCanceledContext(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	stateDir := filepath.Join(home, "candidate-state")
+	if err := os.MkdirAll(filepath.Join(stateDir, "codex", "accounts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL+"/v1")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := bindLocalServingStoreIfCurrent(
+		ctx, stateDir, store, io.Discard, localServingStoreExpectation{},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled binding error = %v, want context canceled", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("canceled binding sent %d request(s)", requests.Load())
 	}
 }
 
@@ -343,7 +374,7 @@ func TestBindLocalServingStoreComparesPriorBindingUnderLock(t *testing.T) {
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL)
 
 	wrong := localServingStoreExpectation{SHA256: strings.Repeat("0", 64), Mode: 0o600}
-	if err := bindLocalServingStoreIfCurrent(candidateState, store, io.Discard, wrong); err == nil || !strings.Contains(err.Error(), "content mismatch") {
+	if err := bindLocalServingStoreIfCurrent(t.Context(), candidateState, store, io.Discard, wrong); err == nil || !strings.Contains(err.Error(), "content mismatch") {
 		t.Fatalf("wrong prior expectation error = %v", err)
 	}
 	unchanged, err := os.ReadFile(path)
@@ -351,7 +382,7 @@ func TestBindLocalServingStoreComparesPriorBindingUnderLock(t *testing.T) {
 		t.Fatalf("wrong expectation changed binding: err=%v", err)
 	}
 	correct := localServingStoreExpectation{SHA256: fmt.Sprintf("%x", priorHash), Mode: 0o600}
-	if err := bindLocalServingStoreIfCurrent(candidateState, store, io.Discard, correct); err != nil {
+	if err := bindLocalServingStoreIfCurrent(t.Context(), candidateState, store, io.Discard, correct); err != nil {
 		t.Fatal(err)
 	}
 	got, err := localServingStore(store)
@@ -384,9 +415,6 @@ func TestParseLocalServingStoreExpectation(t *testing.T) {
 }
 
 func TestBindLocalServingStoreRejectsUnsafeMutationLock(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("serving-store binding is unsupported on Windows")
-	}
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
 	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {
@@ -402,9 +430,6 @@ func TestBindLocalServingStoreRejectsUnsafeMutationLock(t *testing.T) {
 }
 
 func TestUnbindLocalServingStoreRejectsWritableLockDirectory(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("serving-store binding is unsupported on Windows")
-	}
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
 	if err := os.MkdirAll(store.StoreDir(), 0o700); err != nil {

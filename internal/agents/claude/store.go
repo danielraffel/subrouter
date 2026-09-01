@@ -2761,15 +2761,22 @@ func (s Store) prepareSharedState(instancePath string) (err error) {
 	if strings.TrimSpace(s.SharedStateDir) == "" {
 		return nil
 	}
-	lock, err := lockProfileCredential(context.Background(), instancePath)
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
-
 	if err := os.MkdirAll(s.SharedStateDir, 0o700); err != nil {
 		return err
 	}
+	sharedLock, err := lockProfileCredential(
+		context.Background(), filepath.Join(s.SharedStateDir, ".subrouter-shared-state-migration"),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, sharedLock.Close()) }()
+	profileLock, err := lockProfileCredential(context.Background(), instancePath)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, profileLock.Close()) }()
+
 	for _, name := range claudeHighGrowthDirs {
 		source := filepath.Join(instancePath, name)
 		target := filepath.Join(s.SharedStateDir, name)

@@ -229,7 +229,23 @@ case "${1:-}|${2:-}" in
   *) exec /usr/bin/stat "$@" ;;
 esac
 SH
-chmod +x "$TMP/bin/launchctl" "$TMP/bin/curl" "$TMP/bin/codesign" "$TMP/bin/lsof" "$TMP/bin/ps" "$TMP/bin/stat"
+cat >"$TMP/bin/plutil" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${FAKE_MUTATE_BINDING_BEFORE_LEGACY_BOOTSTRAP:-}" ] \
+  && { [ -z "${FAKE_MUTATE_BINDING_SENTINEL:-}" ] \
+    || [ ! -e "$FAKE_MUTATE_BINDING_SENTINEL" ]; }; then
+  temporary="${FAKE_MUTATE_BINDING_BEFORE_LEGACY_BOOTSTRAP}.fake-next"
+  printf '%s\n' 'operator-selected-third-binding' \
+    >"$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$FAKE_MUTATE_BINDING_BEFORE_LEGACY_BOOTSTRAP"
+  [ -z "${FAKE_MUTATE_BINDING_SENTINEL:-}" ] \
+    || : >"$FAKE_MUTATE_BINDING_SENTINEL"
+fi
+exec /usr/bin/plutil "$@"
+SH
+chmod +x "$TMP/bin/launchctl" "$TMP/bin/curl" "$TMP/bin/codesign" "$TMP/bin/lsof" "$TMP/bin/ps" "$TMP/bin/stat" "$TMP/bin/plutil"
 
 legacy="$TMP/home/bin/subrouter-legacy"
 legacy_dependency="$TMP/home/bin/subrouter-legacy-worker"
@@ -381,14 +397,15 @@ chmod +x "$TMP/preflight" "$TMP/canary-fail" "$TMP/canary-ok" "$TMP/canary-switc
 label="test.subrouter.launchagent"
 plist="$TMP/home/Library/LaunchAgents/$label.plist"
 write_plist() {
-  local program="$1" mode="$2"
+  local program="$1" mode="$2" dependency="${3:-}" dependency_entry=""
+  [ -z "$dependency" ] || dependency_entry="<string>$dependency</string>"
   cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$label</string>
 <key>Program</key><string>$program</string>
-<key>ProgramArguments</key><array><string>$program</string><string>$mode</string><string>--addr</string><string>127.0.0.1:43199</string></array>
+<key>ProgramArguments</key><array><string>$program</string><string>$mode</string><string>--addr</string><string>127.0.0.1:43199</string>$dependency_entry</array>
 <key>EnvironmentVariables</key><dict><key>SUBROUTER_STATE_DIR</key><string>$TMP/home/.subrouter-retiring</string></dict>
 </dict></plist>
 EOF
@@ -996,8 +1013,15 @@ rollback_identity=(--backup "$backup" --backup-sha256 "$backup_sha" \
   --serving-store-binding-backup "$manual_serving_store_prior" \
     "$manual_serving_store_prior_sha" 400 \
   --expected-serving-store-binding-sha256 "$manual_serving_store_candidate_sha")
+cat >"$legacy_dependency" <<'SH'
+#!/bin/sh
+# supervisor dependency bytes that overlap the legacy rollback destination
+exit 0
+SH
+chmod 0755 "$legacy_dependency"
+supervisor_dependency_sha="$(shasum -a 256 "$legacy_dependency" | awk '{print $1}')"
 launchctl bootout "gui/$(id -u)/$label"
-write_plist "$supervisor" supervise
+write_plist "$supervisor" supervise "$legacy_dependency"
 launchctl bootstrap "gui/$(id -u)" "$plist"
 mutation_lock_holder=""
 /usr/bin/lockf -k "$mutation_lock" /bin/sleep 30 &
@@ -1020,6 +1044,48 @@ kill "$mutation_lock_holder" 2>/dev/null || true
 wait "$mutation_lock_holder" 2>/dev/null || true
 grep -q 'another deployment or worker update holds' "$TMP/rollback-mutation-lock.err"
 echo "PASS standalone rollback mutation lease refused concurrent updater or deployment"
+
+binding_recheck_sentinel="$TMP/binding-recheck-mutated"
+if FAKE_MUTATE_BINDING_BEFORE_LEGACY_BOOTSTRAP="$manual_serving_store_binding" \
+  FAKE_MUTATE_BINDING_SENTINEL="$binding_recheck_sentinel" \
+  "$ROLLBACK" "${rollback_identity[@]}" --expected-program "$supervisor" \
+  >"$TMP/binding-recheck.out" 2>"$TMP/binding-recheck.err"; then
+  echo "standalone rollback unexpectedly bootstrapped after a concurrent binding change" >&2
+  exit 1
+fi
+[ -e "$binding_recheck_sentinel" ]
+grep -q '^operator-selected-third-binding$' "$manual_serving_store_binding"
+grep -q 'serving-store binding changed immediately before legacy bootstrap; rollback withheld' \
+  "$TMP/binding-recheck.err"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+[ "$(launchctl print "gui/$(id -u)/$label" | awk '$1 == "program" { print $3 }')" = "$supervisor" ]
+[ "$(shasum -a 256 "$legacy_dependency" | awk '{print $1}')" = "$supervisor_dependency_sha" ]
+cp -p "$manual_serving_store_candidate" "$manual_serving_store_binding"
+echo "PASS standalone rollback preserved a concurrent binding and restored the captured supervisor"
+
+launchctl bootout "gui/$(id -u)/$label"
+rm -f "$binding_recheck_sentinel"
+if FAKE_MUTATE_BINDING_BEFORE_LEGACY_BOOTSTRAP="$manual_serving_store_binding" \
+  FAKE_MUTATE_BINDING_SENTINEL="$binding_recheck_sentinel" \
+  "$ROLLBACK" "${rollback_identity[@]}" --expected-program "$supervisor" \
+  >"$TMP/unloaded-binding-recheck.out" 2>"$TMP/unloaded-binding-recheck.err"; then
+  echo "standalone rollback unexpectedly bootstrapped from an unloaded supervisor state" >&2
+  exit 1
+fi
+[ -e "$binding_recheck_sentinel" ]
+grep -q '^operator-selected-third-binding$' "$manual_serving_store_binding"
+grep -q 'installed supervisor plist restored, and job left unloaded' \
+  "$TMP/unloaded-binding-recheck.err"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$supervisor" ]
+[ "$(shasum -a 256 "$legacy_dependency" | awk '{print $1}')" = "$supervisor_dependency_sha" ]
+if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+  echo "originally unloaded supervisor unexpectedly became loaded" >&2
+  exit 1
+fi
+cp -p "$manual_serving_store_candidate" "$manual_serving_store_binding"
+launchctl bootstrap "gui/$(id -u)" "$plist"
+echo "PASS standalone rollback restored an unloaded supervisor plist without loading its job"
+
 "$ROLLBACK" "${rollback_identity[@]}" --expected-program "$supervisor" \
   >"$TMP/rollback.out" 2>"$TMP/rollback.err"
 [ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$plist")" = "$legacy" ]

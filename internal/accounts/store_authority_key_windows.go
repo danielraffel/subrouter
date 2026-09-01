@@ -59,7 +59,7 @@ func openPrivateStoreAuthorityKey(path string) (*os.File, error) {
 	if err != nil || dacl == nil {
 		return closeOnError(fmt.Errorf("account store authority key must have a protected access list"))
 	}
-	trustedWriteSIDs := []*windows.SID{user.User.Sid}
+	trustedAccessSIDs := []*windows.SID{user.User.Sid}
 	for _, sidType := range []windows.WELL_KNOWN_SID_TYPE{
 		windows.WinBuiltinAdministratorsSid,
 		windows.WinLocalSystemSid,
@@ -68,30 +68,26 @@ func openPrivateStoreAuthorityKey(path string) (*os.File, error) {
 		if sidErr != nil {
 			return closeOnError(fmt.Errorf("inspect account store authority ACL: %w", sidErr))
 		}
-		trustedWriteSIDs = append(trustedWriteSIDs, sid)
+		trustedAccessSIDs = append(trustedAccessSIDs, sid)
 	}
-	writeMask := windows.ACCESS_MASK(
-		windows.GENERIC_ALL | windows.GENERIC_WRITE | windows.FILE_GENERIC_WRITE |
-			windows.WRITE_DAC | windows.WRITE_OWNER | windows.DELETE,
-	)
 	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, index, &ace); err != nil {
 			return closeOnError(fmt.Errorf("inspect account store authority ACL entry: %w", err))
 		}
-		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask&writeMask == 0 {
+		if ace == nil || ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask == 0 {
 			continue
 		}
 		aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 		trusted := false
-		for _, trustedSID := range trustedWriteSIDs {
+		for _, trustedSID := range trustedAccessSIDs {
 			if aceSID.Equals(trustedSID) {
 				trusted = true
 				break
 			}
 		}
 		if !trusted {
-			return closeOnError(fmt.Errorf("account store authority key grants write access outside the current user"))
+			return closeOnError(fmt.Errorf("account store authority key grants access outside the current user"))
 		}
 	}
 	return file, nil

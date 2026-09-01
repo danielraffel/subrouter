@@ -54,7 +54,7 @@ func runDaemonCommand(
 		if err != nil {
 			return err
 		}
-		return bindLocalServingStoreIfCurrent(args[1], store, out, expectation)
+		return bindLocalServingStoreIfCurrent(ctx, args[1], store, out, expectation)
 	case "unbind-state":
 		if len(args) != 1 {
 			return fmt.Errorf("usage: sr daemon unbind-state")

@@ -1335,14 +1335,20 @@ func TestKimiProxyCleanupDoesNotFollowReplacedRoot(t *testing.T) {
 	if err := os.Symlink(external, overlay.home); err != nil {
 		t.Fatal(err)
 	}
-	if err := cleanup(); err != nil {
-		t.Fatalf("remove replaced root link: %v", err)
+	t.Cleanup(func() { _ = os.Remove(overlay.home) })
+	err = cleanup()
+	if err == nil || !strings.Contains(err.Error(), "basename was replaced") {
+		t.Fatalf("replacement race was not reported: %v", err)
 	}
 	if got, err := os.ReadFile(marker); err != nil || string(got) != "safe" {
 		t.Fatalf("cleanup followed a replaced root: %q, %v", got, err)
 	}
-	if _, err := os.Lstat(overlay.home); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("replacement link survived cleanup: %v", err)
+	if info, err := os.Lstat(overlay.home); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("replacement link was changed: info=%v err=%v", info, err)
+	}
+	entries, err := os.ReadDir(detached)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("pinned original home was not emptied: entries=%v err=%v", entries, err)
 	}
 }
 

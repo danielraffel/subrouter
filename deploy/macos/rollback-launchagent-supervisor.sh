@@ -26,6 +26,10 @@ ROLLBACK_DESTINATIONS=()
 ROLLBACK_ARTIFACTS=()
 ROLLBACK_ARTIFACT_SHAS=()
 ROLLBACK_ARTIFACT_MODES=()
+INSTALLED_DEPENDENCY_PATHS=()
+INSTALLED_DEPENDENCY_SNAPSHOTS=()
+INSTALLED_DEPENDENCY_SHAS=()
+INSTALLED_DEPENDENCY_MODES=()
 SERVING_STORE_BINDING=""
 SERVING_STORE_BINDING_BACKUP=""
 SERVING_STORE_BINDING_BACKUP_SHA256=""
@@ -211,10 +215,8 @@ try:
             ):
                 raise SystemExit("serving-store binding has an unsafe identity")
             digest = hashlib.sha256()
-            body = bytearray()
             for chunk in iter(lambda: os.read(descriptor, 4096), b""):
                 digest.update(chunk)
-                body.extend(chunk)
         finally:
             os.close(descriptor)
         actual_sha = digest.hexdigest()
@@ -318,7 +320,13 @@ if ! subrouter_mutation_lease_is_held_by_parent "$MUTATION_LOCK_FILE"; then
 fi
 restore_next=""
 cleanup() {
+  local snapshot
   [ -z "$restore_next" ] || rm -f "$restore_next"
+  if [ "${INSTALLED_DEPENDENCY_SNAPSHOTS[0]+present}" = present ]; then
+    for snapshot in "${INSTALLED_DEPENDENCY_SNAPSHOTS[@]}"; do
+      rm -f "$snapshot"
+    done
+  fi
   [ "$owns_mutation_lease" -eq 0 ] || release_subrouter_mutation_lease
 }
 trap cleanup EXIT
@@ -371,6 +379,9 @@ done < <(plist_executable_dependencies "$BACKUP")
 
 service="$DOMAIN/$LABEL"
 captured_pid=""
+installed_plist_sha=""
+installed_plist_mode=""
+installed_job_was_loaded=0
 if [ -e "$PLIST" ]; then
   [ ! -L "$PLIST" ] || launchagent_die "installed plist must not be a symlink"
   if [ -z "$EXPECTED_PROGRAM" ]; then
@@ -389,7 +400,39 @@ if [ -e "$PLIST" ]; then
     launchagent_die "public address override does not match installed plist"
   fi
   public_addr="${installed_public_addr:-$PUBLIC_ADDR_OVERRIDE}"
+  restore_next="${PLIST}.rollback-current.$$"
+  rm -f "$restore_next"
+  installed_plist_sha="$(sha256_file "$PLIST")"
+  installed_plist_mode="$(stat -f '%Lp' "$PLIST")"
+  copy_file_nofollow "$PLIST" "$restore_next" "$installed_plist_mode" \
+    || launchagent_die "snapshot installed plist before rollback"
+  verify_file_sha256 "$PLIST" "$installed_plist_sha" \
+    || launchagent_die "installed plist changed while snapshotting rollback state"
+  verify_file_sha256 "$restore_next" "$installed_plist_sha" \
+    || launchagent_die "installed plist rollback snapshot identity check failed"
+  dependency_index=0
+  while IFS= read -r dependency_path; do
+    [ -n "$dependency_path" ] || continue
+    dependency_snapshot="${PLIST}.rollback-current.$$.dependency.${dependency_index}"
+    dependency_sha="$(sha256_file "$dependency_path")"
+    dependency_mode="$(stat -f '%Lp' "$dependency_path")"
+    INSTALLED_DEPENDENCY_PATHS+=("$dependency_path")
+    INSTALLED_DEPENDENCY_SNAPSHOTS+=("$dependency_snapshot")
+    INSTALLED_DEPENDENCY_SHAS+=("$dependency_sha")
+    INSTALLED_DEPENDENCY_MODES+=("$dependency_mode")
+    rm -f "$dependency_snapshot"
+    verify_file_sha256 "$dependency_path" "$dependency_sha" \
+      || launchagent_die "installed executable dependency has an unsafe identity"
+    copy_file_nofollow "$dependency_path" "$dependency_snapshot" "$dependency_mode" \
+      || launchagent_die "snapshot installed executable dependency before rollback"
+    verify_file_sha256 "$dependency_path" "$dependency_sha" \
+      || launchagent_die "installed executable dependency changed while snapshotting rollback state"
+    verify_file_sha256 "$dependency_snapshot" "$dependency_sha" \
+      || launchagent_die "installed executable dependency rollback snapshot identity check failed"
+    dependency_index=$((dependency_index + 1))
+  done < <(plist_executable_dependencies "$PLIST")
   if launchagent_job_loaded "$service"; then
+    installed_job_was_loaded=1
     captured_pid="$(capture_loaded_identity "$service" "$EXPECTED_RUNNING_PROGRAM")"
     launchctl bootout "$service"
   fi
@@ -408,7 +451,6 @@ wait_for_full_absence "$service" "$captured_pid" "$public_addr"
 serving_store_binding_transaction restore \
   || launchagent_die "serving-store binding changed while removing the candidate; rollback withheld"
 
-restore_next="${PLIST}.rollback-next.$$"
 trap 'exit 130' INT
 trap 'exit 143' TERM
 for index in "${!ROLLBACK_ARTIFACTS[@]}"; do
@@ -422,6 +464,35 @@ verify_file_sha256 "$BACKUP" "$BACKUP_SHA256" \
 atomic_restore_nofollow "$BACKUP" "$PLIST" "$BACKUP_SHA256" 0644 \
   || launchagent_die "rollback plist restore failed"
 plutil -lint "$PLIST" >/dev/null
+
+if ! serving_store_binding_transaction check; then
+  if [ -n "$restore_next" ]; then
+    for index in "${!INSTALLED_DEPENDENCY_PATHS[@]}"; do
+      atomic_restore_nofollow \
+        "${INSTALLED_DEPENDENCY_SNAPSHOTS[$index]}" \
+        "${INSTALLED_DEPENDENCY_PATHS[$index]}" \
+        "${INSTALLED_DEPENDENCY_SHAS[$index]}" \
+        "${INSTALLED_DEPENDENCY_MODES[$index]}" \
+        || launchagent_die "serving-store binding changed and captured supervisor executable restoration failed"
+    done
+    atomic_restore_nofollow \
+      "$restore_next" "$PLIST" "$installed_plist_sha" "$installed_plist_mode" \
+      || launchagent_die "serving-store binding changed and captured supervisor plist restoration failed"
+    plutil -lint "$PLIST" >/dev/null \
+      || launchagent_die "serving-store binding changed and captured supervisor plist is invalid"
+    if [ "$installed_job_was_loaded" -eq 1 ]; then
+      bootstrap_with_retry "$DOMAIN" "$PLIST" "$service" "$public_addr" \
+        || launchagent_die "serving-store binding changed and captured supervisor failed to restart"
+      capture_loaded_identity "$service" "$EXPECTED_RUNNING_PROGRAM" >/dev/null \
+        || launchagent_die "serving-store binding changed and captured supervisor identity was not restored"
+      launchagent_die "serving-store binding changed immediately before legacy bootstrap; rollback withheld and captured supervisor restored"
+    fi
+    launchagent_job_loaded "$service" \
+      && launchagent_die "serving-store binding changed and an originally unloaded supervisor became loaded"
+    launchagent_die "serving-store binding changed immediately before legacy bootstrap; rollback withheld, installed supervisor plist restored, and job left unloaded"
+  fi
+  launchagent_die "serving-store binding changed immediately before legacy bootstrap; rollback withheld"
+fi
 
 bootstrap_with_retry "$DOMAIN" "$PLIST" "$service" "$public_addr" \
   || launchagent_die "rollback LaunchAgent failed to bootstrap"

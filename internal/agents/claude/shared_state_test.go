@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -116,6 +117,68 @@ func TestConcurrentSharedStatePreparationIsIdempotent(t *testing.T) {
 		name := filepath.Join(shared, "projects", fmt.Sprintf("session-%d.jsonl", index))
 		if body, err := os.ReadFile(name); err != nil || string(body) != "history" {
 			t.Fatalf("shared history %d = %q, %v", index, body, err)
+		}
+	}
+}
+
+func TestConcurrentProfilesPreserveConflictingSharedHistory(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, ".claude")
+	store := Store{Dir: root, SharedStateDir: shared}
+	const profiles = 16
+	instances := make([]string, profiles)
+	for index := range profiles {
+		instance := filepath.Join(root, fmt.Sprintf("profile-%d", index))
+		projects := filepath.Join(instance, "projects")
+		if err := os.MkdirAll(projects, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(projects, "session.jsonl"), []byte(fmt.Sprintf("profile-%d", index)), 0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+		instances[index] = instance
+	}
+
+	start := make(chan struct{})
+	errorsSeen := make(chan error, profiles)
+	var ready sync.WaitGroup
+	ready.Add(profiles)
+	for _, instance := range instances {
+		go func() {
+			ready.Done()
+			<-start
+			errorsSeen <- store.PrepareSharedStateDir(instance)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	for range profiles {
+		if err := <-errorsSeen; err != nil {
+			t.Fatalf("concurrent shared-state preparation failed: %v", err)
+		}
+	}
+
+	bodies := make(map[string]bool, profiles)
+	entries, err := os.ReadDir(filepath.Join(shared, "projects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "session.jsonl") {
+			continue
+		}
+		body, readErr := os.ReadFile(filepath.Join(shared, "projects", entry.Name()))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		bodies[string(body)] = true
+	}
+	for index := range profiles {
+		want := fmt.Sprintf("profile-%d", index)
+		if !bodies[want] {
+			t.Fatalf("shared history lost %q; retained %d of %d bodies", want, len(bodies), profiles)
 		}
 	}
 }

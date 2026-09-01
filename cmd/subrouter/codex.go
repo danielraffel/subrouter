@@ -69,7 +69,10 @@ func codex(args []string) error {
 	if err != nil {
 		return err
 	}
-	localProxyToken := cloudClientProxyToken(cloudConfig, baseURL)
+	localProxyToken := ""
+	if localTarget {
+		localProxyToken = cloudClientProxyToken(cloudConfig, baseURL)
+	}
 	userEmailRaw := os.Getenv("SUBROUTER_CODEX_USER_EMAIL")
 	accountID := session.NormalizeAccountID(os.Getenv("SUBROUTER_CODEX_ACCOUNT_ID"))
 	userEmail := ""

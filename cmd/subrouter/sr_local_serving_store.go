@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -11,11 +12,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
-const localServingStoreSchema = "subrouter.local-serving-store/v1"
+const (
+	localServingStoreSchema       = "subrouter.local-serving-store/v1"
+	localServingStoreProbeTimeout = 10 * time.Second
+)
 
 type localServingStoreBinding struct {
 	Schema      string `json:"schema"`
@@ -97,10 +102,11 @@ func ensureLocalServingStoreJSONEOF(decoder *json.Decoder) error {
 }
 
 func bindLocalServingStore(stateDir string, store accounts.CodexStore, out io.Writer) error {
-	return bindLocalServingStoreIfCurrent(stateDir, store, out, localServingStoreExpectation{})
+	return bindLocalServingStoreIfCurrent(context.Background(), stateDir, store, out, localServingStoreExpectation{})
 }
 
 func bindLocalServingStoreIfCurrent(
+	ctx context.Context,
 	stateDir string,
 	store accounts.CodexStore,
 	out io.Writer,
@@ -141,11 +147,21 @@ func bindLocalServingStoreIfCurrent(
 	if err := validateLocalServingStoreExpectation(path, expectation); err != nil {
 		return err
 	}
-	client, err := newLocalStoreAttestedClient(&http.Client{}, localBaseURL(), servingStore)
+	client, err := newLocalStoreAttestedClient(
+		&http.Client{Timeout: localServingStoreProbeTimeout}, localBaseURL(), servingStore,
+	)
 	if err != nil {
 		return err
 	}
-	response, err := client.Get(strings.TrimRight(localBaseURL(), "/") + "/_subrouter/health")
+	healthURL, err := healthURLFor(localBaseURL())
+	if err != nil {
+		return fmt.Errorf("verify local serving state: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return fmt.Errorf("verify local serving state: %w", err)
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("verify local serving state: %w", err)
 	}
