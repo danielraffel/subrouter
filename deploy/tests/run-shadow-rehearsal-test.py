@@ -525,6 +525,31 @@ time.sleep(60)
                         self.assertFalse(self.workspace_witness.exists())
                         self.assertFalse(_listening(port))
 
+    def test_persistent_state_serve_arguments_are_rejected_before_prepare(self) -> None:
+        options = (
+            "--sessions",
+            "--transcripts",
+            "--cloud-config",
+            "--transcript-gcs-uri",
+            "--transcript-azure-url",
+        )
+        for option in options:
+            spellings = (option, "-" + option.removeprefix("--"))
+            for spelling in spellings:
+                for arguments in ([spelling, "must-not-escape"], [spelling + "=must-not-escape"]):
+                    with self.subTest(arguments=arguments):
+                        serve_args = self.root / "serve-args.json"
+                        serve_args.write_text(json.dumps(arguments))
+                        result = self._run(_free_port(), serve_args=serve_args)
+                        self.assertEqual(result.returncode, 1)
+                        evidence = json.loads(result.stdout)
+                        self.assertEqual(
+                            evidence["failure"],
+                            f"serve args JSON must not contain {option}; shadow state, logs, and configuration must remain disposable",
+                        )
+                        self.assertNotIn("must-not-escape", result.stdout + result.stderr)
+                        self.assertFalse(self.workspace_witness.exists())
+
     def test_single_or_double_dash_address_override_is_rejected_before_prepare(self) -> None:
         for arguments in (["--addr", "0.0.0.0:1"], ["--addr=0.0.0.0:1"], ["-addr", "0.0.0.0:1"], ["-addr=0.0.0.0:1"]):
             with self.subTest(arguments=arguments):
@@ -546,7 +571,8 @@ time.sleep(60)
         self.assertEqual(result.returncode, 0)
         self.assertIn("--prepare-callback", result.stdout)
         self.assertIn("--canary-callback", result.stdout)
-        self.assertIn("non-credential serve arguments", result.stdout)
+        self.assertIn("non-credential, non-persistent", result.stdout)
+        self.assertIn("serve arguments", result.stdout)
         self.assertIn("prove teardown", result.stdout)
 
 

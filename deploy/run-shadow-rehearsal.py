@@ -37,6 +37,14 @@ CREDENTIAL_SERVE_OPTIONS = {
     "bedrock-gateway-token": "SUBROUTER_BEDROCK_GATEWAY_TOKEN",
 }
 
+PERSISTENT_SERVE_OPTIONS = (
+    "sessions",
+    "transcripts",
+    "cloud-config",
+    "transcript-gcs-uri",
+    "transcript-azure-url",
+)
+
 
 class ShadowError(Exception):
     pass
@@ -253,6 +261,18 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
                     f"serve args JSON must not contain {option}; "
                     f"use {environment_name} in the helper environment"
                 )
+        for option_name in PERSISTENT_SERVE_OPTIONS:
+            option = "--" + option_name
+            short_option = "-" + option_name
+            if (
+                argument in (option, short_option)
+                or argument.startswith(option + "=")
+                or argument.startswith(short_option + "=")
+            ):
+                _fail(
+                    f"serve args JSON must not contain {option}; "
+                    "shadow state, logs, and configuration must remain disposable"
+                )
     return parsed
 
 
@@ -339,7 +359,7 @@ def main() -> int:
     parser.add_argument("--canary-callback", required=True, help="absolute executable run after readiness")
     parser.add_argument(
         "--serve-args-json",
-        help="optional JSON array of non-credential serve arguments",
+        help="optional JSON array of non-credential, non-persistent serve arguments",
     )
     parser.add_argument("--startup-timeout-seconds", type=int, default=30)
     parser.add_argument("--callback-timeout-seconds", type=int, default=120)

@@ -163,7 +163,10 @@ Both callbacks are invoked directly without a shell. They receive
 `SUBROUTER_SHADOW_CANDIDATE_PATH`, `SUBROUTER_SHADOW_BASE_URL`, and the exact
 candidate SHA in `SUBROUTER_SHADOW_CANDIDATE_SHA256`. The optional serve-args
 file is a JSON array of argument strings after `serve`; it cannot replace
-`serve` or `--addr`. Raw credential flags (`--admin-token`,
+`serve` or `--addr`. Persistent state, log, and configuration destinations
+(`--sessions`, `--transcripts`, `--cloud-config`, `--transcript-gcs-uri`, and
+`--transcript-azure-url`) are rejected so neither local nor remote rehearsal
+artifacts can escape the disposable workspace. Raw credential flags (`--admin-token`,
 `--account-import-token`, Stack keys and tenant secrets, and the Bedrock gateway
 token) are also rejected because command arguments are externally observable.
 Set the corresponding `SUBROUTER_*_FILE` variable in the helper environment
