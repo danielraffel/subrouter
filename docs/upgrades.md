@@ -177,7 +177,9 @@ private and outside the disposable workspace so teardown does not remove it.
 The helper always injects a private `--sessions` path, pins
 `SUBROUTER_CLOUD_CONFIG` inside the disposable state directory, and removes
 inherited transcript-sync settings. It also rejects `--bedrock-autobump`, so a
-rehearsal cannot request a real external quota change.
+rehearsal cannot request a real external quota change. The private account root
+is sealed before either callback runs, preventing compatibility fallback to a
+live legacy account directory under the invoking user's home.
 
 The helper creates its own one-run health key in the private workspace and gives
 only the candidate its file path. Each ownership probe sends a fresh random

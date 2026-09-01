@@ -2986,7 +2986,7 @@ func EnvForConfigDir(instancePath string) []string {
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, item := range os.Environ() {
 		key, _, ok := strings.Cut(item, "=")
-		if ok && (remove[key] || isSubrouterSecretEnvName(key)) {
+		if ok && (remove[key] || isSubrouterEnvName(key)) {
 			continue
 		}
 		env = append(env, item)
@@ -2994,10 +2994,9 @@ func EnvForConfigDir(instancePath string) []string {
 	return append(env, "CLAUDE_CONFIG_DIR="+instancePath)
 }
 
-func isSubrouterSecretEnvName(name string) bool {
+func isSubrouterEnvName(name string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(name))
-	return strings.HasPrefix(upper, "SUBROUTER_") &&
-		(strings.Contains(upper, "TOKEN") || strings.Contains(upper, "SECRET") || strings.Contains(upper, "KEY"))
+	return strings.HasPrefix(upper, "SUBROUTER_")
 }
 
 func AuthStatusForPath(ctx context.Context, claudePath, instancePath string) (*AuthStatus, error) {

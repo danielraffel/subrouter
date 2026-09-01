@@ -490,6 +490,8 @@ func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
 		"CLAUDE_CONFIG_DIR=/personal/profile",
 		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/import-token",
 		"SUBROUTER_FUTURE_KEY=future-secret",
+		"SUBROUTER_CLOUD_CONFIG=/private/cloud-config",
+		"SUBROUTER_STATE_DIR=/private/state",
 	}, "http://127.0.0.1:31415/v1", "/isolated/profile")
 	joined := strings.Join(env, "\n")
 	for _, banned := range []string{
@@ -504,6 +506,8 @@ func TestClaudeSettingsChildEnvironmentContainsNoRoutingSecrets(t *testing.T) {
 		"/personal/profile",
 		"/private/import-token",
 		"future-secret",
+		"/private/cloud-config",
+		"/private/state",
 	} {
 		if strings.Contains(joined, banned) {
 			t.Fatalf("settings-routed Claude env retained %q:\n%s", banned, joined)

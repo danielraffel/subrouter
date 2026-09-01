@@ -250,6 +250,12 @@ func TestLocalStoreAttestedProxyRelayKeepsDurableTokenOutOfChildAndReattests(t *
 		if got := request.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "claude-preferred" {
 			t.Errorf("preferred account = %q", got)
 		}
+		if got := request.Header.Get("X-Subrouter-Session"); got != "" {
+			t.Errorf("synthetic session = %q, want vendor session identity to remain authoritative", got)
+		}
+		if got := request.Header.Get("X-Claude-Session-ID"); got != "existing-claude-session" {
+			t.Errorf("vendor session = %q, want existing-claude-session", got)
+		}
 		routed.Add(1)
 		response.Header().Set("Connection", "close")
 		response.WriteHeader(http.StatusNoContent)
@@ -273,6 +279,7 @@ func TestLocalStoreAttestedProxyRelayKeepsDurableTokenOutOfChildAndReattests(t *
 			t.Fatal(err)
 		}
 		request.Header.Set("Authorization", "Bearer "+childCredential)
+		request.Header.Set("X-Claude-Session-ID", "existing-claude-session")
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)
@@ -881,6 +888,8 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 		"SUBROUTER_ADMIN_TOKEN=durable-admin-secret",
 		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE=/private/import-token",
 		"SUBROUTER_FUTURE_KEY=future-subrouter-secret",
+		"SUBROUTER_CLOUD_CONFIG=/private/cloud-config",
+		"SUBROUTER_STATE_DIR=/private/state",
 		"HTTP_PROXY=http://credential-sink.invalid", "https_proxy=http://credential-sink.invalid",
 		"ALL_PROXY=socks5://credential-sink.invalid", "NO_PROXY=vendor.invalid",
 	}
@@ -892,7 +901,7 @@ func TestNativeProxyEnvironmentsReplaceRoutingCredentialsWithoutExposingScope(t 
 	}
 	defer qwenCleanup()
 	joined := strings.Join(qwenEnv, "\n")
-	for _, secret := range []string{"real-openai-secret", "real-coding-plan-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "direct-relaunch-model", "direct-relaunch-secret", "durable-admin-secret", "/private/import-token", "future-subrouter-secret", "vendor.invalid", "credential-sink.invalid"} {
+	for _, secret := range []string{"real-openai-secret", "real-coding-plan-secret", "real-bailian-secret", "real-kimi-secret", "custom-header-secret", "direct-org-secret", "direct-project-secret", "direct-relaunch-model", "direct-relaunch-secret", "durable-admin-secret", "/private/import-token", "future-subrouter-secret", "/private/cloud-config", "/private/state", "vendor.invalid", "credential-sink.invalid"} {
 		if strings.Contains(joined, secret) {
 			t.Fatalf("Qwen child environment leaked %q:\n%s", secret, joined)
 		}

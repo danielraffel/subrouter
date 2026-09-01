@@ -2095,6 +2095,8 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "/stale/config")
 	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
 	t.Setenv("SUBROUTER_FUTURE_SECRET_FILE", "/private/future-secret")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", "/private/cloud-config")
+	t.Setenv("SUBROUTER_STATE_DIR", "/private/state")
 
 	runner := srRunner{in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
 	if err := runner.claudeDirect(t.Context(), []string{
@@ -2115,7 +2117,7 @@ func TestClaudeDirectUsesAuthoritativePrivateSettings(t *testing.T) {
 	if strings.Contains(got, "user,project,local") {
 		t.Fatalf("direct Claude invocation retained caller setting sources:\n%s", got)
 	}
-	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") || strings.Contains(got, "durable-admin-secret") || strings.Contains(got, "/private/future-secret") {
+	if strings.Contains(got, "attacker.invalid") || strings.Contains(got, "stale.invalid") || strings.Contains(got, "stale-api-key") || strings.Contains(got, "durable-admin-secret") || strings.Contains(got, "/private/future-secret") || strings.Contains(got, "/private/cloud-config") || strings.Contains(got, "/private/state") {
 		t.Fatalf("direct Claude invocation retained hostile routing:\n%s", got)
 	}
 	for _, key := range []string{"ANTHROPIC_BASE_URL=", "ANTHROPIC_API_KEY=", "CLAUDE_CODE_USE_BEDROCK="} {

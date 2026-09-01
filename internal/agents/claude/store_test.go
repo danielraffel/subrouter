@@ -203,6 +203,8 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
 	t.Setenv("SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE", "/private/import-token")
 	t.Setenv("SUBROUTER_FUTURE_SECRET", "future-secret")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", "/private/cloud-config")
+	t.Setenv("SUBROUTER_STATE_DIR", "/private/state")
 
 	seen := make(map[string]string)
 	for _, item := range EnvForConfigDir("/new/config") {
@@ -220,6 +222,8 @@ func TestEnvForConfigDirFiltersInheritedClaudeRouting(t *testing.T) {
 		"SUBROUTER_ADMIN_TOKEN",
 		"SUBROUTER_ACCOUNT_IMPORT_TOKEN_FILE",
 		"SUBROUTER_FUTURE_SECRET",
+		"SUBROUTER_CLOUD_CONFIG",
+		"SUBROUTER_STATE_DIR",
 	} {
 		if _, ok := seen[key]; ok {
 			t.Fatalf("%s was inherited by Claude", key)

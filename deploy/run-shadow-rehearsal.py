@@ -349,7 +349,11 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
         for option_name in SIDE_EFFECT_SERVE_OPTIONS:
             option = "--" + option_name
             short_option = "-" + option_name
-            if argument in (option, short_option):
+            if (
+                argument in (option, short_option)
+                or argument.startswith(option + "=")
+                or argument.startswith(short_option + "=")
+            ):
                 _fail(
                     f"serve args JSON must not contain {option}; "
                     "shadow rehearsals must not trigger external mutations"
@@ -406,6 +410,18 @@ def _write_shadow_health_key(path: Path, key: bytes) -> None:
         view = memoryview(body)
         while view:
             view = view[os.write(descriptor, view) :]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _seal_shadow_state_against_legacy_fallback(state_dir: Path) -> None:
+    codex_dir = state_dir / "codex"
+    codex_dir.mkdir(mode=0o700)
+    sentinel = codex_dir / "shadow-isolated-root"
+    descriptor = os.open(sentinel, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, b"isolated\n")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -502,6 +518,7 @@ def main() -> int:
         workspace.chmod(0o700)
         state_dir = workspace / "state"
         state_dir.mkdir(mode=0o700)
+        _seal_shadow_state_against_legacy_fallback(state_dir)
         prepare_dir = workspace / "prepare-callback"
         prepare_dir.mkdir(mode=0o700)
         canary_dir = workspace / "canary-callback"

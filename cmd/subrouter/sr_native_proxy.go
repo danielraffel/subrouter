@@ -1164,13 +1164,7 @@ func startProxyRelay(
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(sessionID) == "" {
-		sessionID, err = newNativeProxySessionID()
-		if err != nil {
-			_ = listener.Close()
-			return nil, err
-		}
-	}
+	sessionID = strings.TrimSpace(sessionID)
 	relayToken, err := newNativeProxyToken()
 	if err != nil {
 		_ = listener.Close()
@@ -1275,14 +1269,6 @@ func (r *nativeProxyRelay) Close() {
 	}
 }
 
-func newNativeProxySessionID() (string, error) {
-	var body [16]byte
-	if _, err := rand.Read(body[:]); err != nil {
-		return "", fmt.Errorf("create proxy session ID: %w", err)
-	}
-	return "sr-native-" + hex.EncodeToString(body[:]), nil
-}
-
 func newNativeProxyToken() (string, error) {
 	var body [32]byte
 	if _, err := rand.Read(body[:]); err != nil {
@@ -1337,7 +1323,7 @@ var nativeProxyRoutingEnvKeys = []string{
 }
 
 func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, args []string) ([]string, func() error, error) {
-	env := envWithout(envWithoutSubrouterSecrets(environ), nativeProxyRoutingEnvKeys)
+	env := envWithout(envWithoutSubrouterControl(environ), nativeProxyRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, relayRoot)
 	providerURL := strings.TrimRight(relayRoot, "/") + "/" + spec.route
 	switch spec.provider {

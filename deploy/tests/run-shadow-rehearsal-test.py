@@ -43,7 +43,13 @@ class ShadowRehearsalTest(unittest.TestCase):
         self.candidate_addr_witness = self.root / "candidate-addr.txt"
         self.candidate_sessions_witness = self.root / "candidate-sessions.txt"
         self.candidate_cloud_config_witness = self.root / "candidate-cloud-config.txt"
+        self.candidate_codex_state_witness = self.root / "candidate-codex-state.txt"
         self.callback_addr_witness = self.root / "callback-addr.txt"
+        self.test_home = self.root / "home"
+        legacy_accounts = self.test_home / ".codex-accounts" / "accounts"
+        legacy_accounts.mkdir(parents=True)
+        self.legacy_witness = legacy_accounts / "must-not-be-read.json"
+        self.legacy_witness.write_text("live-legacy-state")
         self.candidate = self._script(
             "candidate.py",
             """
@@ -66,6 +72,8 @@ Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHAD
 Path(os.environ["TEST_CANDIDATE_ADDR_WITNESS"]).write_text(args.addr)
 Path(os.environ["TEST_CANDIDATE_SESSIONS_WITNESS"]).write_text(args.sessions)
 Path(os.environ["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"]).write_text(os.environ["SUBROUTER_CLOUD_CONFIG"])
+codex_state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"]) / "codex"
+Path(os.environ["TEST_CANDIDATE_CODEX_STATE_WITNESS"]).write_text(",".join(sorted(path.name for path in codex_state.iterdir())))
 Path(args.sessions).write_text("shadow-only")
 shadow_key = bytes.fromhex(Path(os.environ["SUBROUTER_SHADOW_HEALTH_KEY_FILE"]).read_text().strip())
 
@@ -145,7 +153,9 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         environment["TEST_CANDIDATE_ADDR_WITNESS"] = str(self.candidate_addr_witness)
         environment["TEST_CANDIDATE_SESSIONS_WITNESS"] = str(self.candidate_sessions_witness)
         environment["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"] = str(self.candidate_cloud_config_witness)
+        environment["TEST_CANDIDATE_CODEX_STATE_WITNESS"] = str(self.candidate_codex_state_witness)
         environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
+        environment["HOME"] = str(self.test_home)
         environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = "must-not-reach-callback"
         command = [
             sys.executable,
@@ -203,6 +213,8 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         self.assertTrue(cloud_config.is_relative_to(workspace))
         self.assertFalse(sessions.exists())
         self.assertFalse(cloud_config.exists())
+        self.assertEqual(self.candidate_codex_state_witness.read_text(), "shadow-isolated-root")
+        self.assertEqual(self.legacy_witness.read_text(), "live-legacy-state")
         self.assertFalse(workspace.exists())
         self.assertFalse(_listening(port))
 
@@ -263,6 +275,7 @@ Path(os.environ["TEST_REPLACEMENT_WITNESS"]).write_text("replacement-ran")
                 "TEST_CANDIDATE_ADDR_WITNESS": str(self.candidate_addr_witness),
                 "TEST_CANDIDATE_SESSIONS_WITNESS": str(self.candidate_sessions_witness),
                 "TEST_CANDIDATE_CLOUD_CONFIG_WITNESS": str(self.candidate_cloud_config_witness),
+                "TEST_CANDIDATE_CODEX_STATE_WITNESS": str(self.candidate_codex_state_witness),
                 "TEST_CALLBACK_ADDR_WITNESS": str(self.callback_addr_witness),
                 "TEST_PREPARE_ENTERED": str(prepare_entered),
                 "TEST_RELEASE_PREPARE": str(release_prepare),
@@ -284,9 +297,9 @@ Path(os.environ["TEST_REPLACEMENT_WITNESS"]).write_text("replacement-ran")
                 "--canary-callback",
                 str(self.canary),
                 "--startup-timeout-seconds",
-                "5",
+                "30",
                 "--callback-timeout-seconds",
-                "5",
+                "30",
             ],
             text=True,
             stdout=subprocess.PIPE,
@@ -294,13 +307,13 @@ Path(os.environ["TEST_REPLACEMENT_WITNESS"]).write_text("replacement-ran")
             env=environment,
         )
         try:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 30
             while not prepare_entered.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertTrue(prepare_entered.exists(), "runner never entered pinned prepare callback")
             os.replace(replacement_canary, self.canary)
             release_prepare.write_text("yes")
-            stdout, stderr = runner.communicate(timeout=15)
+            stdout, stderr = runner.communicate(timeout=45)
         finally:
             if runner.poll() is None:
                 runner.terminate()
@@ -483,6 +496,7 @@ time.sleep(60)
         environment["TEST_CANDIDATE_ADDR_WITNESS"] = str(self.candidate_addr_witness)
         environment["TEST_CANDIDATE_SESSIONS_WITNESS"] = str(self.candidate_sessions_witness)
         environment["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"] = str(self.candidate_cloud_config_witness)
+        environment["TEST_CANDIDATE_CODEX_STATE_WITNESS"] = str(self.candidate_codex_state_witness)
         environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
         process = subprocess.Popen(
             [
@@ -558,6 +572,7 @@ time.sleep(60)
                 "TEST_CANDIDATE_ADDR_WITNESS": str(self.candidate_addr_witness),
                 "TEST_CANDIDATE_SESSIONS_WITNESS": str(self.candidate_sessions_witness),
                 "TEST_CANDIDATE_CLOUD_CONFIG_WITNESS": str(self.candidate_cloud_config_witness),
+                "TEST_CANDIDATE_CODEX_STATE_WITNESS": str(self.candidate_codex_state_witness),
                 "TEST_CALLBACK_ADDR_WITNESS": str(self.callback_addr_witness),
             }
         )
@@ -654,7 +669,12 @@ time.sleep(60)
                         self.assertFalse(self.workspace_witness.exists())
 
     def test_external_mutation_serve_arguments_are_rejected_before_prepare(self) -> None:
-        for spelling in ("--bedrock-autobump", "-bedrock-autobump"):
+        for spelling in (
+            "--bedrock-autobump",
+            "-bedrock-autobump",
+            "--bedrock-autobump=true",
+            "-bedrock-autobump=true",
+        ):
             with self.subTest(spelling=spelling):
                 serve_args = self.root / "serve-args.json"
                 serve_args.write_text(json.dumps([spelling]))

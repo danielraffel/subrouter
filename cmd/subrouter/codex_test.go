@@ -221,7 +221,7 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	home := t.TempDir()
 	bin := filepath.Join(home, "codex-fake")
 	record := filepath.Join(home, "record")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep -E '^(SUBROUTER_CODEX_LAUNCHER|SUBROUTER_CODEX_RESUME_COMMAND|SUBROUTER_CODEX_DUMMY_API_KEY|SUBROUTER_ADMIN_TOKEN|SUBROUTER_FUTURE_KEY_FILE)=' >> " + shellQuote(record) + " || true\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + shellQuote(record) + "\nenv | grep -E '^(SUBROUTER_CODEX_LAUNCHER|SUBROUTER_CODEX_RESUME_COMMAND|SUBROUTER_CODEX_DUMMY_API_KEY|SUBROUTER_ADMIN_TOKEN|SUBROUTER_FUTURE_KEY_FILE|SUBROUTER_CLOUD_CONFIG|SUBROUTER_STATE_DIR)=' >> " + shellQuote(record) + " || true\n"
 	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -232,6 +232,8 @@ func TestCodexUtilityRunsWithoutResolvingProxyOrPublishingResumeMetadata(t *test
 	t.Setenv("SUBROUTER_CODEX_DUMMY_API_KEY", "stale-key")
 	t.Setenv("SUBROUTER_ADMIN_TOKEN", "durable-admin-secret")
 	t.Setenv("SUBROUTER_FUTURE_KEY_FILE", "/private/future-key")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", "/private/cloud-config")
+	t.Setenv("SUBROUTER_STATE_DIR", "/private/state")
 	if err := codex([]string{"login", "--help"}); err != nil {
 		t.Fatal(err)
 	}
@@ -664,6 +666,8 @@ func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 		"A=1",
 		"SUBROUTER_ADMIN_TOKEN=admin-secret",
 		"SUBROUTER_FUTURE_SECRET_FILE=/private/future",
+		"SUBROUTER_CLOUD_CONFIG=/private/cloud-config",
+		"SUBROUTER_STATE_DIR=/private/state",
 		subrouterCodexLauncherEnv + "=old",
 		subrouterCodexResumeCommandEnv + "=old resume",
 	}, "local-secret", "subrouter")
@@ -677,7 +681,7 @@ func TestCodexChildEnvMarksSubrouterResumeCommand(t *testing.T) {
 			t.Fatalf("missing %q in:\n%s", want, joined)
 		}
 	}
-	for _, forbidden := range []string{"admin-secret", "/private/future"} {
+	for _, forbidden := range []string{"admin-secret", "/private/future", "/private/cloud-config", "/private/state"} {
 		if strings.Contains(joined, forbidden) {
 			t.Fatalf("retained durable Subrouter secret %q in:\n%s", forbidden, joined)
 		}

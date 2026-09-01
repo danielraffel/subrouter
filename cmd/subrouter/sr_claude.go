@@ -711,7 +711,7 @@ func proxyClaudeInvocation(
 }
 
 func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
-	environ = envWithoutSubrouterSecrets(environ)
+	environ = envWithoutSubrouterControl(environ)
 	env := envWithout(environ, claudeRoutingEnvKeys)
 	env = directPlainHTTPEnvironment(env, baseURL)
 	if configDir != "" {
@@ -1693,7 +1693,10 @@ func (r srRunner) claudeAWS(ctx context.Context, args []string) error {
 }
 
 func claudeAWSChildEnvironment(environ []string, baseURL, region, model, gatewayToken string) []string {
-	env := append(envWithoutSubrouterSecrets(environ),
+	env := envWithoutSubrouterControl(environ)
+	env = envWithout(env, claudeRoutingEnvKeys)
+	env = envWithoutPrefix(env, "AWS_")
+	env = append(env,
 		"CLAUDE_CODE_USE_BEDROCK=1",
 		"CLAUDE_CODE_SKIP_BEDROCK_AUTH=1",
 		"ANTHROPIC_BEDROCK_BASE_URL="+baseURL,
@@ -1743,7 +1746,7 @@ func (r srRunner) claudeDirect(ctx context.Context, args []string) error {
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
-	cmd.Env = envWithout(envWithoutSubrouterSecrets(os.Environ()), claudeRoutingEnvKeys)
+	cmd.Env = envWithout(envWithoutSubrouterControl(os.Environ()), claudeRoutingEnvKeys)
 	return cmd.Run()
 }
 
@@ -1801,10 +1804,10 @@ func envWithout(environ []string, keys []string) []string {
 	return out
 }
 
-// envWithoutSubrouterSecrets prevents a routed vendor child from inheriting
-// durable control-plane credentials. Launch-specific short-lived capabilities
-// are added only after this scrub.
-func envWithoutSubrouterSecrets(environ []string) []string {
+// envWithoutSubrouterControl prevents a vendor child from inheriting either
+// control-plane credentials or paths that locate credential-bearing files.
+// Launch-specific short-lived capabilities are added only after this scrub.
+func envWithoutSubrouterControl(environ []string) []string {
 	out := make([]string, 0, len(environ))
 	for _, item := range environ {
 		name := item
@@ -1812,8 +1815,23 @@ func envWithoutSubrouterSecrets(environ []string) []string {
 			name = before
 		}
 		upper := strings.ToUpper(strings.TrimSpace(name))
-		if strings.HasPrefix(upper, "SUBROUTER_") &&
-			(strings.Contains(upper, "TOKEN") || strings.Contains(upper, "SECRET") || strings.Contains(upper, "KEY")) {
+		if strings.HasPrefix(upper, "SUBROUTER_") {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func envWithoutPrefix(environ []string, prefix string) []string {
+	prefix = strings.ToUpper(strings.TrimSpace(prefix))
+	out := make([]string, 0, len(environ))
+	for _, item := range environ {
+		name := item
+		if before, _, ok := strings.Cut(item, "="); ok {
+			name = before
+		}
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(name)), prefix) {
 			continue
 		}
 		out = append(out, item)
