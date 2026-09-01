@@ -26,6 +26,12 @@ ROLLBACK_DESTINATIONS=()
 ROLLBACK_ARTIFACTS=()
 ROLLBACK_ARTIFACT_SHAS=()
 ROLLBACK_ARTIFACT_MODES=()
+SERVING_STORE_BINDING=""
+SERVING_STORE_BINDING_BACKUP=""
+SERVING_STORE_BINDING_BACKUP_SHA256=""
+SERVING_STORE_BINDING_BACKUP_MODE=""
+SERVING_STORE_BINDING_WAS_ABSENT=0
+EXPECTED_SERVING_STORE_BINDING_SHA256=""
 
 usage() {
   local status="${1:-2}" destination=/dev/stderr
@@ -33,12 +39,18 @@ usage() {
   cat >"$destination" <<EOF
 usage: $0 --backup PLIST --backup-sha256 SHA \\
   --rollback-artifact DEST ARTIFACT SHA MODE [--rollback-artifact ...] \\
+  [--serving-store-binding PATH \\
+    (--serving-store-binding-backup ARTIFACT SHA MODE | \\
+     --serving-store-binding-absent) \\
+    --expected-serving-store-binding-sha256 SHA] \\
   [--public-addr HOST:PORT] [--expected-program PATH] \\
   [--expected-running-program PATH]
 
 Restore the identity-checked legacy LaunchAgent only after proving the loaded
-service, captured process, and public listener are absent. Use the complete
-command printed by a successful supervised activation.
+service, captured process, and public listener are absent. A new migration also
+restores the exact prior default-shell serving-store binding after the legacy
+service is healthy. Use the complete command printed by a successful supervised
+activation.
 EOF
   exit "$status"
 }
@@ -54,6 +66,20 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 5 ] || usage
       ROLLBACK_DESTINATIONS+=("$2"); ROLLBACK_ARTIFACTS+=("$3")
       ROLLBACK_ARTIFACT_SHAS+=("$4"); ROLLBACK_ARTIFACT_MODES+=("$5"); shift 5 ;;
+    --serving-store-binding)
+      [ "$#" -ge 2 ] || usage
+      SERVING_STORE_BINDING="$2"; shift 2 ;;
+    --serving-store-binding-backup)
+      [ "$#" -ge 4 ] || usage
+      SERVING_STORE_BINDING_BACKUP="$2"
+      SERVING_STORE_BINDING_BACKUP_SHA256="$3"
+      SERVING_STORE_BINDING_BACKUP_MODE="$4"
+      shift 4 ;;
+    --serving-store-binding-absent)
+      SERVING_STORE_BINDING_WAS_ABSENT=1; shift ;;
+    --expected-serving-store-binding-sha256)
+      [ "$#" -ge 2 ] || usage
+      EXPECTED_SERVING_STORE_BINDING_SHA256="$2"; shift 2 ;;
     --expected-program) [ "$#" -ge 2 ] || usage; EXPECTED_PROGRAM="$2"; shift 2 ;;
     --public-addr) [ "$#" -ge 2 ] || usage; PUBLIC_ADDR_OVERRIDE="$2"; shift 2 ;;
     --expected-running-program)
@@ -66,6 +92,36 @@ done
 [ -n "$BACKUP" ] || usage
 [ -n "$BACKUP_SHA256" ] || usage
 [ "${#ROLLBACK_ARTIFACTS[@]}" -gt 0 ] || usage
+if [ -n "$SERVING_STORE_BINDING" ]; then
+  [ "$SERVING_STORE_BINDING" = "$HOME/.subrouter/codex/.local-serving-store.json" ] \
+    || launchagent_die "serving-store binding must be the current user's default-shell binding"
+  case "$EXPECTED_SERVING_STORE_BINDING_SHA256" in
+    ????????????????????????????????????????????????????????????????) ;;
+    *) launchagent_die "expected serving-store binding sha256 is invalid" ;;
+  esac
+  case "$EXPECTED_SERVING_STORE_BINDING_SHA256" in
+    *[!0-9a-f]*) launchagent_die "expected serving-store binding sha256 is invalid" ;;
+  esac
+  if [ -n "$SERVING_STORE_BINDING_BACKUP" ]; then
+    [ "$SERVING_STORE_BINDING_WAS_ABSENT" -eq 0 ] || usage
+    python3 - "$SERVING_STORE_BINDING_BACKUP_MODE" <<'PY'
+import sys
+
+value = sys.argv[1]
+if not value or any(character not in "01234567" for character in value):
+    raise SystemExit("serving-store binding backup mode must be octal")
+mode = int(value, 8)
+if mode & 0o077 or mode & ~0o777:
+    raise SystemExit("serving-store binding backup mode must be private and non-special")
+PY
+  else
+    [ "$SERVING_STORE_BINDING_WAS_ABSENT" -eq 1 ] || usage
+  fi
+else
+  [ -z "$SERVING_STORE_BINDING_BACKUP" ] \
+    && [ "$SERVING_STORE_BINDING_WAS_ABSENT" -eq 0 ] \
+    && [ -z "$EXPECTED_SERVING_STORE_BINDING_SHA256" ] || usage
+fi
 
 validate_public_addr() {
   python3 - "$1" <<'PY'
@@ -88,6 +144,166 @@ PY
 }
 
 [ -z "$PUBLIC_ADDR_OVERRIDE" ] || validate_public_addr "$PUBLIC_ADDR_OVERRIDE"
+
+serving_store_binding_transaction() {
+  [ -n "$SERVING_STORE_BINDING" ] || return 0
+  python3 - \
+    "$1" \
+    "$SERVING_STORE_BINDING" \
+    "$EXPECTED_SERVING_STORE_BINDING_SHA256" \
+    "$SERVING_STORE_BINDING_BACKUP" \
+    "$SERVING_STORE_BINDING_BACKUP_SHA256" \
+    "$SERVING_STORE_BINDING_BACKUP_MODE" \
+    "$SERVING_STORE_BINDING_WAS_ABSENT" <<'PY'
+import fcntl
+import hashlib
+import os
+import stat
+import sys
+import tempfile
+
+operation, path, candidate_sha, backup_path, prior_sha, prior_mode_raw, prior_absent_raw = sys.argv[1:]
+if operation not in {"check", "restore"}:
+    raise SystemExit("invalid serving-store binding transaction operation")
+prior_absent = prior_absent_raw == "1"
+parent = os.path.dirname(path)
+os.makedirs(parent, mode=0o700, exist_ok=True)
+parent_info = os.lstat(parent)
+if (
+    not stat.S_ISDIR(parent_info.st_mode)
+    or stat.S_ISLNK(parent_info.st_mode)
+    or parent_info.st_uid != os.getuid()
+    or parent_info.st_mode & 0o022
+):
+    raise SystemExit("serving-store binding directory has an unsafe identity")
+
+lock_path = os.path.join(parent, ".local-serving-store.lock")
+lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+lock_descriptor = os.open(lock_path, lock_flags, 0o600)
+try:
+    lock_opened = os.fstat(lock_descriptor)
+    lock_named = os.lstat(lock_path)
+    if (
+        not stat.S_ISREG(lock_opened.st_mode)
+        or stat.S_ISLNK(lock_named.st_mode)
+        or (lock_opened.st_dev, lock_opened.st_ino) != (lock_named.st_dev, lock_named.st_ino)
+        or lock_opened.st_uid != os.getuid()
+        or lock_opened.st_mode & 0o077
+    ):
+        raise SystemExit("serving-store binding lock has an unsafe identity")
+    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+
+    current_kind = "missing"
+    if os.path.lexists(path):
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            named = os.lstat(path)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_ISLNK(named.st_mode)
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                or opened.st_uid != os.getuid()
+                or opened.st_mode & 0o077
+                or opened.st_size > 4096
+            ):
+                raise SystemExit("serving-store binding has an unsafe identity")
+            digest = hashlib.sha256()
+            body = bytearray()
+            for chunk in iter(lambda: os.read(descriptor, 4096), b""):
+                digest.update(chunk)
+                body.extend(chunk)
+        finally:
+            os.close(descriptor)
+        actual_sha = digest.hexdigest()
+        actual_mode = stat.S_IMODE(opened.st_mode)
+        if actual_sha == candidate_sha and actual_mode == 0o600:
+            current_kind = "candidate"
+        elif (
+            prior_sha
+            and actual_sha == prior_sha
+            and actual_mode == int(prior_mode_raw, 8)
+        ):
+            current_kind = "prior"
+        else:
+            raise SystemExit("serving-store binding changed outside the deployment transaction")
+    elif not prior_absent:
+        raise SystemExit("serving-store binding disappeared outside the transaction")
+
+    if operation == "check" or current_kind == "prior" or (
+        current_kind == "missing" and prior_absent
+    ):
+        raise SystemExit(0)
+
+    if prior_absent:
+        os.unlink(path)
+    else:
+        backup_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        backup_descriptor = os.open(backup_path, backup_flags)
+        try:
+            backup_opened = os.fstat(backup_descriptor)
+            backup_named = os.lstat(backup_path)
+            if (
+                not stat.S_ISREG(backup_opened.st_mode)
+                or stat.S_ISLNK(backup_named.st_mode)
+                or (backup_opened.st_dev, backup_opened.st_ino)
+                != (backup_named.st_dev, backup_named.st_ino)
+            ):
+                raise SystemExit("serving-store binding backup has an unsafe identity")
+            backup = bytearray()
+            backup_digest = hashlib.sha256()
+            for chunk in iter(lambda: os.read(backup_descriptor, 4096), b""):
+                backup.extend(chunk)
+                backup_digest.update(chunk)
+        finally:
+            os.close(backup_descriptor)
+        if backup_digest.hexdigest() != prior_sha:
+            raise SystemExit("serving-store binding backup identity changed")
+        temporary_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".local-serving-store.rollback-", dir=parent
+        )
+        try:
+            os.fchmod(temporary_descriptor, int(prior_mode_raw, 8))
+            view = memoryview(backup)
+            while view:
+                written = os.write(temporary_descriptor, view)
+                view = view[written:]
+            os.fsync(temporary_descriptor)
+            os.close(temporary_descriptor)
+            temporary_descriptor = -1
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_descriptor >= 0:
+                os.close(temporary_descriptor)
+            if os.path.lexists(temporary_path):
+                os.unlink(temporary_path)
+    if prior_absent:
+        if os.path.lexists(path):
+            raise SystemExit("serving-store binding remained after transactional removal")
+    else:
+        restored_descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            restored_opened = os.fstat(restored_descriptor)
+            restored_digest = hashlib.sha256()
+            for chunk in iter(lambda: os.read(restored_descriptor, 4096), b""):
+                restored_digest.update(chunk)
+        finally:
+            os.close(restored_descriptor)
+        if (
+            restored_digest.hexdigest() != prior_sha
+            or stat.S_IMODE(restored_opened.st_mode) != int(prior_mode_raw, 8)
+        ):
+            raise SystemExit("restored serving-store binding identity check failed")
+    parent_descriptor = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+finally:
+    os.close(lock_descriptor)
+PY
+}
 
 # Adopt the migration's kernel lease (or acquire it for a standalone rollback)
 # before hashing or parsing any rollback input. If the migration is killed
@@ -120,6 +336,12 @@ for index in "${!ROLLBACK_ARTIFACTS[@]}"; do
     || launchagent_die "rollback bundle artifact identity check failed"
   [ "${ROLLBACK_DESTINATIONS[$index]}" = "$rollback_program" ] && program_identity_present=1
 done
+if [ -n "$SERVING_STORE_BINDING_BACKUP" ]; then
+  verify_file_sha256 "$SERVING_STORE_BINDING_BACKUP" "$SERVING_STORE_BINDING_BACKUP_SHA256" \
+    || launchagent_die "serving-store binding backup identity check failed"
+fi
+serving_store_binding_transaction check \
+  || launchagent_die "serving-store binding identity check failed; rollback withheld"
 if [ "${#EXPECTED_FILES[@]}" -gt 0 ]; then
   for index in "${!EXPECTED_FILES[@]}"; do
     path="${EXPECTED_FILES[$index]}"
@@ -181,6 +403,9 @@ else
 fi
 validate_public_addr "$public_addr"
 wait_for_full_absence "$service" "$captured_pid" "$public_addr"
+
+serving_store_binding_transaction restore \
+  || launchagent_die "serving-store binding changed while removing the candidate; rollback withheld"
 
 restore_next="${PLIST}.rollback-next.$$"
 trap 'exit 130' INT

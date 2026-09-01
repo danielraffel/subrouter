@@ -76,7 +76,7 @@ func (r srRunner) resetAgainstServer(ctx context.Context, args []string, fixedSe
 		return fmt.Errorf("-n must be at least 1")
 	}
 
-	server := srServerConfig{}
+	var server srServerConfig
 	ok := false
 	if fixedServer != nil {
 		server = *fixedServer

@@ -214,6 +214,29 @@ func TestReadyLocalServingServerDoesNotLoadOrSendAdminToken(t *testing.T) {
 	}
 }
 
+func TestLocalServingStoreAuthorityRemovesAPIPathForHealth(t *testing.T) {
+	store := accounts.CodexStore{Dir: filepath.Join(t.TempDir(), "accounts")}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/_subrouter/health" {
+			http.NotFound(w, request)
+			return
+		}
+		writeLocalStoreAuthorityHealth(t, w, request, store, "disabled")
+	}))
+	defer server.Close()
+
+	runner := srRunner{store: store, client: server.Client()}
+	authority, err := runner.localServingStoreAuthorityForStore(
+		t.Context(), srServerConfig{URL: server.URL + "/v1"}, store,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authority.storeMatches {
+		t.Fatal("serving-store authority did not match")
+	}
+}
+
 func writeLocalStoreAuthorityHealth(t *testing.T, w http.ResponseWriter, request *http.Request, store accounts.CodexStore, importState string) {
 	t.Helper()
 	authorityID, err := accounts.StoreAuthorityID(store.Dir)

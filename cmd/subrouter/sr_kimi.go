@@ -27,8 +27,6 @@ func (r srRunner) kimiCommand(ctx context.Context, args []string) error {
 		return nil
 	}
 	switch args[0] {
-	case "proxy":
-		return r.launchKimiProxy(ctx, args[1:])
 	case "login", "add":
 		label := ""
 		if len(args) > 1 {
@@ -124,8 +122,6 @@ func (r srRunner) kimiRemote(ctx context.Context, server srServerConfig, args []
 		fmt.Fprintln(r.out, "Usage: sr kimi login <label>")
 		fmt.Fprintln(r.out, "       sr kimi list")
 		fmt.Fprintln(r.out, "       sr kimi remove <label>")
-		fmt.Fprintln(r.out, "       sr kimi [--account [account]] [-- kimi args...]")
-		fmt.Fprintln(r.out, "       sr kimi proxy [--account [account]] [-- kimi args...]  (explicit alias)")
 		fmt.Fprintf(r.out, "Managed profiles are stored on server %s.\n", server.Name)
 		return nil
 	}

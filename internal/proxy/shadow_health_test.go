@@ -53,4 +53,16 @@ func TestShadowHealthProofIsExplicitAndChallengeBound(t *testing.T) {
 	if _, exists := malformed[ShadowHealthProofField]; exists {
 		t.Fatalf("malformed challenge produced a proof: %s", response.Body.String())
 	}
+
+	request = httptest.NewRequest(http.MethodGet, "/_subrouter/health", nil)
+	request.Header.Set(ShadowHealthChallengeHeader, hex.EncodeToString(challenge))
+	response = httptest.NewRecorder()
+	Server{}.Handler().ServeHTTP(response, request)
+	var unkeyed map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &unkeyed); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := unkeyed[ShadowHealthProofField]; exists {
+		t.Fatalf("unkeyed server produced a proof: %s", response.Body.String())
+	}
 }

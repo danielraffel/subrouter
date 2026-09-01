@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestShadowHealthKeyLoadsOnlyFromValidPrivateValue(t *testing.T) {
+func TestShadowHealthKeyLoadsValid32ByteValue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "shadow-health-key")
 	want := []byte("0123456789abcdef0123456789abcdef")
 	if err := os.WriteFile(path, []byte(hex.EncodeToString(want)+"\n"), 0o600); err != nil {

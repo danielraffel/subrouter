@@ -321,6 +321,17 @@ provenance, point the candidate at a separately migrated state root. The
 retained rollback plist must keep using the untouched legacy state root so the
 old binary cannot erase provenance from candidate credentials.
 
+Activation also snapshots the default CLI serving-store binding at
+`~/.subrouter/codex/.local-serving-store.json` as either exact bytes, SHA-256,
+and mode or exact absence. After structural acceptance, it invokes the reviewed
+candidate binary directly as `daemon bind-state` with `SUBROUTER_STATE_DIR`
+removed and an expected-prior compare-and-swap condition. The comparison and
+publication occur while holding the same private
+`~/.subrouter/codex/.local-serving-store.lock` used by ordinary bind and unbind
+commands. A concurrent operator change therefore aborts activation without
+being overwritten; the candidate and transaction journal remain available for
+an explicit recovery decision.
+
 The canary callback must be an executable file that exercises ordinary routed
 traffic and returns nonzero unless the expected response is observed. Callback
 paths are executed directly with no shell evaluation or command-string parsing.
@@ -329,6 +340,12 @@ required file-backed credential through its normal consumer.
 `SUBROUTER_PREFLIGHT_TIMEOUT` and `SUBROUTER_CANARY_TIMEOUT` bound the callbacks
 (120 and 300 seconds by default); timeout terminates and waits for the callback
 process group.
+
+The callback runs with `SUBROUTER_STATE_DIR` removed. It therefore exercises
+the same published serving-store selection that a normal shell-launched relay
+will use, rather than succeeding through the activation shell's explicit
+candidate-state override. The exact candidate binding is checked again after
+the callback before rollback is disarmed.
 
 The migration itself checks local health and readiness. The functional canary
 owns every deployment-specific acceptance leg: remote health/readiness probes,
@@ -564,6 +581,9 @@ worker PID and kernel-bound CDHash. Bootstrap, structural acceptance, timeout,
 signal, or canary failure
 invokes the standalone rollback command automatically; a hard interruption is
 recovered from the phase journal before a later activation may proceed.
+Serving-store publication has its own requested and completed journal phases,
+so recovery knows whether the candidate binding may have become visible before
+the interruption.
 
 The successful activation output prints the exact retained backup. To roll back
 later, use that path and the installed supervisor path:
@@ -580,10 +600,12 @@ deploy/macos/rollback-launchagent-supervisor.sh \
 Use the complete copy-pasteable command printed by successful activation; it
 contains one `--rollback-artifact DEST ARTIFACT SHA MODE` entry for the rollback
 program and each literal executable dependency discoverable from its plist or
-shell wrapper. The mode-`0700` bundle contains immutable copies named by their
-SHA-256; activation also writes the same identities to the printed mode-`0600`
-manifest beside the retained plist. Preserve the complete bundle, not only the
-plist path.
+shell wrapper. It also contains the serving-store path, exact candidate-binding
+SHA-256, and either the exact prior binding artifact, SHA-256, and mode or an
+exact-prior-absence declaration. The mode-`0700` bundle contains immutable
+copies named by their SHA-256; activation also writes the same identities to
+the printed mode-`0600` manifest beside the retained plist. Preserve the
+complete bundle, not only the plist path.
 
 Standalone rollback refuses a mismatched installed plist, loaded program, or
 changed PID. Before requesting bootout, it verifies the retained plist and all
@@ -600,6 +622,16 @@ is still removing the captured legacy process; normal standalone rollback does
 not need it.
 If the installed plist is already absent, rollback proceeds only after proving
 the launchd label and listener are absent, then restores the retained backup.
+
+For current transaction bundles, rollback reconciles the serving-store binding
+after proving complete candidate absence and before bootstrapping or probing the
+legacy service. Under the shared serving-store lock, it may replace only the
+exact recorded candidate binding with the exact recorded prior binding, or
+remove it when prior state was absence. Finding the exact prior state is an
+idempotent success; finding any third identity refuses rollback and retains the
+journal instead of clobbering a concurrent operator change. Rollback commands
+from older bundles that do not carry serving-store identity arguments leave the
+binding untouched.
 
 ### Worker upgrade
 

@@ -108,9 +108,12 @@ func TestAuthOnlyOAuthRefreshPreservesRequestTimeExhaustion(t *testing.T) {
 	_, generation, revision := ref.CredentialSnapshot()
 	schedulerRef.AdvanceAccountGenerationWithAccounts(generation, revision, SchedulerAccounts([]accounts.Account{account}))
 	schedulerRef.MarkExhaustedUntil(account.Provider, account.ID, "", time.Now().Add(time.Hour))
-	server := Server{AccountRef: ref, SchedulerRef: schedulerRef, UsageScoreTTL: -1}
+	server := Server{AccountRef: ref, SchedulerRef: schedulerRef, UsageScoreTTL: time.Nanosecond}
 
 	server.refreshUsageScoresIfStale(t.Context())
+	if source.refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want one auth-only refresh", source.refreshCalls)
+	}
 	if !schedulerRef.Get().Exhausted(account.Provider, account.ID) {
 		t.Fatal("auth-only token refresh cleared request-time quota exhaustion")
 	}

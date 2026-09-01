@@ -61,6 +61,67 @@ func TestDefaultCodexBaseURLUsesExplicitDefaultServer(t *testing.T) {
 	}
 }
 
+func TestCodexNamedLoopbackServerIsNotBuiltInLocal(t *testing.T) {
+	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := serverStore.save(srServerFile{
+		Default: "shadow",
+		Servers: []srServerConfig{{Name: "shadow", URL: localBaseURL()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("named loopback server was classified as the built-in local daemon")
+	}
+	t.Setenv("SUBROUTER_CODEX_SERVER", "local")
+	if !codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("explicit built-in local server was classified as remote")
+	}
+}
+
+func TestCodexRemoteFallbackIsBuiltInLocal(t *testing.T) {
+	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := serverStore.save(srServerFile{
+		Default: "remote",
+		Servers: []srServerConfig{{Name: "remote", URL: "https://router.example"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("local fallback from a distinct remote was classified as remote")
+	}
+}
+
+func TestCodexExplicitLoopbackURLIsNotBuiltInLocal(t *testing.T) {
+	t.Setenv("SUBROUTER_CODEX_BASE_URL", localBaseURL())
+	serverStore := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("explicit loopback URL was classified as the built-in local daemon")
+	}
+}
+
+func TestCodexLocalCredentialModeIgnoresNamedLoopbackDefault(t *testing.T) {
+	home := t.TempDir()
+	cloudPath := filepath.Join(home, "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := os.WriteFile(cloudPath, []byte(`{"version":1,"credentialSource":"local"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serverStore := srServerStore{Path: filepath.Join(home, "servers.json")}
+	if err := serverStore.save(srServerFile{
+		Default: "stale-loopback",
+		Servers: []srServerConfig{{Name: "stale-loopback", URL: localBaseURL()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("local credential mode did not classify its forced local daemon as built-in")
+	}
+	t.Setenv("SUBROUTER_CODEX_SERVER", "stale-loopback")
+	if codexResolvedTargetIsBuiltInLocal(serverStore, localBaseURL()) {
+		t.Fatal("explicit named loopback pin was classified as built-in local")
+	}
+}
+
 func TestCodexBaseURLUsesServerEnvOverride(t *testing.T) {
 	t.Setenv("SUBROUTER_CODEX_SERVER", "other")
 	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
@@ -299,11 +360,11 @@ func TestCodexLocalLaunchKeepsDurableProxyTokenInShortLivedRelay(t *testing.T) {
 	}
 	got := string(body)
 	if strings.Contains(got, durableToken) || strings.Contains(got, upstream.URL) {
-		t.Fatalf("Codex child received durable local routing material:\n%s", got)
+		t.Fatal("Codex child received durable local routing material (record redacted)")
 	}
 	if !strings.Contains(got, "SUBROUTER_CODEX_DUMMY_API_KEY=") ||
 		!strings.Contains(got, `model_providers.subrouter.base_url="http://127.0.0.1:`) {
-		t.Fatalf("Codex child did not receive a loopback relay capability:\n%s", got)
+		t.Fatal("Codex child did not receive a loopback relay capability (record redacted)")
 	}
 }
 

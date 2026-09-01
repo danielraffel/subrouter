@@ -99,6 +99,10 @@ Usage:
   sr codex enroll-isolated --retiring-state-dir PATH [--device-auth] [--only ACCOUNT]...
                         Enroll the full isolated candidate by default; repeat --only for
                         validation-only accounts (partial candidates cannot activate)
+  sr daemon bind-state <absolute-state-dir>
+                        Bind loopback CLI relays to an isolated supervised daemon store
+  sr daemon unbind-state
+                        Remove the loopback serving-store binding
   sr az status          Show whether the Azure Codex fallback is armed
   sr az test [model]    Prove the Azure route with one forced request
   sr az codex [args]    Run Codex forced onto Azure
@@ -527,7 +531,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		fmt.Fprint(r.out, srHelp)
 		return nil
 	case "daemon":
-		return runDaemonCommand(ctx, args[1:], r.out, r.errOut)
+		return runDaemonCommand(ctx, args[1:], r.store, r.out, r.errOut)
 	case "setup":
 		return r.cloudSetup(ctx, args[1:])
 	case "claude":

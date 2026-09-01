@@ -28,6 +28,7 @@ SHADOW_CHALLENGE_HEADER = "X-Subrouter-Shadow-Challenge"
 SHADOW_PROOF_FIELD = "shadow_candidate_proof"
 SHADOW_HEALTH_DOMAIN = b"subrouter-shadow-health-v1\x00"
 CALLBACK_RUN_ENV = "SUBROUTER_SHADOW_CALLBACK_RUN_ID"
+CANDIDATE_RUN_ENV = "SUBROUTER_SHADOW_CANDIDATE_RUN_ID"
 
 CREDENTIAL_SERVE_OPTIONS = {
     "admin-token": "SUBROUTER_ADMIN_TOKEN_FILE",
@@ -279,6 +280,45 @@ def _callback_environment(
     return environment
 
 
+def _candidate_environment(
+    workspace: Path,
+    state_dir: Path,
+    candidate: Path,
+    candidate_sha256: str,
+    addr: str,
+    base_url: str,
+    candidate_log: Path,
+    shadow_health_key_file: Path,
+    candidate_run_id: str,
+) -> dict[str, str]:
+    # The prepare callback may use ambient deployment credentials to populate
+    # disposable state. The candidate receives only generated shadow paths and
+    # a private runtime home, never the invoking service's ambient secrets or
+    # secret-file pointers.
+    home = workspace / "home"
+    temporary = workspace / "tmp"
+    home.mkdir(mode=0o700)
+    temporary.mkdir(mode=0o700)
+    return {
+        "HOME": str(home),
+        "PATH": os.defpath,
+        "TMPDIR": str(temporary),
+        "TMP": str(temporary),
+        "TEMP": str(temporary),
+        "SUBROUTER_STATE_DIR": str(state_dir),
+        "SUBROUTER_CLOUD_CONFIG": str(state_dir / "cloud.json"),
+        "SUBROUTER_SHADOW_WORKSPACE": str(workspace),
+        "SUBROUTER_SHADOW_STATE_DIR": str(state_dir),
+        "SUBROUTER_SHADOW_CANDIDATE_PATH": str(candidate),
+        "SUBROUTER_SHADOW_CANDIDATE_SHA256": candidate_sha256,
+        "SUBROUTER_SHADOW_ADDR": addr,
+        "SUBROUTER_SHADOW_BASE_URL": base_url,
+        "SUBROUTER_SHADOW_LOG_FILE": str(candidate_log),
+        "SUBROUTER_SHADOW_HEALTH_KEY_FILE": str(shadow_health_key_file),
+        CANDIDATE_RUN_ENV: candidate_run_id,
+    }
+
+
 def _run_callback(path: Path, environment: dict[str, str], log_path: Path, timeout: int) -> None:
     # Callbacks are trusted deployment code, not a security sandbox. The marker
     # closes accidental daemonization and ordinary setsid escapes; code that
@@ -316,10 +356,13 @@ def _run_callback(path: Path, environment: dict[str, str], log_path: Path, timeo
             _fail("shadow callback left descendant processes")
 
 
-def _marked_callback_process_ids(callback_run_id: str) -> set[int]:
-    marker = f"{CALLBACK_RUN_ENV}={callback_run_id}"
+def _marked_process_ids(marker_name: str, run_id: str) -> set[int]:
+    marker = f"{marker_name}={run_id}"
+    ps_path = shutil.which("ps", path=os.defpath)
+    if ps_path is None:
+        _fail("could not locate process inspector for shadow descendant cleanup")
     result = subprocess.run(
-        ["ps", "eww", "-axo", "pid=,command="],
+        [ps_path, "eww", "-A", "-o", "pid=,command="],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -327,7 +370,7 @@ def _marked_callback_process_ids(callback_run_id: str) -> set[int]:
         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
     )
     if result.returncode != 0:
-        _fail("could not inspect shadow callback descendants")
+        _fail("could not inspect shadow descendants")
     process_ids: set[int] = set()
     for line in result.stdout.splitlines():
         pid_text, separator, command = line.strip().partition(" ")
@@ -339,12 +382,12 @@ def _marked_callback_process_ids(callback_run_id: str) -> set[int]:
     return process_ids
 
 
-def _drain_marked_callback_processes(callback_run_id: str) -> tuple[set[int], bool]:
+def _drain_marked_processes(marker_name: str, run_id: str) -> tuple[set[int], bool]:
     observed: set[int] = set()
     for sent_signal, timeout in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 1.0)):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            current = _marked_callback_process_ids(callback_run_id)
+            current = _marked_process_ids(marker_name, run_id)
             if not current:
                 return observed, True
             observed.update(current)
@@ -354,7 +397,11 @@ def _drain_marked_callback_processes(callback_run_id: str) -> tuple[set[int], bo
                 except (ProcessLookupError, PermissionError):
                     pass
             time.sleep(0.05)
-    return observed, not _marked_callback_process_ids(callback_run_id)
+    return observed, not _marked_process_ids(marker_name, run_id)
+
+
+def _drain_marked_callback_processes(callback_run_id: str) -> tuple[set[int], bool]:
+    return _drain_marked_processes(CALLBACK_RUN_ENV, callback_run_id)
 
 
 def _load_serve_args(raw_path: str | None) -> list[str]:
@@ -386,7 +433,7 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
             ):
                 _fail(
                     f"serve args JSON must not contain {option}; "
-                    f"use {environment_name} in the helper environment"
+                    f"stage any required credential in disposable state rather than using {environment_name}"
                 )
         for option_name in PERSISTENT_SERVE_OPTIONS:
             option = "--" + option_name
@@ -553,6 +600,7 @@ def main() -> int:
     state_dir: Path | None = None
     candidate_log: Path | None = None
     candidate_process: subprocess.Popen[bytes] | None = None
+    candidate_run_id = ""
     host = "127.0.0.1"
     port = 0
 
@@ -626,8 +674,18 @@ def main() -> int:
         shadow_health_key = secrets.token_bytes(32)
         shadow_health_key_file = workspace / "shadow-health-key"
         _write_shadow_health_key(shadow_health_key_file, shadow_health_key)
-        candidate_environment = dict(environment)
-        candidate_environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = str(shadow_health_key_file)
+        candidate_run_id = secrets.token_hex(32)
+        candidate_environment = _candidate_environment(
+            workspace,
+            state_dir,
+            pinned_candidate,
+            candidate_sha256,
+            resolved_addr,
+            base_url,
+            candidate_log,
+            shadow_health_key_file,
+            candidate_run_id,
+        )
         with candidate_log.open("wb") as output:
             candidate_process = subprocess.Popen(
                 [
@@ -672,7 +730,13 @@ def main() -> int:
     finally:
         _ignore_signals(handled_signals)
         if candidate_process is not None:
-            teardown["process_group_absent"] = _terminate_group(candidate_process)
+            group_absent = _terminate_group(candidate_process)
+            try:
+                _, detached_absent = _drain_marked_processes(CANDIDATE_RUN_ENV, candidate_run_id)
+            except ShadowError as error:
+                detached_absent = False
+                failure = failure or str(error)
+            teardown["process_group_absent"] = group_absent and detached_absent
         if port:
             teardown["listener_absent"] = _wait_listener_absent(host, port)
         if workspace is not None:

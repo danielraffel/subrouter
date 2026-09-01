@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,6 +78,28 @@ func StoreAuthorityProof(path, challenge string) (string, error) {
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
+// ExistingStoreAuthorityProof proves access to an already initialized store
+// without creating directories or authority material. Client-side listener
+// attestation uses this after the daemon has answered the challenge so an
+// untrusted binding cannot turn a read into an arbitrary-path write.
+func ExistingStoreAuthorityProof(path, challenge string) (string, error) {
+	challengeBytes, err := hex.DecodeString(strings.TrimSpace(challenge))
+	if err != nil || len(challengeBytes) != 32 {
+		return "", fmt.Errorf("invalid account-store challenge")
+	}
+	resolved, err := resolveStoreAuthorityPath(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve account store authority: %w", err)
+	}
+	key, err := readStoreAuthorityKey(filepath.Join(filepath.Dir(resolved), storeAuthorityKeyFilename))
+	if err != nil {
+		return "", fmt.Errorf("read account store authority: %w", err)
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(challengeBytes)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
 func ensureStoreAuthorityKey(path string) ([]byte, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("resolve account store authority: path is empty")
@@ -131,14 +154,12 @@ func ensureStoreAuthorityKey(path string) ([]byte, error) {
 }
 
 func readStoreAuthorityKey(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
+	file, err := openPrivateStoreAuthorityKey(path)
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("account store authority key must be a private regular file")
-	}
-	key, err := os.ReadFile(path)
+	defer file.Close()
+	key, err := io.ReadAll(io.LimitReader(file, 33))
 	if err != nil {
 		return nil, fmt.Errorf("read account store authority key: %w", err)
 	}

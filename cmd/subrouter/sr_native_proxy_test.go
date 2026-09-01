@@ -572,6 +572,134 @@ func TestTeamNativeProxyQwenChild(t *testing.T) {
 	}
 }
 
+func TestRemoteTenantNativeProxyAuthenticatesPreflightAndRelayWithoutExposingKeyToChild(t *testing.T) {
+	var preflights atomic.Int32
+	var routedRequests atomic.Int32
+	remote := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+testTenantKey {
+			http.Error(response, "tenant authorization required", http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case request.Method == http.MethodHead && request.URL.Path == "/t/"+testTenantKey+"/":
+			preflights.Add(1)
+			response.WriteHeader(http.StatusNoContent)
+		case request.Method == http.MethodPost && request.URL.Path == "/t/"+testTenantKey+"/qwen-token/v1/chat/completions":
+			if preflights.Load() != 1 {
+				http.Error(response, "routed request arrived before authenticated preflight", http.StatusPreconditionFailed)
+				return
+			}
+			if request.Header.Get("X-Subrouter-Agent") != "qwen-token" || request.Header.Get("X-Subrouter-Session") == "" {
+				http.Error(response, "missing routed session identity", http.StatusBadRequest)
+				return
+			}
+			routedRequests.Add(1)
+			response.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer remote.Close()
+
+	var credentialSinkRequests atomic.Int32
+	credentialSink := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		credentialSinkRequests.Add(1)
+		http.Error(response, "unexpected proxy use", http.StatusBadGateway)
+	}))
+	defer credentialSink.Close()
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		t.Setenv(key, credentialSink.URL)
+	}
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.CodexStore{Dir: filepath.Join(home, ".subrouter", "codex", "accounts")}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "tenant",
+		Servers: []srServerConfig{{Name: "tenant", URL: remote.URL, TenantKey: testTenantKey}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A named remote is authoritative before any loopback serving-store
+	// metadata is inspected. This intentionally malformed, public pointer would
+	// fail closed if the remote launch accidentally consulted local authority.
+	if err := os.WriteFile(localServingStoreBindingPath(store), []byte(`{"schema":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{CredentialSource: broker.CredentialSourceLegacy}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", "http://127.0.0.1:1")
+	t.Setenv("QWEN_HOME", filepath.Join(t.TempDir(), "qwen-home"))
+
+	binDir := t.TempDir()
+	qwenPath := filepath.Join(binDir, "qwen")
+	qwenHelper := "#!/bin/sh\nexec \"$SRTEST_BINARY\" -test.run=^TestRemoteTenantNativeProxyQwenChild$ -- \"$@\"\n"
+	if err := os.WriteFile(qwenPath, []byte(qwenHelper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SRTEST_BINARY", os.Args[0])
+	t.Setenv("SRTEST_REMOTE_TENANT_QWEN_HELPER", "1")
+
+	runner := srRunner{store: store, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard}
+	if err := runner.launchNativeProxy(t.Context(), qwenNativeProxy, nil, nativeProxyLaunchOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if preflights.Load() != 1 || routedRequests.Load() != 1 {
+		t.Fatalf("remote tenant requests: preflight=%d routed=%d, want one each", preflights.Load(), routedRequests.Load())
+	}
+	if credentialSinkRequests.Load() != 0 {
+		t.Fatalf("ambient proxy received %d request(s)", credentialSinkRequests.Load())
+	}
+}
+
+func TestRemoteTenantNativeProxyQwenChild(t *testing.T) {
+	if os.Getenv("SRTEST_REMOTE_TENANT_QWEN_HELPER") != "1" {
+		return
+	}
+	for _, arg := range os.Args {
+		if strings.Contains(arg, testTenantKey) {
+			t.Fatal("remote tenant key reached child argv")
+		}
+	}
+	for _, entry := range os.Environ() {
+		if strings.Contains(entry, testTenantKey) {
+			t.Fatal("remote tenant key reached child environment")
+		}
+	}
+	baseURL := os.Getenv("OPENAI_BASE_URL")
+	if !strings.HasPrefix(baseURL, "http://127.0.0.1:") || strings.Contains(baseURL, testTenantKey) {
+		t.Fatal("Qwen child did not receive an opaque loopback relay URL")
+	}
+	if os.Getenv("OPENAI_API_KEY") != "subrouter" {
+		t.Fatal("Qwen child did not receive the non-secret routing sentinel")
+	}
+	request, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		strings.TrimRight(baseURL, "/")+"/chat/completions",
+		strings.NewReader(`{"model":"test","messages":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+os.Getenv("OPENAI_API_KEY"))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("routed Qwen request status = %d", response.StatusCode)
+	}
+}
+
 func TestNativeProxyPinnedPickerIsSortedAndBlankCancels(t *testing.T) {
 	inventory := []remoteServerAccount{
 		{ID: "qwen-token:z", Label: "Shared", Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey},
@@ -1966,6 +2094,21 @@ func TestAntigravityProxyFailsClosedForDirectGeminiConfiguration(t *testing.T) {
 	}
 	if got := testEnvValue(env, "CLOUD_CODE_URL"); got != "http://127.0.0.1:43212/antigravity" {
 		t.Fatalf("CLOUD_CODE_URL = %q", got)
+	}
+}
+
+func TestAntigravityProxyRejectsOversizedSettings(t *testing.T) {
+	home := t.TempDir()
+	settingsDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(settingsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	if err := os.WriteFile(settingsPath, bytes.Repeat([]byte(" "), (1<<20)+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := antigravityDirectProviderConflict([]string{"HOME=" + home}); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("oversized Antigravity settings error = %v", err)
 	}
 }
 

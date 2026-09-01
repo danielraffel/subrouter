@@ -624,10 +624,11 @@ does not advertise `--account` pinning.
 Native proxy launchers preflight the selected router before starting the vendor
 CLI. Hosted or otherwise lease-required routers are rejected until Subrouter has
 a native-launcher session-lease client; local and ordinary self-hosted routers
-remain supported. New sessions and workspace-relative continue operations keep
-provider-and-working-directory affinity. An explicit Kimi session ID instead
-keeps provider-and-session affinity across working directories, without reading
-vendor session files.
+remain supported. New sessions keep provider-and-working-directory affinity.
+Kimi's workspace-relative `--continue` operations keep that same affinity;
+Qwen deliberately rejects continue and resume operations, as detailed below.
+An explicit Kimi session ID instead keeps provider-and-session affinity across
+working directories, without reading vendor session files.
 
 Kimi's CLI owns one global OAuth login, while Subrouter can keep additional
 subscription logins in isolated profiles without switching or rewriting that

@@ -734,7 +734,9 @@ func TestForcedQwenAccountOverridesStickyAndDoesNotFailOver(t *testing.T) {
 	var forcedHits, alternateHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if got := request.Header.Get("X-Subrouter-Account-ID"); got != "" {
-			t.Fatalf("forced routing header leaked upstream: %q", got)
+			t.Errorf("forced routing header leaked upstream: %q", got)
+			http.Error(w, "unexpected internal routing header", http.StatusInternalServerError)
+			return
 		}
 		switch request.Header.Get("Authorization") {
 		case "Bearer forced-key":

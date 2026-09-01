@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1728,7 +1729,19 @@ func TestSRClaudeProxyRejectsPreviouslyStoredRemoteHTTPTenant(t *testing.T) {
 
 func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	home := t.TempDir()
-	local := healthServer(t, http.StatusOK)
+	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			writeLocalStoreAuthorityHealth(t, w, request, store, "enabled")
+			return
+		}
+		if request.Method == http.MethodPost && request.URL.Path == "/v1/messages" {
+			_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"ok"}]}`)
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer local.Close()
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud.json"))
 	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
@@ -1747,7 +1760,7 @@ func TestSRClaudeProxyUsesHealthySelectedLocalRoute(t *testing.T) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runner := srRunner{
 		program: "sr",
-		store:   accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")},
+		store:   store,
 		in:      strings.NewReader(""),
 		out:     io.Discard,
 		errOut:  io.Discard,
@@ -2169,6 +2182,33 @@ func TestSRClaudeHelpDocumentsProfilelessProxy(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("help missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+func TestLocalClaudeRejectsWrongStoreBeforeAccountInventory(t *testing.T) {
+	home := t.TempDir()
+	store := accounts.CodexStore{Dir: filepath.Join(home, "expected", "codex", "accounts")}
+	wrongStore := accounts.CodexStore{Dir: filepath.Join(home, "wrong", "codex", "accounts")}
+	var inventoryRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/_subrouter/health" {
+			writeLocalStoreAuthorityHealth(t, w, request, wrongStore, "enabled")
+			return
+		}
+		inventoryRequests.Add(1)
+		http.Error(w, "credential sink", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", server.URL+"/v1")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(home, "missing-cloud-config.json"))
+
+	runner := srRunner{store: store, client: server.Client(), out: io.Discard, errOut: io.Discard}
+	err := runner.proxyClaudeSelectedRemote(t.Context(), nil, claudeProxyLaunchOptions{accountSelector: "profile"})
+	if err == nil || !strings.Contains(err.Error(), "does not match this CLI") {
+		t.Fatalf("wrong-store Claude launch error = %v", err)
+	}
+	if got := inventoryRequests.Load(); got != 0 {
+		t.Fatalf("wrong-store listener received %d account inventory request(s)", got)
 	}
 }
 

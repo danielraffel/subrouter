@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/cutovercanary"
@@ -58,17 +59,26 @@ func TestLegResultHasExactRunnerKeys(t *testing.T) {
 }
 
 func TestHelpDescribesDirectAndEnvironmentDrivenModes(t *testing.T) {
-	var out bytes.Buffer
-	if err := run([]string{"--help"}, bytes.NewReader(nil), &out); err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{
-		"SUBROUTER_CANARY_LEG_NAME",
-		"peer-probe --config FILE",
-		"witness --challenge FILE --witness FILE",
+	for _, args := range [][]string{
+		{"--help"},
+		{"-help"},
+		{"peer-probe", "--help"},
+		{"witness", "-h"},
 	} {
-		if !bytes.Contains(out.Bytes(), []byte(expected)) {
-			t.Fatalf("help missing %q:\n%s", expected, out.String())
-		}
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			var out bytes.Buffer
+			if err := run(args, bytes.NewReader(nil), &out); err != nil {
+				t.Fatal(err)
+			}
+			for _, expected := range []string{
+				"SUBROUTER_CANARY_LEG_NAME",
+				"peer-probe --config FILE",
+				"witness --challenge FILE --witness FILE",
+			} {
+				if !bytes.Contains(out.Bytes(), []byte(expected)) {
+					t.Fatalf("help missing %q:\n%s", expected, out.String())
+				}
+			}
+		})
 	}
 }

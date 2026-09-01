@@ -620,6 +620,10 @@ func TestCredentialDisplayLabelUsesSafeStoredIdentityClaim(t *testing.T) {
 		"not-a-jwt",
 		encode(`{"email":"not-an-email"}`),
 		encode("{\"email\":\"unsafe@example.test\\nspoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u202espoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u200dspoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u2028spoof\"}"),
+		encode("{\"email\":\"unsafe@example.test\\u2029spoof\"}"),
 	} {
 		if got := credentialDisplayLabel(CredentialInfo{IDToken: token}); got != "router agy login" {
 			t.Fatalf("unsafe token label = %q", got)

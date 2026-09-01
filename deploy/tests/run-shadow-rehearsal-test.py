@@ -59,6 +59,9 @@ import hmac
 import json
 import os
 import signal
+import subprocess
+import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -70,14 +73,31 @@ parser.add_argument("--antigravity-local-credential", required=True)
 args = parser.parse_args()
 assert args.antigravity_local_credential == "false"
 host, port = args.addr.rsplit(":", 1)
-Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
-Path(os.environ["TEST_CANDIDATE_ADDR_WITNESS"]).write_text(args.addr)
-Path(os.environ["TEST_CANDIDATE_SESSIONS_WITNESS"]).write_text(args.sessions)
-Path(os.environ["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"]).write_text(os.environ["SUBROUTER_CLOUD_CONFIG"])
+workspace = Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
+for forbidden in ("SUBROUTER_ADMIN_TOKEN_FILE", "AWS_SECRET_ACCESS_KEY", "ANTHROPIC_API_KEY", "TEST_AMBIENT_CANDIDATE_SECRET"):
+    assert forbidden not in os.environ
+assert Path(os.environ["HOME"]).is_relative_to(workspace)
+assert Path(os.environ["TMPDIR"]).is_relative_to(workspace)
 codex_state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"]) / "codex"
-Path(os.environ["TEST_CANDIDATE_CODEX_STATE_WITNESS"]).write_text(",".join(sorted(path.name for path in codex_state.iterdir())))
+observations = {
+    "workspace": str(workspace),
+    "addr": args.addr,
+    "sessions": args.sessions,
+    "cloud_config": os.environ["SUBROUTER_CLOUD_CONFIG"],
+    "codex_state": ",".join(sorted(path.name for path in codex_state.iterdir())),
+}
+(workspace / "candidate-observations.json").write_text(json.dumps(observations))
 Path(args.sessions).write_text("shadow-only")
 shadow_key = bytes.fromhex(Path(os.environ["SUBROUTER_SHADOW_HEALTH_KEY_FILE"]).read_text().strip())
+if (workspace / "spawn-detached-candidate").exists():
+    body = "import os,time; from pathlib import Path; Path(os.environ['SUBROUTER_SHADOW_WORKSPACE']).joinpath('candidate-detached.pid').write_text(str(os.getpid())); time.sleep(60)"
+    child = subprocess.Popen([sys.executable, "-c", body], start_new_session=True)
+    deadline = time.monotonic() + 5
+    while not (workspace / "candidate-detached.pid").exists() and time.monotonic() < deadline:
+        if child.poll() is not None:
+            raise RuntimeError("detached candidate child exited before ready")
+        time.sleep(0.01)
+    assert (workspace / "candidate-detached.pid").exists()
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -85,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
         challenge_hex = self.headers.get("X-Subrouter-Shadow-Challenge")
         if self.path == "/_subrouter/health" and challenge_hex:
             challenge = bytes.fromhex(challenge_hex)
-            with Path(os.environ["TEST_CHALLENGE_WITNESS"]).open("a") as witness:
+            with (workspace / "challenge-witness").open("a") as witness:
                 witness.write(challenge_hex + "\\n")
             payload["shadow_candidate_proof"] = hmac.new(
                 shadow_key,
@@ -112,6 +132,8 @@ import os
 from pathlib import Path
 state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"])
 (state / "prepared").write_text("yes")
+Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
+os.symlink(os.environ["TEST_CHALLENGE_WITNESS"], Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"]) / "challenge-witness")
 """,
         )
         self.canary = self._script(
@@ -125,6 +147,18 @@ assert (Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"]) / "prepared").read_text()
 assert "SUBROUTER_SHADOW_HEALTH_KEY_FILE" not in os.environ
 with urllib.request.urlopen(os.environ["SUBROUTER_SHADOW_BASE_URL"] + "/_subrouter/ready") as response:
     assert json.load(response)["ok"] is True
+observations = json.loads((Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"]) / "candidate-observations.json").read_text())
+for key, environment_name in {
+    "workspace": "TEST_WORKSPACE_WITNESS",
+    "addr": "TEST_CANDIDATE_ADDR_WITNESS",
+    "sessions": "TEST_CANDIDATE_SESSIONS_WITNESS",
+    "cloud_config": "TEST_CANDIDATE_CLOUD_CONFIG_WITNESS",
+    "codex_state": "TEST_CANDIDATE_CODEX_STATE_WITNESS",
+}.items():
+    Path(os.environ[environment_name]).write_text(observations[key])
+detached_pid = Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"]) / "candidate-detached.pid"
+if detached_pid.exists() and "TEST_DETACHED_PID" in os.environ:
+    Path(os.environ["TEST_DETACHED_PID"]).write_text(detached_pid.read_text())
 Path(os.environ["TEST_CANARY_WITNESS"]).write_text("passed")
 Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_ADDR"])
 """,
@@ -161,6 +195,10 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
         environment["HOME"] = str(self.test_home)
         environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = "must-not-reach-callback"
+        environment["SUBROUTER_ADMIN_TOKEN_FILE"] = "/must-not-reach-candidate/admin-token"
+        environment["AWS_SECRET_ACCESS_KEY"] = "must-not-reach-candidate-aws-secret"
+        environment["ANTHROPIC_API_KEY"] = "must-not-reach-candidate-anthropic-secret"
+        environment["TEST_AMBIENT_CANDIDATE_SECRET"] = "must-not-reach-candidate-test-secret"
         if environment_overrides:
             environment.update(environment_overrides)
         command = [
@@ -273,9 +311,16 @@ codex.mkdir()
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 body = "import os,time; from pathlib import Path; Path(os.environ['TEST_DETACHED_PID']).write_text(str(os.getpid())); time.sleep(60)"
-subprocess.Popen([sys.executable, "-c", body], start_new_session=True)
+child = subprocess.Popen([sys.executable, "-c", body], start_new_session=True)
+deadline = time.monotonic() + 5
+while not Path(os.environ["TEST_DETACHED_PID"]).exists() and time.monotonic() < deadline:
+    if child.poll() is not None:
+        raise RuntimeError("detached callback child exited before ready")
+    time.sleep(0.01)
+assert Path(os.environ["TEST_DETACHED_PID"]).exists()
 """,
         )
         result = self._run(
@@ -298,6 +343,43 @@ subprocess.Popen([sys.executable, "-c", body], start_new_session=True)
         else:
             self.fail(f"detached callback process {process_id} survived teardown")
         self.assertTrue(all(evidence["teardown"].values()))
+
+    def test_detached_candidate_descendant_is_terminated(self) -> None:
+        detached_pid = self.root / "candidate-detached.pid"
+        spawning_prepare = self._script(
+            "spawning-candidate-prepare.py",
+            """
+import os
+from pathlib import Path
+state = Path(os.environ["SUBROUTER_SHADOW_STATE_DIR"])
+(state / "prepared").write_text("yes")
+Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
+(Path(os.environ["SUBROUTER_SHADOW_WORKSPACE"]) / "spawn-detached-candidate").write_text("yes")
+""",
+        )
+        result = self._run(
+            _free_port(),
+            prepare=spawning_prepare,
+            environment_overrides={"TEST_DETACHED_PID": str(detached_pid)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        evidence = json.loads(result.stdout)
+        self.assertTrue(all(evidence["teardown"].values()))
+        self.assertTrue(detached_pid.exists())
+        process_id = int(detached_pid.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.kill(process_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.fail(f"detached candidate process {process_id} survived teardown")
 
     def test_replacing_canary_path_after_pinning_cannot_change_executed_callback(self) -> None:
         prepare_entered = self.root / "prepare-entered"

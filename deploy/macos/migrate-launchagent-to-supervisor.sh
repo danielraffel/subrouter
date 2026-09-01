@@ -40,6 +40,7 @@ CANDIDATE_ENV_JSON="${SUBROUTER_CANDIDATE_ENV_JSON:-}"
 PREFLIGHT_TIMEOUT="${SUBROUTER_PREFLIGHT_TIMEOUT:-120}"
 CANARY_TIMEOUT="${SUBROUTER_CANARY_TIMEOUT:-300}"
 MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
+SERVING_STORE_BINDING="$HOME/.subrouter/codex/.local-serving-store.json"
 
 # Serialize every worker-path mutation and activation with the routine updater.
 # A dedicated helper owns the kernel descriptor and releases it on parent exit
@@ -52,6 +53,83 @@ export SUBROUTER_MUTATION_LEASE_CONTROL_DIR
 trap release_subrouter_mutation_lease EXIT
 
 die() { echo "migrate-launchagent-to-supervisor: $*" >&2; exit 1; }
+private_serving_store_binding_mode() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    named = os.lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        or opened.st_uid != os.getuid()
+        or opened.st_mode & 0o077
+        or opened.st_size > 4096
+    ):
+        raise SystemExit("serving-store binding must be a current-user-owned private regular file")
+    directory = os.stat(os.path.realpath(os.path.dirname(path)))
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+        raise SystemExit("serving-store binding directory must be current-user-owned and not writable by group/other")
+    print(format(stat.S_IMODE(opened.st_mode), "03o"))
+finally:
+    os.close(descriptor)
+PY
+}
+verify_candidate_serving_store_binding() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, state_dir = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    named = os.lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        or opened.st_uid != os.getuid()
+        or opened.st_mode & 0o077
+        or opened.st_size > 4096
+    ):
+        raise SystemExit("published serving-store binding is not a private regular file")
+    body = os.read(descriptor, 4097)
+finally:
+    os.close(descriptor)
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate field")
+        result[key] = value
+    return result
+
+try:
+    binding = json.loads(body, object_pairs_hook=reject_duplicates)
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    raise SystemExit(f"published serving-store binding is invalid JSON: {error}") from error
+expected_accounts = os.path.realpath(os.path.join(state_dir, "codex", "accounts"))
+if (
+    not isinstance(binding, dict)
+    or set(binding) != {"schema", "accounts_dir"}
+    or binding.get("schema") != "subrouter.local-serving-store/v1"
+    or binding.get("accounts_dir") != expected_accounts
+):
+    raise SystemExit("published serving-store binding does not select the candidate state")
+PY
+}
 active_worker_fingerprint() {
   local socket="$1" expected_cdhash="$2" status
   status="$(curl -fsS --max-time 2 --unix-socket "$socket" http://localhost/_subrouter/supervisor-status)" || return 1
@@ -526,6 +604,85 @@ identity_manifest="${backup}.identity"
 : >"$identity_manifest"
 chmod 0600 "$identity_manifest"
 printf '%s  %s\n' "$backup_sha256" "$backup" >>"$identity_manifest"
+serving_store_rollback_args=(--serving-store-binding "$SERVING_STORE_BINDING")
+serving_store_binding_backup=""
+serving_store_binding_backup_sha=""
+serving_store_binding_mode=""
+serving_store_bind_cas_args=()
+if [ -e "$SERVING_STORE_BINDING" ] || [ -L "$SERVING_STORE_BINDING" ]; then
+  serving_store_binding_mode="$(private_serving_store_binding_mode "$SERVING_STORE_BINDING")" \
+    || die "existing serving-store binding is not safe to preserve"
+  serving_store_binding_backup="$bundle/local-serving-store.before.json"
+  copy_file_nofollow \
+    "$SERVING_STORE_BINDING" "$serving_store_binding_backup" "$serving_store_binding_mode" \
+    || die "could not preserve the existing serving-store binding"
+  serving_store_binding_backup_sha="$(sha256_file "$serving_store_binding_backup")"
+  fsync_parent_directory "$serving_store_binding_backup" \
+    || die "could not durably preserve the existing serving-store binding"
+  serving_store_rollback_args+=(
+    --serving-store-binding-backup
+    "$serving_store_binding_backup"
+    "$serving_store_binding_backup_sha"
+    "$serving_store_binding_mode"
+  )
+  serving_store_bind_cas_args+=(
+    --if-current-sha256 "$serving_store_binding_backup_sha"
+    --if-current-mode "$serving_store_binding_mode"
+  )
+  printf 'serving-store-binding-before  %s  %s  %s  %s\n' \
+    "$serving_store_binding_backup_sha" "$serving_store_binding_mode" \
+    "$SERVING_STORE_BINDING" "$serving_store_binding_backup" >>"$identity_manifest"
+else
+  serving_store_rollback_args+=(--serving-store-binding-absent)
+  serving_store_bind_cas_args+=(--if-current-absent)
+  printf 'serving-store-binding-before  absent  %s\n' \
+    "$SERVING_STORE_BINDING" >>"$identity_manifest"
+fi
+candidate_serving_store_binding_artifact="$bundle/local-serving-store.candidate.json"
+python3 - "$candidate_serving_store_binding_artifact" "$STATE_DIR" <<'PY'
+import json
+import os
+import sys
+
+destination, state_dir = sys.argv[1:]
+accounts_dir = os.path.realpath(os.path.join(state_dir, "codex", "accounts"))
+encoded_accounts = json.dumps(accounts_dir, ensure_ascii=False, separators=(",", ":"))
+# Go's encoding/json uses HTML-safe strings and always escapes these two line
+# separators. Match the candidate's json.Marshal bytes exactly so recovery can
+# identify the one publication this transaction is authorized to replace.
+encoded_accounts = (
+    encoded_accounts
+    .replace("&", "\\u0026")
+    .replace("<", "\\u003c")
+    .replace(">", "\\u003e")
+    .replace("\u2028", "\\u2028")
+    .replace("\u2029", "\\u2029")
+)
+payload = (
+    '{"schema":"subrouter.local-serving-store/v1","accounts_dir":'
+    + encoded_accounts
+    + "}\n"
+).encode("utf-8")
+descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.write(descriptor, payload)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+verify_candidate_serving_store_binding \
+  "$candidate_serving_store_binding_artifact" "$STATE_DIR" \
+  || die "could not stage the exact candidate serving-store binding"
+candidate_serving_store_binding_sha="$(sha256_file "$candidate_serving_store_binding_artifact")"
+fsync_parent_directory "$candidate_serving_store_binding_artifact" \
+  || die "could not durably stage the candidate serving-store binding identity"
+serving_store_rollback_args+=(
+  --expected-serving-store-binding-sha256
+  "$candidate_serving_store_binding_sha"
+)
+printf 'candidate-serving-store-binding  %s  %s  %s\n' \
+  "$candidate_serving_store_binding_sha" "$SERVING_STORE_BINDING" \
+  "$candidate_serving_store_binding_artifact" >>"$identity_manifest"
 while IFS= read -r dependency; do
   [ -n "$dependency" ] || continue
   dependency_sha="$(sha256_file "$dependency")"
@@ -575,6 +732,7 @@ rollback() {
       --backup "$backup" \
       --backup-sha256 "$backup_sha256" \
       "${rollback_identity_args[@]}" \
+      "${serving_store_rollback_args[@]}" \
       --public-addr "$public_addr" \
       --expected-program "$SUPERVISOR_BIN" \
       --expected-running-program "$expected_running"; then
@@ -595,7 +753,8 @@ write_recovery_script() {
       "$LABEL" "$PLIST" "$DOMAIN" "$CONTROL_SOCKET"
     printf 'exec %q' "$SCRIPT_DIR/rollback-launchagent-supervisor.sh"
     printf ' %q' --backup "$backup" --backup-sha256 "$backup_sha256" \
-      "${rollback_identity_args[@]}" --public-addr "$public_addr" \
+      "${rollback_identity_args[@]}" "${serving_store_rollback_args[@]}" \
+      --public-addr "$public_addr" \
       --expected-program "$expected_installed" \
       --expected-running-program "$expected_running"
     printf '\n'
@@ -779,11 +938,61 @@ if [ -n "$structural_failure" ]; then
 fi
 set_phase structural_accepted
 
+# Publish the default-shell store selection only after the exact candidate is
+# structurally accepted. Intent is durable before the candidate performs its
+# own attested atomic write, so a crash at any point is recoverable through the
+# same standalone rollback command.
+prior_serving_store_binding_matches=0
+if [ -n "$serving_store_binding_backup" ]; then
+  current_serving_store_binding_mode="$(private_serving_store_binding_mode "$SERVING_STORE_BINDING" 2>/dev/null || true)"
+  if [ "$current_serving_store_binding_mode" = "$serving_store_binding_mode" ] \
+    && verify_file_sha256 "$SERVING_STORE_BINDING" "$serving_store_binding_backup_sha"; then
+    prior_serving_store_binding_matches=1
+  fi
+elif [ ! -e "$SERVING_STORE_BINDING" ] && [ ! -L "$SERVING_STORE_BINDING" ]; then
+  prior_serving_store_binding_matches=1
+fi
+if [ "$prior_serving_store_binding_matches" -ne 1 ]; then
+  release_subrouter_mutation_lease
+  trap - EXIT INT TERM
+  transaction_active=0
+  die "default-shell serving-store binding changed before publication; candidate retained and rollback withheld (journal: $TRANSACTION_DIR)"
+fi
+set_phase serving_store_binding_requested
+candidate_base_url="${health_url%/_subrouter/health}"
+if ! /usr/bin/env -u SUBROUTER_STATE_DIR \
+  SUBROUTER_LOCAL_BASE_URL="$candidate_base_url" \
+  "$WORKER_BIN" daemon bind-state "$STATE_DIR" "${serving_store_bind_cas_args[@]}"; then
+  if rollback; then
+    die "candidate serving-store binding failed; legacy LaunchAgent restored"
+  fi
+  release_subrouter_mutation_lease
+  trap - EXIT INT TERM
+  transaction_active=0
+  die "candidate serving-store binding failed and rollback was withheld (journal: $TRANSACTION_DIR)"
+fi
+if ! verify_candidate_serving_store_binding "$SERVING_STORE_BINDING" "$STATE_DIR" \
+  || ! verify_file_sha256 "$SERVING_STORE_BINDING" "$candidate_serving_store_binding_sha" \
+  || ! fsync_parent_directory "$SERVING_STORE_BINDING"; then
+  if rollback; then
+    die "candidate serving-store binding was not durably published; legacy LaunchAgent restored"
+  fi
+  release_subrouter_mutation_lease
+  trap - EXIT INT TERM
+  transaction_active=0
+  die "candidate serving-store binding identity is unexpected; rollback withheld (journal: $TRANSACTION_DIR)"
+fi
+printf 'candidate-serving-store-binding-published  %s  %s\n' \
+  "$candidate_serving_store_binding_sha" "$SERVING_STORE_BINDING" >>"$identity_manifest"
+inject_hard_fault_after_mutation serving_store_binding_publish
+set_phase serving_store_bound
+
 echo "running bounded functional canary"
 if ! SUBROUTER_CANARY_TRANSACTION_WORKER_PATH="$WORKER_BIN" \
   SUBROUTER_CANARY_TRANSACTION_WORKER_SHA256="$candidate_worker_sha" \
   SUBROUTER_BOUNDED_STATE_DIRECTORY="$TRANSACTION_DIR/functional-canary-process-group" \
-  run_bounded_argv "functional canary" "$CANARY_TIMEOUT" "$CANARY_CALLBACK"; then
+  run_bounded_argv "functional canary" "$CANARY_TIMEOUT" \
+    /usr/bin/env -u SUBROUTER_STATE_DIR "$CANARY_CALLBACK"; then
   if [ "${RUN_BOUNDED_CLEANUP_CONFIRMED:-0}" -ne 1 ]; then
     release_subrouter_mutation_lease
     trap - EXIT INT TERM
@@ -804,6 +1013,8 @@ elif ! verify_file_sha256 "$SUPERVISOR_BIN" "$candidate_supervisor_sha"; then
   post_canary_failure="supervisor executable identity"
 elif ! verify_file_sha256 "$WORKER_BIN" "$candidate_worker_sha"; then
   post_canary_failure="worker executable identity"
+elif ! verify_file_sha256 "$SERVING_STORE_BINDING" "$candidate_serving_store_binding_sha"; then
+  post_canary_failure="default-shell serving-store binding identity"
 elif ! require_process_fingerprint "$candidate_fingerprint" "$SUPERVISOR_BIN"; then
   post_canary_failure="supervisor process continuity before final HTTP acceptance"
 elif ! require_sole_listener_owner "$public_addr" "$candidate_pid"; then
@@ -840,7 +1051,8 @@ echo "rollback identity manifest: $identity_manifest"
 echo "standalone rollback:"
 printf '  %q' "$SCRIPT_DIR/rollback-launchagent-supervisor.sh" \
   --backup "$backup" --backup-sha256 "$backup_sha256" \
-  "${rollback_identity_args[@]}" --public-addr "$public_addr" \
+  "${rollback_identity_args[@]}" "${serving_store_rollback_args[@]}" \
+  --public-addr "$public_addr" \
   --expected-program "$SUPERVISOR_BIN"
 printf '\n'
 echo

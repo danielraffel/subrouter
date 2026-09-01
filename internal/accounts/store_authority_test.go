@@ -14,7 +14,7 @@ func TestStoreAuthorityIDNormalizesTheSamePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	right, err := StoreAuthorityID(filepath.Join(root, "codex", ".", "accounts"))
+	right, err := StoreAuthorityID(filepath.Join(root, "codex") + string(filepath.Separator) + "." + string(filepath.Separator) + "accounts")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestStoreAuthorityProofIsSharedOnlyByTheSameStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := StoreAuthorityProof(filepath.Join(filepath.Dir(store), ".", "accounts"), challenge)
+	second, err := StoreAuthorityProof(filepath.Dir(store)+string(filepath.Separator)+"."+string(filepath.Separator)+"accounts", challenge)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +50,17 @@ func TestStoreAuthorityProofIsSharedOnlyByTheSameStore(t *testing.T) {
 	}
 	if hmac.Equal([]byte(first), []byte(other)) {
 		t.Fatal("different account stores produced the same proof")
+	}
+}
+
+func TestExistingStoreAuthorityProofDoesNotCreateAuthorityMaterial(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "codex", "accounts")
+	challenge := hex.EncodeToString(make([]byte, 32))
+	if _, err := ExistingStoreAuthorityProof(store, challenge); err == nil {
+		t.Fatal("missing existing authority key unexpectedly produced a proof")
+	}
+	if _, err := os.Stat(filepath.Dir(store)); !os.IsNotExist(err) {
+		t.Fatalf("client-side proof created authority material: %v", err)
 	}
 }
 
@@ -128,8 +139,10 @@ func TestStoreAuthorityUsesResolvedSymlinkedStoreDirectory(t *testing.T) {
 }
 
 func TestStoreAuthorityProofRejectsMalformedChallenge(t *testing.T) {
-	if _, err := StoreAuthorityProof(filepath.Join(t.TempDir(), "accounts"), "short"); err == nil {
-		t.Fatal("malformed account-store challenge unexpectedly succeeded")
+	for _, challenge := range []string{"short", hex.EncodeToString(make([]byte, 31))} {
+		if _, err := StoreAuthorityProof(filepath.Join(t.TempDir(), "accounts"), challenge); err == nil {
+			t.Fatalf("malformed account-store challenge %q unexpectedly succeeded", challenge)
+		}
 	}
 }
 

@@ -103,6 +103,20 @@ func TestTeamServerKeepsDedicatedProxyAuthenticationForRemoteOverride(t *testing
 	}
 }
 
+func TestTeamServerRejectsNamedLoopbackRemoteOverride(t *testing.T) {
+	saveReadyCloudConfig(t)
+	local := healthServer(t, 200)
+	t.Setenv("SUBROUTER_LOCAL_BASE_URL", local.URL+"/v1")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "shadow")
+	store := srServerStore{Path: filepath.Join(t.TempDir(), "servers.json")}
+	if err := store.save(srServerFile{Servers: []srServerConfig{{Name: "shadow", URL: local.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := codexBaseURLWithFallback(store, nil); err == nil || !strings.Contains(err.Error(), "team credentials") {
+		t.Fatalf("named loopback team pin error = %v", err)
+	}
+}
+
 func TestTeamProxyNeverSendsStackTokenToALocalURLOverride(t *testing.T) {
 	config := broker.Config{
 		BaseURL:         "https://cmux.test",

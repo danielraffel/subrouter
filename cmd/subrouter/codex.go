@@ -46,13 +46,21 @@ func codex(args []string) error {
 	if err != nil {
 		return err
 	}
-	localTarget := sameLocalProxyEndpoint(baseURL, localBaseURL())
+	localTarget := codexResolvedTargetIsBuiltInLocal(
+		defaultSRServerStore(accounts.DefaultCodexStore()), baseURL,
+	)
 	var localRelayTransport *http.Transport
 	if localTarget {
+		_, servingStoreErr := localServingStore(accounts.DefaultCodexStore())
+		if servingStoreErr != nil {
+			return fmt.Errorf("resolve local Codex serving store: %w", servingStoreErr)
+		}
 		// Construct the store-attesting transport before reading the durable
 		// daemon credential. Its DialContext proves every connection before the
 		// relay can send a credential-bearing request on that connection.
-		localRelayTransport, err = localStoreAttestedRelayTransport(codexProxyRootURL(baseURL), accounts.DefaultCodexStore())
+		localRelayTransport, err = localStoreAttestedRelayTransportWithResolver(
+			codexProxyRootURL(baseURL), localServingStoreResolver(accounts.DefaultCodexStore()),
+		)
 		if err != nil {
 			return fmt.Errorf("secure local Codex relay transport: %w", err)
 		}
@@ -106,6 +114,43 @@ func codex(args []string) error {
 		),
 		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
 	)
+}
+
+// codexResolvedTargetIsBuiltInLocal distinguishes the built-in local daemon
+// from a deliberately named remote that happens to use a loopback URL. Only
+// the built-in target may consult the private local serving-store binding.
+func codexResolvedTargetIsBuiltInLocal(store srServerStore, resolvedURL string) bool {
+	local := localBaseURL()
+	if !sameLocalProxyEndpoint(resolvedURL, local) {
+		return false
+	}
+	if name := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); name != "" {
+		return isLocalServerName(name)
+	}
+	if strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) != "" {
+		return false
+	}
+	if config, err := cloudModeConfig(); err == nil {
+		source := config.EffectiveCredentialSource()
+		if source == broker.CredentialSourceTeam || source == broker.CredentialSourceLocal {
+			return true
+		}
+	}
+	file, err := store.load()
+	if err != nil || strings.TrimSpace(file.Default) == "" {
+		return true
+	}
+	configured, ok := file.find(file.Default)
+	if !ok {
+		return true
+	}
+	configuredURL, err := codexBaseURLForServer(configured)
+	if err != nil {
+		return true
+	}
+	// A distinct configured remote that failed health may have fallen back to
+	// local; that is the built-in daemon. A configured loopback remote did not.
+	return !sameLocalProxyEndpoint(configuredURL, local)
 }
 
 func directPlainHTTPEnvironment(environ []string, baseURL string) []string {
@@ -244,15 +289,15 @@ func codexBaseURLWithFallback(store srServerStore, warn io.Writer) (string, erro
 			if pinErr != nil {
 				return "", pinErr
 			}
-			if source == broker.CredentialSourceTeam &&
-				!sameEndpoint(pinned, local) {
+			pinnedToBuiltInLocal := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_BASE_URL")) == "" &&
+				isLocalServerName(os.Getenv("SUBROUTER_CODEX_SERVER"))
+			if source == broker.CredentialSourceTeam && !pinnedToBuiltInLocal {
 				return "", fmt.Errorf(
 					"team credentials may only be sent through the local daemon at %s; unset SUBROUTER_CODEX_BASE_URL and SUBROUTER_CODEX_SERVER",
 					local,
 				)
 			}
-			if source == broker.CredentialSourceLocal &&
-				!sameEndpoint(pinned, local) {
+			if source == broker.CredentialSourceLocal && !pinnedToBuiltInLocal {
 				return pinned, nil
 			}
 		}

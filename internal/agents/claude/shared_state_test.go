@@ -1,8 +1,10 @@
 package claude
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -64,5 +66,56 @@ func TestExistingProfileHistoryMigratesAndPreservesConflicts(t *testing.T) {
 	}
 	if err := store.prepareSharedState(instance); err != nil {
 		t.Fatalf("second migration failed: %v", err)
+	}
+}
+
+func TestConcurrentSharedStatePreparationIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	instance := filepath.Join(root, "profile")
+	shared := filepath.Join(root, ".claude")
+	projects := filepath.Join(instance, "projects")
+	if err := os.MkdirAll(projects, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 64; index++ {
+		name := filepath.Join(projects, fmt.Sprintf("session-%d.jsonl", index))
+		if err := os.WriteFile(name, []byte("history"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := Store{Dir: root, SharedStateDir: shared}
+	const workers = 32
+	start := make(chan struct{})
+	errorsSeen := make(chan error, workers)
+	var ready sync.WaitGroup
+	ready.Add(workers)
+	for range workers {
+		go func() {
+			ready.Done()
+			<-start
+			errorsSeen <- store.PrepareSharedStateDir(instance)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	for range workers {
+		if err := <-errorsSeen; err != nil {
+			t.Fatalf("concurrent shared-state preparation failed: %v", err)
+		}
+	}
+
+	target, err := os.Readlink(filepath.Join(instance, "projects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != filepath.Join(shared, "projects") {
+		t.Fatalf("projects link = %q, want %q", target, filepath.Join(shared, "projects"))
+	}
+	for index := 0; index < 64; index++ {
+		name := filepath.Join(shared, "projects", fmt.Sprintf("session-%d.jsonl", index))
+		if body, err := os.ReadFile(name); err != nil || string(body) != "history" {
+			t.Fatalf("shared history %d = %q, %v", index, body, err)
+		}
 	}
 }

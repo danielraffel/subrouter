@@ -17,14 +17,14 @@ its ordinary name uses Subrouter.
 | Antigravity / AGY OAuth | `sr agy` or `sr antigravity` (`proxy` aliases); `/antigravity` | One `agy` keychain login on a local/single-tenant router host; not inherited by hosted tenant pools | Local CLI auth is stripped by loopback relay; router OAuth bearer added | Plain `agy` | Sticky session; `--account` is explicitly unsupported because there is no multi-account OAuth selector | Safe token identity claim when present, otherwise router-login label; ready/active/error; quota not exposed | H1, H3, H4 | Local login user-tested; proxy generation canary required after deployment |
 | Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
-| OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | Live auth and routed generation canaries recorded |
+| OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | No auditable in-repository live canary recorded |
 | DeepSeek API key | OpenAI-compatible client at `/deepseek/v1` | Labeled DeepSeek keys | Client auth removed; selected bearer added | Direct DeepSeek URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Together API key | OpenAI-compatible client at `/together/v1` | Labeled Together keys | Client auth removed; selected bearer added | Direct Together URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Fireworks API key | OpenAI-compatible client at `/fireworks/v1` | Labeled Fireworks keys | Client auth removed; selected bearer added | Direct Fireworks URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | OpenCode Zen API key | OpenAI-compatible client at `/opencode-zen/v1` | Labeled OpenCode Zen keys | Client auth removed; selected bearer added | Direct OpenCode Zen URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
-| Z.AI API key | OpenAI-compatible client at `/zai/v1` | Labeled Z.AI keys | Client auth removed; selected bearer added | Direct Z.AI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
+| Z.AI API key | OpenAI-compatible client at `/zai/v1` | Labeled Z.AI keys | Client auth removed; selected bearer added | Direct Z.AI URL | Per session; key failover | Key health/model count; quota not inferred | H1 | No live-account canary recorded |
 | Declared OpenAI-compatible API key | OpenAI-compatible client at `/<declared-name>/v1` | Labeled keys for a startup-declared provider | Client auth removed; selected bearer added | Direct declared upstream | Per session; key failover | Account/routing state; vendor quota not inferred | H1, H2 | No live-account canary recorded |
-| Gemini | None | None | None | Plain Gemini tooling | None | Profile management scaffold only | Namespace/store tests | Not routed; not a canary target |
+| Gemini | None | None | None | Plain Gemini tooling | None | Profile management scaffold only | CLI help and namespace-exclusion tests; profile store untested | Not routed; not a canary target |
 
 Hermetic coverage key:
 
@@ -98,12 +98,14 @@ or account selector: a local or single-tenant router must be signed in with
 keychain token to that server or expose it through a tenant pool. This is a
 product limitation, not missing quota telemetry.
 
-Implemented and hermetically tested, but not yet live-account tested, are Grok,
-DeepSeek, Together, Fireworks, OpenCode Zen, Z.AI, Qwen Coding Plan, the Qwen
-Token Plan Anthropic protocol, and declared custom OpenAI-compatible routes.
-Operators with those accounts are invited to run an exact routed canary and
-record the result. Gemini is excluded from that list because it is only a
-namespace/store scaffold, not a routed adapter.
+Implemented and hermetically tested, but without an auditable in-repository
+live-account canary, are OpenRouter, Grok, DeepSeek, Together, Fireworks,
+OpenCode Zen, Z.AI, Qwen Coding Plan, the Qwen Token Plan Anthropic protocol,
+and declared custom OpenAI-compatible routes. Operators with those accounts
+are invited to run an exact routed canary and record a credential-free result
+or artifact reference. Gemini is excluded from that list because it is only a
+namespace/store scaffold, not a routed adapter; its profile store does not yet
+have direct tests.
 
 Live validation should be recorded only after a real request crosses the exact
 launcher and selected router. A successful status probe or local vendor login

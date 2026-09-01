@@ -543,8 +543,13 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return err
 	}
+	servingStore := r.store
 	if !remote {
-		authority, authorityErr := r.localServingStoreAuthority(ctx, server)
+		servingStore, err = localServingStore(r.store)
+		if err != nil {
+			return fmt.Errorf("resolve local %s serving store: %w", spec.display, err)
+		}
+		authority, authorityErr := r.localServingStoreAuthorityForStore(ctx, server, servingStore)
 		if authorityErr != nil {
 			return fmt.Errorf("verify local %s proxy authority: %w", spec.display, authorityErr)
 		}
@@ -605,7 +610,7 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 		// Build the connection-attesting transport before the durable local
 		// data-plane token is loaded. Its DialContext proves every connection
 		// before a credential-bearing request can leave this process.
-		relayTransport, err = localStoreAttestedRelayTransport(root, r.store)
+		relayTransport, err = localStoreAttestedRelayTransportWithResolver(root, localServingStoreResolver(r.store))
 	}
 	if err != nil {
 		return fmt.Errorf("secure %s proxy relay transport: %w", spec.display, err)
@@ -627,21 +632,21 @@ func (r srRunner) launchNativeProxy(ctx context.Context, spec nativeProxySpec, a
 	if err != nil {
 		return fmt.Errorf("%s CLI %q was not found in PATH", spec.display, spec.command)
 	}
-	env, cleanup, err := nativeProxyEnvironment(spec, relay.URL(), os.Environ(), args)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = cleanup() }()
+	launchArgs := args
 	if spec.provider == accounts.ProviderKimi {
-		args = kimiNativeProxyArgs(args)
+		launchArgs = kimiNativeProxyArgs(args)
 	} else if spec.provider == accounts.ProviderQwenToken {
 		model, modelErr := qwenProxyModel(args)
 		if modelErr != nil {
 			return modelErr
 		}
-		args = qwenNativeProxyArgs(args, model)
+		launchArgs = qwenNativeProxyArgs(args, model)
 	}
-	cmd := exec.CommandContext(ctx, commandPath, args...)
+	env, cleanup, err := nativeProxyEnvironment(spec, relay.URL(), os.Environ(), args)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, commandPath, launchArgs...)
 	cmd.Stdin = r.in
 	cmd.Stdout = r.out
 	cmd.Stderr = r.errOut
@@ -1088,7 +1093,16 @@ func nativeProxyRelayTransport(targetRoot string) (*http.Transport, error) {
 }
 
 func localStoreAttestedRelayTransport(targetRoot string, store accounts.CodexStore) (*http.Transport, error) {
-	client, err := newLocalStoreAttestedClient(&http.Client{Timeout: 15 * time.Second}, targetRoot, store)
+	return localStoreAttestedRelayTransportWithResolver(targetRoot, func() (accounts.CodexStore, error) {
+		return store, nil
+	})
+}
+
+func localStoreAttestedRelayTransportWithResolver(
+	targetRoot string,
+	resolveStore func() (accounts.CodexStore, error),
+) (*http.Transport, error) {
+	client, err := newLocalStoreAttestedClientWithResolver(&http.Client{Timeout: 15 * time.Second}, targetRoot, resolveStore)
 	if err != nil {
 		return nil, err
 	}
@@ -1097,6 +1111,13 @@ func localStoreAttestedRelayTransport(targetRoot string, store accounts.CodexSto
 		return nil, errors.New("local proxy relay requires a direct attested HTTP transport")
 	}
 	return transport, nil
+}
+
+func localServingStoreResolver(store accounts.CodexStore) func() (accounts.CodexStore, error) {
+	if explicitLocalStateAuthority() {
+		return func() (accounts.CodexStore, error) { return store, nil }
+	}
+	return func() (accounts.CodexStore, error) { return localServingStore(store) }
 }
 
 func startNativeProxyRelay(targetRoot string, spec nativeProxySpec, sessionID, proxyToken, forcedAccountID string) (*nativeProxyRelay, error) {
@@ -1117,7 +1138,23 @@ func startLocalStoreAttestedProxyRelay(
 	preferredAccountID string,
 	store accounts.CodexStore,
 ) (*nativeProxyRelay, error) {
-	transport, err := localStoreAttestedRelayTransport(targetRoot, store)
+	return startLocalStoreAttestedProxyRelayWithResolver(
+		targetRoot, route, agent, sessionID, proxyToken, forcedAccountID,
+		preferredAccountID, func() (accounts.CodexStore, error) { return store, nil },
+	)
+}
+
+func startLocalStoreAttestedProxyRelayWithResolver(
+	targetRoot string,
+	route string,
+	agent string,
+	sessionID string,
+	proxyToken string,
+	forcedAccountID string,
+	preferredAccountID string,
+	resolveStore func() (accounts.CodexStore, error),
+) (*nativeProxyRelay, error) {
+	transport, err := localStoreAttestedRelayTransportWithResolver(targetRoot, resolveStore)
 	if err != nil {
 		return nil, fmt.Errorf("secure local proxy target transport: %w", err)
 	}
@@ -1599,14 +1636,20 @@ func antigravityDirectProviderConflict(environ []string) (string, error) {
 		}
 	}
 	settingsPath := filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")
-	body, err := os.ReadFile(settingsPath)
+	settingsFile, err := os.Open(settingsPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("read Antigravity settings: %w", err)
 	}
-	if len(body) > 1<<20 {
+	defer settingsFile.Close()
+	const maxSettingsSize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(settingsFile, maxSettingsSize+1))
+	if err != nil {
+		return "", fmt.Errorf("read Antigravity settings: %w", err)
+	}
+	if len(body) > maxSettingsSize {
 		return "", errors.New("Antigravity settings are too large to validate safely")
 	}
 	var settings struct {

@@ -35,8 +35,21 @@ const (
 // key and credentials. It is not cryptographic channel binding for a topology
 // that exposes a second live attestation oracle to an untrusted relay.
 func newLocalStoreAttestedClient(base *http.Client, rawURL string, store accounts.CodexStore) (*http.Client, error) {
+	return newLocalStoreAttestedClientWithResolver(base, rawURL, func() (accounts.CodexStore, error) {
+		return store, nil
+	})
+}
+
+func newLocalStoreAttestedClientWithResolver(
+	base *http.Client,
+	rawURL string,
+	resolveStore func() (accounts.CodexStore, error),
+) (*http.Client, error) {
 	if base == nil {
 		base = &http.Client{}
+	}
+	if resolveStore == nil {
+		return nil, errors.New("local store attestation requires a store resolver")
 	}
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
@@ -76,6 +89,11 @@ func newLocalStoreAttestedClient(base *http.Client, rawURL string, store account
 		connection, dialErr := dialPinnedLoopback(ctx, network, host, port)
 		if dialErr != nil {
 			return nil, dialErr
+		}
+		store, resolveErr := resolveStore()
+		if resolveErr != nil {
+			_ = connection.Close()
+			return nil, resolveErr
 		}
 		attested, attestErr := attestLocalStoreConnection(ctx, connection, hostHeader, store)
 		if attestErr != nil {
@@ -192,12 +210,14 @@ func attestLocalStoreConnection(ctx context.Context, connection net.Conn, hostHe
 	if err != nil {
 		return nil, err
 	}
-	expectedProof, err := accounts.StoreAuthorityProof(store.Dir, challenge)
+	if strings.TrimSpace(payload.AccountStoreID) == "" || payload.AccountStoreID != expectedID {
+		return nil, errors.New("local proxy account store does not match this CLI")
+	}
+	expectedProof, err := accounts.ExistingStoreAuthorityProof(store.Dir, challenge)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(payload.AccountStoreID) == "" || payload.AccountStoreID != expectedID ||
-		!hmac.Equal([]byte(strings.TrimSpace(payload.AccountStoreProof)), []byte(expectedProof)) {
+	if !hmac.Equal([]byte(strings.TrimSpace(payload.AccountStoreProof)), []byte(expectedProof)) {
 		return nil, errors.New("local proxy account store does not match this CLI")
 	}
 	if err := connection.SetDeadline(time.Time{}); err != nil {

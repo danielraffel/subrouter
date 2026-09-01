@@ -308,23 +308,26 @@ func (r srRunner) proxyClaudeSelectedRemote(ctx context.Context, args []string, 
 		return fmt.Errorf("Claude proxy scope changed (expected %s, current %s); no request was sent", options.expectedScope, actualScope)
 	}
 	if !ok {
-		config, configErr := cloudModeConfig()
-		if configErr != nil {
-			return fmt.Errorf("load cmux.com login: %w", configErr)
+		// Prove the exact local serving store before reading any durable proxy
+		// credential or requesting a server-side account inventory.
+		localServer, _, servingErr := r.readyLocalServingServerWithAuthority(ctx, defaultDaemonStarter())
+		if servingErr != nil {
+			return servingErr
 		}
-		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
-			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
-		}
-		if !ensureLocalHealthy(ctx, fallbackHTTPClient(), localBaseURL(), defaultDaemonStarter(), r.errOut) {
-			return fmt.Errorf("local proxy is unavailable; run '%s doctor'", r.programOrSubrouter())
-		}
-		accountID, resolveErr := r.resolveClaudeProxyAccount(ctx, srServerConfig{Name: "local", URL: localBaseURL()}, options.accountSelector)
+		accountID, resolveErr := r.resolveClaudeProxyAccount(ctx, localServer, options.accountSelector)
 		if resolveErr != nil {
 			return resolveErr
 		}
 		preferredAccountID := strings.TrimSpace(options.preferredAccountID)
 		if preferredAccountID != "" && !validClaudeProxyAccountID(preferredAccountID) {
 			return fmt.Errorf("selected Claude preference has an invalid server routing ID")
+		}
+		config, configErr := cloudModeConfig()
+		if configErr != nil {
+			return fmt.Errorf("load cmux.com login: %w", configErr)
+		}
+		if config.EffectiveCredentialSource() == broker.CredentialSourceTeam && !config.Ready() {
+			return fmt.Errorf("team credential storage requires login and a selected team; run '%s login'", programBase())
 		}
 		proxyToken := cloudClientProxyToken(config, localBaseURL())
 		if proxyToken == "" {
@@ -517,13 +520,17 @@ func (r srRunner) proxyClaudeArgsTo(
 		return fmt.Errorf("prepare shared Claude proxy history: %w", err)
 	}
 	if sameLocalProxyEndpoint(baseURL, localBaseURL()) {
+		_, servingStoreErr := localServingStore(r.store)
+		if servingStoreErr != nil {
+			return fmt.Errorf("resolve local Claude serving store: %w", servingStoreErr)
+		}
 		upstreamToken := strings.TrimSpace(proxyToken)
 		if upstreamToken == "" {
 			upstreamToken = "subrouter"
 		}
-		relay, relayErr := startLocalStoreAttestedProxyRelay(
+		relay, relayErr := startLocalStoreAttestedProxyRelayWithResolver(
 			codexProxyRootURL(baseURL), "v1", "claude", "", upstreamToken,
-			accountID, preferredAccountID, r.store,
+			accountID, preferredAccountID, localServingStoreResolver(r.store),
 		)
 		if relayErr != nil {
 			return fmt.Errorf("start local Claude proxy relay: %w", relayErr)

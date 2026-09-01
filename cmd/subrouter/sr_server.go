@@ -913,12 +913,16 @@ func (r srRunner) readyLocalServingServerWithAuthority(ctx context.Context, star
 	if baseClient == nil {
 		baseClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	attestedClient, err := newLocalStoreAttestedClient(baseClient, localBaseURL(), r.store)
+	servingStore, err := localServingStore(r.store)
+	if err != nil {
+		return srServerConfig{}, localServingStoreAuthority{}, err
+	}
+	attestedClient, err := newLocalStoreAttestedClient(baseClient, localBaseURL(), servingStore)
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
 	}
 	bare := srServerConfig{Name: "local", URL: localBaseURL(), requestClient: attestedClient}
-	authority, err := r.localServingStoreAuthority(ctx, bare)
+	authority, err := r.localServingStoreAuthorityForStore(ctx, bare, servingStore)
 	if err != nil {
 		return srServerConfig{}, localServingStoreAuthority{}, err
 	}
@@ -939,12 +943,24 @@ type localServingStoreAuthority struct {
 }
 
 func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServerConfig) (localServingStoreAuthority, error) {
+	servingStore, err := localServingStore(r.store)
+	if err != nil {
+		return localServingStoreAuthority{}, err
+	}
+	return r.localServingStoreAuthorityForStore(ctx, server, servingStore)
+}
+
+func (r srRunner) localServingStoreAuthorityForStore(ctx context.Context, server srServerConfig, servingStore accounts.CodexStore) (localServingStoreAuthority, error) {
 	var challengeBytes [32]byte
 	if _, err := rand.Read(challengeBytes[:]); err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("create local proxy store challenge: %w", err)
 	}
 	challenge := hex.EncodeToString(challengeBytes[:])
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(server.URL, "/")+"/_subrouter/health", nil)
+	healthURL, err := healthURLFor(server.URL)
+	if err != nil {
+		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation URL: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 	if err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("build local proxy store-attestation request: %w", err)
 	}
@@ -972,17 +988,20 @@ func (r srRunner) localServingStoreAuthority(ctx context.Context, server srServe
 	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&payload); err != nil {
 		return localServingStoreAuthority{}, fmt.Errorf("decode local proxy store attestation: %w", err)
 	}
-	expected, err := accounts.StoreAuthorityID(r.store.Dir)
+	expected, err := accounts.StoreAuthorityID(servingStore.Dir)
 	if err != nil {
 		return localServingStoreAuthority{}, err
 	}
-	expectedProof, err := accounts.StoreAuthorityProof(r.store.Dir, challenge)
+	if strings.TrimSpace(payload.AccountStoreID) == "" || payload.AccountStoreID != expected {
+		return localServingStoreAuthority{storeMatches: false}, nil
+	}
+	expectedProof, err := accounts.ExistingStoreAuthorityProof(servingStore.Dir, challenge)
 	if err != nil {
 		return localServingStoreAuthority{}, err
 	}
 	proofMatches := hmac.Equal([]byte(strings.TrimSpace(payload.AccountStoreProof)), []byte(expectedProof))
 	return localServingStoreAuthority{
-		storeMatches:         proofMatches && strings.TrimSpace(payload.AccountStoreID) != "" && payload.AccountStoreID == expected,
+		storeMatches:         proofMatches,
 		accountImportEnabled: proofMatches && payload.AccountImport == proxy.AccountImportEnabled,
 	}, nil
 }

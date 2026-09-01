@@ -2757,10 +2757,16 @@ var claudeHighGrowthDirs = []string{
 	"debug",
 }
 
-func (s Store) prepareSharedState(instancePath string) error {
+func (s Store) prepareSharedState(instancePath string) (err error) {
 	if strings.TrimSpace(s.SharedStateDir) == "" {
 		return nil
 	}
+	lock, err := lockProfileCredential(context.Background(), instancePath)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+
 	if err := os.MkdirAll(s.SharedStateDir, 0o700); err != nil {
 		return err
 	}
@@ -2809,7 +2815,33 @@ func migrateDirectoryToShared(source, target string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return os.Symlink(target, source)
+	if err := os.Symlink(target, source); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		// A launcher outside this process may have published the same link
+		// without using Subrouter's lock. Treat only the exact intended link as
+		// an idempotent success; every other replacement remains fail-closed.
+		info, statErr := os.Lstat(source)
+		if statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+			return err
+		}
+		current, readErr := os.Readlink(source)
+		if readErr != nil {
+			return readErr
+		}
+		currentPath := current
+		if !filepath.IsAbs(currentPath) {
+			currentPath = filepath.Join(filepath.Dir(source), currentPath)
+		}
+		currentAbs, currentErr := filepath.Abs(currentPath)
+		targetAbs, targetErr := filepath.Abs(target)
+		if currentErr == nil && targetErr == nil && currentAbs == targetAbs {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func mergeDirectoryPreservingConflicts(source, target string) error {

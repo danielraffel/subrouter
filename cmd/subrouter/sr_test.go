@@ -2179,6 +2179,32 @@ func TestSRQwenHelpDocumentsGenericAccountLifecycle(t *testing.T) {
 	}
 }
 
+func TestKimiHelpSeparatesLocalLauncherFromRemoteManagement(t *testing.T) {
+	var out bytes.Buffer
+	runner := srRunner{out: &out}
+	if err := runner.kimiCommand(t.Context(), []string{"--help"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"sr kimi [--account", "sr kimi proxy"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("local Kimi help missing %q:\n%s", want, out.String())
+		}
+	}
+
+	out.Reset()
+	if err := runner.kimiRemote(t.Context(), srServerConfig{Name: "remote"}, []string{"--help"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, localOnly := range []string{"--account", "sr kimi proxy"} {
+		if strings.Contains(out.String(), localOnly) {
+			t.Fatalf("remote Kimi help advertises local-only %q:\n%s", localOnly, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "Managed profiles are stored on server remote") {
+		t.Fatalf("remote Kimi help omits server-scoped management:\n%s", out.String())
+	}
+}
+
 func TestHelpDistinguishesNativeProxyLaunchersFromDirectCLIs(t *testing.T) {
 	for name, help := range map[string]string{
 		"sr":        srHelp,

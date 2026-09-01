@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/account"
 )
@@ -481,7 +482,8 @@ func credentialDisplayLabel(credential CredentialInfo) string {
 		}
 		valid := true
 		for _, char := range email {
-			if char < 0x20 || char == 0x7f {
+			if unicode.IsControl(char) || unicode.Is(unicode.Cf, char) ||
+				unicode.Is(unicode.Zl, char) || unicode.Is(unicode.Zp, char) {
 				valid = false
 				break
 			}
