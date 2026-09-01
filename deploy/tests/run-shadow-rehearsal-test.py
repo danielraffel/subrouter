@@ -41,6 +41,8 @@ class ShadowRehearsalTest(unittest.TestCase):
         self.canary_witness = self.root / "canary.txt"
         self.challenge_witness = self.root / "challenges.txt"
         self.candidate_addr_witness = self.root / "candidate-addr.txt"
+        self.candidate_sessions_witness = self.root / "candidate-sessions.txt"
+        self.candidate_cloud_config_witness = self.root / "candidate-cloud-config.txt"
         self.callback_addr_witness = self.root / "callback-addr.txt"
         self.candidate = self._script(
             "candidate.py",
@@ -57,10 +59,14 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument("command")
 parser.add_argument("--addr", required=True)
+parser.add_argument("--sessions", required=True)
 args = parser.parse_args()
 host, port = args.addr.rsplit(":", 1)
 Path(os.environ["TEST_WORKSPACE_WITNESS"]).write_text(os.environ["SUBROUTER_SHADOW_WORKSPACE"])
 Path(os.environ["TEST_CANDIDATE_ADDR_WITNESS"]).write_text(args.addr)
+Path(os.environ["TEST_CANDIDATE_SESSIONS_WITNESS"]).write_text(args.sessions)
+Path(os.environ["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"]).write_text(os.environ["SUBROUTER_CLOUD_CONFIG"])
+Path(args.sessions).write_text("shadow-only")
 shadow_key = bytes.fromhex(Path(os.environ["SUBROUTER_SHADOW_HEALTH_KEY_FILE"]).read_text().strip())
 
 class Handler(BaseHTTPRequestHandler):
@@ -137,6 +143,8 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         environment["TEST_CANARY_WITNESS"] = str(self.canary_witness)
         environment["TEST_CHALLENGE_WITNESS"] = str(self.challenge_witness)
         environment["TEST_CANDIDATE_ADDR_WITNESS"] = str(self.candidate_addr_witness)
+        environment["TEST_CANDIDATE_SESSIONS_WITNESS"] = str(self.candidate_sessions_witness)
+        environment["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"] = str(self.candidate_cloud_config_witness)
         environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
         environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = "must-not-reach-callback"
         command = [
@@ -189,6 +197,12 @@ Path(os.environ["TEST_CALLBACK_ADDR_WITNESS"]).write_text(os.environ["SUBROUTER_
         self.assertEqual(len(challenges), 2)
         self.assertEqual(len(set(challenges)), 2)
         workspace = Path(self.workspace_witness.read_text())
+        sessions = Path(self.candidate_sessions_witness.read_text())
+        cloud_config = Path(self.candidate_cloud_config_witness.read_text())
+        self.assertTrue(sessions.is_relative_to(workspace))
+        self.assertTrue(cloud_config.is_relative_to(workspace))
+        self.assertFalse(sessions.exists())
+        self.assertFalse(cloud_config.exists())
         self.assertFalse(workspace.exists())
         self.assertFalse(_listening(port))
 
@@ -247,6 +261,8 @@ Path(os.environ["TEST_REPLACEMENT_WITNESS"]).write_text("replacement-ran")
                 "TEST_CANARY_WITNESS": str(self.canary_witness),
                 "TEST_CHALLENGE_WITNESS": str(self.challenge_witness),
                 "TEST_CANDIDATE_ADDR_WITNESS": str(self.candidate_addr_witness),
+                "TEST_CANDIDATE_SESSIONS_WITNESS": str(self.candidate_sessions_witness),
+                "TEST_CANDIDATE_CLOUD_CONFIG_WITNESS": str(self.candidate_cloud_config_witness),
                 "TEST_CALLBACK_ADDR_WITNESS": str(self.callback_addr_witness),
                 "TEST_PREPARE_ENTERED": str(prepare_entered),
                 "TEST_RELEASE_PREPARE": str(release_prepare),
@@ -465,6 +481,8 @@ time.sleep(60)
         environment["TEST_CANARY_WITNESS"] = str(self.canary_witness)
         environment["TEST_CHALLENGE_WITNESS"] = str(self.challenge_witness)
         environment["TEST_CANDIDATE_ADDR_WITNESS"] = str(self.candidate_addr_witness)
+        environment["TEST_CANDIDATE_SESSIONS_WITNESS"] = str(self.candidate_sessions_witness)
+        environment["TEST_CANDIDATE_CLOUD_CONFIG_WITNESS"] = str(self.candidate_cloud_config_witness)
         environment["TEST_CALLBACK_ADDR_WITNESS"] = str(self.callback_addr_witness)
         process = subprocess.Popen(
             [
@@ -538,6 +556,8 @@ time.sleep(60)
                 "TEST_CANARY_WITNESS": str(self.canary_witness),
                 "TEST_CHALLENGE_WITNESS": str(self.challenge_witness),
                 "TEST_CANDIDATE_ADDR_WITNESS": str(self.candidate_addr_witness),
+                "TEST_CANDIDATE_SESSIONS_WITNESS": str(self.candidate_sessions_witness),
+                "TEST_CANDIDATE_CLOUD_CONFIG_WITNESS": str(self.candidate_cloud_config_witness),
                 "TEST_CALLBACK_ADDR_WITNESS": str(self.callback_addr_witness),
             }
         )
@@ -632,6 +652,20 @@ time.sleep(60)
                         )
                         self.assertNotIn("must-not-escape", result.stdout + result.stderr)
                         self.assertFalse(self.workspace_witness.exists())
+
+    def test_external_mutation_serve_arguments_are_rejected_before_prepare(self) -> None:
+        for spelling in ("--bedrock-autobump", "-bedrock-autobump"):
+            with self.subTest(spelling=spelling):
+                serve_args = self.root / "serve-args.json"
+                serve_args.write_text(json.dumps([spelling]))
+                result = self._run(_free_port(), serve_args=serve_args)
+                self.assertEqual(result.returncode, 1)
+                evidence = json.loads(result.stdout)
+                self.assertEqual(
+                    evidence["failure"],
+                    "serve args JSON must not contain --bedrock-autobump; shadow rehearsals must not trigger external mutations",
+                )
+                self.assertFalse(self.workspace_witness.exists())
 
     def test_single_or_double_dash_address_override_is_rejected_before_prepare(self) -> None:
         for arguments in (["--addr", "0.0.0.0:1"], ["--addr=0.0.0.0:1"], ["-addr", "0.0.0.0:1"], ["-addr=0.0.0.0:1"]):

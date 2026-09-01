@@ -174,6 +174,10 @@ where one exists; both callbacks and the candidate inherit that environment.
 The Bedrock gateway currently has only `SUBROUTER_BEDROCK_GATEWAY_TOKEN`, which
 is still safer than a process argument. Keep every referenced credential file
 private and outside the disposable workspace so teardown does not remove it.
+The helper always injects a private `--sessions` path, pins
+`SUBROUTER_CLOUD_CONFIG` inside the disposable state directory, and removes
+inherited transcript-sync settings. It also rejects `--bedrock-autobump`, so a
+rehearsal cannot request a real external quota change.
 
 The helper creates its own one-run health key in the private workspace and gives
 only the candidate its file path. Each ownership probe sends a fresh random

@@ -45,6 +45,8 @@ PERSISTENT_SERVE_OPTIONS = (
     "transcript-azure-url",
 )
 
+SIDE_EFFECT_SERVE_OPTIONS = ("bedrock-autobump",)
+
 
 class ShadowError(Exception):
     pass
@@ -256,9 +258,13 @@ def _callback_environment(
 ) -> dict[str, str]:
     environment = dict(os.environ)
     environment.pop("SUBROUTER_SHADOW_HEALTH_KEY_FILE", None)
+    for name in tuple(environment):
+        if name.startswith("SUBROUTER_TRANSCRIPT_"):
+            environment.pop(name, None)
     environment.update(
         {
             "SUBROUTER_STATE_DIR": str(state_dir),
+            "SUBROUTER_CLOUD_CONFIG": str(state_dir / "cloud.json"),
             "SUBROUTER_SHADOW_WORKSPACE": str(workspace),
             "SUBROUTER_SHADOW_STATE_DIR": str(state_dir),
             "SUBROUTER_SHADOW_CANDIDATE_PATH": str(candidate),
@@ -339,6 +345,14 @@ def _load_serve_args(raw_path: str | None) -> list[str]:
                 _fail(
                     f"serve args JSON must not contain {option}; "
                     "shadow state, logs, and configuration must remain disposable"
+                )
+        for option_name in SIDE_EFFECT_SERVE_OPTIONS:
+            option = "--" + option_name
+            short_option = "-" + option_name
+            if argument in (option, short_option):
+                _fail(
+                    f"serve args JSON must not contain {option}; "
+                    "shadow rehearsals must not trigger external mutations"
                 )
     return parsed
 
@@ -526,7 +540,15 @@ def main() -> int:
         candidate_environment["SUBROUTER_SHADOW_HEALTH_KEY_FILE"] = str(shadow_health_key_file)
         with candidate_log.open("wb") as output:
             candidate_process = subprocess.Popen(
-                [str(pinned_candidate), "serve", "--addr", resolved_addr, *serve_args],
+                [
+                    str(pinned_candidate),
+                    "serve",
+                    "--addr",
+                    resolved_addr,
+                    "--sessions",
+                    str(state_dir / "sessions.json"),
+                    *serve_args,
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.STDOUT,
