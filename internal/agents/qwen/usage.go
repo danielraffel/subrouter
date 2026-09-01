@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -220,9 +221,16 @@ func callConsole(ctx context.Context, client *http.Client, config consoleConfig,
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		_, _ = io.CopyN(io.Discard, res.Body, 4096)
-		if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(res.Body, (1<<20)+1))
+		if res.StatusCode == http.StatusUnauthorized {
 			return ErrConsoleLoginRequired
+		}
+		if res.StatusCode == http.StatusForbidden && len(bodyBytes) <= 1<<20 {
+			var rejection any
+			if json.Unmarshal(bodyBytes, &rejection) == nil &&
+				containsConsoleErrorCode(rejection, "BailianGateway.Login.NotLogined") {
+				return ErrConsoleLoginRequired
+			}
 		}
 		return fmt.Errorf("Qwen Token Plan console returned HTTP %d", res.StatusCode)
 	}
@@ -367,6 +375,20 @@ func hasUsageField(object map[string]any) bool {
 }
 
 func findSubscriptionDetails(value any) (SubscriptionDetails, error) {
+	if details, ok, err := findSubscriptionDetailsByKeys(value, []string{"specCode", "spec_code"}, false); err != nil {
+		return SubscriptionDetails{}, err
+	} else if ok {
+		return details, nil
+	}
+	if details, ok, err := findSubscriptionDetailsByKeys(value, []string{"planName", "plan_name"}, true); err != nil {
+		return SubscriptionDetails{}, err
+	} else if ok {
+		return details, nil
+	}
+	return SubscriptionDetails{}, fmt.Errorf("Qwen Token Plan subscription response contained no plan")
+}
+
+func findSubscriptionDetailsByKeys(value any, planKeys []string, requireKnownPersonalTier bool) (SubscriptionDetails, bool, error) {
 	queue := []any{value}
 	for len(queue) > 0 {
 		value = queue[0]
@@ -380,10 +402,14 @@ func findSubscriptionDetails(value any) (SubscriptionDetails, error) {
 			if code == "" {
 				code = "unknown error"
 			}
-			return SubscriptionDetails{}, fmt.Errorf("Qwen Token Plan console error: %s", code)
+			return SubscriptionDetails{}, false, fmt.Errorf("Qwen Token Plan console error: %s", code)
 		}
-		spec := firstSubscriptionString(object, "specCode", "spec_code", "planName", "plan_name")
+		spec := firstSubscriptionString(object, planKeys...)
 		if spec != "" {
+			if requireKnownPersonalTier && (!subscriptionShaped(object) || !knownPersonalTier(spec)) {
+				queue = appendConsoleChildren(queue, object)
+				continue
+			}
 			status := firstSubscriptionString(object, "status")
 			instanceCode := firstSubscriptionString(object, "instanceCode", "instance_code")
 			return SubscriptionDetails{
@@ -392,11 +418,29 @@ func findSubscriptionDetails(value any) (SubscriptionDetails, error) {
 				InstanceCode: instanceCode,
 				StartsAt:     millisTime(object["startTime"]),
 				ExpiresAt:    millisTime(object["endTime"]),
-			}, nil
+			}, true, nil
 		}
 		queue = appendConsoleChildren(queue, object)
 	}
-	return SubscriptionDetails{}, fmt.Errorf("Qwen Token Plan subscription response contained no plan")
+	return SubscriptionDetails{}, false, nil
+}
+
+func subscriptionShaped(object map[string]any) bool {
+	for _, key := range []string{"status", "instanceCode", "instance_code", "startTime", "endTime"} {
+		if _, ok := object[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func knownPersonalTier(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "lite", "standard", "pro", "max":
+		return true
+	default:
+		return false
+	}
 }
 
 func firstSubscriptionString(object map[string]any, keys ...string) string {
@@ -411,7 +455,13 @@ func firstSubscriptionString(object map[string]any, keys ...string) string {
 }
 
 func appendConsoleChildren(queue []any, object map[string]any) []any {
-	for _, child := range object {
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		child := object[key]
 		switch child := child.(type) {
 		case map[string]any:
 			queue = append(queue, child)
