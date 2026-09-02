@@ -2814,7 +2814,6 @@ func displayUsageRowsPerGroup(out io.Writer, rows []srUsageRow) {
 
 func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNumbers bool, colored bool) {
 	fmt.Fprintln(out)
-	identityCounts := map[string]int{}
 	qwenShortWindow := map[string]bool{}
 	qwenLongWindow := map[string]bool{}
 	for i := range rows {
@@ -2823,9 +2822,6 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			continue
 		}
 		group := usageProviderLabel(*row)
-		if row.accountIdentity != "" {
-			identityCounts[group+"\x00"+row.accountIdentity]++
-		}
 		if usageGridShortWindowCell(*row).Text != "" {
 			qwenShortWindow[group] = true
 		}
@@ -2838,11 +2834,13 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			group := usageProviderLabel(rows[i])
 			rows[i].showShortWindow = qwenShortWindow[group]
 			rows[i].showLongWindow = qwenLongWindow[group]
+			// The API-key account is the routing identity and must remain the
+			// primary label.  Console identity is auxiliary metadata: it may be
+			// shared by several keys and must never make distinct pool members
+			// appear to be one account.
+			rows[i].displayAccount = displayUsageSavedAccountName(rows[i])
 			if rows[i].accountIdentity != "" {
-				rows[i].displayAccount = rows[i].accountIdentity
-				if identityCounts[group+"\x00"+rows[i].accountIdentity] > 1 {
-					rows[i].displayAccount += " (" + displayUsageSavedAccountName(rows[i]) + ")"
-				}
+				rows[i].displayAccount += " (console: " + rows[i].accountIdentity + ")"
 			}
 		}
 	}
