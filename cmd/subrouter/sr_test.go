@@ -4133,7 +4133,7 @@ func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
 	rankUsageRows(rows)
 	displayUsageRows(&out, rows, false)
 	text := out.String()
-	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "first@example.com", "second@example.com"} {
+	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "team-a", "team-b", "console:"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Qwen status should show %q:\n%s", want, text)
 		}
@@ -4161,16 +4161,16 @@ func TestQwenStatusOmitsUnreportedQuotaWindow(t *testing.T) {
 	}
 }
 
-func TestQwenStatusDisambiguatesSharedLoginWithSavedLabel(t *testing.T) {
+func TestQwenStatusKeepsRoutingLabelsWithSharedConsoleLogin(t *testing.T) {
 	t.Setenv("COLUMNS", "160")
 	var out bytes.Buffer
 	displayUsageRows(&out, []srUsageRow{
 		{email: "qwen-token:large", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
 		{email: "qwen-token:small", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "same@example.com"},
 	}, false)
-	for _, want := range []string{"same@example.com (large)", "same@example.com (small)"} {
+	for _, want := range []string{"large (console: same@example.com)", "small (console: same@example.com)"} {
 		if !strings.Contains(out.String(), want) {
-			t.Fatalf("duplicate Qwen login should retain saved-label disambiguation %q:\n%s", want, out.String())
+			t.Fatalf("Qwen status should preserve unique routing labels %q:\n%s", want, out.String())
 		}
 	}
 }
