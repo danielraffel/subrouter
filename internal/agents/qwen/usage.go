@@ -348,6 +348,9 @@ func findUsagePayload(value any) (usagePayload, error) {
 		}
 		if success, ok := object["success"].(bool); ok && !success {
 			code, _ := object["errorCode"].(string)
+			if code == "BailianGateway.Login.NotLogined" {
+				return usagePayload{}, ErrConsoleLoginRequired
+			}
 			if code == "" {
 				code = "unknown error"
 			}
@@ -403,6 +406,9 @@ func findSubscriptionDetailsByKeys(value any, planKeys []string, requireKnownPer
 		}
 		if success, ok := object["success"].(bool); ok && !success {
 			code, _ := object["errorCode"].(string)
+			if code == "BailianGateway.Login.NotLogined" {
+				return SubscriptionDetails{}, ErrConsoleLoginRequired
+			}
 			if code == "" {
 				code = "unknown error"
 			}

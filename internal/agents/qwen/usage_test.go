@@ -107,6 +107,22 @@ func TestConsoleRequestClassifiesExpiredLoginResponse(t *testing.T) {
 	}
 }
 
+func TestUsageAndSubscriptionParsersClassifyEmbeddedExpiredLogin(t *testing.T) {
+	for name, parse := range map[string]func(any) error{
+		"usage":        func(value any) error { _, err := findUsagePayload(value); return err },
+		"subscription": func(value any) error { _, err := findSubscriptionDetails(value); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := parse(map[string]any{"data": map[string]any{
+				"success": false, "errorCode": "BailianGateway.Login.NotLogined",
+			}})
+			if !errors.Is(err, ErrConsoleLoginRequired) {
+				t.Fatalf("error = %v, want ErrConsoleLoginRequired", err)
+			}
+		})
+	}
+}
+
 func TestConsoleRequestClassifiesUnauthorizedHTTPAsExpiredLogin(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
