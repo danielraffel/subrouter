@@ -595,20 +595,15 @@ func TestAntigravityNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T
 	}
 }
 
-func TestAntigravityHelpDoesNotAdvertiseUnavailableRouting(t *testing.T) {
+func TestAntigravityHelpDescribesRoutedAndDirectBoundaries(t *testing.T) {
 	for name, text := range map[string]string{
 		"sr help":         srHelp,
 		"subrouter help":  usageText("subrouter"),
 		"management help": antigravityManagementHelp,
 		"routing notice":  antigravityProxyHelp,
 	} {
-		for _, stale := range []string{"Launch pooled Antigravity", "Run agy through Subrouter", "Omit --account for pooled failover", "agy proxy"} {
-			if strings.Contains(text, stale) {
-				t.Fatalf("%s still advertises unsupported AGY routing with %q", name, stale)
-			}
-		}
-		if name != "sr help" && name != "subrouter help" && !strings.Contains(strings.ToLower(text), "keychain") && !strings.Contains(strings.ToLower(text), "transparent proxy hook") {
-			t.Fatalf("%s does not explain the native AGY account boundary", name)
+		if name != "sr help" && name != "subrouter help" && !strings.Contains(strings.ToLower(text), "pooled") {
+			t.Fatalf("%s does not explain pooled AGY routing", name)
 		}
 	}
 }
