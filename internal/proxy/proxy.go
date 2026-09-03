@@ -7215,6 +7215,16 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	case accounts.ProviderKimi:
 		limited, exhausted, err = responseKimiUsageLimit(response)
 		return limited, exhausted, false, err
+	case accounts.ProviderCodex:
+		// Codex can return a headerless 429 for a short request burst. Treat it
+		// as request-scoped failover, but do not poison the account scheduler;
+		// only an explicit usage_limit_reached payload should mark exhaustion.
+		if response.StatusCode == http.StatusTooManyRequests {
+			return true, false, false, nil
+		}
+		if response.StatusCode == http.StatusUnauthorized {
+			return true, true, true, nil
+		}
 	case accounts.ProviderAntigravity:
 		// Cloud Code uses 429 for both account quota exhaustion and short-lived
 		// allocation throttles. Either way another OAuth account is a safe

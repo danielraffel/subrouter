@@ -45,3 +45,12 @@ func TestAntigravity401TriggersCredentialFailover(t *testing.T) {
 		t.Fatalf("AGY 401 classification = limited %v exhausted %v credential %v err %v", limited, exhausted, credentialFailure, err)
 	}
 }
+
+func TestCodexHeaderless429FailsOverWithoutExhaustingAccount(t *testing.T) {
+	response := &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error"}}`))}
+	transport := usageLimitRetryTransport{provider: accounts.ProviderCodex}
+	limited, exhausted, credentialFailure, err := transport.responseUsageLimited(response)
+	if err != nil || !limited || exhausted || credentialFailure {
+		t.Fatalf("Codex headerless 429 classification = limited %v exhausted %v credential %v err %v", limited, exhausted, credentialFailure, err)
+	}
+}
