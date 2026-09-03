@@ -169,6 +169,11 @@ func TestLocalStoreAttestedClientRejectsUnsafeSocketBeforeCredential(t *testing.
 }
 
 func TestLocalDataClientRejectsPrivateSocketReplacementAfterBinding(t *testing.T) {
+	// This test deliberately supplies its own binding and socket. Do not let a
+	// developer/CI daemon's explicit state authority redirect the client before
+	// it reaches the replacement-identity assertion.
+	t.Setenv("SUBROUTER_STATE_DIR", "")
+	t.Setenv("SUBROUTER_LOCAL_DATA_SOCKET", "")
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
 	initializeLocalDataTestStore(t, store)
