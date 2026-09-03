@@ -53,13 +53,11 @@ must leave native mode serialized and server-side pooling unchanged.
 Plain `agy` remains direct and is outside Subrouter's managed profile lock.
 
 Current acceptance note: a disposable shadow run with two verified OAuth
-profiles reached the real AGY Cloud Code endpoints and exercised account
-failover. Both profiles' Gemini generations were rejected upstream with
-`429 RESOURCE_EXHAUSTED` even though the weekly summary showed headroom, so a
-successful routed generation is not claimed yet. Native Cloud Code generation
-also carries a top-level `project` bound to the OAuth identity. The candidate
-relay discovers and caches the selected account's project before the initial
-attempt (and again for failover), rewriting only that top-level field. This is
-covered by handler-level and one-shot-body tests; cross-account generation is
-still not accepted until a real two-account shadow canary proves a 2xx
-generation.
+profiles reached the real AGY Cloud Code endpoints. Using the consumer
+`daily-cloudcode-pa.googleapis.com` upstream, pinned launches for both
+profiles and a bare pooled launch each returned a real 2xx Gemini generation.
+The prior `cloudcode-pa.googleapis.com` default produced misleading upstream
+`429 RESOURCE_EXHAUSTED` responses. Native Cloud Code generation also carries
+a top-level `project` bound to the OAuth identity. The relay discovers and
+caches the selected account's project when available, rewriting only that
+top-level field; valid control responses without a project remain usable.
