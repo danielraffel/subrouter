@@ -766,6 +766,22 @@ func (r srRunner) requireNativeProxyDataPlaneWithClient(ctx context.Context, roo
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 		return errors.New("selected router requires session-lease or data-plane authentication that native proxy launchers do not support; no vendor CLI was started")
 	}
+	// A provider-specific server may intentionally return 503 from its generic
+	// root when another provider has no accounts (for example an AGY-only
+	// shadow). Use the authenticated health endpoint as the readiness probe in
+	// that case; never treat the 503 itself as ready.
+	healthURL := strings.TrimRight(root, "/") + "/_subrouter/health"
+	healthRequest, healthErr := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if healthErr == nil {
+		healthRequest.Header.Set("Authorization", "Bearer "+strings.TrimSpace(proxyToken))
+		if healthResponse, doErr := secured.Do(healthRequest); doErr == nil {
+			defer healthResponse.Body.Close()
+			_, _ = io.Copy(io.Discard, io.LimitReader(healthResponse.Body, 4<<10))
+			if healthResponse.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+	}
 	return fmt.Errorf("selected router data-plane preflight returned HTTP %d; no vendor CLI was started", response.StatusCode)
 }
 
