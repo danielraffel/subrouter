@@ -89,7 +89,12 @@ func (s *Server) antigravityProject(ctx context.Context, account accounts.Accoun
 		project = strings.TrimSpace(text)
 	}
 	if project == "" {
-		return "", errors.New("AGY project lookup returned no project id")
+		// Individual/free AGY accounts may legitimately return a successful
+		// loadCodeAssist response without a companion project. The native CLI
+		// can still provide its project in the generation envelope; preserve
+		// that value rather than turning valid control-plane responses into a
+		// relay 502. Callers rewrite only when a replacement project is known.
+		return "", nil
 	}
 	antigravityProjectStore.Lock()
 	if antigravityProjectStore.values == nil {
