@@ -599,7 +599,9 @@ The Antigravity CLI exposes one fixed Keychain login and no account selector.
 Subrouter turns that slot into an explicit import source: sign plain `agy` into
 an account, run `sr agy add <label>`, and repeat for each account. Each import
 is validated by an OAuth refresh and stored as an isolated, independently
-refreshable router profile; the vendor Keychain item is never changed. Direct
+refreshable router profile; the vendor Keychain item is never changed by import.
+`sr agy` launches native AGY using a pooled local profile, while
+`sr agy --account <label-or-email>` pins one process. Direct
 `GEMINI_API_KEY` and Application Default Credentials are separate supported
 authentication paths, not additional selectable OAuth profiles
 ([install](https://antigravity.google/docs/cli/install/),
@@ -607,12 +609,14 @@ authentication paths, not additional selectable OAuth profiles
 [enterprise](https://antigravity.google/docs/enterprise/)).
 
 Plain `agy` remains the vendor's supported direct CLI. The current AGY release
-does not expose a transparent proxy hook: explicitly setting its only endpoint
-override changes the vendor request behavior and fails even when that override
-names Google's normal endpoint. `sr agy` and `sr antigravity` therefore fail
-closed with that explanation rather than launching a session that looks routed
-but cannot generate. Only the explicit `sr agy add` command transfers a
-validated credential to the selected self-hosted router through its protected
+does not expose a reliable transparent proxy hook: explicitly setting its only
+endpoint override changes vendor behavior even when that override names
+Google's normal endpoint. Native `sr agy` therefore uses process-scoped
+Keychain profile switching rather than endpoint rewriting. The selected
+identity is verified after switching, and the prior slot is restored on exit;
+pooled selection applies between launches, never by changing an existing
+process. Only the explicit `sr agy add` command transfers a validated
+credential to the selected self-hosted router through its protected
 account-import endpoint. `sr status` reports each managed profile as
 `ready`, `active`, or `error`. When Google's read-only OAuth services expose
 telemetry for that exact profile, it also reports the provider-verified email
@@ -625,8 +629,7 @@ without guessing it into a 5-hour or weekly cadence. Telemetry is
 bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
 managed profile to an unrelated host language-server login. The server adapter
 retains isolated account selection, family-aware scheduling, OAuth refresh, and
-hard-pin semantics for a future compatible client, but current AGY CLI pooling
-and pinning are intentionally unavailable. Plain `agy` uses the current
+hard-pin semantics for compatible clients. Plain `agy` uses the current
 Keychain login directly.
 
 For backward compatibility, a router with no managed Antigravity profiles

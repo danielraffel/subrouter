@@ -95,6 +95,34 @@ func ParseCredential(body []byte, source string, _ time.Time) (CredentialInfo, e
 	return credential, nil
 }
 
+// EncodeCredential returns the Keychain blob format written by the current
+// AGY CLI. It is used only by the native profile switcher; callers must keep
+// the returned bytes in memory and never place them in command arguments or
+// logs.
+func EncodeCredential(credential CredentialInfo) ([]byte, error) {
+	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" {
+		return nil, errors.New("Antigravity OAuth credential is incomplete")
+	}
+	payload := credentialPayload{
+		AccessToken: credential.AccessToken, RefreshToken: credential.RefreshToken,
+		IDToken: credential.IDToken, TokenType: credential.TokenType, Scope: credential.Scope,
+	}
+	if !credential.ExpiresAt.IsZero() {
+		payload.Expiry = credential.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	body, err := json.Marshal(struct {
+		Token      credentialPayload `json:"token"`
+		AuthMethod string            `json:"auth_method"`
+	}{Token: payload, AuthMethod: "oauth"})
+	if err != nil {
+		return nil, fmt.Errorf("encode Antigravity credential: %w", err)
+	}
+	encoded := make([]byte, len(keyringBase64Prefix)+base64.StdEncoding.EncodedLen(len(body)))
+	copy(encoded, keyringBase64Prefix)
+	base64.StdEncoding.Encode(encoded[len(keyringBase64Prefix):], body)
+	return encoded, nil
+}
+
 // expiresAt resolves an absolute expiry from whichever field the writer used. An
 // unparseable expiry is an error rather than a zero value: silently treating a
 // live token as expired would burn a refresh on every request.

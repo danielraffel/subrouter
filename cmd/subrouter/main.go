@@ -1811,7 +1811,7 @@ Usage:
                            Launch Claude Code on AWS Bedrock via the server (Fable 5)
   %[1]s claude-direct [claude args...]
                            Launch Claude Code directly on Anthropic (bypass subrouter)
-  %[1]s agy                Manage imported Antigravity accounts; routed launch is unavailable
+  %[1]s agy                Launch pooled native AGY via the macOS Keychain (use --account to pin; plain agy stays direct)
   %[1]s agy add <label>    Import the current plain agy OAuth login as an isolated account
   %[1]s agy list           List isolated Antigravity accounts
   %[1]s agy remove <label> Remove one isolated Antigravity account

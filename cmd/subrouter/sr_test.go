@@ -2231,8 +2231,9 @@ func TestHelpDistinguishesNativeProxyLaunchersFromDirectCLIs(t *testing.T) {
 				t.Errorf("%s help omits %q", name, command)
 			}
 		}
-		if strings.Contains(help, "agy proxy") || !strings.Contains(help, "routed launch is unavailable") && !strings.Contains(help, "routing unavailable") {
-			t.Errorf("%s help does not fail closed for AGY routing", name)
+		nativeCommand := name + " agy"
+		if strings.Contains(help, "agy proxy") || !strings.Contains(help, nativeCommand) || !strings.Contains(strings.ToLower(help), "keychain") {
+			t.Errorf("%s help does not describe native AGY profile routing", name)
 		}
 		if !strings.Contains(help, "Gemini profiles (routing scaffold only)") {
 			t.Errorf("%s help does not disclose Gemini's scaffold-only state", name)

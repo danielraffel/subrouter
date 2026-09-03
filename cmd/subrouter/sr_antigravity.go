@@ -1,27 +1,40 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	baseaccount "github.com/manaflow-ai/subrouter/account"
 	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
-const antigravityManagementHelp = `Usage: sr agy add <label>
+const antigravityManagementHelp = `Usage: sr agy [--account [label-or-email]] [agy args...]
+       sr agy add <label>
        sr agy list
        sr agy remove <label>
 
-Add imports the current plain 'agy' OAuth login into an isolated Subrouter profile.
-Repeat after signing plain 'agy' into each account. The Keychain item is never changed.
+Bare 'sr agy' launches native AGY using a pooled local profile. Use --account to
+pin one profile for this process; bare --account opens a picker. Each process
+keeps its startup identity and the Keychain slot is restored on exit.
+Use 'sr agy add <label>' to import the current plain 'agy' OAuth login into an
+isolated local profile. Repeat after signing plain 'agy' into each account.
 The label is an alias for selecting/removing the profile; it does not change or
 assert the Google identity in the credential. Status reports each verified identity,
 plan, and model-family quota. The current
-agy CLI has no transparent proxy hook, so routed pooling and pinning are unavailable.
-Use plain 'agy' for direct OAuth access.
+agy CLI has one global Keychain slot, so native profile launches are serialized.
+Use plain 'agy' for direct un-managed OAuth access.
 `
 
 func (r srRunner) antigravityManage(ctx context.Context, args []string) error {
@@ -92,6 +105,124 @@ func (r srRunner) antigravityManage(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown Antigravity command %q; use add, list, or remove", args[0])
 	}
+}
+
+func (r srRunner) launchAntigravityNative(ctx context.Context, args []string) error {
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("native AGY profile pooling requires macOS Keychain; use plain agy on %s", runtime.GOOS)
+	}
+	selector, picker, vendorArgs, err := parseAntigravityNativeArgs(args)
+	if err != nil {
+		return err
+	}
+	store := (&agentantigravity.Store{}).ForServing()
+	profiles, err := store.ListAccounts(ctx)
+	if err != nil {
+		return fmt.Errorf("list local AGY profiles: %w", err)
+	}
+	managed := make([]baseaccount.Account, 0, len(profiles))
+	for _, profile := range profiles {
+		if agentantigravity.IsManagedAccountID(profile.ID) {
+			managed = append(managed, profile)
+		}
+	}
+	if len(managed) == 0 {
+		return fmt.Errorf("no local AGY profiles; sign plain 'agy' into an account, then run 'sr agy add <label>'")
+	}
+	chosen, err := chooseAntigravityProfile(r.in, r.out, managed, selector, picker)
+	if err != nil {
+		return err
+	}
+	credential, ok, err := store.ReadManagedCredential(chosen.Label)
+	if err != nil || !ok {
+		if err == nil {
+			err = fmt.Errorf("profile is missing its credential")
+		}
+		return fmt.Errorf("read local AGY profile %q: %w", chosen.Label, err)
+	}
+	if _, err = store.RefreshAccount(ctx, r.client, chosen); err != nil {
+		return fmt.Errorf("refresh local AGY profile %q: %w", chosen.Label, err)
+	}
+	// RefreshAccount returns an account view; read the durable credential again
+	// so a rotated refresh token is what gets installed in the native slot.
+	credential, ok, err = store.ReadManagedCredential(chosen.Label)
+	if err != nil || !ok {
+		return fmt.Errorf("read refreshed local AGY profile %q: %w", chosen.Label, err)
+	}
+	lockPath := filepath.Join(storepath.StateDir(), "antigravity", "native-keychain.lock")
+	lease, err := agentantigravity.AcquireNativeProfile(ctx, lockPath, credential)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if restoreErr := lease.Restore(context.Background()); restoreErr != nil {
+			fmt.Fprintf(r.errOut, "warning: restore native AGY Keychain profile: %v\n", restoreErr)
+		}
+	}()
+	active, activeOK, err := agentantigravity.ReadLocalCredential(ctx, time.Now())
+	if err != nil || !activeOK || active.RefreshToken != credential.RefreshToken {
+		return fmt.Errorf("native AGY identity verification failed for %q; no vendor process started", chosen.Label)
+	}
+	command, err := exec.LookPath("agy")
+	if err != nil {
+		return fmt.Errorf("find agy: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, command, vendorArgs...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	fmt.Fprintf(r.out, "Launching AGY as %s (native profile is pinned for this process).\n", chosen.Label)
+	return cmd.Run()
+}
+
+func parseAntigravityNativeArgs(args []string) (selector string, picker bool, vendorArgs []string, err error) {
+	vendorArgs = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--account":
+			picker = true
+			if i+1 < len(args) && args[i+1] != "--" && !strings.HasPrefix(args[i+1], "-") {
+				selector, picker, i = args[i+1], false, i+1
+			}
+		case strings.HasPrefix(arg, "--account="):
+			selector = strings.TrimSpace(strings.TrimPrefix(arg, "--account="))
+			if selector == "" {
+				return "", false, nil, errors.New("--account requires a profile selector or no value for the picker")
+			}
+		default:
+			vendorArgs = append(vendorArgs, arg)
+		}
+	}
+	return selector, picker, vendorArgs, nil
+}
+
+func chooseAntigravityProfile(in io.Reader, out io.Writer, profiles []baseaccount.Account, selector string, picker bool) (baseaccount.Account, error) {
+	if selector != "" {
+		for _, profile := range profiles {
+			if strings.EqualFold(profile.Label, selector) || strings.EqualFold(profile.Email, selector) || strings.EqualFold(profile.ID, selector) {
+				return profile, nil
+			}
+		}
+		return baseaccount.Account{}, fmt.Errorf("no local AGY profile matches %q", selector)
+	}
+	if !picker {
+		return profiles[0], nil
+	}
+	for i, profile := range profiles {
+		label := profile.Email
+		if strings.TrimSpace(label) == "" {
+			label = profile.Label
+		}
+		fmt.Fprintf(out, "%d) %s\n", i+1, label)
+	}
+	answer, err := promptLine(out, bufio.NewReader(in), "Use AGY account (#): ")
+	if err != nil {
+		return baseaccount.Account{}, err
+	}
+	index, err := strconv.Atoi(strings.TrimSpace(answer))
+	if err != nil || index < 1 || index > len(profiles) {
+		return baseaccount.Account{}, errors.New("invalid AGY account selection")
+	}
+	return profiles[index-1], nil
 }
 
 func (r srRunner) antigravityRemote(ctx context.Context, server srServerConfig, args []string) error {

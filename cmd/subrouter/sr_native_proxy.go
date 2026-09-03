@@ -100,10 +100,10 @@ var (
 
 func (r srRunner) antigravityCommand(ctx context.Context, args []string) error {
 	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprint(r.out, antigravityProxyHelp)
+		fmt.Fprint(r.out, antigravityManagementHelp)
 		return nil
 	}
-	return errors.New("routed Antigravity is unavailable: the current agy CLI has no transparent proxy hook; use plain 'agy' for direct OAuth access")
+	return r.launchAntigravityNative(ctx, args)
 }
 
 func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {

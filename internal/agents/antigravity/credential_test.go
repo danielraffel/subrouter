@@ -265,6 +265,21 @@ func TestParseCredentialUnwrapsTheKeyringEnvelope(t *testing.T) {
 	}
 }
 
+func TestEncodeCredentialRoundTripsCurrentKeyringEnvelope(t *testing.T) {
+	want := CredentialInfo{AccessToken: "access", RefreshToken: "refresh", IDToken: "id", TokenType: "Bearer", Scope: "scope", ExpiresAt: time.Date(2026, 9, 3, 1, 2, 3, 0, time.UTC)}
+	body, err := EncodeCredential(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ParseCredential(body, "test", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken || got.IDToken != want.IDToken || got.TokenType != want.TokenType || got.Scope != want.Scope || !got.ExpiresAt.Equal(want.ExpiresAt) {
+		t.Fatalf("round trip = %+v, want %+v", got, want)
+	}
+}
+
 // stubOAuthClients fixes the candidate list for a refresh test and clears the
 // working-pair cache, restoring both afterwards.
 func stubOAuthClients(t *testing.T, clients ...oauthClient) {

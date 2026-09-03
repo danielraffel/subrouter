@@ -2081,11 +2081,12 @@ func TestKimiExplicitSessionIdentityIsStableAcrossWorkspaces(t *testing.T) {
 	}
 }
 
-func TestAntigravityProxyFailsClosedWithoutTransparentProxyHook(t *testing.T) {
+func TestAntigravityNativeLaunchRequiresAnImportedProfile(t *testing.T) {
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
 	runner := srRunner{out: io.Discard}
 	for _, args := range [][]string{nil, {"proxy"}, {"--account", "work"}, {"proxy", "--account", "work"}} {
 		err := runner.antigravityCommand(context.Background(), args)
-		if err == nil || !strings.Contains(err.Error(), "no transparent proxy hook") {
+		if err == nil || !strings.Contains(err.Error(), "no local AGY profiles") {
 			t.Fatalf("sr agy args %q error = %v", args, err)
 		}
 	}

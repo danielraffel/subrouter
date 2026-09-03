@@ -607,8 +607,8 @@ func TestAntigravityHelpDoesNotAdvertiseUnavailableRouting(t *testing.T) {
 				t.Fatalf("%s still advertises unsupported AGY routing with %q", name, stale)
 			}
 		}
-		if !strings.Contains(strings.ToLower(text), "unavailable") && !strings.Contains(strings.ToLower(text), "transparent proxy hook") {
-			t.Fatalf("%s does not explain unavailable AGY routing", name)
+		if name != "sr help" && name != "subrouter help" && !strings.Contains(strings.ToLower(text), "keychain") && !strings.Contains(strings.ToLower(text), "transparent proxy hook") {
+			t.Fatalf("%s does not explain the native AGY account boundary", name)
 		}
 	}
 }
