@@ -14,7 +14,7 @@ its ordinary name uses Subrouter.
 | Qwen Coding Plan API key | OpenAI-compatible client at `/qwen/v1` | Labeled Coding Plan keys | Client auth removed; selected bearer added | Plain `qwen` with its normal provider | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live generation canary recorded |
 | Qwen Token Plan, OpenAI protocol | `sr qwen` (`proxy` alias); `/qwen-token/v1` | Labeled Token Plan keys; optional per-key console credential is telemetry only | Client auth removed; selected plan bearer added | Plain `qwen` | Pooled key failover by default; `--account` is a hard per-launch pin; pool shared with Anthropic route | Vendor Lite/Standard/Pro, reported 5h/7d windows, login-needed state, active/recommended | H1, H2, H3 | Account and console status user-tested; native generation canary required after deployment |
 | Qwen Token Plan, Anthropic protocol | Anthropic client at `/qwen-anthropic` | Same Token Plan pool as OpenAI route | Client auth removed; selected plan bearer and Anthropic version added | Direct vendor Anthropic endpoint | Same sticky account and exhaustion state as `/qwen-token` | Same shared account and console telemetry | H1, H2 | No live generation canary recorded |
-| Antigravity / AGY OAuth | `sr agy` native launcher; server route remains `/antigravity` | Isolated profiles explicitly imported from the CLI's fixed Keychain slot with `sr agy add <label>` | Native launcher installs one verified profile at startup; server adapter replaces client auth with the selected router OAuth bearer | Plain `agy` | Native launches are serialized and process-pinned; pooled selection/failover applies between launches, while server requests retain pooled family-aware failover and hard pins | Verified email and plan when exposed; independent Gemini and Claude/GPT quota families; ready/active/error | H1, H2, H4; native profile parser/switch tests | Two live OAuth identities, identity separation, quota/status, and server route tested; native Keychain launch canary pending |
+| Antigravity / AGY OAuth | `sr agy` routed native launcher; server route `/antigravity` | Isolated server OAuth accounts imported with `sr agy add <label>` | `CLOUD_CODE_URL` points AGY at a short-lived local relay; relay replaces client auth with the selected router OAuth bearer | Plain `agy` | Server-side pooled selection/failover is per session and model-family aware; `--account` is a hard pin | Verified email and plan when exposed; independent Gemini and Claude/GPT quota families; ready/active/error | H1, H2, H3, H4 | Shadow proved two identities and server requests; routed native AGY canary required on Darwin |
 | Grok API key | OpenAI-compatible client at `/grok/v1` | Labeled xAI keys | Client auth removed; selected bearer added | Direct xAI URL | Per session; key failover | Key health/model count; quota not inferred | H1, H2 | No live-account canary recorded |
 | Grok OAuth subscription | OpenAI-compatible client at `/grok/v1` | Router-managed Grok OAuth credential | Client auth removed; OAuth bearer plus CLI subscription headers added | Direct Grok CLI | Sticky session; current OAuth source is one login, while API keys can remain alternates | Stored/auth error and active session; no quota claim | H1, H4 | No live-account canary recorded |
 | OpenRouter API key | OpenAI-compatible client at `/openrouter/v1` | Labeled OpenRouter keys | Client auth removed; selected bearer added | Direct OpenRouter URL | Per session; key failover | Key health and vendor credit data when `/key` exposes it | H1, H2 | No auditable in-repository live canary recorded |
@@ -71,13 +71,13 @@ run when an existing system policy is configured rather than masking that
 policy. The overlay disables Qwen's `/auth` and `/model` provider switches and
 shadows direct Alibaba credentials with non-secret process sentinels.
 
-AGY exposes only `CLOUD_CODE_URL` as an endpoint override, and setting it changes
-vendor behavior even when it names the normal Google endpoint. Native `sr agy`
-therefore uses AGM-style process-scoped Keychain profile switching rather than
-rewriting the endpoint. Imports, identity verification, and read-only status
-remain available through the same managed inventory. If a native launch is
-interrupted by a hard kill, `sr agy recover` replays the durable swap journal
-before the next launch; native launches remain serialized.
+AGY exposes `CLOUD_CODE_URL` as a supported endpoint override. `sr agy` uses
+that override to send Cloud Code requests through a short-lived local relay;
+the relay injects the server-selected isolated OAuth credential, so account
+pooling, quota-aware stickiness, refresh, and bounded failover work like the
+other routed clients. Imports, identity verification, and read-only status
+remain available through the same managed inventory. The local AGY login is
+only needed for CLI startup; plain `agy` remains direct and unaffected.
 
 Pooled native-launcher account affinity for new sessions is
 provider-and-working-directory scoped. Kimi's workspace-relative `--continue`

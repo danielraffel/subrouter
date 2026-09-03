@@ -1,24 +1,23 @@
-# Native Antigravity (AGY) profiles
+# Antigravity (AGY) routed profiles
 
-Subrouter supports native AGY OAuth profiles on macOS without rewriting AGY's
-endpoint. The vendor keeps one global Keychain item (`service=gemini`), so
-Subrouter switches that item only for a launched process, verifies the selected
-credential, holds a cross-process lock, and restores the previous opaque value
-when the process exits.
+Subrouter supports pooled AGY OAuth through AGY's supported `CLOUD_CODE_URL`
+override. `sr agy` starts the normal AGY CLI but sends its Cloud Code requests
+through a short-lived local relay; the server selects and authenticates the
+isolated account. Plain `agy` remains direct and is not modified.
 
 ## Add and launch profiles
 
 1. Sign plain `agy` into one Google account.
-2. Run `sr server use local`, then `sr agy add <label>`.
+2. Run `sr agy add <label>` with the intended server selected.
 3. Sign plain `agy` into the next account and repeat with a different label.
 4. Run `sr status` and confirm each verified email appears as its own profile.
 5. Run `sr agy` for deterministic pooled selection, or
    `sr agy --account <label-or-email>` to pin a process.
 
-Native profile selection is between launches. An existing AGY process is never
-migrated to another identity, and native launches are serialized because the
-vendor slot is global. Server-side `/antigravity` OAuth routing is the option
-for parallel account-pooled requests.
+`sr agy` without `--account` pools the imported server accounts, retaining
+session affinity and failing over bounded authentication/rate-limit errors.
+`sr agy --account <label-or-email>` hard-pins one account. The local AGY login
+is used only to pass the CLI's startup check; it is not the routed identity.
 
 ## Recovery and acceptance evidence
 
