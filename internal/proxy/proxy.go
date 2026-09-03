@@ -7222,6 +7222,11 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 		if response.StatusCode == http.StatusTooManyRequests {
 			return true, true, false, nil
 		}
+		if response.StatusCode == http.StatusUnauthorized {
+			// An expired/revoked AGY OAuth access token should be refreshed and,
+			// if refresh cannot repair it, skipped in favor of another profile.
+			return true, true, true, nil
+		}
 		return false, false, false, nil
 	}
 	// API-key providers commonly use a plain 429 for either account credit

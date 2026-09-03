@@ -36,3 +36,12 @@ func TestAntigravity429TriggersAccountFailover(t *testing.T) {
 		t.Fatalf("AGY 429 classification = limited %v exhausted %v credential %v err %v", limited, exhausted, credentialFailure, err)
 	}
 }
+
+func TestAntigravity401TriggersCredentialFailover(t *testing.T) {
+	response := &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader(`{"error":"invalid_token"}`))}
+	transport := usageLimitRetryTransport{provider: accounts.ProviderAntigravity}
+	limited, exhausted, credentialFailure, err := transport.responseUsageLimited(response)
+	if err != nil || !limited || !exhausted || !credentialFailure {
+		t.Fatalf("AGY 401 classification = limited %v exhausted %v credential %v err %v", limited, exhausted, credentialFailure, err)
+	}
+}
