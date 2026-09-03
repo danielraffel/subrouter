@@ -258,7 +258,11 @@ func containsConsoleErrorCode(value any, code string) bool {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, child := range typed {
-			if strings.EqualFold(key, "code") {
+			// Alibaba uses both `code` and `errorCode` (including nested
+			// envelopes) for the same console failure. Treat documented
+			// spellings equivalently so expired telemetry login is not
+			// misreported as generic unavailable quota.
+			if strings.EqualFold(key, "code") || strings.EqualFold(key, "errorCode") || strings.EqualFold(key, "error_code") {
 				if value, ok := child.(string); ok && value == code {
 					return true
 				}

@@ -69,7 +69,9 @@ request/credential failover and safe Codex generic-429 failover. Native AGY
 Keychain/profile hardening is in `cd9573e` and `a7935f8`.
 **Landed in:** isolated candidate worktree; live deployment is still pending.
 **Did it work?:** Focused proxy, AGY, CLI, and Darwin cross-compilation tests
-pass; shadow AGY sessions selected both accounts and returned HTTP 200.
+pass; shadow AGY sessions selected both accounts and reached the real Cloud Code
+endpoints, but both generation attempts returned upstream HTTP 429. Identity
+selection and bounded failover are proven; a successful routed generation is not.
 **Still open:** Live cutover and authenticated production canary remain
 required. Native AGY remains process-scoped/serialized rather than mid-session
 rotatable.

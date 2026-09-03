@@ -131,6 +131,8 @@ func TestConsoleRequestClassifiesForbiddenOnlyWithExactExpiredLoginCode(t *testi
 		wantLogin bool
 	}{
 		{name: "exact nested code", body: `{"error":{"code":"BailianGateway.Login.NotLogined"}}`, wantLogin: true},
+		{name: "exact errorCode", body: `{"errorCode":"BailianGateway.Login.NotLogined"}`, wantLogin: true},
+		{name: "nested errorCode", body: `{"error":{"errorCode":"BailianGateway.Login.NotLogined"}}`, wantLogin: true},
 		{name: "workspace forbidden", body: `{"code":"BailianGateway.Workspace.NotAuthorised"}`},
 		{name: "marker in message", body: `{"code":"Other.Error","message":"BailianGateway.Login.NotLogined"}`},
 		{name: "invalid json", body: `BailianGateway.Login.NotLogined`},
