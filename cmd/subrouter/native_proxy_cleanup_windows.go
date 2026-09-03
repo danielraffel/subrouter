@@ -291,8 +291,20 @@ func removePrivateProxyEntryInRoot(parent *os.Root, name string) error {
 	}
 	if !info.IsDir() {
 		if info.Mode().IsRegular() {
-			if err := parent.Chmod(name, info.Mode()|0o200); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("make %q writable: %w", name, err)
+			// os.Root.Chmod is only available in newer Go releases. Open the
+			// file through the root and chmod the handle for Go 1.24 support.
+			file, openErr := parent.OpenFile(name, os.O_WRONLY, 0)
+			if openErr == nil {
+				chmodErr := file.Chmod(info.Mode() | 0o200)
+				closeErr := file.Close()
+				if chmodErr != nil && !errors.Is(chmodErr, os.ErrNotExist) {
+					return fmt.Errorf("make %q writable: %w", name, chmodErr)
+				}
+				if closeErr != nil && !errors.Is(closeErr, os.ErrNotExist) {
+					return fmt.Errorf("close writable %q: %w", name, closeErr)
+				}
+			} else if !errors.Is(openErr, os.ErrNotExist) {
+				return fmt.Errorf("open %q writable: %w", name, openErr)
 			}
 		}
 		if err := parent.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
