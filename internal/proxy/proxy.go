@@ -4122,7 +4122,8 @@ func (s Server) proxyHandler() http.Handler {
 		azureCodexFallbackReady := !noRetry && azureCodexConfigured && retryPost && postReplayable
 		_, keyedRequestProvider := keyedProviderFor(requestProvider)
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
-			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude || keyedRequestProvider)
+			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude ||
+				requestProvider == accounts.ProviderAntigravity || keyedRequestProvider)
 		localUsageFailover = localUsageFailover ||
 			(account.AuthMode == accounts.AuthModeAPIKey && keyedRequestProvider)
 		usageRetryMaxAttempts := 0
@@ -6929,6 +6930,16 @@ func retryableResponsesPostRequest(r *http.Request) bool {
 }
 
 func retryableUpstreamPostRequest(provider accounts.Provider, r *http.Request) bool {
+	if provider == accounts.ProviderAntigravity {
+		// Cloud Code exposes all AGY operations as POSTs under v1internal. The
+		// request body is replayable and account-specific quota/auth failures can
+		// be retried on another OAuth profile.
+		if r == nil || r.Method != http.MethodPost {
+			return false
+		}
+		path := strings.TrimPrefix(r.URL.Path, "/antigravity")
+		return strings.HasPrefix(path, "/v1internal:") || strings.HasPrefix(path, "/v1internal/")
+	}
 	if provider == accounts.ProviderClaude {
 		if r == nil || r.Method != http.MethodPost {
 			return false
@@ -7204,6 +7215,14 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	case accounts.ProviderKimi:
 		limited, exhausted, err = responseKimiUsageLimit(response)
 		return limited, exhausted, false, err
+	case accounts.ProviderAntigravity:
+		// Cloud Code uses 429 for both account quota exhaustion and short-lived
+		// allocation throttles. Either way another OAuth account is a safe
+		// request-level fallback; the scheduler mark is deliberately short-lived.
+		if response.StatusCode == http.StatusTooManyRequests {
+			return true, true, false, nil
+		}
+		return false, false, false, nil
 	}
 	// API-key providers commonly use a plain 429 for either account credit
 	// exhaustion or a temporary key-specific allocation throttle. In both cases
