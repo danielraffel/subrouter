@@ -142,6 +142,18 @@ func TestAntigravityProjectDiscoveryIsBoundToAccount(t *testing.T) {
 	}
 }
 
+func TestAntigravityProjectDiscoveryAllowsMissingProject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"allowedTiers":[{"id":"standard-tier"}]}`)
+	}))
+	defer server.Close()
+	base, _ := url.Parse(server.URL)
+	project, err := (&Server{}).antigravityProject(context.Background(), accounts.Account{ID: "agy:free", Token: "token"}, base)
+	if err != nil || project != "" {
+		t.Fatalf("project=%q err=%v, want an empty optional project without error", project, err)
+	}
+}
+
 func TestRewriteAntigravityProjectFailsClosedOnMalformedOrInvalidEnvelope(t *testing.T) {
 	for _, body := range [][]byte{[]byte("not-json"), []byte(`{"project":7}`)} {
 		if _, _, err := rewriteAntigravityProject(body, "project-b"); err == nil {
