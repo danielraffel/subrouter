@@ -1814,6 +1814,7 @@ Usage:
   %[1]s agy                Launch pooled native AGY via the macOS Keychain (use --account to pin; plain agy stays direct)
   %[1]s agy add <label>    Import the current plain agy OAuth login as an isolated account
   %[1]s agy list           List isolated Antigravity accounts
+  %[1]s agy recover        Restore a native profile swap left by a crash
   %[1]s agy remove <label> Remove one isolated Antigravity account
   %[1]s spend              Show AWS Bedrock spend tracked by the server
   %[1]s gemini             Manage Gemini profiles (routing scaffold only)

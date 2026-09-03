@@ -605,7 +605,7 @@ func isAntigravityManagementCommand(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "help", "-h", "--help", "add", "import", "list", "ls", "remove", "rm":
+	case "help", "-h", "--help", "add", "import", "list", "ls", "recover", "remove", "rm":
 		return true
 	default:
 		return false

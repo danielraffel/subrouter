@@ -42,6 +42,13 @@ func AcquireNativeProfile(ctx context.Context, lockPath string, credential Crede
 	return acquireNativeProfile(ctx, lockPath, credential)
 }
 
+// RecoverNativeProfile restores a swap left behind by a hard kill or host
+// crash. It is safe to call before every native launch and is a no-op when no
+// recovery journal exists.
+func RecoverNativeProfile(ctx context.Context, lockPath string) error {
+	return recoverNativeProfile(ctx, lockPath)
+}
+
 // Restore puts the exact previous Keychain state back and releases the global
 // profile lease. Calling Restore more than once is safe.
 func (l *NativeProfileLease) Restore(ctx context.Context) error {

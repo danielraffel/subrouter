@@ -5,6 +5,7 @@ package antigravity
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,6 +20,12 @@ import (
 const keychainWriteTimeout = 10 * time.Second
 
 const nativeProfileLockPoll = 50 * time.Millisecond
+
+type nativeProfileJournal struct {
+	Account      string `json:"account,omitempty"`
+	OriginalBlob []byte `json:"original_blob,omitempty"`
+	HadOriginal  bool   `json:"had_original"`
+}
 
 func acquireNativeProfile(ctx context.Context, lockPath string, credential CredentialInfo) (*NativeProfileLease, error) {
 	return acquireNativeProfileWith(ctx, lockPath, credential, readLocalKeychainEntry, writeLocalKeychainEntry, deleteLocalKeychainEntry)
@@ -55,6 +62,10 @@ func acquireNativeProfileWith(ctx context.Context, lockPath string, credential C
 		case <-time.After(nativeProfileLockPoll):
 		}
 	}
+	if err := recoverNativeProfileLocked(ctx, lockPath, write, deleteEntry); err != nil {
+		_ = unlockAndClose(lock)
+		return nil, err
+	}
 	original, hadOriginal, err := read(ctx)
 	if err != nil {
 		_ = unlockAndClose(lock)
@@ -70,17 +81,134 @@ func acquireNativeProfileWith(ctx context.Context, lockPath string, credential C
 		target.Account = keychainAccount
 	}
 	target.Blob = blob
+	if err := writeNativeProfileJournal(lockPath, nativeProfileJournal{Account: original.Account, OriginalBlob: append([]byte(nil), original.Blob...), HadOriginal: hadOriginal}); err != nil {
+		_ = unlockAndClose(lock)
+		return nil, err
+	}
 	if err := write(ctx, target); err != nil {
 		_ = unlockAndClose(lock)
 		return nil, err
 	}
 	return &NativeProfileLease{restore: func(restoreCtx context.Context) error {
 		defer func() { _ = unlockAndClose(lock) }()
+		var restoreErr error
 		if hadOriginal {
-			return write(restoreCtx, original)
+			restoreErr = write(restoreCtx, original)
+		} else {
+			restoreErr = deleteEntry(restoreCtx, target.Account)
 		}
-		return deleteEntry(restoreCtx, target.Account)
+		if restoreErr != nil {
+			return restoreErr
+		}
+		return removeNativeProfileJournal(lockPath)
 	}}, nil
+}
+
+func recoverNativeProfile(ctx context.Context, lockPath string) error {
+	if strings.TrimSpace(lockPath) == "" {
+		return errors.New("Antigravity native profile lock path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return fmt.Errorf("create Antigravity profile lock directory: %w", err)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open Antigravity profile lock: %w", err)
+	}
+	defer func() { _ = unlockAndClose(lock) }()
+	for {
+		err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return fmt.Errorf("lock Antigravity profile slot: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(nativeProfileLockPoll):
+		}
+	}
+	return recoverNativeProfileLocked(ctx, lockPath, writeLocalKeychainEntry, deleteLocalKeychainEntry)
+}
+
+func recoverNativeProfileLocked(ctx context.Context, lockPath string, write keychainWriter, deleteEntry keychainDeleter) error {
+	journal, ok, err := readNativeProfileJournal(lockPath)
+	if err != nil || !ok {
+		return err
+	}
+	if journal.HadOriginal {
+		if err := write(ctx, KeychainEntry{Account: journal.Account, Blob: journal.OriginalBlob}); err != nil {
+			return fmt.Errorf("recover native AGY Keychain profile: %w", err)
+		}
+	} else if err := deleteEntry(ctx, journal.Account); err != nil {
+		return fmt.Errorf("recover native AGY Keychain profile: %w", err)
+	}
+	return removeNativeProfileJournal(lockPath)
+}
+
+func nativeProfileJournalPath(lockPath string) string { return lockPath + ".journal" }
+
+func writeNativeProfileJournal(lockPath string, journal nativeProfileJournal) error {
+	body, err := json.Marshal(journal)
+	if err != nil {
+		return fmt.Errorf("encode native AGY profile journal: %w", err)
+	}
+	path := nativeProfileJournalPath(lockPath)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".native-profile-journal-*")
+	if err != nil {
+		return fmt.Errorf("create native AGY profile journal: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write native AGY profile journal: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("publish native AGY profile journal: %w", err)
+	}
+	return nil
+}
+
+func readNativeProfileJournal(lockPath string) (nativeProfileJournal, bool, error) {
+	body, err := os.ReadFile(nativeProfileJournalPath(lockPath))
+	if os.IsNotExist(err) {
+		return nativeProfileJournal{}, false, nil
+	}
+	if err != nil {
+		return nativeProfileJournal{}, false, err
+	}
+	var journal nativeProfileJournal
+	if err := json.Unmarshal(body, &journal); err != nil {
+		return nativeProfileJournal{}, false, fmt.Errorf("decode native AGY profile journal: %w", err)
+	}
+	if journal.HadOriginal && (journal.Account == "" || len(journal.OriginalBlob) == 0) {
+		return nativeProfileJournal{}, false, errors.New("native AGY profile journal is incomplete")
+	}
+	if !journal.HadOriginal && strings.TrimSpace(journal.Account) == "" {
+		journal.Account = keychainAccount
+	}
+	return journal, true, nil
+}
+
+func removeNativeProfileJournal(lockPath string) error {
+	if err := os.Remove(nativeProfileJournalPath(lockPath)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove native AGY profile journal: %w", err)
+	}
+	return nil
 }
 
 func unlockAndClose(lock *os.File) error {

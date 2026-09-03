@@ -23,6 +23,7 @@ import (
 const antigravityManagementHelp = `Usage: sr agy [--account [label-or-email]] [agy args...]
        sr agy add <label>
        sr agy list
+       sr agy recover       Restore a native profile swap left by a crash
        sr agy remove <label>
 
 Bare 'sr agy' launches native AGY using a pooled local profile. Use --account to
@@ -83,6 +84,13 @@ func (r srRunner) antigravityManage(ctx context.Context, args []string) error {
 		for _, acct := range accounts {
 			fmt.Fprintf(r.out, "%s (%s)\n", acct.Label, acct.ID)
 		}
+		return nil
+	case "recover":
+		lockPath := filepath.Join(storepath.StateDir(), "antigravity", "native-keychain.lock")
+		if err := agentantigravity.RecoverNativeProfile(ctx, lockPath); err != nil {
+			return err
+		}
+		fmt.Fprintln(r.out, "Native AGY Keychain recovery complete (or no recovery was needed).")
 		return nil
 	case "remove", "rm":
 		if len(args) != 2 {

@@ -27,16 +27,46 @@ func TestAcquireNativeProfileRestoresExactOriginalBlob(t *testing.T) {
 	if string(current.Blob) == string(original.Blob) || current.Account != original.Account {
 		t.Fatalf("profile was not installed: %+v", current)
 	}
+	if _, err := os.Stat(nativeProfileJournalPath(lockPath)); err != nil {
+		t.Fatalf("profile journal missing while lease is active: %v", err)
+	}
 	if err := lease.Restore(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if string(current.Blob) != string(original.Blob) || current.Account != original.Account {
 		t.Fatalf("restored entry = %+v, want exact original", current)
 	}
+	if _, err := os.Stat(nativeProfileJournalPath(lockPath)); !os.IsNotExist(err) {
+		t.Fatalf("profile journal still present after restore: %v", err)
+	}
 	if err := lease.Restore(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(lockPath); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRecoverNativeProfileRestoresStaleJournal(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "agy.lock")
+	if err := writeNativeProfileJournal(lockPath, nativeProfileJournal{
+		Account: "antigravity", OriginalBlob: []byte("before-crash"), HadOriginal: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var restored KeychainEntry
+	write := func(_ context.Context, entry KeychainEntry) error {
+		restored = KeychainEntry{Account: entry.Account, Blob: append([]byte(nil), entry.Blob...)}
+		return nil
+	}
+	delete := func(context.Context, string) error { t.Fatal("unexpected delete"); return nil }
+	if err := recoverNativeProfileLocked(context.Background(), lockPath, write, delete); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Account != "antigravity" || string(restored.Blob) != "before-crash" {
+		t.Fatalf("restored = %+v", restored)
+	}
+	if _, err := os.Stat(nativeProfileJournalPath(lockPath)); !os.IsNotExist(err) {
+		t.Fatalf("stale journal was not removed: %v", err)
 	}
 }

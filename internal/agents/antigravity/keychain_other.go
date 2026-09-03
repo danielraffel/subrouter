@@ -11,6 +11,10 @@ func acquireNativeProfile(context.Context, string, CredentialInfo) (*NativeProfi
 	return nil, errors.New("native Antigravity profile switching is supported only on macOS")
 }
 
+func recoverNativeProfile(context.Context, string) error {
+	return errors.New("native Antigravity profile switching is supported only on macOS")
+}
+
 func readLocalKeychainEntry(context.Context) (KeychainEntry, bool, error) {
 	return KeychainEntry{}, false, nil
 }
