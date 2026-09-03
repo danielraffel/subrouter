@@ -279,6 +279,8 @@ func (r srRunner) antigravityRemote(ctx context.Context, server srServerConfig, 
 			fmt.Fprintln(r.out, "No isolated Antigravity accounts configured on the selected server.")
 		}
 		return nil
+	case "recover":
+		return errors.New("native AGY recovery is local-only; run 'sr server use local' and retry")
 	case "remove", "rm":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: sr agy remove <label>")
