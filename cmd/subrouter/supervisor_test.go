@@ -24,6 +24,14 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/front"
 )
 
+func privateSocketTempRoot(t *testing.T) string {
+	t.Helper()
+	if info, err := os.Stat("/private/tmp"); err == nil && info.IsDir() {
+		return "/private/tmp"
+	}
+	return os.TempDir()
+}
+
 // TestMain lets the test binary double as a minimal supervised worker so
 // startWorkerGeneration can be exercised end to end without a real build.
 func TestMain(m *testing.M) {
@@ -189,7 +197,7 @@ func TestPrepareControlSocketRefusesRegularFile(t *testing.T) {
 }
 
 func TestOpenPrivateLocalDataListenerPermissionsAndStaleSafety(t *testing.T) {
-	directory, err := os.MkdirTemp("/private/tmp", "sr-socket-")
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-socket-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +233,7 @@ func TestOpenPrivateLocalDataListenerPermissionsAndStaleSafety(t *testing.T) {
 }
 
 func TestPrivateLocalDataListenerLifetimeLockRejectsSecondOwner(t *testing.T) {
-	directory, err := os.MkdirTemp("/private/tmp", "sr-lock-")
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-lock-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +261,7 @@ func TestPrivateLocalDataListenerLifetimeLockRejectsSecondOwner(t *testing.T) {
 }
 
 func TestPrivateLocalDataListenerDoesNotUnlinkSuccessor(t *testing.T) {
-	directory, err := os.MkdirTemp("/private/tmp", "sr-successor-")
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-successor-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +295,7 @@ func TestPrivateLocalDataListenerDoesNotUnlinkSuccessor(t *testing.T) {
 }
 
 func TestLocalDataSocketLeasePinsParentDuringStaleRecovery(t *testing.T) {
-	root, err := os.MkdirTemp("/private/tmp", "sr-parent-")
+	root, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-parent-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +382,7 @@ func TestStableLocalDataRouterFollowsGenerationSwitchAndRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	directory, err := os.MkdirTemp("/private/tmp", "sr-router-")
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-router-")
 	if err != nil {
 		t.Fatal(err)
 	}

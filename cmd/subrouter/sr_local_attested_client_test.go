@@ -172,7 +172,7 @@ func TestLocalDataClientRejectsPrivateSocketReplacementAfterBinding(t *testing.T
 	home := t.TempDir()
 	store := accounts.CodexStore{Dir: filepath.Join(home, "state", "codex", "accounts")}
 	initializeLocalDataTestStore(t, store)
-	socketDir, err := os.MkdirTemp("/private/tmp", "sr-replace-")
+	socketDir, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-replace-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestLocalDataClientUsesBoundServingStoreForHandshake(t *testing.T) {
 }
 
 func TestLocalDataSocketForExplicitStateUsesSupervisorDefault(t *testing.T) {
-	stateDir, err := os.MkdirTemp("/private/tmp", "sr-state-")
+	stateDir, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-state-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func attachPrivateLocalTestListener(t *testing.T, server *httptest.Server, store
 	if len(stores) == 1 {
 		initializeLocalDataTestStore(t, stores[0])
 	}
-	directory, err := os.MkdirTemp("/private/tmp", "sr-local-")
+	directory, err := os.MkdirTemp(privateSocketTempRoot(t), "sr-local-")
 	if err != nil {
 		t.Fatal(err)
 	}
