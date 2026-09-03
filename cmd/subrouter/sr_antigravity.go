@@ -17,7 +17,9 @@ const antigravityManagementHelp = `Usage: sr agy add <label>
 
 Add imports the current plain 'agy' OAuth login into an isolated Subrouter profile.
 Repeat after signing plain 'agy' into each account. The Keychain item is never changed.
-Status can report each imported identity, plan, and model-family quota. The current
+The label is an alias for selecting/removing the profile; it does not change or
+assert the Google identity in the credential. Status reports each verified identity,
+plan, and model-family quota. The current
 agy CLI has no transparent proxy hook, so routed pooling and pinning are unavailable.
 Use plain 'agy' for direct OAuth access.
 `
