@@ -462,6 +462,13 @@ func attachPrivateLocalTestListener(t *testing.T, server *httptest.Server, store
 
 func initializeLocalDataTestStore(t *testing.T, store accounts.CodexStore) {
 	t.Helper()
+	// StoreAuthorityProof initializes the parent authority directory, while
+	// serving-store attestation also requires the accounts directory itself to
+	// already exist. Create both explicitly so the invariant is portable across
+	// macOS and Linux.
+	if err := os.MkdirAll(store.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := accounts.StoreAuthorityProof(store.Dir, strings.Repeat("00", 32)); err != nil {
 		t.Fatal(err)
 	}
