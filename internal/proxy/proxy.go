@@ -7228,9 +7228,11 @@ func (t usageLimitRetryTransport) responseUsageLimited(response *http.Response) 
 	case accounts.ProviderAntigravity:
 		// Cloud Code uses 429 for both account quota exhaustion and short-lived
 		// allocation throttles. Either way another OAuth account is a safe
-		// request-level fallback; the scheduler mark is deliberately short-lived.
+		// request-level fallback. A bare 429 is deliberately not marked as
+		// scheduler exhaustion: without an authoritative quota marker, doing so
+		// can cook every account during a transient provider-wide throttle.
 		if response.StatusCode == http.StatusTooManyRequests {
-			return true, true, false, nil
+			return true, false, false, nil
 		}
 		if response.StatusCode == http.StatusUnauthorized {
 			// An expired/revoked AGY OAuth access token should be refreshed and,

@@ -97,7 +97,11 @@ func TestKeyedCredentialFailureFailsOverToHealthyCredential(t *testing.T) {
 			if response.Code != http.StatusOK || calls != 2 {
 				t.Fatalf("status=%d calls=%d body=%s, want healthy second attempt", response.Code, calls, response.Body.String())
 			}
-			if !scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), revoked.ID) {
+			if test.provider == accounts.ProviderAntigravity {
+				if scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), revoked.ID) {
+					t.Fatal("transient AGY 429 incorrectly exhausted account")
+				}
+			} else if !scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), revoked.ID) {
 				t.Fatal("rejected credential was not excluded")
 			}
 			if scheduler.Get().Exhausted(schedulerAccountProvider(test.provider), healthy.ID) {

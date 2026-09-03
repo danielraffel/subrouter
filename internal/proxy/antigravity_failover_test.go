@@ -34,7 +34,7 @@ func TestAntigravity429TriggersAccountFailover(t *testing.T) {
 	}
 	transport := usageLimitRetryTransport{provider: accounts.ProviderAntigravity}
 	limited, exhausted, credentialFailure, err := transport.responseUsageLimited(response)
-	if err != nil || !limited || !exhausted || credentialFailure {
+	if err != nil || !limited || exhausted || credentialFailure {
 		t.Fatalf("AGY 429 classification = limited %v exhausted %v credential %v err %v", limited, exhausted, credentialFailure, err)
 	}
 }
