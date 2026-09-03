@@ -2081,27 +2081,19 @@ func TestKimiExplicitSessionIdentityIsStableAcrossWorkspaces(t *testing.T) {
 	}
 }
 
-func TestAntigravityNativeLaunchRequiresAnImportedProfile(t *testing.T) {
+func TestAntigravityRoutedLaunchUsesCloudCodeOverride(t *testing.T) {
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
-	runner := srRunner{out: io.Discard}
-	for _, args := range [][]string{nil, {"proxy"}, {"--account", "work"}, {"proxy", "--account", "work"}} {
-		err := runner.antigravityCommand(context.Background(), args)
-		if err == nil || !strings.Contains(err.Error(), "no local AGY profiles") {
-			t.Fatalf("sr agy args %q error = %v", args, err)
-		}
+	environ := []string{"HOME=" + t.TempDir(), "GEMINI_API_KEY=direct-secret", "CLOUD_CODE_URL=https://old.invalid"}
+	got, cleanup, err := nativeProxyEnvironment(antigravityNativeProxy, "http://127.0.0.1:43212", environ, nil)
+	defer cleanup()
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, environ := range [][]string{
-		{"HOME=" + t.TempDir()},
-		{"HOME=" + t.TempDir(), "GEMINI_API_KEY=direct-secret"},
-	} {
-		_, cleanup, err := nativeProxyEnvironment(antigravityNativeProxy, "http://127.0.0.1:43212", environ, nil)
-		cleanup()
-		if err == nil || !strings.Contains(err.Error(), "no transparent proxy hook") {
-			t.Fatalf("unsupported Antigravity proxy error = %v", err)
-		}
-		if strings.Contains(err.Error(), "direct-secret") {
-			t.Fatal("unsupported Antigravity error exposed the credential")
-		}
+	if value := testEnvValue(got, "CLOUD_CODE_URL"); value != "http://127.0.0.1:43212/antigravity" {
+		t.Fatalf("CLOUD_CODE_URL = %q", value)
+	}
+	if testEnvValue(got, "GEMINI_API_KEY") != "" {
+		t.Fatal("direct Gemini API key leaked into routed AGY environment")
 	}
 }
 

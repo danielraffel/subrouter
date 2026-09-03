@@ -34,11 +34,9 @@ const (
 	antigravityProxyHelp = `Usage: sr antigravity
        sr agy
 
-Show this Antigravity routing notice. Plain 'agy' remains the supported direct CLI.
-Subrouter can securely import multiple Antigravity OAuth accounts and report their
-identity, plan, and model-family quotas, but the current agy CLI does not expose a
-transparent proxy hook. Routed pooling and pinning therefore fail closed instead of
-silently changing provider behavior.
+Launch Antigravity through Subrouter's pooled Cloud Code route. Plain 'agy' remains
+the direct CLI. Subrouter selects and pins isolated OAuth accounts server-side,
+refreshes credentials, and fails over bounded transient/authentication errors.
 `
 	kimiProxyHelp = `Usage: sr kimi [--account [account]] -p <prompt> [kimi args...]
        sr kimi proxy [--account [account]] -p <prompt> [kimi args...]
@@ -109,7 +107,11 @@ func (r srRunner) antigravityCommand(ctx context.Context, args []string) error {
 	if len(args) > 0 && args[0] == "proxy" {
 		args = args[1:]
 	}
-	return r.launchAntigravityNative(ctx, args)
+	// AGY exposes a supported CLOUD_CODE_URL override. Use the same routed
+	// launcher as the other native providers so the server owns account
+	// selection, quota affinity, refresh, and bounded failover. Plain `agy`
+	// remains completely direct and untouched.
+	return r.launchNativeProxy(ctx, antigravityNativeProxy, args, nativeProxyLaunchOptions{})
 }
 
 func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {
@@ -1442,7 +1444,14 @@ func nativeProxyEnvironment(spec nativeProxySpec, relayRoot string, environ, arg
 	providerURL := strings.TrimRight(relayRoot, "/") + "/" + spec.route
 	switch spec.provider {
 	case accounts.ProviderAntigravity:
-		return nil, func() error { return nil }, errors.New("routed Antigravity is unavailable: the current agy CLI has no transparent proxy hook; use plain 'agy' for direct OAuth access")
+		// Current AGY releases honor CLOUD_CODE_URL and append their
+		// /v1internal:* Cloud Code paths to it. The relay injects the server
+		// credential and routing metadata, so the local AGY OAuth credential is
+		// used only to satisfy the CLI startup check and never leaves this
+		// process. Do not set GOOGLE_GEMINI_BASE_URL here: that selects the
+		// separate Gemini API-key mode and bypasses AGY subscription quotas.
+		env = upsertEnv(env, "CLOUD_CODE_URL", providerURL)
+		return env, func() error { return nil }, nil
 	case accounts.ProviderKimi:
 		overlay, cleanup, err := prepareKimiProxyHome(environ)
 		if err != nil {

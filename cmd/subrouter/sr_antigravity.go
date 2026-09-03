@@ -26,16 +26,16 @@ const antigravityManagementHelp = `Usage: sr agy [--account [label-or-email]] [a
        sr agy recover       Restore a native profile swap left by a crash
        sr agy remove <label>
 
-Bare 'sr agy' launches native AGY using a pooled local profile. Use --account to
-pin one profile for this process; bare --account opens a picker. Each process
-keeps its startup identity and the Keychain slot is restored on exit.
+Bare 'sr agy' launches AGY through Subrouter's pooled Cloud Code route. Use
+--account to pin one server account; bare --account opens a picker. Account
+selection, quota affinity, refresh, and bounded failover happen server-side.
 Use 'sr agy add <label>' to import the current plain 'agy' OAuth login into an
 isolated local profile. Repeat after signing plain 'agy' into each account.
 The label is an alias for selecting/removing the profile; it does not change or
-assert the Google identity in the credential. Status reports each verified identity,
-plan, and model-family quota. The current
-agy CLI has one global Keychain slot, so native profile launches are serialized.
-Use plain 'agy' for direct un-managed OAuth access.
+assert the Google identity in the credential. Status reports each verified
+identity, plan, and model-family quota. The local AGY login is used only to
+start the CLI; routed requests use the isolated server pool. Use plain 'agy'
+for direct un-managed OAuth access.
 `
 
 func (r srRunner) antigravityManage(ctx context.Context, args []string) error {
