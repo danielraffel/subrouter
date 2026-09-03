@@ -19,6 +19,14 @@ session affinity and failing over bounded authentication/rate-limit errors.
 `sr agy --account <label-or-email>` hard-pins one account. The local AGY login
 is used only to pass the CLI's startup check; it is not the routed identity.
 
+Cloud Code's `retrieveUserQuotaSummary` is a weekly/model-family summary, not a
+guarantee that every generation allocation is available. A generation can
+still return `429 RESOURCE_EXHAUSTED` for a model or session while `sr status`
+shows remaining quota. Subrouter records the redacted upstream reason and tries
+the other pooled account once within the request budget; if both accounts are
+rejected, the upstream error is returned rather than hidden or retried without
+bound.
+
 ## Recovery and acceptance evidence
 
 If the host or process is hard-killed during a native launch, run:
