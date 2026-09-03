@@ -199,6 +199,8 @@ type Server struct {
 	// MultiTenant router has validated its tenant key. Global remote imports
 	// require a configured admin token instead.
 	tenantAccountImportAuthorized bool
+	antigravityProjectMu          sync.Mutex
+	antigravityProjects           map[string]string
 }
 
 type ActiveSessions struct {
@@ -7542,6 +7544,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if accountID != "" {
 		tried[accountID] = struct{}{}
 	}
+	if t.provider == accounts.ProviderAntigravity && req.GetBody != nil && t.server != nil {
+		if initialBody, bodyErr := req.GetBody(); bodyErr == nil {
+			if raw, readErr := io.ReadAll(initialBody); readErr == nil {
+				t.server.rememberAntigravityProject(accountID, antigravityProjectFromBody(raw))
+			}
+			_ = initialBody.Close()
+		}
+	}
 	overloadRetries := 0
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -7748,6 +7758,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeFailoverExhausted(response, accountID, "replay_failed", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
+		rawBody, readBodyErr := io.ReadAll(body)
+		_ = body.Close()
+		if readBodyErr != nil {
+			return response, nil
+		}
+		body = io.NopCloser(bytes.NewReader(rawBody))
 		if response.Body != nil {
 			_ = response.Body.Close()
 		}
@@ -7772,6 +7788,25 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			attemptReq.URL.User = nextUpstream.User
 			attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.server.pathForUpstream(t.path, nextAccount))
 			attemptReq.URL.RawPath = ""
+			if t.provider == accounts.ProviderAntigravity && antigravityProjectFromBody(rawBody) != "" {
+				project, projectErr := t.server.antigravityProject(req.Context(), nextAccount, nextUpstream)
+				if projectErr != nil {
+					if t.logger != nil {
+						t.logger.Warn("AGY failover refused without replacement project", "agent", t.agent, "session", t.session, "account", nextAccount.ID, "error", projectErr)
+					}
+					return response, nil
+				}
+				rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
+				if rewriteErr != nil {
+					return response, nil
+				}
+				if changed {
+					body = io.NopCloser(bytes.NewReader(rewritten))
+					attemptReq.Body = body
+					attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
+					attemptReq.ContentLength = int64(len(rewritten))
+				}
+			}
 		}
 		setAccountAuthHeaders(attemptReq.Header, nextAccount, t.poolModel)
 		if t.logger != nil {
