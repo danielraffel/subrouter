@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/servicequotas v1.35.9
 	github.com/gorilla/websocket v1.5.3
 	github.com/klauspost/compress v1.19.0
+	github.com/mattn/go-runewidth v0.0.19
 	golang.org/x/sys v0.40.0
 	golang.org/x/term v0.39.0
 )
@@ -25,4 +26,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.8 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.5 // indirect
 	github.com/aws/smithy-go v1.27.3 // indirect
+	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 )

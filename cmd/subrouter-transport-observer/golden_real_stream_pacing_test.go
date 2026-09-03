@@ -9,11 +9,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
 
 type accumulatingObserverDelay struct {
+	mu      sync.Mutex
 	elapsed time.Duration
 }
 
@@ -21,10 +23,19 @@ func (delay *accumulatingObserverDelay) wait(
 	_ context.Context,
 	_ <-chan struct{},
 	_ <-chan struct{},
+	_ <-chan struct{},
 	duration time.Duration,
-) error {
+) (bool, error) {
+	delay.mu.Lock()
 	delay.elapsed += duration
-	return nil
+	delay.mu.Unlock()
+	return false, nil
+}
+
+func (delay *accumulatingObserverDelay) elapsedDuration() time.Duration {
+	delay.mu.Lock()
+	defer delay.mu.Unlock()
+	return delay.elapsed
 }
 
 func TestGoldenObserverDefaultPacingOutlastsDeploymentGate(t *testing.T) {
@@ -43,8 +54,8 @@ func TestGoldenObserverDefaultPacingOutlastsDeploymentGate(t *testing.T) {
 	if _, err := pacer.write(context.Background(), payload.Bytes(), delivered.Write); err != nil {
 		t.Fatal(err)
 	}
-	if delay.elapsed < 20*time.Minute {
-		t.Fatalf("finite golden response pacing runway = %s, want at least 20m", delay.elapsed)
+	if elapsed := delay.elapsedDuration(); elapsed < 20*time.Minute {
+		t.Fatalf("finite golden response pacing runway = %s, want at least 20m", elapsed)
 	}
 	if delivered.Len() >= payload.Len() {
 		t.Fatal("finite golden response completed before gate release")

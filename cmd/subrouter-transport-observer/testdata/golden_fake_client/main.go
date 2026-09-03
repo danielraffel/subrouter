@@ -732,7 +732,10 @@ func serve(args []string) {
 		os.Exit(3)
 	}
 	var config struct {
-		BaseURL string `json:"baseUrl"`
+		BaseURL          string `json:"baseUrl"`
+		CredentialSource string `json:"credentialSource"`
+		HostedURL        string `json:"hostedUrl"`
+		TenantKey        string `json:"tenantKey"`
 	}
 	if json.Unmarshal(data, &config) != nil {
 		os.Exit(3)
@@ -770,6 +773,9 @@ func serve(args []string) {
 		closeSocket := sockets.open()
 		defer closeSocket()
 		leaseURL := strings.TrimRight(config.BaseURL, "/") + "/api/subrouter/leases"
+		if config.CredentialSource == "team" && config.HostedURL != "" && config.TenantKey != "" {
+			leaseURL = strings.TrimRight(config.HostedURL, "/") + "/t/" + url.PathEscape(config.TenantKey) + "/_subrouter/leases"
+		}
 		leaseRequest, _ := http.NewRequestWithContext(request.Context(), http.MethodPost, leaseURL, strings.NewReader("LEASE_REQUEST_BODY_SECRET"))
 		leaseRequest.Header.Set("Authorization", "Bearer LEASE_HEADER_SECRET")
 		if response, leaseErr := http.DefaultClient.Do(leaseRequest); leaseErr == nil {

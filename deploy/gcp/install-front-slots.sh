@@ -29,7 +29,7 @@ log() { printf 'install-front-slots: %s\n' "$*"; }
 die() { log "$*" >&2; exit 1; }
 
 [[ "$(id -u)" == "0" ]] || die "run as root"
-for required_command in curl jq python3 sha256sum systemctl; do
+for required_command in chmod chown curl jq python3 sha256sum systemctl; do
   command -v "${required_command}" >/dev/null 2>&1 \
     || die "${required_command} is required"
 done
@@ -205,8 +205,15 @@ write_units() {
   [[ -n "${service_group}" ]] || service_group="${service_user}"
   [[ -n "${service_home}" ]] || service_home="${STATE_DIR}"
 
+  # `install -d` does not repair an existing directory's owner or mode. A
+  # previously provisioned VM can therefore leave the state directory owned
+  # by root, which prevents a slot worker from publishing its session and
+  # usage-score files. Repair the directory itself on every reconciliation;
+  # do not recurse into credential files that have their own protection.
   install -d -m 0750 -o "${service_user}" -g "${service_group}" \
     "${service_home}" "${STATE_DIR}" "${LOG_DIR}"
+  chown "${service_user}:${service_group}" "${service_home}" "${STATE_DIR}" "${LOG_DIR}"
+  chmod 0750 "${service_home}" "${STATE_DIR}" "${LOG_DIR}"
   install -d -m 0755 "${SLOT_ROOT}/slot-a" "${SLOT_ROOT}/slot-b" "${FRONT_ROOT}" "${CONTROL_ROOT}"
   install -d -m 0755 "${SLOT_ENV_DIR}"
   printf '%s\n' \

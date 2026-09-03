@@ -5,15 +5,32 @@
 # a new generation for future connections.
 set -euo pipefail
 
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/mutation-lease-lib.sh"
+
 REPO="${SUBROUTER_REPO:-manaflow-ai/subrouter}"
 BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
 LABEL="${SUBROUTER_LABEL:-ai.manaflow.subrouter-team}"
 PLIST="${SUBROUTER_PLIST:-/Library/LaunchDaemons/${LABEL}.plist}"
 CONTROL_SOCKET="${SUBROUTER_CONTROL_SOCKET:-}"
+UPGRADE_INHIBIT_FILE="${SUBROUTER_UPGRADE_INHIBIT_FILE:-${PLIST}.supervisor-transaction/upgrade-inhibited}"
+MUTATION_LOCK_FILE="${SUBROUTER_MUTATION_LOCK_FILE:-${PLIST}.supervisor-mutation.lock}"
 HEALTH_URL="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 
 log() { echo "subrouter-autoupdate: $*"; }
+
+if ! acquire_subrouter_mutation_lease "$MUTATION_LOCK_FILE"; then
+  log "another deployment or worker update holds the mutation lease; update deferred"
+  exit 0
+fi
+trap release_subrouter_mutation_lease EXIT
+
+if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
+  log "deployment transaction is active; worker update deferred"
+  exit 0
+fi
 
 if [ -z "$CONTROL_SOCKET" ] && [ -f "$PLIST" ]; then
   # The migration script places the control socket in the service's state
@@ -94,6 +111,11 @@ curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"
 (cd "$tmp" && grep " ${asset}\$" SHA256SUMS | shasum -a 256 -c -)
 chmod 0755 "${tmp}/${asset}"
 "${tmp}/${asset}" --help >/dev/null
+
+if [ -e "$UPGRADE_INHIBIT_FILE" ]; then
+  log "deployment transaction began while preparing the update; worker update deferred"
+  exit 0
+fi
 
 cp -p "$BIN" "$backup"
 install -m 0755 "${tmp}/${asset}" "${BIN}.new"

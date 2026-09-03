@@ -24,6 +24,92 @@ func TestSchedulerRefAllowsOnlyOneStaleRefresh(t *testing.T) {
 	}
 }
 
+func TestSchedulerRefRunIfAccountNotBlocked(t *testing.T) {
+	accountA := account.Account{ID: "a", Provider: account.ProviderCodex}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: accountA.ID, Provider: accountA.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	called := false
+	_, published := ref.RunIfAccountNotBlocked(accountA.Provider, accountA.ID, "gpt-5", time.Now(), func() {
+		called = true
+	})
+	if !published || !called {
+		t.Fatal("eligible account did not publish")
+	}
+	ref.MarkExhaustedUntil(accountA.Provider, accountA.ID, "gpt-5", time.Now().Add(time.Hour))
+	called = false
+	_, published = ref.RunIfAccountNotBlocked(accountA.Provider, accountA.ID, "gpt-5", time.Now(), func() {
+		called = true
+	})
+	if published || called {
+		t.Fatal("exhausted account published")
+	}
+}
+
+func TestSchedulerRefBlockedUntilForUnionsAccountAndModelOverlays(t *testing.T) {
+	now := time.Now()
+	accountA := account.Account{ID: "a", Provider: account.ProviderClaude}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: accountA.ID, Provider: accountA.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	accountUntil := now.Add(2 * time.Hour)
+	modelUntil := now.Add(time.Hour)
+	ref.MarkAccountUnavailableUntil(accountA.Provider, accountA.ID, accountUntil)
+	ref.MarkModelIncompatibleUntil(accountA.Provider, accountA.ID, "claude-opus-4", modelUntil)
+	until, blocked := ref.BlockedUntilFor(
+		accountA.Provider, accountA.ID, "claude-opus-4", now,
+	)
+	if !blocked || !until.Equal(accountUntil) {
+		t.Fatalf("blocked=%v until=%v, want account reset %v", blocked, until, accountUntil)
+	}
+}
+
+func TestSchedulerRefBlockedUntilForPreservesShortExplicitExpiry(t *testing.T) {
+	now := time.Now()
+	accountA := account.Account{ID: "a", Provider: account.ProviderClaude}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: accountA.ID, Provider: accountA.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	want := now.Add(time.Minute)
+	ref.MarkModelIncompatibleUntil(accountA.Provider, accountA.ID, "claude-opus-4", want)
+	until, blocked := ref.BlockedUntilFor(accountA.Provider, accountA.ID, "claude-opus-4", now)
+	if !blocked || !until.Equal(want) {
+		t.Fatalf("blocked=%v until=%v, want explicit expiry %v", blocked, until, want)
+	}
+}
+
+func TestSchedulerRefExplicitGuardIgnoresMissingPoolScoreButHonorsMarks(t *testing.T) {
+	now := time.Now()
+	provider := account.ProviderClaude
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{
+			AccountID: "oauth", Provider: provider, Headroom: 1, ShortHeadroom: 1,
+			ModelScores: map[string]Score{
+				"claude-opus-4": {AccountID: "oauth", Provider: provider, Headroom: 1, ShortHeadroom: 1},
+			},
+		},
+		{AccountID: "api-key", Provider: provider, Headroom: 1, ShortHeadroom: 1},
+	}))
+	called := false
+	if _, published := ref.RunIfAccountNotExplicitlyBlocked(
+		provider, "api-key", "claude-opus-4", now, func() { called = true },
+	); !published || !called {
+		t.Fatal("missing subscription pool score blocked API-key publication")
+	}
+	want := now.Add(time.Hour)
+	ref.MarkAccountUnavailableUntil(provider, "api-key", want)
+	called = false
+	until, published := ref.RunIfAccountNotExplicitlyBlocked(
+		provider, "api-key", "claude-opus-4", now, func() { called = true },
+	)
+	if published || called || !until.Equal(want) {
+		t.Fatalf("explicit mark: published=%v called=%v until=%v want=%v", published, called, until, want)
+	}
+}
+
 func TestSchedulerRefRetryAfterSkippedRefreshWaitsForTTL(t *testing.T) {
 	ref := NewSchedulerRef(NewScheduler(nil))
 	ref.SetUpdatedAt(time.Now().Add(-time.Hour))
@@ -84,6 +170,421 @@ func TestSchedulerRefAccountGenerationInvalidatesLegacyRefresh(t *testing.T) {
 
 	if got := ref.Get().ScoreFor(account.ProviderCodex, "new@example.com").Headroom; got != 0.8 {
 		t.Fatalf("legacy refresh overwrote a newer account generation: headroom = %v, want 0.8", got)
+	}
+}
+
+func TestSchedulerRefCodexOverlayDoesNotClobberConcurrentProviderRefresh(t *testing.T) {
+	newRef := func() *SchedulerRef {
+		ref := NewSchedulerRef(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.2, ShortHeadroom: 0.2},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.3, ShortHeadroom: 0.3},
+		}))
+		ref.AdvanceAccountGeneration(1)
+		return ref
+	}
+
+	t.Run("stale account generation is rejected", func(t *testing.T) {
+		ref := newRef()
+		ref.AdvanceAccountGeneration(2)
+		if !ref.SetForAccountGeneration(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		}), 2) {
+			t.Fatal("full-provider refresh was rejected")
+		}
+		if _, ok := ref.MergeScoresForAccountGeneration([]Score{{
+			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+		}}, 1); ok {
+			t.Fatal("stale account generation was published")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.8 {
+			t.Fatalf("Claude headroom = %v, want concurrent refresh value 0.8", got)
+		}
+	})
+
+	t.Run("same account generation preserves concurrent provider refresh", func(t *testing.T) {
+		ref := newRef()
+		seedRevision := ref.ScoreRevision()
+		staleAutoSwitchSeed := ref.Get()
+		if got := staleAutoSwitchSeed.ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.3 {
+			t.Fatalf("stale auto-switch seed = %v, want 0.3", got)
+		}
+		if !ref.SetForAccountGeneration(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		}), 1) {
+			t.Fatal("full-provider refresh was rejected")
+		}
+		if _, ok := ref.MergeScoresForAccountGenerationAtScoreRevision([]Score{{
+			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+		}}, 1, seedRevision); ok {
+			t.Fatal("older Codex measurement overwrote a concurrent full refresh")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.8 {
+			t.Fatalf("Claude headroom = %v, want concurrent refresh value 0.8", got)
+		}
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.4 {
+			t.Fatalf("Codex headroom = %v, want concurrent refresh value 0.4", got)
+		}
+	})
+
+	t.Run("older direct full refresh is rejected", func(t *testing.T) {
+		ref := newRef()
+		seedRevision := ref.ScoreRevision()
+		if _, ok := ref.MergeScoresForAccountGeneration([]Score{{
+			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+		}}, 1); !ok {
+			t.Fatal("Codex publication was rejected")
+		}
+		if ref.SetForAccountGenerationAtScoreRevision(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		}), 1, seedRevision) {
+			t.Fatal("older direct full refresh overwrote a newer score merge")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.9 {
+			t.Fatalf("Codex headroom = %v, want newer merged value 0.9", got)
+		}
+	})
+
+	t.Run("newer score merge invalidates older full refresh", func(t *testing.T) {
+		ref := newRef()
+		ref.SetUpdatedAt(time.Time{})
+		if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("full-provider refresh did not begin")
+		}
+		if _, ok := ref.MergeScoresForAccountGeneration([]Score{{
+			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+		}}, 1); !ok {
+			t.Fatal("Codex publication was rejected")
+		}
+		if ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("replacement refresh started before the invalidated attempt was consumed")
+		}
+		if ref.FinishRefreshForAccountGeneration(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		}), true, 1) {
+			t.Fatal("older full-provider refresh overwrote a newer score merge")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.9 {
+			t.Fatalf("Codex headroom = %v, want newer merged value 0.9", got)
+		}
+		if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("replacement full-provider refresh was not immediately eligible")
+		}
+		if !ref.FinishRefreshForAccountGeneration(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.85, ShortHeadroom: 0.85},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		}), true, 1) {
+			t.Fatal("replacement full-provider refresh was rejected")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderClaude, "claude").Headroom; got != 0.8 {
+			t.Fatalf("Claude headroom = %v, want replacement refresh value 0.8", got)
+		}
+	})
+
+	t.Run("newer direct publication invalidates older full refresh", func(t *testing.T) {
+		ref := newRef()
+		ref.SetUpdatedAt(time.Time{})
+		if !ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("full-provider refresh did not begin")
+		}
+		revision := ref.ScoreRevision()
+		if !ref.SetForAccountGenerationAtScoreRevision(NewScheduler([]Score{
+			{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9},
+			{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.7, ShortHeadroom: 0.7},
+		}), 1, revision) {
+			t.Fatal("newer direct publication was rejected")
+		}
+		if ref.BeginRefreshIfStaleForAccountGeneration(time.Minute, 1) {
+			t.Fatal("replacement refresh started before the invalidated attempt was consumed")
+		}
+		if ref.FinishRefreshForAccountGeneration(NewScheduler([]Score{{
+			AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.4, ShortHeadroom: 0.4,
+		}}), true, 1) {
+			t.Fatal("older full-provider refresh overwrote the direct publication")
+		}
+		if got := ref.Get().ScoreFor(account.ProviderCodex, "codex").Headroom; got != 0.9 {
+			t.Fatalf("Codex headroom = %v, want newer direct value 0.9", got)
+		}
+	})
+}
+
+func TestSchedulerRefScoreMergePreservesLiveDebitsExhaustionAndStaleness(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.5, ShortHeadroom: 0.5},
+		{AccountID: "claude", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "claude-recovery", Provider: account.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	}))
+	ref.AdvanceAccountGeneration(1)
+	ref.NoteRouted(account.ProviderCodex, "codex")
+	expires := time.Now().Add(time.Hour)
+	ref.MarkExhaustedUntil(account.ProviderClaude, "claude", "", expires)
+	ref.MarkExhaustedUntil(account.ProviderClaude, "claude-recovery", "", time.Now().Add(-time.Second))
+	_ = ref.Get()
+	recoveryKey := poolScopedExhaustionKey(account.ProviderClaude, "claude-recovery", "")
+	if _, ready := ref.recoveryProbeReady[recoveryKey]; !ready {
+		t.Fatal("test setup did not create Claude recovery probe")
+	}
+	oldUpdatedAt := time.Now().Add(-time.Hour)
+	ref.SetUpdatedAt(oldUpdatedAt)
+
+	merged, ok := ref.MergeScoresForAccountGeneration([]Score{{
+		AccountID: "codex", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9,
+	}}, 1)
+	if !ok {
+		t.Fatal("score merge was rejected")
+	}
+	if got := merged.score(account.ProviderCodex, "codex").Headroom; got != 0.9-LiveDebitPerRequest {
+		t.Fatalf("live-debited Codex headroom = %v, want %v", got, 0.9-LiveDebitPerRequest)
+	}
+	if got := ref.LiveDebits()[ScoreKey(account.ProviderCodex, "codex")]; got != 1 {
+		t.Fatalf("live debit count = %d, want 1", got)
+	}
+	if !ref.Get().Exhausted(account.ProviderClaude, "claude") {
+		t.Fatal("score merge cleared another provider's exhaustion overlay")
+	}
+	if got, ok := ref.ExhaustedUntilFor(account.ProviderClaude, "claude", ""); !ok || !got.Equal(expires) {
+		t.Fatalf("exhaustion expiry = %v, %v; want %v, true", got, ok, expires)
+	}
+	if _, ready := ref.recoveryProbeReady[recoveryKey]; !ready {
+		t.Fatal("score merge cleared another provider's recovery probe")
+	}
+	if !ref.Stale(time.Minute) {
+		t.Fatal("partial score merge made the full-provider snapshot look fresh")
+	}
+	ref.mu.RLock()
+	gotUpdatedAt := ref.updatedAt
+	ref.mu.RUnlock()
+	if !gotUpdatedAt.Equal(oldUpdatedAt) {
+		t.Fatalf("updatedAt = %v, want retained age %v", gotUpdatedAt, oldUpdatedAt)
+	}
+}
+
+func TestCredentialExhaustionIsScopedToAccountGeneration(t *testing.T) {
+	credential := account.Account{
+		ID: "repaired@example.com", Provider: account.ProviderCodex, Token: "old-token",
+	}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: credential.ID, Provider: credential.Provider,
+		Headroom: 1, ShortHeadroom: 1,
+	}}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{credential})
+	if !ref.MarkCredentialExhaustedUntil(
+		credential.Provider, credential.ID, credential.CredentialIdentity(), time.Now().Add(time.Hour), 1,
+	) {
+		t.Fatal("current credential failure was rejected")
+	}
+	if !ref.Get().Exhausted(account.ProviderCodex, "repaired@example.com") {
+		t.Fatal("current credential failure did not exclude the account")
+	}
+
+	ref.AdvanceAccountGenerationWithAccounts(2, 2, []account.Account{credential})
+	if !ref.Get().Exhausted(credential.Provider, credential.ID) {
+		t.Fatal("unrelated reload cleared an unchanged credential's exclusion")
+	}
+	replacement := credential
+	replacement.Token = "replacement-token"
+	ref.AdvanceAccountGenerationWithAccounts(3, 3, []account.Account{replacement})
+	if ref.Get().Exhausted(account.ProviderCodex, "repaired@example.com") {
+		t.Fatal("replacement inherited the old credential's exclusion")
+	}
+	if ref.MarkCredentialExhaustedUntil(
+		account.ProviderCodex, "repaired@example.com", "old-token", time.Now().Add(time.Hour), 1,
+	) {
+		t.Fatal("late old-generation credential failure was accepted")
+	}
+	if ref.Get().Exhausted(account.ProviderCodex, "repaired@example.com") {
+		t.Fatal("late old-generation failure poisoned the replacement")
+	}
+}
+
+func TestCredentialFailureAtomicallyAdvancesAccountSnapshot(t *testing.T) {
+	old := account.Account{
+		ID: "reloaded@example.com", Provider: account.ProviderCodex,
+		CredentialVersion: "old-refresh-chain",
+	}
+	current := old
+	current.CredentialVersion = "current-refresh-chain"
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: current.ID, Provider: current.Provider, Headroom: 1, ShortHeadroom: 1,
+	}}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{old})
+
+	if !ref.MarkCredentialExhaustedForSnapshot(
+		current.Provider, current.ID, current.CredentialIdentity(), time.Now().Add(time.Hour),
+		2, 2, []account.Account{current},
+	) {
+		t.Fatal("current credential failure was dropped before the reload publisher synchronized")
+	}
+	if !ref.Get().Exhausted(current.Provider, current.ID) {
+		t.Fatal("current credential was not excluded")
+	}
+	if ref.MarkCredentialExhaustedForSnapshot(
+		old.Provider, old.ID, old.CredentialIdentity(), time.Now().Add(time.Hour),
+		1, 1, []account.Account{old},
+	) {
+		t.Fatal("stale credential snapshot regressed the scheduler generation")
+	}
+}
+
+func TestAccountCredentialSnapshotCannotRegressGeneration(t *testing.T) {
+	old := account.Account{
+		ID: "reloaded@example.com", Provider: account.ProviderCodex,
+		CredentialVersion: "old-refresh-chain",
+	}
+	current := old
+	current.CredentialVersion = "current-refresh-chain"
+	ref := NewSchedulerRef(NewScheduler(nil))
+	ref.AdvanceAccountGenerationWithAccounts(2, 2, []account.Account{current})
+
+	// A delayed publisher with a superficially newer credential revision must
+	// not roll the account generation or credential identity backward.
+	ref.AdvanceAccountGenerationWithAccounts(1, 3, []account.Account{old})
+	if !ref.MarkCredentialExhaustedUntil(
+		current.Provider, current.ID, current.CredentialIdentity(), time.Now().Add(time.Hour), 2,
+	) {
+		t.Fatal("stale publisher replaced the current account generation")
+	}
+	if ref.MarkCredentialExhaustedUntil(
+		old.Provider, old.ID, old.CredentialIdentity(), time.Now().Add(time.Hour), 1,
+	) {
+		t.Fatal("stale account generation became current")
+	}
+}
+
+func TestSyncAccountCredentialsDropsExclusionAfterTokenRotation(t *testing.T) {
+	old := account.Account{
+		ID: "rotated@example.com", Provider: account.ProviderCodex, Token: "same-access-token",
+		CredentialVersion: "old-refresh-chain",
+	}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: old.ID, Provider: old.Provider, Headroom: 1, ShortHeadroom: 1,
+	}}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{old})
+	if !ref.MarkCredentialExhaustedUntil(old.Provider, old.ID, old.CredentialIdentity(), time.Now().Add(time.Hour), 1) {
+		t.Fatal("old credential failure was rejected")
+	}
+	replacement := old
+	replacement.CredentialVersion = "new-refresh-chain"
+	if !ref.SyncAccountCredentials(1, 2, []account.Account{replacement}) {
+		t.Fatal("same-generation token rotation was not published")
+	}
+	// A reload publisher that captured the old snapshot before the rotation
+	// must not roll the fingerprint backward at the same generation.
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{old})
+	if ref.SyncAccountCredentials(1, 1, []account.Account{old}) {
+		t.Fatal("stale same-generation credential snapshot was accepted")
+	}
+	if ref.Get().Exhausted(replacement.Provider, replacement.ID) {
+		t.Fatal("rotated token inherited the old token's exclusion")
+	}
+	if ref.MarkCredentialExhaustedUntil(
+		old.Provider, old.ID, old.CredentialIdentity(), time.Now().Add(time.Hour), 1,
+	) {
+		t.Fatal("late old-token failure was accepted after same-generation rotation")
+	}
+	if ref.Get().Exhausted(replacement.Provider, replacement.ID) {
+		t.Fatal("late old-token failure poisoned the rotated credential")
+	}
+	ref.MarkExhaustedUntil(replacement.Provider, replacement.ID, "", time.Now().Add(time.Hour))
+	rotatedAgain := replacement
+	rotatedAgain.CredentialVersion = "third-refresh-chain"
+	if !ref.SyncAccountCredentials(1, 3, []account.Account{rotatedAgain}) {
+		t.Fatal("second token rotation was not published")
+	}
+	if !ref.Get().Exhausted(rotatedAgain.Provider, rotatedAgain.ID) {
+		t.Fatal("token rotation cleared an account-scoped exclusion")
+	}
+}
+
+func TestTokenRotationRestoresBaseScoreAfterCredentialOverlayWasCarriedForward(t *testing.T) {
+	old := account.Account{ID: "recovered@example.com", Provider: account.ProviderCodex, Token: "old-token"}
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID: old.ID, Provider: old.Provider, Headroom: 0.8, ShortHeadroom: 0.8,
+	}}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{old})
+	if !ref.MarkCredentialExhaustedUntil(old.Provider, old.ID, old.CredentialIdentity(), time.Now().Add(time.Hour), 1) {
+		t.Fatal("credential failure was rejected")
+	}
+	// A failed usage refresh can carry Get's overlaid zero forward. Publishing
+	// that seed must not bake the credential overlay into the base scheduler.
+	ref.FinishRefresh(ref.Get(), true)
+	replacement := old
+	replacement.Token = "new-token"
+	if !ref.SyncAccountCredentials(1, 2, []account.Account{replacement}) {
+		t.Fatal("token rotation was not published")
+	}
+	if got := ref.Get().ScoreFor(replacement.Provider, replacement.ID).Headroom; got != 0.8 {
+		t.Fatalf("token rotation left carried credential zero in base score: got %v want 0.8", got)
+	}
+}
+
+func TestSchedulerRefScoreMergeReturnsActiveExhaustionOverlay(t *testing.T) {
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7},
+		{AccountID: "blocked", Provider: account.ProviderCodex, Headroom: 0.9, ShortHeadroom: 0.9},
+	}))
+	ref.AdvanceAccountGeneration(1)
+	ref.MarkExhaustedUntil(account.ProviderCodex, "blocked", "", time.Now().Add(time.Hour))
+
+	merged, ok := ref.MergeScoresForAccountGeneration([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7, Fresh: true},
+		{AccountID: "blocked", Provider: account.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+	}, 1)
+	if !ok {
+		t.Fatal("score merge was rejected")
+	}
+	if !merged.Exhausted(account.ProviderCodex, "blocked") {
+		t.Fatal("partial merge return omitted the active exhaustion overlay")
+	}
+	picked, err := merged.PickBest([]account.Account{
+		{ID: "healthy", Provider: account.ProviderCodex},
+		{ID: "blocked", Provider: account.ProviderCodex},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "healthy" {
+		t.Fatalf("picked = %q, want healthy account", picked.ID)
+	}
+}
+
+func TestSchedulerRefScoreMergeReturnsActiveCredentialExclusion(t *testing.T) {
+	credential := account.Account{
+		ID: "blocked", Provider: account.ProviderCodex, Token: "blocked-token",
+	}
+	ref := NewSchedulerRef(NewScheduler([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7},
+		{AccountID: credential.ID, Provider: credential.Provider, Headroom: 0.9, ShortHeadroom: 0.9},
+	}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{credential})
+	if !ref.MarkCredentialExhaustedUntil(
+		credential.Provider, credential.ID, credential.CredentialIdentity(), time.Now().Add(time.Hour), 1,
+	) {
+		t.Fatal("credential exclusion was rejected")
+	}
+
+	merged, ok := ref.MergeScoresForAccountGeneration([]Score{
+		{AccountID: "healthy", Provider: account.ProviderCodex, Headroom: 0.7, ShortHeadroom: 0.7, Fresh: true},
+		{AccountID: credential.ID, Provider: credential.Provider, Headroom: 0.9, ShortHeadroom: 0.9, Fresh: true},
+	}, 1)
+	if !ok {
+		t.Fatal("score merge was rejected")
+	}
+	if !merged.Exhausted(credential.Provider, credential.ID) {
+		t.Fatal("partial merge return omitted the active credential exclusion")
+	}
+	picked, err := merged.PickBest([]account.Account{
+		{ID: "healthy", Provider: account.ProviderCodex},
+		credential,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if picked.ID != "healthy" {
+		t.Fatalf("picked = %q, want healthy account", picked.ID)
 	}
 }
 
@@ -359,6 +860,41 @@ func TestModelIncompatibilitySurvivesHealthyPoolRefresh(t *testing.T) {
 	}
 	if ref.Get().Exhausted(account.ProviderCodex, "incompatible@example.com") {
 		t.Fatal("model incompatibility must not exhaust the base account score")
+	}
+}
+
+func TestAccountUnavailableSurvivesHealthyRefreshAndCredentialRotation(t *testing.T) {
+	const accountID = "disabled@example.com"
+	ref := NewSchedulerRef(NewScheduler([]Score{{
+		AccountID:     accountID,
+		Provider:      account.ProviderClaude,
+		Headroom:      0.8,
+		ShortHeadroom: 0.8,
+		Fresh:         true,
+	}}))
+	ref.AdvanceAccountGenerationWithAccounts(1, 1, []account.Account{{
+		ID: accountID, Provider: account.ProviderClaude, Token: "old-token",
+	}})
+	until := time.Now().Add(time.Hour)
+	ref.MarkAccountUnavailableUntil(account.ProviderClaude, accountID, until)
+
+	ref.FinishRefresh(NewScheduler([]Score{{
+		AccountID:     accountID,
+		Provider:      account.ProviderClaude,
+		Headroom:      0.9,
+		ShortHeadroom: 0.9,
+		Fresh:         true,
+	}}), true)
+	ref.AdvanceAccountGenerationWithAccounts(2, 2, []account.Account{{
+		ID: accountID, Provider: account.ProviderClaude, Token: "rotated-token",
+	}})
+
+	if !ref.Get().Exhausted(account.ProviderClaude, accountID) {
+		t.Fatal("healthy quota refresh and credential rotation cleared account-state exclusion")
+	}
+	got, ok := ref.ExhaustedUntilFor(account.ProviderClaude, accountID, "")
+	if !ok || !got.Equal(until) {
+		t.Fatalf("account-state expiry = %v, %t; want %v, true", got, ok, until)
 	}
 }
 

@@ -666,11 +666,15 @@ func validGoldenRevision(value string) bool {
 }
 
 func validateGoldenMigrationSummary(summary goldenSummary, testMode bool) error {
+	return validateGoldenMigrationSummaryForCandidate(summary, testMode, goldenPinnedCandidateTag)
+}
+
+func validateGoldenMigrationSummaryForCandidate(summary goldenSummary, testMode bool, candidateTag string) error {
 	preparation := summary.MigrationPreparation
 	if err := validateGoldenMigrationActionSummary(preparation, "front-migration-preparation"); err != nil {
 		return err
 	}
-	if !testMode && (preparation.ReleaseTag != goldenPinnedCandidateTag ||
+	if !testMode && (preparation.ReleaseTag != candidateTag ||
 		preparation.ReleaseSourceRevision != summary.Activation.ReleaseSourceRevision) {
 		return failGolden("migration_candidate_provenance_mismatch")
 	}

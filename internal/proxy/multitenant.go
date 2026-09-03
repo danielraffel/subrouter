@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -15,7 +16,10 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
+	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
 	"github.com/manaflow-ai/subrouter/internal/stackauth"
 	"github.com/manaflow-ai/subrouter/internal/tenant"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
@@ -244,6 +248,7 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 	}
 	if strings.HasPrefix(path, "/_subrouter/accounts/") ||
 		path == "/_subrouter/account-import" ||
+		path == "/_subrouter/qwen-console" ||
 		path == "/_subrouter/reload-accounts" {
 		return key.Allows(tenant.CapabilityManageAccounts)
 	}
@@ -252,9 +257,11 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 		return key.Allows(tenant.CapabilityUse) ||
 			key.Allows(tenant.CapabilityManageAccounts)
 	}
+	if path == "/_subrouter/sessions" {
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
 	if path == "/_subrouter/leases" ||
-		strings.HasPrefix(path, "/_subrouter/leases/") ||
-		path == "/_subrouter/sessions" {
+		strings.HasPrefix(path, "/_subrouter/leases/") {
 		return key.Allows(tenant.CapabilityUse)
 	}
 	if strings.HasPrefix(path, "/_subrouter/") {
@@ -313,18 +320,35 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	if err := os.MkdirAll(filepath.Join(dir, "codex", "accounts"), 0o700); err != nil {
 		return nil, err
 	}
-	codexStore := accounts.CodexStore{Dir: filepath.Join(dir, "codex", "accounts")}
+	// Tenant handlers are serving paths, not interactive account managers. A
+	// token refresh may update the tenant's stored credential, but it must not
+	// replace the daemon user's ~/.codex/auth.json even when the emails match.
+	codexStore := accounts.CodexStore{
+		Dir:                   filepath.Join(dir, "codex", "accounts"),
+		DisableActiveAuthSync: true,
+		RequireIsolatedOAuth:  true,
+	}
 	claudeStore := agentclaude.Store{Dir: filepath.Join(dir, "codex")}
 	sessions, err := session.NewStore(filepath.Join(dir, "sessions.json"))
 	if err != nil {
 		return nil, err
 	}
 	client := &http.Client{Timeout: 15 * time.Second, Transport: m.Base.Transport}
-	ref, err := OpenAccountRefContext(ctx, codexStore, claudeStore, client)
+	kimiDir := filepath.Join(dir, "kimi")
+	kimiStore := agentkimi.Store{
+		// Tenant pools contain only explicitly imported managed profiles. Point
+		// the singleton CLI slot at an unused tenant-local path so it can never
+		// inherit the host user's global Kimi login.
+		Path:       filepath.Join(kimiDir, "cli-disabled.json"),
+		KimiHome:   kimiDir,
+		ManagedDir: kimiDir,
+	}
+	agyStore := (&agentantigravity.Store{ManagedDir: filepath.Join(dir, "antigravity")}).ForServing()
+	ref, err := OpenAccountRefWithSources(ctx, codexStore, claudeStore, client, []OAuthAccountSource{kimiStore, agyStore})
 	if err != nil {
 		return nil, err
 	}
-	initial, accountGeneration := ref.Snapshot()
+	initial, accountGeneration, credentialRevision := ref.CredentialSnapshot()
 
 	server := m.Base
 	server.Accounts = nil
@@ -336,7 +360,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.Sessions = sessions
 	server.Scheduler = selectacct.Scheduler{}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
-	server.SchedulerRef.AdvanceAccountGeneration(accountGeneration)
+	server.SchedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, SchedulerAccounts(initial))
 	server.ActiveSessions = NewActiveSessions()
 	server.CacheFlight = newSingleFlight()
 	// Reaching a tenant handler already proves possession of the tenant key,
@@ -352,6 +376,7 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 }
 
 func tenantFallbackScores(available []accounts.Account) []selectacct.Score {
+	available = SchedulerAccounts(available)
 	scores := make([]selectacct.Score, 0, len(available))
 	for _, account := range available {
 		headroom := 1.0
@@ -374,6 +399,7 @@ var tenantControlPaths = map[string]bool{
 	"/_subrouter/sessions":        true,
 	"/_subrouter/reload-accounts": true, // loopback-only inside the Server handler
 	"/_subrouter/account-import":  true,
+	"/_subrouter/qwen-console":    true,
 }
 
 func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
@@ -404,6 +430,10 @@ func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
 		}
 		if r.URL.Path == "/_subrouter/accounts/migration/rollback" && r.Method == http.MethodPost {
 			handleTenantMigrationRollback(&server, w, r)
+			return
+		}
+		if r.URL.Path == "/_subrouter/qwen-console" && r.Method == http.MethodPost {
+			server.handleQwenConsoleImport(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/_subrouter/accounts/") && r.Method == http.MethodDelete {
@@ -819,12 +849,13 @@ func validStackTeamName(name string) bool {
 }
 
 type tenantAccountUpload struct {
-	Provider        string `json:"provider"`
-	AccountID       string `json:"accountId,omitempty"`
-	Label           string `json:"label"`
-	APIKey          string `json:"apiKey"`
-	TargetAccountID string `json:"targetAccountID,omitempty"`
-	Tokens          *struct {
+	Provider              string                              `json:"provider"`
+	AccountID             string                              `json:"accountId,omitempty"`
+	Label                 string                              `json:"label"`
+	APIKey                string                              `json:"apiKey"`
+	TargetAccountID       string                              `json:"targetAccountID,omitempty"`
+	OAuthCredentialOrigin accounts.CodexOAuthCredentialOrigin `json:"oauthCredentialOrigin,omitempty"`
+	Tokens                *struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		IDToken      string `json:"idToken"`
@@ -947,19 +978,10 @@ func storedTenantMigrationAccount(input tenantAccountUpload) (accounts.StoredCod
 	}
 	switch input.Provider {
 	case "codex":
-		if input.Tokens == nil || input.Tokens.AccessToken == "" || input.Tokens.RefreshToken == "" || input.Tokens.IDToken == "" {
-			return accounts.StoredCodexAccount{}, errors.New("complete Codex OAuth tokens are required")
-		}
-		return accounts.StoredCodexAccount{
-			Email: input.AccountID, Label: input.Label, Provider: accounts.ProviderCodex,
-			Auth: accounts.CodexAuthFile{
-				AuthMode: "chatgpt",
-				Tokens: &accounts.CodexTokens{
-					AccessToken: input.Tokens.AccessToken, RefreshToken: input.Tokens.RefreshToken,
-					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
-				},
-			},
-		}, nil
+		// OAuth refresh-token ownership cannot be transferred atomically with a
+		// migration batch. Accept it only through the individual upload endpoint,
+		// which rotates the chain before publishing the account.
+		return accounts.StoredCodexAccount{}, errors.New("Codex OAuth migration requires individual server-attested account upload")
 	case "openai-apikey", "anthropic-apikey":
 		if strings.TrimSpace(input.APIKey) == "" {
 			return accounts.StoredCodexAccount{}, errors.New("API key is required")
@@ -1012,6 +1034,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 	}
 	var id string
 	var kind string
+	var prepare func() (string, func() error, error)
 	validateRepairTarget := func(candidate string) bool {
 		return input.TargetAccountID == "" || subtle.ConstantTimeCompare(
 			[]byte(input.TargetAccountID), []byte(candidate),
@@ -1031,7 +1054,7 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+		account := accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: accounts.ProviderCodex,
 			Auth: accounts.CodexAuthFile{
 				AuthMode: "chatgpt",
@@ -1040,10 +1063,68 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 					IDToken: input.Tokens.IDToken, AccountID: input.Tokens.AccountID,
 				},
 			},
-		})
-		if err != nil {
-			http.Error(w, "save Codex account", http.StatusInternalServerError)
-			return
+		}
+		prepare = func() (string, func() error, error) {
+			submittedIdentity, err := accounts.ExtractEmailFromJWT(account.Auth.Tokens.IDToken)
+			if err != nil || strings.TrimSpace(submittedIdentity) == "" {
+				return "", nil, tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+			}
+			expectedIdentity := ""
+			existing, found, err := server.AccountRef.store.FindStored(account.Email)
+			if err != nil {
+				return "", nil, err
+			}
+			if input.TargetAccountID != "" {
+				if !found || existing.Auth.Tokens == nil {
+					return "", nil, tenantUploadError(http.StatusConflict, "Codex repair target is unavailable")
+				}
+				account.Email = existing.Email
+				expectedIdentity, err = accounts.ExtractEmailFromJWT(existing.Auth.Tokens.IDToken)
+				if err != nil || !strings.EqualFold(strings.TrimSpace(expectedIdentity), strings.TrimSpace(submittedIdentity)) {
+					return "", nil, tenantUploadError(http.StatusConflict, "Codex repair identity does not match existing account")
+				}
+			} else if found {
+				return "", nil, tenantUploadError(http.StatusConflict, "Codex account already exists; use repair")
+			}
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return canonicalID, func() error {
+				err := attestAndSaveTenantCodexOAuth(
+					r.Context(), server.AccountRef.client, server.AccountRef.store, account,
+					func(attested *accounts.StoredCodexAccount) error {
+						if attested.Auth.Tokens == nil {
+							return tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+						}
+						refreshedIdentity, identityErr := accounts.ExtractEmailFromJWT(attested.Auth.Tokens.IDToken)
+						if identityErr != nil || strings.TrimSpace(refreshedIdentity) == "" {
+							return tenantUploadError(http.StatusBadRequest, "Codex OAuth credential identity is invalid")
+						}
+						if !strings.EqualFold(strings.TrimSpace(submittedIdentity), strings.TrimSpace(refreshedIdentity)) {
+							return tenantUploadError(http.StatusConflict, "Codex OAuth credential identity changed during transfer")
+						}
+						if expectedIdentity != "" && !strings.EqualFold(strings.TrimSpace(expectedIdentity), strings.TrimSpace(refreshedIdentity)) {
+							return tenantUploadError(http.StatusConflict, "Codex repair identity does not match existing account")
+						}
+						attested.Email = canonicalID
+						return nil
+					},
+				)
+				if err != nil {
+					var uploadErr *tenantAccountUploadError
+					if errors.As(err, &uploadErr) {
+						return err
+					}
+					var validationErr *accountImportValidationError
+					if errors.As(err, &validationErr) {
+						return tenantUploadError(http.StatusBadRequest, "Codex OAuth credential transfer failed")
+					}
+					return err
+				}
+				return nil
+			}, nil
 		}
 	case "openai-apikey", "anthropic-apikey":
 		if strings.TrimSpace(input.APIKey) == "" {
@@ -1062,12 +1143,17 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		if err := server.AccountRef.store.SaveStored(accounts.StoredCodexAccount{
+		account := accounts.StoredCodexAccount{
 			Email: id, Label: input.Label, Provider: provider,
 			Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: strings.TrimSpace(input.APIKey)},
-		}); err != nil {
-			http.Error(w, "save API key", http.StatusInternalServerError)
-			return
+		}
+		prepare = func() (string, func() error, error) {
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), account.Email, false)
+			if err != nil {
+				return "", nil, err
+			}
+			account.Email = canonicalID
+			return canonicalID, func() error { return server.AccountRef.store.SaveStored(account) }, nil
 		}
 	case "claude":
 		if input.ClaudeAIOAuth == nil || input.ClaudeAIOAuth.AccessToken == "" || input.ClaudeAIOAuth.RefreshToken == "" {
@@ -1079,21 +1165,58 @@ func handleTenantAccountUpload(server *Server, w http.ResponseWriter, r *http.Re
 			http.Error(w, "repair target does not match uploaded account", http.StatusConflict)
 			return
 		}
-		if _, err := server.AccountRef.claudeStore.UpsertCredentialProfile(input.Label, *input.ClaudeAIOAuth); err != nil {
-			http.Error(w, "save Claude account", http.StatusInternalServerError)
-			return
+		prepare = func() (string, func() error, error) {
+			canonicalID, err := server.ensureAccountImportCapacity(r.Context(), id, true)
+			if err != nil {
+				return "", nil, err
+			}
+			return canonicalID, func() error {
+				_, err := server.AccountRef.claudeStore.UpsertCredentialProfile(canonicalID, *input.ClaudeAIOAuth)
+				return err
+			}, nil
 		}
 	default:
 		http.Error(w, "unsupported provider", http.StatusBadRequest)
 		return
 	}
-	if _, _, err := server.reloadAccounts(r.Context()); err != nil {
-		http.Error(w, "account saved but reload failed", http.StatusInternalServerError)
+	installedID, err := server.installAccountMutation(r.Context(), prepare)
+	if err != nil {
+		var uploadErr *tenantAccountUploadError
+		if errors.As(err, &uploadErr) {
+			http.Error(w, uploadErr.message, uploadErr.status)
+			return
+		}
+		var capacityErr *accountImportCapacityError
+		if errors.As(err, &capacityErr) {
+			http.Error(w, capacityErr.Error(), http.StatusInsufficientStorage)
+			return
+		}
+		var inventoryErr *accountImportInventoryUnavailableError
+		if errors.As(err, &inventoryErr) {
+			if server.Logger != nil {
+				server.Logger.Error("tenant account inventory unavailable", "source", inventoryErr.source, "error", inventoryErr.err)
+			}
+			http.Error(w, inventoryErr.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "save account", http.StatusInternalServerError)
 		return
 	}
+	id = installedID
 	writeJSON(w, map[string]any{"account": map[string]any{
 		"id": id, "kind": kind, "label": input.Label,
 	}})
+}
+
+type tenantAccountUploadError struct {
+	status  int
+	message string
+}
+
+func (e *tenantAccountUploadError) Error() string { return e.message }
+
+func tenantUploadError(status int, message string) error {
+	return &tenantAccountUploadError{status: status, message: message}
 }
 
 func validTenantAccountText(value string) bool {
@@ -1110,20 +1233,12 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		http.NotFound(w, r)
 		return
 	}
-	removed := false
-	if _, ok, err := server.AccountRef.store.RemoveStored(id); err != nil {
-		http.Error(w, "remove account", http.StatusInternalServerError)
-		return
-	} else if ok {
-		removed = true
-	}
-	if ok, err := server.AccountRef.claudeStore.RemoveProfile(id); err != nil {
-		http.Error(w, "remove account", http.StatusInternalServerError)
-		return
-	} else if ok {
-		removed = true
-	}
+	removed, removeErr := removeTenantAccounts(r.Context(), server.AccountRef, id)
 	if !removed {
+		if removeErr != nil {
+			http.Error(w, "remove account", http.StatusInternalServerError)
+			return
+		}
 		http.Error(w, "account not found", http.StatusNotFound)
 		return
 	}
@@ -1131,7 +1246,273 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 		http.Error(w, "account removed but reload failed", http.StatusInternalServerError)
 		return
 	}
+	if removeErr != nil {
+		http.Error(w, "account removed but credential cleanup failed", http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// removeTenantAccounts snapshots the exact requested identities before joining
+// the canonical installMu -> cross-process account transaction. It then
+// revalidates those identities under the transaction, publishes a generation,
+// and only then mutates durable credentials. A sibling worker that observes
+// the generation blocks on the transaction until every deletion and provider
+// cleanup has either committed or rolled back.
+func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (removed bool, err error) {
+	expectedStored, expectedStoredFound, err := ref.store.FindStored(id)
+	if err != nil {
+		return false, err
+	}
+	expectedClaude, expectedClaudeFound, err := snapshotTenantClaudeProfile(ctx, ref, id)
+	if err != nil {
+		return false, err
+	}
+	var expectedQwenConsole tenantQwenConsoleVersion
+	if expectedStoredFound && expectedStored.ProviderOrDefault() == accounts.ProviderQwenToken {
+		expectedQwenConsole, err = readTenantQwenConsoleVersion(ref, expectedStored.Email)
+		if err != nil {
+			return false, err
+		}
+	}
+	if !expectedStoredFound && !expectedClaudeFound {
+		return false, nil
+	}
+
+	if err := lockMutexContext(ctx, &ref.installMu); err != nil {
+		return false, err
+	}
+	defer ref.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(ctx, ref.store.StoreDir())
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, transactionLock.Close()) }()
+	if _, err := reconcileCompletedAccountRollback(ctx, ref.store, advanceAccountDiskGeneration); err != nil {
+		return false, err
+	}
+	var stored accounts.StoredCodexAccount
+	if expectedStoredFound {
+		var found bool
+		stored, found, err = ref.store.FindStored(expectedStored.Email)
+		if err != nil {
+			return false, err
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			currentConsole, err := readTenantQwenConsoleVersion(ref, stored.Email)
+			if err != nil {
+				return false, err
+			}
+			if currentConsole != expectedQwenConsole {
+				return false, errors.New("Qwen console credential changed during removal")
+			}
+		}
+	}
+	if expectedClaudeFound {
+		current, found, err := snapshotTenantClaudeProfile(ctx, ref, id)
+		if err != nil {
+			return false, err
+		}
+		if !found || current != expectedClaude {
+			return false, errors.New("Claude profile changed during removal")
+		}
+	}
+	published := false
+	if expectedClaudeFound && expectedStoredFound {
+		storedLease, leaseErr := ref.store.AcquireStoredAccountLease(expectedStored.Email)
+		if leaseErr != nil {
+			return false, leaseErr
+		}
+		defer func() { err = errors.Join(err, storedLease.Close()) }()
+		var found bool
+		stored, found, err = storedLease.FindExact()
+		if err != nil {
+			return false, err
+		}
+		if !found || stored.Email != expectedStored.Email ||
+			storedAccountMutationVersion(stored) != storedAccountMutationVersion(expectedStored) {
+			return false, errors.New("stored account changed during removal")
+		}
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			currentConsole, readErr := readTenantQwenConsoleVersion(ref, stored.Email)
+			if readErr != nil {
+				return false, readErr
+			}
+			if currentConsole != expectedQwenConsole {
+				return false, errors.New("Qwen console credential changed during removal")
+			}
+		}
+		if ref.afterTenantStoredRevalidateForTest != nil {
+			ref.afterTenantStoredRevalidateForTest()
+		}
+		removed, removeErr := removeJournaledTenantAccountLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude, stored,
+			storedLease, ref.store.Dir, expectedQwenConsole, ref.qwenRoot(),
+			func() error {
+				if err := ref.advanceDiskGeneration(); err != nil {
+					return err
+				}
+				published = true
+				return nil
+			},
+			ref.beforeTenantStoredRemovalForTest,
+		)
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+		}
+		return removed, removeErr
+	}
+	if expectedClaudeFound {
+		claudeRemoved, removeErr := removeJournaledClaudeProfileLocked(
+			ctx, ref.store.StoreDir(), id, ref.claudeStore, expectedClaude,
+			func() error {
+				if err := ref.advanceDiskGeneration(); err != nil {
+					return err
+				}
+				published = true
+				return nil
+			},
+		)
+		removed = removed || claudeRemoved
+		if removeErr != nil {
+			if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+				ref.evictSnapshotForAccountRollbackLocked()
+			}
+			return removed, removeErr
+		}
+	}
+	if expectedStoredFound {
+		if !published {
+			if err := ref.advanceDiskGeneration(); err != nil {
+				return removed, err
+			}
+		}
+		if ref.beforeTenantStoredRemovalForTest != nil {
+			ref.beforeTenantStoredRemovalForTest()
+		}
+		var storedRemoved bool
+		var removeErr error
+		if stored.ProviderOrDefault() == accounts.ProviderQwenToken {
+			storedRemoved, removeErr = removeTenantQwenAccountLocked(ref, stored, expectedQwenConsole)
+		} else {
+			storedRemoved, removeErr = removeTenantStoredAccountLocked(ref, stored)
+		}
+		removed = removed || storedRemoved
+		if removeErr != nil {
+			return removed, removeErr
+		}
+	}
+	return removed, nil
+}
+
+func snapshotTenantClaudeProfile(ctx context.Context, ref *AccountRef, id string) (agentclaude.ProfileRemovalSnapshot, bool, error) {
+	// Stored-only selectors such as "apikey:work" cannot name a Claude profile.
+	// Treat them as having no Claude component instead of failing the deletion.
+	if agentclaude.ValidateProfileNameAllowEmail(id) != nil {
+		return agentclaude.ProfileRemovalSnapshot{}, false, nil
+	}
+	return ref.claudeStore.SnapshotProfileRemovalContext(ctx, id)
+}
+
+func storedAccountMutationVersion(stored accounts.StoredCodexAccount) [sha256.Size]byte {
+	body, _ := json.Marshal(stored)
+	return sha256.Sum256(body)
+}
+
+type tenantQwenConsoleVersion struct {
+	Found   bool
+	Version string
+}
+
+var syncTenantStoredAccountDir = syncAccountStateDir
+
+func readTenantQwenConsoleVersion(ref *AccountRef, id string) (tenantQwenConsoleVersion, error) {
+	found, version, err := agentqwen.ConsoleCredentialVersionIn(ref.qwenRoot(), id)
+	return tenantQwenConsoleVersion{Found: found, Version: version}, err
+}
+
+func removeTenantStoredAccountLocked(ref *AccountRef, expected accounts.StoredCodexAccount) (bool, error) {
+	_, removed, err := ref.store.RemoveStoredExactDurable(expected, syncTenantStoredAccountDir)
+	return removed, err
+}
+
+func removeTenantQwenAccountLocked(
+	ref *AccountRef,
+	stored accounts.StoredCodexAccount,
+	expectedConsole tenantQwenConsoleVersion,
+) (bool, error) {
+	return agentqwen.RemoveConsoleCredentialExactIn(
+		ref.qwenRoot(), stored.Email, expectedConsole.Found, expectedConsole.Version,
+		func() (bool, error) { return removeTenantStoredAccountLocked(ref, stored) },
+	)
+}
+
+func restoreTenantQwenConsoleDurably(
+	root, accountID string,
+	credential agentqwen.ConsoleCredential,
+	syncDir func(string) error,
+) error {
+	if err := agentqwen.SaveConsoleCredentialIn(root, accountID, credential); err != nil {
+		return err
+	}
+	consoleDir := agentqwen.ConsoleConfigDirIn(root, accountID)
+	if err := syncTenantQwenConsoleFiles(consoleDir); err != nil {
+		return err
+	}
+	return errors.Join(syncDir(consoleDir), syncDir(filepath.Dir(consoleDir)))
+}
+
+func syncTenantQwenConsoleFiles(consoleDir string) error {
+	for _, name := range []string{"config.json", "metadata.json"} {
+		file, err := os.Open(filepath.Join(consoleDir, name))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeTenantQwenAccountWithOps(
+	hasConsole bool,
+	removeConsole func() error,
+	removeAccount func() (bool, error),
+	restoreConsole func() error,
+) (bool, error) {
+	// Remove the separately stored console bearer first. A crash can now leave
+	// a model account without usage metadata, but never an orphaned console
+	// secret after the account itself has disappeared.
+	if hasConsole {
+		if err := removeConsole(); err != nil {
+			return false, err
+		}
+	}
+	removed, removeErr := removeAccount()
+	if removeErr == nil && removed {
+		return true, nil
+	}
+	if removeErr == nil {
+		removeErr = errors.New("Qwen account disappeared during removal")
+	}
+	if hasConsole {
+		removeErr = errors.Join(removeErr, restoreConsole())
+	}
+	return removed, removeErr
 }
 
 func (m *MultiTenant) reloadTenantAccounts(ctx context.Context) {
