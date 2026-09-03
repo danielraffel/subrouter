@@ -596,6 +596,8 @@ reset times from Kimi's usage endpoint. The condensed API-key rows report key
 health and only quota data the provider actually exposes.
 
 The Antigravity CLI exposes one fixed Keychain login and no account selector.
+See [the native AGY runbook](docs/antigravity.md) for the safe profile and
+acceptance procedure.
 Subrouter turns that slot into an explicit import source: sign plain `agy` into
 an account, run `sr agy add <label>`, and repeat for each account. Each import
 is validated by an OAuth refresh and stored as an isolated, independently
