@@ -103,6 +103,12 @@ func (r srRunner) antigravityCommand(ctx context.Context, args []string) error {
 		fmt.Fprint(r.out, antigravityManagementHelp)
 		return nil
 	}
+	// Keep the provider launchers consistent: `proxy` is an optional alias for
+	// routed Kimi/Qwen launches, and must not be passed through as an AGY
+	// vendor argument (where it would be interpreted as an unknown command).
+	if len(args) > 0 && args[0] == "proxy" {
+		args = args[1:]
+	}
 	return r.launchAntigravityNative(ctx, args)
 }
 
