@@ -16,6 +16,9 @@ isolated account. Plain `agy` remains direct and is not modified.
 
 `sr agy` without `--account` pools the imported server accounts, retaining
 session affinity and failing over bounded authentication/rate-limit errors.
+Transient 429 responses are retried/fail over for the request but do not by
+themselves mark an account exhausted; only an authoritative account-wide
+failure should remove it from later selection.
 `sr agy --account <label-or-email>` hard-pins one account. The local AGY login
 is used only to pass the CLI's startup check; it is not the routed identity.
 
