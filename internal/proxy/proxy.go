@@ -7546,13 +7546,20 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// selected account up front (not only after a failover).  Cloud Code treats
 	// a bearer/project mismatch as an allocation failure and may return a
 	// misleading 429.
-	if t.provider == accounts.ProviderAntigravity && t.server != nil && req.GetBody != nil && accountID != "" {
-		body, bodyErr := req.GetBody()
-		if bodyErr != nil {
-			return nil, bodyErr
+	if t.provider == accounts.ProviderAntigravity && t.server != nil && accountID != "" {
+		var rawBody []byte
+		var readErr error
+		if req.GetBody != nil {
+			body, bodyErr := req.GetBody()
+			if bodyErr != nil {
+				return nil, bodyErr
+			}
+			rawBody, readErr = io.ReadAll(body)
+			_ = body.Close()
+		} else if req.Body != nil {
+			rawBody, readErr = io.ReadAll(io.LimitReader(req.Body, 1<<20+1))
+			_ = req.Body.Close()
 		}
-		rawBody, readErr := io.ReadAll(body)
-		_ = body.Close()
 		if readErr != nil {
 			return nil, readErr
 		}
@@ -7578,7 +7585,19 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				attemptReq.Body = io.NopCloser(bytes.NewReader(rewritten))
 				attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
 				attemptReq.ContentLength = int64(len(rewritten))
+			} else if req.GetBody == nil {
+				// Restore a one-shot body even when no rewrite was needed; the
+				// snapshot above consumed it while inspecting the envelope.
+				attemptReq = req.Clone(req.Context())
+				attemptReq.Body = io.NopCloser(bytes.NewReader(rawBody))
+				attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rawBody)), nil }
+				attemptReq.ContentLength = int64(len(rawBody))
 			}
+		} else if req.GetBody == nil && len(rawBody) > 0 {
+			attemptReq = req.Clone(req.Context())
+			attemptReq.Body = io.NopCloser(bytes.NewReader(rawBody))
+			attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rawBody)), nil }
+			attemptReq.ContentLength = int64(len(rawBody))
 		}
 	}
 	tried := map[string]struct{}{}

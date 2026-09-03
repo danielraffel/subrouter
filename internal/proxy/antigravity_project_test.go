@@ -90,9 +90,7 @@ func TestAntigravityInitialAttemptRewritesSelectedAccountProject(t *testing.T) {
 	}))
 	defer upstream.Close()
 	req := httptest.NewRequest(http.MethodPost, upstream.URL+"/antigravity/v1internal:generateContent", strings.NewReader(`{"project":"project-local","request":{"contents":[]}}`))
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(strings.NewReader(`{"project":"project-local","request":{"contents":[]}}`)), nil
-	}
+	// Exercise clients that send a one-shot body without net/http's replay hook.
 	req.Header.Set("Authorization", "Bearer token-selected")
 	transport := usageLimitRetryTransport{
 		base:     http.DefaultTransport,
