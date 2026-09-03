@@ -149,7 +149,7 @@ Running agents:
                         Run pinned to one Claude profile with no account failover
   sr gemini             Manage Gemini profiles (routing scaffold only)
   sr antigravity        Launch or manage native AGY OAuth profiles
-  sr agy                Launch pooled native AGY via the macOS Keychain (use --account to pin; plain agy stays direct)
+  sr agy                Launch AGY through the pooled Cloud Code route (use --account to pin; plain agy stays direct)
   sr kimi [args]        Run Kimi Code through Subrouter (plain kimi stays direct)
   sr qwen [args]        Run Qwen Code through Subrouter (plain qwen stays direct)
   sr <kimi|qwen> --account [account] [-- args]
