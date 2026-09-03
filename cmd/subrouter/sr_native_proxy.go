@@ -101,17 +101,21 @@ func (r srRunner) antigravityCommand(ctx context.Context, args []string) error {
 		fmt.Fprint(r.out, antigravityManagementHelp)
 		return nil
 	}
+	options, vendorArgs, err := parseNativeProxyLaunchArgs(args)
+	if err != nil {
+		return err
+	}
 	// Keep the provider launchers consistent: `proxy` is an optional alias for
 	// routed Kimi/Qwen launches, and must not be passed through as an AGY
 	// vendor argument (where it would be interpreted as an unknown command).
-	if len(args) > 0 && args[0] == "proxy" {
-		args = args[1:]
+	if len(vendorArgs) > 0 && vendorArgs[0] == "proxy" {
+		vendorArgs = vendorArgs[1:]
 	}
 	// AGY exposes a supported CLOUD_CODE_URL override. Use the same routed
 	// launcher as the other native providers so the server owns account
 	// selection, quota affinity, refresh, and bounded failover. Plain `agy`
 	// remains completely direct and untouched.
-	return r.launchNativeProxy(ctx, antigravityNativeProxy, args, nativeProxyLaunchOptions{})
+	return r.launchNativeProxy(ctx, antigravityNativeProxy, vendorArgs, options)
 }
 
 func (r srRunner) launchKimiProxy(ctx context.Context, args []string) error {
