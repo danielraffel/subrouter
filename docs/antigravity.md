@@ -53,6 +53,8 @@ Current acceptance note: a disposable shadow run with two verified OAuth
 profiles reached the real AGY Cloud Code endpoints and exercised account
 failover. Both profiles' Gemini generations were rejected upstream with
 `429 RESOURCE_EXHAUSTED` even though the weekly summary showed headroom, so a
-successful routed generation is not claimed yet. This is recorded as an
-upstream free-tier/model-allocation limitation until a later canary proves a
-2xx generation; it is not evidence of a relay or account-mixing failure.
+successful routed generation is not claimed yet. Native Cloud Code generation
+also carries a top-level `project` bound to the OAuth identity. The current
+relay swaps the bearer during failover but does not yet persist and rewrite
+that project, so cross-account replay is not accepted until that binding is
+implemented and a later two-account canary proves a 2xx generation.
