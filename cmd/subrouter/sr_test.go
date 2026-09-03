@@ -4121,6 +4121,7 @@ func TestAPIKeyProviderStatusUsesCompactRoutingColumns(t *testing.T) {
 }
 
 func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
+	t.Setenv("COLUMNS", "160")
 	var out bytes.Buffer
 	rows := []srUsageRow{
 		{email: "qwen-token:team-a", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, planType: "Lite", providerHealth: "auth ok", quotaStatus: "live", accountIdentity: "first@example.com", keyFingerprint: "key:1111111111", assignedSessions: 2, sessionsKnown: true, windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 25, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 2 * 86400}}},
@@ -4133,7 +4134,7 @@ func TestQwenStatusKeepsMultipleKeysAsSeparateAccounts(t *testing.T) {
 	rankUsageRows(rows)
 	displayUsageRows(&out, rows, false)
 	text := out.String()
-	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "team-a", "team-b", "console:"} {
+	for _, want := range []string{"Lite", "Pro", "active", "rec", "75% left", "60% left", "75%/2d", "90%/1h", "60%/3d", "team-a", "team-b", "team-a (console: first@example.com)", "team-b (console: second@example.com)"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Qwen status should show %q:\n%s", want, text)
 		}
