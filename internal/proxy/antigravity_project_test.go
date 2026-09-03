@@ -77,6 +77,43 @@ func TestAntigravityFailoverRewritesReplacementProject(t *testing.T) {
 	}
 }
 
+func TestAntigravityInitialAttemptRewritesSelectedAccountProject(t *testing.T) {
+	var generationBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1internal:loadCodeAssist" {
+			_, _ = io.WriteString(w, `{"cloudaicompanionProject":{"id":"project-selected"}}`)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		generationBody = string(body)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+	req := httptest.NewRequest(http.MethodPost, upstream.URL+"/antigravity/v1internal:generateContent", strings.NewReader(`{"project":"project-local","request":{"contents":[]}}`))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(`{"project":"project-local","request":{"contents":[]}}`)), nil
+	}
+	req.Header.Set("Authorization", "Bearer token-selected")
+	transport := usageLimitRetryTransport{
+		base:     http.DefaultTransport,
+		server:   &Server{AntigravityUpstream: mustParseURL(t, upstream.URL)},
+		provider: accounts.ProviderAntigravity,
+		account:  "agy:selected",
+		path:     req.URL.Path,
+	}
+	response, err := transport.RoundTrip(req)
+	if err != nil || response == nil || response.StatusCode != http.StatusOK {
+		status := "<nil>"
+		if response != nil {
+			status = response.Status
+		}
+		t.Fatalf("response=%s err=%v", status, err)
+	}
+	if !strings.Contains(generationBody, `"project":"project-selected"`) {
+		t.Fatalf("initial generation used unbound project: %s", generationBody)
+	}
+}
+
 func TestAntigravityProjectDiscoveryIsBoundToAccount(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1internal:loadCodeAssist" {

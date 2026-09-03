@@ -7540,6 +7540,47 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	attemptReq := req
 	accountID := t.account
 	accountCredential := t.accountCredential
+	// Native AGY includes the project selected by the local CLI in every
+	// generation envelope.  A pooled launch may select a different server
+	// account before the first upstream attempt, so bind that envelope to the
+	// selected account up front (not only after a failover).  Cloud Code treats
+	// a bearer/project mismatch as an allocation failure and may return a
+	// misleading 429.
+	if t.provider == accounts.ProviderAntigravity && t.server != nil && req.GetBody != nil && accountID != "" {
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		rawBody, readErr := io.ReadAll(body)
+		_ = body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if antigravityProjectFromBody(rawBody) != "" {
+			bearer := strings.TrimSpace(strings.TrimPrefix(attemptReq.Header.Get("Authorization"), "Bearer "))
+			if bearer == "" {
+				return nil, errors.New("AGY pooled request has no bearer for project binding")
+			}
+			upstream := t.server.upstreamForRequest(t.path, accounts.Account{ID: accountID, Provider: accounts.ProviderAntigravity})
+			if upstream == nil {
+				return nil, errors.New("AGY project binding has no upstream")
+			}
+			project, projectErr := t.server.antigravityProject(req.Context(), accounts.Account{ID: accountID, Token: bearer}, upstream)
+			if projectErr != nil {
+				return nil, projectErr
+			}
+			rewritten, changed, rewriteErr := rewriteAntigravityProject(rawBody, project)
+			if rewriteErr != nil {
+				return nil, rewriteErr
+			}
+			if changed {
+				attemptReq = req.Clone(req.Context())
+				attemptReq.Body = io.NopCloser(bytes.NewReader(rewritten))
+				attemptReq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(rewritten)), nil }
+				attemptReq.ContentLength = int64(len(rewritten))
+			}
+		}
+	}
 	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
