@@ -7,10 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/selectacct"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 func TestRewriteAntigravityProjectOnlyTopLevel(t *testing.T) {
@@ -30,6 +33,47 @@ func TestRewriteAntigravityProjectOnlyTopLevel(t *testing.T) {
 	_ = json.Unmarshal(request["project"], &nested)
 	if project != "project-b" || nested != "nested-a" {
 		t.Fatalf("project=%q nested=%q", project, nested)
+	}
+}
+
+func TestAntigravityFailoverRewritesReplacementProject(t *testing.T) {
+	seen := make([]string, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1internal:loadCodeAssist" {
+			_, _ = io.WriteString(w, `{"cloudaicompanionProject":{"id":"project-b"}}`)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		seen = append(seen, string(body))
+		if r.Header.Get("Authorization") == "Bearer token-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"status":"RESOURCE_EXHAUSTED"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := accounts.Account{ID: "agy:a", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth, Token: "token-a"}
+	b := accounts.Account{ID: "agy:b", Provider: accounts.ProviderAntigravity, AuthMode: accounts.AuthModeOAuth, Token: "token-b"}
+	if _, err := sessions.Put("antigravity", "s", a.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{a, b}, nil)
+	s := Server{AccountRef: ref, Sessions: sessions, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)), AntigravityUpstream: mustParseURL(t, upstream.URL)}
+	r := httptest.NewRequest(http.MethodPost, "/antigravity/v1internal:streamGenerateContent", strings.NewReader(`{"project":"project-a","request":{"contents":[]}}`))
+	r.Header.Set("X-Subrouter-Agent", "antigravity")
+	r.Header.Set("X-Subrouter-Session", "s")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK || len(seen) != 2 {
+		t.Fatalf("status=%d requests=%d body=%s", w.Code, len(seen), w.Body.String())
+	}
+	if !strings.Contains(seen[1], `"project":"project-b"`) {
+		t.Fatalf("replacement project not rewritten: %s", seen[1])
 	}
 }
 
