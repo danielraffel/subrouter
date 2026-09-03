@@ -54,7 +54,8 @@ profiles reached the real AGY Cloud Code endpoints and exercised account
 failover. Both profiles' Gemini generations were rejected upstream with
 `429 RESOURCE_EXHAUSTED` even though the weekly summary showed headroom, so a
 successful routed generation is not claimed yet. Native Cloud Code generation
-also carries a top-level `project` bound to the OAuth identity. The current
-relay swaps the bearer during failover but does not yet persist and rewrite
-that project, so cross-account replay is not accepted until that binding is
-implemented and a later two-account canary proves a 2xx generation.
+also carries a top-level `project` bound to the OAuth identity. The candidate
+relay now discovers and caches the replacement account's project and rewrites
+only that top-level field during failover. This is covered by a handler-level
+test; cross-account generation is still not accepted until a real two-account
+shadow canary proves a 2xx generation.
