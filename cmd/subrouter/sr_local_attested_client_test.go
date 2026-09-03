@@ -213,9 +213,25 @@ func TestLocalDataClientRejectsPrivateSocketReplacementAfterBinding(t *testing.T
 	}
 	_ = os.Remove(socket)
 	var received atomic.Int32
-	replacement, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
+	// Some Linux filesystems can immediately reuse the removed socket inode.
+	// Keep replacing until the test has a distinct identity instead of making
+	// the security assertion depend on inode-allocation luck.
+	var replacement net.Listener
+	for attempt := 0; attempt < 16; attempt++ {
+		replacement, err = net.Listen("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replacementIdentity, identityErr := localDataSocketIdentity(socket)
+		if identityErr == nil && replacementIdentity != identity {
+			break
+		}
+		_ = replacement.Close()
+		_ = os.Remove(socket)
+		replacement = nil
+	}
+	if replacement == nil {
+		t.Fatal("could not allocate a replacement socket with a distinct identity")
 	}
 	defer replacement.Close()
 	if err := os.Chmod(socket, 0o600); err != nil {
