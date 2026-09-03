@@ -20,7 +20,7 @@ import (
 const (
 	usageTimeout          = 8 * time.Second
 	usageResponseLimit    = 1 << 20
-	cloudCodeBaseURL      = "https://cloudcode-pa.googleapis.com"
+	cloudCodeBaseURL      = "https://daily-cloudcode-pa.googleapis.com"
 	googleUserInfoURL     = "https://www.googleapis.com/oauth2/v2/userinfo"
 	loadCodeAssistPath    = "/v1internal:loadCodeAssist"
 	fetchModelsPath       = "/v1internal:fetchAvailableModels"
@@ -159,7 +159,7 @@ func (f usageFetcher) call(ctx context.Context, client *http.Client, method, end
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if parsed.Host == "cloudcode-pa.googleapis.com" || strings.HasPrefix(parsed.Host, "127.0.0.1:") {
+	if parsed.Host == "cloudcode-pa.googleapis.com" || parsed.Host == "daily-cloudcode-pa.googleapis.com" || strings.HasPrefix(parsed.Host, "127.0.0.1:") {
 		req.Header.Set("User-Agent", "antigravity")
 	}
 	res, err := client.Do(req)

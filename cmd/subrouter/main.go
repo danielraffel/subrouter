@@ -340,7 +340,7 @@ func serve(args []string) error {
 	qwenAnthropicUpstreamRaw := flags.String("qwen-anthropic-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenAnthropic), "Alibaba Model Studio Token Plan Anthropic-protocol upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic)")
 	qwenTokenUpstreamRaw := flags.String("qwen-token-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenToken), "Alibaba Model Studio Token Plan upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1)")
 	qwenUpstreamRaw := flags.String("qwen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwen), "Alibaba Model Studio Coding Plan upstream base URL (Beijing: https://coding.dashscope.aliyuncs.com/v1)")
-	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
+	antigravityUpstreamRaw := flags.String("antigravity-upstream", "https://daily-cloudcode-pa.googleapis.com", "Antigravity subscription upstream base URL")
 	antigravityLocalCredential := flags.Bool("antigravity-local-credential", true, "serve managed Antigravity profiles, falling back to the invoking user's CLI credential until the first import")
 	sessionPath := flags.String("sessions", session.DefaultStorePath(), "session assignment store")
 	transcriptDir := flags.String("transcripts", "", "directory for raw Subrouter transcript JSONL files")
