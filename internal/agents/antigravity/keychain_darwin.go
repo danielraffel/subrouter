@@ -230,7 +230,16 @@ func readLocalKeychainEntry(ctx context.Context) (KeychainEntry, bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, keychainReadTimeout)
 	defer cancel()
-	for _, account := range []string{current.Username, keychainAccount} {
+	// AGY normally uses its fixed `antigravity` account. Prefer it when both
+	// slots exist: a stale username-scoped item may belong to another client
+	// and swapping that slot would verify successfully while native AGY keeps
+	// reading the untouched credential. The username fallback supports older
+	// CLI builds that wrote there exclusively.
+	accounts := []string{keychainAccount}
+	if current.Username != keychainAccount {
+		accounts = append(accounts, current.Username)
+	}
+	for _, account := range accounts {
 		cmd := exec.CommandContext(ctx, "security", "find-generic-password", "-s", keychainService, "-a", account, "-w")
 		body, runErr := cmd.Output()
 		if runErr == nil && len(bytes.TrimSpace(body)) > 0 {

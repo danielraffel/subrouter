@@ -177,14 +177,17 @@ func ReadLocalCredential(ctx context.Context, now time.Time) (credential Credent
 		}
 		return nil, false, fmt.Errorf("read Antigravity keychain item: %w", runErr)
 	}
-	body, found, lookupErr := lookup(current.Username)
+	// Prefer AGY's fixed Keychain account when present. If both the fixed slot
+	// and a legacy username-scoped item exist, reading the latter can make
+	// identity verification pass while native AGY continues using the former.
+	body, found, lookupErr := lookup(keychainAccount)
 	if lookupErr != nil {
 		return CredentialInfo{}, false, lookupErr
 	}
 	if !found {
 		// The CLI stores the item under its own account name rather than the
 		// unix user on some versions; try that before concluding it is absent.
-		body, found, lookupErr = lookup(keychainAccount)
+		body, found, lookupErr = lookup(current.Username)
 		if lookupErr != nil {
 			return CredentialInfo{}, false, lookupErr
 		}
