@@ -7645,6 +7645,9 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				return response, nil
 			}
+			if t.provider == accounts.ProviderAntigravity && usageLimited {
+				t.logAntigravityUnusableResponse(response, accountID)
+			}
 		}
 		if !usageLimited && !modelUnsupported {
 			if err := t.commitSuccessfulFailover(response, attempt, accountID); err != nil {
@@ -8130,6 +8133,40 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 		"path", t.path,
 		"status", response.StatusCode,
 		"body", string(prefix))
+}
+
+// logAntigravityUnusableResponse records only bounded, non-content metadata for
+// Cloud Code 429/401 responses.  AGY's quota summary is not authoritative for
+// a particular model/session allocation, so this makes the upstream reason
+// observable without logging prompts or OAuth credentials.
+func (t usageLimitRetryTransport) logAntigravityUnusableResponse(response *http.Response, accountID string) {
+	if t.logger == nil || response == nil {
+		return
+	}
+	fields := []any{
+		"agent", t.agent,
+		"session", t.session,
+		"account", accountID,
+		"method", t.method,
+		"path", t.path,
+		"upstream", t.upstream,
+		"pool_model", t.poolModel,
+		"status", response.StatusCode,
+		"retry_after", response.Header.Get("Retry-After"),
+	}
+	if response.Body != nil {
+		prefix, err := io.ReadAll(io.LimitReader(response.Body, usageLimitInspectMaxBytes+1))
+		response.Body = prefixReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), response.Body), Closer: response.Body}
+		if err == nil {
+			message := normalizedProviderErrorMessage(prefix)
+			if message != "" {
+				fields = append(fields, "error_message", message)
+			} else {
+				fields = append(fields, "error_body", "non_json_or_missing_message")
+			}
+		}
+	}
+	t.logger.Warn("antigravity Cloud Code account unusable", fields...)
 }
 
 // isTerminalCredentialError reports whether an account refresh failed because
