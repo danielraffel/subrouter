@@ -630,7 +630,9 @@ bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
 managed profile to an unrelated host language-server login. The server adapter
 retains isolated account selection, family-aware scheduling, OAuth refresh, and
 hard-pin semantics for compatible clients. Plain `agy` uses the current
-Keychain login directly.
+Keychain login directly. If the host or process is hard-killed during a native
+launch, rerun `sr agy recover` before launching again; the swap journal restores
+the prior Keychain slot without touching the live server.
 
 For backward compatibility, a router with no managed Antigravity profiles
 continues serving its historical host Keychain login. The first successful

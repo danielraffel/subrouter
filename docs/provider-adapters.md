@@ -75,7 +75,9 @@ AGY exposes only `CLOUD_CODE_URL` as an endpoint override, and setting it change
 vendor behavior even when it names the normal Google endpoint. Native `sr agy`
 therefore uses AGM-style process-scoped Keychain profile switching rather than
 rewriting the endpoint. Imports, identity verification, and read-only status
-remain available through the same managed inventory.
+remain available through the same managed inventory. If a native launch is
+interrupted by a hard kill, `sr agy recover` replays the durable swap journal
+before the next launch; native launches remain serialized.
 
 Pooled native-launcher account affinity for new sessions is
 provider-and-working-directory scoped. Kimi's workspace-relative `--continue`
