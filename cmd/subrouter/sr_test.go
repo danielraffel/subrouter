@@ -1753,6 +1753,24 @@ func TestQwenConsoleCredentialSyncsToExplicitRemote(t *testing.T) {
 	}
 }
 
+func TestQwenConsoleCredentialSyncExplainsRemoteImportAuthFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
+		AccessToken: "console-secret", ConsoleRegion: "ap-southeast-1", ConsoleSite: "international",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "protected account import credential required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	runner := srRunner{client: server.Client(), out: io.Discard}
+	err := runner.syncQwenConsoleToServer(t.Context(), root, srServerConfig{Name: "shadow", URL: server.URL}, "qwen-token:work")
+	if err == nil || !strings.Contains(err.Error(), "server account-import authentication is missing or invalid") || !strings.Contains(err.Error(), "sr server install shadow") {
+		t.Fatalf("sync auth error = %v", err)
+	}
+}
+
 func TestQwenConsoleCredentialSyncNeverFollowsRedirects(t *testing.T) {
 	root := t.TempDir()
 	if err := agentqwen.SaveConsoleCredentialIn(root, "qwen-token:work", agentqwen.ConsoleCredential{
