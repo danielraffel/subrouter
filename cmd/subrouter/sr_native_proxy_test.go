@@ -167,6 +167,41 @@ func TestNativeProxyRelayComposesProviderPathAndScrubsClientCredentials(t *testi
 	}
 }
 
+func TestAntigravityNativeProxyRelayComposesCloudCodePath(t *testing.T) {
+	seen := make(chan *http.Request, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		seen <- request.Clone(request.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	attachPrivateLocalTestListener(t, upstream)
+	relay, err := startNativeProxyRelay(upstream.URL, antigravityNativeProxy, "agy-session", "router-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	request, err := http.NewRequest(http.MethodPost, relay.URL()+"/antigravity/v1internal:generateContent", strings.NewReader(`{"model":"gemini-3.1-pro"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer local-agy-token")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	got := <-seen
+	if got.URL.Path != "/antigravity/v1internal:generateContent" {
+		t.Fatalf("upstream path = %q", got.URL.Path)
+	}
+	if got.Header.Get("Authorization") != "Bearer router-token" || got.Header.Get("X-Subrouter-Agent") != "antigravity" || got.Header.Get("X-Subrouter-Session") != "agy-session" {
+		t.Fatalf("routing headers = auth %q agent %q session %q", got.Header.Get("Authorization"), got.Header.Get("X-Subrouter-Agent"), got.Header.Get("X-Subrouter-Session"))
+	}
+}
+
 func TestNativeProxyRelayInjectsOnlyValidatedPinnedAccount(t *testing.T) {
 	seen := make(chan *http.Request, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
