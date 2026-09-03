@@ -199,8 +199,6 @@ type Server struct {
 	// MultiTenant router has validated its tenant key. Global remote imports
 	// require a configured admin token instead.
 	tenantAccountImportAuthorized bool
-	antigravityProjectMu          sync.Mutex
-	antigravityProjects           map[string]string
 }
 
 type ActiveSessions struct {
@@ -7543,14 +7541,6 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	tried := map[string]struct{}{}
 	if accountID != "" {
 		tried[accountID] = struct{}{}
-	}
-	if t.provider == accounts.ProviderAntigravity && req.GetBody != nil && t.server != nil {
-		if initialBody, bodyErr := req.GetBody(); bodyErr == nil {
-			if raw, readErr := io.ReadAll(initialBody); readErr == nil {
-				t.server.rememberAntigravityProject(accountID, antigravityProjectFromBody(raw))
-			}
-			_ = initialBody.Close()
-		}
 	}
 	overloadRetries := 0
 	sealedStripped := false

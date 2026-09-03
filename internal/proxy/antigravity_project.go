@@ -10,9 +10,15 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
+
+var antigravityProjectStore struct {
+	sync.Mutex
+	values map[string]string
+}
 
 // antigravityProjectFromBody extracts only the native Cloud Code envelope's
 // top-level project. Nested request fields are intentionally ignored.
@@ -26,25 +32,25 @@ func antigravityProjectFromBody(body []byte) string {
 	return strings.TrimSpace(envelope.Project)
 }
 
-func (s *Server) rememberAntigravityProject(accountID, project string) {
-	if s == nil || accountID == "" || project == "" {
+func (s *Server) rememberAntigravityProject(accountID string, upstream *url.URL, project string) {
+	if accountID == "" || upstream == nil || project == "" {
 		return
 	}
-	s.antigravityProjectMu.Lock()
-	if s.antigravityProjects == nil {
-		s.antigravityProjects = make(map[string]string)
+	antigravityProjectStore.Lock()
+	if antigravityProjectStore.values == nil {
+		antigravityProjectStore.values = make(map[string]string)
 	}
-	s.antigravityProjects[accountID] = project
-	s.antigravityProjectMu.Unlock()
+	antigravityProjectStore.values[upstream.String()+"\x00"+accountID] = project
+	antigravityProjectStore.Unlock()
 }
 
 func (s *Server) antigravityProject(ctx context.Context, account accounts.Account, upstream *url.URL) (string, error) {
 	if s == nil || upstream == nil || account.ID == "" || account.Token == "" {
 		return "", errors.New("AGY project lookup is unavailable")
 	}
-	s.antigravityProjectMu.Lock()
-	project := s.antigravityProjects[account.ID]
-	s.antigravityProjectMu.Unlock()
+	antigravityProjectStore.Lock()
+	project := antigravityProjectStore.values[upstream.String()+"\x00"+account.ID]
+	antigravityProjectStore.Unlock()
 	if project != "" {
 		return project, nil
 	}
@@ -97,7 +103,12 @@ func (s *Server) antigravityProject(ctx context.Context, account accounts.Accoun
 	if project == "" {
 		return "", errors.New("AGY project lookup returned no project id")
 	}
-	s.rememberAntigravityProject(account.ID, project)
+	antigravityProjectStore.Lock()
+	if antigravityProjectStore.values == nil {
+		antigravityProjectStore.values = make(map[string]string)
+	}
+	antigravityProjectStore.values[upstream.String()+"\x00"+account.ID] = project
+	antigravityProjectStore.Unlock()
 	return project, nil
 }
 
