@@ -48,3 +48,11 @@ identity through startup, request, refresh, and exit. A failed concurrent test
 must leave native mode serialized and server-side pooling unchanged.
 
 Plain `agy` remains direct and is outside Subrouter's managed profile lock.
+
+Current acceptance note: a disposable shadow run with two verified OAuth
+profiles reached the real AGY Cloud Code endpoints and exercised account
+failover. Both profiles' Gemini generations were rejected upstream with
+`429 RESOURCE_EXHAUSTED` even though the weekly summary showed headroom, so a
+successful routed generation is not claimed yet. This is recorded as an
+upstream free-tier/model-allocation limitation until a later canary proves a
+2xx generation; it is not evidence of a relay or account-mixing failure.
