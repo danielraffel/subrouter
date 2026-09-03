@@ -4,6 +4,7 @@ package antigravity
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -68,5 +69,32 @@ func TestRecoverNativeProfileRestoresStaleJournal(t *testing.T) {
 	}
 	if _, err := os.Stat(nativeProfileJournalPath(lockPath)); !os.IsNotExist(err) {
 		t.Fatalf("stale journal was not removed: %v", err)
+	}
+}
+
+func TestAcquireNativeProfileHonorsLockCancellation(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "agy.lock")
+	first, err := acquireNativeProfileWith(context.Background(), lockPath,
+		CredentialInfo{AccessToken: "a", RefreshToken: "r", ExpiresAt: time.Now().Add(time.Hour)},
+		func(context.Context) (KeychainEntry, bool, error) {
+			return KeychainEntry{Account: "antigravity", Blob: []byte("original")}, true, nil
+		},
+		func(context.Context, KeychainEntry) error { return nil },
+		func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Restore(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	_, err = acquireNativeProfileWith(ctx, lockPath,
+		CredentialInfo{AccessToken: "b", RefreshToken: "s", ExpiresAt: time.Now().Add(time.Hour)},
+		func(context.Context) (KeychainEntry, bool, error) {
+			return KeychainEntry{Account: "antigravity", Blob: []byte("original")}, true, nil
+		},
+		func(context.Context, KeychainEntry) error { return nil },
+		func(context.Context, string) error { return nil })
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second launch error = %v, want context deadline", err)
 	}
 }
