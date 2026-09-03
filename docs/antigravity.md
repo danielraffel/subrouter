@@ -58,7 +58,8 @@ failover. Both profiles' Gemini generations were rejected upstream with
 `429 RESOURCE_EXHAUSTED` even though the weekly summary showed headroom, so a
 successful routed generation is not claimed yet. Native Cloud Code generation
 also carries a top-level `project` bound to the OAuth identity. The candidate
-relay now discovers and caches the replacement account's project and rewrites
-only that top-level field during failover. This is covered by a handler-level
-test; cross-account generation is still not accepted until a real two-account
-shadow canary proves a 2xx generation.
+relay discovers and caches the selected account's project before the initial
+attempt (and again for failover), rewriting only that top-level field. This is
+covered by handler-level and one-shot-body tests; cross-account generation is
+still not accepted until a real two-account shadow canary proves a 2xx
+generation.
