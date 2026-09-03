@@ -32,18 +32,6 @@ func antigravityProjectFromBody(body []byte) string {
 	return strings.TrimSpace(envelope.Project)
 }
 
-func (s *Server) rememberAntigravityProject(accountID string, upstream *url.URL, project string) {
-	if accountID == "" || upstream == nil || project == "" {
-		return
-	}
-	antigravityProjectStore.Lock()
-	if antigravityProjectStore.values == nil {
-		antigravityProjectStore.values = make(map[string]string)
-	}
-	antigravityProjectStore.values[upstream.String()+"\x00"+accountID] = project
-	antigravityProjectStore.Unlock()
-}
-
 func (s *Server) antigravityProject(ctx context.Context, account accounts.Account, upstream *url.URL) (string, error) {
 	if s == nil || upstream == nil || account.ID == "" || account.Token == "" {
 		return "", errors.New("AGY project lookup is unavailable")
