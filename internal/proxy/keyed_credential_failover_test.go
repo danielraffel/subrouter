@@ -38,11 +38,20 @@ func TestKeyedCredentialFailureFailsOverToHealthyCredential(t *testing.T) {
 			agent: "kimi", path: "/kimi/v1/messages",
 			status: http.StatusUnauthorized, body: `{"error":{"code":"invalid_api_key","message":"invalid authentication"}}`,
 		},
+		{
+			name: "antigravity generic quota 429", provider: accounts.ProviderAntigravity,
+			agent: "antigravity", path: "/antigravity/v1internal:streamGenerateContent",
+			status: http.StatusTooManyRequests, body: `{"error":{"status":"RESOURCE_EXHAUSTED"}}`,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			const sessionID = "revoked-key"
-			revoked := accounts.Account{ID: test.agent + ":a-revoked", Provider: test.provider, AuthMode: accounts.AuthModeAPIKey, Token: "revoked-key"}
-			healthy := accounts.Account{ID: test.agent + ":z-healthy", Provider: test.provider, AuthMode: accounts.AuthModeAPIKey, Token: "healthy-key"}
+			authMode := accounts.AuthModeAPIKey
+			if test.provider == accounts.ProviderAntigravity {
+				authMode = accounts.AuthModeOAuth
+			}
+			revoked := accounts.Account{ID: test.agent + ":a-revoked", Provider: test.provider, AuthMode: authMode, Token: "revoked-key"}
+			healthy := accounts.Account{ID: test.agent + ":z-healthy", Provider: test.provider, AuthMode: authMode, Token: "healthy-key"}
 			calls := 0
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 				calls++
@@ -77,6 +86,8 @@ func TestKeyedCredentialFailureFailsOverToHealthyCredential(t *testing.T) {
 				server.OpenRouterUpstream = mustParseURL(t, upstream.URL+"/v1")
 			case accounts.ProviderKimi:
 				server.KimiUpstream = mustParseURL(t, upstream.URL+"/coding/v1")
+			case accounts.ProviderAntigravity:
+				server.AntigravityUpstream = mustParseURL(t, upstream.URL)
 			}
 			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(`{"model":"test","messages":[]}`))
 			request.Header.Set("X-Subrouter-Agent", test.agent)
