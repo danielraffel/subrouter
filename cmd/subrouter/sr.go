@@ -3911,7 +3911,7 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 
 func usageGridOpenRouterBalanceCell(row srUsageRow) usageGridCell {
 	if row.credits != nil && row.credits.Balance != "" {
-		return usageGridCell{Text: "$" + row.credits.Balance}
+		return usageGridCell{Text: "$" + displayMoneyTwoPlaces(row.credits.Balance)}
 	}
 	return usageGridCell{}
 }
@@ -3920,7 +3920,23 @@ func usageGridOpenRouterKeyLimitCell(row srUsageRow) usageGridCell {
 	if row.credits == nil || row.credits.Limit == "" {
 		return usageGridCell{}
 	}
-	return usageGridCell{Text: "$" + row.credits.Used + "/$" + row.credits.Limit}
+	return usageGridCell{Text: "$" + displayMoneyTwoPlaces(row.credits.Used) + "/$" + displayMoneyTwoPlaces(row.credits.Limit)}
+}
+
+// displayMoneyTwoPlaces pads provider decimals for readability without
+// rounding or changing the underlying value.
+func displayMoneyTwoPlaces(value string) string {
+	parts := strings.SplitN(value, ".", 2)
+	if len(parts) == 1 {
+		return value + ".00"
+	}
+	if len(parts[1]) == 0 {
+		return parts[0] + ".00"
+	}
+	if len(parts[1]) == 1 {
+		return value + "0"
+	}
+	return value
 }
 
 func usageGridOpenRouterKeyResetCell(row srUsageRow) usageGridCell {
