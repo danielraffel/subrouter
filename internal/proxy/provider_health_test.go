@@ -47,8 +47,9 @@ func TestProbeOpenRouterKeyStatus(t *testing.T) {
 		wantKnown   bool
 		wantUsed    float64
 		wantBalance string
+		wantCredits string
 	}{
-		{name: "finite monthly limit", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.5"},
+		{name: "finite monthly limit", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.5", wantCredits: "8.1"},
 		{name: "unlimited key", status: http.StatusOK, body: `{"data":{"limit":null,"limit_remaining":null,"limit_reset":null}}`, wantState: "auth ok"},
 		{name: "exhausted", status: http.StatusOK, body: `{"data":{"limit":10,"limit_remaining":0,"limit_reset":"weekly"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0"},
 		{name: "zero limit", status: http.StatusOK, body: `{"data":{"limit":0,"limit_remaining":0,"limit_reset":"daily"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0"},
@@ -59,11 +60,19 @@ func TestProbeOpenRouterKeyStatus(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				if request.URL.Path != "/api/v1/key" {
-					t.Errorf("probe path = %q, want /api/v1/key", request.URL.Path)
-				}
 				if request.Header.Get("Authorization") != "Bearer test-openrouter-key" {
 					t.Errorf("Authorization = %q", request.Header.Get("Authorization"))
+				}
+				if request.URL.Path == "/api/v1/credits" && test.wantCredits != "" {
+					_, _ = io.WriteString(w, `{"data":{"total_credits":10,"total_usage":1.9}}`)
+					return
+				}
+				if request.URL.Path == "/api/v1/credits" {
+					http.NotFound(w, request)
+					return
+				}
+				if request.URL.Path != "/api/v1/key" {
+					t.Errorf("probe path = %q, want /api/v1/key", request.URL.Path)
 				}
 				w.WriteHeader(test.status)
 				_, _ = io.WriteString(w, test.body)
@@ -83,8 +92,13 @@ func TestProbeOpenRouterKeyStatus(t *testing.T) {
 			if len(probe.Windows) != 1 || probe.Windows[0].UsedPercent != test.wantUsed {
 				t.Fatalf("windows = %+v, want %.1f%% used", probe.Windows, test.wantUsed)
 			}
-			if probe.Credits == nil || probe.Credits.Balance != test.wantBalance {
-				t.Fatalf("credits = %+v, want remaining %s", probe.Credits, test.wantBalance)
+			if probe.Credits == nil || probe.Credits.Balance != test.wantCredits {
+				if test.wantCredits != "" {
+					t.Fatalf("credits = %+v, want account balance %s", probe.Credits, test.wantCredits)
+				}
+			}
+			if test.name == "finite monthly limit" && (probe.Credits.Limit != "100" || probe.Credits.Used != "25.5" || probe.Credits.LimitReset != "monthly" || probe.Credits.AutoTopUpKnown) {
+				t.Fatalf("key metadata = %+v", probe.Credits)
 			}
 			if test.name == "finite monthly limit" && (probe.Windows[0].Name != "monthly" || probe.Windows[0].LimitWindowSeconds != int64((30*24*time.Hour)/time.Second)) {
 				t.Fatalf("monthly window = %+v", probe.Windows[0])
