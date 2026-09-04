@@ -3107,6 +3107,7 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	extra = widenUsageGridColumnForRows(columns, rows, "Weekly", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Fable wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "State", extra, 20)
+	extra = widenUsageGridColumnForRows(columns, rows, "Credits", extra, 42)
 	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
@@ -3870,7 +3871,23 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 			return usageGridCell{Text: "unlimited", Style: ansiGreen}
 		}
 		if row.credits.Balance != "" {
-			return usageGridCell{Text: "$" + row.credits.Balance}
+			text := "$" + row.credits.Balance
+			if row.credits.Limit != "" {
+				text += " bal; key $" + row.credits.Used + "/$" + row.credits.Limit
+				if row.credits.LimitReset != "" {
+					text += " " + row.credits.LimitReset
+				}
+				if row.credits.AutoTopUpKnown {
+					if row.credits.AutoTopUpEnabled {
+						text += "; top-up on"
+					} else {
+						text += "; top-up off"
+					}
+				} else {
+					text += "; top-up ?"
+				}
+			}
+			return usageGridCell{Text: text}
 		}
 	}
 	if row.apiKeySpend != nil {
