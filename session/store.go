@@ -16,6 +16,15 @@ import (
 // materialize an unbounded session map first.
 const MaxRetainedAssignments = 512
 
+// UserEmailRetention limits how long inactive self-reported identity metadata
+// remains attached to a sticky routing assignment. The assignment itself is
+// retained so a resumed session still reaches the same account.
+const UserEmailRetention = 30 * 24 * time.Hour
+
+// sessionActivityWriteInterval keeps active-session retention accurate without
+// rewriting the shared store for every proxied request.
+const sessionActivityWriteInterval = 24 * time.Hour
+
 type Assignment struct {
 	AgentType string    `json:"agent_type"`
 	SessionID string    `json:"session_id"`
@@ -90,6 +99,105 @@ func (s *Store) Put(agentType, sessionID, accountID, userEmail string) (Assignme
 	return assignment, s.saveLocked()
 }
 
+// Touch records recent use of an existing sticky assignment. Updates are
+// coalesced because this path runs for ordinary requests and the store may be
+// shared by several processes.
+func (s *Store) Touch(agentType, sessionID string) (Assignment, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return Assignment{}, false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return Assignment{}, false, err
+	}
+
+	key := ScopedSessionKey(agentType, sessionID)
+	assignment, ok := s.data[key]
+	if !ok {
+		return Assignment{}, false, nil
+	}
+	now := time.Now().UTC()
+	if now.Sub(assignment.UpdatedAt) < sessionActivityWriteInterval {
+		return assignment, true, nil
+	}
+	assignment.UpdatedAt = now
+	s.data[key] = assignment
+	if err := s.saveLocked(); err != nil {
+		return Assignment{}, false, err
+	}
+	return assignment, true, nil
+}
+
+// CompareAndPut replaces one sticky assignment only while it still points at
+// expectedAccountID. Deferred proxy responses use it so an older stream cannot
+// overwrite a newer forced/admin move that completed while the stream was in
+// flight. swapped is false, without error, when another writer won the race.
+func (s *Store) CompareAndPut(agentType, sessionID, expectedAccountID, accountID, userEmail string) (assignment Assignment, swapped bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return Assignment{}, false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return Assignment{}, false, err
+	}
+
+	now := time.Now().UTC()
+	normalizedAgent := NormalizeAgentType(agentType)
+	if normalizedAgent == "" {
+		normalizedAgent = "codex"
+	}
+	stickySessionID := StickySessionID(normalizedAgent, sessionID)
+	key := ScopedSessionKey(normalizedAgent, stickySessionID)
+	existing, ok := s.data[key]
+	if !ok || existing.AccountID != expectedAccountID {
+		return existing, false, nil
+	}
+	assignment = Assignment{
+		AgentType: normalizedAgent,
+		SessionID: stickySessionID,
+		AccountID: accountID,
+		UserEmail: NormalizeUserEmail(userEmail),
+		CreatedAt: existing.CreatedAt,
+		UpdatedAt: now,
+	}
+	if assignment.UserEmail == "" {
+		assignment.UserEmail = existing.UserEmail
+	}
+	s.data[key] = assignment
+	if err := s.saveLocked(); err != nil {
+		s.data[key] = existing
+		return Assignment{}, false, err
+	}
+	return assignment, true, nil
+}
+
+// Delete removes one scoped sticky assignment and its self-reported identity
+// metadata. It is used by the admin-only sessions endpoint.
+func (s *Store) Delete(agentType, sessionID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return false, err
+	}
+	key := ScopedSessionKey(agentType, sessionID)
+	if _, ok := s.data[key]; !ok {
+		return false, nil
+	}
+	delete(s.data, key)
+	return true, s.saveLocked()
+}
+
 func (s *Store) All() []Assignment {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,9 +253,13 @@ func (s *Store) loadLocked() error {
 	}
 	s.data = data
 	s.migrateLoadedAssignments()
+	changed := s.expireUserEmailsLocked(time.Now().UTC())
 	if s.pruneLocked() {
 		// Rewrite legacy/unbounded files while the session lock is held so
 		// every subsequent reader starts from the bounded representation.
+		changed = true
+	}
+	if changed {
 		return s.saveLocked()
 	}
 	return nil
@@ -175,6 +287,19 @@ func (s *Store) pruneLocked() bool {
 		delete(s.data, stale.key)
 	}
 	return true
+}
+
+func (s *Store) expireUserEmailsLocked(now time.Time) bool {
+	changed := false
+	for key, assignment := range s.data {
+		if assignment.UserEmail == "" || now.Sub(assignment.UpdatedAt) < UserEmailRetention {
+			continue
+		}
+		assignment.UserEmail = ""
+		s.data[key] = assignment
+		changed = true
+	}
+	return changed
 }
 
 func (s *Store) saveLocked() error {

@@ -1,6 +1,8 @@
 package selectacct
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"sync"
 	"time"
@@ -9,12 +11,14 @@ import (
 )
 
 type SchedulerRef struct {
-	mu                sync.RWMutex
-	scheduler         Scheduler
-	updatedAt         time.Time
-	refreshing        bool
-	accountGeneration uint64
-	refreshGeneration uint64
+	mu                 sync.RWMutex
+	scheduler          Scheduler
+	updatedAt          time.Time
+	refreshing         bool
+	refreshInvalidated bool
+	accountGeneration  uint64
+	refreshGeneration  uint64
+	scoreRevision      uint64
 	// legacyFinishInvalidated preserves the historical tokenless FinishRefresh
 	// API for callers that publish without BeginRefreshIfStale. New concurrent
 	// code uses the generation-aware methods below.
@@ -25,10 +29,26 @@ type SchedulerRef struct {
 	// until the next SUCCESSFUL usage refresh, which under load can fail for
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
+	// credentialExhaustedUntil is separate from quota/model evidence and is
+	// scoped to the account snapshot generation that observed the bad token.
+	// Replacing credentials advances the generation, immediately discarding the
+	// old token's exclusion while rejecting late reports from in-flight work.
+	credentialExhaustedUntil map[string]time.Time
+	credentialFingerprints   map[string]string
+	credentialRevision       uint64
+	// accountUnavailableUntil records account-state exclusions, such as an
+	// organization disabling OAuth. Neither healthy quota evidence nor token
+	// rotation proves that account state recovered, so those events must not
+	// clear this overlay.
+	accountUnavailableUntil map[string]time.Time
 	// incompatibleUntil records account/model exclusions learned from upstream
 	// entitlement errors. Usage refreshes cannot supersede these marks because
 	// quota headroom says nothing about whether an account supports a model.
 	incompatibleUntil map[string]time.Time
+	// recoveryProbeReady remembers that an authoritative exclusion expired while
+	// the measured snapshot still read zero. Routing may attempt exactly one
+	// optimistic probe; RunIfAccountNotBlocked consumes the allowance atomically.
+	recoveryProbeReady map[string]struct{}
 	// routedSinceRefresh counts requests the proxy routed per account (by
 	// ScoreKey) since the last successful usage refresh. Pick debits headroom
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
@@ -49,7 +69,213 @@ func (r *SchedulerRef) Get() Scheduler {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
+	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
 	return applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
+}
+
+// RefreshSeed returns the measured scheduler snapshot, including live routing
+// debits but excluding temporary exclusion overlays. A usage refresh carries
+// stale scores forward when an account cannot be fetched; seeding that work
+// from Get would bake an overlay's zero into the replacement snapshot if the
+// overlay expired between scoring and FinishRefresh. Routing reads must use
+// Get, while refresh construction must use this base-only view.
+func (r *SchedulerRef) RefreshSeed() Scheduler {
+	if r == nil {
+		return Scheduler{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	debits := make(map[string]int, len(r.routedSinceRefresh))
+	for key, count := range r.routedSinceRefresh {
+		debits[key] = count
+	}
+	return r.scheduler.WithLiveDebits(debits)
+}
+
+// RunIfAccountNotBlocked executes publish while the current scheduler state
+// remains read-locked. The caller may hold its own publication mutex, but
+// publish must not call back into this SchedulerRef.
+func (r *SchedulerRef) RunIfAccountNotBlocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+	publish func(),
+) (time.Time, bool) {
+	if r == nil {
+		publish()
+		return time.Time{}, true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if until, blocked := r.blockedUntilLocked(provider, accountID, model, now); blocked {
+		return until, false
+	}
+	r.clearExpiredRouteMarksLocked(provider, accountID, model, now)
+	publish()
+	return time.Time{}, true
+}
+
+// BlockedUntilFor reports the union of account-wide, credential, quota-pool,
+// account-state, and model-incompatibility exclusions for one route.
+func (r *SchedulerRef) BlockedUntilFor(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.blockedUntilLocked(provider, accountID, model, now)
+}
+
+// ExplicitBlockedUntilFor reports only time-bounded exclusion marks, without
+// interpreting a missing model score as exhausted. API-key accounts do not
+// participate in subscription model-pool scoring, but still honor explicit
+// account, credential, and model-incompatibility state.
+func (r *SchedulerRef) ExplicitBlockedUntilFor(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.pruneExpired(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.explicitBlockedUntilLocked(provider, accountID, model, now)
+}
+
+func (r *SchedulerRef) explicitBlockedUntilLocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	marks := r.expiryMarksLocked()
+	var until time.Time
+	for _, key := range []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	} {
+		if candidate := marks[key]; candidate.After(until) {
+			until = candidate
+		}
+	}
+	return until, until.After(now)
+}
+
+// RunIfAccountNotExplicitlyBlocked is the API-key publication guard. It
+// ignores absent subscription pool scores while retaining explicit routing
+// exclusions and the same lock-order guarantee as RunIfAccountNotBlocked.
+func (r *SchedulerRef) RunIfAccountNotExplicitlyBlocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+	publish func(),
+) (time.Time, bool) {
+	if r == nil {
+		publish()
+		return time.Time{}, true
+	}
+	r.pruneExpired(now)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if until, blocked := r.explicitBlockedUntilLocked(provider, accountID, model, now); blocked {
+		return until, false
+	}
+	publish()
+	return time.Time{}, true
+}
+
+func (r *SchedulerRef) blockedUntilLocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) (time.Time, bool) {
+	scheduler := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	scheduler = applyExhaustionMarks(scheduler, r.activeCredentialExhaustionLocked(), now)
+	scheduler = applyExhaustionMarks(scheduler, r.accountUnavailableUntil, now)
+	scheduler = applyExhaustionMarks(scheduler, r.incompatibleUntil, now)
+	if !scheduler.ForModel(model).Exhausted(provider, accountID) {
+		return time.Time{}, false
+	}
+	var until time.Time
+	marks := r.expiryMarksLocked()
+	for _, key := range []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	} {
+		if candidate := marks[key]; candidate.After(until) {
+			until = candidate
+		}
+	}
+	if until.IsZero() {
+		if r.recoveryProbeReadyLocked(provider, accountID, model) {
+			return time.Time{}, false
+		}
+		until = now.Add(DefaultExhaustedTTL)
+	} else if !until.After(now) {
+		// An expired authoritative mark grants one optimistic probe even when
+		// the measured snapshot still says zero. The publication guard consumes
+		// that mark atomically so concurrent lease attempts cannot all probe.
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func (r *SchedulerRef) clearExpiredRouteMarksLocked(
+	provider account.Provider,
+	accountID string,
+	model string,
+	now time.Time,
+) {
+	keys := []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	}
+	for _, key := range keys {
+		delete(r.recoveryProbeReady, key)
+	}
+	for _, marks := range []map[string]time.Time{
+		r.exhaustedUntil,
+		r.accountUnavailableUntil,
+		r.incompatibleUntil,
+	} {
+		for _, key := range keys {
+			if until := marks[key]; !until.IsZero() && !until.After(now) {
+				delete(marks, key)
+			}
+		}
+	}
+	// Credential exclusions include the credential fingerprint after the score
+	// key, so remove any expired entry for this route's account.
+	prefix := ScoreKey(provider, accountID) + "\x00"
+	for key, until := range r.credentialExhaustedUntil {
+		if strings.HasPrefix(key, prefix) && !until.After(now) {
+			delete(r.credentialExhaustedUntil, key)
+		}
+	}
+}
+
+func (r *SchedulerRef) recoveryProbeReadyLocked(provider account.Provider, accountID, model string) bool {
+	for _, key := range []string{
+		poolScopedExhaustionKey(provider, accountID, ""),
+		poolScopedExhaustionKey(provider, accountID, model),
+	} {
+		if _, ok := r.recoveryProbeReady[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneExpired drops exhaustion marks whose window has reset. The base snapshot
@@ -76,6 +302,22 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		}
 	}
 	if !anyExpired {
+		for _, until := range r.credentialExhaustedUntil {
+			if !until.After(now) {
+				anyExpired = true
+				break
+			}
+		}
+	}
+	if !anyExpired {
+		for _, until := range r.accountUnavailableUntil {
+			if !until.After(now) {
+				anyExpired = true
+				break
+			}
+		}
+	}
+	if !anyExpired {
 		for _, until := range r.incompatibleUntil {
 			if !until.After(now) {
 				anyExpired = true
@@ -93,7 +335,26 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 		if until.After(now) {
 			continue
 		}
+		probeKeys := r.recoveryProbeKeysForExpiredMarkLocked(key)
+		if len(probeKeys) > 0 {
+			if r.recoveryProbeReady == nil {
+				r.recoveryProbeReady = make(map[string]struct{})
+			}
+			for _, probeKey := range probeKeys {
+				r.recoveryProbeReady[probeKey] = struct{}{}
+			}
+		}
 		delete(r.exhaustedUntil, key)
+	}
+	for key, until := range r.credentialExhaustedUntil {
+		if !until.After(now) {
+			delete(r.credentialExhaustedUntil, key)
+		}
+	}
+	for key, until := range r.accountUnavailableUntil {
+		if !until.After(now) {
+			delete(r.accountUnavailableUntil, key)
+		}
 	}
 	for key, until := range r.incompatibleUntil {
 		if until.After(now) {
@@ -103,22 +364,114 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 	}
 }
 
+func (r *SchedulerRef) scoreForExhaustionKeyLocked(key string) (Score, bool) {
+	scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
+	if !ok {
+		return Score{}, false
+	}
+	score, ok := r.scheduler.scores[scoreKey]
+	if !ok {
+		return Score{}, false
+	}
+	if poolKey != "" {
+		modelScore, exists := score.ModelScores[poolKey]
+		if exists {
+			return modelScore, true
+		}
+		if r.scheduler.hasModelScore(poolKey) {
+			return Score{}, false
+		}
+	}
+	return score, true
+}
+
+func (r *SchedulerRef) recoveryProbeKeysForExpiredMarkLocked(key string) []string {
+	scoreKey, provider, poolKey, ok := exhaustionKeyParts(key)
+	if !ok {
+		return nil
+	}
+	score, ok := r.scheduler.scores[scoreKey]
+	if !ok {
+		return nil
+	}
+	if poolKey != "" {
+		modelScore, exists := score.ModelScores[poolKey]
+		if exists && modelScore.exhausted() {
+			return []string{key}
+		}
+		if !r.scheduler.hasModelScore(poolKey) && score.exhausted() {
+			return []string{key}
+		}
+		return nil
+	}
+	if score.exhausted() {
+		return []string{key}
+	}
+	keys := make([]string, 0, len(score.ModelScores))
+	for model, modelScore := range score.ModelScores {
+		if modelScore.exhausted() {
+			keys = append(keys, poolScopedExhaustionKey(provider, score.AccountID, model))
+		}
+	}
+	return keys
+}
+
 func (r *SchedulerRef) Set(scheduler Scheduler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.refreshing {
-		r.legacyFinishInvalidated = true
-	}
+	inflightRefresh := r.refreshing
 	r.setLocked(scheduler)
+	if inflightRefresh {
+		r.refreshInvalidated = true
+		return
+	}
 	r.refreshing = false
+	r.refreshInvalidated = false
 }
 
 func (r *SchedulerRef) setLocked(scheduler Scheduler) {
+	r.setLockedForScoreKeys(scheduler, nil, true)
+}
+
+func (r *SchedulerRef) setLockedForScoreKeys(scheduler Scheduler, scoreKeys map[string]struct{}, touchUpdatedAt bool) {
 	base := r.scheduler
 	r.scheduler = scheduler
-	r.retainExhaustedExpiriesLocked()
-	r.scheduler = stripCarriedForwardExhaustionOverlays(r.scheduler, base, r.expiryMarksLocked())
-	r.updatedAt = time.Now()
+	r.retainExhaustedExpiriesForScoreKeysLocked(scoreKeys)
+	r.scheduler = stripCarriedForwardExhaustionOverlaysForScoreKeys(r.scheduler, base, r.expiryMarksLocked(), scoreKeys)
+	now := time.Now()
+	for key := range r.recoveryProbeReady {
+		scoreKey, _, _, valid := exhaustionKeyParts(key)
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; valid && !included {
+				continue
+			}
+		}
+		score, ok := r.scoreForExhaustionKeyLocked(key)
+		if !ok || !score.exhausted() {
+			delete(r.recoveryProbeReady, key)
+			continue
+		}
+		if score.Fresh {
+			delete(r.recoveryProbeReady, key)
+			if r.exhaustedUntil == nil {
+				r.exhaustedUntil = make(map[string]time.Time)
+			}
+			until := now.Add(DefaultExhaustedTTL)
+			if score.ShortResetAfterSeconds > 0 {
+				if fromReset := now.Add(time.Duration(score.ShortResetAfterSeconds) * time.Second); fromReset.After(until) {
+					until = fromReset
+				}
+			}
+			if cap := now.Add(8 * 24 * time.Hour); until.After(cap) {
+				until = cap
+			}
+			r.exhaustedUntil[key] = until
+		}
+	}
+	if touchUpdatedAt {
+		r.updatedAt = time.Now()
+	}
+	r.scoreRevision++
 }
 
 // AdvanceAccountGeneration invalidates refresh work computed from an older
@@ -130,6 +483,58 @@ func (r *SchedulerRef) AdvanceAccountGeneration(generation uint64) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.advanceAccountGenerationLocked(generation)
+}
+
+// AdvanceAccountGenerationWithAccounts advances the snapshot and publishes
+// the credential identity currently attached to each routing account. Existing
+// exclusions remain effective for unchanged tokens; repaired tokens do not
+// inherit them.
+func (r *SchedulerRef) AdvanceAccountGenerationWithAccounts(generation, credentialRevision uint64, accounts []account.Account) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation < r.accountGeneration {
+		return
+	}
+	if generation == r.accountGeneration && credentialRevision <= r.credentialRevision && r.credentialFingerprints != nil {
+		return
+	}
+	r.advanceAccountGenerationLocked(generation)
+	r.credentialRevision = credentialRevision
+	r.credentialFingerprints = make(map[string]string, len(accounts))
+	for _, candidate := range accounts {
+		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+	}
+}
+
+// SyncAccountCredentials publishes token rotations that occur within an
+// account generation (for example, a successful OAuth refresh). It does not
+// invalidate score work; it only changes which credential-scoped exclusions
+// apply to the current snapshot.
+func (r *SchedulerRef) SyncAccountCredentials(generation, credentialRevision uint64, accounts []account.Account) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration || credentialRevision < r.credentialRevision {
+		return false
+	}
+	if credentialRevision == r.credentialRevision && r.credentialFingerprints != nil {
+		return true
+	}
+	r.credentialRevision = credentialRevision
+	r.credentialFingerprints = make(map[string]string, len(accounts))
+	for _, candidate := range accounts {
+		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+	}
+	return true
+}
+
+func (r *SchedulerRef) advanceAccountGenerationLocked(generation uint64) {
 	if generation == r.accountGeneration {
 		return
 	}
@@ -138,24 +543,102 @@ func (r *SchedulerRef) AdvanceAccountGeneration(generation uint64) {
 	}
 	r.accountGeneration = generation
 	r.refreshing = false
+	r.refreshInvalidated = false
 	r.updatedAt = time.Time{}
+	r.scoreRevision++
 }
 
 // SetForAccountGeneration publishes a scheduler only when it was computed
 // from the current account snapshot. The comparison and write share one lock,
 // so a concurrent account reload cannot slip between them.
 func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation uint64) bool {
+	return r.SetForAccountGenerationAtScoreRevision(scheduler, generation, r.ScoreRevision())
+}
+
+// ScoreRevision identifies the measured score snapshot independently of the
+// account generation. Callers capture it before slow score work and present it
+// when publishing so a newer same-generation measurement cannot be replaced.
+func (r *SchedulerRef) ScoreRevision() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.scoreRevision
+}
+
+func (r *SchedulerRef) SetForAccountGenerationAtScoreRevision(
+	scheduler Scheduler,
+	generation uint64,
+	scoreRevision uint64,
+) bool {
 	if r == nil {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if generation != r.accountGeneration {
+	if generation != r.accountGeneration || scoreRevision != r.scoreRevision {
 		return false
 	}
+	inflightRefresh := r.refreshing
 	r.setLocked(scheduler)
-	r.refreshing = false
+	if inflightRefresh {
+		r.refreshInvalidated = true
+	} else {
+		r.refreshing = false
+		r.refreshInvalidated = false
+	}
 	return true
+}
+
+// MergeScoresForAccountGeneration atomically overlays measured scores onto the
+// current shared scheduler when they were computed from the current account
+// snapshot. Unlike SetForAccountGeneration, a partial provider refresh cannot
+// replace scores published concurrently for other providers, and it does not
+// cancel a full refresh already in progress for the same generation.
+func (r *SchedulerRef) MergeScoresForAccountGeneration(scores []Score, generation uint64) (Scheduler, bool) {
+	return r.MergeScoresForAccountGenerationAtScoreRevision(scores, generation, r.ScoreRevision())
+}
+
+func (r *SchedulerRef) MergeScoresForAccountGenerationAtScoreRevision(
+	scores []Score,
+	generation uint64,
+	scoreRevision uint64,
+) (Scheduler, bool) {
+	if r == nil {
+		return Scheduler{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.accountGeneration || scoreRevision != r.scoreRevision {
+		return Scheduler{}, false
+	}
+	merged := r.scheduler
+	scoreKeys := make(map[string]struct{}, len(scores))
+	for _, score := range scores {
+		merged = merged.WithScore(score)
+		scoreKeys[ScoreKey(score.Provider, score.AccountID)] = struct{}{}
+	}
+	// This is only a partial provider refresh, so it must not make the shared
+	// full-provider snapshot look fresh and suppress its next scheduled refresh.
+	r.setLockedForScoreKeys(merged, scoreKeys, false)
+	if r.refreshing {
+		// A full refresh that seeded before this merge is now stale for at least
+		// these scores. Keep its claim only until its finish is consumed and
+		// rejected; admitting a replacement sooner would give both attempts the
+		// same account-generation identity and let the older one publish first.
+		r.refreshInvalidated = true
+	}
+	debits := make(map[string]int, len(r.routedSinceRefresh))
+	for key, count := range r.routedSinceRefresh {
+		debits[key] = count
+	}
+	now := time.Now()
+	published := applyExhaustionMarks(r.scheduler, r.exhaustedUntil, now)
+	published = applyExhaustionMarks(published, r.activeCredentialExhaustionLocked(), now)
+	published = applyExhaustionMarks(published, r.accountUnavailableUntil, now)
+	published = applyExhaustionMarks(published, r.incompatibleUntil, now)
+	return published.WithLiveDebits(debits), true
 }
 
 // retainExhaustedExpiriesLocked reconciles mark expiries with an incoming
@@ -175,12 +658,21 @@ func (r *SchedulerRef) SetForAccountGeneration(scheduler Scheduler, generation u
 //     optimistic default. Expiries only extend here, never shorten, so an
 //     authoritative long reset from a rejected response still holds.
 func (r *SchedulerRef) retainExhaustedExpiriesLocked() {
+	r.retainExhaustedExpiriesForScoreKeysLocked(nil)
+}
+
+func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[string]struct{}) {
 	now := time.Now()
 	for key := range r.exhaustedUntil {
 		scoreKey, _, poolKey, ok := exhaustionKeyParts(key)
 		if !ok {
 			delete(r.exhaustedUntil, key)
 			continue
+		}
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; !included {
+				continue
+			}
 		}
 		score, ok := r.scheduler.scores[scoreKey]
 		if ok && poolKey != "" {
@@ -234,7 +726,127 @@ func (r *SchedulerRef) MarkExhaustedUntil(provider account.Provider, accountID, 
 	if r.exhaustedUntil == nil {
 		r.exhaustedUntil = make(map[string]time.Time)
 	}
-	r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)] = until
+	key := poolScopedExhaustionKey(provider, accountID, poolKey)
+	r.exhaustedUntil[key] = until
+	delete(r.recoveryProbeReady, key)
+	r.updatedAt = time.Now()
+}
+
+// MarkCredentialExhaustedUntil records a terminal credential failure only if
+// it was observed against the current account snapshot. Unlike quota marks,
+// credential exclusions are discarded when credentials are reloaded.
+func (r *SchedulerRef) MarkCredentialExhaustedUntil(
+	provider account.Provider,
+	accountID string,
+	credentialIdentity string,
+	until time.Time,
+	accountGeneration uint64,
+) bool {
+	if r == nil || accountID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fingerprint := credentialFingerprint(credentialIdentity)
+	scoreKey := ScoreKey(provider, accountID)
+	if accountGeneration != r.accountGeneration {
+		return false
+	}
+	if r.credentialFingerprints == nil {
+		r.credentialFingerprints = make(map[string]string)
+	}
+	if current, tracked := r.credentialFingerprints[scoreKey]; tracked && current != fingerprint {
+		return false
+	}
+	r.credentialFingerprints[scoreKey] = fingerprint
+	if r.credentialExhaustedUntil == nil {
+		r.credentialExhaustedUntil = make(map[string]time.Time)
+	}
+	r.credentialExhaustedUntil[scoreKey+"\x00"+fingerprint] = until
+	r.updatedAt = time.Now()
+	return true
+}
+
+// MarkCredentialExhaustedForSnapshot atomically publishes a coherent account
+// snapshot and records a terminal failure against the credential in that same
+// snapshot. This closes the reload window where AccountRef has advanced but a
+// separate scheduler-generation sync has not arrived yet.
+func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
+	provider account.Provider,
+	accountID string,
+	credentialIdentity string,
+	until time.Time,
+	accountGeneration uint64,
+	credentialRevision uint64,
+	accounts []account.Account,
+) bool {
+	if r == nil || accountID == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if accountGeneration < r.accountGeneration ||
+		(accountGeneration == r.accountGeneration && credentialRevision < r.credentialRevision) {
+		return false
+	}
+	if accountGeneration > r.accountGeneration {
+		r.advanceAccountGenerationLocked(accountGeneration)
+	}
+	if credentialRevision > r.credentialRevision || r.credentialFingerprints == nil {
+		r.credentialRevision = credentialRevision
+		r.credentialFingerprints = make(map[string]string, len(accounts))
+		for _, candidate := range accounts {
+			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+		}
+	}
+
+	fingerprint := credentialFingerprint(credentialIdentity)
+	scoreKey := ScoreKey(provider, accountID)
+	if current, tracked := r.credentialFingerprints[scoreKey]; !tracked || current != fingerprint {
+		return false
+	}
+	if r.credentialExhaustedUntil == nil {
+		r.credentialExhaustedUntil = make(map[string]time.Time)
+	}
+	r.credentialExhaustedUntil[scoreKey+"\x00"+fingerprint] = until
+	r.updatedAt = time.Now()
+	return true
+}
+
+func credentialFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func (r *SchedulerRef) activeCredentialExhaustionLocked() map[string]time.Time {
+	active := make(map[string]time.Time)
+	for key, until := range r.credentialExhaustedUntil {
+		parts := strings.SplitN(key, "\x00", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		scoreKey := ScoreKey(account.Provider(parts[0]), parts[1])
+		if current, tracked := r.credentialFingerprints[scoreKey]; tracked && current != parts[2] {
+			continue
+		}
+		active[poolScopedExhaustionKey(account.Provider(parts[0]), parts[1], "")] = until
+	}
+	return active
+}
+
+// MarkAccountUnavailableUntil excludes an account because of state that is
+// independent of both its quota and its current credential. Usage refreshes
+// and token rotation cannot supersede this evidence; only expiry can.
+func (r *SchedulerRef) MarkAccountUnavailableUntil(provider account.Provider, accountID string, until time.Time) {
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.accountUnavailableUntil == nil {
+		r.accountUnavailableUntil = make(map[string]time.Time)
+	}
+	r.accountUnavailableUntil[poolScopedExhaustionKey(provider, accountID, "")] = until
 	r.updatedAt = time.Now()
 }
 
@@ -263,7 +875,14 @@ func (r *SchedulerRef) MarkModelIncompatible(provider account.Provider, accountI
 func (r *SchedulerRef) ExhaustedUntilFor(provider account.Provider, accountID, poolKey string) (time.Time, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	until, ok := r.exhaustedUntil[poolScopedExhaustionKey(provider, accountID, poolKey)]
+	key := poolScopedExhaustionKey(provider, accountID, poolKey)
+	until, ok := r.exhaustedUntil[key]
+	if credentialUntil, credentialOK := r.activeCredentialExhaustionLocked()[key]; credentialOK && (!ok || credentialUntil.After(until)) {
+		until, ok = credentialUntil, true
+	}
+	if accountUntil, accountOK := r.accountUnavailableUntil[key]; accountOK && (!ok || accountUntil.After(until)) {
+		until, ok = accountUntil, true
+	}
 	return until, ok
 }
 
@@ -275,11 +894,21 @@ func (r *SchedulerRef) ModelIncompatibleUntilFor(provider account.Provider, acco
 }
 
 func (r *SchedulerRef) expiryMarksLocked() map[string]time.Time {
-	marks := make(map[string]time.Time, len(r.exhaustedUntil)+len(r.incompatibleUntil))
+	marks := make(map[string]time.Time, len(r.exhaustedUntil)+len(r.accountUnavailableUntil)+len(r.incompatibleUntil))
 	for key, until := range r.exhaustedUntil {
 		marks[key] = until
 	}
 	for key, until := range r.incompatibleUntil {
+		if until.After(marks[key]) {
+			marks[key] = until
+		}
+	}
+	for key, until := range r.accountUnavailableUntil {
+		if until.After(marks[key]) {
+			marks[key] = until
+		}
+	}
+	for key, until := range r.activeCredentialExhaustionLocked() {
 		if until.After(marks[key]) {
 			marks[key] = until
 		}
@@ -399,6 +1028,10 @@ func copyModelScores(modelScores map[string]Score) map[string]Score {
 }
 
 func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUntil map[string]time.Time) Scheduler {
+	return stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base, exhaustedUntil, nil)
+}
+
+func stripCarriedForwardExhaustionOverlaysForScoreKeys(current, base Scheduler, exhaustedUntil map[string]time.Time, scoreKeys map[string]struct{}) Scheduler {
 	if len(exhaustedUntil) == 0 {
 		return current
 	}
@@ -415,8 +1048,18 @@ func stripCarriedForwardExhaustionOverlays(current, base Scheduler, exhaustedUnt
 		if !ok {
 			continue
 		}
+		if scoreKeys != nil {
+			if _, included := scoreKeys[scoreKey]; !included {
+				continue
+			}
+		}
 		if poolKey != "" && !base.hasModelScore(poolKey) {
 			for candidateKey, candidate := range next.scores {
+				if scoreKeys != nil {
+					if _, included := scoreKeys[candidateKey]; !included {
+						continue
+					}
+				}
 				modelScore, modelOK := candidate.ModelScores[poolKey]
 				if !modelOK || modelScore.Fresh {
 					continue
@@ -489,6 +1132,7 @@ func (r *SchedulerRef) BeginRefreshIfStaleForAccountGeneration(ttl time.Duration
 		return false
 	}
 	r.refreshing = true
+	r.refreshInvalidated = false
 	r.refreshGeneration = generation
 	return true
 }
@@ -501,6 +1145,11 @@ func (r *SchedulerRef) FinishRefresh(scheduler Scheduler, update bool) {
 	defer r.mu.Unlock()
 	if r.legacyFinishInvalidated {
 		r.legacyFinishInvalidated = false
+		return
+	}
+	if r.refreshing && r.refreshInvalidated {
+		r.refreshInvalidated = false
+		r.refreshing = false
 		return
 	}
 	if r.refreshing && r.refreshGeneration != r.accountGeneration {
@@ -518,6 +1167,11 @@ func (r *SchedulerRef) FinishRefreshForAccountGeneration(scheduler Scheduler, up
 	if generation != r.accountGeneration || !r.refreshing || r.refreshGeneration != generation {
 		return false
 	}
+	if r.refreshInvalidated {
+		r.refreshInvalidated = false
+		r.refreshing = false
+		return false
+	}
 	r.finishRefreshLocked(scheduler, update)
 	return true
 }
@@ -532,9 +1186,11 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 		// snapshot. A failed refresh (update=false) keeps them: the snapshot
 		// is still the old one, so its debits still apply.
 		r.routedSinceRefresh = nil
+		r.scoreRevision++
 	}
 	r.updatedAt = time.Now()
 	r.refreshing = false
+	r.refreshInvalidated = false
 }
 
 // NoteRouted records that one request was routed to the account, debiting its

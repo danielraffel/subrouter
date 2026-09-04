@@ -285,8 +285,14 @@ adopt_persistent_legacy_sampler() {
   else
     [[ "${state}" == inactive && "${result}" == success && "${status}" == 0 ]] \
       || die "committed handoff sampler is ${unit_status}"
-    gcloud_ssh "! systemctl is-active --quiet subrouter.service && sudo test ! -S /var/lib/subrouter/supervisor.sock" \
+    # A Unix-socket pathname can survive its owner and become stale. Let the
+    # installer prove the legacy units are inactive and remove only an
+    # unowned stale socket. A pathname test alone rejects a valid resumable
+    # handoff on VMs with that leftover inode.
+    gcloud_ssh "! systemctl is-active --quiet subrouter.service" \
       || die "committed handoff sampler stopped before legacy service retirement"
+    gcloud_ssh "${REMOTE_INSTALL_COMMAND} cleanup-stopped-legacy-control" \
+      || die "committed handoff could not reconcile the stopped legacy control socket"
   fi
   persistent_legacy_sampler_started=1
 }

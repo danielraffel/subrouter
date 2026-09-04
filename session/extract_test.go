@@ -69,6 +69,53 @@ func TestExtractAccountIDFromSubrouterHeader(t *testing.T) {
 	}
 }
 
+func TestExtractAccountIDWithPresenceRejectsInvalidOrAmbiguousSelectors(t *testing.T) {
+	tests := []struct {
+		name        string
+		headers     map[string][]string
+		wantID      string
+		wantPresent bool
+		wantErr     bool
+	}{
+		{name: "absent"},
+		{name: "primary", headers: map[string][]string{"X-Subrouter-Account-ID": {" team-codex-1 "}}, wantID: "team-codex-1", wantPresent: true},
+		{name: "alias", headers: map[string][]string{"X-Subrouter-Account": {"team-codex-2"}}, wantID: "team-codex-2", wantPresent: true},
+		{name: "same selector through both aliases", headers: map[string][]string{
+			"X-Subrouter-Account-ID": {" team-codex-1"},
+			"X-Subrouter-Account":    {"team-codex-1 "},
+		}, wantID: "team-codex-1", wantPresent: true},
+		{name: "empty", headers: map[string][]string{"X-Subrouter-Account-ID": {""}}, wantPresent: true, wantErr: true},
+		{name: "whitespace", headers: map[string][]string{"X-Subrouter-Account": {" \t "}}, wantPresent: true, wantErr: true},
+		{name: "oversize", headers: map[string][]string{"X-Subrouter-Account-ID": {strings.Repeat("a", 257)}}, wantPresent: true, wantErr: true},
+		{name: "control character", headers: map[string][]string{"X-Subrouter-Account": {"team\x7faccount"}}, wantPresent: true, wantErr: true},
+		{name: "conflicting aliases", headers: map[string][]string{
+			"X-Subrouter-Account-ID": {"team-codex-1"},
+			"X-Subrouter-Account":    {"team-codex-2"},
+		}, wantPresent: true, wantErr: true},
+		{name: "conflicting repeated values", headers: map[string][]string{
+			"X-Subrouter-Account-ID": {"team-codex-1", "team-codex-2"},
+		}, wantPresent: true, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/v1/responses", nil)
+			for name, values := range test.headers {
+				for _, value := range values {
+					req.Header.Add(name, value)
+				}
+			}
+
+			gotID, gotPresent, err := ExtractAccountIDWithPresence(req)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
+			}
+			if gotID != test.wantID || gotPresent != test.wantPresent {
+				t.Fatalf("selection = (%q, %v), want (%q, %v)", gotID, gotPresent, test.wantID, test.wantPresent)
+			}
+		})
+	}
+}
+
 func TestExtractModelFromHeader(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/responses", nil)
 	req.Header.Set("X-Subrouter-Model", " GPT-5.3-Codex-Spark ")
@@ -164,11 +211,16 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	req.Header.Set("X-User-Email", "alice@example.com")
 	req.Header.Set("X-Subrouter-Account-ID", "apikey:paid")
 	req.Header.Set("X-Subrouter-Account", "paid")
+	req.Header.Set("X-Subrouter-Preferred-Account-ID", "preferred")
 	req.Header.Set("X-Subrouter-Model", "GPT-5.3-Codex-Spark")
 	req.Header.Set("X-Model", "GPT-5.3-Codex-Spark")
+	req.Header.Set("X-Subrouter-No-Retry", "1")
 	req.Header.Set("X-Other", "keep")
 
 	StripSubrouterHeaders(req.Header)
+	if got := req.Header.Get("X-Subrouter-No-Retry"); got != "" {
+		t.Fatalf("X-Subrouter-No-Retry = %q, want empty", got)
+	}
 
 	if got := req.Header.Get("X-Subrouter-Lease"); got != "" {
 		t.Fatalf("X-Subrouter-Lease = %q, want empty", got)
@@ -193,6 +245,9 @@ func TestStripSubrouterHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Subrouter-Account"); got != "" {
 		t.Fatalf("X-Subrouter-Account = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Subrouter-Preferred-Account-ID"); got != "" {
+		t.Fatalf("X-Subrouter-Preferred-Account-ID = %q, want empty", got)
 	}
 	if got := req.Header.Get("X-Subrouter-Model"); got != "" {
 		t.Fatalf("X-Subrouter-Model = %q, want empty", got)

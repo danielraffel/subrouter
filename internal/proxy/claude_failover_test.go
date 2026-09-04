@@ -127,6 +127,13 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn429(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after failover", response.StatusCode)
 	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	routed, ok := routedResponseAccount(response)
+	if !ok || routed.ID != "fresh@example.com" {
+		t.Fatalf("final response account = %+v, %t; want fresh account", routed, ok)
+	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (429 then retry)", stub.calls)
 	}
@@ -184,6 +191,9 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn401(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after 401 failover", response.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
 	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (401 then retry)", stub.calls)
@@ -259,6 +269,9 @@ func TestUsageLimitRetryTransportClaudeFallsBackToAPIKey(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after API-key fallback", response.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
 	}
 	if !sawAPIKey {
 		t.Fatal("Claude API-key fallback was not used")
@@ -452,6 +465,9 @@ func TestUsageLimitRetryTransportClaudeFailsOverOn403OrgDisabled(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after failing over the org-disabled account", response.StatusCode)
 	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
 	if stub.calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2 (403 then retry on healthy account)", stub.calls)
 	}
@@ -488,7 +504,7 @@ func TestRefreshSelectedAccountClaudeKeepsAccountOnTransientRefreshError(t *test
 				return account, tc.err
 			}
 
-			got, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
+			got, pending, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
 			if err == nil {
 				t.Fatal("a transient refresh failure must still be reported to the caller")
 			}
@@ -497,6 +513,9 @@ func TestRefreshSelectedAccountClaudeKeepsAccountOnTransientRefreshError(t *test
 			}
 			if got.ID != cooked.ID {
 				t.Fatalf("expected the originally selected account back, got %q", got.ID)
+			}
+			if pending {
+				t.Fatal("a transient refresh failure created a pending reassignment")
 			}
 			if len(refreshed) != 1 || refreshed[0] != cooked.ID {
 				t.Fatalf("expected exactly one refresh of the selected account, got %v", refreshed)
@@ -524,12 +543,15 @@ func TestRefreshSelectedAccountClaudeFailsOverOnTerminalRefreshError(t *testing.
 		return account, nil
 	}
 
-	got, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
+	got, pending, err := server.refreshSelectedAccount(context.Background(), accounts.ProviderClaude, "claude", "session-1", "", claudeRefreshRequest(t), cooked)
 	if err != nil {
 		t.Fatalf("failover to the healthy account should succeed: %v", err)
 	}
 	if got.ID != fresh.ID {
 		t.Fatalf("expected failover to %q, got %q", fresh.ID, got.ID)
+	}
+	if !pending {
+		t.Fatal("the refreshed alternate should remain provisional until upstream success")
 	}
 	if len(refreshed) != 2 || refreshed[0] != cooked.ID || refreshed[1] != fresh.ID {
 		t.Fatalf("expected a refresh of the dead account then the healthy one, got %v", refreshed)

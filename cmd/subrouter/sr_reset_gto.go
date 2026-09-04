@@ -75,18 +75,22 @@ func printResetCredits(out io.Writer, now time.Time, entries []resetCreditsAccou
 // resetListRemote fetches per-account reset-credit detail (count + expiry) from
 // the team server, which alone holds live tokens to query the upstream.
 func (r srRunner) resetListRemote(ctx context.Context, server srServerConfig) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/_subrouter/reset-credits", nil)
+	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
 		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/reset-credits", nil)
+	if err != nil {
+		return redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
-	}
-	res, err := client.Do(req)
+	secured, err := r.securedRequestClientForServer(server, baseURL, 60*time.Second)
 	if err != nil {
 		return err
+	}
+	res, err := secured.Do(req)
+	if err != nil {
+		return redactServerRequestError(err, server)
 	}
 	defer res.Body.Close()
 	if res.StatusCode == http.StatusNotFound {

@@ -10,19 +10,30 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentantigravity "github.com/manaflow-ai/subrouter/internal/agents/antigravity"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+	agentkimi "github.com/manaflow-ai/subrouter/internal/agents/kimi"
 )
 
 const serverAccountImportPath = "/_subrouter/account-import"
 
 type serverAccountImportRequest struct {
-	Provider accounts.Provider            `json:"provider"`
-	Codex    *accounts.StoredCodexAccount `json:"codex,omitempty"`
-	Claude   *serverClaudeAccountImport   `json:"claude,omitempty"`
+	Provider    accounts.Provider               `json:"provider"`
+	Codex       *accounts.StoredCodexAccount    `json:"codex,omitempty"`
+	Claude      *serverClaudeAccountImport      `json:"claude,omitempty"`
+	Kimi        *serverKimiAccountImport        `json:"kimi,omitempty"`
+	Antigravity *serverAntigravityAccountImport `json:"antigravity,omitempty"`
+}
+
+type serverAntigravityAccountImport struct {
+	Label      string                          `json:"label"`
+	Credential agentantigravity.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                            `json:"remove,omitempty"`
 }
 
 type serverClaudeAccountImport struct {
@@ -30,7 +41,17 @@ type serverClaudeAccountImport struct {
 	Credential agentclaude.CredentialInfo `json:"credential"`
 }
 
+type serverKimiAccountImport struct {
+	Label      string                   `json:"label"`
+	Credential agentkimi.CredentialInfo `json:"credential,omitempty"`
+	Remove     bool                     `json:"remove,omitempty"`
+}
+
 func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server srServerConfig) error {
+	return r.ensureServerAccountImportProviderAvailable(ctx, server, "")
+}
+
+func (r srRunner) ensureServerAccountImportProviderAvailable(ctx context.Context, server srServerConfig, provider accounts.Provider) error {
 	// Ask the server rather than assuming a stored credential is required. A
 	// self-hosted server can authenticate callers by tailnet identity, in which
 	// case this entry has nothing to carry and the preflight simply succeeds.
@@ -46,10 +67,23 @@ func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server
 	switch {
 	case res.StatusCode >= 200 && res.StatusCode < 300:
 		var response struct {
-			OK bool `json:"ok"`
+			OK        bool     `json:"ok"`
+			Providers []string `json:"providers"`
 		}
 		if err := json.Unmarshal(body, &response); err != nil || !response.OK {
 			return fmt.Errorf("server %s returned an invalid account-import preflight", server.Name)
+		}
+		if provider != "" {
+			available := false
+			for _, advertised := range response.Providers {
+				if strings.EqualFold(strings.TrimSpace(advertised), string(provider)) {
+					available = true
+					break
+				}
+			}
+			if !available {
+				return fmt.Errorf("server %s does not advertise %s account import; run '%s install %s' first", server.Name, provider, r.serverCommand(), server.Name)
+			}
 		}
 		return nil
 	case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
@@ -65,10 +99,10 @@ func (r srRunner) ensureServerAccountImportAvailable(ctx context.Context, server
 }
 
 func (r srRunner) uploadServerAccount(ctx context.Context, server srServerConfig, account accounts.StoredCodexAccount) error {
+	provider := account.ProviderOrDefault()
 	if err := r.ensureServerAccountImportAvailable(ctx, server); err != nil {
 		return err
 	}
-	provider := account.ProviderOrDefault()
 	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
 		Provider: provider,
 		Codex:    &account,
@@ -85,6 +119,46 @@ func (r srRunner) uploadServerClaudeAccount(ctx context.Context, server srServer
 			Name:       name,
 			Credential: credential,
 		},
+	})
+}
+
+func (r srRunner) uploadServerKimiAccount(ctx context.Context, server srServerConfig, label string, credential agentkimi.CredentialInfo) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderKimi); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider: accounts.ProviderKimi,
+		Kimi:     &serverKimiAccountImport{Label: label, Credential: credential},
+	})
+}
+
+func (r srRunner) removeServerKimiAccount(ctx context.Context, server srServerConfig, label string) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderKimi); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider: accounts.ProviderKimi,
+		Kimi:     &serverKimiAccountImport{Label: label, Remove: true},
+	})
+}
+
+func (r srRunner) uploadServerAntigravityAccount(ctx context.Context, server srServerConfig, label string, credential agentantigravity.CredentialInfo) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderAntigravity); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider:    accounts.ProviderAntigravity,
+		Antigravity: &serverAntigravityAccountImport{Label: label, Credential: credential},
+	})
+}
+
+func (r srRunner) removeServerAntigravityAccount(ctx context.Context, server srServerConfig, label string) error {
+	if err := r.ensureServerAccountImportProviderAvailable(ctx, server, accounts.ProviderAntigravity); err != nil {
+		return err
+	}
+	return r.postServerAccountImport(ctx, server, serverAccountImportRequest{
+		Provider:    accounts.ProviderAntigravity,
+		Antigravity: &serverAntigravityAccountImport{Label: label, Remove: true},
 	})
 }
 
@@ -124,46 +198,50 @@ func serverHasAccountImportCredential(server srServerConfig) bool {
 }
 
 func (r srRunner) doServerAccountImportRequest(ctx context.Context, server srServerConfig, method string, body []byte) (*http.Response, error) {
-	endpoint := serverControlBaseURL(server) + serverAccountImportPath
-	if err := validateServerAccountImportURL(ctx, endpoint); err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
+	baseURL, err := protectedServerControlBaseURL(server)
 	if err != nil {
 		return nil, err
+	}
+	endpoint := baseURL + serverAccountImportPath
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, redactServerRequestError(err, server)
 	}
 	addServerAccountImportAuth(req, server)
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := r.client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	secured, err := securedServerAccountImportClient(client, endpoint)
+	secured, err := r.securedRequestClientForServer(server, endpoint, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	res, err := secured.Do(req)
 	if err != nil {
-		return nil, redactServerAccountImportError(err, server)
+		return nil, redactServerRequestError(err, server)
 	}
 	return res, nil
 }
 
-func redactServerAccountImportError(err error, server srServerConfig) error {
+var tenantPathErrorPattern = regexp.MustCompile(`/t/[^/?#\s"']+`)
+
+func redactServerRequestError(err error, server srServerConfig) error {
 	message := err.Error()
-	for _, secret := range []string{
+	secrets := []string{
 		strings.TrimSpace(server.TenantKey),
 		strings.TrimSpace(server.AccountImportToken),
 		strings.TrimSpace(server.AdminToken),
-	} {
+	}
+	if parsed, parseErr := url.Parse(strings.TrimSpace(server.URL)); parseErr == nil {
+		secrets = append(secrets, tenantKeyFromURL(parsed))
+	}
+	for _, secret := range secrets {
 		if secret == "" {
 			continue
 		}
 		message = strings.ReplaceAll(message, secret, "[redacted]")
 		message = strings.ReplaceAll(message, url.PathEscape(secret), "[redacted]")
 	}
+	message = tenantPathErrorPattern.ReplaceAllString(message, "/t/[redacted]")
 	return errors.New(message)
 }
 
@@ -178,7 +256,7 @@ func addServerAccountImportAuth(req *http.Request, server srServerConfig) {
 	req.Header.Set("Authorization", "Bearer "+token)
 }
 
-func securedServerAccountImportClient(base *http.Client, rawURL string) (*http.Client, error) {
+func securedServerRequestClient(base *http.Client, rawURL string) (*http.Client, error) {
 	clientCopy := *base
 	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -187,9 +265,6 @@ func securedServerAccountImportClient(base *http.Client, rawURL string) (*http.C
 	if err != nil {
 		return nil, err
 	}
-	if parsed.Scheme != "http" {
-		return &clientCopy, nil
-	}
 	var transport *http.Transport
 	switch configured := clientCopy.Transport.(type) {
 	case nil:
@@ -197,85 +272,44 @@ func securedServerAccountImportClient(base *http.Client, rawURL string) (*http.C
 	case *http.Transport:
 		transport = configured.Clone()
 	default:
-		// Test seams and explicit custom transports still pass the URL policy
-		// above. Production uses *http.Transport, where plaintext credentials are
-		// additionally pinned to a verified tailnet/loopback socket below.
+		return nil, errors.New("protected requests require a pinnable HTTP transport")
+	}
+	// Protected control requests intentionally bypass ambient proxies even for
+	// HTTPS. This keeps tenant path keys and authorization metadata out of proxy
+	// logs and matches the stricter direct-transport contract of account import.
+	transport.Proxy = nil
+	clientCopy.Transport = transport
+	if parsed.Scheme != "http" {
 		return &clientCopy, nil
 	}
-	transport.Proxy = nil
-	transport.DialContext = dialSafeAccountImportAddress
+	host := parsed.Hostname()
+	ip := net.ParseIP(host)
+	loopbackName := strings.EqualFold(strings.TrimSuffix(host, "."), "localhost")
+	if !loopbackName && (ip == nil || !safeAccountImportHTTPIP(ip)) {
+		return nil, errors.New("plain HTTP protected requests require a pinned Tailscale or loopback address")
+	}
+	if loopbackName {
+		transport.DialContext = dialLoopbackAddress
+	}
 	clientCopy.Transport = transport
 	return &clientCopy, nil
 }
 
-func dialSafeAccountImportAddress(ctx context.Context, network, address string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
+func dialLoopbackAddress(ctx context.Context, network, address string) (net.Conn, error) {
+	_, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return nil, errors.New("account-import destination is invalid")
-	}
-	var ips []net.IP
-	if ip := net.ParseIP(host); ip != nil {
-		ips = []net.IP{ip}
-	} else {
-		addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, errors.New("account-import host did not resolve")
-		}
-		for _, address := range addresses {
-			ips = append(ips, address.IP)
-		}
-	}
-	if len(ips) == 0 {
-		return nil, errors.New("account-import host did not resolve")
-	}
-	for _, ip := range ips {
-		if !safeAccountImportHTTPIP(ip) {
-			return nil, errors.New("plain HTTP account import is restricted to Tailscale or loopback")
-		}
+		return nil, errors.New("loopback destination is invalid")
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
 	var lastErr error
-	for _, ip := range ips {
-		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+	for _, host := range []string{"127.0.0.1", "::1"} {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
 		if err == nil {
 			return conn, nil
 		}
 		lastErr = err
 	}
 	return nil, lastErr
-}
-
-func validateServerAccountImportURL(ctx context.Context, rawURL string) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-		return errors.New("account-import URL is invalid")
-	}
-	switch strings.ToLower(parsed.Scheme) {
-	case "https":
-		return nil
-	case "http":
-	default:
-		return errors.New("account-import URL must use HTTPS or a Tailscale/loopback HTTP address")
-	}
-	host := parsed.Hostname()
-	if ip := net.ParseIP(host); ip != nil {
-		if safeAccountImportHTTPIP(ip) {
-			return nil
-		}
-		return errors.New("plain HTTP account import is restricted to Tailscale or loopback")
-	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	addresses, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
-	if err != nil || len(addresses) == 0 {
-		return errors.New("account-import host did not resolve")
-	}
-	for _, address := range addresses {
-		if !safeAccountImportHTTPIP(address.IP) {
-			return errors.New("plain HTTP account import is restricted to Tailscale or loopback")
-		}
-	}
-	return nil
 }
 
 func safeAccountImportHTTPIP(ip net.IP) bool {

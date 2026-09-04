@@ -339,10 +339,10 @@ func (r srRunner) azCost(ctx context.Context) error {
 		return err
 	}
 	if summary.Requests == 0 {
-		fmt.Fprintf(r.out, "No Azure Codex requests recorded at %s\n", server.URL)
+		fmt.Fprintf(r.out, "No Azure Codex requests recorded at %s\n", redactedServerURL(server.URL))
 		return nil
 	}
-	fmt.Fprintf(r.out, "Azure Codex spend at %s\n", server.URL)
+	fmt.Fprintf(r.out, "Azure Codex spend at %s\n", redactedServerURL(server.URL))
 	fmt.Fprintf(r.out, "  today $%s · 7d $%s · 30d $%s · all-time $%s (%d req)\n",
 		fmtUSD4(summary.TodayUSD), fmtUSD4(summary.Week7dUSD), fmtUSD4(summary.Month30dUSD),
 		fmtUSD4(summary.TotalUSD), summary.Requests)

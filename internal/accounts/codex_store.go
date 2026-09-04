@@ -1,24 +1,96 @@
 package accounts
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	accountpkg "github.com/manaflow-ai/subrouter/account"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 type CodexStore struct {
-	Dir string
+	Dir                   string
+	DisableActiveAuthSync bool
+	RequireIsolatedOAuth  bool
 }
 
 const migrationBatchControlLockID = ".subrouter-migration-batch-control"
+
+var storedAccountProcessLocks sync.Map
+
+func storedAccountProcessMutex(storeDir, identifier string) *sync.Mutex {
+	key, err := filepath.Abs(filepath.Join(storeDir, "."+accountLockFilename(identifier)+".lock"))
+	if err != nil {
+		key = filepath.Clean(filepath.Join(storeDir, "."+accountLockFilename(identifier)+".lock"))
+	}
+	value, _ := storedAccountProcessLocks.LoadOrStore(key, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+// StoredAccountLease holds the same process and cross-process account lock used
+// by saves, refreshes, and exact removals. Callers coordinating a stored
+// credential with another provider store can keep one exact stored identity
+// stable across that larger transaction without re-entering the account lock.
+//
+// A lease is bound to one exact account identifier. Close must be called once.
+type StoredAccountLease struct {
+	store      CodexStore
+	identifier string
+	lock       *accountFileLock
+	closed     bool
+}
+
+// AcquireStoredAccountLease locks one exact stored-account identity. The
+// caller must already hold any broader transaction locks; the canonical order
+// is broader transaction -> stored-account lease -> provider-specific locks.
+func (s CodexStore) AcquireStoredAccountLease(identifier string) (*StoredAccountLease, error) {
+	identifier = strings.TrimSpace(identifier)
+	if err := validateStoredAccountIdentifier(identifier); err != nil {
+		return nil, err
+	}
+	lock, err := s.lockStoredAccount(identifier)
+	if err != nil {
+		return nil, err
+	}
+	return &StoredAccountLease{store: s, identifier: identifier, lock: lock}, nil
+}
+
+// Close releases the stored-account lease.
+func (l *StoredAccountLease) Close() error {
+	if l == nil || l.lock == nil || l.closed {
+		return nil
+	}
+	l.closed = true
+	return l.lock.Close()
+}
+
+func (l *StoredAccountLease) validFor(identifier string) error {
+	if l == nil || l.lock == nil || l.closed {
+		return errors.New("stored account lease is not active")
+	}
+	if !strings.EqualFold(strings.TrimSpace(identifier), l.identifier) {
+		return fmt.Errorf("stored account lease for %q cannot access %q", l.identifier, identifier)
+	}
+	return nil
+}
+
+// FindExact returns the exact account protected by this lease.
+func (l *StoredAccountLease) FindExact() (StoredCodexAccount, bool, error) {
+	if err := l.validFor(l.identifier); err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	return l.store.findStoredExact(l.identifier)
+}
 
 type StorageKeyCollisionError struct {
 	Identifier         string
@@ -30,17 +102,26 @@ func (e *StorageKeyCollisionError) Error() string {
 }
 
 type StoredCodexAccount struct {
-	Email            string                `json:"email"`
-	Label            string                `json:"label,omitempty"`
-	Provider         Provider              `json:"provider,omitempty"`
-	MigrationBatchID string                `json:"migrationBatchId,omitempty"`
-	AddedAt          string                `json:"addedAt"`
-	Auth             CodexAuthFile         `json:"auth"`
-	ProjectID        string                `json:"projectId,omitempty"`
-	ProjectName      string                `json:"projectName,omitempty"`
-	AdminKeyLabel    string                `json:"adminKeyLabel,omitempty"`
-	Breadcrumbs      []CodexAuthBreadcrumb `json:"breadcrumbs,omitempty"`
+	Email                 string                     `json:"email"`
+	Label                 string                     `json:"label,omitempty"`
+	Provider              Provider                   `json:"provider,omitempty"`
+	OAuthCredentialOrigin CodexOAuthCredentialOrigin `json:"oauthCredentialOrigin,omitempty"`
+	MigrationBatchID      string                     `json:"migrationBatchId,omitempty"`
+	AddedAt               string                     `json:"addedAt"`
+	Auth                  CodexAuthFile              `json:"auth"`
+	ProjectID             string                     `json:"projectId,omitempty"`
+	ProjectName           string                     `json:"projectName,omitempty"`
+	AdminKeyLabel         string                     `json:"adminKeyLabel,omitempty"`
+	Breadcrumbs           []CodexAuthBreadcrumb      `json:"breadcrumbs,omitempty"`
 }
+
+type CodexOAuthCredentialOrigin string
+
+const (
+	CodexOAuthOriginInteractiveImport   CodexOAuthCredentialOrigin = "interactive-import"
+	CodexOAuthOriginIsolatedServerLogin CodexOAuthCredentialOrigin = "isolated-server-login"
+	CodexOAuthOriginServerAttested      CodexOAuthCredentialOrigin = "server-attested-transfer"
+)
 
 type CodexAuthFile struct {
 	Tokens         *CodexTokens         `json:"tokens,omitempty"`
@@ -106,6 +187,18 @@ func DefaultCodexStore() CodexStore {
 	return CodexStore{Dir: filepath.Join(storepath.CodexDir(), "accounts")}
 }
 
+// DefaultCodexStoreForReadOnlyInspection resolves the same effective source as
+// DefaultCodexStore's best-effort legacy migration without copying any state.
+func DefaultCodexStoreForReadOnlyInspection() CodexStore {
+	return CodexStoreForStateRootReadOnlyInspection(storepath.StateDir())
+}
+
+// CodexStoreForStateRootReadOnlyInspection resolves the effective account
+// source for an explicit state root without performing legacy migration.
+func CodexStoreForStateRootReadOnlyInspection(stateRoot string) CodexStore {
+	return CodexStore{Dir: filepath.Join(storepath.CodexDirForStateRootReadOnlyInspection(stateRoot), "accounts")}
+}
+
 func (s CodexStore) StoreDir() string {
 	return filepath.Dir(s.Dir)
 }
@@ -134,6 +227,14 @@ func (s CodexStore) ListStored() ([]StoredCodexAccount, error) {
 		return nil, err
 	}
 	defer lock.Close()
+	return s.listStored(false)
+}
+
+// ListStoredReadOnly reads the durable snapshot without creating a lock file.
+// Writers publish account files atomically, so diagnostics can safely inspect
+// individual files; unlike ListStored, this does not promise one transactionally
+// locked view across a concurrent migration batch.
+func (s CodexStore) ListStoredReadOnly() ([]StoredCodexAccount, error) {
 	return s.listStored(false)
 }
 
@@ -240,7 +341,13 @@ func (a StoredCodexAccount) toAccount(source string) (Account, bool) {
 
 	out.AuthMode = AuthModeOAuth
 	out.Token = a.Auth.Tokens.AccessToken
+	out.CredentialVersion = accountpkg.OAuthCredentialVersion(
+		a.Auth.Tokens.AccessToken, a.Auth.Tokens.RefreshToken,
+	)
 	out.AccountID = a.Auth.Tokens.AccountID
+	if email, err := ExtractEmailFromJWT(a.Auth.Tokens.IDToken); err == nil && strings.TrimSpace(email) != "" {
+		out.Email = strings.TrimSpace(email)
+	}
 	return out, true
 }
 
@@ -264,6 +371,58 @@ func (s CodexStore) SaveStored(account StoredCodexAccount) error {
 		return err
 	}
 	defer lock.Close()
+	return s.saveStoredUnlocked(account)
+}
+
+// ReplaceStoredOAuthWithIsolated replaces one existing Codex OAuth credential
+// after an account-manager login whose identity has already been checked. The
+// read and write share the account lock so a concurrent repair, removal, or
+// refresh cannot be overwritten by a stale pre-login snapshot.
+func (s CodexStore) ReplaceStoredOAuthWithIsolated(ctx context.Context, identifier string, auth CodexAuthFile) error {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return errors.New("account identifier is required")
+	}
+	if auth.Tokens == nil || strings.TrimSpace(auth.Tokens.AccessToken) == "" ||
+		strings.TrimSpace(auth.Tokens.RefreshToken) == "" || strings.TrimSpace(auth.Tokens.IDToken) == "" {
+		return errors.New("isolated Codex login did not produce complete OAuth auth")
+	}
+	email, err := ExtractEmailFromJWT(auth.Tokens.IDToken)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(email), identifier) {
+		return errors.New("isolated Codex login identity does not match the stored account")
+	}
+
+	lock, err := s.lockStoredAccount(identifier)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	account, found, err := s.findStoredExact(identifier)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("account %q changed or was removed during migration", identifier)
+	}
+	if account.IsAPIKey() || account.ProviderOrDefault() != ProviderCodex {
+		return fmt.Errorf("account %q is not a Codex OAuth account", identifier)
+	}
+	storedAccountID := ""
+	if account.Auth.Tokens != nil {
+		storedAccountID = strings.TrimSpace(account.Auth.Tokens.AccountID)
+	}
+	incomingAccountID := strings.TrimSpace(auth.Tokens.AccountID)
+	if storedAccountID != "" && storedAccountID != incomingAccountID {
+		return errors.New("isolated Codex login account does not match the stored account")
+	}
+	previous := account
+	account.Auth = auth
+	account.Auth.RefreshFailure = nil
+	account.OAuthCredentialOrigin = CodexOAuthOriginIsolatedServerLogin
+	appendCodexAuthBreadcrumb(
+		ctx, s, &account, "credential_reenrolled_isolated", "account_manager", false,
+		&previous, &account, nil, nil,
+	)
 	return s.saveStoredUnlocked(account)
 }
 
@@ -337,6 +496,12 @@ func validateStoredAccountIdentifier(identifier string) error {
 	}
 	if strings.HasPrefix(emailToFilename(trimmed), ".") {
 		return errors.New("account identifier cannot create a hidden store entry")
+	}
+	// Save, lock, and atomic-temp paths all decorate this component. Bounding
+	// the undecorated filename leaves room below common 255-byte filesystem
+	// limits for every decoration.
+	if len(emailToFilename(trimmed)) > 220 {
+		return errors.New("account identifier is too long for the credential store")
 	}
 	return nil
 }
@@ -683,6 +848,222 @@ func (s CodexStore) RemoveStored(identifier string) (StoredCodexAccount, bool, e
 		return account, false, err
 	}
 	return account, true, nil
+}
+
+// RemoveStoredExact holds the account's credential lock across the final
+// identity check and unlink. A same-ID repair that wins before this lock is
+// rejected; one that starts afterward cannot be unlinked by this deletion.
+func (s CodexStore) RemoveStoredExact(expected StoredCodexAccount) (StoredCodexAccount, bool, error) {
+	lock, err := s.lockStoredAccount(expected.Email)
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	defer lock.Close()
+	current, found, err := s.findStoredExact(expected.Email)
+	if err != nil || !found {
+		return current, found, err
+	}
+	if !reflect.DeepEqual(current, expected) {
+		return current, false, fmt.Errorf("stored account %q changed during removal", expected.Email)
+	}
+	if err := os.Remove(filepath.Join(s.Dir, emailToFilename(current.Email))); err != nil {
+		return current, false, err
+	}
+	return current, true, nil
+}
+
+const storedRemovalStageSuffix = ".delete-staged"
+
+// RemoveStoredExactDurable stages the exact record out of the live namespace,
+// syncs that rename, and then removes the staged secret. A crash after the
+// rename is recoverable by ReconcileStoredRemovalStages and cannot resurrect a
+// stale live account.
+func (s CodexStore) RemoveStoredExactDurable(expected StoredCodexAccount, syncDir func(string) error) (StoredCodexAccount, bool, error) {
+	lease, err := s.AcquireStoredAccountLease(expected.Email)
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	defer lease.Close()
+	return lease.RemoveExactDurable(expected, syncDir)
+}
+
+// RemoveExactDurable performs an exact durable removal while retaining an
+// already-held lease. This avoids releasing or recursively acquiring the
+// account lock inside a composite provider transaction.
+func (l *StoredAccountLease) RemoveExactDurable(expected StoredCodexAccount, syncDir func(string) error) (StoredCodexAccount, bool, error) {
+	if err := l.validFor(expected.Email); err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	current, found, err := l.store.findStoredExact(expected.Email)
+	if err != nil || !found {
+		return current, found, err
+	}
+	if !reflect.DeepEqual(current, expected) {
+		return current, false, fmt.Errorf("stored account %q changed during removal", expected.Email)
+	}
+	path := filepath.Join(l.store.Dir, emailToFilename(current.Email))
+	staged := path + storedRemovalStageSuffix
+	if err := os.Remove(staged); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return current, false, err
+	}
+	if err := os.Rename(path, staged); err != nil {
+		return current, false, err
+	}
+	if err := syncDir(l.store.Dir); err != nil {
+		renameErr := os.Rename(staged, path)
+		if renameErr != nil {
+			// The live record could not be restored, so the deletion remains
+			// logically committed even though its directory publication failed.
+			return current, true, errors.Join(err, renameErr)
+		}
+		// Once the reverse rename succeeds the record is live again. Report
+		// removed=false even if publishing that restoration fails so a caller
+		// coordinating another credential store restores its side as well.
+		return current, false, errors.Join(err, syncDir(l.store.Dir))
+	}
+	if err := os.Remove(staged); err != nil {
+		return current, true, err
+	}
+	// The first parent sync made the live-to-staged rename durable. Therefore a
+	// failure syncing the final staged unlink cannot resurrect the live record:
+	// either the unlink persists, or the staged record reappears and startup
+	// reconciliation removes it. The deletion is committed in both cases.
+	return current, true, syncDir(l.store.Dir)
+}
+
+// ReconcileStoredRemovalStages rolls forward exact deletions whose live record
+// was already staged away before a process crash.
+func (s CodexStore) ReconcileStoredRemovalStages(syncDir func(string) error) error {
+	return s.reconcileStoredRemovalStages(syncDir, nil)
+}
+
+func (s CodexStore) reconcileStoredRemovalStages(syncDir func(string) error, beforeLease func(string)) error {
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json"+storedRemovalStageSuffix) {
+			continue
+		}
+		path := filepath.Join(s.Dir, entry.Name())
+		staged, found, err := readStoredRemovalStage(path, entry.Name())
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if beforeLease != nil {
+			beforeLease(staged.Email)
+		}
+		lease, err := s.AcquireStoredAccountLease(staged.Email)
+		if err != nil {
+			return err
+		}
+		err = lease.reconcileRemovalStage(path, entry.Name(), staged, syncDir)
+		closeErr := lease.Close()
+		if err != nil || closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
+	}
+	return nil
+}
+
+func readStoredRemovalStage(path, name string) (StoredCodexAccount, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, nil
+	}
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q is not a regular file", name)
+	}
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, nil
+	}
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	var staged StoredCodexAccount
+	if err := json.Unmarshal(body, &staged); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("parse stored removal stage %q: %w", name, err)
+	}
+	if err := validateStoredAccountIdentifier(staged.Email); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q has ambiguous identity: %w", name, err)
+	}
+	if want := emailToFilename(staged.Email) + storedRemovalStageSuffix; name != want {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored removal stage %q does not match its account identity", name)
+	}
+	return staged, true, nil
+}
+
+func (l *StoredAccountLease) reconcileRemovalStage(path, name string, observed StoredCodexAccount, syncDir func(string) error) error {
+	if err := l.validFor(observed.Email); err != nil {
+		return err
+	}
+	staged, found, err := readStoredRemovalStage(path, name)
+	if err != nil || !found {
+		return err
+	}
+	if !reflect.DeepEqual(staged, observed) {
+		return fmt.Errorf("stored removal stage %q changed while awaiting its account lease", name)
+	}
+
+	livePath := strings.TrimSuffix(path, storedRemovalStageSuffix)
+	liveAccount, live, err := readStoredRemovalLive(livePath, strings.TrimSuffix(name, storedRemovalStageSuffix))
+	if err != nil {
+		return err
+	}
+	if live {
+		if !strings.EqualFold(strings.TrimSpace(liveAccount.Email), strings.TrimSpace(staged.Email)) {
+			return fmt.Errorf("stored removal stage %q collides with live account identity", name)
+		}
+		// A live record is an authoritative replacement (or a restored failed
+		// deletion). The stage is stale, but only this identity's lease may
+		// remove it.
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return syncDir(l.store.Dir)
+}
+
+func readStoredRemovalLive(path, name string) (StoredCodexAccount, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return StoredCodexAccount{}, false, nil
+	}
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q is not a regular file", name)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return StoredCodexAccount{}, false, err
+	}
+	var live StoredCodexAccount
+	if err := json.Unmarshal(body, &live); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("parse stored account %q: %w", name, err)
+	}
+	if err := validateStoredAccountIdentifier(live.Email); err != nil {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q has ambiguous identity: %w", name, err)
+	}
+	if want := emailToFilename(live.Email); name != want {
+		return StoredCodexAccount{}, false, fmt.Errorf("stored account %q does not match its account identity", name)
+	}
+	return live, true, nil
 }
 
 // MigratedDirName holds credentials this machine has handed to the team vault.

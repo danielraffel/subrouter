@@ -293,6 +293,43 @@ func TestAzureCodexFallbackServesAndPinsSession(t *testing.T) {
 	}
 }
 
+func TestAzureCodexFallbackResponseIsNotAttributedToPoolAccount(t *testing.T) {
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 1)
+	server.azureCodexSessions = newAzureCodexSticky()
+	transport := azureCodexFallbackTransport{
+		base: &stubRoundTripper{responses: func(*http.Request) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached"}}`)),
+			}
+		}},
+		server:     &server,
+		sessionKey: "codex\x00session-1",
+		accountID:  "pool@example.com",
+		replayBody: func() ([]byte, bool) {
+			return []byte(`{"model":"gpt-5.6-codex","input":[]}`), true
+		},
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	routed, ok := routedResponseAccount(response)
+	if !ok || routed.ID != "" || routed.Provider != accounts.ProviderCodex {
+		t.Fatalf("Azure fallback attribution = %+v, %t; want unattributed Codex response", routed, ok)
+	}
+}
+
 // A 400 is the client's own fault: paying Azure to repeat it would waste money
 // and hide the error.
 func TestAzureCodexFallbackIgnoresClientErrors(t *testing.T) {
@@ -430,6 +467,65 @@ func TestAzureCodexFallbackCapsPoolRetries(t *testing.T) {
 	if got := poolCalls.Load(); got != azureCodexPoolRetryBudget+1 {
 		t.Fatalf("pool attempts = %d, want %d (one attempt plus %d retries)",
 			got, azureCodexPoolRetryBudget+1, azureCodexPoolRetryBudget)
+	}
+}
+
+func TestNoRetryRequestDoesNotFallThroughToAzure(t *testing.T) {
+	var poolCalls atomic.Int32
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		poolCalls.Add(1)
+		if got := r.Header.Get(subrouterNoRetryHeader); got != "" {
+			t.Fatalf("%s leaked to the pool upstream: %q", subrouterNoRetryHeader, got)
+		}
+		http.Error(w, "request timeout", http.StatusRequestTimeout)
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var azureCalls atomic.Int32
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		azureCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 1)
+	now := time.Now()
+	sticky := newAzureCodexSticky()
+	sticky.now = func() time.Time { return now }
+	stickyKey := azureCodexSessionKeyFor("codex", "no-retry-azure")
+	sticky.pin(stickyKey, 0)
+	beforeExpiry := sticky.entries[stickyKey].expiresAt
+	server.azureCodexSessions = sticky
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/responses",
+		strings.NewReader(`{"model":"gpt-5.6-codex","session_id":"no-retry-azure"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(subrouterNoRetryHeader, "1")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusRequestTimeout {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d, body = %s, want the pool's single 408", response.StatusCode, body)
+	}
+	if got := poolCalls.Load(); got != 1 {
+		t.Fatalf("pool calls = %d, want exactly one", got)
+	}
+	if got := azureCalls.Load(); got != 0 {
+		t.Fatalf("azure calls = %d, want none for an explicit no-retry request", got)
+	}
+	if afterExpiry := sticky.entries[stickyKey].expiresAt; !afterExpiry.Equal(beforeExpiry) {
+		t.Fatalf("no-retry request renewed Azure stickiness: before=%v after=%v", beforeExpiry, afterExpiry)
 	}
 }
 
@@ -1335,6 +1431,51 @@ func TestAzureCodexStreamQuotaMarksAccountAndDiverts(t *testing.T) {
 	}
 	if _, marked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "codex-account-0", ""); !marked {
 		t.Fatal("a stream quota failure must mark the account like a 429 would")
+	}
+}
+
+func TestAzureCodexStreamQuotaMarksTheAccountThatProducedTheResponse(t *testing.T) {
+	poolURL, err := url.Parse("https://pool.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"resp_azure"}`)
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 2)
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "initial-account", Provider: accounts.ProviderCodex, Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "routed-account", Provider: accounts.ProviderCodex, Headroom: 0.70, ShortHeadroom: 0.70},
+	}))
+	server.SchedulerRef = schedulerRef
+	body := []byte(`{"model":"gpt-5.6-codex","session_id":"session-routed-quota","stream":true,"input":[]}`)
+	request := httptest.NewRequest(http.MethodPost, "https://pool.invalid/responses", bytes.NewReader(body))
+	transport := azureCodexFallbackTransport{
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"usage_limit_reached\"}}}\n\n")),
+				Request:    request,
+			}
+			return tagRoutedResponseAccount(response, accounts.Account{ID: "routed-account", Provider: accounts.ProviderCodex}), nil
+		}),
+		server:     &server,
+		sessionKey: "codex\x00session-routed-quota",
+		accountID:  "initial-account",
+		replayBody: func() ([]byte, bool) { return body, true },
+	}
+
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, marked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "routed-account", ""); !marked {
+		t.Fatal("stream quota did not exhaust the account that produced the routed response")
+	}
+	if _, marked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "initial-account", ""); marked {
+		t.Fatal("stream quota incorrectly exhausted the request's initial account")
 	}
 }
 

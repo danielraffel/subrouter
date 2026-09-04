@@ -277,5 +277,5 @@ func defaultCodexBaseURLForHealth() (string, error) {
 	if !ok {
 		return "", nil
 	}
-	return codexBaseURLForServer(server), nil
+	return codexBaseURLForServer(server)
 }

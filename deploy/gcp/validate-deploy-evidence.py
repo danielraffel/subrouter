@@ -1214,6 +1214,116 @@ def validate_legacy_retirement(document: dict[str, Any]) -> None:
         fail("legacy retirement evidence was emitted before absence")
 
 
+def validate_preflight_routing(
+    run: dict[str, Any],
+    routing: dict[str, Any],
+    mode: str,
+    legacy_refs: int,
+    front_refs: int,
+) -> None:
+    legacy_url = text(field(routing, "legacy_backend_url", "routing"), "routing.legacy_backend_url")
+    front_url = text(field(routing, "front_backend_url", "routing"), "routing.front_backend_url")
+    if legacy_url == front_url or not legacy_url.startswith("https://") or not front_url.startswith("https://"):
+        fail("preflight backend URLs must be distinct HTTPS resources")
+    project_prefix = f"https://www.googleapis.com/compute/v1/projects/{run['project']}/global/backendServices/"
+    if not legacy_url.startswith(project_prefix) or not front_url.startswith(project_prefix):
+        fail("preflight backend URLs must target the deployment project")
+
+    expected_routing = {
+        "subrouter-staging": (
+            "staging-subrouter",
+            "staging-subrouter-front-canary",
+            "front-canary.staging.sr.cmux.internal",
+        ),
+        "subrouter-team": (
+            "__root__",
+            "subrouter-front-canary",
+            "front-canary.sr.cmux.internal",
+        ),
+    }
+    target = expected_routing.get(run["instance"])
+    active_matcher = text(field(routing, "active_matcher", "routing"), "routing.active_matcher")
+    canary = obj(field(routing, "canary", "routing"), "routing.canary")
+    canary_matcher = text(field(canary, "matcher", "routing.canary"), "routing.canary.matcher")
+    canary_host = text(field(canary, "host", "routing.canary"), "routing.canary.host")
+    canary_backend_url = text(field(canary, "backend_url", "routing.canary"), "routing.canary.backend_url")
+    if target is not None:
+        expected_active_matcher, expected_canary_matcher, expected_canary_host = target
+        exact(active_matcher, expected_active_matcher, "routing.active_matcher")
+        exact(canary_matcher, expected_canary_matcher, "routing.canary.matcher")
+        exact(canary_host, expected_canary_host, "routing.canary.host")
+    exact(canary_backend_url, front_url, "routing.canary.backend_url")
+    exact(
+        boolean(field(routing, "route_assignments_verified", "routing"), "routing.route_assignments_verified"),
+        True,
+        "routing.route_assignments_verified",
+    )
+
+    active_backend_url = text(field(routing, "active_backend_url", "routing"), "routing.active_backend_url")
+    expected_shape = (legacy_refs, front_refs)
+    if mode == "migrate-front":
+        expected_shape = (1, 0)
+    if mode == "slot" and expected_shape == (0, 1):
+        expected_active_url = front_url
+        expected_canary_present = False
+    elif expected_shape in {(1, 0), (1, 1)}:
+        expected_active_url = legacy_url
+        expected_canary_present = expected_shape == (1, 1)
+    else:
+        fail("preflight URL-map reference shape is unsupported")
+    exact(active_backend_url, expected_active_url, "routing.active_backend_url")
+    backend_port_verified = boolean(
+        field(routing, "backend_port_verified", "routing"),
+        "routing.backend_port_verified",
+    )
+    backend_port_required = mode == "migrate-front" or expected_shape == (1, 1)
+    exact(backend_port_verified, backend_port_required, "routing.backend_port_verified")
+    port_name = field(routing, "legacy_backend_port_name", "routing")
+    port_number = field(routing, "instance_group_http_port", "routing")
+    if backend_port_required:
+        exact(text(port_name, "routing.legacy_backend_port_name"), "http",
+              "routing.legacy_backend_port_name")
+        exact(integer(port_number, "routing.instance_group_http_port"), 31415,
+              "routing.instance_group_http_port")
+    else:
+        exact(port_name, "", "routing.legacy_backend_port_name")
+        exact(integer(port_number, "routing.instance_group_http_port"), 0,
+              "routing.instance_group_http_port")
+    canary_present = boolean(field(canary, "present", "routing.canary"), "routing.canary.present")
+    exact(canary_present, expected_canary_present, "routing.canary.present")
+    access_value = field(canary, "access_control", "routing.canary")
+    if canary_present:
+        access = obj(access_value, "routing.canary.access_control")
+        expected_policy = {
+            "subrouter-team": "subrouter-front-canary-policy",
+            "subrouter-staging": "subrouter-staging-front-canary-policy",
+        }.get(run["instance"])
+        if expected_policy is not None:
+            exact(field(access, "name", "routing.canary.access_control"), expected_policy,
+                  "routing.canary.access_control.name")
+        exact(field(access, "type", "routing.canary.access_control"), "CLOUD_ARMOR",
+              "routing.canary.access_control.type")
+        exact(boolean(field(access, "attached", "routing.canary.access_control"),
+                      "routing.canary.access_control.attached"), True,
+              "routing.canary.access_control.attached")
+        for name, expected in (
+            ("allow_priority", 900),
+            ("deny_priority", 1000),
+            ("unauthorized_status", 403),
+            ("authorized_status", 400),
+        ):
+            exact(integer(field(access, name, "routing.canary.access_control"),
+                          f"routing.canary.access_control.{name}"), expected,
+                  f"routing.canary.access_control.{name}")
+        exact(boolean(field(access, "key_redacted_before_backend", "routing.canary.access_control"),
+                      "routing.canary.access_control.key_redacted_before_backend"), True,
+              "routing.canary.access_control.key_redacted_before_backend")
+        sha(field(access, "key_fingerprint_sha256", "routing.canary.access_control"),
+            "routing.canary.access_control.key_fingerprint_sha256")
+    else:
+        exact(access_value, None, "routing.canary.access_control")
+
+
 def validate_deployment_preflight(document: dict[str, Any]) -> None:
     exact(field(document, "evidence_type", "root"), "deployment-preflight", "evidence_type")
     mode = text(field(document, "mode", "root"), "mode")
@@ -1230,7 +1340,7 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
         True,
         "local_golden_required",
     )
-    validate_run(field(document, "run", "root"))
+    run = validate_run(field(document, "run", "root"))
     release = validate_release(field(document, "release", "root"))
     public = obj(field(document, "public", "root"), "public")
     exact(boolean(field(public, "health", "public"), "public.health"), True, "public.health")
@@ -1239,6 +1349,7 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
     text(field(routing, "url_map", "routing"), "routing.url_map")
     legacy_refs = integer(field(routing, "legacy_backend_references", "routing"), "routing.legacy_backend_references")
     front_refs = integer(field(routing, "front_backend_references", "routing"), "routing.front_backend_references")
+    validate_preflight_routing(run, routing, mode, legacy_refs, front_refs)
     topology = obj(field(document, "topology", "root"), "topology")
     exact(
         boolean(field(topology, "candidate_differs_from_active", "topology"),
@@ -1263,10 +1374,41 @@ def validate_deployment_preflight(document: dict[str, Any]) -> None:
         exact(integer(field(legacy, "inactive_connections", "topology.legacy"),
                       "topology.legacy.inactive_connections"), 0, "topology.legacy.inactive_connections")
     else:
-        exact(legacy_refs, 0, "routing.legacy_backend_references")
-        exact(front_refs, 1, "routing.front_backend_references")
         exact(field(topology, "kind", "topology"), "front-slots", "topology.kind")
-        exact(field(topology, "routing_current", "topology"), "front", "topology.routing_current")
+        routing_current = text(field(topology, "routing_current", "topology"), "topology.routing_current")
+        if (legacy_refs, front_refs) == (0, 1):
+            exact(routing_current, "front", "topology.routing_current")
+        elif (legacy_refs, front_refs) == (1, 1):
+            # The migration keeps the legacy backend as the URL-map route so
+            # existing connections remain addressable. The stable front owns
+            # its :31415 listener through descriptor takeover, and the front
+            # backend is still present as the protected canary route.
+            exact(routing_current, "front-listener", "topology.routing_current")
+            exact(
+                boolean(
+                    field(topology, "listener_takeover_verified", "topology"),
+                    "topology.listener_takeover_verified",
+                ),
+                True,
+                "topology.listener_takeover_verified",
+            )
+            takeover = obj(field(topology, "listener_takeover", "topology"), "topology.listener_takeover")
+            exact(boolean(field(takeover, "verified", "topology.listener_takeover"),
+                          "topology.listener_takeover.verified"), True,
+                  "topology.listener_takeover.verified")
+            exact(text(field(takeover, "service", "topology.listener_takeover"),
+                       "topology.listener_takeover.service"),
+                  "subrouter-front.service", "topology.listener_takeover.service")
+            exact(integer(field(takeover, "port", "topology.listener_takeover"),
+                          "topology.listener_takeover.port"), 31415,
+                  "topology.listener_takeover.port")
+            integer(field(takeover, "pid", "topology.listener_takeover"),
+                    "topology.listener_takeover.pid", minimum=2)
+        else:
+            fail(
+                "slot preflight URL-map references must be legacy=0/front=1 "
+                "or listener-takeover legacy=1/front=1"
+            )
         front = obj(field(topology, "front", "topology"), "topology.front")
         exact(boolean(field(front, "service_active", "topology.front"), "topology.front.service_active"), True,
               "topology.front.service_active")

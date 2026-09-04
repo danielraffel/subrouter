@@ -45,6 +45,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 		if got := r.Header.Get("x-codex-window-id"); got != "window-1" {
 			t.Fatalf("x-codex-window-id = %q, want window-1", got)
 		}
+		for _, header := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+			if got := r.Header.Get(header); got != "" {
+				t.Fatalf("%s leaked upstream: %q", header, got)
+			}
+		}
 
 		conn, err := upgrader.Upgrade(w, r, http.Header{"x-codex-turn-state": []string{"turn-1"}})
 		if err != nil {
@@ -81,7 +86,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
-	header := http.Header{"x-codex-window-id": []string{"window-1"}}
+	header := http.Header{
+		"x-codex-window-id":      []string{"window-1"},
+		"X-Subrouter-Account-ID": []string{"a@example.com"},
+		"X-Subrouter-Account":    []string{"a@example.com"},
+	}
 	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -98,6 +107,111 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("message = %q, want ok", string(body))
+	}
+}
+
+func TestWebSocketCommitsSchedulerRerouteOnlyAfterBothUpgradesSucceed(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		upgrades     bool
+		breakStore   bool
+		wantCommit   bool
+		wantReadOkay bool
+	}{
+		{name: "upstream rejects", upgrades: false},
+		{name: "both upgrades succeed", upgrades: true, wantCommit: true, wantReadOkay: true},
+		{name: "assignment persistence fails", upgrades: true, breakStore: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.Header.Get("Authorization") != "Bearer fresh-token" {
+					t.Errorf("Authorization = %q, want scheduler-selected account", request.Header.Get("Authorization"))
+				}
+				if !test.upgrades {
+					http.Error(w, "try later", http.StatusServiceUnavailable)
+					return
+				}
+				conn, err := upgrader.Upgrade(w, request, nil)
+				if err != nil {
+					t.Errorf("upstream upgrade: %v", err)
+					return
+				}
+				defer conn.Close()
+				_ = conn.WriteMessage(websocket.TextMessage, []byte("ok"))
+			}))
+			defer upstream.Close()
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storePath := filepath.Join(t.TempDir(), "sessions.json")
+			store, err := session.NewStore(storePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const sessionID = "ws-scheduler-success-boundary"
+			if _, err := store.Put("codex", sessionID, "spent@example.com", ""); err != nil {
+				t.Fatal(err)
+			}
+			if test.breakStore {
+				if err := os.Remove(storePath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(storePath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			handler := Server{
+				Upstream: upstreamURL,
+				Accounts: []accounts.Account{
+					{ID: "spent@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "spent-token"},
+					{ID: "fresh@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "fresh-token"},
+				},
+				Sessions: store,
+				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+					{AccountID: "spent@example.com", Provider: accounts.ProviderCodex, Headroom: 0.01, ShortHeadroom: 0.01},
+					{AccountID: "fresh@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1},
+				})),
+				MaxBodyBytes: 1024,
+			}.Handler()
+			proxy := httptest.NewServer(handler)
+			defer proxy.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
+			conn, response, dialErr := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Codex-Session-ID": []string{sessionID}})
+			if test.upgrades {
+				if dialErr != nil {
+					t.Fatalf("dial: %v", dialErr)
+				}
+				defer conn.Close()
+				_, _, readErr := conn.ReadMessage()
+				if test.wantReadOkay && readErr != nil {
+					t.Fatalf("read: %v", readErr)
+				}
+				if !test.wantReadOkay && readErr == nil {
+					t.Fatal("websocket remained usable after sticky assignment persistence failed")
+				}
+			} else if dialErr == nil {
+				conn.Close()
+				t.Fatal("websocket unexpectedly upgraded")
+			}
+			if response != nil && response.Body != nil {
+				response.Body.Close()
+			}
+
+			assignment, ok := store.Get("codex", sessionID)
+			if !ok {
+				t.Fatal("sticky assignment disappeared")
+			}
+			want := "spent@example.com"
+			if test.wantCommit {
+				want = "fresh@example.com"
+			}
+			if assignment.AccountID != want {
+				t.Fatalf("sticky assignment = %q, want %q", assignment.AccountID, want)
+			}
+		})
 	}
 }
 
@@ -1961,8 +2075,9 @@ func writeClaudeCredential(t *testing.T, dir string, credential agentclaude.Cred
 
 func proxyStoredOAuthAccount(email, tokenPrefix string, exp time.Time) accounts.StoredCodexAccount {
 	return accounts.StoredCodexAccount{
-		Email:   email,
-		AddedAt: time.Now().UTC().Format(time.RFC3339),
+		Email:                 email,
+		OAuthCredentialOrigin: accounts.CodexOAuthOriginIsolatedServerLogin,
+		AddedAt:               time.Now().UTC().Format(time.RFC3339),
 		Auth: accounts.CodexAuthFile{AuthMode: "chatgpt", Tokens: &accounts.CodexTokens{
 			AccessToken:  proxyTestCodexJWT(email, tokenPrefix+"-access", exp),
 			RefreshToken: tokenPrefix + "-refresh",
@@ -2281,13 +2396,13 @@ func TestHandlerPreservesResponseBodyBytes(t *testing.T) {
 	}
 }
 
-func TestNewOutboundTransportUsesIPv4AndPooledHTTP1(t *testing.T) {
+func TestNewOutboundTransportUsesPinnedAddressFamiliesAndPooledHTTP1(t *testing.T) {
 	transport := NewOutboundTransport()
 	if transport.DisableKeepAlives {
 		t.Fatal("DisableKeepAlives = true, want pooled connections")
 	}
 	if transport.DialContext == nil {
-		t.Fatal("DialContext = nil, want IPv4-only dialer")
+		t.Fatal("DialContext = nil, want address-family-pinned dialer")
 	}
 	if transport.ForceAttemptHTTP2 {
 		t.Fatal("ForceAttemptHTTP2 = true, want false")
@@ -2815,6 +2930,7 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	transcripts := transcript.NewRecorder(filepath.Join(t.TempDir(), "transcripts"))
 	handler := Server{
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{{
@@ -2823,6 +2939,7 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 			Token:    "a-token",
 		}},
 		Sessions:     store,
+		Transcripts:  transcripts,
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
@@ -2867,6 +2984,17 @@ func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
 	}
 	if assignment.UserEmail != "alice@example.com" {
 		t.Fatalf("UserEmail = %q, want alice@example.com", assignment.UserEmail)
+	}
+	events := readTranscriptEventsEventually(t, transcripts.PathForSession("claude", "session-1"), 1)
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "alice@example.com") {
+		t.Fatalf("transcript metadata exposed the full user email: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), userEmailHash("alice@example.com")) {
+		t.Fatalf("transcript metadata omitted the user hash: %s", encoded)
 	}
 }
 
@@ -3682,6 +3810,57 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 	}
 }
 
+func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *testing.T) {
+	var auths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		auth := request.Header.Get("Authorization")
+		auths = append(auths, auth)
+		if auth == "Bearer incompatible-token" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	handler := Server{
+		Upstream: mustParseURL(t, upstream.URL),
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "incompatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+			{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
+		})),
+		MaxBodyBytes: 1024,
+	}.Handler()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
+	request.Header.Set("X-Subrouter-Session", "session-1")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want failed alternate 503", response.Code)
+	}
+	wantAuths := []string{"Bearer incompatible-token", "Bearer compatible-token"}
+	if strings.Join(auths, "\x00") != strings.Join(wantAuths, "\x00") {
+		t.Fatalf("auths = %#v, want %#v", auths, wantAuths)
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok || assignment.AccountID != "incompatible@example.com" {
+		t.Fatalf("failed compatibility replay changed sticky assignment: %+v", assignment)
+	}
+}
+
 func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testing.T) {
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3804,13 +3983,24 @@ func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *te
 }
 
 func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
-	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
-		AccountID:     "incompatible@example.com",
-		Provider:      accounts.ProviderCodex,
-		Headroom:      0.8,
-		ShortHeadroom: 0.8,
-	}}))
-	server := Server{SchedulerRef: schedulerRef}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "session-1", "incompatible@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "incompatible@example.com", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "compatible@example.com", Provider: accounts.ProviderCodex, Headroom: 0.8, ShortHeadroom: 0.8},
+	}))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "incompatible@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "incompatible-token"},
+			{ID: "compatible@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "compatible-token"},
+		},
+		Sessions: store, SchedulerRef: schedulerRef,
+	}
 	response := &http.Response{
 		StatusCode: http.StatusBadRequest,
 		Header:     http.Header{},
@@ -3829,6 +4019,10 @@ func TestCaptureResponseBodyMarksCodexModelCompatibility(t *testing.T) {
 	}
 	if _, accountMarked := schedulerRef.ExhaustedUntilFor(accounts.ProviderCodex, "incompatible@example.com", ""); accountMarked {
 		t.Fatal("passive compatibility inspection must not mark the whole account")
+	}
+	assignment, ok := store.Get("codex", "session-1")
+	if !ok || assignment.AccountID != "compatible@example.com" {
+		t.Fatalf("passive compatibility inspection did not persist the next-request account: %+v", assignment)
 	}
 }
 
@@ -4499,6 +4693,78 @@ func TestHandlerBalancesEquivalentNewSessionsByStoredCounts(t *testing.T) {
 // event, pin the session to the Azure fallback, close with 1012 so the client
 // reconnects, refuse the reconnect's upgrade with 426 so the client switches
 // to the HTTP transport, and then serve the HTTP turn from Azure.
+func TestHandlerForcedCodexWebSocketSelectionErrorDoesNotOfferAzure(t *testing.T) {
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("forced websocket selection failure reached Azure")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{
+		"Session-Id":             []string{"forced-ws-missing"},
+		"X-Subrouter-Account-ID": []string{"missing-account"},
+	}
+	_, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("forced websocket selection unexpectedly upgraded")
+	}
+	if response == nil {
+		t.Fatalf("forced websocket selection error had no HTTP response: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("forced websocket selection status = %d, want 503 (never Azure 426)", response.StatusCode)
+	}
+}
+
+func TestHandlerInvalidForcedCodexWebSocketSelectorDoesNotOfferAzure(t *testing.T) {
+	var azureHits atomic.Int32
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		azureHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := azureCodexFallbackServer(t, azureURL, azureURL, 0)
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	for _, headerName := range []string{"X-Subrouter-Account-ID", "X-Subrouter-Account"} {
+		t.Run(headerName, func(t *testing.T) {
+			wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+			header := http.Header{
+				"Session-Id": []string{"invalid-forced-ws"},
+				headerName:   []string{strings.Repeat("a", 257)},
+			}
+			_, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+			if err == nil {
+				t.Fatal("invalid forced websocket selector unexpectedly upgraded")
+			}
+			if response == nil {
+				t.Fatalf("invalid forced websocket selector had no HTTP response: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", response.StatusCode)
+			}
+		})
+	}
+	if got := azureHits.Load(); got != 0 {
+		t.Fatalf("Azure hits = %d, want 0", got)
+	}
+}
+
 func TestHandlerDivertsOverloadedCodexWebSocketToAzure(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4623,6 +4889,121 @@ func TestHandlerDivertsOverloadedCodexWebSocketToAzure(t *testing.T) {
 	}
 	if azureCalls.Load() != 1 {
 		t.Fatalf("azure calls = %d, want 1", azureCalls.Load())
+	}
+}
+
+// A caller-forced account is an exact provider/account contract. Even a
+// provider-side websocket failure must stay visible to that caller rather
+// than pinning the session to Azure behind its back.
+func TestHandlerForcedCodexWebSocketServerErrorDoesNotDivertToAzure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	var upgrades atomic.Int32
+	failed := `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"capacity"}}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("upstream read: %v", err)
+			return
+		}
+		if upgrades.Add(1) == 1 {
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(failed))
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	azure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("forced websocket request reached Azure")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer azure.Close()
+	azureURL, err := url.Parse(azure.URL + "/openai/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sticky := newAzureCodexSticky()
+	server := Server{
+		CodexUpstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID:       "codex-account",
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "oauth-token",
+		}},
+		Sessions:           store,
+		Scheduler:          selectacct.NewScheduler(nil),
+		MaxBodyBytes:       1 << 20,
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		azureCodexSessions: sticky,
+		AzureCodex: &AzureCodexConfig{
+			Models: []string{"gpt-5.6*"},
+			Endpoints: []AzureCodexEndpoint{{
+				Name:    "test-azure",
+				BaseURL: azureURL,
+				APIKey:  "azure-key",
+			}},
+		},
+	}
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/backend-api/codex/responses"
+	header := http.Header{
+		"Session-Id":             []string{"forced-ws-server-error"},
+		"X-Subrouter-Account-ID": []string{"codex-account"},
+	}
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, body, err := conn.ReadMessage()
+	_ = conn.Close()
+	if err != nil || string(body) != failed {
+		t.Fatalf("forced websocket failure = %q, %v; want upstream failure forwarded", body, err)
+	}
+	if _, pinned := sticky.lookup(azureCodexSessionKeyFor("codex", "forced-ws-server-error")); pinned {
+		t.Fatal("forced websocket server error pinned the session to Azure")
+	}
+
+	// A repeat forced upgrade must remain on the exact account, not be refused
+	// with 426 due to an Azure pin created by the first server error.
+	conn, response, err = websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+		}
+		t.Fatalf("repeat forced upgrade: %v (status %d)", err, status)
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"model":"gpt-5.6-sol"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, body, err := conn.ReadMessage(); err != nil || !strings.Contains(string(body), "response.completed") {
+		t.Fatalf("repeat forced websocket response = %q, %v", body, err)
 	}
 }
 

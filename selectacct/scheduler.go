@@ -86,8 +86,8 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 		sessionCounts: map[string]int{},
 		liveDebits:    s.liveDebits,
 	}
-	for accountID, count := range counts {
-		next.sessionCounts[accountID] = count
+	for accountKey, count := range counts {
+		next.sessionCounts[accountKey] = count
 	}
 	return next
 }
@@ -110,7 +110,15 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
+			if score.Provider == account.ProviderAntigravity {
+				// Antigravity omits disabled, unavailable, and sometimes merely
+				// unreported buckets. Absence is unknown, not proof that this
+				// account cannot serve a pool another account happened to expose.
+				modelScore = score
+				modelScore.ModelScores = nil
+			} else {
+				modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
+			}
 		}
 		next.scores[scoreKey] = modelScore
 	}
@@ -122,6 +130,28 @@ func (s Scheduler) ForModel(model string) Scheduler {
 func (s Scheduler) HasModelPool(model string) bool {
 	key := ModelKey(model)
 	return key != "" && s.hasModelScore(key)
+}
+
+// HasModelPoolFor reports whether a model pool is present within one provider's
+// scores. Pool names are not globally authoritative: two providers can expose
+// the same model spelling while grouping quota differently.
+func (s Scheduler) HasModelPoolFor(provider account.Provider, model string) bool {
+	if provider == "" {
+		provider = account.ProviderCodex
+	}
+	key := ModelKey(model)
+	if key == "" {
+		return false
+	}
+	for _, score := range s.scores {
+		if score.Provider != provider {
+			continue
+		}
+		if _, ok := score.ModelScores[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Scheduler) hasModelScore(key string) bool {
@@ -351,7 +381,14 @@ func (s Scheduler) measuredScore(provider account.Provider, accountID string) Sc
 		score = Score{AccountID: accountID, Provider: provider, Headroom: 1, ShortHeadroom: 1}
 	}
 	if s.sessionCounts != nil {
-		score.Sessions = s.sessionCounts[accountID]
+		key := ScoreKey(provider, accountID)
+		if count, ok := s.sessionCounts[key]; ok {
+			score.Sessions = count
+		} else {
+			// Keep source compatibility for callers that still pass bare account
+			// IDs. Production routing supplies provider-scoped ScoreKey values.
+			score.Sessions = s.sessionCounts[accountID]
+		}
 	}
 	return score
 }
