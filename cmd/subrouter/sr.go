@@ -4026,8 +4026,6 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 					} else {
 						text += "; top-up off"
 					}
-				} else {
-					text += "; top-up ?"
 				}
 			}
 			return usageGridCell{Text: text}
