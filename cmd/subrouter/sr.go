@@ -3926,15 +3926,8 @@ func usageGridOpenRouterKeyLimitCell(row srUsageRow) usageGridCell {
 // displayMoneyTwoPlaces pads provider decimals for readability without
 // rounding or changing the underlying value.
 func displayMoneyTwoPlaces(value string) string {
-	parts := strings.SplitN(value, ".", 2)
-	if len(parts) == 1 {
-		return value + ".00"
-	}
-	if len(parts[1]) == 0 {
-		return parts[0] + ".00"
-	}
-	if len(parts[1]) == 1 {
-		return value + "0"
+	if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+		return fmt.Sprintf("%.2f", parsed)
 	}
 	return value
 }
