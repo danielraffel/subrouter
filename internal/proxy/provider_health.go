@@ -91,6 +91,15 @@ func ProbeProviderKeyStatus(ctx context.Context, client *http.Client, provider a
 				credits.LimitReset = probe.Credits.LimitReset
 			}
 			probe.Credits = credits
+		} else if probe.Credits != nil {
+			// /key filled Balance from limit_remaining, which is the key's
+			// spending headroom and not account cash. With /credits
+			// unavailable there is no account balance to report, so drop it
+			// rather than let the key quota masquerade as a balance — that
+			// conflation is exactly what this probe exists to remove. The key
+			// limit, usage and reset stay: they are still true.
+			probe.Credits.Balance = ""
+			probe.Credits.HasCredits = probe.Credits.Limit != "" || probe.Credits.Used != ""
 		}
 		return probe
 	}

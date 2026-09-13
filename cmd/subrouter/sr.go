@@ -4067,12 +4067,33 @@ func usageGridOpenRouterKeyLimitCell(row srUsageRow) usageGridCell {
 }
 
 // displayMoneyTwoPlaces pads provider decimals for readability without
-// rounding or changing the underlying value.
+// rounding or changing the underlying value. It formats the decimal TEXT
+// rather than a parsed float: fmt.Sprintf("%.2f", …) rounds, so "8.199" would
+// display as "8.20" and overstate the balance. Parsing is used only to reject
+// values that are not numbers.
 func displayMoneyTwoPlaces(value string) string {
-	if parsed, err := strconv.ParseFloat(value, 64); err == nil {
-		return fmt.Sprintf("%.2f", parsed)
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
 	}
-	return value
+	if _, err := strconv.ParseFloat(trimmed, 64); err != nil {
+		return value
+	}
+	// An exponent form has no literal decimal place to pad or truncate.
+	if strings.ContainsAny(trimmed, "eE") {
+		return trimmed
+	}
+	whole, fraction, hasPoint := strings.Cut(trimmed, ".")
+	if !hasPoint {
+		return whole + ".00"
+	}
+	switch {
+	case len(fraction) < 2:
+		return whole + "." + fraction + strings.Repeat("0", 2-len(fraction))
+	case len(fraction) > 2:
+		return whole + "." + fraction[:2] // truncate; never round up
+	}
+	return trimmed
 }
 
 func usageGridOpenRouterKeyResetCell(row srUsageRow) usageGridCell {
