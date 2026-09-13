@@ -5105,8 +5105,11 @@ func TestQwenValidatedKeyStaysReadyWhenConsoleLoginExpires(t *testing.T) {
 	if got := usageGridState(row); got != "ready" {
 		t.Fatalf("state = %q, want ready", got)
 	}
-	if got := compactPickReason(row); got != "quota login needed" {
-		t.Fatalf("Use = %q, want quota login needed", got)
+	if got := compactPickReason(row); got != "quota n/a, needs login" {
+		t.Fatalf("Use = %q, want quota n/a, needs login", got)
+	}
+	if width := len(compactPickReason(row)); width > 22 {
+		t.Fatalf("Use text %q is %d columns, over the 22-column Use budget", compactPickReason(row), width)
 	}
 	if got := usageGridStateColor(row); got == ansiRed {
 		t.Fatal("telemetry-only failure rendered valid routing key red")
@@ -5152,7 +5155,7 @@ func TestRemoteQwenValidatedKeyKeepsTelemetryFailureSeparate(t *testing.T) {
 	}
 	row := rows[0]
 	if row.providerHealth != "auth ok" || usageGridState(row) != "rec" ||
-		!displayRecommendedForNewSession(row) || compactPickReason(row) != "quota login needed" {
+		!displayRecommendedForNewSession(row) || compactPickReason(row) != "quota n/a, needs login" {
 		t.Fatalf("remote Qwen telemetry failure contaminated routing status: %+v", row)
 	}
 }

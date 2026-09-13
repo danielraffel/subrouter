@@ -3626,9 +3626,11 @@ func usageGridError(row srUsageRow) string {
 
 func compactPickReason(row srUsageRow) string {
 	if qwenTelemetryOnlyFailure(row) {
+		// Fits the 22-column Use budget; says the key routes and only the
+		// optional console telemetry needs a login.
 		switch row.quotaStatus {
 		case "login needed":
-			return "quota login needed"
+			return "quota n/a, needs login"
 		case "error":
 			return "quota unavailable"
 		}

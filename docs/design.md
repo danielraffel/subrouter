@@ -56,9 +56,11 @@ The API-key account label (for example, `large-sub`) is the routing identity and
 must remain unique in status output; a console email is only an optional
 `console:` annotation and may be shared by several keys. A valid API key can
 route even when console telemetry is unauthenticated or unavailable. In that
-case status reports `login needed` or `quota unavailable` for telemetry rather
-than treating the account as unusable. Console login is opt-in via
-`sr qwen login` and never replaces the API credential used for requests.
+case the row stays `ready`/`rec`, its Use cell reads `quota n/a, needs login`
+or `quota unavailable`, and the explanation below the table is dimmed and
+worded as `console telemetry unavailable: ... (API key still routes)` rather
+than as an account error. Console login is opt-in via `sr qwen login` and
+never replaces the API credential used for requests.
 
 A model-bound lease requires a top-level `model` string in the forwarded JSON
 body. Every body occurrence and any forwarded `model` query value must match
