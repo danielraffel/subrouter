@@ -683,7 +683,7 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// The authoritative private settings file carries every routing value. Keep the
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
-	cmd.Env = claudeProxyChildEnvironment(os.Environ(), baseURL, configDir, programBase())
+	cmd.Env = claudeProxyChildEnvironment(os.Environ(), baseURL, configDir, programBase(), accountID)
 	return cmd.Run()
 }
 
@@ -744,8 +744,23 @@ const subrouterClaudeResumeCommandEnv = "SUBROUTER_CLAUDE_RESUME_COMMAND"
 // claudeProxyChildEnvironment is the settings-routed child environment plus
 // the resume marker. Only the pooled proxy launcher exports it: local profile
 // launches resume through their own profile, not through the server pool.
-func claudeProxyChildEnvironment(environ []string, baseURL, configDir, launcher string) []string {
+//
+// A launch pinned with `--account` is deliberately NOT advertised. The marker
+// is a bare `claude proxy --resume`, which is an unpinned, pooled launch, so a
+// host replaying it for a pinned session could fail over to a different
+// account and silently break the no-failover contract the pin established.
+// With no marker the host keeps its existing replay behaviour, which is the
+// safe outcome. Preserving the pin would need the account selector inside the
+// marker and a matching grammar on the host side; that is deliberately left
+// out rather than guessed at.
+func claudeProxyChildEnvironment(environ []string, baseURL, configDir, launcher, pinnedAccountID string) []string {
+	// claudeSettingsChildEnvironment already drops every SUBROUTER_* variable,
+	// so a pinned launch needs only to skip adding the marker: an inherited one
+	// cannot survive to be mistaken for this launch's own.
 	env := claudeSettingsChildEnvironment(environ, baseURL, configDir)
+	if strings.TrimSpace(pinnedAccountID) != "" {
+		return env
+	}
 	return upsertEnv(env, subrouterClaudeResumeCommandEnv, trustedClaudeLauncher(launcher)+" claude proxy --resume")
 }
 

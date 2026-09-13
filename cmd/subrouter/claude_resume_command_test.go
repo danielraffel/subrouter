@@ -18,7 +18,7 @@ func TestClaudeProxyChildEnvironmentMarksSubrouterResumeCommand(t *testing.T) {
 		"SUBROUTER_ADMIN_TOKEN=admin-secret",
 		"SUBROUTER_STATE_DIR=/private/state",
 		subrouterClaudeResumeCommandEnv + "=stale resume marker",
-	}, "http://127.0.0.1:31415/v1", "/isolated/profile", "subrouter")
+	}, "http://127.0.0.1:31415/v1", "/isolated/profile", "subrouter", "")
 	joined := strings.Join(got, "\n")
 	for _, want := range []string{
 		subrouterClaudeResumeCommandEnv + "=subrouter claude proxy --resume",
@@ -61,7 +61,7 @@ func TestClaudeProxyChildEnvironmentOnlyTrustsKnownLauncherAliases(t *testing.T)
 		{launcher: "SR", want: "sr"},
 		{launcher: "", want: "sr"},
 	} {
-		got := strings.Join(claudeProxyChildEnvironment(nil, "http://127.0.0.1:31415/v1", "", test.launcher), "\n")
+		got := strings.Join(claudeProxyChildEnvironment(nil, "http://127.0.0.1:31415/v1", "", test.launcher, ""), "\n")
 		if !strings.Contains(got, subrouterClaudeResumeCommandEnv+"="+test.want+" claude proxy --resume") {
 			t.Fatalf("launcher %q env = %q", test.launcher, got)
 		}
@@ -69,7 +69,7 @@ func TestClaudeProxyChildEnvironmentOnlyTrustsKnownLauncherAliases(t *testing.T)
 }
 
 func TestClaudeProxyResumeMarkerIsBoundedCommandTextWithoutRouting(t *testing.T) {
-	env := claudeProxyChildEnvironment(nil, "https://tenant.example/v1", "/isolated/profile", "sr")
+	env := claudeProxyChildEnvironment(nil, "https://tenant.example/v1", "/isolated/profile", "sr", "")
 	var marker string
 	for _, item := range env {
 		if value, ok := strings.CutPrefix(item, subrouterClaudeResumeCommandEnv+"="); ok {
@@ -172,4 +172,40 @@ func redactedEnvNames(env string) string {
 		}
 	}
 	return strings.Join(names, "\n")
+}
+
+// A launch pinned with --account must not advertise a resume. The marker is a
+// bare pooled `claude proxy --resume`, so replaying it for a pinned session
+// could fail over to another account and break the pin's no-failover contract.
+func TestClaudeProxyPinnedAccountExportsNoResumeMarker(t *testing.T) {
+	pinned := claudeProxyChildEnvironment(nil, "http://127.0.0.1:31415/v1", "/isolated/profile", "sr", "work@example.com")
+	for _, item := range pinned {
+		if strings.HasPrefix(item, subrouterClaudeResumeCommandEnv+"=") {
+			t.Fatalf("pinned launch advertised an unpinned resume: %q", item)
+		}
+	}
+	// The pooled launch on the same inputs still advertises one, so the guard
+	// is the pin and not an unrelated regression.
+	pooled := claudeProxyChildEnvironment(nil, "http://127.0.0.1:31415/v1", "/isolated/profile", "sr", "")
+	found := false
+	for _, item := range pooled {
+		if strings.HasPrefix(item, subrouterClaudeResumeCommandEnv+"=") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("pooled launch lost its resume marker")
+	}
+}
+
+// An inherited marker must never survive into a pinned launch and be mistaken
+// for this launch's own advertisement.
+func TestClaudeProxyPinnedAccountDropsInheritedResumeMarker(t *testing.T) {
+	inherited := []string{subrouterClaudeResumeCommandEnv + "=sr claude proxy --resume"}
+	env := claudeProxyChildEnvironment(inherited, "http://127.0.0.1:31415/v1", "", "sr", "work@example.com")
+	for _, item := range env {
+		if strings.HasPrefix(item, subrouterClaudeResumeCommandEnv+"=") {
+			t.Fatalf("inherited marker survived a pinned launch: %q", item)
+		}
+	}
 }
