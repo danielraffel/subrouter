@@ -5210,7 +5210,7 @@ func TestLocalQwenStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
 			continue
 		}
 		if row.quotaStatus != "login needed" || row.accountIdentity != "saved-account@example.test" || row.err == nil ||
-			!strings.Contains(row.err.Error(), "sr qwen login 'qwen-token:work'") || strings.Count(row.err.Error(), "login needed") != 1 {
+			!strings.Contains(row.err.Error(), "sr qwen login 'qwen-token:work'") || strings.Count(row.err.Error(), "login expired") != 1 {
 			t.Fatalf("expired local Qwen row = %+v", row)
 		}
 		return
