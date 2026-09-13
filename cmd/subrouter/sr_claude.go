@@ -683,7 +683,7 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// The authoritative private settings file carries every routing value. Keep the
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
-	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	cmd.Env = claudeProxyChildEnvironment(os.Environ(), baseURL, configDir, programBase())
 	return cmd.Run()
 }
 
@@ -730,6 +730,37 @@ func proxyClaudeInvocation(
 		return "", nil, err
 	}
 	return store.ClaudeConfigDir(profile.Name), launchArgs, nil
+}
+
+// subrouterClaudeResumeCommandEnv names the bounded, credential-free marker
+// exported to a pooled Claude child. A terminal host that captures the launch
+// (for example cmux) can re-invoke the same launcher to resume the session
+// instead of replaying the private --settings path, which is deleted when this
+// process exits. The value is the exact command prefix that accepts a Claude
+// session id: "<launcher> claude proxy --resume". It never carries the proxy
+// URL, token, or account routing; those stay in the private settings file.
+const subrouterClaudeResumeCommandEnv = "SUBROUTER_CLAUDE_RESUME_COMMAND"
+
+// claudeProxyChildEnvironment is the settings-routed child environment plus
+// the resume marker. Only the pooled proxy launcher exports it: local profile
+// launches resume through their own profile, not through the server pool.
+func claudeProxyChildEnvironment(environ []string, baseURL, configDir, launcher string) []string {
+	env := claudeSettingsChildEnvironment(environ, baseURL, configDir)
+	return upsertEnv(env, subrouterClaudeResumeCommandEnv, trustedClaudeLauncher(launcher)+" claude proxy --resume")
+}
+
+// trustedClaudeLauncher mirrors trustedCodexLauncher: only the installed
+// program aliases are echoed into the marker so an arbitrary argv[0] can never
+// become launcher text that a host later executes.
+func trustedClaudeLauncher(launcher string) string {
+	switch strings.TrimSpace(launcher) {
+	case "sr":
+		return "sr"
+	case "subrouter":
+		return "subrouter"
+	default:
+		return "sr"
+	}
 }
 
 func claudeSettingsChildEnvironment(environ []string, baseURL, configDir string) []string {
