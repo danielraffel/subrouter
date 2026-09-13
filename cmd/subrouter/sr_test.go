@@ -5157,6 +5157,30 @@ func TestRemoteQwenValidatedKeyKeepsTelemetryFailureSeparate(t *testing.T) {
 	}
 }
 
+func TestQwenTelemetryOnlyFailureRendersDimNotRedInErrorsBlock(t *testing.T) {
+	telemetry := srUsageRow{
+		email: "qwen-token:work", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "auth ok", quotaStatus: "login needed",
+		err: errors.New("console telemetry unavailable"),
+	}
+	broken := srUsageRow{
+		email: "qwen-token:broken", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
+		providerHealth: "bad key", err: errors.New("model key rejected"),
+	}
+	var out bytes.Buffer
+	displayUsageRowsGrid(&out, []srUsageRow{telemetry, broken}, false, false, true)
+	got := out.String()
+	if !strings.Contains(got, ansiDim+"console telemetry unavailable"+ansiReset) {
+		t.Fatalf("telemetry-only failure was not rendered dim:\n%s", got)
+	}
+	if strings.Contains(got, ansiRed+"console telemetry unavailable") {
+		t.Fatalf("telemetry-only failure was rendered red like a routing failure:\n%s", got)
+	}
+	if !strings.Contains(got, ansiRed+"model key rejected"+ansiReset) {
+		t.Fatalf("real key failure lost its red rendering:\n%s", got)
+	}
+}
+
 func TestLocalQwenStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())

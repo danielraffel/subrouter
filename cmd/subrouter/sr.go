@@ -2886,10 +2886,16 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 	if usageRowsHaveErrors(rows) {
 		for _, row := range rows {
 			if row.err != nil {
+				// A Qwen console telemetry failure leaves the routing key healthy,
+				// so it must not wear the same red as a rejected credential.
+				errStyle := ansiRed
+				if qwenTelemetryOnlyFailure(row) {
+					errStyle = ansiDim
+				}
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
 					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
-					style(colored, ansiRed, row.err.Error()),
+					style(colored, errStyle, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
 			}
 		}
