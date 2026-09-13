@@ -120,7 +120,7 @@ The last column of the matrix uses a small vocabulary:
 Implemented and hermetically tested, but without an auditable in-repository
 live-account canary, are OpenRouter, Grok (both the API key and the OAuth
 subscription from `sr add grok`), DeepSeek, Together, Fireworks, OpenCode Zen,
-Z.AI, Qwen Coding Plan, the Qwen Token Plan Anthropic protocol, and declared
+Z.AI, Qwen Coding Plan, both Qwen Token Plan protocols, and declared
 custom OpenAI-compatible routes. Operators with those accounts are invited to
 run an exact routed canary and record a credential-free result or artifact
 reference. The legacy Gemini CLI namespace is excluded from that list because

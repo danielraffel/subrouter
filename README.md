@@ -599,10 +599,17 @@ exposes.
 ### Subscription (OAuth) providers
 
 Each subscription credential is created by Subrouter's own login or import
-command and stored as an isolated profile that Subrouter refreshes itself:
-`sr add codex`, `sr claude add <profile>` (or `sr add claude`),
+command and stored as an isolated profile: `sr add codex`,
+`sr claude add <profile>` (or `sr add claude`), `sr claude login`,
 `sr kimi login <label>` (or `sr add kimi <label>`), `sr agy add <label>`, and
 `sr add grok`. Codex and Claude are covered above; the others follow.
+
+Subrouter refreshes a credential itself only when the login it performed
+returned a refresh token. `sr claude add` is the exception: it defaults to
+`claude setup-token`, which yields a one-year access token with no refresh
+token, so that profile is never renewed in place and must be re-added when it
+expires (`sr claude list` prints the expiry). Use `sr claude login` for a
+browser OAuth profile that Subrouter refreshes.
 
 The Antigravity CLI exposes one fixed Keychain login and no account selector.
 See [the native AGY runbook](docs/antigravity.md) for the safe profile and
@@ -639,9 +646,13 @@ bounded and account-specific; Subrouter does not scrape the AGY TUI or attach a
 managed profile to an unrelated host language-server login. The server adapter
 retains isolated account selection, family-aware scheduling, OAuth refresh, and
 hard-pin semantics for compatible clients. Plain `agy` uses the current
-Keychain login directly. If the host or process is hard-killed during a native
-launch, rerun `sr agy recover` before launching again; the swap journal restores
-the prior Keychain slot without touching the live server.
+Keychain login directly.
+
+`sr agy` does not swap the Keychain, so a hard-killed `sr agy` leaves no
+Keychain slot to restore and needs no recovery step. `sr agy recover` and its
+swap journal belong to the earlier native profile-switching launcher, which the
+`CLOUD_CODE_URL` relay replaced; keep them only for a profile written by that
+older launcher.
 
 For backward compatibility, a router with no managed Antigravity profiles
 continues serving its historical host Keychain login. The first successful
