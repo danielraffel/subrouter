@@ -115,3 +115,28 @@ func TestDecodeOpenRouterKeyProbeRejectsNonFiniteQuota(t *testing.T) {
 		t.Fatalf("malformed quota was accepted: %+v", probe)
 	}
 }
+
+// A finite key whose /credits probe fails must not report the key's spending
+// headroom as an account balance. /key fills Balance from limit_remaining, so
+// leaving it in place recreates the exact conflation this probe removes.
+func TestOpenRouterKeyProbeDropsBalanceWhenAccountCreditsUnavailable(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/api/v1/credits" {
+			http.NotFound(w, request)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`)
+	}))
+	defer provider.Close()
+
+	probe := ProbeProviderKeyStatus(context.Background(), provider.Client(), accounts.ProviderOpenRouter, provider.URL+"/api/v1", "test-openrouter-key")
+	if probe.Credits == nil {
+		t.Fatalf("key metadata dropped entirely: %+v", probe)
+	}
+	if probe.Credits.Balance != "" {
+		t.Fatalf("key limit_remaining reported as account balance: %q", probe.Credits.Balance)
+	}
+	if probe.Credits.Limit != "100" || probe.Credits.Used != "25.5" || probe.Credits.LimitReset != "monthly" {
+		t.Fatalf("key limit metadata lost with the balance: %+v", probe.Credits)
+	}
+}
