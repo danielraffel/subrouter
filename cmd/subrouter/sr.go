@@ -265,15 +265,20 @@ type srUsageRow struct {
 	apiKeySpend        *accounts.APIKeyUsageSnapshot
 	apiKeyHint         string
 	err                error
-	score              selectacct.Score
-	gtoReason          string
-	gtoRecommended     bool
-	cooked             bool
-	cookedReason       string
-	tempCooked         bool
-	tempCookedReason   string
-	authMode           accounts.AuthMode
-	provider           accounts.Provider
+	// consoleTelemetryErr marks err as coming from the optional Qwen console
+	// quota fetch. The local status path never probes the model key, so it
+	// cannot rely on providerHealth to tell telemetry failures from routing
+	// failures the way the daemon path does.
+	consoleTelemetryErr bool
+	score               selectacct.Score
+	gtoReason           string
+	gtoRecommended      bool
+	cooked              bool
+	cookedReason        string
+	tempCooked          bool
+	tempCookedReason    string
+	authMode            accounts.AuthMode
+	provider            accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -1530,6 +1535,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 					if usageErr != nil || subscriptionErr != nil {
 						rows[idx].err = agentqwen.StatusError(accountID, usageErr, subscriptionErr)
+						rows[idx].consoleTelemetryErr = true
 						if errors.Is(rows[idx].err, agentqwen.ErrConsoleLoginRequired) {
 							rows[idx].quotaStatus = "login needed"
 						} else if usageErr != nil && subscriptionErr != nil {
@@ -3731,10 +3737,14 @@ func compactAntigravityWindowLabel(window accounts.UsageWindow) string {
 
 // A successful model-key probe is authoritative for routing. Console quota is
 // optional, independently authenticated telemetry, so its failure must not
-// turn a working Qwen account red or make it ineligible for routing.
+// turn a working Qwen account red or make it ineligible for routing. The
+// daemon path proves the key with providerHealth; the local path, which does
+// not probe keys, tags the error at its source instead. Both must agree.
 func qwenTelemetryOnlyFailure(row srUsageRow) bool {
-	return usageProvider(row) == accounts.ProviderQwenToken &&
-		row.authMode == accounts.AuthModeAPIKey && row.providerHealth == "auth ok" && row.err != nil
+	if usageProvider(row) != accounts.ProviderQwenToken || row.authMode != accounts.AuthModeAPIKey || row.err == nil {
+		return false
+	}
+	return row.providerHealth == "auth ok" || row.consoleTelemetryErr
 }
 
 // exhaustedModelSuffix names any per-model quota pools that are fully consumed

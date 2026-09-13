@@ -5216,6 +5216,30 @@ func TestLocalQwenStatusExplainsExpiredConsoleLoginOnce(t *testing.T) {
 			!strings.Contains(row.err.Error(), "sr qwen login 'qwen-token:work'") || strings.Count(row.err.Error(), "login expired") != 1 {
 			t.Fatalf("expired local Qwen row = %+v", row)
 		}
+		// The local path cannot probe the model key, so it must classify the
+		// console failure as telemetry-only by its origin, not by providerHealth.
+		if row.providerHealth != "not checked" || !qwenTelemetryOnlyFailure(row) {
+			t.Fatalf("local expired console login was not classified as telemetry-only: %+v", row)
+		}
+		if got := compactPickReason(row); got != "quota n/a, needs login" {
+			t.Fatalf("local Use = %q, want quota n/a, needs login", got)
+		}
+		if usageGridStateColor(row) == ansiRed || usageGridPickColor(row) == ansiRed {
+			t.Fatal("local telemetry-only failure rendered the routing key red")
+		}
+		if got := usageGridState(row); got != "not checked" {
+			t.Fatalf("local state = %q, want not checked (the key is never probed locally)", got)
+		}
+		// The daemon path reports the same failure through status.Error with a
+		// validated key; both paths must land on the same Use text and colour.
+		daemon := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+			ID: stored.Email, Provider: accounts.ProviderQwenToken, AuthMode: accounts.AuthModeAPIKey,
+			AuthChecked: true, AuthValid: true, QuotaStatus: "login needed", Error: row.err.Error(),
+		}})[0]
+		if !qwenTelemetryOnlyFailure(daemon) || compactPickReason(daemon) != compactPickReason(row) ||
+			usageGridPickColor(daemon) == ansiRed || usageGridStateColor(daemon) == ansiRed {
+			t.Fatalf("daemon and local Qwen telemetry classification disagree: daemon=%+v local=%+v", daemon, row)
+		}
 		return
 	}
 	t.Fatal("Qwen status row was missing")
