@@ -42,8 +42,12 @@ MAINTENANCE="${SUBROUTER_MAINTENANCE_FILE:-${STATE}/maintenance}"
 # one file guaranteed to exist wherever rotation runs would be the one nothing
 # prunes.
 LABELS="${SUBROUTER_LOG_ROTATE_LABELS:-ai.manaflow.subrouter-team ai.manaflow.subrouter-guard ai.manaflow.subrouter ai.manaflow.subrouter-log-rotate}"
-# Directories searched for those plists, in order.
-PLIST_DIRS="${SUBROUTER_LOG_ROTATE_PLIST_DIRS:-/Library/LaunchDaemons /Library/LaunchAgents ${HOME}/Library/LaunchAgents}"
+# Directories searched for those plists, in order. Unquoted expansion below
+# globs these, which is deliberate: `install-daemon` writes its plist to the
+# LaunchAgents directory of the user who ran it, and when this job runs as a
+# system LaunchDaemon $HOME is root's, so ${HOME}/Library/LaunchAgents would
+# never find it. Every user's LaunchAgents directory has to be in scope.
+PLIST_DIRS="${SUBROUTER_LOG_ROTATE_PLIST_DIRS:-/Library/LaunchDaemons /Library/LaunchAgents /Users/*/Library/LaunchAgents ${HOME}/Library/LaunchAgents}"
 # Extra paths an operator names explicitly, space separated.
 EXTRA_LOGS="${SUBROUTER_LOG_ROTATE_EXTRA:-}"
 # Injectable so the test can assert on discovery without a real plist tool,
@@ -87,7 +91,7 @@ discover_logs() {
 
 # rotate_one archives and truncates a single log when it exceeds the threshold.
 rotate_one() {
-  local log_path="$1" size stamp archive
+  local log_path="$1" size stamp archive inode_before inode_after
   [ -n "$log_path" ] || return 0
   # /dev/null is a legitimate value for a plist log key; never touch a device.
   [ -f "$log_path" ] || return 0
@@ -97,18 +101,49 @@ rotate_one() {
   [ -w "$log_path" ] || { log "not writable, skipping: ${log_path}"; return 0; }
 
   size=$(stat -f %z "$log_path" 2>/dev/null || echo 0)
-  [ "$size" -gt "$MAX_BYTES" ] || return 0
+  if [ "$size" -le "$MAX_BYTES" ]; then
+    # Retention still applies to a log that is not rotating right now. A quiet
+    # host may never cross the size threshold again, and without this its old
+    # archives would outlive both bounds -- which would silently defeat the age
+    # bound precisely where it matters most.
+    prune "$log_path"
+    return 0
+  fi
 
   stamp=$(date -u +%Y%m%d-%H%M%SZ)
   archive="${log_path}.${stamp}.gz"
-  if ! gzip -c "$log_path" >"$archive" 2>/dev/null; then
+
+  # Read the contents through a descriptor opened once, not by re-opening the
+  # path. gzip on a large log takes real time, and a log directory writable by
+  # someone else (a user LaunchAgent's own ~/Library/Logs, say) gives them a
+  # window to swap the path for a symlink mid-archive. Holding the descriptor
+  # means the bytes archived are the bytes we checked.
+  inode_before=$(stat -f %i "$log_path" 2>/dev/null || echo 0)
+  exec 9<"$log_path" || { log "FAILED to open ${log_path}; left intact"; return 1; }
+  # umask so an archive of a restrictive log cannot become world-readable
+  # through whatever umask launchd happened to hand us.
+  if ! (umask 077; gzip -c <&9 >"$archive" 2>/dev/null); then
+    exec 9<&-
     rm -f "$archive"
     log "FAILED to archive ${log_path}; left intact"
     return 1
   fi
+  exec 9<&-
+
+  # Re-verify immediately before truncating. If the path was swapped while we
+  # were archiving, truncating it now would empty someone else's file.
+  inode_after=$(stat -f %i "$log_path" 2>/dev/null || echo 0)
+  if [ -L "$log_path" ] || [ "$inode_before" != "$inode_after" ]; then
+    log "REFUSING to truncate ${log_path}: it changed while being archived; archive retained at ${archive}"
+    return 1
+  fi
+
   # Truncate, never recreate: the inode must outlive this so launchd's open
   # descriptor keeps pointing at the file the service still writes to.
-  : >"$log_path"
+  if ! : >"$log_path"; then
+    log "FAILED to truncate ${log_path}; archive retained at ${archive}"
+    return 1
+  fi
   log "rotated ${log_path} (${size} bytes) -> ${archive}"
 
   prune "$log_path"

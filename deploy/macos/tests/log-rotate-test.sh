@@ -114,6 +114,32 @@ test_age_zero_disables() {
   teardown
 }
 
+# Retention must apply to a log that is NOT rotating. A quiet host may never
+# cross the size threshold again, and its archives would otherwise outlive both
+# bounds -- defeating the age bound exactly where it matters most.
+test_prunes_when_below_threshold() {
+  setup
+  : >"$ROOT/logs/err.log.20260101-000000Z.gz"
+  touch -t 202601010000 "$ROOT/logs/err.log.20260101-000000Z.gz"
+  printf 'small\n' >"$ROOT/logs/err.log"
+  SUBROUTER_LOG_MAX_BYTES=1048576 SUBROUTER_LOG_MAX_AGE_DAYS=1 "$ROTATE" >/dev/null 2>&1
+  [ ! -e "$ROOT/logs/err.log.20260101-000000Z.gz" ]; check "retention applies even when no rotation is due" $?
+  grep -q 'small' "$ROOT/logs/err.log"; check "the un-rotated log itself is untouched" $?
+  teardown
+}
+
+# An archive of a restrictive log must not become readable by other local users
+# through whatever umask launchd supplies.
+test_archive_permissions() {
+  setup
+  big "$ROOT/logs/err.log" 2048
+  ( umask 000; SUBROUTER_LOG_MAX_BYTES=1024 "$ROTATE" >/dev/null 2>&1 )
+  local mode
+  mode=$(stat -f %Lp "$ROOT/logs"/err.log.*.gz 2>/dev/null | head -1)
+  [ "$mode" = "600" ]; check "archives are created 0600 regardless of umask (got ${mode:-none})" $?
+  teardown
+}
+
 test_honors_maintenance() {
   setup
   : >"$ROOT/state/maintenance"
@@ -178,6 +204,8 @@ test_leaves_small_logs_alone
 test_prunes_to_keep
 test_prunes_by_age
 test_age_zero_disables
+test_prunes_when_below_threshold
+test_archive_permissions
 test_honors_maintenance
 test_stale_maintenance_does_not_suppress
 test_refuses_symlink
