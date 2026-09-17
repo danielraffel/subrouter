@@ -4266,7 +4266,7 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 
 func TestClaudeStatusRendersExtraUsageBalanceAndDisabledState(t *testing.T) {
 	t.Setenv("COLUMNS", "220")
-	limit, used := 20.0, 7.5
+	limit, used := 2000.0, 750.0
 	for _, tc := range []struct {
 		name    string
 		enabled bool

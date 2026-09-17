@@ -1959,7 +1959,7 @@ func TestClaudeUsageWindowsSynthesizeUnusedOpusSonnetPools(t *testing.T) {
 }
 
 func TestClaudeExtraUsageDoesNotIncreaseSubscriptionHeadroom(t *testing.T) {
-	limit, used, utilization := 25.0, 5.0, 20.0
+	limit, used, utilization := 2500.0, 500.0, 20.0
 	windows := claudeUsageWindows(&agentclaude.UsageResponse{
 		FiveHour: &agentclaude.RateLimit{Utilization: floatPtr(100)},
 		SevenDay: &agentclaude.RateLimit{Utilization: floatPtr(100)},
@@ -1971,8 +1971,8 @@ func TestClaudeExtraUsageDoesNotIncreaseSubscriptionHeadroom(t *testing.T) {
 	if score.Headroom != 0 || score.ShortHeadroom != 0 {
 		t.Fatalf("subscription score = headroom %.2f short %.2f, want cooked despite extra usage", score.Headroom, score.ShortHeadroom)
 	}
-	if !score.ClaudeExtraUsageEnabled || !score.ClaudeExtraUsageKnown || score.ClaudeExtraUsageRemaining != 20 {
-		t.Fatalf("extra usage score metadata = %+v, want enabled with 20 remaining", score)
+	if !score.ClaudeExtraUsageEnabled || !score.ClaudeExtraUsageKnown || score.ClaudeExtraUsageRemaining != 2000 {
+		t.Fatalf("extra usage score metadata = %+v, want enabled with 2000 cents remaining", score)
 	}
 }
 

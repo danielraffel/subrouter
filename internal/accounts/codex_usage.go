@@ -27,8 +27,8 @@ type UsageWindow struct {
 	ExtraUsage *ExtraUsageInfo `json:"extra_usage,omitempty"`
 }
 
-// ExtraUsageInfo describes Claude's optional paid usage budget. Amounts are
-// expressed in Anthropic's credit units (currently USD-equivalent values).
+// ExtraUsageInfo describes Claude's optional paid usage budget. Anthropic
+// reports MonthlyLimit and UsedCredits in US cents; Utilization is percent.
 type ExtraUsageInfo struct {
 	IsEnabled    bool     `json:"is_enabled"`
 	MonthlyLimit *float64 `json:"monthly_limit,omitempty"`
@@ -47,6 +47,17 @@ func (e *ExtraUsageInfo) Remaining() (float64, bool) {
 		remaining = 0
 	}
 	return remaining, true
+}
+
+// DollarBalance converts Anthropic's cent-denominated values for display.
+// Routing should use Remaining directly because it needs only ordering and a
+// positive-balance check, both of which are invariant under this conversion.
+func (e *ExtraUsageInfo) DollarBalance() (remaining, limit float64, known bool) {
+	remainingCredits, known := e.Remaining()
+	if !known {
+		return 0, 0, false
+	}
+	return remainingCredits / 100, *e.MonthlyLimit / 100, true
 }
 
 type CodexUsageDetails struct {

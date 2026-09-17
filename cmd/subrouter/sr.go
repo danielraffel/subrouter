@@ -3297,7 +3297,7 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 	if !extra.IsEnabled {
 		return usageGridCell{Text: "off", Style: ansiDim}
 	}
-	remaining, known := extra.Remaining()
+	remaining, limit, known := extra.DollarBalance()
 	if !known {
 		return usageGridCell{Text: "on, balance ?", Style: ansiYellow}
 	}
@@ -3305,7 +3305,7 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 	if remaining <= 0 {
 		styleName = ansiYellow
 	}
-	return usageGridCell{Text: fmt.Sprintf("on $%.2f/$%.2f", remaining, *extra.MonthlyLimit), Style: styleName}
+	return usageGridCell{Text: fmt.Sprintf("on $%.2f/$%.2f", remaining, limit), Style: styleName}
 }
 
 func isAntigravityFamilyWindow(window accounts.UsageWindow, family string, weekly bool) bool {
