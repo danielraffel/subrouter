@@ -4043,7 +4043,7 @@ func TestClaudeUsageGridPrioritizesPopulatedColumnsWithoutTruncatingCore(t *test
 			t.Fatalf("Claude grid missing %q:\n%s", want, got)
 		}
 	}
-	for _, unwanted := range []string{"Opus wk", "Sonnet wk", "Extra", "..."} {
+	for _, unwanted := range []string{"Opus wk", "Sonnet wk", "Extra", "Auto-reload", "..."} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("Claude grid unexpectedly contains %q:\n%s", unwanted, got)
 		}
@@ -4064,7 +4064,7 @@ func TestClaudeUsageGridNarrowSchemaIsDeterministicAndOmitsEmptyColumns(t *testi
 	if first.String() != second.String() {
 		t.Fatalf("narrow schema is not deterministic:\nfirst:\n%s\nsecond:\n%s", first.String(), second.String())
 	}
-	for _, unwanted := range []string{"Fable wk", "Opus wk", "Sonnet wk", "Extra"} {
+	for _, unwanted := range []string{"Fable wk", "Opus wk", "Sonnet wk", "Extra", "Auto-reload"} {
 		if strings.Contains(first.String(), unwanted) {
 			t.Fatalf("narrow grid unexpectedly contains empty %q column:\n%s", unwanted, first.String())
 		}
@@ -4267,19 +4267,21 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 func TestClaudeStatusRendersExtraUsageBalanceAndDisabledState(t *testing.T) {
 	t.Setenv("COLUMNS", "220")
 	limit, used := 2000.0, 750.0
-	balance := 123.0
 	autoReloadOff := false
 	for _, tc := range []struct {
 		name  string
 		extra *accounts.ExtraUsageInfo
 		want  string
 	}{
-		{name: "enabled", extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used}, want: "on $12.50/$20.00"},
+		// The $ figure mirrors Claude's "Monthly spend limit: $X of $Y" line:
+		// metered spend used, not remaining and not the prepaid credit balance
+		// (the OAuth usage API never reports one).
+		{name: "enabled", extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used}, want: "$7.50/$20.00"},
 		{name: "disabled", extra: &accounts.ExtraUsageInfo{IsEnabled: false, MonthlyLimit: &limit, UsedCredits: &used}, want: "off"},
 		{
-			name:  "credits balance with auto-reload",
-			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used, CreditsBalance: &balance, AutoReload: &autoReloadOff},
-			want:  "on $1.23/$20.00 auto-reload off",
+			name:  "spend with auto-reload",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used, AutoReload: &autoReloadOff},
+			want:  "Auto-reload",
 		},
 		{
 			name:  "disabled with reason",
