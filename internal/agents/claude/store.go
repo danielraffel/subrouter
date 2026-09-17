@@ -263,7 +263,15 @@ func ExtraUsageInfoFromUsage(usage *UsageResponse) *accounts.ExtraUsageInfo {
 	if cents, ok := usage.Spend.BalanceCents(); ok {
 		info.CreditsBalance = cents
 	}
-	if toggle, ok := usage.Spend.AutoReloadEnabled(); ok {
+	if usage.Spend != nil {
+		// Anthropic returns auto_reload as null when the account never
+		// enrolled; the Claude settings page renders that state as
+		// "Auto-reload off", so only a missing spend block means unknown.
+		toggle, ok := usage.Spend.AutoReloadEnabled()
+		if !ok {
+			off := false
+			toggle = &off
+		}
 		info.AutoReload = toggle
 	}
 	return info
