@@ -3161,14 +3161,22 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		{Key: "Opus wk", Title: "Opus wk"},
 		{Key: "Sonnet wk", Title: "Sonnet wk"},
 		{Key: "Extra", Title: "Extra usage"},
+		{Key: "ExtraSpend", Title: "$"},
+		{Key: "ExtraAutoReload", Title: "Auto-reload"},
 	} {
 		if !usageGridRowsHaveValue(rows, candidate.Key) {
 			continue
 		}
 		capWidth := 12
-		if candidate.Key == "Extra" {
-			// "on $1.23/$50.00 auto-reload off" is the widest cell.
-			capWidth = 31
+		switch candidate.Key {
+		case "Extra":
+			// "off · out of credits" is the widest cell.
+			capWidth = 20
+		case "ExtraSpend":
+			// "$21.99/$50.00" is the widest cell.
+			capWidth = 13
+		case "ExtraAutoReload":
+			capWidth = 11
 		}
 		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, capWidth)
 		columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
@@ -3226,29 +3234,31 @@ func widenUsageGridColumnForRows(columns []usageGridColumn, rows []srUsageRow, k
 
 func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	return map[string]usageGridCell{
-		"#":         {Text: rowIndex, Style: ansiDim},
-		"Account":   {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
-		"Plan":      {Text: usageGridPlan(row), Style: ansiDim},
-		"Login":     {Text: row.accountIdentity, Style: ansiDim},
-		"State":     {Text: usageGridState(row), Style: usageGridStateColor(row)},
-		"Key ID":    {Text: row.keyFingerprint, Style: ansiDim},
-		"Sessions":  {Text: usageGridSessions(row), Style: ansiDim},
-		"Models":    {Text: usageGridModels(row), Style: ansiDim},
-		"Endpoints": {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
-		"Quota":     {Text: usageGridProviderQuota(row), Style: ansiDim},
-		"Pick":      {Text: compactPickReason(row), Style: usageGridPickColor(row)},
-		"5h":        usageGridProviderShortWindowCell(row),
-		"7d":        usageGridProviderLongWindowCell(row),
-		"Reset":     usageGridResetCell(row),
-		"Spark":     usageGridShortNamedWindowCell(row),
-		"Spark wk":  usageGridNamedWindowCell(row.windows, true),
-		"Credits":   usageGridCreditsCell(row),
-		"Session":   usageGridWindowCell(row.windows, isClaudeSessionWindow),
-		"Weekly":    usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
-		"Fable wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
-		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
-		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
-		"Extra":     usageGridClaudeExtraCell(row),
+		"#":               {Text: rowIndex, Style: ansiDim},
+		"Account":         {Text: displayUsageAccountName(row), Style: ansiBold + ansiWhite},
+		"Plan":            {Text: usageGridPlan(row), Style: ansiDim},
+		"Login":           {Text: row.accountIdentity, Style: ansiDim},
+		"State":           {Text: usageGridState(row), Style: usageGridStateColor(row)},
+		"Key ID":          {Text: row.keyFingerprint, Style: ansiDim},
+		"Sessions":        {Text: usageGridSessions(row), Style: ansiDim},
+		"Models":          {Text: usageGridModels(row), Style: ansiDim},
+		"Endpoints":       {Text: strings.Join(proxy.ProviderEndpoints(row.provider), " "), Style: ansiDim},
+		"Quota":           {Text: usageGridProviderQuota(row), Style: ansiDim},
+		"Pick":            {Text: compactPickReason(row), Style: usageGridPickColor(row)},
+		"5h":              usageGridProviderShortWindowCell(row),
+		"7d":              usageGridProviderLongWindowCell(row),
+		"Reset":           usageGridResetCell(row),
+		"Spark":           usageGridShortNamedWindowCell(row),
+		"Spark wk":        usageGridNamedWindowCell(row.windows, true),
+		"Credits":         usageGridCreditsCell(row),
+		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
+		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
+		"Fable wk":        usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
+		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
+		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
+		"Extra":           usageGridClaudeExtraCell(row),
+		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
+		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
 		}),
@@ -3270,16 +3280,22 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	}
 }
 
-func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
-	extra := row.extraUsage
-	if extra == nil {
-		for i := range row.windows {
-			if row.windows[i].ExtraUsage != nil {
-				extra = row.windows[i].ExtraUsage
-				break
-			}
+// claudeExtraUsageForRow finds the account's paid-usage metadata, whether the
+// server exposed it directly or on the synthetic "extra" window.
+func claudeExtraUsageForRow(row srUsageRow) *accounts.ExtraUsageInfo {
+	if row.extraUsage != nil {
+		return row.extraUsage
+	}
+	for i := range row.windows {
+		if row.windows[i].ExtraUsage != nil {
+			return row.windows[i].ExtraUsage
 		}
 	}
+	return nil
+}
+
+func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
 	if extra == nil {
 		// Older native and hosted servers exposed only the synthetic percentage
 		// window. Keep that useful status until every server carries balances.
@@ -3297,33 +3313,40 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{Text: text, Style: ansiDim}
 	}
-	// The first figure is the prepaid credit balance when Anthropic reports
-	// one (promotional credits are spent before metered usage); otherwise it
-	// is the remaining monthly spend cap. The second figure is always the cap.
-	balance, known := extra.DollarCreditsBalance()
-	remaining, limit, capKnown := extra.DollarBalance()
-	if !known {
-		if !capKnown {
-			return usageGridCell{Text: "on, balance ?", Style: ansiYellow}
-		}
-		balance = remaining
+	return usageGridCell{Text: "on", Style: ansiGreen}
+}
+
+// usageGridClaudeExtraSpendCell mirrors Claude's own "Monthly spend limit:
+// $X of $Y" line: metered spend used over the cap. The prepaid/promotional
+// credit balance Claude shows separately is not exposed by the OAuth usage
+// API (spend.balance is always null there; the credits endpoints require a
+// browser session cookie), so it cannot be displayed.
+func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil || !extra.IsEnabled {
+		return usageGridCell{}
 	}
-	if !capKnown {
-		return usageGridCell{Text: fmt.Sprintf("on $%.2f", balance), Style: ansiYellow}
+	if extra.MonthlyLimit == nil || extra.UsedCredits == nil {
+		return usageGridCell{Text: "?", Style: ansiYellow}
 	}
-	text := fmt.Sprintf("on $%.2f/$%.2f", balance, limit)
-	if extra.AutoReload != nil {
-		if *extra.AutoReload {
-			text += " auto-reload on"
-		} else {
-			text += " auto-reload off"
-		}
-	}
+	used := *extra.UsedCredits / 100
+	limit := *extra.MonthlyLimit / 100
 	styleName := ansiGreen
-	if balance <= 0 {
+	if limit-used <= 0 {
 		styleName = ansiYellow
 	}
-	return usageGridCell{Text: text, Style: styleName}
+	return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
+}
+
+func usageGridClaudeExtraAutoReloadCell(row srUsageRow) usageGridCell {
+	extra := claudeExtraUsageForRow(row)
+	if extra == nil || !extra.IsEnabled || extra.AutoReload == nil {
+		return usageGridCell{}
+	}
+	if *extra.AutoReload {
+		return usageGridCell{Text: "on", Style: ansiGreen}
+	}
+	return usageGridCell{Text: "off", Style: ansiDim}
 }
 
 func humanizeClaudeExtraDisabledReason(reason string) string {

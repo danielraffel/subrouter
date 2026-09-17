@@ -29,9 +29,12 @@ type UsageWindow struct {
 
 // ExtraUsageInfo describes Claude's optional paid usage budget. Anthropic
 // reports MonthlyLimit and UsedCredits in US cents; Utilization is percent.
-// CreditsBalance is the prepaid/promotional credit remainder in cents, spent
-// before metered usage; AutoReload reports Anthropic's auto-reload toggle.
-// Both are display metadata only — routing decisions stay with Remaining.
+// AutoReload reports Anthropic's auto-reload toggle (null from the API reads
+// as off, matching the Claude settings page). DisabledReason, CreditsBalance,
+// and AutoReload are display metadata only — routing stays with Remaining.
+// CreditsBalance is the prepaid credit remainder in cents; the OAuth usage
+// API has only ever returned null for it, so it is carried for completeness,
+// not displayed.
 type ExtraUsageInfo struct {
 	IsEnabled    bool     `json:"is_enabled"`
 	MonthlyLimit *float64 `json:"monthly_limit,omitempty"`
@@ -45,15 +48,6 @@ type ExtraUsageInfo struct {
 	AutoReload     *bool    `json:"auto_reload,omitempty"`
 }
 
-// DollarCreditsBalance converts the cent-denominated prepaid balance for
-// display. The boolean is false when Anthropic did not report a balance.
-func (e *ExtraUsageInfo) DollarCreditsBalance() (float64, bool) {
-	if e == nil || e.CreditsBalance == nil {
-		return 0, false
-	}
-	return *e.CreditsBalance / 100, true
-}
-
 // Remaining reports the known positive balance. Both the configured limit and
 // used amount must be present: unknown balance must never authorize paid use.
 func (e *ExtraUsageInfo) Remaining() (float64, bool) {
@@ -65,17 +59,6 @@ func (e *ExtraUsageInfo) Remaining() (float64, bool) {
 		remaining = 0
 	}
 	return remaining, true
-}
-
-// DollarBalance converts Anthropic's cent-denominated values for display.
-// Routing should use Remaining directly because it needs only ordering and a
-// positive-balance check, both of which are invariant under this conversion.
-func (e *ExtraUsageInfo) DollarBalance() (remaining, limit float64, known bool) {
-	remainingCredits, known := e.Remaining()
-	if !known {
-		return 0, 0, false
-	}
-	return remainingCredits / 100, *e.MonthlyLimit / 100, true
 }
 
 type CodexUsageDetails struct {
