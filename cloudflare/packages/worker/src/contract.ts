@@ -69,6 +69,9 @@ export interface ClaudeExtraUsage {
   readonly monthly_limit?: number
   readonly used_credits?: number
   readonly utilization?: number
+  readonly disabled_reason?: string
+  readonly credits_balance?: number
+  readonly auto_reload?: boolean
 }
 
 export interface StoredAccountContract extends Account {
