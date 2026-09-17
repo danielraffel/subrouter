@@ -4267,19 +4267,31 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 func TestClaudeStatusRendersExtraUsageBalanceAndDisabledState(t *testing.T) {
 	t.Setenv("COLUMNS", "220")
 	limit, used := 2000.0, 750.0
+	balance := 123.0
+	autoReloadOff := false
 	for _, tc := range []struct {
-		name    string
-		enabled bool
-		want    string
+		name  string
+		extra *accounts.ExtraUsageInfo
+		want  string
 	}{
-		{name: "enabled", enabled: true, want: "on $12.50/$20.00"},
-		{name: "disabled", enabled: false, want: "off"},
+		{name: "enabled", extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used}, want: "on $12.50/$20.00"},
+		{name: "disabled", extra: &accounts.ExtraUsageInfo{IsEnabled: false, MonthlyLimit: &limit, UsedCredits: &used}, want: "off"},
+		{
+			name:  "credits balance with auto-reload",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used, CreditsBalance: &balance, AutoReload: &autoReloadOff},
+			want:  "on $1.23/$20.00 auto-reload off",
+		},
+		{
+			name:  "disabled with reason",
+			extra: &accounts.ExtraUsageInfo{IsEnabled: false, MonthlyLimit: &limit, UsedCredits: &used, DisabledReason: "out_of_credits"},
+			want:  "off · out of credits",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
 			displayUsageRows(&out, []srUsageRow{{
 				email: "claude@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
-				planType: "max", extraUsage: &accounts.ExtraUsageInfo{IsEnabled: tc.enabled, MonthlyLimit: &limit, UsedCredits: &used},
+				planType: "max", extraUsage: tc.extra,
 				score: selectacct.Score{AccountID: "claude@example.com", Headroom: 0, ShortHeadroom: 0},
 			}}, false)
 			if !strings.Contains(out.String(), tc.want) {

@@ -2493,12 +2493,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
 	if usage.ExtraUsage != nil {
-		extra := &accounts.ExtraUsageInfo{
-			IsEnabled:    usage.ExtraUsage.IsEnabled,
-			MonthlyLimit: usage.ExtraUsage.MonthlyLimit,
-			UsedCredits:  usage.ExtraUsage.UsedCredits,
-			Utilization:  usage.ExtraUsage.Utilization,
-		}
+		extra := agentclaude.ExtraUsageInfoFromUsage(usage)
 		used := 0.0
 		if extra.Utilization != nil {
 			used = *extra.Utilization
@@ -3172,7 +3167,8 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		}
 		capWidth := 12
 		if candidate.Key == "Extra" {
-			capWidth = 18
+			// "on $1.23/$50.00 auto-reload off" is the widest cell.
+			capWidth = 31
 		}
 		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, capWidth)
 		columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
@@ -3295,17 +3291,52 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 		return usageGridCell{}
 	}
 	if !extra.IsEnabled {
-		return usageGridCell{Text: "off", Style: ansiDim}
+		text := "off"
+		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
+			text = "off · " + reason
+		}
+		return usageGridCell{Text: text, Style: ansiDim}
 	}
-	remaining, limit, known := extra.DollarBalance()
+	// The first figure is the prepaid credit balance when Anthropic reports
+	// one (promotional credits are spent before metered usage); otherwise it
+	// is the remaining monthly spend cap. The second figure is always the cap.
+	balance, known := extra.DollarCreditsBalance()
+	remaining, limit, capKnown := extra.DollarBalance()
 	if !known {
-		return usageGridCell{Text: "on, balance ?", Style: ansiYellow}
+		if !capKnown {
+			return usageGridCell{Text: "on, balance ?", Style: ansiYellow}
+		}
+		balance = remaining
+	}
+	if !capKnown {
+		return usageGridCell{Text: fmt.Sprintf("on $%.2f", balance), Style: ansiYellow}
+	}
+	text := fmt.Sprintf("on $%.2f/$%.2f", balance, limit)
+	if extra.AutoReload != nil {
+		if *extra.AutoReload {
+			text += " auto-reload on"
+		} else {
+			text += " auto-reload off"
+		}
 	}
 	styleName := ansiGreen
-	if remaining <= 0 {
+	if balance <= 0 {
 		styleName = ansiYellow
 	}
-	return usageGridCell{Text: fmt.Sprintf("on $%.2f/$%.2f", remaining, limit), Style: styleName}
+	return usageGridCell{Text: text, Style: styleName}
+}
+
+func humanizeClaudeExtraDisabledReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "":
+		return ""
+	case "out_of_credits":
+		return "out of credits"
+	case "spend_limit_reached":
+		return "spend limit reached"
+	default:
+		return strings.ReplaceAll(reason, "_", " ")
+	}
 }
 
 func isAntigravityFamilyWindow(window accounts.UsageWindow, family string, weekly bool) bool {

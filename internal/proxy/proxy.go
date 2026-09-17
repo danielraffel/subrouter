@@ -1654,12 +1654,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 		windows = append(windows, accounts.UsageWindow{Name: "sonnet-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.SonnetFeature})
 	}
 	if usage.ExtraUsage != nil {
-		extra := &accounts.ExtraUsageInfo{
-			IsEnabled:    usage.ExtraUsage.IsEnabled,
-			MonthlyLimit: usage.ExtraUsage.MonthlyLimit,
-			UsedCredits:  usage.ExtraUsage.UsedCredits,
-			Utilization:  usage.ExtraUsage.Utilization,
-		}
+		extra := agentclaude.ExtraUsageInfoFromUsage(usage)
 		used := 0.0
 		if extra.Utilization != nil {
 			used = *extra.Utilization

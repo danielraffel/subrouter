@@ -29,11 +29,29 @@ type UsageWindow struct {
 
 // ExtraUsageInfo describes Claude's optional paid usage budget. Anthropic
 // reports MonthlyLimit and UsedCredits in US cents; Utilization is percent.
+// CreditsBalance is the prepaid/promotional credit remainder in cents, spent
+// before metered usage; AutoReload reports Anthropic's auto-reload toggle.
+// Both are display metadata only — routing decisions stay with Remaining.
 type ExtraUsageInfo struct {
 	IsEnabled    bool     `json:"is_enabled"`
 	MonthlyLimit *float64 `json:"monthly_limit,omitempty"`
 	UsedCredits  *float64 `json:"used_credits,omitempty"`
 	Utilization  *float64 `json:"utilization,omitempty"`
+	// DisabledReason is Anthropic's machine reason when IsEnabled is false,
+	// e.g. "out_of_credits".
+	DisabledReason string `json:"disabled_reason,omitempty"`
+	// CreditsBalance is the remaining prepaid credit balance in cents.
+	CreditsBalance *float64 `json:"credits_balance,omitempty"`
+	AutoReload     *bool    `json:"auto_reload,omitempty"`
+}
+
+// DollarCreditsBalance converts the cent-denominated prepaid balance for
+// display. The boolean is false when Anthropic did not report a balance.
+func (e *ExtraUsageInfo) DollarCreditsBalance() (float64, bool) {
+	if e == nil || e.CreditsBalance == nil {
+		return 0, false
+	}
+	return *e.CreditsBalance / 100, true
 }
 
 // Remaining reports the known positive balance. Both the configured limit and
