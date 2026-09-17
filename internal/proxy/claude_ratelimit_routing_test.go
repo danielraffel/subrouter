@@ -2061,6 +2061,64 @@ func TestClaudeRejectedPaidResponseAcceptedOnlyAfterWholePoolCooked(t *testing.T
 	}
 }
 
+func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-paid-revisit", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+	}))
+
+	var paidHits, ordinaryHits int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		header := http.Header{}
+		header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			paidHits++
+			header.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
+			return &http.Response{StatusCode: http.StatusOK, Header: header,
+				Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"id":"paid-%d"}`, paidHits)))}
+		}
+		ordinaryHits++
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header,
+			Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-paid-revisit", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+		budget: newAttemptBudget(2),
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paidHits != 2 || ordinaryHits != 1 {
+		t.Fatalf("upstream hits paid=%d ordinary=%d, want 2/1", paidHits, ordinaryHits)
+	}
+	if response.Header.Get("X-Subrouter-Claude-Extra-Usage") != "true" ||
+		response.Header.Get("Anthropic-Ratelimit-Unified-Status") != "allowed" {
+		t.Fatalf("paid fallback headers = %v, want normalized allowed extra usage", response.Header)
+	}
+	if !strings.Contains(string(body), `"paid-2"`) {
+		t.Fatalf("body = %q, want second paid attempt", body)
+	}
+}
+
 // A model pool with quota left is still unusable when the account-wide windows
 // are cooked: the pool score must include base windows.
 func TestClaudeModelPoolScoresIncludeBaseWindows(t *testing.T) {

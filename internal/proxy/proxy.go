@@ -7783,6 +7783,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		tried[accountID] = struct{}{}
 	}
 	overloadRetries := 0
+	claudeExtraUsageRetried := false
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
@@ -7990,7 +7991,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
 		if !modelUnsupported {
-			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil)
+			nextAccount, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
 		}
 		if pickErr != nil {
 			if t.logger != nil {
@@ -8020,6 +8021,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			_ = response.Body.Close()
 		}
 		previousAccount := accountID
+		_, nextWasAlreadyTried := tried[nextAccount.ID]
+		if t.provider == accounts.ProviderClaude && nextWasAlreadyTried {
+			// A funded account may have been tried before the final ordinary
+			// subscription became exhausted. oauthRetryCandidate permits exactly
+			// one revisit after the pool-wide guard becomes true; remember that
+			// distinct paid attempt so another rejection cannot loop back again.
+			claudeExtraUsageRetried = true
+		}
 		accountID = nextAccount.ID
 		accountCredential = nextAccount.CredentialIdentity()
 		tried[accountID] = struct{}{}
@@ -8523,7 +8532,7 @@ func (s Server) rerouteModelIncompatibility(ctx context.Context, provider accoun
 	// This runs inside the replay transport, so selection is provisional until
 	// the replacement request returns 2xx. Persisting here would pin the session
 	// to an account that may immediately reject or fail the replay.
-	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex)
+	account, err := s.oauthRetryCandidate(ctx, provider, agentType, sessionID, userEmail, model, tried, provider == accounts.ProviderCodex, false)
 	if err != nil && s.Logger != nil {
 		s.Logger.Warn("model incompatibility has no alternate account",
 			"provider", provider,
@@ -8549,7 +8558,7 @@ func (s Server) rerouteModelIncompatibilityForReconnect(ctx context.Context, pro
 // durable sticky assignment. In-request replay commits only after a 2xx
 // response, while pre-request refresh callers return a pending-commit bit to
 // their protocol-specific success boundary.
-func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
+func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage bool) (accounts.Account, error) {
 	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
@@ -8576,21 +8585,22 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			}
 			candidates = append(candidates, account)
 		}
-		if len(candidates) == 0 {
-			if lastErr != nil {
-				return accounts.Account{}, lastErr
-			}
-			return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
-		}
 		var account accounts.Account
 		if provider == accounts.ProviderClaude {
 			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, allCandidates); ok {
-				if _, alreadyTried := tried[fallback.ID]; !alreadyTried {
+				_, alreadyTried := tried[fallback.ID]
+				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback
 				}
 			}
 		}
 		if account.ID == "" {
+			if len(candidates) == 0 {
+				if lastErr != nil {
+					return accounts.Account{}, lastErr
+				}
+				return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
+			}
 			var err error
 			account, err = pickRoutingAccount(scheduler, candidates)
 			if err != nil {
