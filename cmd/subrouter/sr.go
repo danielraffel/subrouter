@@ -3165,7 +3165,7 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		{Key: "Fable wk", Title: "Fable wk"},
 		{Key: "Opus wk", Title: "Opus wk"},
 		{Key: "Sonnet wk", Title: "Sonnet wk"},
-		{Key: "Extra", Title: "Extra"},
+		{Key: "Extra", Title: "Extra usage"},
 	} {
 		if !usageGridRowsHaveValue(rows, candidate.Key) {
 			continue
