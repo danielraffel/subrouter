@@ -123,7 +123,16 @@ func (s Scheduler) ForModel(model string) Scheduler {
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {
-				modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
+				modelScore = Score{
+					AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0,
+					// Paid Claude capacity is account metadata, not model-pool
+					// subscription headroom. Preserve it on the synthetic exhausted
+					// model score so a different account's model overlay cannot hide
+					// the funded fallback after every subscription is cooked.
+					ClaudeExtraUsageEnabled:   score.ClaudeExtraUsageEnabled,
+					ClaudeExtraUsageKnown:     score.ClaudeExtraUsageKnown,
+					ClaudeExtraUsageRemaining: score.ClaudeExtraUsageRemaining,
+				}
 			}
 		}
 		next.scores[scoreKey] = modelScore

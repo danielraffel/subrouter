@@ -1993,6 +1993,18 @@ func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testin
 	if got, ok := pickClaudeExtraUsageFallback(poolScheduler.Get().ForModel(agentclaude.OpusFeature), accountsInPool); !ok || got.ID != "paid" {
 		t.Fatalf("model-pool fallback = %+v, %v; want paid with preserved extra metadata", got, ok)
 	}
+	mixedPool := selectacct.NewScheduler([]selectacct.Score{
+		paid,
+		{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+			ModelScores: map[string]selectacct.Score{
+				selectacct.ModelKey(agentclaude.OpusFeature): {
+					AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+				},
+			}},
+	}).ForModel(agentclaude.OpusFeature)
+	if got, ok := pickClaudeExtraUsageFallback(mixedPool, accountsInPool); !ok || got.ID != "paid" {
+		t.Fatalf("mixed model-pool fallback = %+v, %v; want paid metadata preserved on missing model overlay", got, ok)
+	}
 
 	other.Headroom, other.ShortHeadroom = 0.5, 0.5
 	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
@@ -2116,6 +2128,33 @@ func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *test
 	}
 	if !strings.Contains(string(body), `"paid-2"`) {
 		t.Fatalf("body = %q, want second paid attempt", body)
+	}
+}
+
+func TestClaudeExtraUsageRevisitRefreshFailureIsAttemptedOnce(t *testing.T) {
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-paid"},
+			{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-other"},
+		},
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+				ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
+			{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+		})),
+	}
+	refreshes := 0
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		refreshes++
+		return accounts.Account{}, fmt.Errorf("Claude OAuth refresh failed: 400 Bad Request: invalid_grant")
+	}
+	tried := map[string]struct{}{"paid": {}, "other": {}}
+	_, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderClaude, "claude", "session-paid-refresh", "", "", tried, false, true)
+	if err == nil {
+		t.Fatal("paid fallback with a dead credential unexpectedly succeeded")
+	}
+	if refreshes != 1 {
+		t.Fatalf("paid fallback refresh attempts = %d, want exactly 1", refreshes)
 	}
 }
 

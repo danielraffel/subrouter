@@ -8591,6 +8591,12 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback
+					if alreadyTried {
+						// Consume the one-time revisit before refreshAccount. If that
+						// refresh fails, this function loops internally and must not
+						// select the same broken paid credential indefinitely.
+						allowTriedClaudeExtraUsage = false
+					}
 				}
 			}
 		}
