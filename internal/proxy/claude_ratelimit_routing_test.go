@@ -1958,6 +1958,109 @@ func TestClaudeUsageWindowsSynthesizeUnusedOpusSonnetPools(t *testing.T) {
 	}
 }
 
+func TestClaudeExtraUsageDoesNotIncreaseSubscriptionHeadroom(t *testing.T) {
+	limit, used, utilization := 25.0, 5.0, 20.0
+	windows := claudeUsageWindows(&agentclaude.UsageResponse{
+		FiveHour: &agentclaude.RateLimit{Utilization: floatPtr(100)},
+		SevenDay: &agentclaude.RateLimit{Utilization: floatPtr(100)},
+		ExtraUsage: &agentclaude.ExtraUsage{
+			IsEnabled: true, MonthlyLimit: &limit, UsedCredits: &used, Utilization: &utilization,
+		},
+	})
+	score := scoreFromUsageWindows(accounts.ProviderClaude, "paid", windows)
+	if score.Headroom != 0 || score.ShortHeadroom != 0 {
+		t.Fatalf("subscription score = headroom %.2f short %.2f, want cooked despite extra usage", score.Headroom, score.ShortHeadroom)
+	}
+	if !score.ClaudeExtraUsageEnabled || !score.ClaudeExtraUsageKnown || score.ClaudeExtraUsageRemaining != 20 {
+		t.Fatalf("extra usage score metadata = %+v, want enabled with 20 remaining", score)
+	}
+}
+
+func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testing.T) {
+	accountsInPool := []accounts.Account{
+		{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+		{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+	}
+	paid := selectacct.Score{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+		ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 12}
+	other := selectacct.Score{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0}
+	if got, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); !ok || got.ID != "paid" {
+		t.Fatalf("fallback = %+v, %v; want paid", got, ok)
+	}
+	poolScheduler := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{paid, other}))
+	poolScheduler.MarkExhausted(accounts.ProviderClaude, "paid", selectacct.ModelKey(agentclaude.OpusFeature))
+	poolScheduler.MarkExhausted(accounts.ProviderClaude, "other", selectacct.ModelKey(agentclaude.OpusFeature))
+	if got, ok := pickClaudeExtraUsageFallback(poolScheduler.Get().ForModel(agentclaude.OpusFeature), accountsInPool); !ok || got.ID != "paid" {
+		t.Fatalf("model-pool fallback = %+v, %v; want paid with preserved extra metadata", got, ok)
+	}
+
+	other.Headroom, other.ShortHeadroom = 0.5, 0.5
+	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
+		t.Fatal("extra usage became eligible while another subscription still had quota")
+	}
+
+	other.Headroom, other.ShortHeadroom = 0, 0
+	paid.ClaudeExtraUsageRemaining = 0
+	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
+		t.Fatal("zero-balance extra usage became eligible")
+	}
+	paid.ClaudeExtraUsageRemaining = 12
+	paid.ClaudeExtraUsageEnabled = false
+	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
+		t.Fatal("disabled extra usage became eligible")
+	}
+}
+
+func TestClaudeRejectedPaidResponseAcceptedOnlyAfterWholePoolCooked(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		otherHeadroom float64
+		wantAccepted  bool
+	}{
+		{name: "all subscriptions cooked", otherHeadroom: 0, wantAccepted: true},
+		{name: "another subscription available", otherHeadroom: 1, wantAccepted: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := Server{
+				Accounts: []accounts.Account{
+					{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+					{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
+				},
+				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+					{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+						ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
+					{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: tc.otherHeadroom, ShortHeadroom: tc.otherHeadroom},
+				})),
+			}
+			stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
+				header := http.Header{}
+				header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+				header.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
+				return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{"id":"paid"}`))}
+			}}
+			transport := usageLimitRetryTransport{base: stub, server: &server, provider: accounts.ProviderClaude,
+				account: "paid", maxAttempts: 1, budget: newAttemptBudget(0)}
+			req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
+			response, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			accepted := response.Header.Get("X-Subrouter-Claude-Extra-Usage") == "true"
+			if accepted != tc.wantAccepted {
+				t.Fatalf("accepted = %v, want %v; headers=%v", accepted, tc.wantAccepted, response.Header)
+			}
+			if tc.wantAccepted && response.Header.Get("Anthropic-Ratelimit-Unified-Status") != "allowed" {
+				t.Fatalf("client status = %q, want allowed", response.Header.Get("Anthropic-Ratelimit-Unified-Status"))
+			}
+		})
+	}
+}
+
 // A model pool with quota left is still unusable when the account-wide windows
 // are cooked: the pool score must include base windows.
 func TestClaudeModelPoolScoresIncludeBaseWindows(t *testing.T) {

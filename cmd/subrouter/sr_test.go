@@ -4264,6 +4264,31 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	}
 }
 
+func TestClaudeStatusRendersExtraUsageBalanceAndDisabledState(t *testing.T) {
+	t.Setenv("COLUMNS", "220")
+	limit, used := 20.0, 7.5
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		want    string
+	}{
+		{name: "enabled", enabled: true, want: "on $12.50/$20.00"},
+		{name: "disabled", enabled: false, want: "off"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			displayUsageRows(&out, []srUsageRow{{
+				email: "claude@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
+				planType: "max", extraUsage: &accounts.ExtraUsageInfo{IsEnabled: tc.enabled, MonthlyLimit: &limit, UsedCredits: &used},
+				score: selectacct.Score{AccountID: "claude@example.com", Headroom: 0, ShortHeadroom: 0},
+			}}, false)
+			if !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("status output missing %q:\n%s", tc.want, out.String())
+			}
+		})
+	}
+}
+
 func srFloatPtr(v float64) *float64 { return &v }
 
 func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {

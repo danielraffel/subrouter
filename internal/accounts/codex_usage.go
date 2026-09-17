@@ -21,6 +21,32 @@ type UsageWindow struct {
 	// account-wide primary/secondary windows. Used to route a request to its
 	// model-specific quota pool without matching on display strings.
 	Feature string
+	// ExtraUsage carries Claude's paid-usage allowance on the synthetic
+	// "extra" window. It is status and fallback-routing metadata, not a
+	// subscription quota window, so scoring code must exclude it.
+	ExtraUsage *ExtraUsageInfo `json:"extra_usage,omitempty"`
+}
+
+// ExtraUsageInfo describes Claude's optional paid usage budget. Amounts are
+// expressed in Anthropic's credit units (currently USD-equivalent values).
+type ExtraUsageInfo struct {
+	IsEnabled    bool     `json:"is_enabled"`
+	MonthlyLimit *float64 `json:"monthly_limit,omitempty"`
+	UsedCredits  *float64 `json:"used_credits,omitempty"`
+	Utilization  *float64 `json:"utilization,omitempty"`
+}
+
+// Remaining reports the known positive balance. Both the configured limit and
+// used amount must be present: unknown balance must never authorize paid use.
+func (e *ExtraUsageInfo) Remaining() (float64, bool) {
+	if e == nil || e.MonthlyLimit == nil || e.UsedCredits == nil {
+		return 0, false
+	}
+	remaining := *e.MonthlyLimit - *e.UsedCredits
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, true
 }
 
 type CodexUsageDetails struct {

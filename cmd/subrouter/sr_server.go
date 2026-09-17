@@ -1354,6 +1354,7 @@ type remoteServerUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1510,6 +1511,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			windows:            status.Windows,
 			credits:            status.Credits,
 			complimentaryReset: status.ComplimentaryReset,
+			extraUsage:         status.ExtraUsage,
 			provider:           status.Provider,
 			providerHealth:     status.ProviderHealth,
 			authChecked:        status.AuthChecked,
