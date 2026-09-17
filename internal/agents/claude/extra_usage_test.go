@@ -43,25 +43,50 @@ func TestExtraUsageInfoFromUsageCarriesDisplayMetadata(t *testing.T) {
 }
 
 func TestExtraUsageInfoFromUsageToleratesNullAndUnexpectedSpendShapes(t *testing.T) {
-	for _, body := range []string{
-		// The shape observed live: both fields null.
-		`{"extra_usage": {"is_enabled": false, "monthly_limit": 5000, "used_credits": 1080}, "spend": {"balance": null, "auto_reload": null}}`,
-		// Defensive: auto_reload as an object must not fail the fetch.
-		`{"extra_usage": {"is_enabled": true, "monthly_limit": 5000, "used_credits": 0}, "spend": {"balance": null, "auto_reload": {"enabled": true}}}`,
-		// No spend block at all.
-		`{"extra_usage": {"is_enabled": true, "monthly_limit": 5000, "used_credits": 0}}`,
+	for _, tc := range []struct {
+		name       string
+		body       string
+		wantReload *bool
+	}{
+		{
+			// The shape observed live: both fields null. Null auto_reload is
+			// the never-enrolled state, which Claude's settings page renders
+			// as "Auto-reload off".
+			name:       "null fields",
+			body:       `{"extra_usage": {"is_enabled": false, "monthly_limit": 5000, "used_credits": 1080}, "spend": {"balance": null, "auto_reload": null}}`,
+			wantReload: func() *bool { b := false; return &b }(),
+		},
+		{
+			// Defensive: auto_reload as an object must not fail the fetch.
+			name:       "object auto_reload",
+			body:       `{"extra_usage": {"is_enabled": true, "monthly_limit": 5000, "used_credits": 0}, "spend": {"balance": null, "auto_reload": {"enabled": true}}}`,
+			wantReload: func() *bool { b := true; return &b }(),
+		},
+		{
+			// No spend block at all: auto-reload state is unknown.
+			name: "no spend block",
+			body: `{"extra_usage": {"is_enabled": true, "monthly_limit": 5000, "used_credits": 0}}`,
+		},
 	} {
-		var usage UsageResponse
-		if err := json.Unmarshal([]byte(body), &usage); err != nil {
-			t.Fatalf("decode %s: %v", body, err)
-		}
-		info := ExtraUsageInfoFromUsage(&usage)
-		if info == nil {
-			t.Fatalf("expected extra usage info for %s", body)
-		}
-		if info.CreditsBalance != nil {
-			t.Fatalf("unexpected credits balance for %s", body)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			var usage UsageResponse
+			if err := json.Unmarshal([]byte(tc.body), &usage); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			info := ExtraUsageInfoFromUsage(&usage)
+			if info == nil {
+				t.Fatal("expected extra usage info")
+			}
+			if info.CreditsBalance != nil {
+				t.Fatalf("unexpected credits balance: %v", *info.CreditsBalance)
+			}
+			switch {
+			case tc.wantReload == nil && info.AutoReload != nil:
+				t.Fatalf("auto reload = %v, want unknown", *info.AutoReload)
+			case tc.wantReload != nil && (info.AutoReload == nil || *info.AutoReload != *tc.wantReload):
+				t.Fatalf("auto reload = %v, want %v", info.AutoReload, *tc.wantReload)
+			}
+		})
 	}
 }
 

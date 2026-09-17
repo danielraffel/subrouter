@@ -5348,7 +5348,29 @@ func (s Server) markAccountExhaustedFromResponseForAccount(account accounts.Acco
 		)
 		return
 	}
+	if claudeResponseCooksWeeklyWindow(header) {
+		// Only weekly-cooked evidence may authorize paid fallback later; a
+		// session-level rejection leaves WeeklyHeadroom intact.
+		s.SchedulerRef.MarkWeeklyExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+		return
+	}
 	s.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(account.Provider), account.ID, poolKey, claudeExhaustionExpiry(header, time.Now()))
+}
+
+// claudeResponseCooksWeeklyWindow reports that the rejected response proves
+// the account's weekly (7d) window is exhausted, via Anthropic's per-window
+// unified headers. Missing headers mean the rejection might be session-level,
+// which is never weekly evidence.
+func claudeResponseCooksWeeklyWindow(header http.Header) bool {
+	if strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-7d-status")), "rejected") {
+		return true
+	}
+	if raw := strings.TrimSpace(claudeHeaderGet(header, "anthropic-ratelimit-unified-7d-utilization")); raw != "" {
+		if utilization, err := strconv.ParseFloat(raw, 64); err == nil && utilization >= 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // credentialExhaustionTTL is how long an account with a dead credential
@@ -6452,7 +6474,10 @@ func claudeExtraUsageEligible(score selectacct.Score) bool {
 }
 
 // pickClaudeExtraUsageFallback returns a funded paid-usage account only when
-// every Claude subscription account in the candidate pool is exhausted.
+// every Claude subscription account in the candidate pool has its weekly
+// window cooked. An account cooked on its 5h session window alone still has
+// weekly quota coming back on its own; that is a temporary wait, never a
+// reason to spend paid credits.
 func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, bool) {
 	var best accounts.Account
 	bestRemaining := -1.0
@@ -6462,10 +6487,10 @@ func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []a
 			continue
 		}
 		seenSubscription = true
-		if !scheduler.Exhausted(accounts.ProviderClaude, candidate.ID) {
+		score := scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID)
+		if !score.WeeklyCooked() {
 			return accounts.Account{}, false
 		}
-		score := scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID)
 		if claudeExtraUsageEligible(score) && score.ClaudeExtraUsageRemaining > bestRemaining {
 			best = candidate
 			bestRemaining = score.ClaudeExtraUsageRemaining
@@ -6475,15 +6500,16 @@ func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []a
 }
 
 // claudeExtraUsageResponseAllowed is the request-time guard. The current
-// rejected response proves this account's subscription is cooked; every other
-// subscription must already be exhausted before its paid completion is used.
+// rejected response alone does not prove the weekly window is cooked — a 429
+// can be session-level — so this account and every other subscription must
+// show a cooked weekly window before its paid completion is used.
 func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, poolModel string) bool {
 	if s.SchedulerRef == nil {
 		return false
 	}
 	scheduler := s.scheduler().ForModel(poolModel)
 	current := scheduler.ScoreFor(accounts.ProviderClaude, accountID)
-	if !claudeExtraUsageEligible(current) {
+	if !claudeExtraUsageEligible(current) || !current.WeeklyCooked() {
 		return false
 	}
 	seenCurrent := false
@@ -6495,7 +6521,7 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 			seenCurrent = true
 			continue
 		}
-		if !scheduler.Exhausted(accounts.ProviderClaude, candidate.ID) {
+		if !scheduler.ScoreFor(accounts.ProviderClaude, candidate.ID).WeeklyCooked() {
 			return false
 		}
 	}

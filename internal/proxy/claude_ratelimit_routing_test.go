@@ -1981,9 +1981,9 @@ func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testin
 		{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
 		{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
 	}
-	paid := selectacct.Score{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+	paid := selectacct.Score{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
 		ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 12}
-	other := selectacct.Score{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0}
+	other := selectacct.Score{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0}
 	if got, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); !ok || got.ID != "paid" {
 		t.Fatalf("fallback = %+v, %v; want paid", got, ok)
 	}
@@ -1995,10 +1995,10 @@ func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testin
 	}
 	mixedPool := selectacct.NewScheduler([]selectacct.Score{
 		paid,
-		{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+		{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
 			ModelScores: map[string]selectacct.Score{
 				selectacct.ModelKey(agentclaude.OpusFeature): {
-					AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+					AccountID: "other", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
 				},
 			}},
 	}).ForModel(agentclaude.OpusFeature)
@@ -2006,7 +2006,22 @@ func TestPickClaudeExtraUsageFallbackRequiresWholePoolCookedAndBalance(t *testin
 		t.Fatalf("mixed model-pool fallback = %+v, %v; want paid metadata preserved on missing model overlay", got, ok)
 	}
 
-	other.Headroom, other.ShortHeadroom = 0.5, 0.5
+	// Session-only exhaustion is a temporary wait, never a reason to spend:
+	// weekly headroom anywhere in the pool refuses the paid fallback.
+	other.Headroom, other.ShortHeadroom, other.WeeklyHeadroom = 0, 0, 0.5
+	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
+		t.Fatal("extra usage became eligible while another subscription had weekly quota")
+	}
+	// The funded account itself must be weekly-cooked too: paid credits on an
+	// account whose own weekly window still has quota are just as off-limits.
+	weeklyLeft := paid
+	weeklyLeft.WeeklyHeadroom = 0.5
+	other.WeeklyHeadroom = 0
+	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{weeklyLeft, other}), accountsInPool); ok {
+		t.Fatal("extra usage became eligible while the funded account had weekly quota")
+	}
+
+	other.Headroom, other.ShortHeadroom, other.WeeklyHeadroom = 0.5, 0.5, 0.5
 	if _, ok := pickClaudeExtraUsageFallback(selectacct.NewScheduler([]selectacct.Score{paid, other}), accountsInPool); ok {
 		t.Fatal("extra usage became eligible while another subscription still had quota")
 	}
@@ -2027,10 +2042,12 @@ func TestClaudeRejectedPaidResponseAcceptedOnlyAfterWholePoolCooked(t *testing.T
 	for _, tc := range []struct {
 		name          string
 		otherHeadroom float64
+		otherWeekly   float64
 		wantAccepted  bool
 	}{
-		{name: "all subscriptions cooked", otherHeadroom: 0, wantAccepted: true},
-		{name: "another subscription available", otherHeadroom: 1, wantAccepted: false},
+		{name: "all subscriptions cooked", otherHeadroom: 0, otherWeekly: 0, wantAccepted: true},
+		{name: "another subscription available", otherHeadroom: 1, otherWeekly: 1, wantAccepted: false},
+		{name: "another subscription only session-cooked", otherHeadroom: 0, otherWeekly: 0.5, wantAccepted: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := Server{
@@ -2039,9 +2056,9 @@ func TestClaudeRejectedPaidResponseAcceptedOnlyAfterWholePoolCooked(t *testing.T
 					{ID: "other", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth},
 				},
 				SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-					{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0,
+					{AccountID: "paid", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0,
 						ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-					{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: tc.otherHeadroom, ShortHeadroom: tc.otherHeadroom},
+					{AccountID: "other", Provider: accounts.ProviderClaude, Headroom: tc.otherHeadroom, ShortHeadroom: tc.otherHeadroom, WeeklyHeadroom: tc.otherWeekly},
 				})),
 			}
 			stub := &stubRoundTripper{responses: func(*http.Request) *http.Response {
@@ -2079,9 +2096,9 @@ func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *test
 		t.Fatal(err)
 	}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
-		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1,
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 0,
 			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
-		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1},
 	}))
 
 	var paidHits, ordinaryHits int
@@ -2095,6 +2112,9 @@ func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *test
 				Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"id":"paid-%d"}`, paidHits)))}
 		}
 		ordinaryHits++
+		// The 7d rejection header is what authorizes the paid revisit: a
+		// session-level 429 alone must never cook the weekly window.
+		header.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
 		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header,
 			Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
 	}}
@@ -2128,6 +2148,52 @@ func TestClaudeExtraUsageRevisitsFundedAccountAfterLastSubscriptionCooks(t *test
 	}
 	if !strings.Contains(string(body), `"paid-2"`) {
 		t.Fatalf("body = %q, want second paid attempt", body)
+	}
+}
+
+// A session-level 429 (no weekly evidence in the unified headers) must never
+// unlock the paid fallback: the account's weekly window recovers on its own.
+func TestClaudeExtraUsageNotUnlockedBySessionOnlyRejection(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-paid-session-only", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 0,
+			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1},
+	}))
+
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		header := http.Header{}
+		header.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		if strings.Contains(req.Header.Get("Authorization"), "tok-cooked") {
+			header.Set("Anthropic-Ratelimit-Unified-Overage-In-Use", "true")
+			return &http.Response{StatusCode: http.StatusOK, Header: header,
+				Body: io.NopCloser(strings.NewReader(`{"id":"paid"}`))}
+		}
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header,
+			Body: io.NopCloser(strings.NewReader(realisticAnthropic429Body))}
+	}}
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-paid-session-only", account: "cooked@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 3,
+		budget: newAttemptBudget(2),
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok-cooked")
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.Header.Get("X-Subrouter-Claude-Extra-Usage") == "true" {
+		t.Fatalf("session-only rejection unlocked paid fallback: %v", response.Header)
 	}
 }
 
