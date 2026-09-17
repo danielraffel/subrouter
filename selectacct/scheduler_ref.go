@@ -1005,7 +1005,16 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 		if score.ModelScores == nil {
 			score.ModelScores = make(map[string]Score, 1)
 		}
-		score.ModelScores[poolKey] = Score{AccountID: score.AccountID, Provider: provider, Headroom: 0, ShortHeadroom: 0}
+		poolScore, exists := score.ModelScores[poolKey]
+		if !exists {
+			poolScore = score
+			poolScore.ModelScores = nil
+		}
+		poolScore.AccountID = score.AccountID
+		poolScore.Provider = provider
+		poolScore.Headroom = 0
+		poolScore.ShortHeadroom = 0
+		score.ModelScores[poolKey] = poolScore
 		next.scores[scoreKey] = score
 	}
 	return next

@@ -262,6 +262,7 @@ type srUsageRow struct {
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
+	extraUsage         *accounts.ExtraUsageInfo
 	apiKeySpend        *accounts.APIKeyUsageSnapshot
 	apiKeyHint         string
 	err                error
@@ -2274,6 +2275,9 @@ func scoreFromWindows(accountID string, windows []accounts.UsageWindow) selectac
 		}
 	}
 	for _, window := range windows {
+		if window.ExtraUsage != nil {
+			continue
+		}
 		limitWindows = append(limitWindows, selectacct.LimitWindow{
 			Name:               window.Name,
 			UsedPercent:        window.UsedPercent,
@@ -2373,10 +2377,6 @@ func isClaudeOpusWeeklyWindow(window accounts.UsageWindow) bool {
 
 func isClaudeSonnetWeeklyWindow(window accounts.UsageWindow) bool {
 	return strings.Contains(strings.ToLower(window.Name), "sonnet")
-}
-
-func isClaudeExtraWindow(window accounts.UsageWindow) bool {
-	return strings.Contains(strings.ToLower(window.Name), "extra")
 }
 
 func clampUsagePercent(value float64) float64 {
@@ -2492,8 +2492,18 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	add(agentclaude.FableWindowName, sevenDaySeconds, usage.SevenDayOAuthApps)
 	add("opus-weekly", sevenDaySeconds, usage.SevenDayOpus)
 	add("sonnet-weekly", sevenDaySeconds, usage.SevenDaySonnet)
-	if usage.ExtraUsage != nil && usage.ExtraUsage.IsEnabled && usage.ExtraUsage.Utilization != nil {
-		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: *usage.ExtraUsage.Utilization})
+	if usage.ExtraUsage != nil {
+		extra := &accounts.ExtraUsageInfo{
+			IsEnabled:    usage.ExtraUsage.IsEnabled,
+			MonthlyLimit: usage.ExtraUsage.MonthlyLimit,
+			UsedCredits:  usage.ExtraUsage.UsedCredits,
+			Utilization:  usage.ExtraUsage.Utilization,
+		}
+		used := 0.0
+		if extra.Utilization != nil {
+			used = *extra.Utilization
+		}
+		windows = append(windows, accounts.UsageWindow{Name: "extra", UsedPercent: used, ExtraUsage: extra})
 	}
 	return windows
 }
@@ -3160,7 +3170,11 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		if !usageGridRowsHaveValue(rows, candidate.Key) {
 			continue
 		}
-		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, 12)
+		capWidth := 12
+		if candidate.Key == "Extra" {
+			capWidth = 18
+		}
+		candidate.Width = usageGridDesiredWidth(rows, candidate.Key, candidate.Title, capWidth)
 		columns = appendUsageGridColumnIfFits(columns, candidate, termWidth)
 	}
 	return columns
@@ -3238,7 +3252,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Fable wk":  usageGridWindowCell(row.windows, isClaudeOAuthAppsWeeklyWindow),
 		"Opus wk":   usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk": usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
-		"Extra":     usageGridWindowCell(row.windows, isClaudeExtraWindow),
+		"Extra":     usageGridClaudeExtraCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
 		}),
@@ -3258,6 +3272,40 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 			return isAntigravityLegacyFamilyWindow(window, "claude-gpt")
 		}),
 	}
+}
+
+func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
+	extra := row.extraUsage
+	if extra == nil {
+		for i := range row.windows {
+			if row.windows[i].ExtraUsage != nil {
+				extra = row.windows[i].ExtraUsage
+				break
+			}
+		}
+	}
+	if extra == nil {
+		// Older native and hosted servers exposed only the synthetic percentage
+		// window. Keep that useful status until every server carries balances.
+		for _, window := range row.windows {
+			if strings.Contains(strings.ToLower(window.Name), "extra") {
+				return usageGridWindowStatusCell(window)
+			}
+		}
+		return usageGridCell{}
+	}
+	if !extra.IsEnabled {
+		return usageGridCell{Text: "off", Style: ansiDim}
+	}
+	remaining, limit, known := extra.DollarBalance()
+	if !known {
+		return usageGridCell{Text: "on, balance ?", Style: ansiYellow}
+	}
+	styleName := ansiGreen
+	if remaining <= 0 {
+		styleName = ansiYellow
+	}
+	return usageGridCell{Text: fmt.Sprintf("on $%.2f/$%.2f", remaining, limit), Style: styleName}
 }
 
 func isAntigravityFamilyWindow(window accounts.UsageWindow, family string, weekly bool) bool {

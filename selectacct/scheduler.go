@@ -26,6 +26,12 @@ type Score struct {
 	// uses it to tell "fresh evidence re-confirmed exhausted" apart from "old
 	// zero score dragged along".
 	Fresh bool
+	// ClaudeExtraUsage is kept outside Headroom: paid credits must never make an
+	// account look like ordinary subscription capacity. Proxy routing consults
+	// it only after every subscription account is exhausted.
+	ClaudeExtraUsageEnabled   bool
+	ClaudeExtraUsageKnown     bool
+	ClaudeExtraUsageRemaining float64
 }
 
 type Scheduler struct {
@@ -117,7 +123,16 @@ func (s Scheduler) ForModel(model string) Scheduler {
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {
-				modelScore = Score{AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0}
+				modelScore = Score{
+					AccountID: score.AccountID, Provider: score.Provider, Headroom: 0, ShortHeadroom: 0,
+					// Paid Claude capacity is account metadata, not model-pool
+					// subscription headroom. Preserve it on the synthetic exhausted
+					// model score so a different account's model overlay cannot hide
+					// the funded fallback after every subscription is cooked.
+					ClaudeExtraUsageEnabled:   score.ClaudeExtraUsageEnabled,
+					ClaudeExtraUsageKnown:     score.ClaudeExtraUsageKnown,
+					ClaudeExtraUsageRemaining: score.ClaudeExtraUsageRemaining,
+				}
 			}
 		}
 		next.scores[scoreKey] = modelScore
