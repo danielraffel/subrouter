@@ -50,13 +50,13 @@ func TestProbeOpenRouterKeyStatus(t *testing.T) {
 		wantUsed      float64
 		wantBalance   string
 	}{
-		{name: "finite monthly limit", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.5"},
-		{name: "account balance from credits", status: http.StatusOK, body: `{"data":{"limit":40,"limit_remaining":40,"limit_reset":"monthly"}}`, creditsStatus: http.StatusOK, creditsBody: `{"data":{"total_credits":45,"total_usage":36.904185575}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 0, wantBalance: "8.1"},
-		{name: "credits endpoint fails falls back to cap", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, creditsStatus: http.StatusInternalServerError, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.5"},
-		{name: "credits overuse clamps to zero", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, creditsStatus: http.StatusOK, creditsBody: `{"data":{"total_credits":10,"total_usage":12.5}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "0"},
+		{name: "finite monthly limit", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.50"},
+		{name: "account balance from credits", status: http.StatusOK, body: `{"data":{"limit":40,"limit_remaining":40,"limit_reset":"monthly"}}`, creditsStatus: http.StatusOK, creditsBody: `{"data":{"total_credits":45,"total_usage":36.904185575}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 0, wantBalance: "8.10"},
+		{name: "credits endpoint fails falls back to cap", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, creditsStatus: http.StatusInternalServerError, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.50"},
+		{name: "credits overuse clamps to zero", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, creditsStatus: http.StatusOK, creditsBody: `{"data":{"total_credits":10,"total_usage":12.5}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "0.00"},
 		{name: "unlimited key", status: http.StatusOK, body: `{"data":{"limit":null,"limit_remaining":null,"limit_reset":null}}`, wantState: "auth ok"},
-		{name: "exhausted", status: http.StatusOK, body: `{"data":{"limit":10,"limit_remaining":0,"limit_reset":"weekly"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0"},
-		{name: "zero limit", status: http.StatusOK, body: `{"data":{"limit":0,"limit_remaining":0,"limit_reset":"daily"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0"},
+		{name: "exhausted", status: http.StatusOK, body: `{"data":{"limit":10,"limit_remaining":0,"limit_reset":"weekly"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0.00"},
+		{name: "zero limit", status: http.StatusOK, body: `{"data":{"limit":0,"limit_remaining":0,"limit_reset":"daily"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0.00"},
 		{name: "optional fields missing", status: http.StatusOK, body: `{"data":{}}`, wantState: "auth ok"},
 		{name: "bad key", status: http.StatusUnauthorized, body: `{}`, wantState: "bad key"},
 		{name: "provider unavailable", status: http.StatusInternalServerError, body: `{}`, wantState: "http 500"},

@@ -1193,7 +1193,7 @@ func TestUsageStatusesIncludesOpenRouterKeyQuota(t *testing.T) {
 	}
 	// The balance comes from /credits (total_credits - total_usage), not the
 	// key's monthly spend cap.
-	if got.Credits == nil || got.Credits.Balance != "8.1" {
+	if got.Credits == nil || got.Credits.Balance != "8.10" {
 		t.Fatalf("OpenRouter credits = %+v", got.Credits)
 	}
 }

@@ -82,7 +82,7 @@ func ProbeProviderKeyStatus(ctx context.Context, client *http.Client, provider a
 			if probe.Credits == nil {
 				probe.Credits = &accounts.CreditsInfo{HasCredits: true}
 			}
-			probe.Credits.Balance = strconv.FormatFloat(math.Round(balance*100)/100, 'f', -1, 64)
+			probe.Credits.Balance = strconv.FormatFloat(math.Round(balance*100)/100, 'f', 2, 64)
 		}
 		return probe
 	}
@@ -137,7 +137,7 @@ func decodeOpenRouterKeyProbe(probe ProviderKeyProbe, body io.Reader) ProviderKe
 	}
 	probe.QuotaUsageKnown = true
 	probe.Windows = []accounts.UsageWindow{{Name: cadence, UsedPercent: usedPercent, LimitWindowSeconds: windowSeconds}}
-	probe.Credits = &accounts.CreditsInfo{HasCredits: true, Balance: strconv.FormatFloat(remaining, 'f', -1, 64)}
+	probe.Credits = &accounts.CreditsInfo{HasCredits: true, Balance: strconv.FormatFloat(remaining, 'f', 2, 64)}
 	return probe
 }
 
