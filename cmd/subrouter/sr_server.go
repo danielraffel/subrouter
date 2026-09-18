@@ -1100,6 +1100,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	}
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
+		enrichClaudeRowsWithWebBalances(ctx, rows)
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
