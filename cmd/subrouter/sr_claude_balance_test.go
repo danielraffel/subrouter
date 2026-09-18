@@ -95,9 +95,17 @@ func claudeWebTestEnv(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	oldBase := claudeWebBaseURL
 	oldDiscover := claudeWebDiscoverSessionKeys
+	oldTransport := claudeWebDefaultTransport
+	oldReady := claudeWebTransportReady
+	// Tests talk to httptest servers over plain net/http, never the Swift
+	// probe or a real browser.
+	claudeWebDefaultTransport = netHTTPClaudeWebTransport
+	claudeWebTransportReady = func() bool { return true }
 	t.Cleanup(func() {
 		claudeWebBaseURL = oldBase
 		claudeWebDiscoverSessionKeys = oldDiscover
+		claudeWebDefaultTransport = oldTransport
+		claudeWebTransportReady = oldReady
 	})
 }
 
@@ -425,5 +433,68 @@ func TestParseClaudeBinaryCookiesSoftFail(t *testing.T) {
 		if got := parseClaudeBinaryCookies(data); len(got) != 0 {
 			t.Errorf("%s: parseClaudeBinaryCookies = %v, want soft-fail", name, got)
 		}
+	}
+}
+
+func TestClaudeWebRotatedSessionKey(t *testing.T) {
+	cases := []struct {
+		name      string
+		setCookie string
+		want      string
+	}{
+		{"simple", "sessionKey=sk-ant-rotated; Path=/; HttpOnly", "sk-ant-rotated"},
+		{"among others", "other=1; sessionKey=sk-ant-new; Expires=Wed, 21 Oct 2041 07:28:00 GMT", "sk-ant-new"},
+		{"ignores v3 cookie", "sessionKeyV3=sk-ant-v3; Path=/", ""},
+		{"ignores non-claude value", "sessionKey=not-a-key; Path=/", ""},
+		{"multi-line", "x=1\nsessionKey=sk-ant-second; Path=/", "sk-ant-second"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		if got := claudeWebRotatedSessionKey(tc.setCookie); got != tc.want {
+			t.Errorf("%s: claudeWebRotatedSessionKey = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A Cloudflare managed challenge (403 "Just a moment") means the TLS
+// fingerprint was blocked, not that the session died; the stored session must
+// survive so a later, unblocked run can use it.
+func TestClaudeWebBalancesCloudflareChallengeKeepsSession(t *testing.T) {
+	claudeWebTestEnv(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, "<html><title>Just a moment...</title></html>")
+	}))
+	defer server.Close()
+	claudeWebBaseURL = server.URL
+	claudeWebDiscoverSessionKeys = func(context.Context) []claudeWebSessionKeyCandidate { return nil }
+
+	saveClaudeWebSessions([]claudeWebSession{{SessionKey: "sk-ant-stored", Email: "user@example.com"}})
+	balances := claudeWebBalances(context.Background(), map[string]bool{"user@example.com": true})
+	if len(balances) != 0 {
+		t.Fatalf("balances = %v", balances)
+	}
+	sessions := loadClaudeWebSessions()
+	if len(sessions) != 1 || sessions[0].SessionKey != "sk-ant-stored" {
+		t.Fatalf("cloudflare challenge dropped the session: %+v", sessions)
+	}
+}
+
+// When the transport cannot make requests this run (probe still compiling),
+// enrichment must bail before any session validation or browser discovery.
+func TestClaudeWebBalancesTransportNotReady(t *testing.T) {
+	claudeWebTestEnv(t)
+	claudeWebTransportReady = func() bool { return false }
+	claudeWebDiscoverSessionKeys = func(context.Context) []claudeWebSessionKeyCandidate {
+		t.Error("discovery must not run when the transport is not ready")
+		return nil
+	}
+	saveClaudeWebSessions([]claudeWebSession{{SessionKey: "sk-ant-stored", Email: "user@example.com"}})
+	if balances := claudeWebBalances(context.Background(), map[string]bool{"user@example.com": true}); len(balances) != 0 {
+		t.Fatalf("balances = %v", balances)
+	}
+	sessions := loadClaudeWebSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("sessions touched while transport not ready: %+v", sessions)
 	}
 }

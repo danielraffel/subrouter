@@ -150,46 +150,114 @@ func saveClaudeWebBalanceCache(cache claudeWebBalanceCacheFile) {
 
 var errClaudeWebUnauthorized = errors.New("claude web session unauthorized")
 
+// claudeWebResponse is one HTTP response from the web API transport.
+type claudeWebResponse struct {
+	status    int
+	body      []byte
+	setCookie string
+}
+
+// claudeWebTransport fetches url with the sessionKey cookie and returns the
+// raw response for the caller to map onto errors.
+type claudeWebTransport func(ctx context.Context, url, sessionKey string) (claudeWebResponse, error)
+
+// claudeWebDefaultTransport is net/http everywhere except darwin, where
+// claude.ai's Cloudflare blocks Go's TLS fingerprint and the Swift URLSession
+// probe (sr_claude_balance_darwin.go) is installed instead. Tests override it
+// with netHTTPClaudeWebTransport against httptest servers.
+var claudeWebDefaultTransport claudeWebTransport = netHTTPClaudeWebTransport
+
+// claudeWebTransportReady reports whether the platform transport can make
+// requests right now. On darwin it kicks off the lazy probe compile and
+// reports false until the binary exists, so a run that would only fail
+// skips browser-cookie reads (and their potential Keychain prompts) entirely.
+var claudeWebTransportReady = func() bool { return true }
+
+func netHTTPClaudeWebTransport(ctx context.Context, url, sessionKey string) (claudeWebResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return claudeWebResponse{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cookie", "sessionKey="+sessionKey)
+	client := &http.Client{Timeout: claudeWebRequestTimeout}
+	res, err := client.Do(req)
+	if err != nil {
+		return claudeWebResponse{}, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, claudeWebMaxBodyBytes))
+	if err != nil {
+		return claudeWebResponse{}, err
+	}
+	return claudeWebResponse{
+		status:    res.StatusCode,
+		body:      body,
+		setCookie: strings.Join(res.Header.Values("Set-Cookie"), "\n"),
+	}, nil
+}
+
+// claudeWebRotatedSessionKey extracts a rotated sessionKey value from
+// Set-Cookie header text. Values that do not look like a Claude session key
+// (e.g. sessionKeyV3) are ignored.
+func claudeWebRotatedSessionKey(setCookie string) string {
+	rest := setCookie
+	for {
+		idx := strings.Index(rest, "sessionKey=")
+		if idx < 0 {
+			return ""
+		}
+		rest = rest[idx+len("sessionKey="):]
+		token := rest
+		if end := strings.IndexAny(rest, ";,\n\r\t "); end >= 0 {
+			token = rest[:end]
+		}
+		if strings.HasPrefix(token, "sk-ant-") {
+			return token
+		}
+	}
+}
+
+// claudeWebIsCloudflareChallenge recognizes Cloudflare's managed challenge
+// page, which says the TLS fingerprint was blocked — not that the session is
+// dead. It must never be treated as unauthorized.
+func claudeWebIsCloudflareChallenge(body []byte) bool {
+	prefix := string(body[:min(len(body), 64*1024)])
+	return strings.Contains(strings.ToLower(prefix), "just a moment")
+}
+
 type claudeWebClient struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL   string
+	transport claudeWebTransport
 }
 
 func newClaudeWebClient() *claudeWebClient {
 	return &claudeWebClient{
-		baseURL:    strings.TrimRight(claudeWebBaseURL, "/"),
-		httpClient: &http.Client{Timeout: claudeWebRequestTimeout},
+		baseURL:   strings.TrimRight(claudeWebBaseURL, "/"),
+		transport: claudeWebDefaultTransport,
 	}
 }
 
 // get performs a session-authenticated GET and folds a rotated sessionKey
 // from Set-Cookie back into the session so it survives claude.ai's rotation.
 func (c *claudeWebClient) get(ctx context.Context, session *claudeWebSession, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	resp, err := c.transport(ctx, c.baseURL+path, session.SessionKey)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Cookie", "sessionKey="+session.SessionKey)
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
+	if rotated := claudeWebRotatedSessionKey(resp.setCookie); rotated != "" {
+		session.SessionKey = rotated
 	}
-	defer res.Body.Close()
-	for _, cookie := range res.Cookies() {
-		if cookie.Name == "sessionKey" && strings.HasPrefix(cookie.Value, "sk-ant-") {
-			session.SessionKey = cookie.Value
+	if resp.status == http.StatusUnauthorized || resp.status == http.StatusForbidden {
+		if claudeWebIsCloudflareChallenge(resp.body) {
+			return nil, fmt.Errorf("claude web api %s blocked by a cloudflare challenge", path)
 		}
-	}
-	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
-		_, _ = io.Copy(io.Discard, res.Body)
 		return nil, errClaudeWebUnauthorized
 	}
-	if res.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, res.Body)
-		return nil, fmt.Errorf("claude web api %s returned %s", path, res.Status)
+	if resp.status != http.StatusOK {
+		return nil, fmt.Errorf("claude web api %s returned status %d", path, resp.status)
 	}
-	return io.ReadAll(io.LimitReader(res.Body, claudeWebMaxBodyBytes))
+	return resp.body, nil
 }
 
 func (c *claudeWebClient) accountEmail(ctx context.Context, session *claudeWebSession) (string, error) {
@@ -310,6 +378,12 @@ func claudeWebBalances(ctx context.Context, wanted map[string]bool) map[string]f
 		}
 	}
 	if len(missing) == 0 {
+		return balances
+	}
+	if !claudeWebTransportReady() {
+		// The transport cannot make requests this run (e.g. the darwin probe
+		// binary is still compiling); leave the rows as they are and let the
+		// next run pick up the ready transport.
 		return balances
 	}
 
