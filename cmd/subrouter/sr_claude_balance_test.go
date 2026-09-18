@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -351,5 +353,77 @@ func TestClaudeWebBalancesReusesStoredSession(t *testing.T) {
 	if len(sessions) != 1 || sessions[0].SessionKey != "sk-ant-rotated" {
 		data, _ := json.Marshal(sessions)
 		t.Fatalf("sessions after renewal = %s", data)
+	}
+}
+
+// binaryCookieRecord builds one Safari binarycookies record with strings laid
+// out after the 56-byte header (size, unknown, flags, unknown, four string
+// offsets, 8-byte end marker, big-endian float64 expiry and creation).
+func binaryCookieRecord(domain, name, path, value string) []byte {
+	stringsBlob := domain + "\x00" + name + "\x00" + path + "\x00" + value + "\x00"
+	record := make([]byte, 56+len(stringsBlob))
+	binary.LittleEndian.PutUint32(record[0:4], uint32(len(record)))
+	nameOffset := 56 + len(domain) + 1
+	pathOffset := nameOffset + len(name) + 1
+	valueOffset := pathOffset + len(path) + 1
+	binary.LittleEndian.PutUint32(record[16:20], 56)
+	binary.LittleEndian.PutUint32(record[20:24], uint32(nameOffset))
+	binary.LittleEndian.PutUint32(record[24:28], uint32(pathOffset))
+	binary.LittleEndian.PutUint32(record[28:32], uint32(valueOffset))
+	binary.BigEndian.PutUint64(record[40:48], math.Float64bits(800000000))
+	binary.BigEndian.PutUint64(record[48:56], math.Float64bits(700000000))
+	copy(record[56:], stringsBlob)
+	return record
+}
+
+// buildBinaryCookiesFixture assembles a single-page binarycookies file.
+func buildBinaryCookiesFixture(records ...[]byte) []byte {
+	page := make([]byte, 8+4*len(records))
+	binary.BigEndian.PutUint32(page[0:4], 0x00000100)
+	binary.LittleEndian.PutUint32(page[4:8], uint32(len(records)))
+	offset := len(page)
+	for i, record := range records {
+		binary.LittleEndian.PutUint32(page[8+4*i:12+4*i], uint32(offset))
+		page = append(page, record...)
+		offset += len(record)
+	}
+	page = append(page, 0, 0, 0, 0) // page footer
+	var be [4]byte
+	data := []byte("cook")
+	binary.BigEndian.PutUint32(be[:], 1)
+	data = append(data, be[:]...)
+	binary.BigEndian.PutUint32(be[:], uint32(len(page)))
+	data = append(data, be[:]...)
+	return append(data, page...)
+}
+
+func TestParseClaudeBinaryCookies(t *testing.T) {
+	fixture := buildBinaryCookiesFixture(
+		binaryCookieRecord(".claude.ai", "sessionKey", "/", "sk-ant-safari-key"),
+		binaryCookieRecord(".example.com", "sessionKey", "/", "sk-ant-wrong-domain"),
+		binaryCookieRecord(".claude.ai", "otherCookie", "/", "sk-ant-wrong-name"),
+		binaryCookieRecord(".claude.ai", "sessionKey", "/", "not-a-session-key"),
+	)
+	got := parseClaudeBinaryCookies(fixture)
+	if len(got) != 1 || got[0] != "sk-ant-safari-key" {
+		t.Fatalf("parseClaudeBinaryCookies = %v", got)
+	}
+}
+
+func TestParseClaudeBinaryCookiesSoftFail(t *testing.T) {
+	valid := buildBinaryCookiesFixture(binaryCookieRecord(".claude.ai", "sessionKey", "/", "sk-ant-safari-key"))
+	cases := map[string][]byte{
+		"empty":            nil,
+		"garbage":          []byte("not a cookies file at all, just text"),
+		"bad magic":        append([]byte("xxxx"), make([]byte, 64)...),
+		"truncated header": []byte("cook\x00"),
+		"zero pages":       []byte("cook\x00\x00\x00\x00"),
+		"absurd pages":     []byte("cook\xff\xff\xff\xff"),
+		"truncated page":   valid[:len(valid)/2],
+	}
+	for name, data := range cases {
+		if got := parseClaudeBinaryCookies(data); len(got) != 0 {
+			t.Errorf("%s: parseClaudeBinaryCookies = %v, want soft-fail", name, got)
+		}
 	}
 }

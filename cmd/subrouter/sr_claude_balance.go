@@ -531,3 +531,83 @@ func decryptChromiumCookieValue(encrypted, key []byte) (string, error) {
 	}
 	return "", errors.New("decrypted cookie value does not look like a token")
 }
+
+// parseClaudeBinaryCookies extracts claude.ai sessionKey values from a Safari
+// binarycookies file. The format: "cook" magic, a big-endian page count and
+// page-size table, then pages that start with 0x00000100 big-endian and carry
+// a little-endian cookie count and offset table. Each record is little-endian
+// u32 size/unknown/flags/unknown/string-offsets followed by big-endian
+// float64 expiry and creation (Mac absolute time) and null-terminated
+// strings; the fixed header is 56 bytes. Every malformed input fails soft:
+// whatever could be parsed is returned, the rest is skipped, so machines
+// without Full Disk Access just fall through the discovery chain.
+func parseClaudeBinaryCookies(data []byte) []string {
+	if len(data) < 8 || string(data[:4]) != "cook" {
+		return nil
+	}
+	numPages := int(binary.BigEndian.Uint32(data[4:8]))
+	if numPages <= 0 || numPages > 4096 || len(data) < 8+4*numPages {
+		return nil
+	}
+	var out []string
+	offset := 8 + 4*numPages
+	for i := 0; i < numPages; i++ {
+		pageSize := int(binary.BigEndian.Uint32(data[8+4*i : 12+4*i]))
+		if pageSize <= 0 || offset+pageSize > len(data) {
+			return out
+		}
+		out = append(out, parseClaudeBinaryCookiePage(data[offset:offset+pageSize])...)
+		offset += pageSize
+	}
+	return out
+}
+
+func parseClaudeBinaryCookiePage(page []byte) []string {
+	if len(page) < 8 || binary.BigEndian.Uint32(page[0:4]) != 0x00000100 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(page[4:8]))
+	if count <= 0 || count > 1<<20 || len(page) < 8+4*count {
+		return nil
+	}
+	var out []string
+	for i := 0; i < count; i++ {
+		recordOffset := int(binary.LittleEndian.Uint32(page[8+4*i : 12+4*i]))
+		if recordOffset < 0 || recordOffset >= len(page) {
+			continue
+		}
+		if value, ok := parseClaudeBinaryCookieRecord(page[recordOffset:]); ok {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func parseClaudeBinaryCookieRecord(record []byte) (string, bool) {
+	// A record needs at least the 56-byte header before any strings.
+	if len(record) < 56 {
+		return "", false
+	}
+	size := int(binary.LittleEndian.Uint32(record[0:4]))
+	if size >= 56 && size < len(record) {
+		record = record[:size]
+	}
+	domain := binaryCookieString(record, int(binary.LittleEndian.Uint32(record[16:20])))
+	name := binaryCookieString(record, int(binary.LittleEndian.Uint32(record[20:24])))
+	value := binaryCookieString(record, int(binary.LittleEndian.Uint32(record[28:32])))
+	if name == "sessionKey" && strings.Contains(domain, "claude.ai") && strings.HasPrefix(value, "sk-ant-") {
+		return value, true
+	}
+	return "", false
+}
+
+func binaryCookieString(record []byte, offset int) string {
+	if offset < 0 || offset >= len(record) {
+		return ""
+	}
+	end := bytes.IndexByte(record[offset:], 0)
+	if end < 0 {
+		return ""
+	}
+	return string(record[offset : offset+end])
+}

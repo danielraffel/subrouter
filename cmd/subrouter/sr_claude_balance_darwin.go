@@ -72,6 +72,29 @@ func discoverClaudeWebSessionKeys(ctx context.Context) []claudeWebSessionKeyCand
 		}
 		out = append(out, firefoxClaudeSessionKeys(ctx, home, family)...)
 	}
+	out = append(out, safariClaudeSessionKeys(home)...)
+	return out
+}
+
+// Safari keeps its cookies in a binarycookies file. Reading it needs no
+// decryption, but on machines without Full Disk Access the read simply fails
+// and Safari falls out of the chain silently.
+var claudeWebSafariCookieFiles = []string{
+	"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+	"Library/Cookies/Cookies.binarycookies",
+}
+
+func safariClaudeSessionKeys(home string) []claudeWebSessionKeyCandidate {
+	var out []claudeWebSessionKeyCandidate
+	for _, rel := range claudeWebSafariCookieFiles {
+		data, err := os.ReadFile(filepath.Join(home, rel))
+		if err != nil {
+			continue
+		}
+		for _, key := range parseClaudeBinaryCookies(data) {
+			out = append(out, claudeWebSessionKeyCandidate{SessionKey: key, Source: "Safari"})
+		}
+	}
 	return out
 }
 
