@@ -1163,10 +1163,17 @@ func TestUsageStatusesIncludesOpenRouterKeyQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/api/v1/key" || request.Header.Get("Authorization") != "Bearer test-openrouter-key" {
-			t.Errorf("unexpected OpenRouter probe path=%q auth=%q", request.URL.Path, request.Header.Get("Authorization"))
+		if request.Header.Get("Authorization") != "Bearer test-openrouter-key" {
+			t.Errorf("unexpected OpenRouter probe auth=%q", request.Header.Get("Authorization"))
 		}
-		_, _ = io.WriteString(w, `{"data":{"limit":200,"limit_remaining":150,"limit_reset":"monthly"}}`)
+		switch request.URL.Path {
+		case "/api/v1/key":
+			_, _ = io.WriteString(w, `{"data":{"limit":200,"limit_remaining":150,"limit_reset":"monthly"}}`)
+		case "/api/v1/credits":
+			_, _ = io.WriteString(w, `{"data":{"total_credits":45,"total_usage":36.904185575}}`)
+		default:
+			t.Errorf("unexpected OpenRouter probe path=%q", request.URL.Path)
+		}
 	}))
 	defer upstream.Close()
 
@@ -1184,7 +1191,9 @@ func TestUsageStatusesIncludesOpenRouterKeyQuota(t *testing.T) {
 	if len(got.Windows) != 1 || got.Windows[0].Name != "monthly" || got.Windows[0].UsedPercent != 25 {
 		t.Fatalf("OpenRouter windows = %+v", got.Windows)
 	}
-	if got.Credits == nil || got.Credits.Balance != "150" {
+	// The balance comes from /credits (total_credits - total_usage), not the
+	// key's monthly spend cap.
+	if got.Credits == nil || got.Credits.Balance != "8.1" {
 		t.Fatalf("OpenRouter credits = %+v", got.Credits)
 	}
 }

@@ -67,7 +67,9 @@ func TestUsageStatusesLiveBoundsKeyedProviderProbeConcurrency(t *testing.T) {
 		t.Fatalf("statuses = %d, want 8", len(statuses))
 	}
 	calls, maximum := transport.counts()
-	if calls != 8 || maximum != accountFetchConcurrency {
-		t.Fatalf("key probe calls/max = %d/%d, want 8/%d", calls, maximum, accountFetchConcurrency)
+	// Each OpenRouter probe makes two sequential calls (key, then credits), so
+	// the concurrency bound is unchanged even though the call count doubled.
+	if calls != 16 || maximum != accountFetchConcurrency {
+		t.Fatalf("key probe calls/max = %d/%d, want 16/%d", calls, maximum, accountFetchConcurrency)
 	}
 }
