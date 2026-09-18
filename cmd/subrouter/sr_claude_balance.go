@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
@@ -486,15 +487,18 @@ func dedupeClaudeWebSessions(sessions []claudeWebSession) []claudeWebSession {
 }
 
 // enrichClaudeRowsWithWebBalances sets extraUsage.CreditsBalance on every
-// Claude row whose email matches a resolved web session. It runs under a
-// short overall timeout and any failure leaves the rows untouched.
+// Claude row whose email matches a resolved web session. Server rows carry
+// the profile name instead of an email when the profile ID is not one, so
+// those are resolved through the local Claude profile store first. It runs
+// under a short overall timeout and any failure leaves the rows untouched.
 func enrichClaudeRowsWithWebBalances(ctx context.Context, rows []srUsageRow) {
+	resolver := newClaudeProfileEmailResolver()
 	wanted := map[string]bool{}
 	for _, row := range rows {
 		if row.provider != accounts.ProviderClaude {
 			continue
 		}
-		if email := strings.ToLower(strings.TrimSpace(row.email)); email != "" {
+		if email := resolver.key(row.email); email != "" {
 			wanted[email] = true
 		}
 	}
@@ -511,12 +515,69 @@ func enrichClaudeRowsWithWebBalances(ctx context.Context, rows []srUsageRow) {
 		if rows[i].provider != accounts.ProviderClaude {
 			continue
 		}
-		balance, ok := balances[strings.ToLower(strings.TrimSpace(rows[i].email))]
+		balance, ok := balances[resolver.key(rows[i].email)]
 		if !ok {
 			continue
 		}
 		applyClaudeWebBalance(&rows[i], balance)
 	}
+}
+
+// claudeProfileEmailResolver maps Claude profile names to the account email
+// recorded in the profile instance's .claude.json (oauthAccount.emailAddress).
+// Lookups are cached per enrichment call and every failure — unknown profile,
+// missing file, missing field — resolves to "", leaving the row untouched.
+type claudeProfileEmailResolver struct {
+	store *agentclaude.Store
+	cache map[string]string
+}
+
+func newClaudeProfileEmailResolver() *claudeProfileEmailResolver {
+	return &claudeProfileEmailResolver{cache: map[string]string{}}
+}
+
+// key returns the lower-cased balance-map key for a row's email field: the
+// email itself when present, else the resolved profile email, else "".
+func (r *claudeProfileEmailResolver) key(name string) string {
+	trimmed := strings.TrimSpace(name)
+	key := strings.ToLower(trimmed)
+	if key == "" || strings.Contains(key, "@") {
+		return key
+	}
+	if email, ok := r.cache[key]; ok {
+		return email
+	}
+	email := r.lookup(trimmed)
+	r.cache[key] = email
+	return email
+}
+
+func (r *claudeProfileEmailResolver) lookup(name string) string {
+	if r.store == nil {
+		store := agentclaude.DefaultStore()
+		r.store = &store
+	}
+	if _, ok := r.store.FindProfile(name); !ok {
+		return ""
+	}
+	dir := r.store.PreferredInstancePath(r.store.InstancePath(name))
+	data, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if err != nil {
+		return ""
+	}
+	var config struct {
+		OAuthAccount struct {
+			EmailAddress string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	email := strings.ToLower(strings.TrimSpace(config.OAuthAccount.EmailAddress))
+	if !strings.Contains(email, "@") {
+		return ""
+	}
+	return email
 }
 
 // applyClaudeWebBalance records the balance on the row's existing extra-usage

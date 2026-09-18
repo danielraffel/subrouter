@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
 // Chromium's macOS cookie key: PBKDF2-SHA1("password", "saltysalt", 1003, 16).
@@ -496,5 +498,59 @@ func TestClaudeWebBalancesTransportNotReady(t *testing.T) {
 	sessions := loadClaudeWebSessions()
 	if len(sessions) != 1 {
 		t.Fatalf("sessions touched while transport not ready: %+v", sessions)
+	}
+}
+
+// Server status rows carry the Claude profile name when the profile ID is not
+// an email; enrichment must resolve it through the local profile store's
+// .claude.json (oauthAccount.emailAddress) before matching the balance map.
+func TestEnrichClaudeRowsResolvesProfileNames(t *testing.T) {
+	claudeWebTestEnv(t)
+
+	// Profile "daniel-raffel" with an instance dir recording the account email.
+	codexDir := storepath.CodexDir()
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	profiles := `{"profiles":{"daniel-raffel":{"name":"daniel-raffel","createdAt":"2026-01-01T00:00:00Z","dir":"daniel-raffel"}}}`
+	if err := os.WriteFile(filepath.Join(codexDir, "claude.json"), []byte(profiles), 0600); err != nil {
+		t.Fatal(err)
+	}
+	instanceDir := filepath.Join(codexDir, "claude", "daniel-raffel")
+	if err := os.MkdirAll(instanceDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"oauthAccount":{"emailAddress":"daniel.raffel@gmail.com"}}`
+	if err := os.WriteFile(filepath.Join(instanceDir, ".claude.json"), []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := claudeWebTestServer(t, "daniel.raffel@gmail.com", "org-1", 365)
+	defer server.Close()
+	claudeWebBaseURL = server.URL
+	claudeWebDiscoverSessionKeys = func(context.Context) []claudeWebSessionKeyCandidate {
+		return []claudeWebSessionKeyCandidate{{SessionKey: "sk-ant-discovered", Source: "test"}}
+	}
+	// Rows already carrying a real email still match directly; serve this one
+	// from a fresh cache entry so the test needs only one web account.
+	saveClaudeWebBalanceCache(claudeWebBalanceCacheFile{Balances: map[string]claudeWebBalanceCacheEntry{
+		"user@example.com": {BalanceCents: 500, FetchedAt: time.Now()},
+	}})
+
+	rows := []srUsageRow{
+		{email: "daniel-raffel", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+		{email: "unknown-name", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+		{email: "user@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth},
+	}
+	enrichClaudeRowsWithWebBalances(context.Background(), rows)
+
+	if rows[0].extraUsage == nil || rows[0].extraUsage.CreditsBalance == nil || *rows[0].extraUsage.CreditsBalance != 365 {
+		t.Fatalf("profile-named row not enriched: %+v", rows[0].extraUsage)
+	}
+	if rows[1].extraUsage != nil {
+		t.Fatalf("unknown profile name was enriched: %+v", rows[1].extraUsage)
+	}
+	if rows[2].extraUsage == nil || rows[2].extraUsage.CreditsBalance == nil || *rows[2].extraUsage.CreditsBalance != 500 {
+		t.Fatalf("direct email row not enriched: %+v", rows[2].extraUsage)
 	}
 }
