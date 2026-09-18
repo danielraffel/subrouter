@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1045,7 +1047,7 @@ func (r *AccountRef) Statuses(ctx context.Context, forceRefresh bool) []AccountS
 			ID:          profile.Name,
 			Provider:    accounts.ProviderClaude,
 			AuthMode:    accounts.AuthModeOAuth,
-			Email:       claudeProfileEmail(profile.Name),
+			Email:       claudeProfileEmail(r.claudeStore, profile.Name),
 			Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
 			AuthChecked: true,
 		}
@@ -1383,7 +1385,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				ID:          profile.Name,
 				Provider:    accounts.ProviderClaude,
 				AuthMode:    accounts.AuthModeOAuth,
-				Email:       claudeProfileEmail(profile.Name),
+				Email:       claudeProfileEmail(r.claudeStore, profile.Name),
 				Source:      r.claudeStore.ClaudeConfigDir(profile.Name),
 				AuthChecked: true,
 			},
@@ -1549,11 +1551,37 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 	return out
 }
 
-func claudeProfileEmail(name string) string {
+// claudeProfileEmail reports the account email for a Claude profile.
+// Email-shaped profile names pass through; anything else (push-time names
+// like "daniel-raffel") is resolved from the profile instance's .claude.json
+// (oauthAccount.emailAddress). Every failure — unknown profile, missing or
+// unparseable file, missing field — yields "", preserving the old behavior of
+// simply not knowing the email.
+func claudeProfileEmail(store agentclaude.Store, name string) string {
 	if strings.Contains(name, "@") {
 		return name
 	}
-	return ""
+	if _, ok := store.FindProfile(name); !ok {
+		return ""
+	}
+	dir := store.PreferredInstancePath(store.InstancePath(name))
+	data, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if err != nil {
+		return ""
+	}
+	var config struct {
+		OAuthAccount struct {
+			EmailAddress string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	email := strings.ToLower(strings.TrimSpace(config.OAuthAccount.EmailAddress))
+	if !strings.Contains(email, "@") {
+		return ""
+	}
+	return email
 }
 
 // claudePoolModel canonicalizes a Claude request model to the quota-pool
