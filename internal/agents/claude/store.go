@@ -1690,7 +1690,7 @@ func (s Store) SetActiveProfile(name string) error {
 }
 
 func (s Store) CreateProfile(name string) (string, error) {
-	if err := ValidateProfileName(name); err != nil {
+	if err := ValidateProfileNameAllowEmail(name); err != nil {
 		return "", err
 	}
 	lock, err := lockProfileRegistry(s.ProfilesPath())
