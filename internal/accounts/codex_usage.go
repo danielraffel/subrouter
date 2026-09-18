@@ -33,8 +33,8 @@ type UsageWindow struct {
 // as off, matching the Claude settings page). DisabledReason, CreditsBalance,
 // and AutoReload are display metadata only — routing stays with Remaining.
 // CreditsBalance is the prepaid credit remainder in cents; the OAuth usage
-// API has only ever returned null for it, so it is carried for completeness,
-// not displayed.
+// API has only ever returned null for it, so `sr status` fills it locally
+// from the claude.ai web session API (see sr_claude_balance.go).
 type ExtraUsageInfo struct {
 	IsEnabled    bool     `json:"is_enabled"`
 	MonthlyLimit *float64 `json:"monthly_limit,omitempty"`

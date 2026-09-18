@@ -1764,6 +1764,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		}()
 	}
 	wg.Wait()
+	enrichClaudeRowsWithWebBalances(ctx, rows)
 	rankUsageRows(rows)
 	return rows, nil
 }
@@ -3316,21 +3317,32 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 	return usageGridCell{Text: "on", Style: ansiGreen}
 }
 
-// usageGridClaudeExtraSpendCell mirrors Claude's own "Monthly spend limit:
-// $X of $Y" line: metered spend used over the cap. The prepaid/promotional
-// credit balance Claude shows separately is not exposed by the OAuth usage
-// API (spend.balance is always null there; the credits endpoints require a
-// browser session cookie), so it cannot be displayed.
+// usageGridClaudeExtraSpendCell renders the prepaid extra-usage balance over
+// the monthly cap ("$3.74/$50.00") when the local claude.ai web enrichment
+// resolved a balance; the OAuth usage API never returns one. Without a known
+// balance it falls back to Claude's "Monthly spend limit: $X of $Y" line:
+// metered spend used over the cap.
 func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
 	extra := claudeExtraUsageForRow(row)
 	if extra == nil || !extra.IsEnabled {
 		return usageGridCell{}
 	}
-	if extra.MonthlyLimit == nil || extra.UsedCredits == nil {
+	if extra.MonthlyLimit == nil {
+		return usageGridCell{Text: "?", Style: ansiYellow}
+	}
+	limit := *extra.MonthlyLimit / 100
+	if extra.CreditsBalance != nil {
+		balance := *extra.CreditsBalance / 100
+		styleName := ansiGreen
+		if balance <= 0 {
+			styleName = ansiYellow
+		}
+		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, limit), Style: styleName}
+	}
+	if extra.UsedCredits == nil {
 		return usageGridCell{Text: "?", Style: ansiYellow}
 	}
 	used := *extra.UsedCredits / 100
-	limit := *extra.MonthlyLimit / 100
 	styleName := ansiGreen
 	if limit-used <= 0 {
 		styleName = ansiYellow

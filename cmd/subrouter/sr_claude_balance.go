@@ -1,0 +1,533 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/storepath"
+)
+
+// Claude's prepaid extra-usage balance is not exposed by the OAuth usage API;
+// it is only served by claude.ai's first-party web JSON API behind a
+// sessionKey browser cookie. This file enriches `sr status` rows locally with
+// that balance, the way CodexBar does. It is display-only: routing decisions
+// never see these values.
+//
+// Security rules for this machinery:
+//   - sessionKey values are secrets. They are never logged and are persisted
+//     only in claude-web-sessions.json under storepath.CodexDir(), mode 0600.
+//   - Cookie reading is read-only and macOS-only (build-tagged); everywhere
+//     else discovery is a no-op stub.
+//   - Any failure leaves status rows exactly as the server/OAuth data
+//     produced them.
+
+const (
+	claudeWebDefaultBaseURL  = "https://claude.ai/api"
+	claudeWebBalanceCacheTTL = 5 * time.Minute
+	claudeWebEnrichTimeout   = 4 * time.Second
+	claudeWebRequestTimeout  = 5 * time.Second
+	claudeWebMaxBodyBytes    = 1 << 20
+)
+
+// claudeWebBaseURL is a variable so tests can point the client at an
+// httptest server.
+var claudeWebBaseURL = claudeWebDefaultBaseURL
+
+// claudeWebDiscoverSessionKeys reads claude.ai sessionKey cookies from local
+// browsers. It is platform-specific: sr_claude_balance_darwin.go installs the
+// real implementation and sr_claude_balance_other.go installs a no-op stub.
+// Tests override and restore it; the discovery path must never touch a real
+// Keychain or browser profile in tests.
+var claudeWebDiscoverSessionKeys func(ctx context.Context) []claudeWebSessionKeyCandidate
+
+type claudeWebSessionKeyCandidate struct {
+	SessionKey string
+	Source     string
+}
+
+// claudeWebSession is a persisted claude.ai web session. SessionKey is a
+// secret: never log it.
+type claudeWebSession struct {
+	SessionKey string `json:"session_key"`
+	Email      string `json:"email,omitempty"`
+	OrgID      string `json:"org_id,omitempty"`
+	Source     string `json:"source,omitempty"`
+}
+
+type claudeWebSessionFile struct {
+	Sessions []claudeWebSession `json:"sessions"`
+}
+
+func claudeWebSessionsPath() string {
+	return filepath.Join(storepath.CodexDir(), "claude-web-sessions.json")
+}
+
+func loadClaudeWebSessions() []claudeWebSession {
+	data, err := os.ReadFile(claudeWebSessionsPath())
+	if err != nil {
+		return nil
+	}
+	var file claudeWebSessionFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return nil
+	}
+	return file.Sessions
+}
+
+// saveClaudeWebSessions persists sessions with owner-only permissions. The
+// file contains session keys, so it must never be world-readable.
+func saveClaudeWebSessions(sessions []claudeWebSession) {
+	writeClaudeWebJSON(claudeWebSessionsPath(), claudeWebSessionFile{Sessions: sessions})
+}
+
+func writeClaudeWebJSON(path string, value any) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	// Rename preserves the temp file's mode, but chmod defensively in case an
+	// older, looser file was replaced.
+	_ = os.Chmod(path, 0600)
+}
+
+// claudeWebBalanceCacheEntry is a disk-cached balance reading so repeated
+// `sr status` runs are instant and claude.ai is not hammered.
+type claudeWebBalanceCacheEntry struct {
+	BalanceCents float64   `json:"balance_cents"`
+	FetchedAt    time.Time `json:"fetched_at"`
+}
+
+type claudeWebBalanceCacheFile struct {
+	Balances map[string]claudeWebBalanceCacheEntry `json:"balances"`
+}
+
+func claudeWebBalanceCachePath() string {
+	return filepath.Join(storepath.CodexDir(), "claude-web-balances.json")
+}
+
+func loadClaudeWebBalanceCache() claudeWebBalanceCacheFile {
+	data, err := os.ReadFile(claudeWebBalanceCachePath())
+	if err != nil {
+		return claudeWebBalanceCacheFile{Balances: map[string]claudeWebBalanceCacheEntry{}}
+	}
+	var file claudeWebBalanceCacheFile
+	if err := json.Unmarshal(data, &file); err != nil || file.Balances == nil {
+		return claudeWebBalanceCacheFile{Balances: map[string]claudeWebBalanceCacheEntry{}}
+	}
+	return file
+}
+
+func saveClaudeWebBalanceCache(cache claudeWebBalanceCacheFile) {
+	writeClaudeWebJSON(claudeWebBalanceCachePath(), cache)
+}
+
+var errClaudeWebUnauthorized = errors.New("claude web session unauthorized")
+
+type claudeWebClient struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+func newClaudeWebClient() *claudeWebClient {
+	return &claudeWebClient{
+		baseURL:    strings.TrimRight(claudeWebBaseURL, "/"),
+		httpClient: &http.Client{Timeout: claudeWebRequestTimeout},
+	}
+}
+
+// get performs a session-authenticated GET and folds a rotated sessionKey
+// from Set-Cookie back into the session so it survives claude.ai's rotation.
+func (c *claudeWebClient) get(ctx context.Context, session *claudeWebSession, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cookie", "sessionKey="+session.SessionKey)
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	for _, cookie := range res.Cookies() {
+		if cookie.Name == "sessionKey" && strings.HasPrefix(cookie.Value, "sk-ant-") {
+			session.SessionKey = cookie.Value
+		}
+	}
+	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
+		_, _ = io.Copy(io.Discard, res.Body)
+		return nil, errClaudeWebUnauthorized
+	}
+	if res.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, res.Body)
+		return nil, fmt.Errorf("claude web api %s returned %s", path, res.Status)
+	}
+	return io.ReadAll(io.LimitReader(res.Body, claudeWebMaxBodyBytes))
+}
+
+func (c *claudeWebClient) accountEmail(ctx context.Context, session *claudeWebSession) (string, error) {
+	body, err := c.get(ctx, session, "/account")
+	if err != nil {
+		return "", err
+	}
+	var response struct {
+		EmailAddress string `json:"email_address"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", err
+	}
+	email := strings.TrimSpace(response.EmailAddress)
+	if email == "" {
+		return "", errors.New("claude web account response has no email_address")
+	}
+	return email, nil
+}
+
+type claudeWebOrganization struct {
+	UUID         string   `json:"uuid"`
+	Name         string   `json:"name"`
+	Capabilities []string `json:"capabilities"`
+}
+
+func (org claudeWebOrganization) hasChatCapability() bool {
+	for _, capability := range org.Capabilities {
+		if strings.EqualFold(strings.TrimSpace(capability), "chat") {
+			return true
+		}
+	}
+	return false
+}
+
+// organizationID picks the first chat-capable org, else the first org, the
+// same defensive selection CodexBar uses.
+func (c *claudeWebClient) organizationID(ctx context.Context, session *claudeWebSession) (string, error) {
+	body, err := c.get(ctx, session, "/organizations")
+	if err != nil {
+		return "", err
+	}
+	var orgs []claudeWebOrganization
+	if err := json.Unmarshal(body, &orgs); err != nil {
+		return "", err
+	}
+	for _, org := range orgs {
+		if org.UUID != "" && org.hasChatCapability() {
+			return org.UUID, nil
+		}
+	}
+	for _, org := range orgs {
+		if org.UUID != "" {
+			return org.UUID, nil
+		}
+	}
+	return "", errors.New("claude web account has no organization")
+}
+
+func (c *claudeWebClient) prepaidBalanceCents(ctx context.Context, session *claudeWebSession, orgID string) (float64, error) {
+	body, err := c.get(ctx, session, "/organizations/"+orgID+"/prepaid/credits")
+	if err != nil {
+		return 0, err
+	}
+	var response struct {
+		Amount   float64 `json:"amount"`
+		Currency string  `json:"currency"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return 0, err
+	}
+	if response.Amount < 0 {
+		return 0, fmt.Errorf("claude web prepaid credits returned negative amount")
+	}
+	return response.Amount, nil
+}
+
+// fetchBalance validates the session with a cheap /api/account call, resolves
+// the organization, and reads the prepaid credit balance in cents. It updates
+// the session in place (email, org, rotated session key).
+func (c *claudeWebClient) fetchBalance(ctx context.Context, session *claudeWebSession) (string, float64, error) {
+	email, err := c.accountEmail(ctx, session)
+	if err != nil {
+		return "", 0, err
+	}
+	session.Email = email
+	if session.OrgID == "" {
+		orgID, err := c.organizationID(ctx, session)
+		if err != nil {
+			return "", 0, err
+		}
+		session.OrgID = orgID
+	}
+	balance, err := c.prepaidBalanceCents(ctx, session, session.OrgID)
+	if err != nil {
+		return "", 0, err
+	}
+	return email, balance, nil
+}
+
+// claudeWebBalances resolves prepaid balances (in cents) for the wanted
+// lower-cased emails, using the disk cache when fresh, then stored sessions,
+// then browser cookie discovery. All failures are silent: whatever could not
+// be resolved is simply absent from the result.
+func claudeWebBalances(ctx context.Context, wanted map[string]bool) map[string]float64 {
+	balances := map[string]float64{}
+	if len(wanted) == 0 {
+		return balances
+	}
+	cache := loadClaudeWebBalanceCache()
+	now := time.Now()
+	missing := map[string]bool{}
+	for email := range wanted {
+		if entry, ok := cache.Balances[email]; ok && now.Sub(entry.FetchedAt) < claudeWebBalanceCacheTTL {
+			balances[email] = entry.BalanceCents
+		} else {
+			missing[email] = true
+		}
+	}
+	if len(missing) == 0 {
+		return balances
+	}
+
+	client := newClaudeWebClient()
+	sessions := loadClaudeWebSessions()
+	keptSessions := make([]claudeWebSession, 0, len(sessions)+1)
+	sessionsChanged := false
+	cacheChanged := false
+
+	for _, session := range sessions {
+		emailKey := strings.ToLower(strings.TrimSpace(session.Email))
+		if emailKey == "" || !missing[emailKey] {
+			keptSessions = append(keptSessions, session)
+			continue
+		}
+		email, balance, err := client.fetchBalance(ctx, &session)
+		if err != nil {
+			if errors.Is(err, errClaudeWebUnauthorized) {
+				// The stored key is dead; drop it so the next run re-reads
+				// browser cookies instead of retrying a known-bad secret.
+				sessionsChanged = true
+				continue
+			}
+			keptSessions = append(keptSessions, session)
+			continue
+		}
+		emailKey = strings.ToLower(email)
+		balances[emailKey] = balance
+		cache.Balances[emailKey] = claudeWebBalanceCacheEntry{BalanceCents: balance, FetchedAt: now}
+		cacheChanged = true
+		delete(missing, emailKey)
+		keptSessions = append(keptSessions, session)
+		sessionsChanged = true
+	}
+
+	if len(missing) > 0 && claudeWebDiscoverSessionKeys != nil {
+		for _, candidate := range claudeWebDiscoverSessionKeys(ctx) {
+			if len(missing) == 0 || ctx.Err() != nil {
+				break
+			}
+			key := strings.TrimSpace(candidate.SessionKey)
+			if !strings.HasPrefix(key, "sk-ant-") || claudeWebSessionKeyKnown(keptSessions, key) {
+				continue
+			}
+			session := claudeWebSession{SessionKey: key, Source: candidate.Source}
+			email, balance, err := client.fetchBalance(ctx, &session)
+			if err != nil {
+				continue
+			}
+			emailKey := strings.ToLower(email)
+			balances[emailKey] = balance
+			cache.Balances[emailKey] = claudeWebBalanceCacheEntry{BalanceCents: balance, FetchedAt: now}
+			cacheChanged = true
+			delete(missing, emailKey)
+			keptSessions = append(keptSessions, session)
+			sessionsChanged = true
+		}
+	}
+
+	if sessionsChanged {
+		saveClaudeWebSessions(dedupeClaudeWebSessions(keptSessions))
+	}
+	if cacheChanged {
+		saveClaudeWebBalanceCache(cache)
+	}
+	return balances
+}
+
+func claudeWebSessionKeyKnown(sessions []claudeWebSession, key string) bool {
+	for _, session := range sessions {
+		if session.SessionKey == key {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupeClaudeWebSessions keeps one session per email (the most recently
+// validated wins) and per key for sessions that never resolved an email.
+func dedupeClaudeWebSessions(sessions []claudeWebSession) []claudeWebSession {
+	out := make([]claudeWebSession, 0, len(sessions))
+	seenKey := map[string]bool{}
+	byEmail := map[string]int{}
+	for _, session := range sessions {
+		if session.SessionKey == "" || seenKey[session.SessionKey] {
+			continue
+		}
+		seenKey[session.SessionKey] = true
+		emailKey := strings.ToLower(strings.TrimSpace(session.Email))
+		if emailKey != "" {
+			if idx, ok := byEmail[emailKey]; ok {
+				out[idx] = session
+				continue
+			}
+			byEmail[emailKey] = len(out)
+		}
+		out = append(out, session)
+	}
+	return out
+}
+
+// enrichClaudeRowsWithWebBalances sets extraUsage.CreditsBalance on every
+// Claude row whose email matches a resolved web session. It runs under a
+// short overall timeout and any failure leaves the rows untouched.
+func enrichClaudeRowsWithWebBalances(ctx context.Context, rows []srUsageRow) {
+	wanted := map[string]bool{}
+	for _, row := range rows {
+		if row.provider != accounts.ProviderClaude {
+			continue
+		}
+		if email := strings.ToLower(strings.TrimSpace(row.email)); email != "" {
+			wanted[email] = true
+		}
+	}
+	if len(wanted) == 0 {
+		return
+	}
+	enrichCtx, cancel := context.WithTimeout(ctx, claudeWebEnrichTimeout)
+	defer cancel()
+	balances := claudeWebBalances(enrichCtx, wanted)
+	if len(balances) == 0 {
+		return
+	}
+	for i := range rows {
+		if rows[i].provider != accounts.ProviderClaude {
+			continue
+		}
+		balance, ok := balances[strings.ToLower(strings.TrimSpace(rows[i].email))]
+		if !ok {
+			continue
+		}
+		applyClaudeWebBalance(&rows[i], balance)
+	}
+}
+
+// applyClaudeWebBalance records the balance on the row's existing extra-usage
+// metadata when present — including the synthetic "extra" window local rows
+// carry, which must not be shadowed by a fresh row-level value — and creates
+// the ExtraUsageInfo when the server sent none.
+func applyClaudeWebBalance(row *srUsageRow, balanceCents float64) {
+	balance := balanceCents
+	if extra := claudeExtraUsageForRow(*row); extra != nil {
+		extra.CreditsBalance = &balance
+		return
+	}
+	row.extraUsage = &accounts.ExtraUsageInfo{CreditsBalance: &balance}
+}
+
+// pbkdf2SHA1 derives a key per RFC 2898 with HMAC-SHA1. Chromium's macOS
+// cookie key is PBKDF2-SHA1(password, salt "saltysalt", 1003 iterations, 16
+// bytes); this hand-rolled implementation avoids a golang.org/x/crypto
+// dependency.
+func pbkdf2SHA1(password, salt []byte, iterations, keyLen int) []byte {
+	prf := hmac.New(sha1.New, password)
+	hashLen := prf.Size()
+	numBlocks := (keyLen + hashLen - 1) / hashLen
+	var dk []byte
+	var blockBuf [4]byte
+	for block := 1; block <= numBlocks; block++ {
+		prf.Reset()
+		_, _ = prf.Write(salt)
+		binary.BigEndian.PutUint32(blockBuf[:], uint32(block))
+		_, _ = prf.Write(blockBuf[:])
+		u := prf.Sum(nil)
+		t := make([]byte, hashLen)
+		copy(t, u)
+		for i := 1; i < iterations; i++ {
+			prf.Reset()
+			_, _ = prf.Write(u)
+			u = prf.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		dk = append(dk, t...)
+	}
+	return dk[:keyLen]
+}
+
+// decryptChromiumCookieValue decrypts a Chromium "v10" cookie value:
+// AES-128-CBC with the PBKDF2-derived key and an IV of 16 space bytes.
+// Chrome 80+ prepends a SHA256 of the host key to the plaintext; when the
+// plaintext does not itself look like a token, that prefix is stripped.
+func decryptChromiumCookieValue(encrypted, key []byte) (string, error) {
+	if !bytes.HasPrefix(encrypted, []byte("v10")) {
+		return "", errors.New("chromium cookie value is not v10 encrypted")
+	}
+	payload := encrypted[len("v10"):]
+	if len(payload) == 0 || len(payload)%aes.BlockSize != 0 {
+		return "", errors.New("chromium cookie value has invalid length")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	iv := bytes.Repeat([]byte(" "), aes.BlockSize)
+	plain := make([]byte, len(payload))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, payload)
+	if len(plain) == 0 {
+		return "", errors.New("chromium cookie value is empty")
+	}
+	padding := int(plain[len(plain)-1])
+	if padding == 0 || padding > aes.BlockSize || padding > len(plain) {
+		return "", errors.New("chromium cookie value has invalid padding")
+	}
+	for _, b := range plain[len(plain)-padding:] {
+		if int(b) != padding {
+			return "", errors.New("chromium cookie value has invalid padding")
+		}
+	}
+	plain = plain[:len(plain)-padding]
+	if text := string(plain); strings.HasPrefix(text, "sk-") {
+		return text, nil
+	}
+	if len(plain) > sha256.Size {
+		if text := string(plain[sha256.Size:]); strings.HasPrefix(text, "sk-") {
+			return text, nil
+		}
+	}
+	return "", errors.New("decrypted cookie value does not look like a token")
+}
