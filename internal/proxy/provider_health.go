@@ -74,7 +74,17 @@ func ProbeProviderKeyStatus(ctx context.Context, client *http.Client, provider a
 	}
 	probe.State = "auth ok"
 	if provider == accounts.ProviderOpenRouter {
-		return decodeOpenRouterKeyProbe(probe, res.Body)
+		probe = decodeOpenRouterKeyProbe(probe, res.Body)
+		// /auth/key reports the key's monthly spend cap, not the pay-as-you-go
+		// account balance; the balance lives at /credits. Override only on a
+		// clean read so a credits failure keeps the cap-based fallback.
+		if balance, ok := fetchOpenRouterCreditsBalance(ctx, &probeClient, url, token); ok {
+			if probe.Credits == nil {
+				probe.Credits = &accounts.CreditsInfo{HasCredits: true}
+			}
+			probe.Credits.Balance = strconv.FormatFloat(math.Round(balance*100)/100, 'f', -1, 64)
+		}
+		return probe
 	}
 	var payload struct {
 		Data []struct{} `json:"data"`
@@ -129,4 +139,46 @@ func decodeOpenRouterKeyProbe(probe ProviderKeyProbe, body io.Reader) ProviderKe
 	probe.Windows = []accounts.UsageWindow{{Name: cadence, UsedPercent: usedPercent, LimitWindowSeconds: windowSeconds}}
 	probe.Credits = &accounts.CreditsInfo{HasCredits: true, Balance: strconv.FormatFloat(remaining, 'f', -1, 64)}
 	return probe
+}
+
+// fetchOpenRouterCreditsBalance reads the pay-as-you-go account balance from
+// /api/v1/credits (total_credits - total_usage, clamped at zero). The health
+// URL ends in the registry-declared "/key" path, so the credits endpoint sits
+// alongside it. Any failure — transport, non-2xx, malformed or non-finite
+// numbers — reports ok=false and the caller keeps the cap-based balance.
+func fetchOpenRouterCreditsBalance(ctx context.Context, client *http.Client, healthURL, token string) (float64, bool) {
+	creditsURL := strings.TrimSuffix(healthURL, "/key") + "/credits"
+	if creditsURL == healthURL {
+		return 0, false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, creditsURL, nil)
+	if err != nil {
+		return 0, false
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := client.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return 0, false
+	}
+	var payload struct {
+		Data struct {
+			TotalCredits *float64 `json:"total_credits"`
+			TotalUsage   *float64 `json:"total_usage"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&payload) != nil ||
+		payload.Data.TotalCredits == nil || payload.Data.TotalUsage == nil {
+		return 0, false
+	}
+	credits, usage := *payload.Data.TotalCredits, *payload.Data.TotalUsage
+	if credits < 0 || usage < 0 ||
+		math.IsNaN(credits) || math.IsInf(credits, 0) ||
+		math.IsNaN(usage) || math.IsInf(usage, 0) {
+		return 0, false
+	}
+	return math.Max(0, credits-usage), true
 }

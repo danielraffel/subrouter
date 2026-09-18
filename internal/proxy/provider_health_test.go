@@ -39,16 +39,21 @@ func TestProbeProviderKeyDoesNotForwardCredentialsAcrossRedirects(t *testing.T) 
 
 func TestProbeOpenRouterKeyStatus(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      int
-		body        string
-		wantState   string
-		wantQuota   string
-		wantKnown   bool
-		wantUsed    float64
-		wantBalance string
+		name          string
+		status        int
+		body          string
+		creditsStatus int
+		creditsBody   string
+		wantState     string
+		wantQuota     string
+		wantKnown     bool
+		wantUsed      float64
+		wantBalance   string
 	}{
 		{name: "finite monthly limit", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.5"},
+		{name: "account balance from credits", status: http.StatusOK, body: `{"data":{"limit":40,"limit_remaining":40,"limit_reset":"monthly"}}`, creditsStatus: http.StatusOK, creditsBody: `{"data":{"total_credits":45,"total_usage":36.904185575}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 0, wantBalance: "8.1"},
+		{name: "credits endpoint fails falls back to cap", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, creditsStatus: http.StatusInternalServerError, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "74.5"},
+		{name: "credits overuse clamps to zero", status: http.StatusOK, body: `{"data":{"limit":100,"limit_remaining":74.5,"limit_reset":"monthly"}}`, creditsStatus: http.StatusOK, creditsBody: `{"data":{"total_credits":10,"total_usage":12.5}}`, wantState: "auth ok", wantQuota: "live", wantKnown: true, wantUsed: 25.5, wantBalance: "0"},
 		{name: "unlimited key", status: http.StatusOK, body: `{"data":{"limit":null,"limit_remaining":null,"limit_reset":null}}`, wantState: "auth ok"},
 		{name: "exhausted", status: http.StatusOK, body: `{"data":{"limit":10,"limit_remaining":0,"limit_reset":"weekly"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0"},
 		{name: "zero limit", status: http.StatusOK, body: `{"data":{"limit":0,"limit_remaining":0,"limit_reset":"daily"}}`, wantState: "auth ok", wantQuota: "exhausted", wantKnown: true, wantUsed: 100, wantBalance: "0"},
@@ -58,21 +63,41 @@ func TestProbeOpenRouterKeyStatus(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			var creditsHits atomic.Int32
 			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				if request.URL.Path != "/api/v1/key" {
-					t.Errorf("probe path = %q, want /api/v1/key", request.URL.Path)
-				}
 				if request.Header.Get("Authorization") != "Bearer test-openrouter-key" {
 					t.Errorf("Authorization = %q", request.Header.Get("Authorization"))
 				}
-				w.WriteHeader(test.status)
-				_, _ = io.WriteString(w, test.body)
+				switch request.URL.Path {
+				case "/api/v1/key":
+					w.WriteHeader(test.status)
+					_, _ = io.WriteString(w, test.body)
+				case "/api/v1/credits":
+					creditsHits.Add(1)
+					if test.creditsStatus == 0 {
+						http.NotFound(w, request)
+						return
+					}
+					w.WriteHeader(test.creditsStatus)
+					_, _ = io.WriteString(w, test.creditsBody)
+				default:
+					t.Errorf("probe path = %q, want /api/v1/key or /api/v1/credits", request.URL.Path)
+				}
 			}))
 			defer provider.Close()
 
 			probe := ProbeProviderKeyStatus(context.Background(), provider.Client(), accounts.ProviderOpenRouter, provider.URL+"/api/v1", "test-openrouter-key")
 			if probe.State != test.wantState || probe.QuotaStatus != test.wantQuota || probe.QuotaUsageKnown != test.wantKnown {
 				t.Fatalf("probe = %+v", probe)
+			}
+			// The credits call happens exactly once, and only after the key
+			// auth succeeded.
+			wantCreditsHits := 0
+			if test.wantState == "auth ok" {
+				wantCreditsHits = 1
+			}
+			if got := int(creditsHits.Load()); got != wantCreditsHits {
+				t.Fatalf("credits hits = %d, want %d", got, wantCreditsHits)
 			}
 			if !test.wantKnown {
 				if len(probe.Windows) != 0 || probe.Credits != nil {
