@@ -554,3 +554,70 @@ func TestEnrichClaudeRowsResolvesProfileNames(t *testing.T) {
 		t.Fatalf("direct email row not enriched: %+v", rows[2].extraUsage)
 	}
 }
+
+func TestPushClaudeWebBalances(t *testing.T) {
+	type push struct {
+		Email        string  `json:"email"`
+		BalanceCents float64 `json:"balance_cents"`
+	}
+	var got []push
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_subrouter/claude-web-balance" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var p push
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			http.Error(w, "bad", http.StatusBadRequest)
+			return
+		}
+		got = append(got, p)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	runner := srRunner{}
+	config := srServerConfig{Name: "test", URL: server.URL, requestClient: server.Client()}
+	runner.pushClaudeWebBalances(context.Background(), config, map[string]float64{"user@example.com": 365})
+	if len(got) != 1 || got[0].Email != "user@example.com" || got[0].BalanceCents != 365 {
+		t.Fatalf("pushes = %+v", got)
+	}
+
+	// Push failures are silent: a dead server must not error, hang, or panic.
+	server.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runner.pushClaudeWebBalances(context.Background(), config, map[string]float64{"user@example.com": 365})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("push to a dead server did not return")
+	}
+}
+
+// The fan-out only pushes what was freshly fetched; cache hits are excluded.
+func TestClaudeWebBalancesFreshReporting(t *testing.T) {
+	claudeWebTestEnv(t)
+	server := claudeWebTestServer(t, "user@example.com", "org-1", 900)
+	defer server.Close()
+	claudeWebBaseURL = server.URL
+	claudeWebDiscoverSessionKeys = func(context.Context) []claudeWebSessionKeyCandidate { return nil }
+
+	saveClaudeWebBalanceCache(claudeWebBalanceCacheFile{Balances: map[string]claudeWebBalanceCacheEntry{
+		"cached@example.com": {BalanceCents: 100, FetchedAt: time.Now()},
+	}})
+	saveClaudeWebSessions([]claudeWebSession{{SessionKey: "sk-ant-stored", Email: "user@example.com"}})
+
+	balances, fresh := claudeWebBalancesWithFresh(context.Background(), map[string]bool{
+		"user@example.com":   true,
+		"cached@example.com": true,
+	})
+	if balances["user@example.com"] != 900 || balances["cached@example.com"] != 100 {
+		t.Fatalf("balances = %v", balances)
+	}
+	if len(fresh) != 1 || fresh["user@example.com"] != 900 {
+		t.Fatalf("fresh = %v, want only the network-fetched balance", fresh)
+	}
+}

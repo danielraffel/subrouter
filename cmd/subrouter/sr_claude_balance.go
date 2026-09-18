@@ -364,9 +364,18 @@ func (c *claudeWebClient) fetchBalance(ctx context.Context, session *claudeWebSe
 // then browser cookie discovery. All failures are silent: whatever could not
 // be resolved is simply absent from the result.
 func claudeWebBalances(ctx context.Context, wanted map[string]bool) map[string]float64 {
+	balances, _ := claudeWebBalancesWithFresh(ctx, wanted)
+	return balances
+}
+
+// claudeWebBalancesWithFresh additionally reports the balances that were
+// fetched from the network during this call (cache hits excluded), so callers
+// can fan those out to the server for clients without a local web session.
+func claudeWebBalancesWithFresh(ctx context.Context, wanted map[string]bool) (map[string]float64, map[string]float64) {
 	balances := map[string]float64{}
+	fresh := map[string]float64{}
 	if len(wanted) == 0 {
-		return balances
+		return balances, fresh
 	}
 	cache := loadClaudeWebBalanceCache()
 	now := time.Now()
@@ -379,13 +388,13 @@ func claudeWebBalances(ctx context.Context, wanted map[string]bool) map[string]f
 		}
 	}
 	if len(missing) == 0 {
-		return balances
+		return balances, fresh
 	}
 	if !claudeWebTransportReady() {
 		// The transport cannot make requests this run (e.g. the darwin probe
 		// binary is still compiling); leave the rows as they are and let the
 		// next run pick up the ready transport.
-		return balances
+		return balances, fresh
 	}
 
 	client := newClaudeWebClient()
@@ -413,6 +422,7 @@ func claudeWebBalances(ctx context.Context, wanted map[string]bool) map[string]f
 		}
 		emailKey = strings.ToLower(email)
 		balances[emailKey] = balance
+		fresh[emailKey] = balance
 		cache.Balances[emailKey] = claudeWebBalanceCacheEntry{BalanceCents: balance, FetchedAt: now}
 		cacheChanged = true
 		delete(missing, emailKey)
@@ -436,6 +446,7 @@ func claudeWebBalances(ctx context.Context, wanted map[string]bool) map[string]f
 			}
 			emailKey := strings.ToLower(email)
 			balances[emailKey] = balance
+			fresh[emailKey] = balance
 			cache.Balances[emailKey] = claudeWebBalanceCacheEntry{BalanceCents: balance, FetchedAt: now}
 			cacheChanged = true
 			delete(missing, emailKey)
@@ -450,7 +461,7 @@ func claudeWebBalances(ctx context.Context, wanted map[string]bool) map[string]f
 	if cacheChanged {
 		saveClaudeWebBalanceCache(cache)
 	}
-	return balances
+	return balances, fresh
 }
 
 func claudeWebSessionKeyKnown(sessions []claudeWebSession, key string) bool {
@@ -492,6 +503,14 @@ func dedupeClaudeWebSessions(sessions []claudeWebSession) []claudeWebSession {
 // those are resolved through the local Claude profile store first. It runs
 // under a short overall timeout and any failure leaves the rows untouched.
 func enrichClaudeRowsWithWebBalances(ctx context.Context, rows []srUsageRow) {
+	enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
+}
+
+// enrichClaudeRowsWithWebBalancesFresh enriches like
+// enrichClaudeRowsWithWebBalances and additionally returns the balances that
+// were freshly fetched from claude.ai during this call (cache hits excluded),
+// so the caller can fan them out to the server.
+func enrichClaudeRowsWithWebBalancesFresh(ctx context.Context, rows []srUsageRow) map[string]float64 {
 	resolver := newClaudeProfileEmailResolver()
 	wanted := map[string]bool{}
 	for _, row := range rows {
@@ -503,13 +522,13 @@ func enrichClaudeRowsWithWebBalances(ctx context.Context, rows []srUsageRow) {
 		}
 	}
 	if len(wanted) == 0 {
-		return
+		return nil
 	}
 	enrichCtx, cancel := context.WithTimeout(ctx, claudeWebEnrichTimeout)
 	defer cancel()
-	balances := claudeWebBalances(enrichCtx, wanted)
+	balances, fresh := claudeWebBalancesWithFresh(enrichCtx, wanted)
 	if len(balances) == 0 {
-		return
+		return fresh
 	}
 	for i := range rows {
 		if rows[i].provider != accounts.ProviderClaude {
@@ -521,6 +540,7 @@ func enrichClaudeRowsWithWebBalances(ctx context.Context, rows []srUsageRow) {
 		}
 		applyClaudeWebBalance(&rows[i], balance)
 	}
+	return fresh
 }
 
 // claudeProfileEmailResolver maps Claude profile names to the account email
