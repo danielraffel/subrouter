@@ -5092,11 +5092,24 @@ func streamWebSocketMessage(
 const webSocketCloseWriteTimeout = time.Second
 
 const (
-	maxWebSocketMessageBytes     = 8 << 20
-	webSocketCopyChunkBytes      = 32 << 10
-	webSocketForwardBudgetBytes  = 32 << 20
+	// maxWebSocketMessageBytes caps one websocket message. Codex realtime
+	// sessions embed base64 screenshots in request messages, so image-heavy
+	// turns legitimately run to tens of MiB; 64 MiB covers those while still
+	// bounding per-message memory.
+	maxWebSocketMessageBytes = 64 << 20
+	webSocketCopyChunkBytes  = 32 << 10
+	// webSocketForwardBudgetBytes bounds outstanding copy chunks across all
+	// connections. Chunks are 32 KiB regardless of message size, so the
+	// forward budget does not scale with the message cap.
+	webSocketForwardBudgetBytes = 32 << 20
+	// webSocketInspectMessageBytes keeps every legal message fully
+	// inspectable (transcript capture plus failure-class sniffing), so it
+	// follows the message cap.
 	webSocketInspectMessageBytes = maxWebSocketMessageBytes
-	webSocketInspectBudgetBytes  = 32 << 20
+	// webSocketInspectBudgetBytes bounds captured message bytes outstanding
+	// across all connections; 4× the message cap lets one full-size message
+	// capture while other connections keep inspecting.
+	webSocketInspectBudgetBytes = 4 * maxWebSocketMessageBytes
 )
 
 var (
