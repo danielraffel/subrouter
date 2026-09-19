@@ -7409,12 +7409,10 @@ func providerOverloadBackoffAt(header http.Header, retry int, now time.Time) tim
 	return wait
 }
 
-// sleepCtx waits for d or until ctx is cancelled, using the injected sleep when
-// present (tests) and a real timer otherwise.
-func (t usageLimitRetryTransport) sleepCtx(ctx context.Context, d time.Duration) error {
-	if t.sleep != nil {
-		return t.sleep(ctx, d)
-	}
+// retrySleep is the default backoff wait for retry transports. It is a
+// package variable so handler-level tests (which have no transport sleep
+// injection point) can keep retries off real timers.
+var retrySleep = func(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
@@ -7423,6 +7421,15 @@ func (t usageLimitRetryTransport) sleepCtx(ctx context.Context, d time.Duration)
 	case <-timer.C:
 		return nil
 	}
+}
+
+// sleepCtx waits for d or until ctx is cancelled, using the injected sleep when
+// present (tests) and a real timer otherwise.
+func (t usageLimitRetryTransport) sleepCtx(ctx context.Context, d time.Duration) error {
+	if t.sleep != nil {
+		return t.sleep(ctx, d)
+	}
+	return retrySleep(ctx, d)
 }
 
 // responseUsageLimited separates "try another account for this request" from
@@ -7859,6 +7866,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		tried[accountID] = struct{}{}
 	}
 	overloadRetries := 0
+	capacityRetries := 0
 	claudeExtraUsageRetried := false
 	sealedStripped := false
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -7961,11 +7969,50 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return response, nil
 			}
 		}
+		// Codex capacity failures arrive as a bare 5xx, as a capacity message
+		// inside a 4xx body (sniffed after the usage-limit inspection claims
+		// its own), or — most commonly — as an overload or quota rejection
+		// smuggled inside an HTTP 200 stream before the first output event.
+		// Peek at the stream start now, while the response can still be
+		// replayed on another account before the client sees a byte; a stream
+		// that already produced output is returned untouched and never
+		// replayed.
+		codexCapacity := false
+		peekUsageLimited := false
 		modelUnsupported := false
+		if t.provider == accounts.ProviderCodex {
+			if response.StatusCode >= 500 && response.StatusCode <= 599 {
+				codexCapacity = true
+			} else if response.StatusCode == http.StatusOK {
+				class, failurePayload, peekErr := peekCodexBootstrapFailure(response)
+				if peekErr != nil {
+					// Deliver whatever was buffered through the normal path,
+					// exactly as an uninspected response would be delivered.
+					if t.logger != nil {
+						t.logger.Warn("codex bootstrap inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", peekErr)
+					}
+				} else {
+					switch class {
+					case codexFailureServer:
+						if codexChatGPTModelUnsupportedJSON(failurePayload) {
+							// Model incompatibility has its own marking and
+							// reroute path below; it is not capacity.
+							modelUnsupported = true
+						} else {
+							codexCapacity = true
+						}
+					case codexFailureQuota:
+						peekUsageLimited = true
+					}
+				}
+			}
+		}
 		var inspectErr error
 		switch t.provider {
 		case accounts.ProviderCodex:
-			modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+			if !modelUnsupported {
+				modelUnsupported, inspectErr = responseCodexChatGPTModelUnsupported(response)
+			}
 		case accounts.ProviderKimi:
 			modelUnsupported, inspectErr = responseKimiModelCapabilityFailure(response)
 		}
@@ -7976,7 +8023,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			return response, nil
 		}
 		usageLimited, exhausted, credentialFailure := false, false, false
-		if !modelUnsupported {
+		if peekUsageLimited {
+			// A streamed quota rejection found by the bootstrap peek fails
+			// over exactly like its 4xx twin.
+			usageLimited, exhausted = true, true
+		}
+		if !modelUnsupported && !usageLimited {
 			usageLimited, exhausted, credentialFailure, inspectErr = t.responseUsageLimited(response)
 			if inspectErr != nil {
 				if t.logger != nil {
@@ -7988,7 +8040,20 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				t.logAntigravityUnusableResponse(response, accountID)
 			}
 		}
-		if !usageLimited && !modelUnsupported {
+		if t.provider == accounts.ProviderCodex && !codexCapacity && !usageLimited && !modelUnsupported &&
+			response.StatusCode >= 400 && response.StatusCode < 500 {
+			// Codex sometimes reports model capacity as a 4xx (even 400)
+			// instead of 503; the message text is the only signal.
+			capacity, sniffErr := sniffCodexCapacityResponse(response)
+			if sniffErr != nil {
+				if t.logger != nil {
+					t.logger.Warn("codex capacity inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", sniffErr)
+				}
+				return response, nil
+			}
+			codexCapacity = capacity
+		}
+		if !usageLimited && !modelUnsupported && !codexCapacity {
 			if err := t.commitSuccessfulFailover(response, attempt, accountID); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
@@ -7996,6 +8061,99 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				return nil, err
 			}
 			return response, nil
+		}
+		if t.provider == accounts.ProviderCodex && codexCapacity {
+			// Codex capacity retry: first the same account (capacity often
+			// clears in seconds and the prompt cache stays warm), then another
+			// account — capacity can be one backend cell, and the failed
+			// account earns a short pool-scoped cooldown so concurrent
+			// requests dodge it too. The request is never replayed once the
+			// client has seen output; giving up delivers the failure exactly
+			// as the upstream sent it.
+			if capacityRetries >= codexCapacityMaxRetries || !t.budget.consume() {
+				if t.logger != nil {
+					t.logger.Warn("codex capacity retries exhausted; passing failure through", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "capacity_retries", capacityRetries)
+				}
+				// Deliver through the ordinary success path: for a streamed
+				// failure this installs the deferred-commit wrapper, which
+				// keeps the sticky assignment unless a successful terminal
+				// event arrives — exactly how an uninspected failure stream
+				// is delivered.
+				if err := t.commitSuccessfulFailover(response, attempt, accountID); err != nil {
+					if response.Body != nil {
+						_ = response.Body.Close()
+					}
+					return nil, err
+				}
+				return response, nil
+			}
+			wait := codexCapacityBackoffAt(response.Header, capacityRetries, time.Now())
+			capacityRetries++
+			if capacityRetries > 1 && t.server != nil {
+				if nextAccount, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false); pickErr == nil {
+					if t.server.SchedulerRef != nil {
+						t.server.SchedulerRef.MarkExhaustedUntil(schedulerAccountProvider(t.provider), accountID, selectacct.ModelKey(t.poolModel), time.Now().Add(codexCapacityCooldownTTL))
+					}
+					if response.Body != nil {
+						_ = response.Body.Close()
+					}
+					if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
+						return nil, sleepErr
+					}
+					body, bodyErr := req.GetBody()
+					if bodyErr != nil {
+						return nil, bodyErr
+					}
+					previousAccount := accountID
+					accountID = nextAccount.ID
+					accountCredential = nextAccount.CredentialIdentity()
+					tried[accountID] = struct{}{}
+					if t.server.SchedulerRef != nil {
+						t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+					}
+					attemptReq = req.Clone(req.Context())
+					attemptReq.Body = body
+					attemptReq.GetBody = req.GetBody
+					attemptReq.ContentLength = req.ContentLength
+					if nextUpstream := t.server.upstreamForRequest(t.path, nextAccount); nextUpstream != nil {
+						attemptReq.URL.Scheme = nextUpstream.Scheme
+						attemptReq.URL.Host = nextUpstream.Host
+						attemptReq.URL.User = nextUpstream.User
+						attemptReq.URL.Path = joinURLPath(nextUpstream.Path, t.server.pathForUpstream(t.path, nextAccount))
+						attemptReq.URL.RawPath = ""
+					}
+					setAccountAuthHeaders(attemptReq.Header, nextAccount, t.poolModel)
+					if t.logger != nil {
+						t.logger.Warn("retrying codex request on another account after capacity failure", "agent", t.agent, "session", t.session, "previous_account", previousAccount, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "wait", wait.String(), "capacity_retry", capacityRetries, "attempt", attempt+1, "max_attempts", maxAttempts)
+					}
+					continue
+				}
+				// No alternate account: fall through to a same-account retry.
+			}
+			if t.logger != nil {
+				t.logger.Warn("retrying codex request after capacity failure", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "status", response.StatusCode, "wait", wait.String(), "capacity_retry", capacityRetries)
+			}
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
+				return nil, sleepErr
+			}
+			body, bodyErr := req.GetBody()
+			if bodyErr != nil {
+				return nil, bodyErr
+			}
+			// Preserve the CURRENT attempt's headers: after an earlier account
+			// failover attemptReq carries that account's auth, and cloning from
+			// the original req would silently revert to the first account.
+			currentHeader := attemptReq.Header.Clone()
+			attemptReq = req.Clone(req.Context())
+			attemptReq.Body = body
+			attemptReq.GetBody = req.GetBody
+			attemptReq.ContentLength = req.ContentLength
+			attemptReq.Header = currentHeader
+			attempt-- // same-account capacity retry spends no failover slot
+			continue
 		}
 		exhaustionPool := selectacct.ModelKey(t.poolModel)
 		if t.provider == accounts.ProviderCodex && usageLimited {
