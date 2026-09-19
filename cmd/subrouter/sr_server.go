@@ -1102,6 +1102,12 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
 		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
+		qwenQuotas, qwenApplied, qwenFresh := enrichQwenRowsWithCookieQuotaFresh(ctx, rows)
+		if qwenApplied {
+			// The cookie overlay changes quota windows, so re-rank before
+			// display and before the pick recommendation reads scores.
+			rankUsageRows(rows)
+		}
 		fmt.Fprintf(r.out, "Server: %s (%s)\n", server.Name, redactedServerURL(server.URL))
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
@@ -1109,6 +1115,11 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
 		r.pushClaudeWebBalances(ctx, server, fresh)
+		if qwenFresh {
+			for _, quota := range qwenQuotas {
+				r.pushQwenCookieQuota(ctx, server, quota)
+			}
+		}
 		return nil
 	}
 	res, err := r.fetchServerAccountsResponse(ctx, server)
@@ -1589,9 +1600,25 @@ func addServerAdminAuth(req *http.Request, server srServerConfig) {
 // in usage-status. Display-only: every failure is silent, and the whole push
 // runs under its own short timeout off the status display path.
 func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConfig, balances map[string]float64) {
-	if len(balances) == 0 {
+	for email, cents := range balances {
+		r.postServerTelemetry(ctx, server, "/_subrouter/claude-web-balance", map[string]any{"email": email, "balance_cents": cents})
+	}
+}
+
+// pushQwenCookieQuota fans a freshly fetched cookie-derived Qwen quota reading
+// out to the server so clients without a Qwen Cloud browser session still see
+// quota in usage-status.
+func (r srRunner) pushQwenCookieQuota(ctx context.Context, server srServerConfig, quota qwenCookieQuota) {
+	if quota.email == "" || len(quota.windows) == 0 {
 		return
 	}
+	r.postServerTelemetry(ctx, server, "/_subrouter/qwen-quota", map[string]any{"email": quota.email, "windows": quota.windows})
+}
+
+// postServerTelemetry pushes one display-only telemetry payload to a server
+// endpoint. Every failure is silent, and pushes run under their own short
+// timeout off the status display path.
+func (r srRunner) postServerTelemetry(ctx context.Context, server srServerConfig, path string, payload map[string]any) {
 	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
 		return
@@ -1602,24 +1629,22 @@ func (r srRunner) pushClaudeWebBalances(ctx context.Context, server srServerConf
 	}
 	pushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	for email, cents := range balances {
-		body, err := json.Marshal(map[string]any{"email": email, "balance_cents": cents})
-		if err != nil {
-			continue
-		}
-		req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, baseURL+"/_subrouter/claude-web-balance", bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		addServerAdminAuth(req, server)
-		res, err := secured.Do(req)
-		if err != nil {
-			continue
-		}
-		_, _ = io.Copy(io.Discard, res.Body)
-		res.Body.Close()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
 	}
+	req, err := http.NewRequestWithContext(pushCtx, http.MethodPost, baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	addServerAdminAuth(req, server)
+	res, err := secured.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, res.Body)
+	res.Body.Close()
 }
 
 func (r srRunner) serverInstall(ctx context.Context, store srServerStore, args []string) error {

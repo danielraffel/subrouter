@@ -762,11 +762,21 @@ not claim that a generation was spent or that quota remains. Other vendors
 remain `not exposed` when no quota API is available.
 
 The console credential is used only for optional quota telemetry and currently
-contains an Alibaba access token, not a refresh-token chain. If Alibaba returns
-`BailianGateway.Login.NotLogined`, routing with the stored model key remains
-valid while the status row says `login needed`; repeat `sr qwen login` for that
-account to restore telemetry. This is separate from model-key health and does
-not disable the account for routing.
+contains an Alibaba access token, not a refresh-token chain. When it expires,
+the CLI falls back to the Alibaba Cloud Model Studio console
+(`modelstudio.console.alibabacloud.com`) login cookies in local browsers (the
+same read-only cookie mechanism as the Claude prepaid balance):
+`sr status` overlays live quota from the web session and pushes it to the
+server, which re-shares it to every client (`POST /_subrouter/qwen-quota`, 24h
+TTL). If neither path has a live session the row says `login needed`; repeat
+`sr qwen login` for that account to restore telemetry. This is separate from
+model-key health and does not disable the account for routing.
+
+Browser-sourced telemetry — Qwen quota and the Claude prepaid extra-usage
+balance alike — is gathered wherever a browser session exists and distributed
+by the proxy. For the freshest data on every client, sign in on the machine
+that hosts the proxy; its CLI publishes what it reads and the server fans it
+out. Clients never need their own browser login.
 
 Store multiple Qwen accounts with distinct labels; each key remains a separate
 schedulable account while the Token Plan's two protocol routes share that pool:

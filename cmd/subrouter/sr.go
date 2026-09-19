@@ -1765,6 +1765,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	}
 	wg.Wait()
 	enrichClaudeRowsWithWebBalances(ctx, rows)
+	enrichQwenRowsWithCookieQuota(ctx, rows)
 	rankUsageRows(rows)
 	return rows, nil
 }
