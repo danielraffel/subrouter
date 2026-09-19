@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,13 +21,13 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 )
 
-// Qwen Token Plan quota normally comes from the Bailian CLI console
+// Qwen Token Plan quota normally comes from the Model Studio console
 // access_token, which dies often and needs an interactive browser login.
-// Qwen Cloud's own dashboard calls the same tokenplan APIs with browser
+// The Model Studio web console calls the same tokenplan APIs with browser
 // cookies, and web sessions outlive the CLI token by a lot. This file is a
 // display-only fallback: when a Qwen row's quota is unknown ("quota login
-// needed"), read the qwencloud/alibabacloud session cookies locally, call the
-// tokenplan usage API the way the dashboard does, and overlay the row's quota
+// needed"), read the alibabacloud/aliyun session cookies locally, call the
+// tokenplan usage API the way the console does, and overlay the row's quota
 // windows. Freshly fetched readings are pushed to the server so other clients
 // see them too. Cookie values are secrets: never logged, cache files 0600,
 // and every failure leaves the row untouched.
@@ -35,24 +36,41 @@ const (
 	qwenCookieUsageAPI       = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage"
 	qwenCookieConsoleProduct = "sfm_bailian"
 	qwenCookieConsoleAction  = "IntlBroadScopeAspnGateway"
+	// Alibaba's live console contract, including its historical spelling.
+	qwenCookieConsoleSite    = "MODELSTUDIO_ALBABACLOUD"
 	qwenCookieRegion         = "ap-southeast-1"
 	qwenCookieLanguage       = "en-US"
 	qwenCookieCacheTTL       = 5 * time.Minute
 	qwenCookieRequestTimeout = 6 * time.Second
+	qwenCookieMaxAttempts    = 3
 )
+
+// qwenCookieBrowserUserAgent keeps the console gateway treating the request
+// like a real browser call; some endpoints 403 obvious non-browser clients.
+const qwenCookieBrowserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 
 // URLs are variables so tests can point the client at an httptest server.
 var (
-	qwenCookieDataGateway  = "https://cs-data.qwencloud.com"
-	qwenCookieDashboardURL = "https://home.qwencloud.com/billing/subscription/token-plan-individual"
-	qwenCookieUserInfoURL  = "https://home.qwencloud.com/tool/user/info.json"
+	qwenCookieDataGateway  = "https://bailian-singapore-cs.alibabacloud.com"
+	qwenCookieDashboardURL = "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=plan#/efm/subscription/token-plan/personal"
+	qwenCookieUserInfoURL  = "https://modelstudio.console.alibabacloud.com/tool/user/info.json"
 )
 
-// qwenDiscoverCookieHeader reads the qwencloud/alibabacloud session cookies
-// from local browsers. Platform-specific: sr_qwen_cookie_darwin.go installs
-// the real implementation, sr_qwen_cookie_other.go a no-op stub. Tests
-// override and restore it.
-var qwenDiscoverCookieHeader func(ctx context.Context) (header, source string, ok bool)
+// qwenCookieSession is one browser profile's cookie header. Profiles are
+// kept separate: different profiles are usually different Alibaba accounts,
+// and merging their cookies would pair one account's ticket with another's
+// CSRF token.
+type qwenCookieSession struct {
+	header string
+	source string // browser/profile label, used for cache keying
+}
+
+// qwenDiscoverCookieSessions reads the alibabacloud/aliyun session cookies
+// from local browsers, one entry per browser profile carrying a login
+// ticket. Platform-specific: sr_qwen_cookie_darwin.go installs the real
+// implementation, sr_qwen_cookie_other.go a no-op stub. Tests override and
+// restore it.
+var qwenDiscoverCookieSessions func(ctx context.Context) []qwenCookieSession
 
 var qwenSecTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`"secToken"\s*:\s*"([^"]+)"`),
@@ -60,6 +78,9 @@ var qwenSecTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`secToken['"]?\s*[:=]\s*['"]([^'"]+)['"]`),
 	regexp.MustCompile(`sec_token['"]?\s*[:=]\s*['"]([^'"]+)['"]`),
 	regexp.MustCompile(`csrfToken['"]?\s*[:=]\s*['"]([^'"]+)['"]`),
+	// The OneConsole shell embeds the token inside window.ALIYUN_CONSOLE_CONFIG
+	// with an upper-case, unquoted key: `SEC_TOKEN: "<token>"`.
+	regexp.MustCompile(`SEC_TOKEN['"]?\s*[:=]\s*['"]([^'"]+)['"]`),
 }
 
 func qwenCookieHTTPClient() *http.Client {
@@ -72,6 +93,7 @@ func qwenCookieGET(ctx context.Context, client *http.Client, url, cookieHeader s
 		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", qwenCookieBrowserUserAgent)
 	req.Header.Set("Cookie", cookieHeader)
 	res, err := client.Do(req)
 	if err != nil {
@@ -79,6 +101,34 @@ func qwenCookieGET(ctx context.Context, client *http.Client, url, cookieHeader s
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	return body, res.StatusCode, err
+}
+
+// qwenCookieDashboardGET fetches the console dashboard HTML the way a browser
+// navigation would. The OneConsole shell only server-renders
+// window.ALIYUN_CONSOLE_CONFIG.SEC_TOKEN for a genuine same-origin document
+// navigation; a bare XHR-style request receives a token-less shell.
+func qwenCookieDashboardGET(ctx context.Context, client *http.Client, rawURL, cookieHeader string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("User-Agent", qwenCookieBrowserUserAgent)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Cookie", cookieHeader)
+	if parsed, perr := url.Parse(rawURL); perr == nil && parsed.Host != "" {
+		req.Header.Set("Referer", "https://"+parsed.Host+"/")
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
 	return body, res.StatusCode, err
 }
 
@@ -111,11 +161,11 @@ func qwenCookieValue(header, name string) string {
 	return ""
 }
 
-// resolveQwenSecToken mirrors the dashboard's token resolution: inline
-// dashboard HTML first (freshest), then a sec_token cookie, then the
-// user-info JSON endpoint.
+// resolveQwenSecToken mirrors the console's token resolution: inline
+// dashboard HTML first (freshest, navigation-style fetch), then a sec_token
+// cookie, then the user-info JSON endpoint.
 func resolveQwenSecToken(ctx context.Context, client *http.Client, cookieHeader string) (string, error) {
-	if body, status, err := qwenCookieGET(ctx, client, qwenCookieDashboardURL, cookieHeader); err == nil && status == http.StatusOK {
+	if body, status, err := qwenCookieDashboardGET(ctx, client, qwenCookieDashboardURL, cookieHeader); err == nil && status == http.StatusOK {
 		html := string(body)
 		if !qwenLooksLikeLoginPage(html) {
 			for _, pattern := range qwenSecTokenPatterns {
@@ -226,10 +276,16 @@ func qwenCookieFetchUsage(ctx context.Context, client *http.Client, cookieHeader
 		"protocol":    "V2",
 		"console":     "ONE_CONSOLE",
 		"productCode": "p_efm",
-		"consoleSite": "QWENCLOUD",
-		"domain":      dashboardURL.Host,
-		"feURL":       qwenCookieDashboardURL,
-		"xsp_lang":    qwenCookieLanguage,
+		"consoleSite": qwenCookieConsoleSite,
+		// 3 = personal/solo workspace; the gateway resolves the session's
+		// default workspace from this. A hardcoded switchAgent would bind the
+		// call to one account's workspace and fail every other account.
+		"switchUserType":    3,
+		"domain":            dashboardURL.Host,
+		"feURL":             qwenCookieDashboardURL,
+		"userNickName":      "",
+		"userPrincipalName": "",
+		"xsp_lang":          qwenCookieLanguage,
 	}
 	if cna := qwenCookieValue(cookieHeader, "cna"); cna != "" {
 		cornerstone["X-Anonymous-Id"] = cna
@@ -244,12 +300,17 @@ func qwenCookieFetchUsage(ctx context.Context, client *http.Client, cookieHeader
 		return nil, err
 	}
 	form := url.Values{
-		"product":   {qwenCookieConsoleProduct},
-		"action":    {qwenCookieConsoleAction},
-		"sec_token": {secToken},
-		"region":    {qwenCookieRegion},
-		"language":  {qwenCookieLanguage},
-		"params":    {string(paramsJSON)},
+		"product":  {qwenCookieConsoleProduct},
+		"action":   {qwenCookieConsoleAction},
+		"region":   {qwenCookieRegion},
+		"language": {qwenCookieLanguage},
+		"params":   {string(paramsJSON)},
+	}
+	// The Personal gateway accepts cookie-only requests for some accounts but
+	// rejects others unless the browser's sec_token is present; send it when
+	// resolved, continue without it otherwise.
+	if secToken != "" {
+		form.Set("sec_token", secToken)
 	}
 	endpoint := qwenCookieDataGateway + "/data/api.json?action=" + qwenCookieConsoleAction +
 		"&product=" + qwenCookieConsoleProduct + "&api=" + url.QueryEscape(qwenCookieUsageAPI) + "&_v=undefined"
@@ -259,6 +320,7 @@ func qwenCookieFetchUsage(ctx context.Context, client *http.Client, cookieHeader
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", qwenCookieBrowserUserAgent)
 	req.Header.Set("Cookie", cookieHeader)
 	req.Header.Set("Origin", "https://"+dashboardURL.Host)
 	req.Header.Set("Referer", qwenCookieDashboardURL)
@@ -416,45 +478,295 @@ func saveQwenCookieQuotaCache(cache qwenCookieQuotaCacheFile) {
 	_ = os.Chmod(path, 0600)
 }
 
-// qwenCookieQuota is one cookie-path reading: the account email when the
-// user-info endpoint identified it, plus the quota windows.
+// qwenCookieQuota is one cookie-path reading: the account identity when it
+// could be resolved (exact email from the passport last-username cookie,
+// masked email from login_aliyunid, Havana member ID), plus the quota
+// windows.
 type qwenCookieQuota struct {
-	email   string
-	windows []accounts.UsageWindow
+	email       string
+	maskedEmail string
+	memberID    string
+	windows     []accounts.UsageWindow
 }
 
-// qwenCookieQuotaFresh fetches quota through the browser cookie session. The
-// disk cache serves repeat runs; fresh reports whether the network was used.
-func qwenCookieQuotaFresh(ctx context.Context) (qwenCookieQuota, bool, error) {
-	cache := loadQwenCookieQuotaCache()
-	for _, entry := range cache.Accounts {
-		if time.Since(entry.FetchedAt) < qwenCookieCacheTTL && len(entry.Windows) > 0 {
-			return qwenCookieQuota{email: entry.Email, windows: entry.Windows}, false, nil
+// identityKey dedups sessions that are the same Alibaba account logged into
+// two browsers or profiles.
+func (q qwenCookieQuota) identityKey() string {
+	if q.email != "" {
+		return q.email
+	}
+	if q.memberID != "" {
+		return "member:" + q.memberID
+	}
+	if q.maskedEmail != "" {
+		return "masked:" + q.maskedEmail
+	}
+	return ""
+}
+
+// qwenCookieSessionIdentity extracts the account identity embedded in the
+// passport cookies. The last-username cookie (last_u_*) carries a base64 JSON
+// blob with the exact loginId; login_aliyunid carries a masked email
+// ("thegenerous****@gmail.com"); havana_tgc carries the Havana member ID, a
+// stable per-account identifier that works even when no email exists (e.g.
+// SSO logins that never set a username cookie).
+func qwenCookieSessionIdentity(header string) (email, maskedEmail, memberID string) {
+	for _, pair := range qwenCookiePairs(header) {
+		name := pair[0]
+		value := pair[1]
+		switch {
+		case strings.HasPrefix(name, "last_u_"):
+			if id, hid := qwenDecodeLastUsernameCookie(value); id != "" {
+				email = id
+				if hid != "" {
+					memberID = hid
+				}
+			}
+		case name == "login_aliyunid":
+			if strings.Contains(value, "@") {
+				if strings.Contains(value, "*") {
+					maskedEmail = strings.ToLower(value)
+				} else if email == "" {
+					email = strings.ToLower(value)
+				}
+			}
+		case name == "havana_tgc":
+			if memberID == "" {
+				memberID = qwenDecodeHavanaMemberID(value)
+			}
 		}
 	}
-	if qwenDiscoverCookieHeader == nil {
-		return qwenCookieQuota{}, false, errors.New("qwen cookie discovery unavailable")
+	return email, maskedEmail, memberID
+}
+
+// qwenDecodeLastUsernameCookie decodes the passport last-username cookie: a
+// base64 JSON blob like {"hid":270612222595,"loginId":"user@example.com"}.
+func qwenDecodeLastUsernameCookie(value string) (loginID, hid string) {
+	parsed, ok := qwenDecodeBase64JSON(value)
+	if !ok {
+		return "", ""
 	}
-	header, _, ok := qwenDiscoverCookieHeader(ctx)
-	if !ok || strings.TrimSpace(header) == "" {
-		return qwenCookieQuota{}, false, errors.New("no qwen browser session")
+	if raw, ok := parsed["loginId"].(string); ok {
+		loginID = strings.ToLower(strings.TrimSpace(raw))
+		if !strings.Contains(loginID, "@") {
+			loginID = ""
+		}
+	}
+	if num, ok := parsed["hid"].(float64); ok && num > 0 {
+		hid = strconv.FormatInt(int64(num), 10)
+	}
+	return loginID, hid
+}
+
+// qwenDecodeHavanaMemberID decodes the havana_tgc ticket-granting cookie and
+// returns the account's member ID from its first accInfos entry.
+func qwenDecodeHavanaMemberID(value string) string {
+	parsed, ok := qwenDecodeBase64JSON(value)
+	if !ok {
+		return ""
+	}
+	partial, ok := parsed["patialTgc"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	infos, ok := partial["accInfos"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, raw := range infos {
+		info, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if num, ok := info["memberId"].(float64); ok && num > 0 {
+			return strconv.FormatInt(int64(num), 10)
+		}
+	}
+	return ""
+}
+
+// qwenDecodeBase64JSON decodes a base64 (standard or raw-URL) JSON object.
+func qwenDecodeBase64JSON(value string) (map[string]any, bool) {
+	var decoded []byte
+	var err error
+	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawURLEncoding, base64.URLEncoding} {
+		if decoded, err = encoding.DecodeString(value); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, false
+	}
+	var parsed map[string]any
+	if json.Unmarshal(decoded, &parsed) != nil {
+		return nil, false
+	}
+	return parsed, true
+}
+
+// qwenMaskedEmailMatches reports whether a masked console email
+// ("thegenerous****@gmail.com") can only be the given account email.
+func qwenMaskedEmailMatches(masked, email string) bool {
+	if masked == "" || !strings.Contains(masked, "*") {
+		return false
+	}
+	maskLocal, maskDomain, ok := strings.Cut(masked, "@")
+	if !ok {
+		return false
+	}
+	local, domain, ok := strings.Cut(email, "@")
+	if !ok || !strings.EqualFold(domain, maskDomain) {
+		return false
+	}
+	prefix, suffix, _ := strings.Cut(maskLocal, "*")
+	suffix = strings.TrimLeft(suffix, "*")
+	return strings.HasPrefix(local, prefix) && strings.HasSuffix(local, suffix) &&
+		len(local) >= len(prefix)+len(suffix)+1
+}
+
+// qwenCookieQuotasFresh fetches quota through each discovered browser cookie
+// session. The disk cache (keyed by browser profile) serves repeat runs
+// without network calls; fresh reports whether any reading came from the
+// network this call. A session whose console login has expired is skipped —
+// and its cache entry dropped — so a dead profile never blocks a live one.
+func qwenCookieQuotasFresh(ctx context.Context) ([]qwenCookieQuota, bool, error) {
+	cache := loadQwenCookieQuotaCache()
+	pruneQwenCookieQuotaCache(&cache)
+	if qwenDiscoverCookieSessions == nil {
+		if quotas := cachedQwenCookieQuotas(cache); len(quotas) > 0 {
+			return quotas, false, nil
+		}
+		return nil, false, errors.New("qwen cookie discovery unavailable")
+	}
+	sessions := qwenDiscoverCookieSessions(ctx)
+	if len(sessions) == 0 {
+		if quotas := cachedQwenCookieQuotas(cache); len(quotas) > 0 {
+			return quotas, false, nil
+		}
+		return nil, false, errors.New("no qwen browser session")
 	}
 	client := qwenCookieHTTPClient()
-	secToken, err := resolveQwenSecToken(ctx, client, header)
-	if err != nil {
-		return qwenCookieQuota{}, false, err
+	var quotas []qwenCookieQuota
+	seenIdentities := map[string]bool{}
+	fresh := false
+	for _, session := range sessions {
+		if ctx.Err() != nil {
+			break
+		}
+		cacheKey := "source:" + session.source
+		if entry, ok := cache.Accounts[cacheKey]; ok && len(entry.Windows) > 0 && time.Since(entry.FetchedAt) < qwenCookieCacheTTL {
+			quota := qwenCookieQuota{email: entry.Email, windows: entry.Windows}
+			if key := quota.identityKey(); key == "" || !seenIdentities[key] {
+				seenIdentities[key] = true
+				quotas = append(quotas, quota)
+			}
+			continue
+		}
+		email, maskedEmail, memberID := qwenCookieSessionIdentity(session.header)
+		if email == "" && maskedEmail == "" && memberID == "" {
+			// Some console variants expose the account email on the user-info
+			// endpoint; try it before declaring the session anonymous.
+			email = qwenCookieAccountEmail(ctx, client, session.header)
+		}
+		quota := qwenCookieQuota{email: email, maskedEmail: maskedEmail, memberID: memberID}
+		if key := quota.identityKey(); key != "" && seenIdentities[key] {
+			// Same Alibaba account logged into two browsers/profiles.
+			continue
+		}
+		// Best-effort: the Personal gateway accepts cookie-only requests for
+		// some accounts and only rejects others without the browser's
+		// sec_token.
+		secToken, _ := resolveQwenSecToken(ctx, client, session.header)
+		windows, err := qwenCookieFetchUsageRetried(ctx, client, session.header, secToken)
+		if err != nil {
+			if qwenCookieSessionExpired(err) {
+				delete(cache.Accounts, cacheKey)
+				saveQwenCookieQuotaCache(cache)
+			}
+			continue
+		}
+		if len(windows) == 0 {
+			continue
+		}
+		cache.Accounts[cacheKey] = qwenCookieQuotaCacheEntry{Email: email, Windows: windows, FetchedAt: time.Now()}
+		saveQwenCookieQuotaCache(cache)
+		quota.windows = windows
+		quotas = append(quotas, quota)
+		seenIdentities[quota.identityKey()] = true
+		fresh = true
 	}
-	windows, err := qwenCookieFetchUsage(ctx, client, header, secToken)
-	if err != nil {
-		return qwenCookieQuota{}, false, err
+	if len(quotas) == 0 {
+		return nil, fresh, errors.New("no live qwen browser session")
 	}
-	if len(windows) == 0 {
-		return qwenCookieQuota{}, false, errors.New("qwen tokenplan usage payload not found")
+	return quotas, fresh, nil
+}
+
+// cachedQwenCookieQuotas serves every still-fresh cache entry, for callers
+// that cannot or could not run discovery.
+func cachedQwenCookieQuotas(cache qwenCookieQuotaCacheFile) []qwenCookieQuota {
+	var quotas []qwenCookieQuota
+	seen := map[string]bool{}
+	for _, entry := range cache.Accounts {
+		if len(entry.Windows) == 0 || time.Since(entry.FetchedAt) >= qwenCookieCacheTTL {
+			continue
+		}
+		quota := qwenCookieQuota{email: entry.Email, windows: entry.Windows}
+		if key := quota.identityKey(); key != "" && seen[key] {
+			continue
+		}
+		seen[quota.identityKey()] = true
+		quotas = append(quotas, quota)
 	}
-	email := qwenCookieAccountEmail(ctx, client, header)
-	cache.Accounts[email] = qwenCookieQuotaCacheEntry{Email: email, Windows: windows, FetchedAt: time.Now()}
-	saveQwenCookieQuotaCache(cache)
-	return qwenCookieQuota{email: email, windows: windows}, true, nil
+	return quotas
+}
+
+// pruneQwenCookieQuotaCache drops day-old entries so dead sessions and
+// pre-rename cache keys cannot linger in the file forever.
+func pruneQwenCookieQuotaCache(cache *qwenCookieQuotaCacheFile) {
+	for key, entry := range cache.Accounts {
+		if time.Since(entry.FetchedAt) > 24*time.Hour {
+			delete(cache.Accounts, key)
+		}
+	}
+}
+
+// qwenCookieSessionExpired reports whether the gateway rejected the cookie
+// session as logged out. Workspace-permission failures
+// (BailianGateway.Workspace.NotAuthorised) are deliberately excluded: the
+// session is alive there, and evicting it would re-fail identically forever.
+func qwenCookieSessionExpired(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "notlogined") ||
+		strings.Contains(msg, "needlogin") ||
+		strings.Contains(msg, "request has expired")
+}
+
+// qwenCookieFetchUsageRetried calls the usage API past the gateway's
+// intermittent empty-payload quirk: it sometimes answers 200 "Success" with
+// no rolling-window fields, and an immediate re-request usually returns them.
+func qwenCookieFetchUsageRetried(ctx context.Context, client *http.Client, cookieHeader, secToken string) ([]accounts.UsageWindow, error) {
+	var windows []accounts.UsageWindow
+	var err error
+	for attempt := 0; attempt < qwenCookieMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(400 * time.Millisecond):
+			}
+		}
+		windows, err = qwenCookieFetchUsage(ctx, client, cookieHeader, secToken)
+		if err == nil {
+			return windows, nil
+		}
+		if !strings.Contains(err.Error(), "payload not found") {
+			return nil, err
+		}
+	}
+	return nil, err
 }
 
 // qwenRowNeedsCookieQuota reports whether a row is a Qwen token-plan row
@@ -479,16 +791,17 @@ func enrichQwenRowsWithCookieQuota(ctx context.Context, rows []srUsageRow) {
 	enrichQwenRowsWithCookieQuotaFresh(ctx, rows)
 }
 
-// qwenCookieQuotaResult is the outcome of an enrichment attempt: applied says
-// at least one row changed, fresh says the reading came from the network this
-// call (cache hits excluded) so the caller can fan it out to the server.
-
 // enrichQwenRowsWithCookieQuotaFresh overlays cookie-derived quota windows on
-// Qwen rows whose quota is unknown. Matching is by console account email;
-// when the cookie session's identity is unknown or unmatched, a single needy
-// row is enriched on the assumption that one configured account maps to the
-// one browser login. Any failure leaves every row untouched.
-func enrichQwenRowsWithCookieQuotaFresh(ctx context.Context, rows []srUsageRow) (quota qwenCookieQuota, applied, fresh bool) {
+// Qwen rows whose quota is unknown. Each browser profile is resolved
+// independently, so multiple accounts each get their own session's windows.
+// Matching, in order: exact email, unique masked email, the single-account
+// assumption (one needy row and one session with at most one side
+// identified), and elimination (sessions and rows pair off 1:1 with one of
+// each left). When both identities are known and differ, we never guess. Any
+// per-session failure leaves that account's row untouched. Rows that get
+// matched anonymously backfill the quota's email from the row's console
+// account label so the reading can fan out to the server.
+func enrichQwenRowsWithCookieQuotaFresh(ctx context.Context, rows []srUsageRow) (quotas []qwenCookieQuota, applied, fresh bool) {
 	needy := make([]int, 0, 2)
 	for i, row := range rows {
 		if qwenRowNeedsCookieQuota(row) {
@@ -496,35 +809,100 @@ func enrichQwenRowsWithCookieQuotaFresh(ctx context.Context, rows []srUsageRow) 
 		}
 	}
 	if len(needy) == 0 {
-		return qwenCookieQuota{}, false, false
+		return nil, false, false
 	}
 	enrichCtx, cancel := context.WithTimeout(ctx, claudeWebEnrichTimeout)
 	defer cancel()
-	var err error
-	quota, fresh, err = qwenCookieQuotaFresh(enrichCtx)
-	if err != nil {
-		return qwenCookieQuota{}, false, false
+	quotas, fresh, err := qwenCookieQuotasFresh(enrichCtx)
+	if len(quotas) == 0 || err != nil && len(quotas) == 0 {
+		return nil, false, false
 	}
-	for _, i := range needy {
-		key := qwenRowAccountKey(rows[i])
-		if quota.email != "" && key != "" && key != quota.email {
-			continue
+	matchedQuota := map[int]bool{}
+	matchedRow := map[int]bool{}
+	applyMatch := func(qi, i int) {
+		if key := qwenRowAccountKey(rows[i]); key != "" && quotas[qi].email == "" {
+			quotas[qi].email = key
 		}
-		if quota.email == "" && len(needy) > 1 {
-			// Unknown session identity with several candidate accounts: never
-			// guess which one the browser is logged into.
-			continue
-		}
-		if quota.email != "" && key == "" && len(needy) > 1 {
-			continue
-		}
-		applyQwenCookieQuota(&rows[i], quota.windows)
+		applyQwenCookieQuota(&rows[i], quotas[qi].windows)
+		matchedQuota[qi] = true
+		matchedRow[i] = true
 		applied = true
 	}
-	if !applied {
-		return qwenCookieQuota{}, false, false
+	// Exact email matches.
+	for _, i := range needy {
+		key := qwenRowAccountKey(rows[i])
+		if key == "" {
+			continue
+		}
+		for qi := range quotas {
+			if quotas[qi].email != "" && quotas[qi].email == key {
+				applyMatch(qi, i)
+				break
+			}
+		}
 	}
-	return quota, true, fresh
+	// Masked-email matches ("thegenerous****@gmail.com"), unique candidate only.
+	for _, i := range needy {
+		if matchedRow[i] {
+			continue
+		}
+		key := qwenRowAccountKey(rows[i])
+		if key == "" {
+			continue
+		}
+		match := -1
+		for qi := range quotas {
+			if matchedQuota[qi] {
+				continue
+			}
+			if qwenMaskedEmailMatches(quotas[qi].maskedEmail, key) {
+				if match != -1 {
+					match = -1
+					break
+				}
+				match = qi
+			}
+		}
+		if match >= 0 {
+			applyMatch(match, i)
+		}
+	}
+	// Single-account assumption: one needy row, one session, at most one of
+	// the two identities known.
+	if len(needy) == 1 && len(quotas) == 1 && !matchedRow[needy[0]] {
+		if quotas[0].email == "" || qwenRowAccountKey(rows[needy[0]]) == "" {
+			applyMatch(0, needy[0])
+		}
+	}
+	// Elimination: sessions and needy rows pair off 1:1 with exactly one of
+	// each left, and the leftover session's account is not positively known
+	// to be a different one. A session count above the row count (an account
+	// subrouter does not manage) disables this, so foreign quota is never
+	// shown on a managed row.
+	if len(quotas) == len(needy) {
+		unmatchedQuota, unmatchedQuotaCount := -1, 0
+		for qi := range quotas {
+			if !matchedQuota[qi] {
+				unmatchedQuota = qi
+				unmatchedQuotaCount++
+			}
+		}
+		unmatchedRow, unmatchedRowCount := -1, 0
+		for _, i := range needy {
+			if !matchedRow[i] {
+				unmatchedRow = i
+				unmatchedRowCount++
+			}
+		}
+		if unmatchedQuotaCount == 1 && unmatchedRowCount == 1 &&
+			(quotas[unmatchedQuota].email == "" || qwenRowAccountKey(rows[unmatchedRow]) == "") {
+			applyMatch(unmatchedQuota, unmatchedRow)
+		}
+	}
+	if !applied {
+		return nil, false, false
+	}
+	return quotas, true, fresh
 }
 
 func applyQwenCookieQuota(row *srUsageRow, windows []accounts.UsageWindow) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,12 +22,12 @@ func qwenCookieTestEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
-	oldDiscover := qwenDiscoverCookieHeader
+	oldDiscover := qwenDiscoverCookieSessions
 	oldGateway := qwenCookieDataGateway
 	oldDashboard := qwenCookieDashboardURL
 	oldUserInfo := qwenCookieUserInfoURL
 	t.Cleanup(func() {
-		qwenDiscoverCookieHeader = oldDiscover
+		qwenDiscoverCookieSessions = oldDiscover
 		qwenCookieDataGateway = oldGateway
 		qwenCookieDashboardURL = oldDashboard
 		qwenCookieUserInfoURL = oldUserInfo
@@ -70,7 +71,7 @@ func qwenCookieTestHandler(t *testing.T, email string) http.Handler {
 				http.Error(w, "bad params", http.StatusBadRequest)
 				return
 			}
-			if params.Api != qwenCookieUsageAPI || params.Data.Cornerstone.ConsoleSite != "QWENCLOUD" {
+			if params.Api != qwenCookieUsageAPI || params.Data.Cornerstone.ConsoleSite != qwenCookieConsoleSite {
 				http.Error(w, "bad api", http.StatusBadRequest)
 				return
 			}
@@ -197,8 +198,8 @@ func TestEnrichQwenRowsWithCookieQuota(t *testing.T) {
 	server := qwenCookieTestServer(t, "user@example.com")
 	defer server.Close()
 	qwenCookieTestTargets(server)
-	qwenDiscoverCookieHeader = func(context.Context) (string, string, bool) {
-		return "login_aliyunid_ticket=ticket; cna=abc", "test", true
+	qwenDiscoverCookieSessions = func(context.Context) []qwenCookieSession {
+		return []qwenCookieSession{{header: "login_aliyunid_ticket=ticket; cna=abc", source: "test"}}
 	}
 
 	rows := []srUsageRow{
@@ -215,9 +216,9 @@ func TestEnrichQwenRowsWithCookieQuota(t *testing.T) {
 			email: "user@example.com", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
 		},
 	}
-	quota, applied, fresh := enrichQwenRowsWithCookieQuotaFresh(context.Background(), rows)
-	if !applied || !fresh || quota.email != "user@example.com" {
-		t.Fatalf("quota=%+v applied=%v fresh=%v", quota, applied, fresh)
+	quotas, applied, fresh := enrichQwenRowsWithCookieQuotaFresh(context.Background(), rows)
+	if !applied || !fresh || len(quotas) != 1 || quotas[0].email != "user@example.com" {
+		t.Fatalf("quotas=%+v applied=%v fresh=%v", quotas, applied, fresh)
 	}
 	if !rows[0].quotaUsageKnown || rows[0].quotaStatus != "live" || len(rows[0].windows) != 2 || rows[0].err != nil {
 		t.Fatalf("matched row = quotaKnown=%v status=%q windows=%+v err=%v", rows[0].quotaUsageKnown, rows[0].quotaStatus, rows[0].windows, rows[0].err)
@@ -229,22 +230,91 @@ func TestEnrichQwenRowsWithCookieQuota(t *testing.T) {
 		t.Fatal("non-Qwen row was enriched")
 	}
 
-	// A second run serves the disk cache: applied but not fresh.
+	// A second run serves the disk cache: applied without any network, so the
+	// closed server proves no fetch happened.
 	server.Close()
 	rows[0].quotaUsageKnown = false
 	rows[0].windows = nil
 	rows[0].quotaStatus = "login needed"
 	rows[0].err = errors.New("Qwen console login needed")
-	qwenDiscoverCookieHeader = func(context.Context) (string, string, bool) {
-		t.Error("discovery must not run when the cache is fresh")
-		return "", "", false
-	}
 	_, applied, fresh = enrichQwenRowsWithCookieQuotaFresh(context.Background(), rows[:1])
 	if !applied || fresh {
 		t.Fatalf("cache run: applied=%v fresh=%v", applied, fresh)
 	}
 	if !rows[0].quotaUsageKnown || len(rows[0].windows) != 2 {
 		t.Fatalf("cached row = %+v", rows[0].windows)
+	}
+}
+
+// Two browser sessions logged into different Alibaba accounts enrich the two
+// matching rows with their own windows.
+func TestEnrichQwenRowsMultipleSessions(t *testing.T) {
+	qwenCookieTestEnv(t)
+	reset := time.Now().Add(2 * time.Hour).UnixMilli()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie := r.Header.Get("Cookie")
+		var email string
+		var weekly float64
+		switch {
+		case strings.Contains(cookie, "ticket=aaa"):
+			email, weekly = "a@example.com", 0.12
+		case strings.Contains(cookie, "ticket=bbb"):
+			email, weekly = "b@example.com", 0.62
+		default:
+			fmt.Fprint(w, `{"success":false,"errorCode":"BailianGateway.Login.NotLogined"}`)
+			return
+		}
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/billing/"):
+			fmt.Fprint(w, `<html><script>var x={"secToken":"t"};</script></html>`)
+		case r.URL.Path == "/tool/user/info.json":
+			fmt.Fprintf(w, `{"data":{"email":%q,"secToken":"t"}}`, email)
+		case r.URL.Path == "/data/api.json":
+			fmt.Fprintf(w, `{"success":true,"data":{"per5HourPercentage":0.37,"per1WeekPercentage":%v,"per5HourResetTime":%d,"per1WeekResetTime":%d}}`, weekly, reset, reset)
+		}
+	}))
+	defer server.Close()
+	qwenCookieTestTargets(server)
+	qwenDiscoverCookieSessions = func(context.Context) []qwenCookieSession {
+		return []qwenCookieSession{
+			{header: "login_aliyunid_ticket=aaa", source: "Chrome/Default"},
+			{header: "login_aliyunid_ticket=bbb", source: "Chrome/Profile 1"},
+		}
+	}
+
+	rows := []srUsageRow{
+		{email: "qwen-token:a", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "a@example.com", quotaStatus: "login needed"},
+		{email: "qwen-token:b", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "b@example.com", quotaStatus: "login needed"},
+	}
+	quotas, applied, fresh := enrichQwenRowsWithCookieQuotaFresh(context.Background(), rows)
+	if !applied || !fresh || len(quotas) != 2 {
+		t.Fatalf("quotas=%+v applied=%v fresh=%v", quotas, applied, fresh)
+	}
+	if !rows[0].quotaUsageKnown || len(rows[0].windows) != 2 || rows[0].windows[1].UsedPercent != 12 {
+		t.Fatalf("row a windows = %+v", rows[0].windows)
+	}
+	if !rows[1].quotaUsageKnown || len(rows[1].windows) != 2 || rows[1].windows[1].UsedPercent != 62 {
+		t.Fatalf("row b windows = %+v", rows[1].windows)
+	}
+
+	// A dead session (logged out: user-info has no email, usage says
+	// NotLogined) leaves its row untouched while the live session enriches.
+	rows[1].quotaUsageKnown = false
+	rows[1].windows = nil
+	rows[1].quotaStatus = "login needed"
+	qwenDiscoverCookieSessions = func(context.Context) []qwenCookieSession {
+		return []qwenCookieSession{
+			{header: "login_aliyunid_ticket=aaa", source: "Chrome/Default"},
+			{header: "login_aliyunid_ticket=dead", source: "Chrome/Profile 1"},
+		}
+	}
+	// Bust the cache for the dead profile so the network path runs.
+	cache := loadQwenCookieQuotaCache()
+	delete(cache.Accounts, "source:Chrome/Profile 1")
+	saveQwenCookieQuotaCache(cache)
+	_, applied, _ = enrichQwenRowsWithCookieQuotaFresh(context.Background(), rows[1:2])
+	if applied || rows[1].quotaUsageKnown {
+		t.Fatalf("dead session enriched row: %+v", rows[1].windows)
 	}
 }
 
@@ -264,14 +334,117 @@ func TestEnrichQwenRowsUnknownIdentity(t *testing.T) {
 	}))
 	defer server.Close()
 	qwenCookieTestTargets(server)
-	qwenDiscoverCookieHeader = func(context.Context) (string, string, bool) {
-		return "login_aliyunid_ticket=ticket", "test", true
+	qwenDiscoverCookieSessions = func(context.Context) []qwenCookieSession {
+		return []qwenCookieSession{{header: "login_aliyunid_ticket=ticket", source: "test"}}
 	}
 
 	single := []srUsageRow{{email: "qwen-token:work", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, quotaStatus: "login needed"}}
 	_, applied, _ := enrichQwenRowsWithCookieQuotaFresh(context.Background(), single)
 	if !applied || !single[0].quotaUsageKnown {
 		t.Fatalf("single unknown-identity row not enriched: %+v", single[0])
+	}
+}
+
+// qwenB64 encodes a JSON blob the way the passport cookies do.
+func qwenB64(raw string) string {
+	return base64.StdEncoding.EncodeToString([]byte(raw))
+}
+
+func TestQwenCookieSessionIdentity(t *testing.T) {
+	lastU := qwenB64(`{"hid":270612222595,"loginId":"TheGenerousCorp@Gmail.com","sg":"abc"}`)
+	havana := qwenB64(`{"createTime":1,"patialTgc":{"accInfos":{"6":{"accessType":1,"memberId":270602993999,"tgtId":"t"}}}}`)
+
+	email, masked, memberID := qwenCookieSessionIdentity("login_aliyunid_ticket=t; last_u_intl-aliyun_intl-aliyun=" + lastU)
+	if email != "thegenerouscorp@gmail.com" || masked != "" || memberID != "270612222595" {
+		t.Fatalf("last_u identity = %q %q %q", email, masked, memberID)
+	}
+
+	email, masked, memberID = qwenCookieSessionIdentity("login_aliyunid_ticket=t; havana_tgc=" + havana)
+	if email != "" || masked != "" || memberID != "270602993999" {
+		t.Fatalf("havana identity = %q %q %q", email, masked, memberID)
+	}
+
+	email, masked, memberID = qwenCookieSessionIdentity("login_aliyunid_ticket=t; login_aliyunid=thegenerous****@gmail.com")
+	if email != "" || masked != "thegenerous****@gmail.com" || memberID != "" {
+		t.Fatalf("masked identity = %q %q %q", email, masked, memberID)
+	}
+
+	if !qwenMaskedEmailMatches("thegenerous****@gmail.com", "thegenerouscorp@gmail.com") {
+		t.Fatal("masked email should match its account")
+	}
+	if qwenMaskedEmailMatches("thegenerous****@gmail.com", "daniel.raffel@gmail.com") {
+		t.Fatal("masked email matched the wrong account")
+	}
+	if qwenMaskedEmailMatches("thegenerous****@gmail.com", "thegenerouscorp@example.org") {
+		t.Fatal("masked email matched the wrong domain")
+	}
+	if qwenMaskedEmailMatches("dan****@gmail.com", "dan@gmail.com") {
+		t.Fatal("masked email matched with no hidden characters")
+	}
+}
+
+// Cookie-embedded identity drives matching end to end: an exact-email session
+// matches its row directly, and a member-ID-only session pairs with the
+// remaining row by elimination, backfilling its email for fan-out.
+func TestEnrichQwenRowsCookieIdentity(t *testing.T) {
+	qwenCookieTestEnv(t)
+	reset := time.Now().Add(2 * time.Hour).UnixMilli()
+	lastU := qwenB64(`{"hid":111,"loginId":"a@example.com","sg":"x"}`)
+	havana := qwenB64(`{"createTime":1,"patialTgc":{"accInfos":{"6":{"memberId":222,"tgtId":"t"}}}}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie := r.Header.Get("Cookie")
+		var weekly float64
+		switch {
+		case strings.Contains(cookie, "ticket=aaa"):
+			weekly = 0.12
+		case strings.Contains(cookie, "ticket=bbb"):
+			weekly = 0.62
+		default:
+			fmt.Fprint(w, `{"success":false,"errorCode":"BailianGateway.Login.NotLogined"}`)
+			return
+		}
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/billing/"):
+			fmt.Fprint(w, `<html><script>var x={"secToken":"t"};</script></html>`)
+		case r.URL.Path == "/tool/user/info.json":
+			// The Model Studio console user-info carries no email.
+			fmt.Fprint(w, `{"code":"200","data":{"secToken":"t"},"successResponse":true}`)
+		case r.URL.Path == "/data/api.json":
+			fmt.Fprintf(w, `{"success":true,"data":{"per5HourPercentage":0.37,"per1WeekPercentage":%v,"per5HourResetTime":%d,"per1WeekResetTime":%d}}`, weekly, reset, reset)
+		}
+	}))
+	defer server.Close()
+	qwenCookieTestTargets(server)
+	qwenDiscoverCookieSessions = func(context.Context) []qwenCookieSession {
+		return []qwenCookieSession{
+			{header: "login_aliyunid_ticket=aaa; last_u_intl-aliyun_intl-aliyun=" + lastU, source: "Chrome/Default"},
+			{header: "login_aliyunid_ticket=bbb; havana_tgc=" + havana, source: "Chrome/Profile 1"},
+		}
+	}
+
+	rows := []srUsageRow{
+		{email: "qwen-token:a", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "a@example.com", quotaStatus: "login needed"},
+		{email: "qwen-token:b", provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey, accountIdentity: "b@example.com", quotaStatus: "login needed"},
+	}
+	quotas, applied, fresh := enrichQwenRowsWithCookieQuotaFresh(context.Background(), rows)
+	if !applied || !fresh || len(quotas) != 2 {
+		t.Fatalf("quotas=%+v applied=%v fresh=%v", quotas, applied, fresh)
+	}
+	if !rows[0].quotaUsageKnown || len(rows[0].windows) != 2 || rows[0].windows[1].UsedPercent != 12 {
+		t.Fatalf("row a windows = %+v", rows[0].windows)
+	}
+	if !rows[1].quotaUsageKnown || len(rows[1].windows) != 2 || rows[1].windows[1].UsedPercent != 62 {
+		t.Fatalf("row b windows = %+v", rows[1].windows)
+	}
+	// The eliminated session inherits the row's identity for the server push.
+	var bQuota *qwenCookieQuota
+	for qi := range quotas {
+		if quotas[qi].memberID == "222" {
+			bQuota = &quotas[qi]
+		}
+	}
+	if bQuota == nil || bQuota.email != "b@example.com" {
+		t.Fatalf("eliminated quota identity = %+v", bQuota)
 	}
 }
 

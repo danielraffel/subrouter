@@ -1102,7 +1102,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	if available {
 		rows := usageRowsFromServerUsageStatuses(usage)
 		fresh := enrichClaudeRowsWithWebBalancesFresh(ctx, rows)
-		qwenQuota, qwenApplied, qwenFresh := enrichQwenRowsWithCookieQuotaFresh(ctx, rows)
+		qwenQuotas, qwenApplied, qwenFresh := enrichQwenRowsWithCookieQuotaFresh(ctx, rows)
 		if qwenApplied {
 			// The cookie overlay changes quota windows, so re-rank before
 			// display and before the pick recommendation reads scores.
@@ -1116,7 +1116,9 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		r.printAzureCodexStatus(ctx, server)
 		r.pushClaudeWebBalances(ctx, server, fresh)
 		if qwenFresh {
-			r.pushQwenCookieQuota(ctx, server, qwenQuota)
+			for _, quota := range qwenQuotas {
+				r.pushQwenCookieQuota(ctx, server, quota)
+			}
 		}
 		return nil
 	}

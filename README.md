@@ -763,8 +763,9 @@ remain `not exposed` when no quota API is available.
 
 The console credential is used only for optional quota telemetry and currently
 contains an Alibaba access token, not a refresh-token chain. When it expires,
-the CLI falls back to the Qwen Cloud / alibabacloud login cookies in local
-browsers (the same read-only cookie mechanism as the Claude prepaid balance):
+the CLI falls back to the Alibaba Cloud Model Studio console
+(`modelstudio.console.alibabacloud.com`) login cookies in local browsers (the
+same read-only cookie mechanism as the Claude prepaid balance):
 `sr status` overlays live quota from the web session and pushes it to the
 server, which re-shares it to every client (`POST /_subrouter/qwen-quota`, 24h
 TTL). If neither path has a live session the row says `login needed`; repeat
