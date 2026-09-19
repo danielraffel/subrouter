@@ -249,6 +249,7 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 	if strings.HasPrefix(path, "/_subrouter/accounts/") ||
 		path == "/_subrouter/account-import" ||
 		path == "/_subrouter/qwen-console" ||
+		path == "/_subrouter/qwen-quota" ||
 		path == "/_subrouter/claude-web-balance" ||
 		path == "/_subrouter/reload-accounts" {
 		return key.Allows(tenant.CapabilityManageAccounts)
@@ -401,6 +402,7 @@ var tenantControlPaths = map[string]bool{
 	"/_subrouter/reload-accounts":    true, // loopback-only inside the Server handler
 	"/_subrouter/account-import":     true,
 	"/_subrouter/qwen-console":       true,
+	"/_subrouter/qwen-quota":         true,
 	"/_subrouter/claude-web-balance": true,
 }
 

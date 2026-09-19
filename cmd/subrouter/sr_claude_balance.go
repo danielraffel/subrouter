@@ -644,38 +644,48 @@ func pbkdf2SHA1(password, salt []byte, iterations, keyLen int) []byte {
 	return dk[:keyLen]
 }
 
-// decryptChromiumCookieValue decrypts a Chromium "v10" cookie value:
-// AES-128-CBC with the PBKDF2-derived key and an IV of 16 space bytes.
-// Chrome 80+ prepends a SHA256 of the host key to the plaintext; when the
-// plaintext does not itself look like a token, that prefix is stripped.
-func decryptChromiumCookieValue(encrypted, key []byte) (string, error) {
+// decryptChromiumV10 decrypts a Chromium "v10" cookie value: AES-128-CBC with
+// the PBKDF2-derived key and an IV of 16 space bytes. Returns the raw
+// plaintext; Chrome 80+ may prepend a SHA256 of the host key, which callers
+// strip according to their own value-shape rules.
+func decryptChromiumV10(encrypted, key []byte) ([]byte, error) {
 	if !bytes.HasPrefix(encrypted, []byte("v10")) {
-		return "", errors.New("chromium cookie value is not v10 encrypted")
+		return nil, errors.New("chromium cookie value is not v10 encrypted")
 	}
 	payload := encrypted[len("v10"):]
 	if len(payload) == 0 || len(payload)%aes.BlockSize != 0 {
-		return "", errors.New("chromium cookie value has invalid length")
+		return nil, errors.New("chromium cookie value has invalid length")
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	iv := bytes.Repeat([]byte(" "), aes.BlockSize)
 	plain := make([]byte, len(payload))
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, payload)
 	if len(plain) == 0 {
-		return "", errors.New("chromium cookie value is empty")
+		return nil, errors.New("chromium cookie value is empty")
 	}
 	padding := int(plain[len(plain)-1])
 	if padding == 0 || padding > aes.BlockSize || padding > len(plain) {
-		return "", errors.New("chromium cookie value has invalid padding")
+		return nil, errors.New("chromium cookie value has invalid padding")
 	}
 	for _, b := range plain[len(plain)-padding:] {
 		if int(b) != padding {
-			return "", errors.New("chromium cookie value has invalid padding")
+			return nil, errors.New("chromium cookie value has invalid padding")
 		}
 	}
-	plain = plain[:len(plain)-padding]
+	return plain[:len(plain)-padding], nil
+}
+
+// decryptChromiumCookieValue decrypts a Chromium "v10" cookie value and
+// returns it only when it looks like a token, stripping the Chrome 80+
+// SHA256(host_key) prefix when present.
+func decryptChromiumCookieValue(encrypted, key []byte) (string, error) {
+	plain, err := decryptChromiumV10(encrypted, key)
+	if err != nil {
+		return "", err
+	}
 	if text := string(plain); strings.HasPrefix(text, "sk-") {
 		return text, nil
 	}
@@ -687,16 +697,39 @@ func decryptChromiumCookieValue(encrypted, key []byte) (string, error) {
 	return "", errors.New("decrypted cookie value does not look like a token")
 }
 
-// parseClaudeBinaryCookies extracts claude.ai sessionKey values from a Safari
-// binarycookies file. The format: "cook" magic, a big-endian page count and
-// page-size table, then pages that start with 0x00000100 big-endian and carry
-// a little-endian cookie count and offset table. Each record is little-endian
-// u32 size/unknown/flags/unknown/string-offsets followed by big-endian
-// float64 expiry and creation (Mac absolute time) and null-terminated
-// strings; the fixed header is 56 bytes. Every malformed input fails soft:
-// whatever could be parsed is returned, the rest is skipped, so machines
-// without Full Disk Access just fall through the discovery chain.
-func parseClaudeBinaryCookies(data []byte) []string {
+// decryptChromiumCookieValueForHost decrypts a Chromium "v10" cookie value
+// for a known host key, stripping the Chrome 80+ SHA256(host) prefix when it
+// matches. Unlike decryptChromiumCookieValue it makes no assumption about the
+// value's shape.
+func decryptChromiumCookieValueForHost(encrypted, key []byte, host string) (string, error) {
+	plain, err := decryptChromiumV10(encrypted, key)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(host))
+	if len(plain) > sha256.Size && bytes.Equal(plain[:sha256.Size], sum[:]) {
+		plain = plain[sha256.Size:]
+	}
+	return string(plain), nil
+}
+
+// binaryCookie is one cookie record from a Safari binarycookies file.
+type binaryCookie struct {
+	domain string
+	name   string
+	value  string
+}
+
+// parseBinaryCookies extracts every cookie from a Safari binarycookies file.
+// The format: "cook" magic, a big-endian page count and page-size table, then
+// pages that start with 0x00000100 big-endian and carry a little-endian
+// cookie count and offset table. Each record is little-endian u32
+// size/unknown/flags/unknown/string-offsets followed by big-endian float64
+// expiry and creation (Mac absolute time) and null-terminated strings; the
+// fixed header is 56 bytes. Every malformed input fails soft: whatever could
+// be parsed is returned, the rest is skipped, so machines without Full Disk
+// Access just fall through the discovery chain.
+func parseBinaryCookies(data []byte) []binaryCookie {
 	if len(data) < 8 || string(data[:4]) != "cook" {
 		return nil
 	}
@@ -704,20 +737,32 @@ func parseClaudeBinaryCookies(data []byte) []string {
 	if numPages <= 0 || numPages > 4096 || len(data) < 8+4*numPages {
 		return nil
 	}
-	var out []string
+	var out []binaryCookie
 	offset := 8 + 4*numPages
 	for i := 0; i < numPages; i++ {
 		pageSize := int(binary.BigEndian.Uint32(data[8+4*i : 12+4*i]))
 		if pageSize <= 0 || offset+pageSize > len(data) {
 			return out
 		}
-		out = append(out, parseClaudeBinaryCookiePage(data[offset:offset+pageSize])...)
+		out = append(out, parseBinaryCookiePage(data[offset:offset+pageSize])...)
 		offset += pageSize
 	}
 	return out
 }
 
-func parseClaudeBinaryCookiePage(page []byte) []string {
+// parseClaudeBinaryCookies extracts claude.ai sessionKey values from a Safari
+// binarycookies file.
+func parseClaudeBinaryCookies(data []byte) []string {
+	var out []string
+	for _, cookie := range parseBinaryCookies(data) {
+		if cookie.name == "sessionKey" && strings.Contains(cookie.domain, "claude.ai") && strings.HasPrefix(cookie.value, "sk-ant-") {
+			out = append(out, cookie.value)
+		}
+	}
+	return out
+}
+
+func parseBinaryCookiePage(page []byte) []binaryCookie {
 	if len(page) < 8 || binary.BigEndian.Uint32(page[0:4]) != 0x00000100 {
 		return nil
 	}
@@ -725,35 +770,33 @@ func parseClaudeBinaryCookiePage(page []byte) []string {
 	if count <= 0 || count > 1<<20 || len(page) < 8+4*count {
 		return nil
 	}
-	var out []string
+	var out []binaryCookie
 	for i := 0; i < count; i++ {
 		recordOffset := int(binary.LittleEndian.Uint32(page[8+4*i : 12+4*i]))
 		if recordOffset < 0 || recordOffset >= len(page) {
 			continue
 		}
-		if value, ok := parseClaudeBinaryCookieRecord(page[recordOffset:]); ok {
-			out = append(out, value)
+		if cookie, ok := parseBinaryCookieRecord(page[recordOffset:]); ok {
+			out = append(out, cookie)
 		}
 	}
 	return out
 }
 
-func parseClaudeBinaryCookieRecord(record []byte) (string, bool) {
+func parseBinaryCookieRecord(record []byte) (binaryCookie, bool) {
 	// A record needs at least the 56-byte header before any strings.
 	if len(record) < 56 {
-		return "", false
+		return binaryCookie{}, false
 	}
 	size := int(binary.LittleEndian.Uint32(record[0:4]))
 	if size >= 56 && size < len(record) {
 		record = record[:size]
 	}
-	domain := binaryCookieString(record, int(binary.LittleEndian.Uint32(record[16:20])))
-	name := binaryCookieString(record, int(binary.LittleEndian.Uint32(record[20:24])))
-	value := binaryCookieString(record, int(binary.LittleEndian.Uint32(record[28:32])))
-	if name == "sessionKey" && strings.Contains(domain, "claude.ai") && strings.HasPrefix(value, "sk-ant-") {
-		return value, true
-	}
-	return "", false
+	return binaryCookie{
+		domain: binaryCookieString(record, int(binary.LittleEndian.Uint32(record[16:20]))),
+		name:   binaryCookieString(record, int(binary.LittleEndian.Uint32(record[20:24]))),
+		value:  binaryCookieString(record, int(binary.LittleEndian.Uint32(record[28:32]))),
+	}, true
 }
 
 func binaryCookieString(record []byte, offset int) string {
