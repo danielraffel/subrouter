@@ -3879,6 +3879,12 @@ func TestHandlerRetriesCodexModelCompatibilityErrorOnAlternateOAuthAccount(t *te
 }
 
 func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *testing.T) {
+	// The alternate's bare 503 is a Codex capacity failure, so it is retried
+	// (bounded by the shared request budget) before passing through; keep
+	// those retries off real timers.
+	originalRetrySleep := retrySleep
+	retrySleep = func(context.Context, time.Duration) error { return nil }
+	t.Cleanup(func() { retrySleep = originalRetrySleep })
 	var auths []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		auth := request.Header.Get("Authorization")
@@ -3919,7 +3925,9 @@ func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want failed alternate 503", response.Code)
 	}
-	wantAuths := []string{"Bearer incompatible-token", "Bearer compatible-token"}
+	// The alternate's 503 is retried as a Codex capacity failure until the
+	// shared request budget (five retries) is spent, then delivered as-is.
+	wantAuths := []string{"Bearer incompatible-token", "Bearer compatible-token", "Bearer compatible-token", "Bearer compatible-token", "Bearer compatible-token", "Bearer compatible-token"}
 	if strings.Join(auths, "\x00") != strings.Join(wantAuths, "\x00") {
 		t.Fatalf("auths = %#v, want %#v", auths, wantAuths)
 	}

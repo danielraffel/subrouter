@@ -880,6 +880,8 @@ func TestStreamingFailoverCommitsOnlyOnSuccessfulTerminalEvent(t *testing.T) {
 			transport := usageLimitRetryTransport{
 				base: base, server: &Server{Sessions: store}, provider: accounts.ProviderCodex,
 				agent: "codex", session: "stream-session", account: "alternate", expectedAccount: "original", maxAttempts: 1, commitFirstSuccess: true,
+				// Capacity retries on smuggled failure streams stay off real timers.
+				sleep: func(context.Context, time.Duration) error { return nil },
 			}
 			request := httptest.NewRequest(http.MethodPost, "https://codex.test/responses", strings.NewReader(`{}`))
 			request.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(`{}`)), nil }
