@@ -7328,7 +7328,14 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if err != nil {
 		return accounts.Account{}, err
 	}
-	if scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
+	// Codex usage snapshots can be stale or unavailable after a credential
+	// refresh failure. Try every untried OAuth account and let its refresh (or
+	// the upstream response) establish the truth; explicit credential failures
+	// are still marked and excluded by the caller. Kimi and Antigravity retain
+	// their stricter scheduler gate until their provider-specific semantics are
+	// migrated separately.
+	if (provider != accounts.ProviderCodex || account.AuthMode != accounts.AuthModeOAuth) &&
+		scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
 	}
 	return account, nil
