@@ -7314,6 +7314,20 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 		}
 		untried = append(untried, account)
 	}
+	// Stale quota scores are retryable for Codex, but explicit account
+	// exclusions are authoritative and must never be bypassed by that policy.
+	if provider == accounts.ProviderCodex && s.SchedulerRef != nil {
+		eligible := untried[:0]
+		for _, account := range untried {
+			_, allowed := s.SchedulerRef.RunIfAccountNotExplicitlyBlocked(
+				schedulerAccountProvider(account.Provider), account.ID, "", time.Now(), func() {})
+			if !allowed {
+				continue
+			}
+			eligible = append(eligible, account)
+		}
+		untried = eligible
+	}
 	if len(untried) == 0 {
 		return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
 	}

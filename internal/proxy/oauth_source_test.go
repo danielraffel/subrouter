@@ -663,6 +663,41 @@ func TestRefreshSelectedCodexAccountFailsOverWhenAlternateScoreIsStale(t *testin
 	}
 }
 
+func TestRefreshSelectedCodexAccountSkipsExplicitlyUnavailableAlternate(t *testing.T) {
+	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := accounts.Account{ID: "dead@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "stale"}
+	blocked := accounts.Account{ID: "blocked@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "blocked"}
+	server := Server{
+		Accounts: []accounts.Account{dead, blocked},
+		Sessions: sessions,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: dead.ID, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+			{AccountID: blocked.ID, Provider: accounts.ProviderCodex, Headroom: 0, ShortHeadroom: 0},
+		})),
+	}
+	server.SchedulerRef.MarkAccountUnavailableUntil(accounts.ProviderCodex, blocked.ID, time.Now().Add(time.Hour))
+	var refreshed []string
+	server.RefreshAccountFn = func(_ context.Context, acct accounts.Account) (accounts.Account, error) {
+		refreshed = append(refreshed, acct.ID)
+		return acct, errors.New("Codex OAuth refresh failed: invalid_grant")
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = server.refreshSelectedAccount(context.Background(), accounts.ProviderCodex, "codex", "session-2", "", request, dead)
+	if err == nil {
+		t.Fatal("refresh should fail when every alternate is explicitly unavailable")
+	}
+	if len(refreshed) != 1 || refreshed[0] != dead.ID {
+		t.Fatalf("explicitly unavailable alternate was retried: %v", refreshed)
+	}
+}
+
 func TestRefreshSelectedAntigravityAccountFailsOverOnTerminalCredentialError(t *testing.T) {
 	sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
