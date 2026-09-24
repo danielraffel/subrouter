@@ -6537,6 +6537,18 @@ func (s Server) accountForSessionProvider(provider accounts.Provider, agentType,
 	return s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
 }
 
+// modelPoolScoreAvailable distinguishes an unknown/stale usage score from an
+// account that has no score for a model pool that another account exposes.
+// ForModel intentionally zeroes the latter so unsupported model requests do
+// not get routed optimistically when stale-score recovery is enabled.
+func modelPoolScoreAvailable(s selectacct.Scheduler, provider accounts.Provider, accountID, poolModel string) bool {
+	if poolModel == "" || !s.HasModelPoolFor(provider, poolModel) {
+		return true
+	}
+	_, ok := s.ScoreFor(provider, accountID).ModelScores[selectacct.ModelKey(poolModel)]
+	return ok
+}
+
 type accountSelectionOptions struct {
 	allowFableAPIKeyPool bool
 	ignoreForcedAccount  bool
@@ -6652,14 +6664,15 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
 						schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel, time.Now())
 				}
-			authoritativeExhaustion := scheduler.ScoreFor(schedulerAccountProvider(candidate.Provider), candidate.ID).Fresh
-			if s.SchedulerRef != nil {
-				for _, poolKey := range []string{"", poolModel} {
-					if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(candidate.Provider), candidate.ID, poolKey); marked && until.After(time.Now()) {
-						authoritativeExhaustion = true
+				authoritativeExhaustion := !modelPoolScoreAvailable(base, schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel) ||
+					scheduler.ScoreFor(schedulerAccountProvider(candidate.Provider), candidate.ID).Fresh
+				if s.SchedulerRef != nil {
+					for _, poolKey := range []string{"", poolModel} {
+						if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(candidate.Provider), candidate.ID, poolKey); marked && until.After(time.Now()) {
+							authoritativeExhaustion = true
+						}
 					}
 				}
-			}
 				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
 					candidate = fallback
 				} else if explicitlyUnavailable || authoritativeExhaustion {
@@ -6713,7 +6726,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
 				schedulerAccountProvider(account.Provider), account.ID, poolModel, time.Now())
 		}
-		authoritativeExhaustion := scheduler.ScoreFor(schedulerAccountProvider(account.Provider), account.ID).Fresh
+		authoritativeExhaustion := !modelPoolScoreAvailable(base, schedulerAccountProvider(account.Provider), account.ID, poolModel) ||
+			scheduler.ScoreFor(schedulerAccountProvider(account.Provider), account.ID).Fresh
 		if s.SchedulerRef != nil {
 			for _, poolKey := range []string{"", poolModel} {
 				if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(account.Provider), account.ID, poolKey); marked && until.After(time.Now()) {
