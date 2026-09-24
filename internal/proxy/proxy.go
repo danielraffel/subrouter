@@ -6647,17 +6647,22 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 				return account, sessionID, userEmail, nil
 			}
 			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
+				explicitlyUnavailable := false
+				if s.SchedulerRef != nil {
+					_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
+						schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel, time.Now())
+				}
+			authoritativeExhaustion := scheduler.ScoreFor(schedulerAccountProvider(candidate.Provider), candidate.ID).Fresh
+			if s.SchedulerRef != nil {
+				for _, poolKey := range []string{"", poolModel} {
+					if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(candidate.Provider), candidate.ID, poolKey); marked && until.After(time.Now()) {
+						authoritativeExhaustion = true
+					}
+				}
+			}
 				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
 					candidate = fallback
-				} else {
-					// The whole pool is exhausted: Pick ranks exhausted accounts
-					// last but still returns one, and the post-selection check
-					// below rejects it before the assignment is ever persisted.
-					// Reaching that check through this branch used to log a
-					// "rerouting" to an unusable account that never happened,
-					// once per request for as long as the pool stayed exhausted.
-					// Fail the selection here so the handler goes straight to the
-					// fallback chain.
+				} else if explicitlyUnavailable || authoritativeExhaustion {
 					return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 				}
 			}
@@ -6697,12 +6702,34 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			return accounts.Account{}, sessionID, userEmail, err
 		}
 	}
+	// A zero scheduler score is not proof that a Claude account is exhausted.
+	// Anthropic's usage endpoint can reject subscription OAuth tokens (403) or
+	// rate-limit the proxy (429), and the resulting stale/unknown score used to
+	// make an existing session fail before it could be reassigned. Route the
+	// selected account and let the request-time response drive real failover.
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
-		fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts)
-		if !ok {
+		explicitlyUnavailable := false
+		if s.SchedulerRef != nil {
+			_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
+				schedulerAccountProvider(account.Provider), account.ID, poolModel, time.Now())
+		}
+		authoritativeExhaustion := scheduler.ScoreFor(schedulerAccountProvider(account.Provider), account.ID).Fresh
+		if s.SchedulerRef != nil {
+			for _, poolKey := range []string{"", poolModel} {
+				if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(account.Provider), account.ID, poolKey); marked && until.After(time.Now()) {
+					authoritativeExhaustion = true
+				}
+			}
+		}
+		// Preserve the paid-extra-usage path when every subscription account is
+		// genuinely weekly-cooked. If no funded fallback is eligible, keep the
+		// selected account: usage scores can still be stale or unknown, and the
+		// request-time response remains the source of truth.
+		if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
+			account = fallback
+		} else if explicitlyUnavailable || authoritativeExhaustion {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 		}
-		account = fallback
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be

@@ -282,7 +282,7 @@ func TestUsageLimitRetryTransportClaudeFallsBackToAPIKey(t *testing.T) {
 	}
 }
 
-func TestAccountForSessionProviderClaudeRefusesExhaustedOAuthWithoutFallback(t *testing.T) {
+func TestAccountForSessionProviderClaudeRoutesWhenUsageScoreSaysExhausted(t *testing.T) {
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -306,11 +306,101 @@ func TestAccountForSessionProviderClaudeRefusesExhaustedOAuthWithoutFallback(t *
 	}
 	req.Header.Set("X-Subrouter-Agent", "claude")
 	req.Header.Set("X-Subrouter-Session", "session-1")
-	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err == nil {
-		t.Fatal("expected exhausted Claude OAuth selection to be refused")
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-1", req); err != nil {
+		t.Fatalf("stale exhausted Claude OAuth score should route optimistically: %v", err)
 	}
-	if _, ok := store.Get("claude", "session-1"); ok {
-		t.Fatal("exhausted account should not be assigned to a fresh Claude session")
+	if assignment, ok := store.Get("claude", "session-1"); !ok || assignment.AccountID != "cooked@example.com" {
+		t.Fatalf("Claude account should be assigned for request-time validation: %+v", assignment)
+	}
+}
+
+func TestAccountForSessionProviderClaudeReassignsRemovedSessionAccount(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 1, ShortHeadroom: 1},
+	}))
+	if _, err := store.Put("claude", "session-removed", "removed@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-removed")
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-removed", req); err != nil {
+		t.Fatalf("removed Claude account should be replaced automatically: %v", err)
+	}
+	assignment, ok := store.Get("claude", "session-removed")
+	if !ok || assignment.AccountID != "fresh@example.com" {
+		t.Fatalf("removed account assignment = %+v, want fresh@example.com", assignment)
+	}
+}
+
+func TestAccountForSessionProviderClaudeReassignsStickySessionWithStaleScores(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	}))
+	if _, err := store.Put("claude", "session-stale", "cooked@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-stale")
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-stale", req); err != nil {
+		t.Fatalf("stale Claude scores should still route: %v", err)
+	}
+	assignment, ok := store.Get("claude", "session-stale")
+	if !ok || assignment.AccountID == "cooked@example.com" {
+		t.Fatalf("stale sticky assignment = %+v, want reassignment", assignment)
+	}
+}
+
+func TestAccountForSessionProviderClaudeRejectsExplicitlyUnavailableAccount(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	server.Accounts = server.Accounts[:1]
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	}))
+	server.SchedulerRef.MarkAccountUnavailableUntil(accounts.ProviderClaude, "cooked@example.com", time.Now().Add(time.Hour))
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-unavailable")
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-unavailable", req); err == nil {
+		t.Fatal("explicitly unavailable Claude account should not be routed")
+	}
+	if _, ok := store.Get("claude", "session-unavailable"); ok {
+		t.Fatal("explicitly unavailable account should not be persisted")
+	}
+}
+
+func TestAccountForSessionProviderClaudeRejectsAuthoritativeExhaustionMark(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	server.Accounts = server.Accounts[:1]
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0},
+	}))
+	server.SchedulerRef.MarkExhaustedUntil(accounts.ProviderClaude, "cooked@example.com", "", time.Now().Add(time.Hour))
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-marked")
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-marked", req); err == nil {
+		t.Fatal("authoritatively exhausted Claude account should not be routed")
+	}
+	if _, ok := store.Get("claude", "session-marked"); ok {
+		t.Fatal("authoritatively exhausted account should not be persisted")
 	}
 }
 
