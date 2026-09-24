@@ -6664,8 +6664,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 					_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
 						schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel, time.Now())
 				}
-				authoritativeExhaustion := !modelPoolScoreAvailable(base, schedulerAccountProvider(candidate.Provider), candidate.ID, poolModel) ||
-					scheduler.ScoreFor(schedulerAccountProvider(candidate.Provider), candidate.ID).Fresh
+				candidateProvider := schedulerAccountProvider(candidate.Provider)
+				candidateScore := base.ScoreFor(candidateProvider, candidate.ID)
+				authoritativeExhaustion := !modelPoolScoreAvailable(base, candidateProvider, candidate.ID, poolModel) || candidateScore.Fresh
 				if s.SchedulerRef != nil {
 					for _, poolKey := range []string{"", poolModel} {
 						if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(candidate.Provider), candidate.ID, poolKey); marked && until.After(time.Now()) {
@@ -6726,8 +6727,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			_, explicitlyUnavailable = s.SchedulerRef.ExplicitlyUnavailableUntilFor(
 				schedulerAccountProvider(account.Provider), account.ID, poolModel, time.Now())
 		}
-		authoritativeExhaustion := !modelPoolScoreAvailable(base, schedulerAccountProvider(account.Provider), account.ID, poolModel) ||
-			scheduler.ScoreFor(schedulerAccountProvider(account.Provider), account.ID).Fresh
+		accountProvider := schedulerAccountProvider(account.Provider)
+		accountScore := base.ScoreFor(accountProvider, account.ID)
+		authoritativeExhaustion := !modelPoolScoreAvailable(base, accountProvider, account.ID, poolModel) || accountScore.Fresh
 		if s.SchedulerRef != nil {
 			for _, poolKey := range []string{"", poolModel} {
 				if until, marked := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(account.Provider), account.ID, poolKey); marked && until.After(time.Now()) {
