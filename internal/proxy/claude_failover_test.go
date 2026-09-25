@@ -404,6 +404,33 @@ func TestAccountForSessionProviderClaudeRejectsAuthoritativeExhaustionMark(t *te
 	}
 }
 
+func TestClaudeExtraUsageFallbackSkipsExplicitlyUnavailableAccount(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{
+			AccountID: "cooked@example.com", Provider: accounts.ProviderClaude,
+			Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
+			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 0.95,
+		},
+		{
+			AccountID: "fresh@example.com", Provider: accounts.ProviderClaude,
+			Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
+			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 0.40,
+		},
+	}))
+	server.SchedulerRef.MarkAccountUnavailableUntil(accounts.ProviderClaude, "cooked@example.com", time.Now().Add(time.Hour))
+
+	fallback, ok := server.pickClaudeExtraUsageFallbackForServer(
+		server.SchedulerRef.Get(), server.Accounts, "",
+	)
+	if !ok {
+		t.Fatal("expected an eligible paid-usage fallback")
+	}
+	if fallback.ID != "fresh@example.com" {
+		t.Fatalf("fallback account = %q, want fresh@example.com", fallback.ID)
+	}
+}
+
 func TestCaptureResponseBodyClaude401MarksExhausted(t *testing.T) {
 	server, _ := claudeFailoverServer(t)
 	response := &http.Response{

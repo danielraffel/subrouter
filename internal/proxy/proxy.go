@@ -6674,7 +6674,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 						}
 					}
 				}
-				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
+				if fallback, ok := s.pickClaudeExtraUsageFallbackForServer(scheduler, availableAccounts, poolModel); ok {
 					candidate = fallback
 				} else if explicitlyUnavailable || authoritativeExhaustion {
 					return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
@@ -6741,7 +6741,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// genuinely weekly-cooked. If no funded fallback is eligible, keep the
 		// selected account: usage scores can still be stale or unknown, and the
 		// request-time response remains the source of truth.
-		if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
+		if fallback, ok := s.pickClaudeExtraUsageFallbackForServer(scheduler, availableAccounts, poolModel); ok {
 			account = fallback
 		} else if explicitlyUnavailable || authoritativeExhaustion {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
@@ -6784,6 +6784,25 @@ func claudeExtraUsageEligible(score selectacct.Score) bool {
 // window cooked. An account cooked on its 5h session window alone still has
 // weekly quota coming back on its own; that is a temporary wait, never a
 // reason to spend paid credits.
+//
+// The server-aware wrapper below removes credential, account-state, and model
+// exclusions before the generic score-based selection, so paid usage never
+// overrides an explicit unavailability mark.
+func (s Server) pickClaudeExtraUsageFallbackForServer(scheduler selectacct.Scheduler, candidates []accounts.Account, poolModel string) (accounts.Account, bool) {
+	filtered := make([]accounts.Account, 0, len(candidates))
+	for _, candidate := range candidates {
+		if s.SchedulerRef != nil {
+			if _, unavailable := s.SchedulerRef.ExplicitlyUnavailableUntilFor(
+				accounts.ProviderClaude, candidate.ID, poolModel, time.Now(),
+			); unavailable {
+				continue
+			}
+		}
+		filtered = append(filtered, candidate)
+	}
+	return pickClaudeExtraUsageFallback(scheduler, filtered)
+}
+
 func pickClaudeExtraUsageFallback(scheduler selectacct.Scheduler, candidates []accounts.Account) (accounts.Account, bool) {
 	var best accounts.Account
 	bestRemaining := -1.0
@@ -8915,7 +8934,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		}
 		var account accounts.Account
 		if provider == accounts.ProviderClaude {
-			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, allCandidates); ok {
+			if fallback, ok := s.pickClaudeExtraUsageFallbackForServer(scheduler, allCandidates, poolModel); ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback
