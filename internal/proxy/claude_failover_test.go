@@ -314,6 +314,38 @@ func TestAccountForSessionProviderClaudeRoutesWhenUsageScoreSaysExhausted(t *tes
 	}
 }
 
+func TestAccountForSessionProviderClaudeRejectsFreshExhaustedScore(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := Server{
+		Accounts: []accounts.Account{{
+			ID:       "cooked@example.com",
+			Provider: accounts.ProviderClaude,
+			AuthMode: accounts.AuthModeOAuth,
+			Token:    "tok-cooked",
+		}},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, Fresh: true},
+		})),
+		MaxBodyBytes: 1024,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("X-Subrouter-Session", "session-fresh")
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-fresh", req); err == nil {
+		t.Fatal("freshly exhausted Claude account should not be routed")
+	}
+	if _, ok := store.Get("claude", "session-fresh"); ok {
+		t.Fatal("freshly exhausted account should not be persisted")
+	}
+}
+
 func TestAccountForSessionProviderClaudeReassignsRemovedSessionAccount(t *testing.T) {
 	server, store := claudeFailoverServer(t)
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
