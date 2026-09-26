@@ -182,6 +182,10 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	if err != nil {
 		return err
 	}
+	cmuxPath, err := exec.LookPath("cmux")
+	if err != nil {
+		return fmt.Errorf("cannot install wake worker: cmux is not executable: %w", err)
+	}
 	logDir := storepath.StateDir()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -189,7 +193,7 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return err
 	}
-	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir)
+	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath)
 	if err := os.WriteFile(path, []byte(plist), 0o600); err != nil {
 		return err
 	}
@@ -201,17 +205,17 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	return nil
 }
 
-func wakeLaunchdPlist(executable, stateDir, logDir string) string {
+func wakeLaunchdPlist(executable, stateDir, logDir, cmuxPath string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>%s</string>
-<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string></array>
+<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string><string>--cmux</string><string>%s</string></array>
 <key>EnvironmentVariables</key><dict><key>SUBROUTER_STATE_DIR</key><string>%s</string></dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
 <key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
 </dict></plist>
-`, wakeLaunchdLabel, plistXMLString(executable), plistXMLString(stateDir), plistXMLString(filepath.Join(logDir, "wake-worker.log")), plistXMLString(filepath.Join(logDir, "wake-worker.err.log")))
+`, wakeLaunchdLabel, plistXMLString(executable), plistXMLString(cmuxPath), plistXMLString(stateDir), plistXMLString(filepath.Join(logDir, "wake-worker.log")), plistXMLString(filepath.Join(logDir, "wake-worker.err.log")))
 }
 
 func plistXMLString(value string) string {

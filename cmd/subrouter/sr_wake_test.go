@@ -145,10 +145,11 @@ func TestAlarmDueAtUsesStableBoundedJitter(t *testing.T) {
 }
 
 func TestWakeLaunchdPlistPinsStateRoot(t *testing.T) {
-	plist := wakeLaunchdPlist("/tmp/subrouter&candidate", "/tmp/state&root", "/tmp/logs")
+	plist := wakeLaunchdPlist("/tmp/subrouter&candidate", "/tmp/state&root", "/tmp/logs", "/tmp/cmux&bin")
 	for _, want := range []string{
 		"<key>SUBROUTER_STATE_DIR</key><string>/tmp/state&amp;root</string>",
 		"<string>/tmp/subrouter&amp;candidate</string>",
+		"<string>/tmp/cmux&amp;bin</string>",
 	} {
 		if !strings.Contains(plist, want) {
 			t.Fatalf("plist missing %q:\n%s", want, plist)
