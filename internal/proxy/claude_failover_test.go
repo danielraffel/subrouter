@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -344,6 +345,111 @@ func TestAccountForSessionProviderClaudeRejectsFreshExhaustedScore(t *testing.T)
 	if _, ok := store.Get("claude", "session-fresh"); ok {
 		t.Fatal("freshly exhausted account should not be persisted")
 	}
+}
+
+// A Max account whose score lacks the Opus pool that other (cooked) accounts
+// expose must not be refused: the zero-filled pool score is unknown, not
+// measured exhaustion. Regression for the 503 "no non-exhausted claude
+// accounts" served while the only uncooked account still had quota.
+func TestAccountForSessionProviderClaudeRoutesAccountMissingModelPool(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opusKey := selectacct.ModelKey(claudePoolModel("claude-opus-5-5"))
+	server := Server{
+		Accounts: []accounts.Account{
+			{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+			{ID: "fresh@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"},
+		},
+		Sessions: store,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+			{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Fresh: true,
+				ModelScores: map[string]selectacct.Score{opusKey: {AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Fresh: true}}},
+			{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.5, ShortHeadroom: 0.9, Fresh: true},
+		})),
+		MaxBodyBytes: 1024,
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{"model":"claude-opus-5-5"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Subrouter-Agent", "claude")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Subrouter-Session", "session-missing-pool")
+	account, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-missing-pool", req)
+	if err != nil {
+		t.Fatalf("account missing a model-pool score should route optimistically: %v", err)
+	}
+	if account.ID != "fresh@example.com" {
+		t.Fatalf("routed to %q, want fresh@example.com", account.ID)
+	}
+}
+
+// Live shape from 2026-09-25: a setup-token Max account (user:inference only)
+// cannot read /api/oauth/usage, so its windows come from the rate-limit header
+// probe and carry session, weekly, and Fable buckets but no Opus/Sonnet bucket.
+// Every browser-OAuth account is weekly-cooked. Opus requests must route to the
+// setup-token account on its session/weekly headroom, and must still refuse it
+// once its measured weekly window is spent.
+func TestClaudeOpusRoutesSetupTokenAccountFromLiveUsageShape(t *testing.T) {
+	week := int64(7 * 24 * 60 * 60)
+	cooked := scoreFromUsageWindows(accounts.ProviderClaude, "cooked@example.com", []accounts.UsageWindow{
+		{Name: "5h", UsedPercent: 0, LimitWindowSeconds: 18000},
+		{Name: "7d", UsedPercent: 100, LimitWindowSeconds: week},
+		{Name: agentclaude.FableWindowName, UsedPercent: 13, LimitWindowSeconds: week, Feature: agentclaude.FableFeature},
+		{Name: "opus-weekly", UsedPercent: 0, LimitWindowSeconds: week, Feature: agentclaude.OpusFeature},
+		{Name: "sonnet-weekly", UsedPercent: 0, LimitWindowSeconds: week, Feature: agentclaude.SonnetFeature},
+	})
+	cooked.Fresh = true
+	setupTokenWindows := func(weeklyUsed float64) selectacct.Score {
+		score := scoreFromUsageWindows(accounts.ProviderClaude, "setup@example.com", []accounts.UsageWindow{
+			{Name: "5h", UsedPercent: 4, LimitWindowSeconds: 18000},
+			{Name: "7d", UsedPercent: weeklyUsed, LimitWindowSeconds: week},
+			{Name: agentclaude.FableWindowName, UsedPercent: 16, LimitWindowSeconds: week, Feature: agentclaude.FableFeature},
+		})
+		score.Fresh = true
+		return score
+	}
+	route := func(t *testing.T, setup selectacct.Score) (accounts.Account, error) {
+		t.Helper()
+		store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		server := Server{
+			Accounts: []accounts.Account{
+				{ID: "cooked@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-cooked"},
+				{ID: "setup@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-setup"},
+			},
+			Sessions:     store,
+			SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{cooked, setup})),
+			MaxBodyBytes: 1024,
+		}
+		req, err := http.NewRequest(http.MethodPost, "https://subrouter.test/v1/messages", strings.NewReader(`{"model":"claude-opus-5-5"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Subrouter-Agent", "claude")
+		req.Header.Set("X-Subrouter-Session", "session-live")
+		account, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "session-live", req)
+		return account, err
+	}
+	t.Run("weekly headroom left routes", func(t *testing.T) {
+		account, err := route(t, setupTokenWindows(53))
+		if err != nil {
+			t.Fatalf("setup-token account with 47%% weekly left was refused: %v", err)
+		}
+		if account.ID != "setup@example.com" {
+			t.Fatalf("routed to %q, want setup@example.com", account.ID)
+		}
+	})
+	t.Run("weekly spent refuses", func(t *testing.T) {
+		if account, err := route(t, setupTokenWindows(100)); err == nil {
+			t.Fatalf("weekly-spent pool routed to %q; want no non-exhausted accounts", account.ID)
+		}
+	})
 }
 
 func TestAccountForSessionProviderClaudeReassignsRemovedSessionAccount(t *testing.T) {
