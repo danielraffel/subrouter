@@ -13,3 +13,5 @@ func acquireFileLock(path string) (func(), error) {
 	}
 	return func() { _ = f.Close() }, nil
 }
+
+func AcquireWorkerLock(path string) (func(), error) { return acquireFileLock(path) }

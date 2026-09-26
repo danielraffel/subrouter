@@ -42,6 +42,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
+	"github.com/manaflow-ai/subrouter/wake"
 )
 
 // Account import states reported by /_subrouter/health.
@@ -193,6 +194,9 @@ type Server struct {
 	codexEgressTransports      []http.RoundTripper
 	CodexOverloadFailover      *CodexOverloadFailoverConfig
 	codexOverloadRerouteCounts *codexOverloadReroutes
+	// Recovery records classified provider/quota evidence for the shared cmux
+	// watcher. It never owns terminal reads or writes.
+	Recovery *RecoveryTracker
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -1958,6 +1962,9 @@ func (s Server) Handler() http.Handler {
 	if s.ActiveSessions == nil {
 		s.ActiveSessions = NewActiveSessions()
 	}
+	if s.Recovery == nil {
+		s.Recovery = NewRecoveryTracker()
+	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
 	}
@@ -2017,6 +2024,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/reload-accounts", s.requireAdmin(s.handleReloadAccounts))
 	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
+	mux.HandleFunc("/_subrouter/recovery-status", s.requireAdmin(s.handleRecoveryStatus))
 	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
 	mux.HandleFunc("/_subrouter/transcripts", s.requireAdmin(s.handleTranscriptList))
@@ -8310,6 +8318,22 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 			})
 		} else if t.server != nil && exhausted && !modelUnsupported {
+			if t.server.Recovery != nil {
+				kind := ""
+				resetAt := time.Time{}
+				bodyPrefix := peekResponseBodyPrefix(response)
+				switch t.provider {
+				case accounts.ProviderCodex:
+					kind = wake.KindCodexQuota
+					resetAt, _ = codexUsageLimitExpiry(bodyPrefix, time.Now().UTC())
+				case accounts.ProviderClaude:
+					kind = wake.KindClaudeQuota
+					resetAt = claudeExhaustionExpiry(response.Header, time.Now().UTC())
+				}
+				if kind != "" {
+					t.server.Recovery.RecordQuotaFailure(t.agent, t.session, kind, exhaustionPool, time.Now().UTC(), resetAt)
+				}
+			}
 			// Use the response's own reset time so the mark self-expires when the
 			// window recovers. Codex responses lack these headers; their body
 			// carries resets_in_seconds or a workspace-level reason instead, so

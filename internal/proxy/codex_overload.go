@@ -114,6 +114,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 		}
 		failed, reason, response := codexOverloadFailure(response)
 		if !failed {
+			if t.server.Recovery != nil && response != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+				t.server.Recovery.RecordProviderHealthy(t.agent, t.session, time.Now().UTC())
+			}
 			if switched > 0 && response.StatusCode >= http.StatusOK &&
 				response.StatusCode < http.StatusMultipleChoices && t.server.Sessions != nil {
 				// The candidate picker no longer commits the session on
@@ -126,6 +129,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			return response, nil
 		}
 		t.server.markAccountOverloaded(accountID, t.poolModel, config.markTTL())
+		if t.server.Recovery != nil {
+			t.server.Recovery.RecordCapacityFailure(t.agent, t.session, t.poolModel, time.Now().UTC())
+		}
 		if switched >= maxAccounts {
 			t.logOverload("codex overload failover exhausted", accountID, reason, switched, "max_accounts")
 			return response, nil

@@ -78,6 +78,9 @@ Usage:
   sr wake schedule ...  Schedule a quota/provider recovery wake alarm
   sr wake now [agent]   Make scheduled alarms eligible immediately
   sr wake cancel ...    Cancel one alarm, an agent's alarms, or all alarms
+  sr wake worker        Run the singleton cmux wake worker (--once for a pass)
+  sr wake install       Install and bootstrap the reboot-surviving launchd worker
+  sr wake uninstall     Stop and remove the launchd worker
   sr wake enable|disable <codex|claude>
                         Enable or disable automatic recovery for one agent
   sr qwen login [--console-account <email-or-label>] <account>

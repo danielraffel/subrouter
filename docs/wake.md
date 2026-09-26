@@ -1,8 +1,9 @@
 # Quota wake alarms
 
 `sr wake` is the local control surface for quota-triggered agent resumes. The
-alarm store and policy commands are available now; automatic proxy scheduling
-and the launchd worker are the remaining integration work.
+alarm store, policy commands, proxy handoff, automatic scheduling, and the
+launchd worker are available on this branch. Fleet enablement remains an
+explicit rollout step after the upgraded proxy is deployed.
 It is disabled by default and must be enabled independently for Codex and
 Claude. The existing cmux/session watcher remains the only component that
 reads a terminal surface or sends a resume action; Subrouter owns quota
@@ -27,6 +28,15 @@ The watcher validates the original machine, cmux surface, agent type, session
 ID, and active-writer state before sending the configured action. A mismatched
 or missing surface becomes `stale`; no replacement tab is selected.
 
+`sr wake worker` is the singleton shared watcher. It reads the proxy's
+classified `/_subrouter/recovery-status` handoff, resolves the saved cmux
+session with `cmux sessions --json`, validates the exact surface with
+`cmux read-screen`, and is the only process that sends the action. Install it
+across reboot with `sr wake install`; remove it with `sr wake uninstall`.
+The worker uses a 30-second deterministic per-alarm jitter and a five-second
+default spacing between sends; use `--interval` and `--spacing` to tune the
+monitor without changing alarm times.
+
 The queue keeps three recovery kinds separate: `codex-provider` is a temporary
 model-provider capacity event and requires a cooldown plus a lightweight health
 check; `codex-quota` is an account reset and uses `/goal resume` after reset and
@@ -40,6 +50,12 @@ show that the route is usable before one expensive resume is attempted. Further
 failures use bounded backoff and a finite attempt budget; they do not loop
 large-context resumes. Token usage and whether generation began are recorded
 for each attempt so this policy can be tuned from evidence.
+
+The default policy permits two goal attempts and does not send a fallback
+`continue`. Fallback is an explicit policy choice and is sent at most once
+after the configured failure threshold; otherwise the state becomes `stop`
+until a fresh provider event. This keeps repeated capacity failures from
+burning replay tokens.
 
 ## Configuration and controls
 
@@ -69,6 +85,9 @@ sr wake now <claude|codex|all>
 sr wake cancel <id>
 sr wake cancel --agent <claude|codex>
 sr wake cancel --all
+sr wake worker --once
+sr wake install
+sr wake uninstall
 ```
 
 Durations accept days, hours, and minutes (`2d4h15m`). They are converted to
