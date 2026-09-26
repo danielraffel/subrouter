@@ -1569,7 +1569,17 @@ func (r claudeRunner) env() error {
 // the Claude process is closed automatically so the user does not have to exit
 // by hand. Returns the process exit error and whether we initiated the close
 // (in which case a non-nil exit error is expected and not a failure).
+//
+// A re-login runs against a profile that already holds a credential (for
+// example a setup token being replaced by browser OAuth). Only a credential
+// that differs from the one present at launch counts as a completed login;
+// otherwise the pre-existing token would close Claude before the browser flow
+// ran and be re-published unchanged.
 func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string) (error, bool) {
+	baselineToken := ""
+	if existing, _ := r.store.ReadCredential(ctx, claudeConfigDir); existing != nil {
+		baselineToken = existing.AccessToken
+	}
 	if err := cmd.Start(); err != nil {
 		return err, false
 	}
@@ -1586,7 +1596,7 @@ func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cm
 			return err, true
 		case <-ticker.C:
 			credential, _ := r.store.ReadCredential(ctx, claudeConfigDir)
-			if credential == nil || credential.AccessToken == "" {
+			if credential == nil || credential.AccessToken == "" || credential.AccessToken == baselineToken {
 				continue
 			}
 			fmt.Fprintln(r.errOut, "\nLogin detected; closing Claude...")
