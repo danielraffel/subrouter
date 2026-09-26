@@ -52,7 +52,9 @@ large-context resumes. Token usage and whether generation began are recorded
 for each attempt so this policy can be tuned from evidence. The proxy records
 dispatch, pending state, and the next matching POST outcome
 (`generation_began`, `generation_not_started`, or
-`provider_or_quota_failure`) without adding a second terminal watcher.
+`provider_or_quota_failure`) without adding a second terminal watcher. Token
+fields are retained when the caller supplies usage counts; the watcher itself
+does not parse or persist request bodies.
 
 The default policy permits two goal attempts and does not send a fallback
 `continue`. Fallback is an explicit policy choice and is sent at most once
