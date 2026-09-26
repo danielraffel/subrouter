@@ -156,8 +156,16 @@ func (t *RecoveryTracker) record(agent, session, kind, pool string, at, resetAt 
 	key := recoveryKey(agent, session)
 	s := t.state[key]
 	s.Agent, s.SessionID, s.Kind, s.Pool = agent, session, kind, pool
+	previousFailure := s.LastFailureAt
 	s.LastActivityAt, s.LastFailureAt = at.UTC(), at.UTC()
-	s.ResetAt = resetAt.UTC()
+	// A pooled request can observe several exhausted accounts before it
+	// returns. Keep the earliest reset from that short failure batch so the
+	// watcher wakes at the first usable account. A later failure starts a new
+	// batch, even if an older reset is still in the past.
+	withinBatch := !previousFailure.IsZero() && at.Sub(previousFailure) >= 0 && at.Sub(previousFailure) <= 5*time.Second
+	if !withinBatch || s.ResetAt.IsZero() || (!resetAt.IsZero() && resetAt.Before(s.ResetAt)) {
+		s.ResetAt = resetAt.UTC()
+	}
 	s.Failures++
 	t.state[key] = s
 }

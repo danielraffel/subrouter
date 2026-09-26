@@ -50,3 +50,19 @@ func TestRecoveryTrackerRecordsReplayOutcome(t *testing.T) {
 		t.Fatalf("successful replay state=%+v", state)
 	}
 }
+
+func TestRecoveryTrackerKeepsSoonestResetWithinFailureBatch(t *testing.T) {
+	tracker := NewRecoveryTracker()
+	now := time.Now().UTC()
+	tracker.RecordQuotaFailure("codex", "s1", wake.KindCodexQuota, "", now, now.Add(2*time.Hour))
+	tracker.RecordQuotaFailure("codex", "s1", wake.KindCodexQuota, "", now.Add(time.Second), now.Add(20*time.Minute))
+	state := tracker.List(now)[0]
+	if !state.ResetAt.Equal(now.Add(20 * time.Minute)) {
+		t.Fatalf("reset=%s, want soonest reset %s", state.ResetAt, now.Add(20*time.Minute))
+	}
+	tracker.RecordQuotaFailure("codex", "s1", wake.KindCodexQuota, "", now.Add(10*time.Minute), now.Add(3*time.Hour))
+	state = tracker.List(now)[0]
+	if !state.ResetAt.Equal(now.Add(3 * time.Hour)) {
+		t.Fatalf("new batch reset=%s, want %s", state.ResetAt, now.Add(3*time.Hour))
+	}
+}
