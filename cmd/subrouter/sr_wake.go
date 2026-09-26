@@ -343,6 +343,15 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, startedAt
 		if (state.Agent != "codex" && state.Agent != "claude") || state.LastFailureAt.IsZero() || (!initial && state.LastFailureAt.Before(startedAt)) {
 			continue
 		}
+		enabled, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Enabled(state.Agent)
+		if err != nil {
+			return err
+		}
+		if !enabled {
+			// Disabled automatic recovery must not enqueue alarms that wait for
+			// a later enable. Explicit schedule commands remain usable.
+			continue
+		}
 		var matched cmuxSessionWire
 		found := false
 		for _, candidate := range sessions {
@@ -400,7 +409,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, startedAt
 				action = "continue"
 			}
 		}
-		_, err = store.Put(wake.Alarm{Kind: state.Kind, Agent: state.Agent, SessionID: state.SessionID, SurfaceID: matched.SurfaceID, Machine: "local", Pool: state.Pool, Action: action, WakeAt: wakeAt, ExpiresAt: wakeAt.Add(7 * 24 * time.Hour), JitterSeconds: 30, SessionLastActiveAt: lastActive, ObservedAt: state.LastFailureAt}, now)
+		_, err = store.Put(wake.Alarm{Kind: state.Kind, Agent: state.Agent, SessionID: state.SessionID, SurfaceID: matched.SurfaceID, Machine: "local", Pool: state.Pool, Action: action, WakeAt: wakeAt, ExpiresAt: wakeAt.Add(7 * 24 * time.Hour), JitterSeconds: 30, SessionLastActiveAt: lastActive, ObservedAt: state.LastFailureAt, Automatic: true}, now)
 		if err != nil {
 			return err
 		}
@@ -440,12 +449,14 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 		if alarm.Status != wake.StatusScheduled || alarmDueAt(alarm).After(now) {
 			continue
 		}
-		enabled, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Enabled(alarm.Agent)
-		if err != nil {
-			return err
-		}
-		if !enabled {
-			continue
+		if alarm.Automatic {
+			enabled, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Enabled(alarm.Agent)
+			if err != nil {
+				return err
+			}
+			if !enabled {
+				continue
+			}
 		}
 		initialAlarm := alarm.ObservedAt.IsZero() || alarm.ObservedAt.Before(workerStartedAt)
 		if alarm.SessionLastActiveAt.IsZero() || !wake.EligibleForAutomatic(alarm.SessionLastActiveAt, now, initialAlarm, !initialAlarm) {
@@ -613,7 +624,7 @@ func scheduleWake(store *wake.Store, args []string, now time.Time, out interface
 			return fmt.Errorf("last-active must be RFC3339: %w", err)
 		}
 	}
-	a, err := store.Put(wake.Alarm{Kind: vals["kind"], Agent: vals["agent"], SessionID: vals["session"], SurfaceID: vals["surface"], Machine: vals["machine"], Pool: vals["pool"], Action: vals["action"], WakeAt: now.Add(after), ExpiresAt: now.Add(expiry), JitterSeconds: jitter, SessionLastActiveAt: lastActive}, now)
+	a, err := store.Put(wake.Alarm{Kind: vals["kind"], Agent: vals["agent"], SessionID: vals["session"], SurfaceID: vals["surface"], Machine: vals["machine"], Pool: vals["pool"], Action: vals["action"], WakeAt: now.Add(after), ExpiresAt: now.Add(expiry), JitterSeconds: jitter, SessionLastActiveAt: lastActive, Automatic: false}, now)
 	if err != nil {
 		return err
 	}

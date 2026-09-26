@@ -54,6 +54,7 @@ type Alarm struct {
 	JitterSeconds       int       `json:"jitter_seconds,omitempty"`
 	SessionLastActiveAt time.Time `json:"session_last_active_at,omitempty"`
 	ObservedAt          time.Time `json:"observed_at,omitempty"`
+	Automatic           bool      `json:"automatic,omitempty"`
 }
 
 const InitialSessionMaxAge = 8 * time.Hour

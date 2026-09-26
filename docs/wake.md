@@ -120,7 +120,9 @@ failover only and do not create long-lived alarms.
 
 ## Acceptance
 
-- No wake alarm is created while the agent setting is disabled.
+- The watcher creates no automatic alarm while the agent setting is disabled.
+  Explicit `wake schedule` alarms remain available for manual control, including
+  `wake now` and worker dispatch.
 - A session fails over immediately before any alarm is created.
 - The alarm selects the earliest eligible account reset for the requested pool.
 - Reboot and sleep/wake preserve the alarm and its absolute timestamps.

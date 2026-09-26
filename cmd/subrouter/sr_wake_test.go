@@ -35,6 +35,9 @@ func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := wake.NewStore(filepath.Join(storepath.StateDir(), "wake.json"))
+	if err := wake.NewConfig(filepath.Join(storepath.StateDir(), "wake-config.json")).SetEnabled("claude", true); err != nil {
+		t.Fatal(err)
+	}
 	if err := syncRecoveryAlarms(store, server.URL, cmux, now.Add(-time.Minute), true); err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +47,63 @@ func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 	}
 	if len(alarms) != 1 || alarms[0].SurfaceID != "surface-1" || alarms[0].Action != "continue" {
 		t.Fatalf("alarms=%+v", alarms)
+	}
+}
+
+func TestSyncRecoveryAlarmsDoesNotEnqueueWhenDisabled(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", stateRoot)
+	now := time.Now().UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]recoveryWireState{{Agent: "claude", SessionID: "disabled", Kind: wake.KindClaudeQuota, LastActivityAt: now, LastFailureAt: now}})
+	}))
+	defer server.Close()
+	cmux := filepath.Join(stateRoot, "cmux-fake")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nprintf '{\"sessions\":[]}'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := wake.NewStore(filepath.Join(storepath.StateDir(), "wake.json"))
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true); err != nil {
+		t.Fatal(err)
+	}
+	alarms, err := store.List(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 0 {
+		t.Fatalf("disabled automatic recovery enqueued alarms=%+v", alarms)
+	}
+}
+
+func TestDispatchManualAlarmIgnoresAutomaticDisabledSetting(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", stateRoot)
+	now := time.Now().UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/_subrouter/recovery-status" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	cmux := filepath.Join(stateRoot, "cmux-fake")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nif [ \"$1\" = read-screen ]; then printf prompt; else exit 0; fi\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := wake.NewStore(filepath.Join(storepath.StateDir(), "wake.json"))
+	if _, err := store.Put(wake.Alarm{Kind: wake.KindClaudeQuota, Agent: "claude", SessionID: "manual", SurfaceID: "surface", Action: "continue", WakeAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour), SessionLastActiveAt: now}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now.Add(-time.Minute), &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	alarms, err := store.List(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 1 || alarms[0].Status != wake.StatusCompleted {
+		t.Fatalf("manual alarm was not dispatched while disabled: %+v", alarms)
 	}
 }
 
@@ -76,6 +136,10 @@ func TestSyncRecoveryAlarmsRejectsStaleInitialSession(t *testing.T) {
 func TestAlarmDueAtUsesStableBoundedJitter(t *testing.T) {
 	alarm := wake.Alarm{ID: "w_jitter", WakeAt: time.Unix(100, 0).UTC(), JitterSeconds: 30}
 	first, second := alarmDueAt(alarm), alarmDueAt(alarm)
-	if !first.Equal(second) { t.Fatalf("jitter is not deterministic: %v vs %v", first, second) }
-	if first.Before(alarm.WakeAt) || first.After(alarm.WakeAt.Add(30*time.Second)) { t.Fatalf("jitter outside bound: %v", first) }
+	if !first.Equal(second) {
+		t.Fatalf("jitter is not deterministic: %v vs %v", first, second)
+	}
+	if first.Before(alarm.WakeAt) || first.After(alarm.WakeAt.Add(30*time.Second)) {
+		t.Fatalf("jitter outside bound: %v", first)
+	}
 }
