@@ -8902,10 +8902,6 @@ func (t usageLimitRetryTransport) logClaudeUnusableResponse(response *http.Respo
 		"body", string(prefix))
 }
 
-// logAntigravityUnusableResponse records only bounded, non-content metadata for
-// Cloud Code 429/401 responses.  AGY's quota summary is not authoritative for
-// a particular model/session allocation, so this makes the upstream reason
-// observable without logging prompts or OAuth credentials.
 // logCodexUnusableResponse records why Codex refused an attempt before the
 // transport fails over. A bare 429 is treated as request-scoped, so without
 // this the refusal is invisible whenever failover succeeds: the upstream error
@@ -8982,6 +8978,10 @@ func codexErrorBodyFields(body []byte) []any {
 	return fields
 }
 
+// logAntigravityUnusableResponse records only bounded, non-content metadata for
+// Cloud Code 429/401 responses.  AGY's quota summary is not authoritative for
+// a particular model/session allocation, so this makes the upstream reason
+// observable without logging prompts or OAuth credentials.
 func (t usageLimitRetryTransport) logAntigravityUnusableResponse(response *http.Response, accountID string) {
 	if t.logger == nil || response == nil {
 		return
