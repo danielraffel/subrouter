@@ -160,7 +160,7 @@ Running agents:
 
   sr server             Legacy form of sr remote
   sr server add <name> --url <url> [--default]
-  sr server use <name|local> [--no-codex-config]
+  sr server use <name|local> [--codex-config|--no-codex-config]
   sr server rename <old> <new>
   sr server install <name>
   sr server login <name> [--device-auth]

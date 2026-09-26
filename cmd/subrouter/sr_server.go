@@ -96,7 +96,7 @@ This machine's daemon:
 Named servers:
   %[1]s list
   %[1]s add <name> --url <url> [--default] [--tailscale-node-id <id>] [--admin-token <token>] [--account-import-token <token>] [--tenant-key srt_<hex>] [--ssh-host <user@host>] [--gcp-instance <name> --gcp-zone <zone> --gcp-project <project>]
-  %[1]s use <name|local> [--no-codex-config]
+  %[1]s use <name|local> [--codex-config|--no-codex-config]
   %[1]s current
   %[1]s clear-default
   %[1]s rename <old> <new>
@@ -600,7 +600,7 @@ func (r srRunner) serverAdd(store srServerStore, args []string) error {
 func (r srRunner) serverUse(store srServerStore, args []string) error {
 	command := r.serverCommand()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: %s use <name|local> [--no-codex-config]", command)
+		return fmt.Errorf("usage: %s use <name|local> [--codex-config|--no-codex-config]", command)
 	}
 	name := strings.TrimSpace(args[0])
 	flags := flag.NewFlagSet(command+" use", flag.ContinueOnError)
@@ -790,7 +790,10 @@ func (r srRunner) clearDefaultServer(store srServerStore, updateCodexConfig bool
 }
 
 func addCodexConfigSwitchFlags(flags *flag.FlagSet) (*bool, *bool) {
-	writeCodexConfig := flags.Bool("codex-config", true, "write CODEX_HOME/config.toml routing defaults")
+	// Keep plain `codex` direct by default.  `sr codex` supplies process-scoped
+	// routing overrides, so a durable config write is only an explicit opt-in
+	// for users who also want Codex Desktop routed.
+	writeCodexConfig := flags.Bool("codex-config", false, "write CODEX_HOME/config.toml routing defaults")
 	noCodexConfig := flags.Bool("no-codex-config", false, "do not modify CODEX_HOME/config.toml")
 	return writeCodexConfig, noCodexConfig
 }
