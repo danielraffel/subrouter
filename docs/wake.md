@@ -57,6 +57,10 @@ after the configured failure threshold; otherwise the state becomes `stop`
 until a fresh provider event. This keeps repeated capacity failures from
 burning replay tokens.
 
+Enable the opt-in fallback explicitly with `sr wake policy codex
+--allow-continue --continue-after 2`. The policy is persisted with restrictive
+permissions and remains disabled until changed.
+
 ## Configuration and controls
 
 The configuration is per agent and disabled by default:
@@ -88,6 +92,7 @@ sr wake cancel --all
 sr wake worker --once
 sr wake install
 sr wake uninstall
+sr wake policy codex --no-continue --max-goal-attempts 2 --cooldown 1m
 ```
 
 Durations accept days, hours, and minutes (`2d4h15m`). They are converted to

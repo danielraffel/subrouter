@@ -78,9 +78,65 @@ func (r srRunner) wake(args []string) error {
 		}
 		fmt.Fprintf(r.out, "automatic %s recovery %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
 		return nil
+	case "policy":
+		return updateWakePolicy(args[1:], r.out)
 	default:
 		return fmt.Errorf("unknown wake command %q", args[0])
 	}
+}
+
+func updateWakePolicy(args []string, out interface{ Write([]byte) (int, error) }) error {
+	if len(args) < 1 || (args[0] != "codex" && args[0] != "claude") {
+		return fmt.Errorf("usage: sr wake policy <codex|claude> [--allow-continue|--no-continue] [--max-goal-attempts N] [--continue-after N] [--cooldown DURATION]")
+	}
+	agent := args[0]
+	cfg := wake.NewConfig(storepath.StateDir() + "/wake-config.json")
+	current, err := cfg.Policy(agent)
+	if err != nil {
+		return err
+	}
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--allow-continue":
+			current.AllowContinue = true
+		case "--no-continue":
+			current.AllowContinue = false
+		case "--max-goal-attempts", "--continue-after":
+			if i+1 >= len(args) {
+				return fmt.Errorf("%s requires a positive integer", args[i])
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n <= 0 {
+				return fmt.Errorf("%s requires a positive integer", args[i])
+			}
+			if args[i] == "--max-goal-attempts" {
+				current.MaxGoalAttempts = n
+			} else {
+				current.ContinueAfter = n
+			}
+			i++
+		case "--cooldown":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--cooldown requires a duration")
+			}
+			d, err := wake.ParseDuration(args[i+1])
+			if err != nil || d <= 0 {
+				return fmt.Errorf("invalid cooldown")
+			}
+			current.CooldownSeconds = int(d / time.Second)
+			if current.CooldownSeconds <= 0 {
+				return fmt.Errorf("cooldown must be at least one second")
+			}
+			i++
+		default:
+			return fmt.Errorf("unknown policy option %q", args[i])
+		}
+	}
+	if err := cfg.SetPolicy(agent, current); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "updated %s wake policy: allow_continue=%t max_goal_attempts=%d continue_after=%d cooldown=%ds\n", agent, current.AllowContinue, current.MaxGoalAttempts, current.ContinueAfter, current.CooldownSeconds)
+	return nil
 }
 
 const wakeLaunchdLabel = "ai.manaflow.subrouter.wake"
@@ -300,6 +356,12 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, startedAt
 		if state.Agent == "codex" && state.Kind == wake.KindCodexProvider {
 			action = "/goal resume"
 			policy := wake.DefaultGoalResumePolicy()
+			if configured, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Policy("codex"); err == nil {
+				policy.AllowContinue = configured.AllowContinue
+				policy.MaxGoalAttempts = configured.MaxGoalAttempts
+				policy.ContinueAfter = configured.ContinueAfter
+				policy.Cooldown = time.Duration(configured.CooldownSeconds) * time.Second
+			}
 			next := policy.Next(wake.ResumeState{Failures: state.Failures, GoalAttempts: state.GoalAttempts, ContinueSent: state.ContinueSent, LastFailureAt: state.LastFailureAt, GenerationBegan: false}, now, !state.ProviderHealthyAt.IsZero() && state.ProviderHealthyAt.After(state.LastFailureAt))
 			switch next {
 			case wake.ResumeWait, wake.ResumeStop:

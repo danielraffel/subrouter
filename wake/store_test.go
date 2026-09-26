@@ -92,6 +92,17 @@ func TestConfigDisabledByDefaultAndPersists(t *testing.T) {
 	if enabled, err := cfg.Enabled("codex"); err != nil || enabled {
 		t.Fatalf("codex enabled=%v err=%v, want false", enabled, err)
 	}
+	policy, err := cfg.Policy("codex")
+	if err != nil || policy.AllowContinue || policy.MaxGoalAttempts != 2 {
+		t.Fatalf("default policy=%+v err=%v", policy, err)
+	}
+	policy.AllowContinue = true
+	if err := cfg.SetPolicy("codex", policy); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := cfg.Policy("codex"); err != nil || !saved.AllowContinue {
+		t.Fatalf("saved policy=%+v err=%v", saved, err)
+	}
 }
 
 func TestEligibleForAutomaticRejectsStaleInitialSessions(t *testing.T) {
