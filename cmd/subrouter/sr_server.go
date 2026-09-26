@@ -1109,6 +1109,7 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 		displayUsageRowsPerGroup(r.out, rows)
 		printAccountCountSummary(r.out, rows)
 		printKimiCLIOnlyStatusHint(r.out, rows)
+		printLocalWakeSummary(r.out, server.URL)
 		r.printBedrockStatus(ctx, server)
 		r.printAzureCodexStatus(ctx, server)
 		r.pushClaudeWebBalances(ctx, server, fresh)

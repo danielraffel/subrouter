@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,6 +83,28 @@ func (r srRunner) wake(args []string) error {
 		return updateWakePolicy(args[1:], r.out)
 	default:
 		return fmt.Errorf("unknown wake command %q", args[0])
+	}
+}
+
+func printLocalWakeSummary(out interface{ Write([]byte) (int, error) }, serverURL string) {
+	target, err := url.Parse(serverURL)
+	if err != nil || (target.Hostname() != "127.0.0.1" && target.Hostname() != "localhost" && target.Hostname() != "::1") {
+		return
+	}
+	alarms, err := wake.NewStore(storepath.StateDir() + "/wake.json").List(time.Now().UTC())
+	if err != nil {
+		return
+	}
+	scheduled := 0
+	for _, alarm := range alarms {
+		if alarm.Status == wake.StatusScheduled || alarm.Status == wake.StatusFired {
+			scheduled++
+		}
+	}
+	if scheduled == 0 {
+		fmt.Fprintln(out, "Wake alarms: none scheduled")
+	} else {
+		fmt.Fprintf(out, "Wake alarms: %d scheduled or firing (use 'sr wake list' for details)\n", scheduled)
 	}
 }
 
