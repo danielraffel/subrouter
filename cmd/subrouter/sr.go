@@ -74,6 +74,12 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
+  sr wake list          List durable agent wake alarms
+  sr wake schedule ...  Schedule a quota/provider recovery wake alarm
+  sr wake now [agent]   Make scheduled alarms eligible immediately
+  sr wake cancel ...    Cancel one alarm, an agent's alarms, or all alarms
+  sr wake enable|disable <codex|claude>
+                        Enable or disable automatic recovery for one agent
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
   sr qwen [args]        Run Qwen Code through the selected Token Plan pool
@@ -296,6 +302,11 @@ func srForProgram(program string, args []string) error {
 	return runner.run(context.Background(), args)
 }
 
+func srWakeForProgram(args []string) error {
+	runner := srRunner{program: "sr", in: os.Stdin, out: os.Stdout, errOut: os.Stderr}
+	return runner.wake(args)
+}
+
 func codexStoreForCommand(args []string) accounts.CodexStore {
 	if isCodexIsolatedEnrollmentCommand(args) {
 		return rawCodexStoreForStateRoot(storepath.StateDir())
@@ -335,6 +346,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
+		case "wake":
+			return r.wake(args[1:])
 		case "codex":
 			if isCodexAccountCommand(args) {
 				return r.codexAccount(ctx, args[1:])
@@ -490,6 +503,8 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
+	case "wake":
+		return r.wake(args[1:])
 	case "codex":
 		return r.codexAccount(ctx, args[1:])
 	case "qwen":
