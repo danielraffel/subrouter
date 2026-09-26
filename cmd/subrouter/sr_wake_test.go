@@ -143,3 +143,15 @@ func TestAlarmDueAtUsesStableBoundedJitter(t *testing.T) {
 		t.Fatalf("jitter outside bound: %v", first)
 	}
 }
+
+func TestWakeLaunchdPlistPinsStateRoot(t *testing.T) {
+	plist := wakeLaunchdPlist("/tmp/subrouter&candidate", "/tmp/state&root", "/tmp/logs")
+	for _, want := range []string{
+		"<key>SUBROUTER_STATE_DIR</key><string>/tmp/state&amp;root</string>",
+		"<string>/tmp/subrouter&amp;candidate</string>",
+	} {
+		if !strings.Contains(plist, want) {
+			t.Fatalf("plist missing %q:\n%s", want, plist)
+		}
+	}
+}

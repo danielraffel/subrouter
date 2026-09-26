@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -188,15 +189,7 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return err
 	}
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>%s</string>
-<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
-<key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
-</dict></plist>
-`, wakeLaunchdLabel, executable, filepath.Join(logDir, "wake-worker.log"), filepath.Join(logDir, "wake-worker.err.log"))
+	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir)
 	if err := os.WriteFile(path, []byte(plist), 0o600); err != nil {
 		return err
 	}
@@ -206,6 +199,27 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	}
 	fmt.Fprintf(out, "installed %s\n", path)
 	return nil
+}
+
+func wakeLaunchdPlist(executable, stateDir, logDir string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>%s</string>
+<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string></array>
+<key>EnvironmentVariables</key><dict><key>SUBROUTER_STATE_DIR</key><string>%s</string></dict>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
+<key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
+</dict></plist>
+`, wakeLaunchdLabel, plistXMLString(executable), plistXMLString(stateDir), plistXMLString(filepath.Join(logDir, "wake-worker.log")), plistXMLString(filepath.Join(logDir, "wake-worker.err.log")))
+}
+
+func plistXMLString(value string) string {
+	var escaped strings.Builder
+	if err := xml.EscapeText(&escaped, []byte(value)); err != nil {
+		return value
+	}
+	return escaped.String()
 }
 
 func uninstallWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
