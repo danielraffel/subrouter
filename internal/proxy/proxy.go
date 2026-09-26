@@ -4576,6 +4576,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			if s.Recovery != nil && r.Method == http.MethodPost &&
+				(sessionAgentType == "codex" || sessionAgentType == "claude") {
+				success := response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+				s.Recovery.RecordReplayResponse(sessionAgentType, sessionID, success, success, 0, 0)
+			}
 			if pendingSessionCommit && !usageFailoverInstalled && response.StatusCode >= 200 && response.StatusCode < 300 {
 				if err := s.commitSuccessfulHTTPResponse(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
 					return fmt.Errorf("persist successful session reassignment: %w", err)

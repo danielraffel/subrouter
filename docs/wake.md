@@ -49,7 +49,10 @@ and enters a short cooldown. The watcher or a lightweight provider probe must
 show that the route is usable before one expensive resume is attempted. Further
 failures use bounded backoff and a finite attempt budget; they do not loop
 large-context resumes. Token usage and whether generation began are recorded
-for each attempt so this policy can be tuned from evidence.
+for each attempt so this policy can be tuned from evidence. The proxy records
+dispatch, pending state, and the next matching POST outcome
+(`generation_began`, `generation_not_started`, or
+`provider_or_quota_failure`) without adding a second terminal watcher.
 
 The default policy permits two goal attempts and does not send a fallback
 `continue`. Fallback is an explicit policy choice and is sent at most once

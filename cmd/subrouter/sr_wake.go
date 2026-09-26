@@ -300,6 +300,10 @@ type recoveryWireState struct {
 	Failures          int       `json:"failures"`
 	GoalAttempts      int       `json:"goal_attempts"`
 	ContinueSent      bool      `json:"continue_sent"`
+	ReplayPending     bool      `json:"replay_pending"`
+	LastReplayAt      time.Time `json:"last_replay_at"`
+	LastReplayAction  string    `json:"last_replay_action"`
+	LastReplayOutcome string    `json:"last_replay_outcome"`
 }
 type cmuxSessionWire struct {
 	Agent     string `json:"agent"`
@@ -492,7 +496,7 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 }
 
 func postRecoveryGeneration(serverURL string, alarm wake.Alarm) error {
-	body := strings.NewReader(fmt.Sprintf(`{"agent":%q,"session_id":%q,"generation_began":false}`, alarm.Agent, alarm.SessionID))
+	body := strings.NewReader(fmt.Sprintf(`{"agent":%q,"session_id":%q,"action":%q,"dispatched_at":%q}`, alarm.Agent, alarm.SessionID, alarm.Action, time.Now().UTC().Format(time.RFC3339Nano)))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(serverURL, "/")+"/_subrouter/recovery-status", body)
