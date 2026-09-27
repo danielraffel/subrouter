@@ -14,6 +14,13 @@
 #   - while health is good, it records the serving binary as last-good
 #   - while health is down, it restores that binary and restarts the service
 #
+# Health alone cannot catch a release that starts fine and then breaks routing
+# or streaming. While release-state.json says a new worker is "baking" (see
+# release-bake-lib.sh), this job also compares the new generation's
+# /_subrouter/traffic outcome ratios with the baseline taken from the outgoing
+# generation, rolls a regression back and pins the previous release, and only
+# records the new worker as last-good once the bake passes.
+#
 # It runs every 60 seconds and acts on the second consecutive failure, which
 # bounds a bad-worker outage at about two minutes without reacting to a single
 # transient probe failure.
@@ -25,6 +32,7 @@ BIN="${SUBROUTER_BIN:-/usr/local/bin/subrouter}"
 SUPERVISOR_BIN="${SUBROUTER_SUPERVISOR_BIN:-/usr/local/libexec/subrouter-supervisor}"
 STATE="${SUBROUTER_VERIFY_STATE:-/var/lib/subrouter-verify}"
 LAST_GOOD="${SUBROUTER_LAST_GOOD:-${STATE}/subrouter.last-good}"
+VERSION_FILE="${SUBROUTER_VERSION_FILE:-/etc/subrouter-version}"
 HEALTH="${SUBROUTER_HEALTH_URL:-http://127.0.0.1:31415/_subrouter/health}"
 ALERTS="${SUBROUTER_ALERTS_FILE:-${STATE}/alerts.log}"
 HEARTBEAT="${SUBROUTER_GUARD_HEARTBEAT:-${STATE}/guard.heartbeat}"
@@ -48,6 +56,16 @@ GUARD_LOCK_STALE_MINS="${SUBROUTER_GUARD_LOCK_STALE_MINS:-10}"
 # restart passes through that state for seconds, so the sentinel still wins for
 # a short grace, and after it the guard bootstraps a service nobody is running.
 MISSING_SERVICE_GRACE_MINS="${SUBROUTER_GUARD_MISSING_SERVICE_GRACE_MINS:-3}"
+
+# The bake gate lives next to this script. Without it the guard keeps its
+# health-only behaviour rather than failing every tick.
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+BAKE_LIB="${SUBROUTER_BAKE_LIB:-${SCRIPT_DIR}/release-bake-lib.sh}"
+BAKE_GATE=0
+if [ -f "$BAKE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$BAKE_LIB" && BAKE_GATE=1
+fi
 
 mkdir -p "$STATE"
 now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -105,6 +123,95 @@ restart_service() {
   "$LAUNCHCTL" bootstrap system "$PLIST" >/dev/null 2>&1 || true
 }
 
+# After a rollback the version marker must describe what is running, not the
+# release that was just rejected. Left alone, subrouter-autoupdate.sh sees the
+# rejected tag as "installed" and never retries it (even after a human clears
+# the inhibit sentinel), and subrouter-verify.sh reports the wrong version.
+# A "rollback:" label never equals a release tag, so the updater retries the
+# release once the sentinel is cleared.
+record_rollback_version() { # record_rollback_version <restored sha256>
+  local previous
+  previous="$(sed -n '1p' "$VERSION_FILE" 2>/dev/null || true)"
+  previous="${previous:-unknown}"
+  # Keep the original release across repeated rollbacks instead of nesting.
+  case "$previous" in
+    rollback:*' (was '*')') previous="${previous#* (was }"; previous="${previous%)}" ;;
+  esac
+  mkdir -p "$(dirname "$VERSION_FILE")" 2>/dev/null || true
+  if printf 'rollback:%s (was %s)\n' "${1:0:12}" "$previous" >"${VERSION_FILE}.new" 2>/dev/null &&
+     mv -f "${VERSION_FILE}.new" "$VERSION_FILE"; then
+    emit INFO "version marker now reads rollback:${1:0:12} (was ${previous})"
+  else
+    rm -f "${VERSION_FILE}.new" 2>/dev/null || true
+    emit ALERT "could not update $VERSION_FILE after rollback; it still names ${previous}"
+  fi
+}
+
+# pin_after_rollback <text>: stop subrouter-autoupdate.sh from reinstalling
+# the worker that was just removed.
+pin_after_rollback() {
+  mkdir -p "$(dirname "$UPGRADE_INHIBIT_FILE")" 2>/dev/null || true
+  printf '%s\n' "$1" >"$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
+  chmod 0600 "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
+  emit ALERT "worker autoupdate paused by $UPGRADE_INHIBIT_FILE until a human clears it"
+}
+
+# Only a real tag may become the version marker after a bake rollback;
+# anything else gets the rollback:<sha> label.
+is_release_tag() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; }
+
+# hot_swap_back asks the supervisor for a new generation from the binary now
+# on disk, so a bake rollback never closes the listener. A restart is the
+# fallback when the control socket does not answer.
+hot_swap_back() {
+  local socket
+  socket="$(bake_control_socket)"
+  if [ -n "$socket" ] && [ -S "$socket" ] &&
+     curl -fsS --max-time 120 --unix-socket "$socket" -X POST "http://localhost/_subrouter/upgrade" >/dev/null 2>&1; then
+    emit INFO "supervisor switched to the restored worker; the listener stayed up"
+    return 0
+  fi
+  emit ALERT "control socket ${socket:-unknown} did not take the restored worker; restarting ${LABEL}"
+  restart_service
+}
+
+# bake_rollback <reason>: a baking release regressed while health still
+# answers. Put last-good back behind the live listener and pin it.
+bake_rollback() {
+  local reason="$1" version previous live_sha good_sha
+  version="$(bake_state_field version)"
+  previous="$(bake_state_field previous_version)"
+  live_sha="$(sha_of "$BIN")"
+  good_sha="$(sha_of "$LAST_GOOD")"
+  if [ "$good_sha" = "missing" ] || [ "$good_sha" = "$live_sha" ]; then
+    emit ALERT "bake gate: ${version:-the new worker} regressed (${reason}) but there is no different last-good worker to restore; this needs a human"
+    return 1
+  fi
+  emit ALERT "bake gate: rolling back ${version:-worker ${live_sha:0:12}} to ${previous:-last-good ${good_sha:0:12}}: ${reason}"
+  cp -p "$BIN" "${BIN}.rejected-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  pin_after_rollback "pinned at ${previous:-rollback:${good_sha:0:12}} by subrouter-guard.sh bake gate: rolled back ${version:-worker ${live_sha:0:12}} at ${now_iso} (${reason}); clear with subrouter-deploy.sh unpin"
+  if ! { install -m 0755 "$LAST_GOOD" "${BIN}.rollback" && mv -f "${BIN}.rollback" "$BIN"; }; then
+    rm -f "${BIN}.rollback"
+    emit ALERT "could not write ${BIN}; bake rollback failed"
+    return 1
+  fi
+  if is_release_tag "$previous" &&
+     printf '%s\n' "$previous" >"${VERSION_FILE}.new" 2>/dev/null &&
+     mv -f "${VERSION_FILE}.new" "$VERSION_FILE"; then
+    emit INFO "version marker now reads ${previous}"
+  else
+    rm -f "${VERSION_FILE}.new" 2>/dev/null || true
+    record_rollback_version "$good_sha"
+  fi
+  bake_mark rolled_back "$reason"
+  hot_swap_back
+  if wait_health; then
+    emit INFO "bake rollback done: ${previous:-last-good} is serving"
+  else
+    emit ALERT "health did not answer after the bake rollback; the health-down path takes over next cycle"
+  fi
+}
+
 : >"$HEARTBEAT"
 
 # One actor at a time. launchd will not overlap this job with itself, but an
@@ -119,19 +226,66 @@ if ! mkdir "$GUARD_LOCK_DIR" 2>/dev/null; then
   rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true
   mkdir "$GUARD_LOCK_DIR" 2>/dev/null || { emit ALERT "cannot take $GUARD_LOCK_DIR"; exit 0; }
 fi
-trap 'rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true' EXIT
+HELD_DEPLOY_LOCK=0
+release_locks() {
+  if [ "$HELD_DEPLOY_LOCK" -eq 1 ]; then
+    rm -f "$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+    rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  fi
+  rmdir "$GUARD_LOCK_DIR" 2>/dev/null || true
+}
+trap release_locks EXIT
 
-# subrouter-deploy.sh owns the outcome while it runs: it swaps the binary,
-# waits for the new generation, and reverts on its own. A guard tick inside
-# that window would either record the untested candidate as last-good or
-# restart the service under the deploy, so stand down and say so.
-if [ -d "$DEPLOY_LOCK_DIR" ] && [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin "-${DEPLOY_LOCK_GRACE_MINS}" 2>/dev/null)" ]; then
-  emit INFO "subrouter-deploy.sh holds $DEPLOY_LOCK_DIR; standing down this cycle"
+# subrouter-deploy.sh and subrouter-autoupdate.sh own the outcome while they
+# hold the deploy lock: they swap the binary, wait for the new generation, and
+# revert on their own. A guard tick inside that window would either record the
+# untested candidate as last-good or restart the service under them, so stand
+# down and say so. Otherwise the guard takes the same lock for this tick, so
+# neither can start a swap between its health probe and its promotion.
+if mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null; then
+  HELD_DEPLOY_LOCK=1
+  printf 'subrouter-guard.sh pid %s\n' "$$" >"$DEPLOY_LOCK_DIR/owner" 2>/dev/null || true
+elif [ -n "$(find "$DEPLOY_LOCK_DIR" -maxdepth 0 -mmin "-${DEPLOY_LOCK_GRACE_MINS}" 2>/dev/null)" ]; then
+  emit INFO "$(sed -n '1p' "$DEPLOY_LOCK_DIR/owner" 2>/dev/null | grep . || echo subrouter-deploy.sh) holds $DEPLOY_LOCK_DIR; standing down this cycle"
   exit 0
+elif [ -d "$DEPLOY_LOCK_DIR" ]; then
+  emit ALERT "$DEPLOY_LOCK_DIR is older than ${DEPLOY_LOCK_GRACE_MINS}m; acting without it"
 fi
 
 if probe_health; then
   rm -f "$STRIKES_FILE"
+  if [ "$BAKE_GATE" -eq 1 ] && bake_is_baking; then
+    decision="$(bake_evaluate "$(bake_fetch_traffic)" 2>/dev/null || true)"
+    action="${decision%%$'\t'*}"
+    reason="${decision#*$'\t'}"
+    case "$action" in
+      rollback)
+        bake_rollback "$reason"
+        exit 0
+        ;;
+      promote)
+        live_sha="$(sha_of "$BIN")"
+        mkdir -p "$(dirname "$LAST_GOOD")"
+        if cp -p "$BIN" "${LAST_GOOD}.new" && mv -f "${LAST_GOOD}.new" "$LAST_GOOD"; then
+          bake_mark promoted "$reason"
+          emit INFO "bake gate: promoted $(bake_state_field version) (${live_sha:0:12}) to last-good: ${reason}"
+        else
+          rm -f "${LAST_GOOD}.new"
+          emit ALERT "bake gate: could not record last-good worker ${live_sha:0:12}; still baking"
+        fi
+        exit 0
+        ;;
+      continue)
+        emit INFO "bake gate: $(bake_state_field version) baking: ${reason}"
+        exit 0
+        ;;
+      *)
+        # An unreadable state file must not promote an unbaked worker.
+        emit ALERT "bake gate: could not evaluate $RELEASE_STATE_FILE; last-good left unchanged"
+        exit 0
+        ;;
+    esac
+  fi
   live_sha="$(sha_of "$BIN")"
   good_sha="$(sha_of "$LAST_GOOD")"
   if [ "$live_sha" != "missing" ] && [ "$live_sha" != "$good_sha" ]; then
@@ -189,6 +343,10 @@ if [ "$good_sha" != "missing" ] && [ "$live_sha" != "$good_sha" ]; then
   chmod 0600 "$UPGRADE_INHIBIT_FILE" 2>/dev/null || true
   emit ALERT "worker autoupdate paused by $UPGRADE_INHIBIT_FILE until a human clears it"
   if install -m 0755 "$LAST_GOOD" "${BIN}.rollback" && mv -f "${BIN}.rollback" "$BIN"; then
+    record_rollback_version "$good_sha"
+    if [ "$BAKE_GATE" -eq 1 ] && bake_is_baking; then
+      bake_mark rolled_back "health down ${strikes} consecutive checks"
+    fi
     restart_service
   else
     rm -f "${BIN}.rollback"

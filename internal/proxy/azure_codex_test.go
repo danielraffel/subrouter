@@ -193,6 +193,8 @@ func azureCodexFallbackServer(t *testing.T, azureURL *url.URL, poolURL *url.URL,
 		Scheduler:     selectacct.NewScheduler(nil),
 		MaxBodyBytes:  1 << 20,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// The Azure diversion is under test, not the capacity retry before it.
+		CodexOverloadFailover: withoutCapacityRetry(),
 		AzureCodex: &AzureCodexConfig{
 			Endpoints: []AzureCodexEndpoint{{
 				Name:        "test-azure",
@@ -1307,6 +1309,7 @@ func TestAzureCodexStreamFailureDetection(t *testing.T) {
 // is far past a megabyte. Bounding the decode by the session-id peek limit
 // refused the fallback for exactly those requests.
 func TestAzureCodexFallbackServesABodyLargerThanThePeekLimit(t *testing.T) {
+	t.Parallel()
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached"}}`)
@@ -1586,6 +1589,7 @@ func TestAzureCodexStripsSealedContentFromAnyItemType(t *testing.T) {
 // A reset connection to Azure used to lose the fallback outright, and by then
 // the pool had already refused the request, so the client saw the failure.
 func TestAzureCodexResendsAfterAConnectionReset(t *testing.T) {
+	t.Parallel()
 	var attempts atomic.Int32
 	var received atomic.Value
 	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {

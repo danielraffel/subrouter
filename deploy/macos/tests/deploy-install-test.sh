@@ -81,6 +81,14 @@ setup() { # setup <upgrade-mode>
   export SUBROUTER_UPGRADE_INHIBIT_FILE="$ROOT/transaction/upgrade-inhibited"
   export SUBROUTER_DEPLOY_LOCK_DIR="$ROOT/state/deploy.lock"
   export SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS=3
+  export SUBROUTER_WORKER_CONFIG="$ROOT/state/worker-config.json"
+  export SUBROUTER_PLIST="$ROOT/team.plist"
+  python3 - "$SUBROUTER_PLIST" "$SUBROUTER_WORKER_CONFIG" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "wb") as stream:
+    plistlib.dump({"ProgramArguments": ["/usr/local/libexec/subrouter-supervisor", "supervise",
+        "--worker-config", sys.argv[2], "--", "--flag"]}, stream)
+PY
   start_fake_supervisor "$1"
 }
 
@@ -275,6 +283,246 @@ printf 'ok\n' >"$HEALTH_FILE"
 bash "$DEPLOY" install-supervisor "$ROOT/supervisor-candidate" >/dev/null 2>&1
 grep -q "pinned by hand" "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null
 check "install-supervisor leaves an existing autoupdate pin in place" $?
+teardown
+
+# --- Release installs, pins and kept backups --------------------------------
+# A file:// release tree stands in for GitHub: <tag>/<asset> and SHA256SUMS.
+
+make_release() { # make_release <tag> [bad-sum|no-sum]
+  local tag="$1" dir="$ROOT/releases/$1" asset="subrouter_${1#v}_darwin_amd64"
+  mkdir -p "$dir"
+  printf '#!/bin/sh\n# release %s\nexit 0\n' "$tag" >"$dir/$asset"
+  chmod 0755 "$dir/$asset"
+  case "${2:-}" in
+    bad-sum) printf '%064d  %s\n' 0 "$asset" >"$dir/SHA256SUMS" ;;
+    no-sum) printf '%064d  subrouter_%s_darwin_arm64\n' 0 "${tag#v}" >"$dir/SHA256SUMS" ;;
+    *) (cd "$dir" && shasum -a 256 "$asset" >SHA256SUMS) ;;
+  esac
+}
+
+release_env() {
+  export SUBROUTER_RELEASE_DOWNLOAD_URL="file://$ROOT/releases"
+  export SUBROUTER_RELEASE_ARCH=x86_64
+  export SUBROUTER_BACKUP_DIR="$ROOT/state/backups"
+  printf 'v1.0.0\n' >"$SUBROUTER_VERSION_FILE"
+}
+
+# 12. install-release downloads, verifies and installs a release.
+setup ok
+release_env
+make_release v2.0.0
+bash "$DEPLOY" install-release v2.0.0 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$ROOT/bin/subrouter" "$ROOT/releases/v2.0.0/subrouter_2.0.0_darwin_amd64"
+check "install-release installs the verified release worker" $?
+[ "$(cat "$SUBROUTER_VERSION_FILE")" = "v2.0.0" ]
+check "install-release records the release tag" $?
+ls "$SUBROUTER_BACKUP_DIR"/*_v1.0.0 >/dev/null 2>&1
+check "install-release keeps the replaced worker as a versioned backup" $?
+teardown
+
+# 13. A checksum mismatch installs nothing.
+setup ok
+release_env
+make_release v2.0.0 bad-sum
+before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+bash "$DEPLOY" install-release v2.0.0 >/dev/null 2>&1
+rc=$?
+after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+[ "$rc" -ne 0 ] && [ "$before" = "$after" ] && [ "$(cat "$SUBROUTER_VERSION_FILE")" = "v1.0.0" ] && [ ! -s "$ROOT/upgrade.calls" ]
+check "install-release refuses a checksum mismatch" $?
+teardown
+
+# 14. A release without exactly one checksum line installs nothing.
+setup ok
+release_env
+make_release v2.0.0 no-sum
+before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+bash "$DEPLOY" install-release v2.0.0 >/dev/null 2>&1
+rc=$?
+after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+[ "$rc" -ne 0 ] && [ "$before" = "$after" ]
+check "install-release refuses a release with no checksum for the asset" $?
+bash "$DEPLOY" install-release 'v2;rm' >/dev/null 2>&1
+[ $? -ne 0 ]
+check "install-release refuses a malformed version" $?
+teardown
+
+# 15. Only the newest three backups are kept, loose legacy copies included.
+setup ok
+release_env
+for n in 1 2 3 4 5; do
+  : >"$ROOT/bin/subrouter.backup-2026010${n}-000000"
+  touch -t "2026010${n}0000" "$ROOT/bin/subrouter.backup-2026010${n}-000000"
+done
+for tag in v2.0.0 v3.0.0 v4.0.0 v5.0.0; do
+  make_release "$tag"
+  bash "$DEPLOY" install-release "$tag" >/dev/null 2>&1
+done
+[ "$(find "$SUBROUTER_BACKUP_DIR" -type f | wc -l)" -eq 3 ] \
+  && ls "$SUBROUTER_BACKUP_DIR"/*_v4.0.0 >/dev/null 2>&1 \
+  && ! ls "$SUBROUTER_BACKUP_DIR"/*_v1.0.0 >/dev/null 2>&1
+check "only the newest three versioned backups are kept" $?
+[ "$(find "$ROOT/bin" -name 'subrouter.backup-*' | wc -l)" -eq 3 ] && [ ! -e "$ROOT/bin/subrouter.backup-20260101-000000" ]
+check "older loose subrouter.backup-* copies are pruned" $?
+
+# 16. rollback --to puts a kept release back and names it in the marker.
+bash "$DEPLOY" rollback --to v3.0.0 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$ROOT/bin/subrouter" "$ROOT/releases/v3.0.0/subrouter_3.0.0_darwin_amd64" \
+  && [ "$(cat "$SUBROUTER_VERSION_FILE")" = "v3.0.0" ]
+check "rollback --to restores a kept release" $?
+ls "$SUBROUTER_BACKUP_DIR"/*_v5.0.0 >/dev/null 2>&1
+check "rollback keeps the worker it replaced, so it can be rolled forward" $?
+bash "$DEPLOY" rollback --to v1.0.0 >/dev/null 2>&1
+[ $? -ne 0 ] && cmp -s "$ROOT/bin/subrouter" "$ROOT/releases/v3.0.0/subrouter_3.0.0_darwin_amd64"
+check "rollback --to a pruned version is refused" $?
+list_out="$(bash "$DEPLOY" list 2>&1)"
+printf '%s\n' "$list_out" | grep -q '^installed v3.0.0' \
+  && printf '%s\n' "$list_out" | grep -q '^pinned    no' \
+  && printf '%s\n' "$list_out" | grep -q ' v5.0.0 '
+check "list shows the installed version, the pin state and kept backups" $?
+teardown
+
+# 17. pin <version> installs that release and pins autoupdate at it.
+setup ok
+release_env
+make_release v2.0.0
+bash "$DEPLOY" pin v2.0.0 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$SUBROUTER_VERSION_FILE")" = "v2.0.0" ] \
+  && grep -q '^pinned at v2.0.0' "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null
+check "pin <version> installs the release and leaves the pin in place" $?
+list_out="$(bash "$DEPLOY" list 2>&1)"
+printf '%s\n' "$list_out" | grep -q '^pinned    yes: pinned at v2.0.0'
+check "list reports the pin" $?
+bash "$DEPLOY" unpin >/dev/null 2>&1
+[ ! -e "$SUBROUTER_UPGRADE_INHIBIT_FILE" ]
+check "unpin removes the pin" $?
+teardown
+
+# 18. pin without a version pins what is installed and installs nothing.
+setup ok
+release_env
+bash "$DEPLOY" pin >/dev/null 2>&1
+grep -q '^pinned at v1.0.0' "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null && [ ! -s "$ROOT/upgrade.calls" ]
+check "pin without a version pins the installed release" $?
+teardown
+
+# 19. A failed pinned install keeps autoupdate pinned at the running release.
+setup fail
+release_env
+make_release v2.0.0
+bash "$DEPLOY" pin v2.0.0 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q '^pinned at v1.0.0' "$SUBROUTER_UPGRADE_INHIBIT_FILE" 2>/dev/null \
+  && [ "$(cat "$SUBROUTER_VERSION_FILE")" = "v1.0.0" ]
+check "a failed pin install pins the release that is still running" $?
+teardown
+
+# 20. The deploy lock is shared with the guard and autoupdate: an install
+# waits for the holder and then refuses, naming it, without touching anything.
+setup ok
+mkdir -p "$SUBROUTER_DEPLOY_LOCK_DIR"
+printf 'subrouter-guard.sh pid 1\n' >"$SUBROUTER_DEPLOY_LOCK_DIR/owner"
+before="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+out="$(SUBROUTER_DEPLOY_LOCK_WAIT_SECS=1 bash "$DEPLOY" install "$ROOT/candidate" 2>&1)"
+rc=$?
+after="$(shasum -a 256 "$ROOT/bin/subrouter" | awk '{print $1}')"
+[ "$rc" -ne 0 ] && [ "$before" = "$after" ] && printf '%s\n' "$out" | grep -q "subrouter-guard.sh pid 1 holds"
+check "install waits for, then names, the holder of the shared deploy lock" $?
+[ -d "$SUBROUTER_DEPLOY_LOCK_DIR" ] && [ -f "$SUBROUTER_DEPLOY_LOCK_DIR/owner" ]
+check "a refused install leaves the other holder's lock alone" $?
+teardown
+
+# 21. reconfigure installs a valid worker config through a hot upgrade.
+setup ok
+printf '{"args":["--old"]}\n' >"$SUBROUTER_WORKER_CONFIG"; chmod 0640 "$SUBROUTER_WORKER_CONFIG"
+printf '{"args":["--bedrock"],"env":{"A":"b"}}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && cmp -s "$SUBROUTER_WORKER_CONFIG" "$ROOT/new-config.json" && [ "$(wc -l <"$ROOT/upgrade.calls")" -eq 1 ]
+check "reconfigure installs the config and upgrades once" $?
+if stat --version >/dev/null 2>&1; then live_mode="$(stat -c '%a' "$SUBROUTER_WORKER_CONFIG")"; else live_mode="$(stat -f '%Lp' "$SUBROUTER_WORKER_CONFIG")"; fi
+[ "$live_mode" = "640" ]
+check "reconfigure keeps the live file mode" $?
+teardown
+
+# 22. A config whose worker never becomes ready is reverted.
+setup fail
+printf '{"args":["--old"]}\n' >"$SUBROUTER_WORKER_CONFIG"
+printf '{"args":["--bad"]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && grep -q -- "--old" "$SUBROUTER_WORKER_CONFIG" && [ "$(wc -l <"$ROOT/upgrade.calls")" -ge 2 ]
+check "a failed reconfigure restores the old config and upgrades back" $?
+teardown
+
+# 23. An invalid file never reaches the supervisor.
+setup ok
+printf '{"args":["--addr","127.0.0.1:1"]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ ! -e "$SUBROUTER_WORKER_CONFIG" ] && [ ! -s "$ROOT/upgrade.calls" ]
+check "reconfigure refuses a config that sets a supervisor-owned flag" $?
+teardown
+
+# 24. A plist without --worker-config would silently ignore the file.
+setup ok
+python3 -c 'import plistlib,sys; plistlib.dump({"ProgramArguments":["sup","supervise","--","--flag"]}, open(sys.argv[1],"wb"))' "$SUBROUTER_PLIST"
+printf '{"args":[]}\n' >"$ROOT/new-config.json"
+bash "$DEPLOY" reconfigure "$ROOT/new-config.json" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ ! -s "$ROOT/upgrade.calls" ]
+check "reconfigure refuses a plist that does not wire --worker-config" $?
+teardown
+
+# 25. An install starts a bake against the outgoing generation's traffic and
+# leaves last-good on the outgoing worker; promote ends the bake early.
+release_field() {
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2],""); print(v if isinstance(v,str) else json.dumps(v))' \
+    "$ROOT/state/release-state.json" "$1" 2>/dev/null
+}
+setup ok
+printf 'v9.9.8\n' >"$SUBROUTER_VERSION_FILE"
+printf '{"started_at":"2026-09-01T00:00:00Z","uptime_seconds":100,"requests":1000,"responses":{"5xx":4},"proxy_5xx":2,"stream_drops":{"proxy":1}}\n' >"$ROOT/traffic.json"
+export SUBROUTER_TRAFFIC_URL="file://$ROOT/traffic.json"
+cp "$ROOT/bin/subrouter" "$ROOT/outgoing"
+bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >"$ROOT/install.out" 2>&1
+[ "$(release_field state)" = "baking" ] && [ "$(release_field version)" = "v9.9.9" ] \
+  && [ "$(release_field previous_version)" = "v9.9.8" ] \
+  && release_field baseline | grep -q '"proxy_5xx": 2'
+check "install starts a bake with the outgoing generation as baseline" $?
+cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/outgoing"
+check "install leaves last-good on the outgoing worker while baking" $?
+bash "$DEPLOY" status >"$ROOT/status.out" 2>&1
+grep -q '^release   v9.9.9 baking since .* (previous v9.9.8); [0-9]*m[0-9]*s left' "$ROOT/status.out"
+check "status prints the bake state" $?
+
+# 26. Replacing a worker that is still baking keeps the bake's last-good,
+# previous release and baseline: an unbaked worker is never the rollback target.
+printf '#!/bin/sh\n# candidate two\nexit 0\n' >"$ROOT/candidate2"; chmod 0755 "$ROOT/candidate2"
+printf '{"started_at":"2026-09-26T00:00:00Z","uptime_seconds":10,"requests":5,"responses":{"5xx":5},"proxy_5xx":5,"stream_drops":{"proxy":0}}\n' >"$ROOT/traffic.json"
+bash "$DEPLOY" install "$ROOT/candidate2" --label v9.9.10 >/dev/null 2>&1
+cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/outgoing" && [ "$(release_field previous_version)" = "v9.9.8" ] \
+  && [ "$(release_field version)" = "v9.9.10" ] && release_field baseline | grep -q '"requests": 1000'
+check "installing over a baking worker keeps the original last-good and baseline" $?
+
+bash "$DEPLOY" promote >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(release_field state)" = "promoted" ] && cmp -s "$SUBROUTER_LAST_GOOD" "$ROOT/candidate2"
+check "promote ends a bake early and advances last-good" $?
+bash "$DEPLOY" promote >/dev/null 2>&1
+[ $? -ne 0 ]
+check "promote refuses when nothing is baking" $?
+unset SUBROUTER_TRAFFIC_URL
+teardown
+
+# 27. SUBROUTER_BAKE_SECONDS=0 turns the gate off: installs are promoted.
+setup ok
+SUBROUTER_BAKE_SECONDS=0 bash "$DEPLOY" install "$ROOT/candidate" --label v9.9.9 >/dev/null 2>&1
+[ "$(release_field state)" = "promoted" ]
+check "a zero bake window records the install as promoted" $?
 teardown
 
 if [ "$failures" -ne 0 ]; then printf '%d check(s) failed\n' "$failures"; exit 1; fi

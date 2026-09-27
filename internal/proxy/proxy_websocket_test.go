@@ -268,6 +268,7 @@ func TestHandlerRejectsCrossOriginBrowserWebSocketBeforeUpstreamDial(t *testing.
 }
 
 func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -327,6 +328,7 @@ func TestHandlerRejectsOversizedWebSocketMessage(t *testing.T) {
 // Image-heavy Codex sessions legitimately exceed the old 8 MiB cap; a message
 // under maxWebSocketMessageBytes must be forwarded intact in both directions.
 func TestHandlerForwardsLargeWebSocketMessage(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -2519,6 +2521,7 @@ func TestNewOutboundTransportDialsIPv4(t *testing.T) {
 }
 
 func TestHandlerRetriesReplayableResponsesPostOnTransientTransportError(t *testing.T) {
+	t.Parallel()
 	for _, path := range []string{"/v1/responses", "/v1/responses/compact"} {
 		t.Run(path, func(t *testing.T) {
 			upstreamURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
@@ -2590,6 +2593,7 @@ func TestHandlerRetriesReplayableResponsesPostOnTransientTransportError(t *testi
 }
 
 func TestHandlerRetriesReplayableResponsesPostOnUpstreamRequestTimeout(t *testing.T) {
+	t.Parallel()
 	for _, path := range []string{"/v1/responses", "/v1/responses/compact"} {
 		t.Run(path, func(t *testing.T) {
 			upstreamURL, err := url.Parse("https://chatgpt.com/backend-api/codex")
@@ -2825,6 +2829,7 @@ func TestHandlerPreservesWebSocketMessageBytes(t *testing.T) {
 }
 
 func TestHandlerRecordsHTTPTranscriptBodies(t *testing.T) {
+	t.Parallel()
 	requestBody := []byte(`{"session_id":"codex-session:0","input":"hello"}`)
 	responseBody := []byte("event: done\ndata: {}\n\n")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2898,6 +2903,7 @@ func TestHandlerRecordsHTTPTranscriptBodies(t *testing.T) {
 }
 
 func TestHandlerRecordsWebSocketTranscriptMessages(t *testing.T) {
+	t.Parallel()
 	clientPayload := []byte(`{"encrypted_content":"client-ciphertext","prompt_cache_key":"cache-key"}`)
 	upstreamPayload := []byte(`{"encrypted_content":"upstream-ciphertext"}`)
 	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
@@ -2967,6 +2973,7 @@ func TestHandlerRecordsWebSocketTranscriptMessages(t *testing.T) {
 }
 
 func TestHandlerStoresUserEmailAndStripsSubrouterHeaders(t *testing.T) {
+	t.Parallel()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Subrouter-Session"); got != "" {
 			t.Fatalf("X-Subrouter-Session = %q, want empty", got)
@@ -3914,6 +3921,9 @@ func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *
 			{AccountID: "compatible@example.com", Headroom: 0.80, ShortHeadroom: 0.80},
 		})),
 		MaxBodyBytes: 1024,
+		// The 503 is a capacity failure, so the default capacity retry
+		// replays it; fast gaps keep the test quick.
+		CodexOverloadFailover: &CodexOverloadFailoverConfig{sameAccountGap: func() time.Duration { return time.Millisecond }, stayRetryLimit: codexTestStayRetries},
 	}.Handler()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello"}`))
 	request.Header.Set("X-Subrouter-Session", "session-1")
@@ -3923,9 +3933,15 @@ func TestFailedCodexModelCompatibilityAlternateKeepsOriginalStickyAssignment(t *
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want failed alternate 503", response.Code)
 	}
-	wantAuths := []string{"Bearer incompatible-token", "Bearer compatible-token"}
-	if strings.Join(auths, "\x00") != strings.Join(wantAuths, "\x00") {
-		t.Fatalf("auths = %#v, want %#v", auths, wantAuths)
+	// The capacity retries go to the account that answered, never back
+	// through the incompatible one.
+	if len(auths) != 2+codexTestStayRetries || auths[0] != "Bearer incompatible-token" {
+		t.Fatalf("auths = %#v, want incompatible then %d compatible attempts", auths, 1+codexTestStayRetries)
+	}
+	for _, auth := range auths[1:] {
+		if auth != "Bearer compatible-token" {
+			t.Fatalf("auths = %#v, want every retry on the compatible account", auths)
+		}
 	}
 	assignment, ok := store.Get("codex", "session-1")
 	if !ok || assignment.AccountID != "incompatible@example.com" {
@@ -3993,6 +4009,7 @@ func TestHandlerDoesNotRetryCodexModelCompatibilityErrorOnAPIKeyAccount(t *testi
 }
 
 func TestHandlerDoesNotMarkCodexAccountWideWhenCompatibilityModelIsUnknown(t *testing.T) {
+	t.Parallel()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer incompatible-token" {
 			w.WriteHeader(http.StatusBadRequest)
