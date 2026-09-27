@@ -189,7 +189,7 @@ func (m *MultiTenant) serveResolvedTenant(
 		return
 	}
 	if freshCredential.Hash != credential.Hash ||
-		!tenantCredentialAllows(freshCredential, path, r.Method) {
+		!tenantCredentialAllowsRequest(freshCredential, path, r) {
 		http.Error(w, "tenant key lacks required capability", http.StatusForbidden)
 		return
 	}
@@ -229,6 +229,19 @@ func (m *MultiTenant) legacyStackCredentialExpired(tenantID, key string) bool {
 	}
 	return m.StackLegacyKeyCutoff.IsZero() ||
 		!now.Before(m.StackLegacyKeyCutoff)
+}
+
+// tenantCredentialAllowsRequest adds request-shaped grants to
+// tenantCredentialAllows. A use key may look up one session by its ID (a
+// client status line asking which account serves its own session); listing
+// every session stays an account-management capability.
+func tenantCredentialAllowsRequest(key tenant.Key, path string, r *http.Request) bool {
+	if key.Restricted && path == "/_subrouter/sessions" && r.Method == http.MethodGet &&
+		strings.TrimSpace(r.URL.Query().Get("session_id")) != "" &&
+		(key.Allows(tenant.CapabilityUse) || key.Allows(tenant.CapabilityManageAccounts)) {
+		return true
+	}
+	return tenantCredentialAllows(key, path, r.Method)
 }
 
 func tenantCredentialAllows(key tenant.Key, path, method string) bool {
@@ -375,6 +388,9 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	server.AdminToken = ""
 	server.AccountImportToken = ""
 	server.tenantAccountImportAuthorized = true
+	// Token usage is an operator view of the global pool; tenants neither
+	// share nor persist into it.
+	server.TokenUsage = nil
 	server.Transcripts = nil
 	if m.TranscriptDir != "" {
 		server.Transcripts = transcript.NewRecorder(filepath.Join(m.TranscriptDir, "tenants", t.ID))
@@ -838,11 +854,35 @@ func (m *MultiTenant) scheduleTenantDeletion(id string) {
 
 func (m *MultiTenant) deleteRetiredTenant(id string) (bool, error) {
 	if m.TranscriptDir != "" {
+		// Write out the tenant's buffered transcript events first, so none
+		// land after the directory is removed.
+		m.mu.Lock()
+		server := m.servers[id]
+		m.mu.Unlock()
+		if server != nil {
+			_ = server.Transcripts.Close()
+		}
 		if err := os.RemoveAll(filepath.Join(m.TranscriptDir, "tenants", id)); err != nil {
 			return false, err
 		}
 	}
 	return m.Registry.DeleteRetired(id)
+}
+
+// CloseTranscripts flushes and closes every instantiated tenant's transcript
+// recorder. Shutdown calls it after the HTTP server has drained.
+func (m *MultiTenant) CloseTranscripts() error {
+	m.mu.Lock()
+	recorders := make([]*transcript.Recorder, 0, len(m.servers))
+	for _, server := range m.servers {
+		recorders = append(recorders, server.Transcripts)
+	}
+	m.mu.Unlock()
+	var errs []error
+	for _, recorder := range recorders {
+		errs = append(errs, recorder.Close())
+	}
+	return errors.Join(errs...)
 }
 
 func (m *MultiTenant) forgetTenant(id string) {
