@@ -117,6 +117,33 @@ pipx install subrouter
 
 All install paths provide `subrouter`, `sr`, and `cx`. The npm and Python wrappers download the matching Go release binary for macOS, Linux, Windows, FreeBSD, OpenBSD, or NetBSD on amd64, arm64, or supported 32-bit variants. Set `SUBROUTER_BIN` to use a local binary instead.
 
+### Updating and rolling back
+
+On a laptop or a self-managed Linux/Windows install (a `sr setup` LaunchAgent, a user or system systemd unit, the Windows scheduled task, or a plain binary on `PATH`):
+
+```bash
+sr update --check          # installed, running and available versions; changes nothing
+sr update                  # install the latest release (asks first; --yes skips the prompt)
+sr update --version v0.1.140
+sr rollback                # put the binary the last update replaced back
+sr rollback --list         # kept backups
+sr rollback --to v0.1.139
+```
+
+`sr update` downloads the release asset and `SHA256SUMS` from the GitHub release (the same source and check as `install.sh`), keeps the replaced binary in `.subrouter-backups/` next to it (the last three), swaps it in atomically along with the `sr`/`cx` aliases, restarts the daemon, and waits for `/_subrouter/health` to report the new version. If health or the version check fails within 45 seconds it restores the previous binary and restarts again. A system-wide install needs `sudo sr update`. `sr doctor` warns when the CLI and the daemon report different versions.
+
+It refuses where something else owns the binary: npm and pip installs upgrade with `npm install -g subrouter@latest` or `pip install --upgrade subrouter` (`pipx upgrade subrouter`), and team hosts use the deploy script instead.
+
+On a supervised team Mac (the `ai.manaflow.subrouter-team` LaunchDaemon), use [`subrouter-deploy.sh`](deploy/macos/DEPLOY.md):
+
+```bash
+sudo subrouter-deploy.sh install-release v0.1.140   # download, verify, hot-swap; reverts itself on failure
+sudo subrouter-deploy.sh pin v0.1.139               # install v0.1.139 and stop autoupdate replacing it
+sudo subrouter-deploy.sh unpin                      # let autoupdate move to the latest release again
+sudo subrouter-deploy.sh list                       # installed version, pin state, kept backups
+sudo subrouter-deploy.sh rollback [--to v0.1.139]   # last-good, or a kept release
+```
+
 ### Local macOS daemon
 
 On macOS, install Subrouter as a localhost-only LaunchAgent:
@@ -384,10 +411,10 @@ experimental_realtime_ws_base_url = "http://100.64.0.1:31415/v1"
 
 Use `--no-codex-config` to change only Subrouter's selected server. Use `sr server use local` or `sr server clear-default` to return to the local daemon and rewrite Codex config to `127.0.0.1:31415`.
 
-The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_CODEX_SERVER=team`.
+The server name is only a local nickname. Use whatever matches your setup, such as `team`, `prod`, or `staging`. For a one-off command, set `SUBROUTER_SERVER=team` (`SUBROUTER_CODEX_SERVER` is an older alias; when both are set, `SUBROUTER_SERVER` wins).
 Rename a local server nickname with `sr server rename <old> <new>`.
 
-Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_CODEX_SERVER=local sr <command>` for a one-off local command.
+Top-level `sr` account commands follow the selected target. If `sr server use team` is active, `sr add`, `sr add-key`, `sr list`, `sr status`, `sr usage`, and `sr pick` talk to that server. If the selected target is local, those same commands use the local account store. Commands without a remote-safe implementation fail before editing local auth when a server is selected. Use `SUBROUTER_SERVER=local sr <command>` for a one-off local command.
 
 Set `SUBROUTER_CODEX_USER_EMAIL` to attribute Codex traffic to a teammate:
 
@@ -503,6 +530,43 @@ local managed-profile login state, so the same label can be usable in
 Remote server-pool launches need neither local Claude profiles nor a local
 Subrouter daemon; Claude arguments such as `--resume <session-id>` pass through
 unchanged.
+
+Overload (Anthropic 529 or another 5xx) should be rare and brief, and it is
+API-wide, so by default Subrouter waits it out on the session's own account,
+where its prompt cache lives: it retries after 1s, 2s, 4s and 8s, then every
+15s, for up to 8 minutes from the first attempt (no retry starts past that),
+then passes the 529 to Claude Code, which gives a request 10 minutes.
+`SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT` on the daemon changes the cap (a Go
+duration; `0` keeps retrying until the client disconnects) and
+`SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL` the steady gap (at least 500ms; the
+ramp is capped at it, so `2s` retries after 1s, 2s, 2s, ...). With
+`SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1` on the daemon a client may choose
+its own with the `X-Subrouter-Retry: interval=2s,max-wait=20m` header (either
+key optional; the interval is clamped to 500ms-60m and max-wait capped at 60m,
+and `max-wait=0` also means 60m: only the operator's `MAX_WAIT=0` makes the
+wait unbounded), which is what
+`sr claude --retry-interval 2s --retry-max-wait 20m` sends. To retry harder:
+
+```bash
+# daemon: every 2s after the ramp, for up to 20 minutes
+SUBROUTER_CLAUDE_OVERLOAD_RETRY_INTERVAL=2s SUBROUTER_CLAUDE_OVERLOAD_MAX_WAIT=20m subrouter serve
+# or per launch, when the daemon sets SUBROUTER_CLAUDE_OVERLOAD_RETRY_HEADER=1
+sr claude --retry-interval 2s --retry-max-wait 20m
+```
+
+Past 10 minutes Claude Code's own request timeout ends the request first. A
+long wait is
+logged on its first retry and then about once a minute, and
+`/_subrouter/health` counts requests currently waiting under
+`overload_retry_held`.
+
+If you really want to move a conversation, start or fork a new session (it is
+placed fresh), or launch with `sr claude proxy --account <profile>`. For
+operators who prefer it, `SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1` on the daemon
+opts in to trying one other account, once per request, after the first two
+retries; it costs the conversation its prompt cache. Codex capacity errors
+follow the same rule; see
+[docs/codex.md](docs/codex.md#selected-model-is-at-capacity).
 
 For manual client configuration, authenticate to the Subrouter proxy rather
 than exposing an upstream Claude OAuth token. A trusted local or legacy
@@ -951,6 +1015,23 @@ A conversation that starts on the ChatGPT pool and then falls back carries reaso
 Azure is metered, unlike the subscription pool, so every served request is priced into `azure-codex-cost.jsonl` next to the session store and summarized at `/_subrouter/azure-codex-cost`. `sr az cost` prints it, and `sr` status grows a spend line once the fallback has run. Cached input is billed at the cached rate rather than the full one, and a model with no price entry contributes zero rather than a guess.
 
 `curl -s http://127.0.0.1:31415/_subrouter/health` lists the armed endpoints by name under `azure_codex`. Only `/responses` falls back; `/responses/compact`, the model catalog, and `/alpha/search` are ChatGPT-backend endpoints with no Azure equivalent. Team credential storage (`sr storage team`) refuses this fallback, like the other personal-credential routes.
+
+## Token usage
+
+The server counts the tokens every successful model turn spent, per UTC hour, provider, serving account (the final one after any failover), model, and client. It reads only the usage block the provider reports at the end of a response: OpenAI Responses (`response.completed` over SSE or WebSocket, or a plain JSON reply), chat completions (`usage.prompt_tokens`/`completion_tokens`), and Anthropic messages (`message_start` plus `message_delta`, or a plain JSON reply). A turn whose usage could not be read still counts in `requests` and in `requests_without_usage`, never as a zero-token turn.
+
+Counts follow OpenAI's convention: `input_tokens` is every prompt token, and `cached_input_tokens` and `cache_write_input_tokens` are parts of it (Anthropic's cache reads and writes are added back in to match). `reasoning_output_tokens` is part of `output_tokens`.
+
+The client is, in order: the `X-Subrouter-Client` header (1-64 characters from `A-Za-z0-9._-`, otherwise ignored); `user:<hash>` from the user email header, the same short hash the request log uses; the tailnet node name behind the connection when the peer is on a tailnet; otherwise `unknown`. `sr codex`, `sr claude`, and the native provider relay send `X-Subrouter-Client` with this machine's short host name; set `SUBROUTER_CLIENT_NAME` to choose another. The header is stripped before the request leaves for the provider.
+
+```sh
+curl -s -H "Authorization: Bearer $SUBROUTER_ADMIN_TOKEN" \
+  "https://subrouter.example/_subrouter/token-usage?since=24h"
+```
+
+`since` takes a duration (`24h`, the default) or an RFC3339 time, and reaches back at most 30 days. The reply is `{"since", "generated_at", "rows": [...]}`, one row per hour, provider, `account_id`, model, and client, with `requests`, `requests_without_usage`, `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, and `reasoning_output_tokens`. The endpoint needs admin access.
+
+Rows are written to `token-usage.jsonl` next to the session store every few minutes and at shutdown, and kept for 30 days. No prompt or completion text, email address, or credential is stored; only the counts above. A turn the Azure or Fable fallback answers after the pool gave up is counted under `account_id` `fallback`. Requests the Bedrock gateway or a pinned Azure session serve directly are not in this view yet; their spend stays in `bedrock-cost.jsonl` and `azure-codex-cost.jsonl`.
 
 ## Security defaults
 

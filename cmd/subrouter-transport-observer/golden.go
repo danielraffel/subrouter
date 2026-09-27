@@ -88,6 +88,16 @@ var goldenTestHooks struct {
 	releaseStream          func(string) error
 	localEgressMaxGap      time.Duration
 	probeScheduleTolerance time.Duration
+	// probeClock replaces wall-clock scheduling and stamping of the 10 Hz
+	// health prober, and probeHTTPTimeout replaces its per-probe timeout.
+	// Nil and zero keep production behavior.
+	probeClock       goldenProbeClock
+	probeHTTPTimeout time.Duration
+	// processSampleMaxGap and processSampleHardCeiling replace the production
+	// sampling-gap target and hard ceiling for synthetic orchestration runs
+	// whose scheduler is a loaded shared CI host. Zero keeps production limits.
+	processSampleMaxGap      time.Duration
+	processSampleHardCeiling time.Duration
 }
 
 func goldenProbeScheduleToleranceForRun() time.Duration {
@@ -95,6 +105,31 @@ func goldenProbeScheduleToleranceForRun() time.Duration {
 		return goldenTestHooks.probeScheduleTolerance
 	}
 	return goldenProbeScheduleTolerance
+}
+
+// goldenProbeMinimumSpacingForRun is the probe spacing the frequency check
+// counts against. Production runs require one probe per goldenProbeInterval;
+// a test run that widened the schedule tolerance accepts one probe per
+// interval-plus-tolerance, the same spacing its gap check already allows.
+func goldenProbeMinimumSpacingForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.probeScheduleTolerance > 0 {
+		return goldenProbeInterval + goldenTestHooks.probeScheduleTolerance
+	}
+	return goldenProbeInterval
+}
+
+func goldenProcessSampleMaxGapForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.processSampleMaxGap > 0 {
+		return goldenTestHooks.processSampleMaxGap
+	}
+	return goldenProcessSampleMaxGap
+}
+
+func goldenProcessSampleHardCeilingForRun() time.Duration {
+	if goldenTestHooks.enabled && goldenTestHooks.processSampleHardCeiling > 0 {
+		return goldenTestHooks.processSampleHardCeiling
+	}
+	return goldenProcessSampleHardCeiling
 }
 
 type goldenOptions struct {
@@ -2608,7 +2643,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 			if gap > r.localMaxSampleGap {
 				r.localMaxSampleGap = gap
 			}
-			if gap > goldenProcessSampleMaxGap {
+			if gap > goldenProcessSampleMaxGapForRun() {
 				r.localGapsOverTarget++
 			}
 		}
@@ -2653,7 +2688,7 @@ func (r *goldenRunner) recordGoldenProcessSample(pid int) {
 				if gap > session.maxProcessSampleGap {
 					session.maxProcessSampleGap = gap
 				}
-				if gap > goldenProcessSampleMaxGap {
+				if gap > goldenProcessSampleMaxGapForRun() {
 					session.sampleGapsOverTarget++
 				}
 			}
@@ -2717,10 +2752,10 @@ func (r *goldenRunner) finalizeLocalDaemonRSS() error {
 // live for a few hundred milliseconds, so one hiccup would otherwise dominate
 // the ratio. Further gaps fail once they stop being rare.
 func goldenSamplingGapUnacceptable(maxGap time.Duration, gapsOverTarget, samples int) bool {
-	if maxGap > goldenProcessSampleHardCeiling {
+	if maxGap > goldenProcessSampleHardCeilingForRun() {
 		return true
 	}
-	if maxGap <= goldenProcessSampleMaxGap || samples <= 0 || gapsOverTarget <= 1 {
+	if maxGap <= goldenProcessSampleMaxGapForRun() || samples <= 0 || gapsOverTarget <= 1 {
 		return false
 	}
 	return gapsOverTarget*100 > samples*goldenProcessSampleOverTargetPercentLimit
@@ -2767,12 +2802,25 @@ type goldenProbeEvent struct {
 
 type goldenProbeStats struct {
 	startedAt time.Time
+	clock     goldenProbeClock
 	mu        sync.Mutex
 	events    []goldenProbeEvent
 	record    *jsonlRecorder
 	loops     sync.WaitGroup
 	samples   sync.WaitGroup
 	finished  chan struct{}
+	// recorded is signalled after each event is appended, and done is the
+	// probe context's cancellation, for stop to wait on the schedule.
+	recorded chan struct{}
+	done     <-chan struct{}
+	stopOnce sync.Once
+}
+
+func (s *goldenProbeStats) probeClock() goldenProbeClock {
+	if s.clock == nil {
+		return goldenRealProbeClock{}
+	}
+	return s.clock
 }
 
 func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigin *url.URL) (*goldenProbeStats, error) {
@@ -2784,7 +2832,11 @@ func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigi
 		file.Close()
 		return nil, failGolden("health_evidence_protect_failed")
 	}
-	stats := &goldenProbeStats{startedAt: time.Now().UTC(), record: &jsonlRecorder{writer: file}, finished: make(chan struct{})}
+	clock := goldenProbeClockForRun()
+	stats := &goldenProbeStats{
+		startedAt: clock.now(), clock: clock, record: &jsonlRecorder{writer: file},
+		finished: make(chan struct{}), recorded: make(chan struct{}, 1), done: ctx.Done(),
+	}
 	targets := []struct {
 		label string
 		url   string
@@ -2799,15 +2851,15 @@ func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigi
 		stats.loops.Add(1)
 		go func() {
 			defer stats.loops.Done()
-			ticker := time.NewTicker(goldenProbeInterval)
-			defer ticker.Stop()
-			stats.launchProbe(ctx, target.label, target.url)
+			ticks, stopTicks := clock.ticks(stats.startedAt)
+			defer stopTicks()
+			stats.launchProbe(ctx, target.label, target.url, stats.startedAt)
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
-					stats.launchProbe(ctx, target.label, target.url)
+				case tick := <-ticks:
+					stats.launchProbe(ctx, target.label, target.url, tick)
 				}
 			}
 		}()
@@ -2822,24 +2874,26 @@ func (r *goldenRunner) startProbes(ctx context.Context, publicOrigin, localOrigi
 	return stats, nil
 }
 
-func (s *goldenProbeStats) launchProbe(parent context.Context, label, rawURL string) {
+func (s *goldenProbeStats) launchProbe(parent context.Context, label, rawURL string, tick time.Time) {
 	s.samples.Add(1)
 	go func() {
 		defer s.samples.Done()
-		s.runProbe(parent, label, rawURL)
+		s.runProbe(parent, label, rawURL, tick)
 	}()
 }
 
-func (s *goldenProbeStats) runProbe(parent context.Context, label, rawURL string) {
-	started := time.Now().UTC()
-	ctx, cancel := context.WithTimeout(parent, goldenHTTPTimeout)
+func (s *goldenProbeStats) runProbe(parent context.Context, label, rawURL string, tick time.Time) {
+	clock := s.probeClock()
+	started := clock.probeStart(tick)
+	timeout := goldenProbeHTTPTimeoutForRun()
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	status := 0
 	var responseBytes int64
 	if requestErr == nil {
 		client := &http.Client{
-			Timeout: goldenHTTPTimeout,
+			Timeout: timeout,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -2855,7 +2909,7 @@ func (s *goldenProbeStats) runProbe(parent context.Context, label, rawURL string
 	if lifecycleErr := parent.Err(); requestErr != nil && lifecycleErr != nil && errors.Is(requestErr, lifecycleErr) {
 		return
 	}
-	completed := time.Now().UTC()
+	completed := clock.now()
 	event := goldenProbeEvent{
 		Kind: "probe", Timestamp: started.Format(time.RFC3339Nano),
 		CompletedAt: completed.Format(time.RFC3339Nano), Label: label,
@@ -2866,6 +2920,12 @@ func (s *goldenProbeStats) runProbe(parent context.Context, label, rawURL string
 	s.mu.Lock()
 	s.events = append(s.events, event)
 	s.mu.Unlock()
+	if s.recorded != nil {
+		select {
+		case s.recorded <- struct{}{}:
+		default:
+		}
+	}
 	_ = s.record.write(event)
 }
 
@@ -2874,8 +2934,52 @@ func (s *goldenProbeStats) wait() {
 }
 
 func (s *goldenProbeStats) stop(cancel context.CancelFunc) {
+	s.stopOnce.Do(s.awaitScheduledProbes)
 	cancel()
 	s.wait()
+}
+
+// awaitScheduledProbes holds a stop until every label has recorded each probe
+// its clock scheduled up to now, when the clock promises to deliver all of
+// them. Otherwise cancelling could discard a probe that was due before the
+// interval being validated ended but had not yet run. It returns early if the
+// probe context ends, since probes cancelled with it record nothing.
+func (s *goldenProbeStats) awaitScheduledProbes() {
+	if s.clock == nil || s.recorded == nil {
+		return
+	}
+	cutoff := s.clock.now()
+	want, ok := s.clock.scheduledThrough(s.startedAt, cutoff)
+	if !ok {
+		return
+	}
+	for {
+		if s.recordedThrough(cutoff, want) {
+			return
+		}
+		select {
+		case <-s.done:
+			return
+		case <-s.recorded:
+		}
+	}
+}
+
+func (s *goldenProbeStats) recordedThrough(cutoff time.Time, want int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := make(map[string]int)
+	for _, event := range s.events {
+		if stamp, err := time.Parse(time.RFC3339Nano, event.Timestamp); err == nil && !stamp.After(cutoff) {
+			counts[event.Label]++
+		}
+	}
+	for _, label := range []string{"public-health", "public-ready", "local-health", "local-ready"} {
+		if counts[label] < want {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *goldenProbeStats) summaries() []goldenProbeSummary {
@@ -4973,7 +5077,7 @@ func validateGoldenSummaryForCandidate(summary goldenSummary, testMode bool, can
 		return failGolden("health_evidence_incomplete")
 	}
 	for _, health := range summary.Health {
-		if health.Label == "" || health.Samples == 0 || health.Failures != 0 || health.MaxStartGapMillis > 250 {
+		if health.Label == "" || health.Samples == 0 || health.Failures != 0 || goldenProbeSummaryGapExceeded(health) {
 			return failGolden("health_evidence_incomplete")
 		}
 	}

@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -795,10 +794,7 @@ func (r srRunner) nativeProxyServer(ctx context.Context) (srServerConfig, bool, 
 		return srServerConfig{}, false, fmt.Errorf("load credential storage: %w", err)
 	}
 	source := config.EffectiveCredentialSource()
-	explicitTarget := strings.TrimSpace(os.Getenv("SUBROUTER_SERVER"))
-	if explicitTarget == "" {
-		explicitTarget = strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER"))
-	}
+	explicitTarget := explicitServerTarget()
 	explicitServer := explicitTarget != ""
 	explicitLocal := explicitServer && isLocalServerName(explicitTarget)
 	if explicitServer {
@@ -1085,8 +1081,10 @@ func (r srRunner) pickNativeProxyAccount(spec nativeProxySpec, inventory []remot
 	if answer == "" {
 		return "", false, nil
 	}
-	if index, parseErr := strconv.Atoi(answer); parseErr == nil && index >= 1 && index <= len(inventory) {
-		return inventory[index-1].ID, true, nil
+	if index, isNumber, parseErr := parsePickerNumber(answer, len(inventory)); parseErr != nil {
+		return "", false, parseErr
+	} else if isNumber {
+		return inventory[index].ID, true, nil
 	}
 	accountID, err := resolveNativeProxyAccountSelector(spec, inventory, answer)
 	if err != nil {
@@ -1314,9 +1312,20 @@ func startProxyRelay(
 	providerPrefix := relayPrefix + "/" + route
 	relayHost := listener.Addr().String()
 	reverse := &httputil.ReverseProxy{Transport: transport}
+	defaultClientName := srClientName()
 	reverse.Rewrite = func(proxyRequest *httputil.ProxyRequest) {
 		proxyRequest.SetURL(target)
 		request := proxyRequest.Out
+		// The client label passes through when the tool behind the relay set
+		// a valid one; otherwise the relay names this machine.
+		clientName := normalizeClientName(request.Header.Get(clientNameHeader))
+		if clientName == "" {
+			clientName = defaultClientName
+		}
+		request.Header.Del(clientNameHeader)
+		if clientName != "" {
+			request.Header.Set(clientNameHeader, clientName)
+		}
 		for _, header := range []string{
 			"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "X-Auth-Token",
 			"OpenAI-Organization", "OpenAI-Project",

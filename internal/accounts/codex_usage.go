@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -185,6 +188,7 @@ func FetchCodexUsageDetails(ctx context.Context, client *http.Client, account Ac
 		ComplimentaryReset: usage.ComplimentaryReset,
 		RawRateLimit:       usage.RateLimit,
 	}
+	logCodexUsageShapeOnce(usage.RateLimit)
 	if usage.Credits != nil {
 		details.Credits = &CreditsInfo{
 			HasCredits: usage.Credits.HasCredits,
@@ -464,25 +468,39 @@ func (w codexLimitWindow) resetAfterSeconds() int64 {
 	return remaining
 }
 
-// weeklyWindowMinSeconds is the shortest window length treated as the
-// account-wide weekly limit.
-const weeklyWindowMinSeconds = 6 * 24 * 60 * 60
-
 // WeeklyLimitCooked reports whether an account is blocked by its account-wide
-// weekly rate-limit window. The upstream limit_reached flag is authoritative;
-// otherwise any fully consumed window of at least six days counts, whether
-// upstream reports it as primary or secondary. A secondary window without a
-// reported length is assumed to be the weekly one.
+// weekly rate-limit window. See WeeklyCookedWindow for the rule.
 func WeeklyLimitCooked(details CodexUsageDetails) bool {
-	rl := details.RawRateLimit
-	if rl.LimitReached {
-		return true
+	_, cooked := WeeklyCookedWindow(codexUsageResponse{RateLimit: details.RawRateLimit}.windows())
+	return cooked
+}
+
+// seenCodexUsageShapes records which rate-limit layouts this process has
+// already logged, so each distinct layout is logged once.
+var seenCodexUsageShapes sync.Map
+
+// logCodexUsageShapeOnce logs the layout of a Codex usage response the first
+// time this process sees it. Upstream moved the weekly window from
+// secondary_window to primary_window for some accounts without notice; a new
+// layout showing up in the log is the early signal for the next such change.
+func logCodexUsageShapeOnce(rl codexRateLimitDetails) {
+	shape := codexUsageShape(rl)
+	if _, loaded := seenCodexUsageShapes.LoadOrStore(shape, struct{}{}); loaded {
+		return
 	}
-	for _, w := range []*codexLimitWindow{rl.PrimaryWindow, rl.SecondaryWindow} {
-		if w != nil && w.UsedPercent >= 100 && w.LimitWindowSeconds >= weeklyWindowMinSeconds {
-			return true
+	slog.Info("codex usage response layout observed", "layout", shape)
+}
+
+func codexUsageShape(rl codexRateLimitDetails) string {
+	slot := func(w *codexLimitWindow) string {
+		if w == nil {
+			return "none"
 		}
+		if w.LimitWindowSeconds <= 0 {
+			return "unknown"
+		}
+		return strconv.FormatInt(w.LimitWindowSeconds, 10) + "s"
 	}
-	sw := rl.SecondaryWindow
-	return sw != nil && sw.LimitWindowSeconds == 0 && sw.UsedPercent >= 100
+	return "primary=" + slot(rl.PrimaryWindow) + " secondary=" + slot(rl.SecondaryWindow) +
+		" limit_reached=" + strconv.FormatBool(rl.LimitReached)
 }
