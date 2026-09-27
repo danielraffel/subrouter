@@ -66,3 +66,14 @@ func TestRecoveryTrackerKeepsSoonestResetWithinFailureBatch(t *testing.T) {
 		t.Fatalf("new batch reset=%s, want %s", state.ResetAt, now.Add(3*time.Hour))
 	}
 }
+
+func TestRecoveryTrackerRecordsLaterSessionSuccess(t *testing.T) {
+	tracker := NewRecoveryTracker()
+	now := time.Now().UTC()
+	tracker.RecordQuotaFailure("claude", "resumed", wake.KindClaudeQuota, "claude-opus", now, now.Add(5*24*time.Hour))
+	tracker.RecordSessionSuccess("claude", "resumed", now.Add(30*time.Second))
+	state := tracker.List(now)[0]
+	if !state.LastSuccessAt.Equal(now.Add(30*time.Second)) || !state.LastFailureAt.Equal(now) {
+		t.Fatalf("session success erased failure evidence: %+v", state)
+	}
+}

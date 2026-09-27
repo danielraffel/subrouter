@@ -20,9 +20,15 @@ configurable grace delay and bounded per-session jitter. Dispatch is rate
 limited so many sessions do not reconnect at once.
 
 On the first watcher scan, recently active means last activity within eight
-hours. Later monitor passes require a newly observed, confirmed signal. They do
-not rediscover and resume an old tab from a broad screen scrape. Existing old
-alarms remain visible for audit but are never reactivated by that first scan.
+hours. The worker waits 30 seconds after a failure before saving the cmux
+activity baseline, so the error itself can finish updating the terminal.
+Later passes accept only a quota or provider signal from the preceding eight
+hours. They do not rediscover and resume an old tab from a broad screen scrape. An alarm
+already scheduled for a future reset can fire after eight hours if the exact
+agent, session, and surface binding still exists at dispatch.
+If the proxy sees a later successful request or a newer quota failure, the old
+alarm becomes stale. Later cmux activity also makes it stale after a short
+window that lets the original quota error finish updating the screen.
 
 The watcher validates the original machine, cmux surface, agent type, session
 ID, and active-writer state before sending the configured action. A mismatched
@@ -42,6 +48,20 @@ model-provider capacity event and requires a cooldown plus a lightweight health
 check; `codex-quota` is an account reset and uses `/goal resume` after reset and
 grace; `claude-quota` is a Claude reset and uses `continue`. A signal for one
 kind cannot create or dispatch another kind of alarm.
+
+An existing automatic quota alarm also watches for fresh quota returning
+before its predicted reset time. Once the proxy confirms a valid subscription
+account has enough quota for that agent and model pool, the shared worker moves
+that alarm to one minute from now plus its normal jitter. This covers a manual
+reset credit or a service-side early reset. It does not accelerate other agents,
+other model pools, provider-capacity alarms, manual alarms, or cancelled alarms.
+It requires a subscription usage measurement newer than the failure. Cached
+pre-failure windows, stale last-good usage, and paid extra-usage-only windows
+cannot prove recovery. Automatic recovery
+must still be enabled for the agent. Early wake is on by default and can be
+disabled per agent with `sr wake early codex disable` or `sr wake early claude
+disable`; `enable` restores the default. The scheduled reset time remains the
+fallback if no fresh recovery is observed.
 
 Codex capacity recovery must not immediately replay a large `/goal resume`
 request after a provider failure. The first failure records the provider error
@@ -68,27 +88,18 @@ permissions and remains disabled until changed.
 
 ## Configuration and controls
 
-The configuration is per agent and disabled by default:
+Automatic recovery is disabled by default for each agent. Early wake is enabled
+by default for both agents, but only has an effect when automatic recovery is
+enabled. Settings persist in the local `wake-config.json` state file.
 
-```toml
-[watcher.auto_resume.claude]
-enabled = false
-action = "continue"
-delay = "2m"
-
-[watcher.auto_resume.codex]
-enabled = false
-action = "goal-resume"
-delay = "2m"
-```
-
-Planned controls are:
+Controls are:
 
 ```text
 sr wake list
 sr wake show <id>
 sr wake enable <claude|codex>
 sr wake disable <claude|codex>
+sr wake early <claude|codex> <enable|disable>
 sr wake update <id> --delay 5m --expires-in 2d4h15m
 sr wake now <claude|codex|all>
 sr wake cancel <id>

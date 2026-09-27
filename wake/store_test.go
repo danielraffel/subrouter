@@ -1,6 +1,7 @@
 package wake
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -80,8 +81,20 @@ func TestStoreCancelAgentLeavesOtherAgent(t *testing.T) {
 
 func TestConfigDisabledByDefaultAndPersists(t *testing.T) {
 	cfg := NewConfig(filepath.Join(t.TempDir(), "wake-config.json"))
+	if early, err := cfg.EarlyOnRecovery("codex"); err != nil || !early {
+		t.Fatalf("default early recovery=%v err=%v", early, err)
+	}
 	if enabled, err := cfg.Enabled("codex"); err != nil || enabled {
 		t.Fatalf("default enabled=%v err=%v, want false", enabled, err)
+	}
+	if err := cfg.SetEarlyOnRecovery("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if early, err := cfg.EarlyOnRecovery("codex"); err != nil || early {
+		t.Fatalf("disabled early recovery=%v err=%v", early, err)
+	}
+	if early, err := cfg.EarlyOnRecovery("claude"); err != nil || !early {
+		t.Fatalf("Claude early recovery=%v err=%v", early, err)
 	}
 	if err := cfg.SetEnabled("claude", true); err != nil {
 		t.Fatal(err)
@@ -102,6 +115,19 @@ func TestConfigDisabledByDefaultAndPersists(t *testing.T) {
 	}
 	if saved, err := cfg.Policy("codex"); err != nil || !saved.AllowContinue {
 		t.Fatalf("saved policy=%+v err=%v", saved, err)
+	}
+}
+
+func TestEarlyRecoveryDefaultsOnForExistingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wake-config.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"enabled":{"codex":true,"claude":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := NewConfig(path)
+	for _, agent := range []string{"codex", "claude"} {
+		if early, err := cfg.EarlyOnRecovery(agent); err != nil || !early {
+			t.Fatalf("legacy config %s early=%v err=%v", agent, early, err)
+		}
 	}
 }
 

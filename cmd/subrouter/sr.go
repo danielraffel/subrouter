@@ -82,6 +82,7 @@ Usage:
   sr wake install       Install and bootstrap the reboot-surviving launchd worker
   sr wake uninstall     Stop and remove the launchd worker
   sr wake policy <agent> Configure bounded Codex replay/fallback policy
+  sr wake early <agent> enable|disable  Advance matching quota alarms on fresh recovery (default on)
   sr wake enable|disable <codex|claude>
                         Enable or disable automatic recovery for one agent
   sr sessions [--all] [--json]

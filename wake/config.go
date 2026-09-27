@@ -17,15 +17,16 @@ type Policy struct {
 }
 
 type configFile struct {
-	Version  int               `json:"version"`
-	Enabled  map[string]bool   `json:"enabled"`
-	Policies map[string]Policy `json:"policies"`
+	Version         int               `json:"version"`
+	Enabled         map[string]bool   `json:"enabled"`
+	EarlyOnRecovery map[string]bool   `json:"early_on_recovery"`
+	Policies        map[string]Policy `json:"policies"`
 }
 
 func NewConfig(path string) *Config { return &Config{path: path} }
 
 func defaultConfig() configFile {
-	return configFile{Version: 1, Enabled: map[string]bool{"codex": false, "claude": false}, Policies: map[string]Policy{"codex": {MaxGoalAttempts: 2, ContinueAfter: 2, CooldownSeconds: 60}}}
+	return configFile{Version: 1, Enabled: map[string]bool{"codex": false, "claude": false}, EarlyOnRecovery: map[string]bool{"codex": true, "claude": true}, Policies: map[string]Policy{"codex": {MaxGoalAttempts: 2, ContinueAfter: 2, CooldownSeconds: 60}}}
 }
 
 func (c *Config) load() (configFile, error) {
@@ -48,7 +49,33 @@ func (c *Config) load() (configFile, error) {
 	if state.Policies == nil {
 		state.Policies = map[string]Policy{}
 	}
+	if state.EarlyOnRecovery == nil {
+		state.EarlyOnRecovery = map[string]bool{"codex": true, "claude": true}
+	}
 	return state, nil
+}
+
+func (c *Config) EarlyOnRecovery(agent string) (bool, error) {
+	if agent != "codex" && agent != "claude" {
+		return false, fmt.Errorf("wake agent must be codex or claude")
+	}
+	state, err := c.load()
+	if err != nil {
+		return false, err
+	}
+	return state.EarlyOnRecovery[agent], nil
+}
+
+func (c *Config) SetEarlyOnRecovery(agent string, enabled bool) error {
+	if agent != "codex" && agent != "claude" {
+		return fmt.Errorf("wake agent must be codex or claude")
+	}
+	state, err := c.load()
+	if err != nil {
+		return err
+	}
+	state.EarlyOnRecovery[agent] = enabled
+	return c.save(state)
 }
 
 func (c *Config) SetEnabled(agent string, enabled bool) error {

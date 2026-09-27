@@ -21,7 +21,7 @@ import (
 
 func (r srRunner) wake(args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprintln(r.out, "usage: sr wake list|show <id>|schedule [options]|now [codex|claude|all]|cancel <id>|cancel --agent <agent>|cancel --all|enable|disable <agent>")
+		fmt.Fprintln(r.out, "usage: sr wake list|show <id>|schedule [options]|now [codex|claude|all]|cancel <id>|cancel --agent <agent>|cancel --all|enable|disable <agent>|early <agent> <enable|disable>")
 		return nil
 	}
 	store := wake.NewStore(storepath.StateDir() + "/wake.json")
@@ -51,7 +51,7 @@ func (r srRunner) wake(args []string) error {
 		if !ok {
 			return fmt.Errorf("wake alarm %q not found", args[1])
 		}
-		fmt.Fprintf(r.out, "id=%s status=%s agent=%s action=%s wake_at=%s expires_at=%s session=%s surface=%s machine=%s attempt=%d jitter=%ds\n", a.ID, a.Status, a.Agent, a.Action, a.WakeAt.Format(time.RFC3339), a.ExpiresAt.Format(time.RFC3339), a.SessionID, a.SurfaceID, a.Machine, a.Attempt, a.JitterSeconds)
+		fmt.Fprintf(r.out, "id=%s status=%s agent=%s action=%s wake_at=%s expires_at=%s session=%s surface=%s machine=%s attempt=%d jitter=%ds accelerated_at=%s\n", a.ID, a.Status, a.Agent, a.Action, a.WakeAt.Format(time.RFC3339), a.ExpiresAt.Format(time.RFC3339), a.SessionID, a.SurfaceID, a.Machine, a.Attempt, a.JitterSeconds, a.AcceleratedAt.Format(time.RFC3339))
 		return nil
 	case "schedule":
 		return scheduleWake(store, args[1:], now, r.out)
@@ -82,6 +82,25 @@ func (r srRunner) wake(args []string) error {
 		return nil
 	case "policy":
 		return updateWakePolicy(args[1:], r.out)
+	case "early":
+		if len(args) < 2 || len(args) > 3 || (args[1] != "codex" && args[1] != "claude") {
+			return fmt.Errorf("usage: sr wake early <codex|claude> [enable|disable]")
+		}
+		cfg := wake.NewConfig(storepath.StateDir() + "/wake-config.json")
+		if len(args) == 3 {
+			if args[2] != "enable" && args[2] != "disable" {
+				return fmt.Errorf("usage: sr wake early <codex|claude> [enable|disable]")
+			}
+			if err := cfg.SetEarlyOnRecovery(args[1], args[2] == "enable"); err != nil {
+				return err
+			}
+		}
+		early, err := cfg.EarlyOnRecovery(args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "early recovery for %s: %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[early])
+		return nil
 	default:
 		return fmt.Errorf("unknown wake command %q", args[0])
 	}
@@ -283,11 +302,18 @@ func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte
 	defer lock()
 	startedAt := time.Now().UTC()
 	initial := true
+	lastReadinessCheck := time.Time{}
 	pass := func() error {
 		if err := syncRecoveryAlarms(store, serverURL, cmuxPath, startedAt, initial); err != nil {
 			return err
 		}
 		initial = false
+		if lastReadinessCheck.IsZero() || time.Since(lastReadinessCheck) >= time.Minute {
+			lastReadinessCheck = time.Now()
+			if err := accelerateRecoveredQuotaAlarms(store, serverURL, lastReadinessCheck); err != nil {
+				fmt.Fprintf(out, "wake worker early recovery: %v\n", err)
+			}
+		}
 		return dispatchDueWakeAlarms(store, serverURL, cmuxPath, spacing, startedAt, out)
 	}
 	if once {
@@ -306,6 +332,85 @@ func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte
 	return nil
 }
 
+// accelerateRecoveredQuotaAlarms uses the proxy's fresh subscription evidence
+// to move only matching automatic quota alarms earlier. The shared worker
+// remains the sole component that ultimately sends a terminal command.
+func accelerateRecoveredQuotaAlarms(store *wake.Store, serverURL string, now time.Time) error {
+	alarms, err := store.List(now)
+	if err != nil {
+		return err
+	}
+	cfg := wake.NewConfig(storepath.StateDir() + "/wake-config.json")
+	checked := map[string]bool{}
+	for _, alarm := range alarms {
+		if !alarm.Automatic || alarm.Status != wake.StatusScheduled ||
+			(alarm.Kind != wake.KindCodexQuota && alarm.Kind != wake.KindClaudeQuota) ||
+			!alarm.WakeAt.After(now.Add(time.Minute)) {
+			continue
+		}
+		enabled, err := cfg.Enabled(alarm.Agent)
+		if err != nil {
+			return err
+		}
+		early, err := cfg.EarlyOnRecovery(alarm.Agent)
+		if err != nil {
+			return err
+		}
+		if !enabled || !early {
+			continue
+		}
+		key := alarm.Agent + "\x00" + alarm.Pool + "\x00" + alarm.ObservedAt.Format(time.RFC3339Nano)
+		ready, seen := checked[key]
+		if !seen {
+			ready, err = fetchRecoveryReadiness(serverURL, alarm.Agent, alarm.Pool, alarm.ObservedAt)
+			if err != nil {
+				return err
+			}
+			checked[key] = ready
+		}
+		if !ready {
+			continue
+		}
+		_, err = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+			if a.Status != wake.StatusScheduled || !a.WakeAt.After(now.Add(time.Minute)) {
+				return nil
+			}
+			a.WakeAt = now.Add(time.Minute)
+			a.AcceleratedAt = now
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fetchRecoveryReadiness(serverURL, agent, pool string, observedAt time.Time) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+	query := url.Values{"agent": {agent}, "pool": {pool}, "observed_at": {observedAt.Format(time.RFC3339Nano)}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(serverURL, "/")+"/_subrouter/recovery-readiness?"+query.Encode(), nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("recovery-readiness returned %s", resp.Status)
+	}
+	var result struct {
+		Ready bool `json:"ready"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	return result.Ready, nil
+}
+
 type recoveryWireState struct {
 	Agent             string    `json:"agent"`
 	SessionID         string    `json:"session_id"`
@@ -315,6 +420,7 @@ type recoveryWireState struct {
 	LastFailureAt     time.Time `json:"last_failure_at"`
 	ResetAt           time.Time `json:"reset_at"`
 	ProviderHealthyAt time.Time `json:"provider_healthy_at"`
+	LastSuccessAt     time.Time `json:"last_success_at"`
 	Failures          int       `json:"failures"`
 	GoalAttempts      int       `json:"goal_attempts"`
 	ContinueSent      bool      `json:"continue_sent"`
@@ -333,7 +439,7 @@ type cmuxSessionsWire struct {
 	Sessions []cmuxSessionWire `json:"sessions"`
 }
 
-func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, startedAt time.Time, initial bool) error {
+func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Time, initial bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(serverURL, "/")+"/_subrouter/recovery-status", nil)
@@ -361,8 +467,42 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, startedAt
 	if err != nil {
 		return err
 	}
+	for _, alarm := range existing {
+		if !alarm.Automatic || alarm.Status != wake.StatusScheduled ||
+			(alarm.Kind != wake.KindCodexQuota && alarm.Kind != wake.KindClaudeQuota) {
+			continue
+		}
+		for _, state := range states {
+			if state.Agent != alarm.Agent || state.SessionID != alarm.SessionID {
+				continue
+			}
+			if state.LastSuccessAt.After(alarm.ObservedAt) || state.LastFailureAt.After(alarm.ObservedAt) {
+				_, err := store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+					a.Status = wake.StatusStale
+					a.LastError = "session made a newer request after the quota failure"
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+			break
+		}
+	}
 	for _, state := range states {
-		if (state.Agent != "codex" && state.Agent != "claude") || state.LastFailureAt.IsZero() || (!initial && state.LastFailureAt.Before(startedAt)) {
+		if (state.Agent != "codex" && state.Agent != "claude") || state.LastFailureAt.IsZero() || state.LastFailureAt.Before(now.Add(-8*time.Hour)) {
+			continue
+		}
+		// Let the failed response finish updating cmux before capturing the
+		// alarm's activity baseline. Later changes can then be treated as
+		// possible manual interaction without a permanent grace blind spot.
+		// A command typed during this delay without a completed provider turn
+		// has not established recovery; a later response or screen update will
+		// supersede the alarm, and the operator can cancel it explicitly.
+		if now.Before(state.LastFailureAt.Add(30 * time.Second)) {
+			continue
+		}
+		if (state.Kind == wake.KindCodexQuota || state.Kind == wake.KindClaudeQuota) && state.LastSuccessAt.After(state.LastFailureAt) {
 			continue
 		}
 		enabled, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Enabled(state.Agent)
@@ -467,6 +607,8 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 		return err
 	}
 	sent := 0
+	var sessions []cmuxSessionWire
+	sessionsLoaded := false
 	for _, alarm := range alarms {
 		if alarm.Status != wake.StatusScheduled || alarmDueAt(alarm).After(now) {
 			continue
@@ -480,14 +622,59 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 				continue
 			}
 		}
-		initialAlarm := alarm.ObservedAt.IsZero() || alarm.ObservedAt.Before(workerStartedAt)
-		if alarm.SessionLastActiveAt.IsZero() || !wake.EligibleForAutomatic(alarm.SessionLastActiveAt, now, initialAlarm, !initialAlarm) {
-			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
-				a.Status = wake.StatusStale
-				a.LastError = "session is older than initial 8h freshness window"
-				return nil
-			})
-			continue
+		if alarm.Automatic {
+			if alarm.Kind == wake.KindCodexProvider && alarm.SessionLastActiveAt.Before(now.Add(-8*time.Hour)) {
+				_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+					a.Status = wake.StatusStale
+					a.LastError = "provider alarm session is older than eight hours"
+					return nil
+				})
+				continue
+			}
+			// A saved automatic alarm may wait days for quota. Require its
+			// exact binding; explicit manual alarms retain their surface check.
+			if !sessionsLoaded {
+				sessions, err = readCMUXSessions(cmuxPath)
+				if err != nil {
+					return err
+				}
+				sessionsLoaded = true
+			}
+			matched := false
+			var sessionUpdatedAt time.Time
+			for _, session := range sessions {
+				if session.Agent == alarm.Agent && session.SessionID == alarm.SessionID && session.SurfaceID == alarm.SurfaceID {
+					matched = true
+					sessionUpdatedAt, _ = time.Parse(time.RFC3339Nano, session.UpdatedAt)
+					break
+				}
+			}
+			if !matched {
+				_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+					a.Status = wake.StatusStale
+					a.LastError = "exact cmux session binding is missing"
+					return nil
+				})
+				continue
+			}
+			if sessionUpdatedAt.IsZero() {
+				_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+					a.Status = wake.StatusStale
+					a.LastError = "cmux session activity time is missing or invalid"
+					return nil
+				})
+				continue
+			}
+			// The saved activity timestamp includes the quota error's own
+			// screen update. Any subsequent change can be a manual resume.
+			if !alarm.SessionLastActiveAt.IsZero() && sessionUpdatedAt.After(alarm.SessionLastActiveAt) {
+				_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+					a.Status = wake.StatusStale
+					a.LastError = "cmux session was active after the quota failure"
+					return nil
+				})
+				continue
+			}
 		}
 		if err := validateSurface(cmuxPath, alarm.SurfaceID); err != nil {
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusStale; a.LastError = err.Error(); return nil })

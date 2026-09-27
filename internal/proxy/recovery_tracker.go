@@ -30,6 +30,7 @@ type RecoveryState struct {
 	RequestTokens     int64     `json:"request_tokens,omitempty"`
 	ResponseTokens    int64     `json:"response_tokens,omitempty"`
 	ProviderHealthyAt time.Time `json:"provider_healthy_at,omitempty"`
+	LastSuccessAt     time.Time `json:"last_success_at,omitempty"`
 }
 
 type RecoveryTracker struct {
@@ -59,6 +60,19 @@ func (t *RecoveryTracker) RecordProviderHealthy(agent, session string, at time.T
 	s := t.state[key]
 	s.Agent, s.SessionID = agent, session
 	s.LastActivityAt, s.ProviderHealthyAt = at.UTC(), at.UTC()
+	t.state[key] = s
+}
+
+func (t *RecoveryTracker) RecordSessionSuccess(agent, session string, at time.Time) {
+	if t == nil || session == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	key := recoveryKey(agent, session)
+	s := t.state[key]
+	s.Agent, s.SessionID = agent, session
+	s.LastActivityAt, s.LastSuccessAt = at.UTC(), at.UTC()
 	t.state[key] = s
 }
 

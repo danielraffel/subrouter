@@ -24,7 +24,7 @@ func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode([]recoveryWireState{{Agent: "claude", SessionID: sessionID, Kind: wake.KindClaudeQuota, LastActivityAt: now, LastFailureAt: now, ResetAt: now.Add(time.Minute)}})
+		_ = json.NewEncoder(w).Encode([]recoveryWireState{{Agent: "claude", SessionID: sessionID, Kind: wake.KindClaudeQuota, LastActivityAt: now.Add(-time.Minute), LastFailureAt: now.Add(-time.Minute), ResetAt: now.Add(time.Minute)}})
 	}))
 	defer server.Close()
 	cmux := filepath.Join(stateRoot, "cmux-fake")
@@ -88,7 +88,7 @@ func TestDispatchManualAlarmIgnoresAutomaticDisabledSetting(t *testing.T) {
 	}))
 	defer server.Close()
 	cmux := filepath.Join(stateRoot, "cmux-fake")
-	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nif [ \"$1\" = read-screen ]; then printf prompt; else exit 0; fi\n"), 0o700); err != nil {
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nif [ \"$1\" = sessions ]; then printf '{\"sessions\":[]}'; elif [ \"$1\" = read-screen ]; then printf prompt; else exit 0; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	store := wake.NewStore(filepath.Join(storepath.StateDir(), "wake.json"))
@@ -154,5 +154,188 @@ func TestWakeLaunchdPlistPinsStateRoot(t *testing.T) {
 		if !strings.Contains(plist, want) {
 			t.Fatalf("plist missing %q:\n%s", want, plist)
 		}
+	}
+}
+
+func TestEarlyRecoveryAdvancesOnlyMatchingAutomaticQuotaAlarm(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	now := time.Now().UTC()
+	store := wake.NewStore(filepath.Join(root, "wake.json"))
+	cfg := wake.NewConfig(filepath.Join(root, "wake-config.json"))
+	for _, agent := range []string{"codex", "claude"} {
+		if err := cfg.SetEnabled(agent, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alarms := []wake.Alarm{
+		{Agent: "codex", Kind: wake.KindCodexQuota, SessionID: "codex-quota", SurfaceID: "c1", Action: "/goal resume", Automatic: true},
+		{Agent: "codex", Kind: wake.KindCodexQuota, SessionID: "codex-spark", SurfaceID: "c4", Pool: "gpt-5.3-codex-spark", Action: "/goal resume", Automatic: true},
+		{Agent: "claude", Kind: wake.KindClaudeQuota, SessionID: "claude-quota", SurfaceID: "a1", Action: "continue", Automatic: true},
+		{Agent: "codex", Kind: wake.KindCodexProvider, SessionID: "provider", SurfaceID: "c2", Action: "/goal resume", Automatic: true},
+		{Agent: "codex", Kind: wake.KindCodexQuota, SessionID: "manual", SurfaceID: "c3", Action: "/goal resume"},
+	}
+	for _, alarm := range alarms {
+		alarm.WakeAt = now.Add(5 * 24 * time.Hour)
+		alarm.ExpiresAt = now.Add(6 * 24 * time.Hour)
+		alarm.SessionLastActiveAt = now
+		if _, err := store.Put(alarm, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_subrouter/recovery-readiness" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ready": r.URL.Query().Get("agent") == "codex" && r.URL.Query().Get("pool") == ""})
+	}))
+	defer server.Close()
+	if err := accelerateRecoveredQuotaAlarms(store, server.URL, now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.List(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, alarm := range got {
+		wantEarly := alarm.SessionID == "codex-quota"
+		if wantEarly != !alarm.AcceleratedAt.IsZero() {
+			t.Fatalf("alarm %s accelerated=%v", alarm.SessionID, !alarm.AcceleratedAt.IsZero())
+		}
+		if wantEarly && !alarm.WakeAt.Equal(now.Add(time.Minute)) {
+			t.Fatalf("accelerated wake=%s", alarm.WakeAt)
+		}
+	}
+	if err := cfg.SetEarlyOnRecovery("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := accelerateRecoveredQuotaAlarms(store, server.URL, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOldScheduledAlarmCanFireWhenExactSessionStillExists(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	now := time.Now().UTC()
+	store := wake.NewStore(filepath.Join(root, "wake.json"))
+	if err := wake.NewConfig(filepath.Join(root, "wake-config.json")).SetEnabled("claude", true); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.Put(wake.Alarm{Agent: "claude", Kind: wake.KindClaudeQuota, SessionID: "old-session", SurfaceID: "old-surface", Action: "continue", Automatic: true, SessionLastActiveAt: now.Add(-5 * 24 * time.Hour), ObservedAt: now.Add(-5 * 24 * time.Hour), WakeAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour)}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer server.Close()
+	cmux := filepath.Join(root, "cmux-fake")
+	sessions := `{"sessions":[{"agent":"claude","session_id":"old-session","surface_id":"old-surface","updated_at":"` + now.Add(-5*24*time.Hour).Format(time.RFC3339Nano) + `"}]}`
+	script := "#!/bin/sh\nif [ \"$1\" = sessions ]; then printf '%s'; elif [ \"$1\" = read-screen ]; then printf prompt; fi\n"
+	script = strings.Replace(script, "%s", sessions, 1)
+	if err := os.WriteFile(cmux, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	alarms, err := store.List(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 1 || alarms[0].Status != wake.StatusCompleted {
+		t.Fatalf("old but bound alarm=%+v", alarms)
+	}
+}
+
+func TestOldScheduledAlarmDoesNotInterruptManuallyResumedSession(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	now := time.Now().UTC()
+	observedAt := now.Add(-5 * 24 * time.Hour)
+	store := wake.NewStore(filepath.Join(root, "wake.json"))
+	if err := wake.NewConfig(filepath.Join(root, "wake-config.json")).SetEnabled("claude", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(wake.Alarm{Agent: "claude", Kind: wake.KindClaudeQuota, SessionID: "old-session", SurfaceID: "old-surface", Action: "continue", Automatic: true, SessionLastActiveAt: observedAt, ObservedAt: observedAt, WakeAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour)}, now); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(http.StatusNoContent) }))
+	defer server.Close()
+	cmux := filepath.Join(root, "cmux-fake")
+	sessions := `{"sessions":[{"agent":"claude","session_id":"old-session","surface_id":"old-surface","updated_at":"` + observedAt.Add(2*time.Minute).Format(time.RFC3339Nano) + `"}]}`
+	script := "#!/bin/sh\nif [ \"$1\" = sessions ]; then printf '%s'; elif [ \"$1\" = read-screen ]; then printf prompt; else exit 0; fi\n"
+	if err := os.WriteFile(cmux, []byte(strings.Replace(script, "%s", sessions, 1)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	alarms, err := store.List(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 1 || alarms[0].Status != wake.StatusStale || calls != 0 {
+		t.Fatalf("manually resumed session alarm=%+v posts=%d", alarms, calls)
+	}
+}
+
+func TestOldProviderAlarmDoesNotReplayAfterEightHours(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	now := time.Now().UTC()
+	store := wake.NewStore(filepath.Join(root, "wake.json"))
+	if err := wake.NewConfig(filepath.Join(root, "wake-config.json")).SetEnabled("codex", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(wake.Alarm{Agent: "codex", Kind: wake.KindCodexProvider, SessionID: "old-provider", SurfaceID: "old-surface", Action: "/goal resume", Automatic: true, SessionLastActiveAt: now.Add(-9 * time.Hour), ObservedAt: now.Add(-9 * time.Hour), WakeAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour)}, now); err != nil {
+		t.Fatal(err)
+	}
+	cmux := filepath.Join(root, "cmux-fake")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatchDueWakeAlarms(store, "http://127.0.0.1:1", cmux, 0, now, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	alarms, err := store.List(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 1 || alarms[0].Status != wake.StatusStale {
+		t.Fatalf("old provider alarm=%+v", alarms)
+	}
+}
+
+func TestLaterSuccessfulRequestCancelsQuotaAlarmWithinFirstMinute(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	now := time.Now().UTC()
+	observedAt := now.Add(-5 * time.Minute)
+	store := wake.NewStore(filepath.Join(root, "wake.json"))
+	if err := wake.NewConfig(filepath.Join(root, "wake-config.json")).SetEnabled("claude", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(wake.Alarm{Agent: "claude", Kind: wake.KindClaudeQuota, SessionID: "resumed", SurfaceID: "surface", Action: "continue", Automatic: true, SessionLastActiveAt: observedAt, ObservedAt: observedAt, WakeAt: now.Add(5 * 24 * time.Hour), ExpiresAt: now.Add(6 * 24 * time.Hour)}, now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]recoveryWireState{{Agent: "claude", SessionID: "resumed", Kind: wake.KindClaudeQuota, LastActivityAt: observedAt.Add(30 * time.Second), LastFailureAt: observedAt, LastSuccessAt: observedAt.Add(30 * time.Second)}})
+	}))
+	defer server.Close()
+	cmux := filepath.Join(root, "cmux-fake")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nprintf '{\"sessions\":[]}'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true); err != nil {
+		t.Fatal(err)
+	}
+	alarms, err := store.List(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 1 || alarms[0].Status != wake.StatusStale {
+		t.Fatalf("resumed session alarm=%+v", alarms)
 	}
 }

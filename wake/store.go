@@ -55,6 +55,7 @@ type Alarm struct {
 	SessionLastActiveAt time.Time `json:"session_last_active_at,omitempty"`
 	ObservedAt          time.Time `json:"observed_at,omitempty"`
 	Automatic           bool      `json:"automatic,omitempty"`
+	AcceleratedAt       time.Time `json:"accelerated_at,omitempty"`
 }
 
 const InitialSessionMaxAge = 8 * time.Hour
