@@ -2467,3 +2467,82 @@ func TestProxyClaudeEnablesUpstreamModelDiscovery(t *testing.T) {
 		t.Fatal("direct profile discovery was changed")
 	}
 }
+
+// `sr claude add` with no flags must run the browser OAuth flow that works for
+// pooled routing, including over an existing setup-token profile (the exact
+// repair path): the new refreshable credential replaces the setup token, and
+// the success line names the plan from the credential when `claude auth
+// status` reports none.
+func TestClaudeAddDefaultsToBrowserOAuthOverSetupTokenProfile(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir("work@example.com")
+	setupToken := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-setup","expiresAt":4102444800000,"scopes":["user:inference"]}}`
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte(setupToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+if [ "$1" = "setup-token" ]; then
+  echo "setup-token must not run by default" >&2
+  exit 3
+fi
+if [ "$1" = "/login" ]; then
+  sleep 3 &
+  wait $!
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"claude-access-oauth","refreshToken":"claude-refresh-oauth","expiresAt":4102444800000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	if err := runner.run(t.Context(), []string{"add", "work@example.com"}); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	credential, err := store.ReadCredential(t.Context(), configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential == nil || credential.AccessToken != "claude-access-oauth" || credential.RefreshToken == "" {
+		t.Fatalf("add kept the setup token instead of the OAuth credential: %+v\n%s", credential, out.String())
+	}
+	if !strings.Contains(out.String(), `Added Claude profile "work@example.com". (work@example.com) [max]`) {
+		t.Fatalf("success line should name the plan from the credential:\n%s", out.String())
+	}
+}
+
+func TestClaudeProfilePlanLabelFallsBackToCredential(t *testing.T) {
+	max := &claude.CredentialInfo{SubscriptionType: "max"}
+	cases := []struct {
+		name       string
+		status     *claude.AuthStatus
+		credential *claude.CredentialInfo
+		want       string
+	}{
+		{"auth status wins", &claude.AuthStatus{SubscriptionType: "pro"}, max, "pro"},
+		{"credential fallback", &claude.AuthStatus{}, max, "max"},
+		{"nil status", nil, max, "max"},
+		{"setup token has no plan", &claude.AuthStatus{}, &claude.CredentialInfo{AccessToken: "sk-ant-oat01-x"}, ""},
+		{"nothing known", nil, nil, ""},
+	}
+	for _, tc := range cases {
+		if got := claudeProfilePlanLabel(tc.status, tc.credential); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
