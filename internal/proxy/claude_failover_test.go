@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -841,5 +843,226 @@ func TestIsTerminalCredentialErrorClassifiesUnreadableCredential(t *testing.T) {
 	}
 	if isTerminalCredentialError(context.Canceled) {
 		t.Fatal("a cancelled context must stay transient")
+	}
+}
+
+const claudeSSEOverloadedEvent = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+
+const claudeSSEMessageStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
+	"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+
+const claudeSSEContent = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+	"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+
+const claudeSSETail = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+	"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+func claudeSSEResponse(body string) *http.Response {
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+// TestClaudeSSEOverloadBeforeContentRetried: Anthropic can answer 200 and then
+// send an overloaded_error SSE event before any content. Nothing reached the
+// client yet, so it must be retried like a 529 and the client must receive the
+// retried, successful stream.
+func TestClaudeSSEOverloadBeforeContentRetried(t *testing.T) {
+	server, store := claudeFailoverServer(t)
+	if _, err := store.Put("claude", "session-sse", "fresh@example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		if calls == 1 {
+			return claudeSSEResponse(claudeSSEMessageStart + claudeSSEOverloadedEvent)
+		}
+		return claudeSSEResponse(claudeSSEMessageStart + claudeSSEContent + claudeSSETail)
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "session-sse", account: "fresh@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
+	req.Header.Set("Authorization", "Bearer tok-fresh")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (overloaded stream, then retry)", calls)
+	}
+	if string(body) != claudeSSEMessageStart+claudeSSEContent+claudeSSETail {
+		t.Fatalf("client body = %q, want only the retried successful stream", string(body))
+	}
+	if len(waits) != 1 || waits[0] != time.Second {
+		t.Fatalf("backoff waits = %v, want [1s]", waits)
+	}
+	if server.SchedulerRef.Get().Exhausted(accounts.ProviderClaude, "fresh@example.com") {
+		t.Fatal("an in-stream overload must NOT mark the account exhausted")
+	}
+}
+
+// TestClaudeSSEOverloadAfterContentPassedThrough: once content has streamed,
+// replaying would duplicate output, so a later overloaded_error must be passed
+// through untouched with no retry.
+func TestClaudeSSEOverloadAfterContentPassedThrough(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	stream := claudeSSEMessageStart + claudeSSEContent + claudeSSEOverloadedEvent
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		return claudeSSEResponse(stream)
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "s", account: "fresh@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{"stream":true}`)))
+	req.Header.Set("Authorization", "Bearer tok-fresh")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if calls != 1 || len(waits) != 0 {
+		t.Fatalf("calls=%d waits=%v, want a single attempt with no retry", calls, waits)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != stream {
+		t.Fatalf("status=%d body=%q, want the original stream passed through", response.StatusCode, string(body))
+	}
+}
+
+// TestClaudeOverloadNoRerouteWithoutHeadroom: the opt-in one-shot overload
+// reroute only targets an account with new-session headroom; otherwise the
+// request keeps to the same-account ladder and the 529 passes through once it
+// is spent.
+func TestClaudeOverloadNoRerouteWithoutHeadroom(t *testing.T) {
+	server, _ := claudeFailoverServer(t)
+	server.ClaudeOverloadReroute = true
+	// Both accounts are low but not exhausted: below new-session headroom.
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "cooked@example.com", Provider: accounts.ProviderClaude, Headroom: 0.1, ShortHeadroom: 0.1},
+		{AccountID: "fresh@example.com", Provider: accounts.ProviderClaude, Headroom: 0.1, ShortHeadroom: 0.1},
+	}))
+	var calls int
+	stub := &stubRoundTripper{responses: func(req *http.Request) *http.Response {
+		calls++
+		if !strings.Contains(req.Header.Get("Authorization"), "tok-fresh") {
+			t.Errorf("attempt went to %q without an eligible reroute target", req.Header.Get("Authorization"))
+		}
+		return &http.Response{StatusCode: 529, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"overloaded_error"}}`))}
+	}}
+	var waits []time.Duration
+	transport := usageLimitRetryTransport{
+		base: stub, server: &server, provider: accounts.ProviderClaude,
+		agent: "claude", session: "s", account: "fresh@example.com",
+		method: http.MethodPost, path: "/v1/messages", maxAttempts: 6,
+		sleep: recordSleep(&waits), overloadPolicy: claudeShortLadder,
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer tok-fresh")
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 529 || calls != 1+claudeShortLadderRetries {
+		t.Fatalf("status=%d calls=%d, want 529 after %d same-account attempts", response.StatusCode, calls, 1+claudeShortLadderRetries)
+	}
+}
+
+// TestClaudeStreamOverloadedPeekTimeoutKeepsBytes: when the first decisive
+// event is slower than the peek bound, the stream is handed over undecided
+// and every byte (peeked and later) still reaches the client in order.
+func TestClaudeStreamOverloadedPeekTimeoutKeepsBytes(t *testing.T) {
+	previous := claudeSSEOverloadPeekTimeout
+	claudeSSEOverloadPeekTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { claudeSSEOverloadPeekTimeout = previous })
+	pr, pw := io.Pipe()
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream")
+	response := &http.Response{StatusCode: http.StatusOK, Header: h, Body: pr}
+	go func() {
+		_, _ = pw.Write([]byte(claudeSSEMessageStart))
+		time.Sleep(100 * time.Millisecond)
+		_, _ = pw.Write([]byte(claudeSSEContent + claudeSSETail))
+		_ = pw.Close()
+	}()
+	if claudeStreamOverloaded(response) {
+		t.Fatal("an undecided stream must not be classified as overloaded")
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != claudeSSEMessageStart+claudeSSEContent+claudeSSETail {
+		t.Fatalf("body = %q, want the full stream in order", string(body))
+	}
+	_ = response.Body.Close()
+}
+
+// A pinned account whose refresh token is dead must fail once with a final,
+// readable error. A 503 made Claude Code retry the same dead refresh ten
+// times before giving up.
+func TestPinnedClaudeAccountWithDeadCredentialFailsFast(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refresh string
+		want    string
+	}{
+		{name: "invalid_grant", refresh: `Claude OAuth refresh failed: 400 Bad Request: {"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}`, want: "needs re-login"},
+		{name: "account_on_hold", refresh: `Claude OAuth refresh failed: 403 Forbidden: {"error": {"type": "account_on_hold"}}`, want: "restricted by Anthropic"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := claudeFailoverServer(t)
+			refreshes := 0
+			server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+				refreshes++
+				if account.ID == "cooked@example.com" {
+					return account, errors.New(tc.refresh)
+				}
+				return account, nil
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5"}`))
+			req.RemoteAddr = "127.0.0.1:5000"
+			req.Header.Set("X-Subrouter-Agent", "claude")
+			req.Header.Set("X-Claude-Code-Session-Id", "pinned-session")
+			req.Header.Set("X-Subrouter-Account-ID", "cooked@example.com")
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, req)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("X-Should-Retry"); got != "false" {
+				t.Fatalf("X-Should-Retry = %q", got)
+			}
+			var body struct {
+				Type  string `json:"type"`
+				Error struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body is not Anthropic-shaped JSON: %v: %s", err, response.Body.String())
+			}
+			if body.Type != "error" || body.Error.Type != "permission_error" || !strings.Contains(body.Error.Message, tc.want) || !strings.Contains(body.Error.Message, "cooked@example.com") {
+				t.Fatalf("body = %+v", body)
+			}
+		})
 	}
 }
