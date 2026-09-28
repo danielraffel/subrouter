@@ -25,8 +25,30 @@ type GoalResumePolicy struct {
 	AllowContinue   bool
 }
 
+const maxProviderCooldown = 15 * time.Minute
+
 func DefaultGoalResumePolicy() GoalResumePolicy {
 	return GoalResumePolicy{Cooldown: 60 * time.Second, MaxGoalAttempts: 2, ContinueAfter: 2, AllowContinue: false}
+}
+
+// CooldownFor returns an exponentially increasing delay for repeated provider
+// failures. A successful provider event resets the failure count upstream.
+// Capping the delay keeps recovery responsive without hammering a busy model.
+func (p GoalResumePolicy) CooldownFor(failures int) time.Duration {
+	if p.Cooldown <= 0 {
+		p.Cooldown = time.Minute
+	}
+	if failures <= 1 {
+		return p.Cooldown
+	}
+	delay := p.Cooldown
+	for i := 1; i < failures && delay < maxProviderCooldown; i++ {
+		delay *= 2
+		if delay >= maxProviderCooldown {
+			return maxProviderCooldown
+		}
+	}
+	return delay
 }
 
 type ResumeState struct {
@@ -51,7 +73,7 @@ func (p GoalResumePolicy) Next(state ResumeState, now time.Time, probeHealthy bo
 	if state.Failures == 0 {
 		return ResumeGoal
 	}
-	if !state.LastFailureAt.IsZero() && now.Before(state.LastFailureAt.Add(p.Cooldown)) {
+	if !state.LastFailureAt.IsZero() && now.Before(state.LastFailureAt.Add(p.CooldownFor(state.Failures))) {
 		return ResumeWait
 	}
 	if !probeHealthy {

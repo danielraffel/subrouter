@@ -575,6 +575,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 			case wake.ResumeContinue:
 				action = "continue"
 			}
+			wakeAt = state.LastFailureAt.Add(policy.CooldownFor(state.Failures))
 		}
 		_, err = store.Put(wake.Alarm{Kind: state.Kind, Agent: state.Agent, SessionID: state.SessionID, SurfaceID: matched.SurfaceID, Machine: "local", Pool: state.Pool, Action: action, WakeAt: wakeAt, ExpiresAt: wakeAt.Add(7 * 24 * time.Hour), JitterSeconds: 30, SessionLastActiveAt: lastActive, ObservedAt: state.LastFailureAt, Automatic: true}, now)
 		if err != nil {
