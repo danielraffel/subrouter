@@ -39,6 +39,57 @@ func upstreamStackToken(r *http.Request) string {
 	return strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 }
 
+func TestUpstreamAttemptTracksPhysicalInflightThroughResponseBody(t *testing.T) {
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	server := Server{SchedulerRef: ref}
+	accountA := accounts.Account{ID: "a", Provider: accounts.ProviderCodex}
+	key := selectacct.ScoreKey(accounts.ProviderCodex, "a")
+
+	base := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		if got := ref.InflightCounts()[key]; got != 1 {
+			t.Fatalf("inflight inside physical RoundTrip = %d, want 1", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+	req, err := http.NewRequest(http.MethodPost, "https://pool.invalid/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := &upstreamAttempt{
+		server:  &server,
+		account: accountA,
+		budget:  newAttemptBudget(0),
+		getBody: req.GetBody,
+	}
+	transport := upstreamLayers{
+		replayablePost: &replayablePostRetryTransport{method: http.MethodPost, maxAttempts: 1},
+	}.build(base, attempt)
+
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ref.InflightCounts()[key]; got != 1 {
+		t.Fatalf("inflight before body consumption = %d, want 1", got)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if got := ref.InflightCounts(); got != nil {
+		t.Fatalf("inflight after EOF = %v, want nil", got)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := ref.InflightCounts(); got != nil {
+		t.Fatalf("second release after Close changed inflight = %v", got)
+	}
+}
+
 // A is overloaded, so the capacity layer moves the request to another
 // account, B. B's 401 must be charged to B and never to A, even with the
 // transport replay layer sitting between the capacity and usage layers, and
@@ -298,5 +349,65 @@ func TestUpstreamStackAttributesResponseToServingAccount(t *testing.T) {
 				t.Fatalf("response attributed to %+v (%t), want %s with %s", routed, ok, tc.want, wantToken)
 			}
 		})
+	}
+}
+
+// The egress transports stand in for the wrapped base, so an egress replay
+// is a physical attempt of its own and must be counted while it runs.
+func TestCodexEgressReplayTracksPhysicalInflight(t *testing.T) {
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	egressURL, _ := url.Parse("http://egress.invalid:3128")
+	server := Server{
+		SchedulerRef: ref,
+		CodexEgress:  &CodexEgressConfig{Proxies: []*url.URL{egressURL}},
+	}
+	key := selectacct.ScoreKey(accounts.ProviderCodex, "a")
+	var egressCalls int
+	server.codexEgressTransports = []http.RoundTripper{roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		egressCalls++
+		if got := ref.InflightCounts()[key]; got != 1 {
+			t.Fatalf("inflight inside egress RoundTrip = %d, want 1", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		}, nil
+	})}
+	base := roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"server_is_overloaded"}}`)),
+		}, nil
+	})
+	req, err := http.NewRequest(http.MethodPost, "https://pool.invalid/responses", strings.NewReader(`{"model":"gpt-6-astra","input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := &upstreamAttempt{
+		server:   &server,
+		account:  accounts.Account{ID: "a", Provider: accounts.ProviderCodex},
+		provider: accounts.ProviderCodex,
+		budget:   newAttemptBudget(0),
+		getBody:  req.GetBody,
+	}
+	transport := upstreamLayers{
+		codexEgress: &codexEgressFallbackTransport{sessionKey: "session-inflight"},
+	}.build(base, attempt)
+
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || egressCalls != 1 {
+		t.Fatalf("status=%d egressCalls=%d, want 200 via one egress", response.StatusCode, egressCalls)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if got := ref.InflightCounts(); got != nil {
+		t.Fatalf("inflight after body consumption = %v, want nil", got)
 	}
 }

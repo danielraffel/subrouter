@@ -69,6 +69,10 @@ type SchedulerRef struct {
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
 	// instead of herding onto the snapshot's best account until it cooks.
 	routedSinceRefresh map[string]int
+	// inflight counts physical upstream attempts whose response is still open,
+	// keyed by ScoreKey. Unlike routedSinceRefresh it is instantaneous and is
+	// never cleared by a usage refresh.
+	inflight map[string]int
 	// lastDemand is when a request for each provider was last routed or
 	// turned away for lack of a usable account. Unlike routedSinceRefresh it
 	// survives refreshes, so it answers "is anyone asking right now?".
@@ -1418,6 +1422,53 @@ func (r *SchedulerRef) LastDemand(provider account.Provider) time.Time {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.lastDemand[provider]
+}
+
+// BeginInflight records one physical upstream attempt against an account and
+// returns an idempotent release function. The count spans response-body
+// lifetime, so streamed requests remain visible until EOF or Close.
+func (r *SchedulerRef) BeginInflight(provider account.Provider, accountID string) func() {
+	if r == nil || accountID == "" {
+		return func() {}
+	}
+	key := ScoreKey(provider, accountID)
+	r.mu.Lock()
+	if r.inflight == nil {
+		r.inflight = make(map[string]int)
+	}
+	r.inflight[key]++
+	r.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.inflight[key] <= 1 {
+				delete(r.inflight, key)
+				return
+			}
+			r.inflight[key]--
+		})
+	}
+}
+
+// InflightCounts returns a snapshot of live physical upstream attempts by
+// ScoreKey for Scheduler.WithInflightCounts.
+func (r *SchedulerRef) InflightCounts() map[string]int {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.inflight) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(r.inflight))
+	for key, count := range r.inflight {
+		out[key] = count
+	}
+	return out
 }
 
 // LiveDebits returns the per-account routed-request counts since the last

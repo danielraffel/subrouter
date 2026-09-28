@@ -5117,6 +5117,16 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = layers.build(transport, attempt)
+		} else if s.SchedulerRef != nil && s.CredentialBroker == nil {
+			// Non-replayable requests bypass the retry stack, so give their
+			// single physical attempt the same response-lifetime accounting.
+			transport = inflightAttemptTransport{
+				base: transport,
+				attempt: &upstreamAttempt{
+					server:  &s,
+					account: accounts.Account{ID: account.ID, Provider: requestProvider},
+				},
+			}
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
@@ -5481,6 +5491,16 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
 		return
 	}
+
+	// A WebSocket is one long-lived physical attempt on the selected account.
+	// Keep it in the same live-load signal as streaming HTTP until the
+	// connection ends. Broker leases are centrally selected and do not use the
+	// local SchedulerRef, so they stay outside this accounting.
+	releaseInflight := func() {}
+	if s.SchedulerRef != nil && s.CredentialBroker == nil {
+		releaseInflight = s.SchedulerRef.BeginInflight(schedulerAccountProvider(account.Provider), account.ID)
+	}
+	defer releaseInflight()
 
 	upstreamURL := cloneURL(r.URL)
 	upstreamURL.Scheme = websocketScheme(upstream.Scheme)
@@ -10527,7 +10547,9 @@ const (
 
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
-		return s.SchedulerRef.Get().WithLiveDebits(s.SchedulerRef.LiveDebits())
+		return s.SchedulerRef.Get().
+			WithLiveDebits(s.SchedulerRef.LiveDebits()).
+			WithInflightCounts(s.SchedulerRef.InflightCounts())
 	}
 	return s.Scheduler
 }
