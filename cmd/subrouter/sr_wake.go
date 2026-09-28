@@ -78,7 +78,7 @@ func (r srRunner) wake(args []string) error {
 		if err := cfg.SetEnabled(args[1], args[0] == "enable"); err != nil {
 			return err
 		}
-		fmt.Fprintf(r.out, "automatic %s auto-resume %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
+		fmt.Fprintf(r.out, "%s auto-resume %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
 		return nil
 	case "policy":
 		return updateWakePolicy(args[1:], r.out)
