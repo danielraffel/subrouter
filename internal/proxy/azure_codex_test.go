@@ -314,11 +314,8 @@ func TestAzureCodexFallbackResponseIsNotAttributedToPoolAccount(t *testing.T) {
 		server:     &server,
 		sessionKey: "codex\x00session-1",
 		accountID:  "pool@example.com",
-		replayBody: func() ([]byte, bool) {
-			return []byte(`{"model":"gpt-5.6-codex","input":[]}`), true
-		},
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{}`))
+	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{"model":"gpt-5.6-codex","input":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1469,7 +1466,6 @@ func TestAzureCodexStreamQuotaMarksTheAccountThatProducedTheResponse(t *testing.
 		server:     &server,
 		sessionKey: "codex\x00session-routed-quota",
 		accountID:  "initial-account",
-		replayBody: func() ([]byte, bool) { return body, true },
 	}
 
 	response, err := transport.RoundTrip(request)
@@ -1841,10 +1837,14 @@ func TestFailoverAfterSealedRepairKeepsRepairedBody(t *testing.T) {
 		t.Error("the request went to Azure instead of another pool account")
 	})
 	server := azureCodexFallbackServer(t, azureURL, poolURL, 2)
-	// Start on account 0 so the repair happens before the failover.
+	// Start on account 0 so the repair happens before the failover. Account 1
+	// sits below MinNewSessionHeadroom: at 0.5 both accounts shared the
+	// placement spread band and the first pick was random, so the request
+	// sometimes started on account 1 and never failed over. It is still a
+	// failover candidate.
 	server.Scheduler = selectacct.NewScheduler([]selectacct.Score{
 		{AccountID: "codex-account-0", Headroom: 1, ShortHeadroom: 1},
-		{AccountID: "codex-account-1", Headroom: 0.5, ShortHeadroom: 0.5},
+		{AccountID: "codex-account-1", Headroom: 0.2, ShortHeadroom: 0.2},
 	})
 	proxy := httptest.NewServer(server.Handler())
 	defer proxy.Close()
