@@ -5,7 +5,7 @@
 ## Completed or verified
 
 - **Claude session self-healing:** PR #361 branch `feat/claude-session-self-heal`
-  is pushed at `0283cca8`. It contains durable quota alarms, exact cmux
+  is pushed at `25a64528`. It contains durable quota alarms, exact cmux
   session/surface binding, early reset detection, and bounded resume dispatch.
   The full Go suite passes locally. Merge and live deployment are still
   separate gates and are not claimed here.
