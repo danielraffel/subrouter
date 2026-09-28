@@ -50,6 +50,42 @@ func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 	}
 }
 
+func TestSyncRecoveryAlarmsUsesGoalResumeForCodexQuota(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", stateRoot)
+	now := time.Now().UTC().Truncate(time.Second)
+	sessionID := "codex-quota-session"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_subrouter/recovery-status" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]recoveryWireState{{Agent: "codex", SessionID: sessionID, Kind: wake.KindCodexQuota, LastActivityAt: now.Add(-time.Minute), LastFailureAt: now.Add(-time.Minute), ResetAt: now.Add(time.Minute)}})
+	}))
+	defer server.Close()
+	cmux := filepath.Join(stateRoot, "cmux-fake")
+	sessions := `{"sessions":[{"agent":"codex","session_id":"` + sessionID + `","surface_id":"surface-codex","updated_at":"` + now.Format(time.RFC3339) + `"}]}`
+	script := "#!/bin/sh\nif [ \"$1\" = sessions ]; then printf '%s'; else printf 'prompt'; fi\n"
+	script = strings.Replace(script, "%s", sessions, 1)
+	if err := os.WriteFile(cmux, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := wake.NewStore(filepath.Join(storepath.StateDir(), "wake.json"))
+	if err := wake.NewConfig(filepath.Join(storepath.StateDir(), "wake-config.json")).SetEnabled("codex", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now.Add(-time.Minute), true); err != nil {
+		t.Fatal(err)
+	}
+	alarms, err := store.List(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 1 || alarms[0].Action != "/goal resume" {
+		t.Fatalf("alarms=%+v", alarms)
+	}
+}
+
 func TestSyncRecoveryAlarmsDoesNotEnqueueWhenDisabled(t *testing.T) {
 	stateRoot := t.TempDir()
 	t.Setenv("SUBROUTER_STATE_DIR", stateRoot)

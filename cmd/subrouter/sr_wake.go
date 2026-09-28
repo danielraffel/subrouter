@@ -547,8 +547,13 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 			wakeAt = state.ResetAt.Add(2 * time.Minute)
 		}
 		action := "continue"
-		if state.Agent == "codex" && state.Kind == wake.KindCodexProvider {
+		if state.Agent == "codex" {
+			// Codex exposes /goal resume as the interactive recovery command.
+			// Keep Claude's supported `continue` action unchanged; Codex quota
+			// and provider alarms both need the Codex action by default.
 			action = "/goal resume"
+		}
+		if state.Agent == "codex" && state.Kind == wake.KindCodexProvider {
 			policy := wake.DefaultGoalResumePolicy()
 			if configured, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Policy("codex"); err == nil {
 				policy.AllowContinue = configured.AllowContinue
