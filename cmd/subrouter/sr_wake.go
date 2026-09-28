@@ -78,7 +78,7 @@ func (r srRunner) wake(args []string) error {
 		if err := cfg.SetEnabled(args[1], args[0] == "enable"); err != nil {
 			return err
 		}
-		fmt.Fprintf(r.out, "automatic %s recovery %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
+		fmt.Fprintf(r.out, "automatic %s auto-resume %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
 		return nil
 	case "policy":
 		return updateWakePolicy(args[1:], r.out)
@@ -99,7 +99,7 @@ func (r srRunner) wake(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(r.out, "early recovery for %s: %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[early])
+		fmt.Fprintf(r.out, "early auto-resume for %s: %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[early])
 		return nil
 	default:
 		return fmt.Errorf("unknown wake command %q", args[0])
@@ -311,7 +311,7 @@ func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte
 		if lastReadinessCheck.IsZero() || time.Since(lastReadinessCheck) >= time.Minute {
 			lastReadinessCheck = time.Now()
 			if err := accelerateRecoveredQuotaAlarms(store, serverURL, lastReadinessCheck); err != nil {
-				fmt.Fprintf(out, "wake worker early recovery: %v\n", err)
+				fmt.Fprintf(out, "wake worker early auto-resume: %v\n", err)
 			}
 		}
 		return dispatchDueWakeAlarms(store, serverURL, cmuxPath, spacing, startedAt, out)
@@ -510,7 +510,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 			return err
 		}
 		if !enabled {
-			// Disabled automatic recovery must not enqueue alarms that wait for
+			// Disabled auto-resume must not enqueue alarms that wait for
 			// a later enable. Explicit schedule commands remain usable.
 			continue
 		}

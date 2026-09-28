@@ -1,7 +1,11 @@
-# Quota wake alarms
+# Subrouter auto-resume alarms
 
-`sr wake` is the local control surface for quota-triggered agent resumes. The
-alarm store, policy commands, proxy handoff, automatic scheduling, and the
+The `sr wake` command is the local control surface for automatic agent resumes. The
+name is retained because this feature schedules durable wake alarms; the user-
+facing behavior is auto-resume after a quota reset or temporary provider
+capacity failure.
+
+The worker, alarm store, policy commands, proxy handoff, automatic scheduling, and the
 launchd worker are available on this branch. Fleet enablement remains an
 explicit rollout step after the upgraded proxy is deployed.
 It is disabled by default and must be enabled independently for Codex and
@@ -57,8 +61,8 @@ reset credit or a service-side early reset. It does not accelerate other agents,
 other model pools, provider-capacity alarms, manual alarms, or cancelled alarms.
 It requires a subscription usage measurement newer than the failure. Cached
 pre-failure windows, stale last-good usage, and paid extra-usage-only windows
-cannot prove recovery. Automatic recovery
-must still be enabled for the agent. Early wake is on by default and can be
+cannot prove recovery. Auto-resume must still be enabled for the agent. Early
+auto-resume is on by default and can be
 disabled per agent with `sr wake early codex disable` or `sr wake early claude
 disable`; `enable` restores the default. The scheduled reset time remains the
 fallback if no fresh recovery is observed.
@@ -88,8 +92,8 @@ permissions and remains disabled until changed.
 
 ## Configuration and controls
 
-Automatic recovery is disabled by default for each agent. Early wake is enabled
-by default for both agents, but only has an effect when automatic recovery is
+Auto-resume is disabled by default for each agent. Early auto-resume is enabled
+by default for both agents, but only has an effect when auto-resume is
 enabled. Settings persist in the local `wake-config.json` state file.
 
 Controls are:
