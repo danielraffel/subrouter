@@ -7,8 +7,10 @@
 - **Claude session self-healing:** PR #361 branch `feat/claude-session-self-heal`
   is pushed at `25a64528`. It contains durable quota alarms, exact cmux
   session/surface binding, early reset detection, and bounded resume dispatch.
-  The full Go suite passes locally. Merge and live deployment are still
-  separate gates and are not claimed here.
+  The full Go suite passes locally. The public PR page still reports the PR as
+  open and Draft; four pre-merge checks pass, while docstring coverage is a
+  warning at 40% versus the configured 80% threshold. Merge and live
+  deployment are still separate gates and are not claimed here.
 - **Codex stale-account refresh failover:** current `origin/main` already
   contains the OAuth refresh change that retries an untried Codex account even
   when its usage score is stale or unavailable. The regression test
