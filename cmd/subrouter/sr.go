@@ -1404,6 +1404,10 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	switch config.EffectiveCredentialSource() {
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
+	case broker.CredentialSourceHosted:
+		if !explicitLocalServerTarget() {
+			return r.cloudStatus(ctx)
+		}
 	case broker.CredentialSourceLegacy:
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
