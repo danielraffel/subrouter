@@ -9196,6 +9196,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	overloadRerouted, quotaFailedOver := false, false
 	claudeExtraUsageRetried := false
 	sealedStripped := false
+	// replayReq is what later attempts rebuild from. It starts as the client's
+	// request and becomes the stripped one once sealed reasoning is dropped,
+	// so a failover that re-reads the body does not send the unreadable blob
+	// again (a 400 while healthy accounts remain). The same-account overload
+	// retry uses it too for consistency, though today it only runs for
+	// providers that never strip.
+	replayReq := req
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		response, err := base.RoundTrip(attemptReq)
 		response = tagRoutedResponseAccount(response, accounts.Account{
@@ -9296,7 +9303,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
 				return nil, sleepErr
 			}
-			body, bodyErr := req.GetBody()
+			body, bodyErr := replayReq.GetBody()
 			if bodyErr != nil {
 				return nil, bodyErr
 			}
@@ -9304,10 +9311,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// failover attemptReq carries that account's auth, and cloning from the
 			// original req would silently revert to the first account.
 			currentHeader := attemptReq.Header.Clone()
-			attemptReq = req.Clone(req.Context())
+			attemptReq = replayReq.Clone(req.Context())
 			attemptReq.Body = body
-			attemptReq.GetBody = req.GetBody
-			attemptReq.ContentLength = req.ContentLength
+			attemptReq.GetBody = replayReq.GetBody
+			attemptReq.ContentLength = replayReq.ContentLength
 			attemptReq.Header = currentHeader
 			attempt-- // retry the same account without spending a failover slot
 			continue
@@ -9351,6 +9358,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						return response, nil
 					}
 					attemptReq = retryReq
+					replayReq = retryReq
 					attempt--
 					continue
 				}
@@ -9481,7 +9489,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			t.logClaudeFailoverExhausted(response, accountID, "no_alternate_account", attempt, maxAttempts, len(tried))
 			return response, nil
 		}
-		body, bodyErr := req.GetBody()
+		body, bodyErr := replayReq.GetBody()
 		if bodyErr != nil {
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry could not replay request body", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", bodyErr)
@@ -9514,10 +9522,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if t.server != nil && t.server.SchedulerRef != nil {
 			t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
 		}
-		attemptReq = req.Clone(req.Context())
+		attemptReq = replayReq.Clone(req.Context())
 		attemptReq.Body = body
-		attemptReq.GetBody = req.GetBody
-		attemptReq.ContentLength = req.ContentLength
+		attemptReq.GetBody = replayReq.GetBody
+		attemptReq.ContentLength = replayReq.ContentLength
 		// A provider may route API-key and subscription credentials to different
 		// hosts (Grok does). Rebuild the target from the replacement account so a
 		// mixed-auth failover never sends a credential to the previous account's
