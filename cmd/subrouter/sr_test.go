@@ -969,6 +969,7 @@ func TestAutoImportIfEmptySkipsProviderOnlyOAuthInstallations(t *testing.T) {
 func TestAutoImportIfEmptyDoesNotPublishMissingActiveCodexAuth(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex-home"))
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
 	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	var out bytes.Buffer
@@ -2849,6 +2850,7 @@ func TestSRTraceShowsOAuthBreadcrumbs(t *testing.T) {
 func TestSRSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := accounts.DefaultCodexStore()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
 		Email:   "apikey:paid",
@@ -2977,6 +2979,7 @@ func TestSRSwitchPublishesOAuthIsolationDowngradeToRunningServer(t *testing.T) {
 func TestSRSwitchDoesNotWriteActiveAuthOrDowngradeWhenPublicationFails(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := accounts.DefaultCodexStore()
 	account := accounts.StoredCodexAccount{
 		Email:                 "isolated@example.test",
@@ -3994,8 +3997,8 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 			windows: []accounts.UsageWindow{
 				{Name: "primary", UsedPercent: 55, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Hour / time.Second)},
 				{Name: "secondary", UsedPercent: 20, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((4 * 24 * time.Hour) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 8, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((30 * time.Minute) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((6 * 24 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 8, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((30 * time.Minute) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((6 * 24 * time.Hour) / time.Second)},
 			},
 			credits:            &accounts.CreditsInfo{Balance: "0"},
 			complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Consumed: true},
@@ -4003,8 +4006,11 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	}, true)
 
 	got := out.String()
-	if !strings.Contains(got, "Account") || !strings.Contains(got, "Spark wk") || !strings.Contains(got, "1x reset") {
+	if !strings.Contains(got, "Account") || !strings.Contains(got, "1x reset") {
 		t.Fatalf("grid header missing:\n%s", got)
+	}
+	if strings.Contains(got, "Spark") {
+		t.Fatalf("grid should not render retired Spark columns:\n%s", got)
 	}
 	if !strings.Contains(got, "lawrence@cmux.com") || !strings.Contains(got, "active rec") || !strings.Contains(got, "used") {
 		t.Fatalf("grid row missing state:\n%s", got)
@@ -4501,8 +4507,8 @@ func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {
 			windows: []accounts.UsageWindow{
 				{Name: "primary", UsedPercent: 4, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Minute / time.Second)},
 				{Name: "secondary", UsedPercent: 33, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 0, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 0, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 0, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 0, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 			},
 			credits: &accounts.CreditsInfo{Balance: "0"},
 		},
@@ -4587,41 +4593,32 @@ func TestUsageGridSuppressesShortWindowsByQuotaFamily(t *testing.T) {
 	windows := []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
 		{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}
 	cooked := srUsageRow{cooked: true, windows: windows}
 	if cell := usageGridShortWindowCell(cooked); cell.Text != "" {
 		t.Fatalf("short window cell = %q, want blank when general weekly quota is cooked", cell.Text)
 	}
-	if cell := usageGridShortNamedWindowCell(cooked); cell.Text == "" {
-		t.Fatal("Spark short window should remain visible when only general weekly quota is cooked")
-	}
 
 	tempCooked := srUsageRow{tempCooked: true, windows: []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
 		{Name: "secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}}
 	if cell := usageGridShortWindowCell(tempCooked); cell.Text == "" {
 		t.Fatal("temporarily cooked row should still show the short window")
-	}
-	if cell := usageGridShortNamedWindowCell(tempCooked); cell.Text == "" {
-		t.Fatal("temporarily cooked row should still show the short named window")
 	}
 
 	sparkWeeklyCooked := srUsageRow{cooked: true, windows: []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
 		{Name: "secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}}
 	if cell := usageGridShortWindowCell(sparkWeeklyCooked); cell.Text == "" {
 		t.Fatal("general short window should remain visible when only Spark weekly quota is cooked")
-	}
-	if cell := usageGridShortNamedWindowCell(sparkWeeklyCooked); cell.Text != "" {
-		t.Fatalf("Spark short window cell = %q, want blank when Spark weekly quota is cooked", cell.Text)
 	}
 }
 
