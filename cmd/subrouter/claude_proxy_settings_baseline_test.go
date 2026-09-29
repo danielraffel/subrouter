@@ -16,6 +16,8 @@ const baselineUserSettings = `{
 		"allow": ["Bash(ls:*)", "Read(//tmp/**)"],
 		"deny": ["Bash(rm -rf:*)"],
 		"ask": ["Bash(git push:*)"],
+		"additionalDirectories": ["/work"],
+		"futureList": ["not-documented"],
 		"defaultMode": "acceptEdits"
 	},
 	"hooks": {
@@ -97,8 +99,13 @@ func TestSeedClaudeProxySettingsBaselineSeedsNewFolder(t *testing.T) {
 	if want := []string{"Bash(git push:*)"}; !reflect.DeepEqual(baselineStrings(t, permissions["ask"]), want) {
 		t.Fatalf("ask = %v", permissions["ask"])
 	}
-	if _, ok := permissions["defaultMode"]; ok {
-		t.Fatalf("single-valued permission setting copied: %v", permissions)
+	if want := []string{"/work"}; !reflect.DeepEqual(baselineStrings(t, permissions["additionalDirectories"]), want) {
+		t.Fatalf("additionalDirectories = %v", permissions["additionalDirectories"])
+	}
+	for _, key := range []string{"defaultMode", "futureList"} {
+		if _, ok := permissions[key]; ok {
+			t.Fatalf("permissions.%s copied; only the documented lists may be: %v", key, permissions)
+		}
 	}
 	hooks := got["hooks"].(map[string]any)
 	for _, event := range []string{"SessionStart", "PostToolUse"} {

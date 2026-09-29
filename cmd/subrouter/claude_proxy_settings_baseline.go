@@ -29,6 +29,10 @@ import (
 // overlay, because claudeProxyUserSettingsPath returns "" for it.
 var claudeProxySettingsBaselineKeys = []string{"permissions", "hooks"}
 
+// claudeProxyPermissionListKeys are the permissions lists that are unioned.
+// Any other key under permissions, list or not, stays the directory's own.
+var claudeProxyPermissionListKeys = []string{"allow", "deny", "ask", "additionalDirectories"}
+
 // seedClaudeProxySettingsBaseline merges the baseline keys of the user's
 // settings file into configDir/settings.json. A missing or unparsable user
 // file, or an unparsable proxy file, is left alone; errors are for logging
@@ -126,8 +130,8 @@ func mergeClaudePermissionLists(ownValue any, user map[string]any) (map[string]a
 		own = map[string]any{}
 	}
 	changed := false
-	for key, value := range user {
-		userList, ok := value.([]any)
+	for _, key := range claudeProxyPermissionListKeys {
+		userList, ok := user[key].([]any)
 		if !ok {
 			continue
 		}
