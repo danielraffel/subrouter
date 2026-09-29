@@ -74,16 +74,18 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status             Show usage across all configured providers (non-interactive)
-  sr wake list          List durable agent wake alarms
-  sr wake schedule ...  Schedule a quota/provider recovery wake alarm
-  sr wake now [agent]   Make scheduled alarms eligible immediately
-  sr wake cancel ...    Cancel one alarm, an agent's alarms, or all alarms
-  sr wake worker        Run the singleton cmux wake worker (--once for a pass)
-  sr wake install       Install and bootstrap the reboot-surviving launchd worker
-  sr wake uninstall     Stop and remove the launchd worker
-  sr wake policy <agent> Configure bounded Codex replay/fallback policy
-  sr wake early <agent> enable|disable  Advance matching quota alarms on fresh recovery (default on)
-  sr wake enable|disable <codex|claude>
+  sr auto-resume status Show agent flags, worker state, and pending alarms
+  sr auto-resume ...    Configure and run the auto-resume worker
+  sr wake ...           Backward-compatible alias for sr auto-resume
+  sr auto-resume schedule ...  Schedule a quota/provider recovery alarm
+  sr auto-resume now [agent]   Make scheduled alarms eligible immediately
+  sr auto-resume cancel ...    Cancel one alarm, an agent's alarms, or all alarms
+  sr auto-resume worker        Run the singleton cmux auto-resume worker (--once for a pass)
+  sr auto-resume install       Install and bootstrap the reboot-surviving launchd worker
+  sr auto-resume uninstall     Stop and remove the launchd worker
+  sr auto-resume policy <agent> Configure bounded Codex replay/fallback policy
+  sr auto-resume early <agent> enable|disable  Advance matching quota alarms on fresh recovery (default on)
+  sr auto-resume enable|disable <codex|claude>
                         Enable or disable automatic recovery for one agent
   sr sessions [--all] [--json]
                         List pooled Claude/Codex sessions, the account serving each
@@ -394,7 +396,7 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
-		case "wake":
+		case "wake", "auto-resume":
 			return r.wake(args[1:])
 		case "codex":
 			if isCodexAccountCommand(args) {
@@ -553,7 +555,7 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return r.remove(ctx, args[1])
 	case "status":
 		return r.status(ctx)
-	case "wake":
+	case "wake", "auto-resume":
 		return r.wake(args[1:])
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])

@@ -1,9 +1,9 @@
-# Subrouter auto-resume alarms
+# Subrouter auto-resume
 
-The `sr wake` command is the local control surface for automatic agent resumes. The
-name is retained because this feature schedules durable wake alarms; the user-
-facing behavior is auto-resume after a quota reset or temporary provider
-capacity failure.
+The `sr auto-resume` command is the local control surface for automatic agent
+resumes. `sr wake` remains a backward-compatible alias. The worker schedules
+durable alarms internally, but the user-facing behavior is auto-resume after a
+quota reset or temporary provider-capacity failure.
 
 The worker, alarm store, policy commands, proxy handoff, automatic scheduling, and the
 launchd worker are available on this branch. Fleet enablement remains an
@@ -38,11 +38,11 @@ The watcher validates the original machine, cmux surface, agent type, session
 ID, and active-writer state before sending the configured action. A mismatched
 or missing surface becomes `stale`; no replacement tab is selected.
 
-`sr wake worker` is the singleton shared watcher. It reads the proxy's
+`sr auto-resume worker` is the singleton shared watcher. It reads the proxy's
 classified `/_subrouter/recovery-status` handoff, resolves the saved cmux
 session with `cmux sessions --json`, validates the exact surface with
 `cmux read-screen`, and is the only process that sends the action. Install it
-across reboot with `sr wake install`; remove it with `sr wake uninstall`.
+across reboot with `sr auto-resume install`; remove it with `sr auto-resume uninstall`.
 The worker uses a 30-second deterministic per-alarm jitter and a five-second
 default spacing between sends; use `--interval` and `--spacing` to tune the
 monitor without changing alarm times.
@@ -63,7 +63,7 @@ It requires a subscription usage measurement newer than the failure. Cached
 pre-failure windows, stale last-good usage, and paid extra-usage-only windows
 cannot prove recovery. Auto-resume must still be enabled for the agent. Early
 auto-resume is on by default and can be
-disabled per agent with `sr wake early codex disable` or `sr wake early claude
+disabled per agent with `sr auto-resume early codex disable` or `sr auto-resume early claude
 disable`; `enable` restores the default. The scheduled reset time remains the
 fallback if no fresh recovery is observed.
 
@@ -86,7 +86,7 @@ after the configured failure threshold; otherwise the state becomes `stop`
 until a fresh provider event. This keeps repeated capacity failures from
 burning replay tokens.
 
-Enable the opt-in fallback explicitly with `sr wake policy codex
+Enable the opt-in fallback explicitly with `sr auto-resume policy codex
 --allow-continue --continue-after 2`. The policy is persisted with restrictive
 permissions and remains disabled until changed.
 
@@ -99,20 +99,21 @@ enabled. Settings persist in the local `wake-config.json` state file.
 Controls are:
 
 ```text
-sr wake list
-sr wake show <id>
-sr wake enable <claude|codex>
-sr wake disable <claude|codex>
-sr wake early <claude|codex> <enable|disable>
-sr wake update <id> --delay 5m --expires-in 2d4h15m
-sr wake now <claude|codex|all>
-sr wake cancel <id>
-sr wake cancel --agent <claude|codex>
-sr wake cancel --all
-sr wake worker --once
-sr wake install
-sr wake uninstall
-sr wake policy codex --no-continue --max-goal-attempts 2 --cooldown 1m
+sr auto-resume status
+sr auto-resume list
+sr auto-resume show <id>
+sr auto-resume enable <claude|codex>
+sr auto-resume disable <claude|codex>
+sr auto-resume early <claude|codex> <enable|disable>
+sr auto-resume update <id> --delay 5m --expires-in 2d4h15m
+sr auto-resume now <claude|codex|all>
+sr auto-resume cancel <id>
+sr auto-resume cancel --agent <claude|codex>
+sr auto-resume cancel --all
+sr auto-resume worker --once
+sr auto-resume install
+sr auto-resume uninstall
+sr auto-resume policy codex --no-continue --max-goal-attempts 2 --cooldown 1m
 ```
 
 Durations accept days, hours, and minutes (`2d4h15m`). They are converted to
@@ -121,7 +122,7 @@ absolute UTC timestamps when stored so alarms survive reboot. Each record has
 provider/model pool, action, launchd label, and status (`scheduled`, `fired`,
 `completed`, `stale`, `cancelled`, `expired`, or `failed`).
 
-`wake now` revalidates and dispatches existing alarms immediately. It uses the
+`auto-resume now` revalidates and dispatches existing alarms immediately. It uses the
 same writer checks and throttling as automatic dispatch, which makes it safe
 after a manual quota reset.
 
@@ -142,7 +143,7 @@ failover only and do not create long-lived alarms.
 
 - The watcher creates no automatic alarm while the agent setting is disabled.
   Explicit `wake schedule` alarms remain available for manual control, including
-  `wake now` and worker dispatch.
+  `auto-resume now` and worker dispatch.
 - A session fails over immediately before any alarm is created.
 - The alarm selects the earliest eligible account reset for the requested pool.
 - Reboot and sleep/wake preserve the alarm and its absolute timestamps.

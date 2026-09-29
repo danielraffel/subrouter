@@ -21,12 +21,14 @@ import (
 
 func (r srRunner) wake(args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprintln(r.out, "usage: sr wake list|show <id>|schedule [options]|now [codex|claude|all]|cancel <id>|cancel --agent <agent>|cancel --all|enable|disable <agent>|early <agent> <enable|disable>")
+		fmt.Fprintln(r.out, "usage: sr auto-resume status|list|show <id>|schedule [options]|now [codex|claude|all]|cancel <id>|cancel --agent <agent>|cancel --all|enable|disable <agent>|early <agent> <enable|disable>")
 		return nil
 	}
 	store := wake.NewStore(storepath.StateDir() + "/wake.json")
 	now := time.Now().UTC()
 	switch args[0] {
+	case "status":
+		return autoResumeStatus(store, r.out)
 	case "list":
 		alarms, err := store.List(now)
 		if err != nil {
@@ -78,6 +80,11 @@ func (r srRunner) wake(args []string) error {
 		if err := cfg.SetEnabled(args[1], args[0] == "enable"); err != nil {
 			return err
 		}
+		if args[0] == "enable" {
+			if err := ensureWakeLaunchd(r.out); err != nil {
+				return err
+			}
+		}
 		fmt.Fprintf(r.out, "%s auto-resume %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
 		return nil
 	case "policy":
@@ -104,6 +111,32 @@ func (r srRunner) wake(args []string) error {
 	default:
 		return fmt.Errorf("unknown wake command %q", args[0])
 	}
+}
+
+func autoResumeStatus(store *wake.Store, out interface{ Write([]byte) (int, error) }) error {
+	cfg := wake.NewConfig(storepath.StateDir() + "/wake-config.json")
+	for _, agent := range []string{"claude", "codex"} {
+		enabled, err := cfg.Enabled(agent)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "%s auto-resume: %s\n", agent, map[bool]string{true: "enabled", false: "disabled"}[enabled])
+	}
+	alarms, err := store.List(time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	scheduled := 0
+	for _, alarm := range alarms {
+		if alarm.Status == wake.StatusScheduled || alarm.Status == wake.StatusFired {
+			scheduled++
+		}
+	}
+	uid := strconv.Itoa(os.Getuid())
+	worker := exec.Command("launchctl", "print", "gui/"+uid+"/"+wakeLaunchdLabel).Run() == nil
+	fmt.Fprintf(out, "worker: %s\n", map[bool]string{true: "running", false: "not running"}[worker])
+	fmt.Fprintf(out, "alarms: %d scheduled or firing\n", scheduled)
+	return nil
 }
 
 func printLocalWakeSummary(out interface{ Write([]byte) (int, error) }, serverURL string) {
@@ -222,6 +255,14 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	}
 	fmt.Fprintf(out, "installed %s\n", path)
 	return nil
+}
+
+func ensureWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
+	uid := strconv.Itoa(os.Getuid())
+	if exec.Command("launchctl", "print", "gui/"+uid+"/"+wakeLaunchdLabel).Run() == nil {
+		return nil
+	}
+	return installWakeLaunchd(out)
 }
 
 func wakeLaunchdPlist(executable, stateDir, logDir, cmuxPath string) string {
