@@ -50,6 +50,17 @@ func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 	}
 }
 
+func TestResumeActionForSurfaceChoosesGoalOrRegularSession(t *testing.T) {
+	if got := resumeActionForSurface("ready for the next prompt"); got != "continue" {
+		t.Fatalf("regular session action=%q, want continue", got)
+	}
+	for _, screen := range []string{"Goal paused", "Goal stalled (/goal resume)", "pursuing goal (idle)"} {
+		if got := resumeActionForSurface(screen); got != "/goal resume" {
+			t.Fatalf("screen %q action=%q, want /goal resume", screen, got)
+		}
+	}
+}
+
 func TestSyncRecoveryAlarmsUsesGoalResumeForCodexQuota(t *testing.T) {
 	stateRoot := t.TempDir()
 	t.Setenv("SUBROUTER_STATE_DIR", stateRoot)
@@ -65,7 +76,7 @@ func TestSyncRecoveryAlarmsUsesGoalResumeForCodexQuota(t *testing.T) {
 	defer server.Close()
 	cmux := filepath.Join(stateRoot, "cmux-fake")
 	sessions := `{"sessions":[{"agent":"codex","session_id":"` + sessionID + `","surface_id":"surface-codex","updated_at":"` + now.Format(time.RFC3339) + `"}]}`
-	script := "#!/bin/sh\nif [ \"$1\" = sessions ]; then printf '%s'; else printf 'prompt'; fi\n"
+	script := "#!/bin/sh\nif [ \"$1\" = sessions ]; then printf '%s'; else printf 'Goal stalled (/goal resume)'; fi\n"
 	script = strings.Replace(script, "%s", sessions, 1)
 	if err := os.WriteFile(cmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)

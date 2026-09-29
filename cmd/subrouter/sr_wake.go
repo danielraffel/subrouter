@@ -601,13 +601,11 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 		if state.ResetAt.After(wakeAt) {
 			wakeAt = state.ResetAt.Add(2 * time.Minute)
 		}
-		action := "continue"
-		if state.Agent == "codex" {
-			// Codex exposes /goal resume as the interactive recovery command.
-			// Keep Claude's supported `continue` action unchanged; Codex quota
-			// and provider alarms both need the Codex action by default.
-			action = "/goal resume"
+		screen, err := readSurface(cmuxPath, matched.SurfaceID)
+		if err != nil {
+			continue
 		}
+		action := resumeActionForSurface(screen)
 		if state.Agent == "codex" && state.Kind == wake.KindCodexProvider {
 			policy := wake.DefaultGoalResumePolicy()
 			if configured, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Policy("codex"); err == nil {
@@ -629,6 +627,13 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 				}
 			case wake.ResumeContinue:
 				action = "continue"
+			case wake.ResumeGoal:
+				// Preserve the session-aware choice. A regular session must not
+				// receive a goal-only command just because the provider policy
+				// selected its goal-replay branch.
+				if resumeActionForSurface(screen) == "/goal resume" {
+					action = "/goal resume"
+				}
 			}
 			wakeAt = state.LastFailureAt.Add(policy.CooldownFor(state.Failures))
 		}
@@ -793,18 +798,34 @@ func alarmDueAt(alarm wake.Alarm) time.Time {
 	return alarm.WakeAt.Add(time.Duration(n%uint64(alarm.JitterSeconds+1)) * time.Second)
 }
 
-func validateSurface(cmuxPath, surface string) error {
+func readSurface(cmuxPath, surface string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cmuxPath, "read-screen", "--surface", surface, "--lines", "80")
 	body, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("surface validation failed: %w", err)
+		return "", fmt.Errorf("surface validation failed: %w", err)
 	}
-	if len(strings.TrimSpace(string(body))) == 0 {
-		return fmt.Errorf("surface validation returned an empty screen")
+	screen := strings.TrimSpace(string(body))
+	if screen == "" {
+		return "", fmt.Errorf("surface validation returned an empty screen")
 	}
-	return nil
+	return screen, nil
+}
+
+func validateSurface(cmuxPath, surface string) error {
+	_, err := readSurface(cmuxPath, surface)
+	return err
+}
+
+func resumeActionForSurface(screen string) string {
+	lower := strings.ToLower(screen)
+	for _, marker := range []string{"goal paused", "goal stalled", "pursuing goal"} {
+		if strings.Contains(lower, marker) {
+			return "/goal resume"
+		}
+	}
+	return "continue"
 }
 
 func updateWake(store *wake.Store, args []string, now time.Time, out interface{ Write([]byte) (int, error) }) error {
