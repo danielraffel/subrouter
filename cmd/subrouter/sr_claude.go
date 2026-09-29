@@ -786,6 +786,9 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
 		slog.Warn("share Claude user config with proxy config", "error", err)
 	}
+	if err := seedClaudeProxySettingsBaseline(claudeProxyUserSettingsPath(storeDir), configDir); err != nil {
+		slog.Warn("seed Claude proxy settings with the user's permissions and hooks", "error", err)
+	}
 	shareClaudeProxyProjectTrust(configDir, storeDir)
 	return nil
 }
