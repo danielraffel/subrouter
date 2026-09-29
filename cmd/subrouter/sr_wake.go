@@ -84,6 +84,20 @@ func (r srRunner) wake(args []string) error {
 			if err := ensureWakeLaunchd(r.out); err != nil {
 				return err
 			}
+		} else {
+			claudeEnabled, err := cfg.Enabled("claude")
+			if err != nil {
+				return err
+			}
+			codexEnabled, err := cfg.Enabled("codex")
+			if err != nil {
+				return err
+			}
+			if !claudeEnabled && !codexEnabled {
+				if err := uninstallWakeLaunchd(r.out); err != nil {
+					return err
+				}
+			}
 		}
 		fmt.Fprintf(r.out, "%s auto-resume %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
 		return nil
