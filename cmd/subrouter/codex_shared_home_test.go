@@ -434,7 +434,7 @@ func TestPrepareCodexSharedHomeLinksAndRefreshes(t *testing.T) {
 	}
 }
 
-func TestCodexBareLaunchUsesSharedHomeWithoutConfigOverrides(t *testing.T) {
+func TestCodexBareLaunchUsesSharedHomeWithRecoveryOverrides(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(home, ".subrouter"))
@@ -479,6 +479,25 @@ func TestCodexBareLaunchUsesSharedHomeWithoutConfigOverrides(t *testing.T) {
 	config, _ := os.ReadFile(filepath.Join(shared, "config.toml"))
 	if !strings.Contains(string(config), `base_url = "`+upstream.URL+`/v1"`) {
 		t.Fatalf("shared config lacks the resolved server:\n%s", config)
+	}
+	if !strings.Contains(string(config), `X-Subrouter-Capacity-Retry = "persist"`) ||
+		!strings.Contains(string(config), `X-Subrouter-Capacity-Retryable = "1"`) ||
+		!strings.Contains(string(config), "request_max_retries = 100") ||
+		!strings.Contains(string(config), "stream_max_retries = 100") ||
+		!strings.Contains(string(config), "goals = true") {
+		t.Fatalf("shared config lacks recovery settings:\n%s", config)
+	}
+
+	if err := codex([]string{"--no-goal-resume", "fix"}); err != nil {
+		t.Fatal(err)
+	}
+	body, _ = os.ReadFile(record)
+	if got := string(body); got != "args:fix\nhome:"+shared+"\n" {
+		t.Fatalf("shared opt-out launch = %q", got)
+	}
+	config, _ = os.ReadFile(filepath.Join(shared, "config.toml"))
+	if strings.Contains(string(config), `X-Subrouter-Capacity-Retryable = "1"`) || strings.Contains(string(config), "request_max_retries = 100") {
+		t.Fatalf("shared opt-out retains recovery settings:\n%s", config)
 	}
 
 	if err := codex([]string{"-m", "gpt-5", "fix"}); err != nil {

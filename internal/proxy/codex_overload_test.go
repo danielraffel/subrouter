@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -614,5 +615,17 @@ func TestCodexEgressReplaysJSONCapacityBody(t *testing.T) {
 	status, body := codexEgressPost(t, proxy.URL, "session-json")
 	if status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
 		t.Fatalf("status=%d body=%s, want the egress to serve after a JSON capacity body", status, body)
+	}
+}
+
+func TestCodexRetryableCapacityWebSocketRerouteUsesBudget(t *testing.T) {
+	server := Server{codexOverloadRerouteCounts: newCodexOverloadReroutes()}
+	for i := 0; i < codexOverloadMaxWebSocketReroutes; i++ {
+		if !server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+			t.Fatalf("retryable reroute %d refused inside budget", i+1)
+		}
+	}
+	if server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+		t.Fatal("retryable reroute allowed past budget")
 	}
 }

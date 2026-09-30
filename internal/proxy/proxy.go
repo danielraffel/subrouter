@@ -5999,10 +5999,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 							return errAzureCodexWebSocketDivert
 						}
 					}
-					if modelState.capacityRetryable && codexCapacityFailureJSON(body) {
-						if modelState.capacityPersist {
-							_ = codexSleepContext(ctx, s.CodexOverloadFailover.persistDelay())
-						}
+					if modelState.capacityRetryable && codexCapacityFailureJSON(body) && s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
 						return errCodexWebSocketCapacityRetry
 					}
 				}
