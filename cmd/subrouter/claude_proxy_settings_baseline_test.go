@@ -260,3 +260,83 @@ func TestPrepareClaudeProxySharedStateSeedsBaselineAndHonoursOptOut(t *testing.T
 		t.Fatalf("hermetic store seeded from the user's home: %v", err)
 	}
 }
+
+// A rule the user deletes from their own file stops applying in pooled
+// sessions, an edited hook replaces the old one, and anything Claude saved
+// into the proxy directory itself survives.
+func TestSeedClaudeProxySettingsBaselineRevokesWhatTheUserRemoves(t *testing.T) {
+	root := t.TempDir()
+	userPath := filepath.Join(root, "user", "settings.json")
+	configDir := filepath.Join(root, "proxy")
+	proxyPath := filepath.Join(configDir, "settings.json")
+	writeBaselineFile(t, userPath, `{
+		"permissions": {"allow": ["Bash(ls:*)", "Bash(cat:*)"]},
+		"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "old.sh"}]}]}
+	}`)
+	// Claude saved this rule from inside a pooled session.
+	writeBaselineFile(t, proxyPath, `{"permissions": {"allow": ["Bash(make:*)"]}}`)
+	if err := seedClaudeProxySettingsBaseline(userPath, configDir); err != nil {
+		t.Fatal(err)
+	}
+	if got := baselineStrings(t, readBaselineFile(t, proxyPath)["permissions"].(map[string]any)["allow"]); !reflect.DeepEqual(got, []string{"Bash(make:*)", "Bash(ls:*)", "Bash(cat:*)"}) {
+		t.Fatalf("first seed allow = %v", got)
+	}
+
+	writeBaselineFile(t, userPath, `{
+		"permissions": {"allow": ["Bash(ls:*)"]},
+		"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "new.sh"}]}]}
+	}`)
+	if err := seedClaudeProxySettingsBaseline(userPath, configDir); err != nil {
+		t.Fatal(err)
+	}
+	settings := readBaselineFile(t, proxyPath)
+	if got := baselineStrings(t, settings["permissions"].(map[string]any)["allow"]); !reflect.DeepEqual(got, []string{"Bash(make:*)", "Bash(ls:*)"}) {
+		t.Fatalf("revoked rule still allowed or Claude's own rule lost: %v", got)
+	}
+	stop, _ := json.Marshal(settings["hooks"].(map[string]any)["Stop"])
+	if strings.Contains(string(stop), "old.sh") || !strings.Contains(string(stop), "new.sh") {
+		t.Fatalf("edited hook not replaced: %s", stop)
+	}
+
+	// Removing every rule and hook from the user file clears what sr seeded.
+	writeBaselineFile(t, userPath, `{"theme": "dark"}`)
+	if err := seedClaudeProxySettingsBaseline(userPath, configDir); err != nil {
+		t.Fatal(err)
+	}
+	settings = readBaselineFile(t, proxyPath)
+	if got := baselineStrings(t, settings["permissions"].(map[string]any)["allow"]); !reflect.DeepEqual(got, []string{"Bash(make:*)"}) {
+		t.Fatalf("allow after user cleared it = %v", got)
+	}
+	if hooks, ok := settings["hooks"].(map[string]any); ok && len(hooks) > 0 {
+		t.Fatalf("seeded hooks left behind: %v", hooks)
+	}
+	if _, err := os.Stat(claudeProxySeededSettingsPath(configDir)); !os.IsNotExist(err) {
+		t.Fatalf("empty seeded record should be removed, stat err = %v", err)
+	}
+}
+
+// Without a record of what sr seeded, nothing is removed: a directory set up
+// by an older sr keeps every entry until sr has seeded it itself.
+func TestSeedClaudeProxySettingsBaselineRemovesOnlyRecordedEntries(t *testing.T) {
+	root := t.TempDir()
+	userPath := filepath.Join(root, "user", "settings.json")
+	configDir := filepath.Join(root, "proxy")
+	proxyPath := filepath.Join(configDir, "settings.json")
+	writeBaselineFile(t, userPath, `{"permissions": {"allow": ["Bash(ls:*)"]}}`)
+	writeBaselineFile(t, proxyPath, `{"permissions": {"allow": ["Bash(ls:*)", "Bash(old:*)"]}}`)
+	if err := seedClaudeProxySettingsBaseline(userPath, configDir); err != nil {
+		t.Fatal(err)
+	}
+	if got := baselineStrings(t, readBaselineFile(t, proxyPath)["permissions"].(map[string]any)["allow"]); !reflect.DeepEqual(got, []string{"Bash(ls:*)", "Bash(old:*)"}) {
+		t.Fatalf("unrecorded entries changed: %v", got)
+	}
+	// An entry the directory already had is not sr's, so dropping it from
+	// the user file later leaves it in place.
+	writeBaselineFile(t, userPath, `{"permissions": {"allow": []}}`)
+	if err := seedClaudeProxySettingsBaseline(userPath, configDir); err != nil {
+		t.Fatal(err)
+	}
+	if got := baselineStrings(t, readBaselineFile(t, proxyPath)["permissions"].(map[string]any)["allow"]); !reflect.DeepEqual(got, []string{"Bash(ls:*)", "Bash(old:*)"}) {
+		t.Fatalf("pre-existing entry removed: %v", got)
+	}
+}

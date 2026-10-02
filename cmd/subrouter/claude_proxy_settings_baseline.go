@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/fsutil"
@@ -18,10 +19,14 @@ import (
 // permission rules and hooks: a new directory starts with them, and an
 // existing one gains any it is missing each time sr prepares it.
 //
-// The merge only adds. Rule lists and hook groups are unioned without
-// duplicates, entries the directory already has are never removed, and every
-// other key (theme, autoMode, a /config change made inside a pooled session)
-// is left exactly as the directory has it. Only permissions and hooks are
+// Rule lists and hook groups are unioned without duplicates. sr records each
+// entry it adds in a sidecar file next to the proxy settings, so an entry the
+// user later deletes from their own file, or a hook command they edit, is
+// removed from the directory too: otherwise a revoked allow rule would keep
+// working in pooled sessions with no file the user owns to revoke it from.
+// Entries the directory had for any other reason (Claude saving a rule from
+// a pooled session) are never removed, and every other key (theme, autoMode,
+// a /config change) is left exactly as the directory has it. Only permissions and hooks are
 // copied: they hold no credentials, and keys that could substitute a
 // credential source never leave the user's file.
 //
@@ -47,15 +52,15 @@ func seedClaudeProxySettingsBaseline(userSettingsPath, configDir string) error {
 	}
 	user, ok := readClaudeSettingsObject(userSettingsPath)
 	if !ok {
+		// Missing or mid-edit: revoking everything sr seeded because the
+		// user's file is briefly unreadable would be worse than waiting.
 		return nil
 	}
-	baseline := map[string]any{}
-	for _, key := range claudeProxySettingsBaselineKeys {
-		if value, ok := user[key].(map[string]any); ok && len(value) > 0 {
-			baseline[key] = value
-		}
-	}
-	if len(baseline) == 0 {
+	seededPath := claudeProxySeededSettingsPath(configDir)
+	seeded := readClaudeProxySeeded(seededPath)
+	userPermissions, _ := user["permissions"].(map[string]any)
+	userHooks, _ := user["hooks"].(map[string]any)
+	if len(userPermissions) == 0 && len(userHooks) == 0 && seeded.empty() {
 		return nil
 	}
 	// A dotfile manager may link the file elsewhere; write through the link.
@@ -86,42 +91,45 @@ func seedClaudeProxySettingsBaseline(userSettingsPath, configDir string) error {
 	if own == nil {
 		own = map[string]any{}
 	}
+	next := claudeProxySeeded{Permissions: map[string][]string{}, Hooks: map[string][]string{}}
 	changed := false
-	if user, ok := baseline["permissions"].(map[string]any); ok {
-		if merged, ok := mergeClaudePermissionLists(own["permissions"], user); ok {
-			own["permissions"] = merged
-			changed = true
+	if merged, ok := reconcileClaudeProxyLists(own["permissions"], userPermissions, claudeProxyPermissionListKeys, seeded.Permissions, next.Permissions); ok {
+		own["permissions"] = merged
+		changed = true
+	}
+	if merged, ok := reconcileClaudeProxyLists(own["hooks"], userHooks, nil, seeded.Hooks, next.Hooks); ok {
+		own["hooks"] = merged
+		changed = true
+	}
+	if changed {
+		var out bytes.Buffer
+		encoder := json.NewEncoder(&out)
+		encoder.SetEscapeHTML(false) // hook commands keep their literal > and &
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(own); err != nil {
+			return err
+		}
+		mode := os.FileMode(0o600)
+		if statErr == nil {
+			mode = info.Mode().Perm()
+		}
+		if err := fsutil.WriteFileAtomic(proxySettingsPath, out.Bytes(), mode); err != nil {
+			return err
 		}
 	}
-	if user, ok := baseline["hooks"].(map[string]any); ok {
-		if merged, ok := mergeClaudeHookGroups(own["hooks"], user); ok {
-			own["hooks"] = merged
-			changed = true
-		}
+	if !next.equal(seeded) {
+		return writeClaudeProxySeeded(seededPath, next)
 	}
-	if !changed {
-		return nil
-	}
-	var out bytes.Buffer
-	encoder := json.NewEncoder(&out)
-	encoder.SetEscapeHTML(false) // hook commands keep their literal > and &
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(own); err != nil {
-		return err
-	}
-	mode := os.FileMode(0o600)
-	if statErr == nil {
-		mode = info.Mode().Perm()
-	}
-	return fsutil.WriteFileAtomic(proxySettingsPath, out.Bytes(), mode)
+	return nil
 }
 
-// mergeClaudePermissionLists unions each list the user's permissions block
-// has (allow, deny, ask, additionalDirectories) into the proxy's, keeping the
-// proxy's order and appending only missing entries. Single values such as
-// defaultMode stay the proxy's own. A proxy permissions value that is not an
-// object is left untouched. It reports whether anything was added.
-func mergeClaudePermissionLists(ownValue any, user map[string]any) (map[string]any, bool) {
+// reconcileClaudeProxyLists brings each named list of ownValue in line with
+// the user's: entries sr seeded that the user no longer has are removed, and
+// user entries the directory lacks are appended. keys limits which lists are
+// considered (nil means every list key either side names). It records in
+// nextSeeded the entries that are now present because sr put them there, and
+// reports whether ownValue changed. A non-object ownValue is left untouched.
+func reconcileClaudeProxyLists(ownValue any, user map[string]any, keys []string, seeded, nextSeeded map[string][]string) (map[string]any, bool) {
 	own, ok := ownValue.(map[string]any)
 	if ownValue != nil && !ok {
 		return nil, false
@@ -129,73 +137,145 @@ func mergeClaudePermissionLists(ownValue any, user map[string]any) (map[string]a
 	if own == nil {
 		own = map[string]any{}
 	}
-	changed := false
-	for _, key := range claudeProxyPermissionListKeys {
-		userList, ok := user[key].([]any)
-		if !ok {
-			continue
+	if keys == nil {
+		names := map[string]bool{}
+		for key := range user {
+			names[key] = true
 		}
+		for key := range seeded {
+			names[key] = true
+		}
+		for key := range names {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+	}
+	changed := false
+	for _, key := range keys {
+		userList, _ := user[key].([]any)
 		existing, ok := own[key].([]any)
 		if own[key] != nil && !ok {
 			continue
 		}
-		if merged, added := unionJSONList(existing, userList); added {
-			own[key] = merged
-			changed = true
+		merged, stillSeeded, listChanged := reconcileJSONList(existing, userList, seeded[key])
+		if len(stillSeeded) > 0 {
+			nextSeeded[key] = stillSeeded
 		}
+		if !listChanged {
+			continue
+		}
+		changed = true
+		if len(merged) == 0 && own[key] != nil && len(existing) > 0 && userList == nil {
+			delete(own, key)
+			continue
+		}
+		own[key] = merged
 	}
 	return own, changed
 }
 
-// mergeClaudeHookGroups unions the user's hook groups into the proxy's per
-// event. A group already present with identical content is not added again.
-func mergeClaudeHookGroups(ownValue any, user map[string]any) (map[string]any, bool) {
-	own, ok := ownValue.(map[string]any)
-	if ownValue != nil && !ok {
-		return nil, false
+// reconcileJSONList drops from base each entry sr seeded (seededKeys) that
+// user no longer holds, then appends each user entry base lacks. Entries are
+// compared as canonical JSON so object key order does not matter. It returns
+// the list, the canonical keys sr is now responsible for, and whether the
+// list changed.
+func reconcileJSONList(base, user []any, seededKeys []string) ([]any, []string, bool) {
+	wanted := make(map[string]bool, len(user))
+	for _, entry := range user {
+		if key, err := json.Marshal(entry); err == nil {
+			wanted[string(key)] = true
+		}
 	}
-	if own == nil {
-		own = map[string]any{}
+	wasSeeded := make(map[string]bool, len(seededKeys))
+	for _, key := range seededKeys {
+		wasSeeded[key] = true
 	}
 	changed := false
-	for event, value := range user {
-		userGroups, ok := value.([]any)
-		if !ok {
+	present := make(map[string]bool, len(base)+len(user))
+	out := make([]any, 0, len(base)+len(user))
+	var responsible []string
+	for _, entry := range base {
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			out = append(out, entry)
 			continue
 		}
-		existing, ok := own[event].([]any)
-		if own[event] != nil && !ok {
-			continue
-		}
-		if merged, added := unionJSONList(existing, userGroups); added {
-			own[event] = merged
+		key := string(raw)
+		if wasSeeded[key] && !wanted[key] {
 			changed = true
+			continue
 		}
+		if present[key] {
+			out = append(out, entry)
+			continue
+		}
+		present[key] = true
+		if wasSeeded[key] {
+			responsible = append(responsible, key)
+		}
+		out = append(out, entry)
 	}
-	return own, changed
+	for _, entry := range user {
+		raw, err := json.Marshal(entry)
+		if err != nil || present[string(raw)] {
+			continue
+		}
+		present[string(raw)] = true
+		responsible = append(responsible, string(raw))
+		out = append(out, entry)
+		changed = true
+	}
+	return out, responsible, changed
 }
 
-// unionJSONList appends each entry of extra that base does not already hold,
-// comparing canonical JSON so object key order does not matter.
-func unionJSONList(base, extra []any) ([]any, bool) {
-	seen := make(map[string]bool, len(base)+len(extra))
-	out := make([]any, 0, len(base)+len(extra))
-	for _, entry := range base {
-		key, err := json.Marshal(entry)
-		if err == nil {
-			seen[string(key)] = true
-		}
-		out = append(out, entry)
+// claudeProxySeededSettingsFile sits next to a proxy directory's
+// settings.json and lists, as canonical JSON, each entry sr seeded there.
+const claudeProxySeededSettingsFile = "settings.subrouter-seeded.json"
+
+type claudeProxySeeded struct {
+	Permissions map[string][]string `json:"permissions,omitempty"`
+	Hooks       map[string][]string `json:"hooks,omitempty"`
+}
+
+func (s claudeProxySeeded) empty() bool {
+	return len(s.Permissions) == 0 && len(s.Hooks) == 0
+}
+
+func (s claudeProxySeeded) equal(other claudeProxySeeded) bool {
+	a, _ := json.Marshal(s)
+	b, _ := json.Marshal(other)
+	return bytes.Equal(a, b)
+}
+
+func claudeProxySeededSettingsPath(configDir string) string {
+	return filepath.Join(configDir, claudeProxySeededSettingsFile)
+}
+
+// readClaudeProxySeeded returns the recorded seeded entries. A missing or
+// unreadable record means sr seeded nothing it can prove, so nothing is
+// removed: only entries sr knows it added are ever taken away.
+func readClaudeProxySeeded(path string) claudeProxySeeded {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return claudeProxySeeded{}
 	}
-	added := false
-	for _, entry := range extra {
-		key, err := json.Marshal(entry)
-		if err != nil || seen[string(key)] {
-			continue
-		}
-		seen[string(key)] = true
-		out = append(out, entry)
-		added = true
+	var seeded claudeProxySeeded
+	if err := json.Unmarshal(body, &seeded); err != nil {
+		return claudeProxySeeded{}
 	}
-	return out, added
+	return seeded
+}
+
+func writeClaudeProxySeeded(path string, seeded claudeProxySeeded) error {
+	if seeded.empty() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	body, err := json.MarshalIndent(seeded, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.WriteFileAtomic(path, append(body, '\n'), 0o600)
 }

@@ -555,12 +555,14 @@ proxy directory's own `settings.json` gets your `permissions` rule lists
 (`allow`, `deny`, `ask`, `additionalDirectories`) and your `hooks`, so a
 Claude started there by anything other than `sr` still applies them. That
 second step runs every time `sr` prepares the directory: a new directory is
-seeded, and an existing one gains only the rules and hook groups it is
-missing. Nothing it already has is removed or replaced, other keys (`theme`,
-`autoMode`, `defaultMode`, choices made with `/config`) are left alone, and a
-file that does not parse is skipped. A rule you later delete from
-`~/.claude/settings.json` stays in proxy directories that already have it;
-remove it there by hand. Set `SUBROUTER_CLAUDE_USER_SETTINGS=0` (or `false`,
+seeded, and an existing one gains the rules and hook groups it is missing.
+Subrouter records what it added in `settings.subrouter-seeded.json` next to
+that file, so a rule you later delete from `~/.claude/settings.json`, or a hook
+command you edit, is removed from the proxy directory the next time `sr`
+prepares it. Entries the directory had for any other reason, such as a rule
+Claude saved during a pooled session, are never removed; other keys (`theme`,
+`autoMode`, `defaultMode`, choices made with `/config`) are left alone; and a
+file that does not parse is skipped. Set `SUBROUTER_CLAUDE_USER_SETTINGS=0` (or `false`,
 `off`) to launch pooled Claude without any of your settings and leave proxy
 `settings.json` files untouched.
 
