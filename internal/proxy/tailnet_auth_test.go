@@ -135,6 +135,7 @@ func TestLocalProxyTokenAdmitsVerifiedTailnetPeerOnly(t *testing.T) {
 		wantAuth   bool
 	}{
 		{name: "verified tailnet peer", remoteAddr: "100.120.161.125:51000", allow: true, bearer: "subrouter", wantAuth: true},
+		{name: "verified tailnet peer without authorization", remoteAddr: "100.120.161.125:51000", allow: true, wantAuth: true},
 		{name: "unverified remote peer", remoteAddr: "192.168.86.60:51000", allow: false, bearer: "subrouter", wantAuth: false},
 		{name: "loopback without secret", remoteAddr: "127.0.0.1:51000", allow: true, bearer: "subrouter", wantAuth: false},
 		{name: "loopback with secret", remoteAddr: "127.0.0.1:51000", allow: false, bearer: "local-secret", wantAuth: true},
@@ -144,7 +145,9 @@ func TestLocalProxyTokenAdmitsVerifiedTailnetPeerOnly(t *testing.T) {
 			server := Server{LocalProxyToken: "local-secret", TailnetAuth: auth}
 			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 			req.RemoteAddr = tc.remoteAddr
-			req.Header.Set("Authorization", "Bearer "+tc.bearer)
+			if tc.bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.bearer)
+			}
 			if got := server.localProxyAuthorized(req); got != tc.wantAuth {
 				t.Fatalf("localProxyAuthorized = %v, want %v", got, tc.wantAuth)
 			}
