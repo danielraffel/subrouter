@@ -5366,6 +5366,9 @@ func (s Server) localProxyAuthorized(r *http.Request) bool {
 	if token == "" {
 		return true
 	}
+	if s.tailnetPeerSkipsLocalProxyToken(r) {
+		return true
+	}
 	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	if len(authorization) <= len("Bearer ") ||
 		!strings.EqualFold(authorization[:len("Bearer ")], "Bearer ") {
@@ -5376,7 +5379,7 @@ func (s Server) localProxyAuthorized(r *http.Request) bool {
 		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
 		return true
 	}
-	return s.tailnetPeerSkipsLocalProxyToken(r) || s.knownSessionSkipsLocalProxyToken(r, got)
+	return s.knownSessionSkipsLocalProxyToken(r, got)
 }
 
 // legacyLocalProxyPlaceholder is what sr sends as the proxy credential when
