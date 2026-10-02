@@ -1119,11 +1119,11 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	// they overlap the usage fetch and the Claude balance enrichment instead
 	// of adding one round trip each after the table prints.
 	sections := r.startServerStatusSections(ctx, server,
+		srRunner.printDeploymentVisibilityStatus,
 		srRunner.printBedrockStatus,
 		srRunner.printAzureCodexStatus,
 		srRunner.printCodexCapacityStatus,
 		srRunner.printTokenUsageStatus,
-		srRunner.printPlacementStatus,
 	)
 	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
 	if err != nil {
@@ -1154,6 +1154,15 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	_, err = io.Copy(r.out, res.Body)
 	if err == nil {
 		fmt.Fprintln(r.out)
+		// Older daemons may fall back to the accounts endpoint. Keep the
+		// deployment header visible even when usage rows are unavailable.
+		for _, section := range sections {
+			if section == nil {
+				continue
+			}
+			<-section.done
+			_, _ = r.out.Write(section.out.Bytes())
+		}
 	}
 	return err
 }
@@ -1535,7 +1544,9 @@ func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerC
 	if err != nil {
 		return nil, false, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status", nil)
+	// `sr status` is an interactive read; bypass the daemon's short shared
+	// usage cache so quota changes are visible immediately after a request.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status?refresh=1", nil)
 	if err != nil {
 		return nil, false, redactServerRequestError(err, server)
 	}
@@ -2238,7 +2249,11 @@ func (r srRunner) serverLoginOne(ctx context.Context, server srServerConfig, dev
 	}
 	r.printUploadOutcome(true, fmt.Sprintf("Uploaded %s to server %s.", email, server.Name))
 	if account.Email != email {
-		fmt.Fprintf(r.out, "Stored as: %s\n", account.DisplayName())
+		stored := account.DisplayName()
+		if plan := account.PlanType(); plan != "" {
+			stored += " (plan: " + plan + ")"
+		}
+		fmt.Fprintf(r.out, "Stored as: %s\n", stored)
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	fmt.Fprintf(r.out, "The new %s refresh token is stored on %s, not kept as your local active login.\n", email, server.Name)

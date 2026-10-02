@@ -218,6 +218,7 @@ type Server struct {
 	// overloadHeld counts requests currently waiting out an overload on
 	// their own account, per provider.
 	overloadHeld               *overloadHeldGauge
+	recoveryCounters           *recoveryCounterStore
 	codexOverloadRerouteCounts *codexOverloadReroutes
 	codexPersistLoops          *codexPersistLoops
 	codexShedding              *codexSheddingTracker
@@ -1109,18 +1110,14 @@ func (r *AccountRef) Refresh(ctx context.Context, account accounts.Account) (acc
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	replaced := false
-	for i := range r.accounts {
-		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
-			if r.accounts[i].CredentialIdentity() != next.CredentialIdentity() {
-				r.credentialRevision++
-			}
-			r.accounts[i] = next
-			replaced = true
-			break
+	if i := accountIndex(r.accounts, account.ID, func(candidate accounts.Account) bool {
+		return sameProvider(candidate.Provider, account.Provider)
+	}); i >= 0 {
+		if r.accounts[i].CredentialIdentity() != next.CredentialIdentity() {
+			r.credentialRevision++
 		}
-	}
-	if !replaced {
+		r.accounts[i] = next
+	} else {
 		r.accounts = append(r.accounts, next)
 		r.credentialRevision++
 	}
@@ -1359,6 +1356,19 @@ func (r *AccountRef) InvalidateUsageStatusCache() {
 	r.usageStatusAt = time.Time{}
 	r.usageStatusEpoch++
 	r.usageStatusSweep = nil
+}
+
+// InvalidateUsageWindowsCache drops per-account usage windows as well as the
+// aggregate status snapshot. Interactive `sr status` calls use this so a
+// refresh really reaches the provider instead of reusing the two-minute
+// scheduler cache.
+func (r *AccountRef) InvalidateUsageWindowsCache() {
+	if r == nil {
+		return
+	}
+	r.usageWindowsMu.Lock()
+	r.usageWindows = nil
+	r.usageWindowsMu.Unlock()
 }
 
 func authLikeUsageError(message string) bool {
@@ -2145,14 +2155,14 @@ func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows
 func (r *AccountRef) replace(account accounts.Account) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for i := range r.accounts {
-		if sameProvider(r.accounts[i].Provider, account.Provider) && accountMatches(r.accounts[i], account.ID) {
-			if r.accounts[i].CredentialIdentity() != account.CredentialIdentity() {
-				r.credentialRevision++
-			}
-			r.accounts[i] = account
-			return
+	if i := accountIndex(r.accounts, account.ID, func(candidate accounts.Account) bool {
+		return sameProvider(candidate.Provider, account.Provider)
+	}); i >= 0 {
+		if r.accounts[i].CredentialIdentity() != account.CredentialIdentity() {
+			r.credentialRevision++
 		}
+		r.accounts[i] = account
+		return
 	}
 	r.accounts = append(r.accounts, account)
 	r.credentialRevision++
@@ -2211,6 +2221,9 @@ func (s Server) Handler() http.Handler {
 	if s.overloadHeld == nil {
 		s.overloadHeld = newOverloadHeldGauge()
 	}
+	if s.recoveryCounters == nil {
+		s.recoveryCounters = &recoveryCounterStore{}
+	}
 	if s.claudeWebBalances == nil && s.AccountRef != nil {
 		s.claudeWebBalances = newClaudeWebBalanceStore(filepath.Join(s.AccountRef.store.Dir, "claude-web-balances.json"))
 	}
@@ -2266,6 +2279,7 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		"account_import": s.AccountImportState(),
 		"auth":           s.AuthMode(),
 		"version":        buildversion.Version(),
+		"build":          buildversion.Get(),
 	}
 	// Compatibility for v1 bindings and direct local daemons. v2 clients use
 	// the mutually authenticated private-socket handshake and never accept this
@@ -2304,6 +2318,9 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 	if held := s.overloadHeld.snapshot(); held != nil {
 		// Requests currently waiting out an overload on their own account.
 		payload["overload_retry_held"] = held
+	}
+	if counters := s.recoveryCounters.snapshot(time.Now()); len(counters) > 0 {
+		payload["recovery_counters"] = counters
 	}
 	if release, ok := readReleaseState(s.ReleaseStatePath); ok {
 		// Post-upgrade bake state written by the macOS deploy scripts.
@@ -2512,6 +2529,12 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.AccountRef != nil {
+		// Interactive status commands opt into a live sweep. Background clients
+		// keep the short shared cache so a dashboard cannot stampede providers.
+		if r.URL.Query().Get("refresh") == "1" {
+			s.AccountRef.InvalidateUsageStatusCache()
+			s.AccountRef.InvalidateUsageWindowsCache()
+		}
 		scoreRevision := uint64(0)
 		if s.SchedulerRef != nil {
 			scoreRevision = s.SchedulerRef.ScoreRevision()
@@ -2785,17 +2808,25 @@ func (s Server) withRequestTimeExhaustionWindows(statuses []AccountUsageStatus) 
 			name = agentclaude.FableWindowName
 			feature = agentclaude.FableModel
 		}
-		if usageWindowNamed(status.Windows, name) {
-			continue
-		}
-		status.Windows = append(append([]accounts.UsageWindow(nil), status.Windows...), accounts.UsageWindow{
+		exhausted := accounts.UsageWindow{
 			Name:               name,
 			UsedPercent:        100,
 			LimitWindowSeconds: windowSeconds,
 			ResetAfterSeconds:  resetAfter,
 			ResetAt:            until,
 			Feature:            feature,
-		})
+		}
+		updated := false
+		for j := range status.Windows {
+			if status.Windows[j].Name == name {
+				status.Windows[j] = exhausted
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			status.Windows = append(append([]accounts.UsageWindow(nil), status.Windows...), exhausted)
+		}
 	}
 	return out
 }
@@ -5130,6 +5161,10 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
+			if requestProvider == accounts.ProviderCodex && azureCodexRequest(r.Method, r.URL.Path) &&
+				r.Header.Get(CodexCapacityRetryableHeader) == "1" {
+				response, _ = codexRetryableCapacityResponse(response)
+			}
 			if pendingSessionCommit && !usageFailoverInstalled && response.StatusCode >= 200 && response.StatusCode < 300 {
 				if err := s.commitSuccessfulHTTPResponse(response, sessionAgentType, sessionID, pendingSessionExpectedAccount, account.ID, userEmail); err != nil {
 					return fmt.Errorf("persist successful session reassignment: %w", err)
@@ -5586,8 +5621,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	upstreamConn.SetReadLimit(maxWebSocketMessageBytes)
 
 	modelState := &webSocketModelState{
-		model:           compatibilityModel,
-		capacityPersist: s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
+		model:             compatibilityModel,
+		capacityPersist:   s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger).persist,
+		capacityRetryable: r.Header.Get(CodexCapacityRetryableHeader) == "1",
 	}
 	if s.TokenUsage != nil {
 		modelState.usageClient, modelState.usageClientBlocking = s.TokenUsage.tokenUsageClient(r, userEmail)
@@ -5700,7 +5736,8 @@ type webSocketModelState struct {
 	// capacityPersist is the connection's capacity retry policy (header on
 	// the upgrade request, or the environment): persist mode widens the
 	// session's reroute allowance.
-	capacityPersist bool
+	capacityPersist   bool
+	capacityRetryable bool
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -5958,6 +5995,9 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 							return errAzureCodexWebSocketDivert
 						}
 					}
+					if modelState.capacityRetryable && codexCapacityFailureJSON(body) && s.codexRetryableCapacityWebSocketReroute(ctx, agentType, sessionID, modelState.capacityPersist) {
+						return errCodexWebSocketCapacityRetry
+					}
 				}
 			}
 			switch {
@@ -6006,6 +6046,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			}
 			if errors.Is(err, errCodexWebSocketReroute) {
 				closeWebSocketWithServiceRestart(dst, "codex account exhausted; reconnect")
+				return
+			}
+			if errors.Is(err, errCodexWebSocketCapacityRetry) {
+				closeWebSocketWithServiceRestart(dst, "codex capacity retry; reconnect")
 				return
 			}
 			forwardWebSocketClose(dst, err)
@@ -6322,6 +6366,8 @@ var errAzureCodexWebSocketDivert = errors.New("codex websocket turn diverted to 
 // the pool's other accounts are free and come first; the fallback catches the
 // reconnect only when nothing in the pool can start it.
 var errCodexWebSocketReroute = errors.New("codex websocket turn rerouted off an exhausted account")
+
+var errCodexWebSocketCapacityRetry = errors.New("codex websocket turn needs a capacity retry")
 
 // closeWebSocketWithServiceRestart ends the client connection with 1012
 // (service restart), which Codex handles by reconnecting with a full
@@ -10555,13 +10601,35 @@ func (s Server) scheduler() selectacct.Scheduler {
 }
 
 func findAccount(haystack []accounts.Account, id string) (accounts.Account, bool) {
-	needle := strings.TrimSpace(id)
-	for _, account := range haystack {
-		if accountMatches(account, needle) {
-			return account, true
-		}
+	if i := accountIndex(haystack, strings.TrimSpace(id), nil); i >= 0 {
+		return haystack[i], true
 	}
 	return accounts.Account{}, false
+}
+
+// accountIndex returns the index of the account that id selects among those
+// keep accepts (nil keeps all), or -1. An exact ID match wins over a label or
+// API-key-name match anywhere in the list: an owner-keyed Codex record
+// ("codex-owner-<hash>") is labeled with its bare login email, which is also
+// the ID of a legacy record for that email, so a first-match scan could
+// return or overwrite the owner-keyed record when the legacy one was meant.
+func accountIndex(haystack []accounts.Account, id string, keep func(accounts.Account) bool) int {
+	if id == "" {
+		return -1
+	}
+	fallback := -1
+	for i, account := range haystack {
+		if keep != nil && !keep(account) {
+			continue
+		}
+		if strings.EqualFold(account.ID, id) {
+			return i
+		}
+		if fallback < 0 && accountMatches(account, id) {
+			fallback = i
+		}
+	}
+	return fallback
 }
 
 // sameProvider reports whether two providers refer to the same upstream,

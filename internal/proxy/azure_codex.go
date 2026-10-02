@@ -1019,7 +1019,16 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	}
 	fallback, endpoint, served := t.server.azureCodexResponse(req, body, t.sessionKey, preferred, reason)
 	if !served {
+		if retry, ok := t.server.codexFallbackRetryRequest(req, t.attempt, response); ok {
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			return base.RoundTrip(retry)
+		}
 		return response, err
+	}
+	if t.server.recoveryCounters != nil {
+		t.server.recoveryCounters.add(accounts.ProviderCodex, "handoff_503", time.Now())
 	}
 	t.server.azureCodexSessions.pin(t.sessionKey, endpoint)
 	if t.server.Logger != nil {

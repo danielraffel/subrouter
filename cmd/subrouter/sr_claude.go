@@ -780,11 +780,11 @@ func prepareClaudeProxySharedState(configDir, storeDir string) error {
 		// Hermetic/test stores must never attach to the user's real Claude home.
 		return nil
 	}
-	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
 		return err
 	}
-	if err := defaultStore.ShareUserConfigDir(configDir); err != nil {
-		slog.Warn("share Claude user config with proxy config", "error", err)
+	if err := defaultStore.PrepareSharedStateDir(configDir); err != nil {
+		return err
 	}
 	if err := seedClaudeProxySettingsBaseline(claudeProxyUserSettingsPath(storeDir), configDir); err != nil {
 		slog.Warn("seed Claude proxy settings with the user's permissions and hooks", "error", err)
@@ -874,6 +874,12 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	if err != nil {
 		return err
 	}
+	if store := claude.DefaultStore(); filepath.Clean(r.store.StoreDir()) == filepath.Clean(store.Dir) {
+		settingsBody, err = withClaudeProxyMemoryDirectory(settingsBody, store.SharedStateDir)
+		if err != nil {
+			return err
+		}
+	}
 	settingsBody, err = withClaudeSessionStatusLine(settingsBody, r.sessionLaunchID, r.store.StoreDir())
 	if err != nil {
 		return err
@@ -900,7 +906,14 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// The authoritative private settings file carries every routing value. Keep the
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
-	cmd.Env = claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	childEnv := claudeSettingsChildEnvironment(os.Environ(), baseURL, configDir)
+	if defaultStore := claude.DefaultStore(); filepath.Clean(r.store.StoreDir()) == filepath.Clean(defaultStore.Dir) && strings.TrimSpace(defaultStore.SharedStateDir) != "" {
+		// Claude resolves auto-memory before it applies settings.env. Set the
+		// shared root in the child environment so its per-project memory path
+		// never begins at the proxy symlink.
+		childEnv = upsertEnv(childEnv, "CLAUDE_CODE_REMOTE_MEMORY_DIR", defaultStore.SharedStateDir)
+	}
+	cmd.Env = childEnv
 	runErr := cmd.Run()
 	if r.sessionLaunchID != "" {
 		ledger := newSessionLedger(r.store.StoreDir())
@@ -1911,6 +1924,10 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 		}
 		launchSettingsBody = settingsOverride
 	}
+	launchSettingsBody, err = withManagedClaudeUserSettings(launchSettingsBody, claudeProxyUserSettingsPath(r.store.Dir))
+	if err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, claudePath)
 	if len(launchSettingsBody) > 0 {
 		settingsArg, cleanupSettings, settingsErr := attachClaudeLaunchSettings(cmd, launchSettingsBody)
@@ -1929,6 +1946,25 @@ func (r claudeRunner) runClaude(ctx context.Context, name string, extra []string
 	cmd.Stderr = r.errOut
 	cmd.Env = claudeSettingsChildEnvironment(claude.EnvForConfigDir(configDir), secureBaseURL, configDir)
 	return cmd.Run()
+}
+
+// withManagedClaudeUserSettings gives a managed profile launch the same user
+// settings overlay as a pooled launch. CLAUDE_CONFIG_DIR points at the profile,
+// which hides ~/.claude/settings.json (env such as subagent limits, hooks,
+// permissions). Claude already reads the profile's own settings.json, so only
+// the user's file is merged; routing values in the launch body still win. A
+// profile without routing gets an overlay only when user settings exist.
+func withManagedClaudeUserSettings(launchSettingsBody []byte, userSettingsPath string) ([]byte, error) {
+	if strings.TrimSpace(userSettingsPath) == "" {
+		return launchSettingsBody, nil
+	}
+	if _, ok := readClaudeSettingsObject(userSettingsPath); !ok {
+		return launchSettingsBody, nil
+	}
+	if len(launchSettingsBody) == 0 {
+		launchSettingsBody = []byte("{}")
+	}
+	return withClaudeUserSettings(launchSettingsBody, userSettingsPath, "")
 }
 
 func managedClaudeLaunchArgs(args []string, settingsPath string) ([]string, error) {
@@ -2102,8 +2138,42 @@ func managedClaudeProfileLaunchMode(configDir string) (managedClaudeLaunchMode, 
 	return managedClaudeLaunchDirect, nil
 }
 
+// managedClaudeProfileCredentialEnvKeys are the profile settings values that
+// authenticate a managed launch. The launch override clears every routing key,
+// and Claude treats an explicitly empty --settings value as authoritative, so
+// each credential the profile declares must be restated in the override.
+var managedClaudeProfileCredentialEnvKeys = []string{
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"CLAUDE_CODE_OAUTH_TOKEN",
+	"CLAUDE_CODE_API_KEY",
+	"CLAUDE_CODE_AUTH_TOKEN",
+}
+
 func managedClaudeLaunchSettings(secureBaseURL, configDir string) ([]byte, error) {
-	return claudeLaunchSettingsJSON(configDir, map[string]string{"ANTHROPIC_BASE_URL": secureBaseURL})
+	env := map[string]string{}
+	if configDir != "" {
+		body, err := os.ReadFile(filepath.Join(configDir, "settings.json"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read managed Claude settings: %w", err)
+		}
+		if err == nil {
+			var settings struct {
+				Env map[string]string `json:"env"`
+			}
+			if err := json.Unmarshal(body, &settings); err != nil {
+				return nil, fmt.Errorf("parse managed Claude settings: %w", err)
+			}
+			for _, key := range managedClaudeProfileCredentialEnvKeys {
+				if value := settings.Env[key]; value != "" {
+					env[key] = value
+				}
+			}
+		}
+	}
+	env["ANTHROPIC_BASE_URL"] = secureBaseURL
+	return claudeLaunchSettingsJSON(configDir, env)
 }
 
 func proxyClaudeLaunchSettings(baseURL, proxyToken, configDir string, accountIDs ...string) ([]byte, error) {
