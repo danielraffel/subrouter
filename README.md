@@ -495,6 +495,39 @@ The supported Codex commands include `add`, `add-key`, `import`, `list`, `switch
 
 OpenCode uses XDG data home, so `XDG_DATA_HOME` changes its auth path. pi uses `PI_CODING_AGENT_DIR` when set. Existing unrelated provider credentials in those files are preserved.
 
+### Adding an account to a shared pool
+
+A pool server keeps its own copy of every account. A login on a client only
+lives in that client's store until it is pushed, so where you run the login
+decides what to do next.
+
+**From a client machine** (the pool runs on another host):
+
+```bash
+sr claude login <email>          # browser login; sign in as <email>
+sr claude push <email>           # upload it to the default pool server
+sr status                        # the account appears with its plan, e.g. [max]
+```
+
+**On the machine that runs the pool proxy:** the proxy reads accounts from its
+own state directory (`SUBROUTER_STATE_DIR` in its LaunchAgent), not from
+`~/.subrouter`. Log in directly into that store; `sr claude push` cannot help
+here, because with local credential storage it assumes the CLI and the proxy
+already share one store:
+
+```bash
+export SUBROUTER_STATE_DIR="$(plutil -extract EnvironmentVariables.SUBROUTER_STATE_DIR raw ~/Library/LaunchAgents/ai.manaflow.subrouter-tailnet.plist)"
+sr claude login <email>
+curl -fsS -X POST http://127.0.0.1:31415/_subrouter/reload-accounts
+unset SUBROUTER_STATE_DIR
+```
+
+To replace an account, for example a setup-token login with a browser login,
+run `sr claude remove <email>` first, in the same place you add it. Prefer the
+browser login (`sr claude login`) for pool accounts: a setup-token login
+carries no plan, so the pool shows its plan as `unknown`, and it cannot renew
+itself.
+
 Claude profiles are also native Go and use the same Subrouter store:
 
 ```bash

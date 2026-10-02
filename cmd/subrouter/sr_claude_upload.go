@@ -86,7 +86,9 @@ func (r srRunner) pushClaudeProfile(ctx context.Context, name string, requireSer
 		return nil
 	case broker.CredentialSourceLocal:
 		if requireServer {
-			return fmt.Errorf("credential storage is local; the profile already stays on this machine")
+			// On the pool host itself the proxy may read a different state
+			// directory than this shell, so "already here" is not a promise.
+			return fmt.Errorf("credential storage is local, so there is no remote pool to push to. On the machine that runs the pool proxy, log in with SUBROUTER_STATE_DIR set to the proxy's state directory; see \"Adding an account to a shared pool\" in the README")
 		}
 		return nil
 	}
