@@ -80,7 +80,7 @@ func TestBakeGateEndToEnd(t *testing.T) {
 	// A. good -> bad: the bad worker starts, answers health, and fails a third
 	// of proxied requests with its own 502. The bake rolls it back and pins.
 	h.logf("=== A: upgrade v0.0.1 -> v0.0.3 (broken build) with a 60s bake")
-	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "60"}, "install", bad, "--label", "v0.0.3")
+	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "60"}, "install", bad, "--label", "v0.0.3", "--allow-unrelated", "e2e fixture")
 	h.expectHealthVersion("v0.0.3")
 	h.expectRelease("baking", "v0.0.3")
 	gen.resetWindow()
@@ -124,7 +124,7 @@ func TestBakeGateEndToEnd(t *testing.T) {
 	// advances last-good.
 	h.logf("=== B: upgrade v0.0.1 -> v0.0.2 (good build) with a 20s bake")
 	gen.resetWindow()
-	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "20"}, "install", good2, "--label", "v0.0.2")
+	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "20"}, "install", good2, "--label", "v0.0.2", "--allow-unrelated", "e2e fixture")
 	h.expectRelease("baking", "v0.0.2")
 	h.guard()
 	if !sameFile(t, h.lastGood(), good1) {
@@ -153,7 +153,7 @@ func TestBakeGateEndToEnd(t *testing.T) {
 	slow := newTrafficGenerator(h, 700*time.Millisecond)
 	slow.start()
 	defer slow.stop()
-	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "15"}, "install", good1, "--label", "v0.0.1")
+	h.deploy(map[string]string{"SUBROUTER_BAKE_SECONDS": "15"}, "install", good1, "--label", "v0.0.1", "--allow-unrelated", "e2e fixture")
 	h.upstreamFailures.Store(4)
 	state = h.guardUntil(func(s releaseState) bool { return s.State != "baking" }, 60*time.Second)
 	if state.State != "promoted" {
@@ -253,6 +253,11 @@ func newHarness(t *testing.T) *harness {
 		"SUBROUTER_RELEASE_STATE="+filepath.Join(root, "verify", "release-state.json"),
 		"SUBROUTER_GUARD_HEALTH_WAIT_SECS=20",
 		"SUBROUTER_DEPLOY_HEALTH_TIMEOUT_SECS=30",
+		// This test covers the bake, which is the plain-upgrade path. The
+		// real supervisor supports canary rollouts, and with them an install
+		// is judged by the supervisor's gate instead of baking
+		// (deploy/macos/tests/canary-rollout-test.sh covers that path).
+		"SUBROUTER_DEPLOY_CANARY=0",
 	)
 	return h
 }

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
@@ -9,6 +10,37 @@ import (
 	"sync"
 	"time"
 )
+
+type codexCapacityPersistAfterFallbackKey struct{}
+
+func withCodexCapacityPersistAfterFallback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, codexCapacityPersistAfterFallbackKey{}, true)
+}
+
+func codexCapacityPersistAfterFallback(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(codexCapacityPersistAfterFallbackKey{}).(bool)
+	return value
+}
+
+func (s *Server) codexFallbackRetryRequest(req *http.Request, attempt *upstreamAttempt, response *http.Response) (*http.Request, bool) {
+	if s == nil || req == nil || attempt == nil || codexCapacityPersistAfterFallback(req.Context()) ||
+		req.Context().Err() != nil || attempt.capacityPolicy == nil || !attempt.capacityPolicy.persist {
+		return nil, false
+	}
+	failed, _, _ := codexOverloadFailure(response)
+	if !failed {
+		return nil, false
+	}
+	account := attempt.current()
+	next, err := attempt.replay(req, &account)
+	if err != nil {
+		return nil, false
+	}
+	return next.WithContext(withCodexCapacityPersistAfterFallback(req.Context())), true
+}
 
 // Capacity retry policy.
 //
@@ -38,7 +70,9 @@ import (
 //   - failover (opt-in): one same-account retry after a 250-750ms jittered
 //     gap, then the overload failover to other accounts (100-400ms gaps),
 //     all inside a ~10s budget (~3s while shedding). Failed accounts are
-//     marked at capacity for the model pool.
+//     marked at capacity for the model pool. A conversation estimated past
+//     FailoverMaxInput (default 32k input tokens) is not moved: it takes the
+//     default ladder above, since a switch would re-bill its whole cache.
 //   - persist (opt-in): keep retrying until a budget (default 2m, from the
 //     first attempt) expires. With the failover off it is a preset of the
 //     same-account ladder (steady 1s gaps, capped at the longer of the
@@ -55,6 +89,9 @@ import (
 //
 // Client cancellation ends either loop immediately.
 const (
+	// CodexCapacityRetryableHeader opts Codex into the retryable final
+	// capacity response. It is stripped before the request goes upstream.
+	CodexCapacityRetryableHeader = "X-Subrouter-Capacity-Retryable"
 	// CodexCapacityRetryHeader selects the policy per request: "persist" or
 	// "default". It is stripped before the request goes upstream.
 	CodexCapacityRetryHeader = "X-Subrouter-Capacity-Retry"
@@ -138,6 +175,23 @@ type codexCapacityRetryPolicy struct {
 // operator's wait, and an operator's unbounded wait stays unbounded. An
 // explicit wait (persist, or a requested max-wait) is not shortened by a
 // configured fallback.
+func (c *CodexOverloadFailoverConfig) postFallbackRetryBudget(policy codexCapacityRetryPolicy, stay overloadRetryPolicy) (time.Duration, bool) {
+	if policy.retry.maxWaitSet {
+		return stay.maxWait, stay.unbounded
+	}
+	if c != nil && c.StayUnbounded {
+		return 0, true
+	}
+	budget := policy.persistBudget
+	if c == nil || c.CapacityRetryBudget <= 0 {
+		budget = max(budget, codexCapacityDefaultStayMaxWait)
+	}
+	if c != nil && c.StayMaxWait > budget {
+		budget = c.StayMaxWait
+	}
+	return budget, false
+}
+
 func (c *CodexOverloadFailoverConfig) stayPolicy(policy codexCapacityRetryPolicy) (overloadRetryPolicy, bool) {
 	var stay overloadRetryPolicy
 	if c != nil {

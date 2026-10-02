@@ -9,12 +9,18 @@ import (
 // releaseStateView mirrors proxy.ReleaseState: the post-upgrade bake state a
 // supervised team host reports as "release" in /_subrouter/health.
 type releaseStateView struct {
-	Version         string `json:"version"`
-	PreviousVersion string `json:"previous_version"`
-	State           string `json:"state"`
-	Reason          string `json:"reason"`
-	Since           string `json:"since"`
-	BakeUntil       string `json:"bake_until"`
+	Version          string `json:"version"`
+	PreviousVersion  string `json:"previous_version"`
+	State            string `json:"state"`
+	Reason           string `json:"reason"`
+	Since            string `json:"since"`
+	BakeUntil        string `json:"bake_until"`
+	Weight           int    `json:"weight"`
+	CandidateVersion string `json:"candidate_version"`
+	IncumbentVersion string `json:"incumbent_version"`
+	LastAction       string `json:"last_action"`
+	LastReason       string `json:"last_reason"`
+	LastActionAt     string `json:"last_action_at"`
 }
 
 // releaseStatusText renders the bake state in one line, e.g.
@@ -40,6 +46,20 @@ func releaseStatusText(release *releaseStateView, now time.Time) string {
 			return fmt.Sprintf("%s baking (window over; promoted on the next guard check)", version)
 		}
 		return fmt.Sprintf("%s baking (%s left)", version, roundedMinutes(left))
+	case "canary":
+		// A supervisor canary rollout: the candidate's share of new
+		// sessions and how long it has held it.
+		text := fmt.Sprintf("%s canary %d%%", version, release.Weight)
+		if since, err := time.Parse(time.RFC3339, release.Since); err == nil && !now.Before(since) {
+			text += fmt.Sprintf(" (%s)", roundedMinutes(now.Sub(since)))
+		}
+		return text
+	case "aborted":
+		text := fmt.Sprintf("%s aborted at %d%%", version, release.Weight)
+		if reason := strings.TrimSpace(release.Reason); reason != "" {
+			text += ": " + reason
+		}
+		return text
 	case "promoted":
 		return fmt.Sprintf("%s promoted", version)
 	case "rolled_back":

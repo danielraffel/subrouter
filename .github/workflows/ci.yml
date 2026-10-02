@@ -112,6 +112,8 @@ jobs:
         run: |
           bash deploy/macos/tests/guard-rollback-test.sh
           bash deploy/macos/tests/deploy-install-test.sh
+          bash deploy/macos/tests/canary-rollout-test.sh
+          bash deploy/macos/tests/upgrade-host-rollouts-test.sh
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -350,3 +352,8 @@ jobs:
       - name: Test rollback and signal transaction matrix
         if: ${{ needs.changes.outputs.matrix == 'true' }}
         run: deploy/macos/tests/launchagent-transaction-test.sh
+
+      - name: Test launchd log rotation
+        # Uses BSD stat and plutil, so it runs here rather than in the Linux
+        # deploy-scripts job.
+        run: bash deploy/macos/tests/log-rotate-test.sh

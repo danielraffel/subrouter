@@ -82,6 +82,31 @@ func TestWithSessionCountsUsesLiveAssignments(t *testing.T) {
 	}
 }
 
+func TestInflightPenaltyReordersPlacementWithoutExhaustingOrEvicting(t *testing.T) {
+	accountA := account.Account{ID: "a", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
+	accountB := account.Account{ID: "b", Provider: account.ProviderCodex, AuthMode: account.AuthModeOAuth}
+	base := NewScheduler([]Score{
+		{AccountID: "a", Provider: account.ProviderCodex, Headroom: 0.80, ShortHeadroom: 0.80},
+		{AccountID: "b", Provider: account.ProviderCodex, Headroom: 0.75, ShortHeadroom: 0.75},
+	})
+	picked, err := base.PickBest([]account.Account{accountA, accountB})
+	if err != nil || picked.ID != "a" {
+		t.Fatalf("baseline pick = %q %v, want a", picked.ID, err)
+	}
+
+	busy := base.WithInflightCounts(map[string]int{ScoreKey(account.ProviderCodex, "a"): 1})
+	picked, err = busy.PickBest([]account.Account{accountA, accountB})
+	if err != nil || picked.ID != "b" {
+		t.Fatalf("inflight pick = %q %v, want b", picked.ID, err)
+	}
+	if busy.Exhausted(account.ProviderCodex, "a") {
+		t.Fatal("inflight penalty marked a healthy account exhausted")
+	}
+	if !busy.UsableForStickySession(account.ProviderCodex, "a") {
+		t.Fatal("inflight penalty evicted a sticky session")
+	}
+}
+
 func TestWithSessionCountsSeparatesProvidersSharingAnAccountID(t *testing.T) {
 	scheduler := NewScheduler([]Score{
 		{AccountID: "same@example.com", Provider: account.ProviderCodex, Headroom: 0.75},

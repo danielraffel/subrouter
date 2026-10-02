@@ -141,6 +141,81 @@ func TestRemoteAndHostedGrokAddAreExplicitlyUnsupported(t *testing.T) {
 	}
 }
 
+func TestLocalAccountDisplayNameHidesStableCodexKeyByDefault(t *testing.T) {
+	auth := testCodexAuth("owner@example.com", "workspace-owner")
+	account := accounts.StoredCodexAccount{Email: "codex-owner-stable-key", Auth: auth}
+
+	display := account.DisplayName()
+	if got := localAccountDisplayName(account, false); got != display || strings.Contains(got, "codex-owner") {
+		t.Fatalf("default display name = %q, want %q", got, display)
+	}
+	withID := localAccountDisplayName(account, true)
+	if withID != display+" [codex-owner-stable-key]" {
+		t.Fatalf("ID display name = %q, want explicit stable key", withID)
+	}
+}
+
+func TestListHidesStableCodexKeysUnlessRequested(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := accounts.CodexStore{Dir: filepath.Join(home, "accounts")}
+	for index, workspace := range []string{"workspace-one", "workspace-two"} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email:   fmt.Sprintf("codex-owner-%d", index+1),
+			AddedAt: "2026-01-01T00:00:00Z",
+			Auth:    testCodexAuth("owner@example.com", workspace),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &out}
+	if err := runner.list(nil); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "owner@example.com") || !strings.Contains(text, "sr list --ids") {
+		t.Fatalf("default list = %q, want email and IDs hint", text)
+	}
+	if strings.Contains(text, "codex-owner-1") || strings.Contains(text, "codex-owner-2") {
+		t.Fatalf("default list leaked stable IDs: %q", text)
+	}
+
+	out.Reset()
+	if err := runner.list([]string{"--ids"}); err != nil {
+		t.Fatal(err)
+	}
+	text = out.String()
+	if !strings.Contains(text, "] [codex-owner-1]") || !strings.Contains(text, "] [codex-owner-2]") {
+		t.Fatalf("ID list = %q, want explicit stable IDs", text)
+	}
+}
+
+func TestAccountListRejectsUnsupportedOptionsInEveryMode(t *testing.T) {
+	runner := srRunner{program: "sr", out: io.Discard}
+	args := []string{"--invalid"}
+	for name, call := range map[string]func() error{
+		"local":  func() error { return runner.list(args) },
+		"remote": func() error { return runner.listServerAccounts(t.Context(), srServerConfig{}, args) },
+		"hosted": func() error {
+			_, err := runner.runTeamCredentialCommand(t.Context(), append([]string{"list"}, args...))
+			return err
+		},
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "usage: sr list [--ids]") {
+			t.Fatalf("%s: got %v, want list usage error before reading accounts", name, err)
+		}
+	}
+}
+
+func TestAccountListIDsIncludesExactAPIKeySelector(t *testing.T) {
+	account := accounts.StoredCodexAccount{Email: "apikey:work", Auth: accounts.CodexAuthFile{AuthMode: "apikey"}}
+	if got := localAccountDisplayName(account, true); got != "work (api key) [apikey:work]" {
+		t.Fatalf("ID display = %q, want exact selector", got)
+	}
+}
+
 // When local credentials are served by a protected serving daemon, "sr add
 // codex ..." is routed to runRemoteAccountCommand's "add" case before
 // addProvider ever runs (see sr.go's routeToServingAPI check). That case used
@@ -894,6 +969,7 @@ func TestAutoImportIfEmptySkipsProviderOnlyOAuthInstallations(t *testing.T) {
 func TestAutoImportIfEmptyDoesNotPublishMissingActiveCodexAuth(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex-home"))
 	t.Setenv("SUBROUTER_STATE_DIR", filepath.Join(root, "state"))
 	store := accounts.CodexStore{Dir: filepath.Join(root, "codex", "accounts")}
 	var out bytes.Buffer
@@ -2352,7 +2428,7 @@ func TestStatusHelpCoversEveryConfiguredProvider(t *testing.T) {
 		"sr":        srHelp,
 		"subrouter": usageText("subrouter"),
 	} {
-		if !strings.Contains(help, "status             Show usage across all configured providers") {
+		if !strings.Contains(help, "status [--json]    Show usage across all configured providers") {
 			t.Errorf("%s help does not describe provider-wide status", name)
 		}
 		if strings.Contains(help, "status             Show Codex and Claude usage") {
@@ -2774,6 +2850,7 @@ func TestSRTraceShowsOAuthBreadcrumbs(t *testing.T) {
 func TestSRSwitchAPIKeyWritesCodexAuthJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := accounts.DefaultCodexStore()
 	if err := store.SaveStored(accounts.StoredCodexAccount{
 		Email:   "apikey:paid",
@@ -2902,6 +2979,7 @@ func TestSRSwitchPublishesOAuthIsolationDowngradeToRunningServer(t *testing.T) {
 func TestSRSwitchDoesNotWriteActiveAuthOrDowngradeWhenPublicationFails(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	store := accounts.DefaultCodexStore()
 	account := accounts.StoredCodexAccount{
 		Email:                 "isolated@example.test",
@@ -3919,8 +3997,8 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 			windows: []accounts.UsageWindow{
 				{Name: "primary", UsedPercent: 55, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Hour / time.Second)},
 				{Name: "secondary", UsedPercent: 20, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((4 * 24 * time.Hour) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 8, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((30 * time.Minute) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((6 * 24 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 8, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((30 * time.Minute) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((6 * 24 * time.Hour) / time.Second)},
 			},
 			credits:            &accounts.CreditsInfo{Balance: "0"},
 			complimentaryReset: &accounts.ComplimentaryResetInfo{Known: true, Consumed: true},
@@ -3928,8 +4006,11 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	}, true)
 
 	got := out.String()
-	if !strings.Contains(got, "Account") || !strings.Contains(got, "Spark wk") || !strings.Contains(got, "1x reset") {
+	if !strings.Contains(got, "Account") || !strings.Contains(got, "1x reset") {
 		t.Fatalf("grid header missing:\n%s", got)
+	}
+	if strings.Contains(got, "Spark") {
+		t.Fatalf("grid should not render retired Spark columns:\n%s", got)
 	}
 	if !strings.Contains(got, "lawrence@cmux.com") || !strings.Contains(got, "active rec") || !strings.Contains(got, "used") {
 		t.Fatalf("grid row missing state:\n%s", got)
@@ -3947,6 +4028,18 @@ func TestDisplayUsageRowsGridWhenForced(t *testing.T) {
 	}
 	if separator == "" || strings.Contains(separator, "===") || strings.Contains(separator, "---") {
 		t.Fatalf("grid separator should be a thin Unicode rule:\n%s", got)
+	}
+}
+
+func TestUsageGridCreditsHidesPlaceholderZero(t *testing.T) {
+	if got := usageGridCreditsCell(srUsageRow{credits: &accounts.CreditsInfo{Balance: "0"}}); got.Text != "" {
+		t.Fatalf("placeholder credits = %q, want hidden", got.Text)
+	}
+	if got := usageGridCreditsCell(srUsageRow{credits: &accounts.CreditsInfo{Balance: "0", HasCredits: true}}); got.Text != "$0" {
+		t.Fatalf("real zero balance = %q, want $0", got.Text)
+	}
+	if got := usageGridCreditsCell(srUsageRow{credits: &accounts.CreditsInfo{Balance: "12.50"}}); got.Text != "$12.50" {
+		t.Fatalf("non-zero balance = %q, want $12.50", got.Text)
 	}
 }
 
@@ -4426,8 +4519,8 @@ func TestDisplayUsageRowsGridCompactsForNarrowTerminals(t *testing.T) {
 			windows: []accounts.UsageWindow{
 				{Name: "primary", UsedPercent: 4, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64(time.Minute / time.Second)},
 				{Name: "secondary", UsedPercent: 33, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((5 * 24 * time.Hour) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 0, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-				{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 0, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 0, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+				{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 0, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 			},
 			credits: &accounts.CreditsInfo{Balance: "0"},
 		},
@@ -4512,41 +4605,32 @@ func TestUsageGridSuppressesShortWindowsByQuotaFamily(t *testing.T) {
 	windows := []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
 		{Name: "secondary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}
 	cooked := srUsageRow{cooked: true, windows: windows}
 	if cell := usageGridShortWindowCell(cooked); cell.Text != "" {
 		t.Fatalf("short window cell = %q, want blank when general weekly quota is cooked", cell.Text)
 	}
-	if cell := usageGridShortNamedWindowCell(cooked); cell.Text == "" {
-		t.Fatal("Spark short window should remain visible when only general weekly quota is cooked")
-	}
 
 	tempCooked := srUsageRow{tempCooked: true, windows: []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
 		{Name: "secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 100, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}}
 	if cell := usageGridShortWindowCell(tempCooked); cell.Text == "" {
 		t.Fatal("temporarily cooked row should still show the short window")
-	}
-	if cell := usageGridShortNamedWindowCell(tempCooked); cell.Text == "" {
-		t.Fatal("temporarily cooked row should still show the short named window")
 	}
 
 	sparkWeeklyCooked := srUsageRow{cooked: true, windows: []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
 		{Name: "secondary", UsedPercent: 2, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/primary", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
-		{Name: "GPT-5.3-Codex-Spark/secondary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/primary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 1, LimitWindowSeconds: int64((5 * time.Hour) / time.Second)},
+		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}}
 	if cell := usageGridShortWindowCell(sparkWeeklyCooked); cell.Text == "" {
 		t.Fatal("general short window should remain visible when only Spark weekly quota is cooked")
-	}
-	if cell := usageGridShortNamedWindowCell(sparkWeeklyCooked); cell.Text != "" {
-		t.Fatalf("Spark short window cell = %q, want blank when Spark weekly quota is cooked", cell.Text)
 	}
 }
 
@@ -5454,6 +5538,68 @@ func TestProviderDefaultUpstreamsAreDeclared(t *testing.T) {
 		}
 		if proxy.ProviderMetering(provider) == "" {
 			t.Fatalf("provider %q declares no metering description", provider)
+		}
+	}
+}
+
+// The name sr list prints must select the account, even when the account is
+// stored under a stable codex-owner key.
+func TestFindStoredAcceptsListedDisplayName(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	account := accounts.StoredCodexAccount{
+		Email: "codex-owner-stable-key", AddedAt: "2026-01-01T00:00:00Z",
+		Auth: testCodexAuth("owner@example.com", "workspace-owner"),
+	}
+	if err := store.SaveStored(account); err != nil {
+		t.Fatal(err)
+	}
+	listed := localAccountDisplayName(account, false)
+	found, ok, err := store.FindStored(listed)
+	if err != nil || !ok || found.Email != "codex-owner-stable-key" {
+		t.Fatalf("FindStored(%q) = %q, %v, %v; want the stable-key account", listed, found.Email, ok, err)
+	}
+}
+
+// Two workspaces that list as the same text are ambiguous, not missing, so
+// the error points at sr list --ids instead of "no account found".
+func TestFindStoredReportsDuplicateDisplayNameAsAmbiguous(t *testing.T) {
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	for _, key := range []string{"codex-owner-a", "codex-owner-b"} {
+		if err := store.SaveStored(accounts.StoredCodexAccount{
+			Email: key, AddedAt: "2026-01-01T00:00:00Z",
+			Auth: testCodexAuth("shared@example.com", "workspace-"+key),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	all, err := store.ListStored()
+	if err != nil || len(all) != 2 {
+		t.Fatalf("ListStored = %d, %v", len(all), err)
+	}
+	listed := localAccountDisplayName(all[0], false)
+	if other := localAccountDisplayName(all[1], false); other != listed {
+		t.Skipf("fixture accounts list differently (%q, %q)", listed, other)
+	}
+	_, ok, err := store.FindStored(listed)
+	if ok || err == nil || !strings.Contains(err.Error(), "multiple accounts match") {
+		t.Fatalf("FindStored(%q) = %v, %v; want an ambiguity error", listed, ok, err)
+	}
+}
+
+// A server account is shown by its label, never by its stable key, and the
+// key only appears when asked for.
+func TestRemoteAccountDisplayNamePrefersLabel(t *testing.T) {
+	for _, tc := range []struct {
+		id, label, email string
+		mode             accounts.AuthMode
+		want             string
+	}{
+		{"codex-owner-1", "owner@example.com [team]", "codex-owner-1", accounts.AuthModeOAuth, "owner@example.com [team]"},
+		{"codex-owner-1", "", "owner@example.com", accounts.AuthModeOAuth, "owner@example.com"},
+		{"apikey:work", "work", "", accounts.AuthModeAPIKey, "apikey:work"},
+	} {
+		if got := remoteAccountDisplayName(tc.id, tc.label, tc.email, tc.mode); got != tc.want {
+			t.Fatalf("remoteAccountDisplayName(%q, %q, %q) = %q, want %q", tc.id, tc.label, tc.email, got, tc.want)
 		}
 	}
 }

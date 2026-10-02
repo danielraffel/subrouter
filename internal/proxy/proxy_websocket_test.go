@@ -71,7 +71,9 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stats := NewTrafficStats(time.Now())
 	handler := Server{
+		Traffic:  stats,
 		Upstream: upstreamURL,
 		Accounts: []accounts.Account{{
 			ID:        "a@example.com",
@@ -83,7 +85,11 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 		Scheduler:    selectacct.NewScheduler(nil),
 		MaxBodyBytes: 1024,
 	}.Handler()
-	subrouter := httptest.NewServer(handler)
+	done := make(chan struct{})
+	subrouter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		handler.ServeHTTP(w, r)
+	}))
 	defer subrouter.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(subrouter.URL, "http") + "/v1/responses"
@@ -108,6 +114,82 @@ func TestHandlerProxiesWebSocketWithSelectedAccountAuth(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("message = %q, want ok", string(body))
+	}
+	_ = conn.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("proxy WebSocket handler did not finish")
+	}
+	got := stats.Snapshot(nil, time.Now())
+	if got.Requests != 1 || got.Responses.Other != 1 || got.Responses.Class2xx != 0 || got.Responses.Class5xx != 0 {
+		t.Fatalf("successful WebSocket traffic = %+v, want one 101 response", got)
+	}
+}
+
+func TestWebSocketTracksInflightUntilConnectionCloses(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(_ *http.Request) bool { return true }}
+	upstreamStarted := make(chan struct{})
+	upstreamRelease := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		close(upstreamStarted)
+		<-upstreamRelease
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+		AccountID: "a@example.com", Provider: accounts.ProviderCodex, Headroom: 1, ShortHeadroom: 1,
+	}}))
+	handler := Server{
+		Upstream: upstreamURL,
+		Accounts: []accounts.Account{{
+			ID: "a@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "selected-token",
+		}},
+		Sessions:     store,
+		SchedulerRef: ref,
+		MaxBodyBytes: 1024,
+	}.Handler()
+	proxy := httptest.NewServer(handler)
+	defer proxy.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Codex-Session-ID": []string{"ws-inflight"}})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	defer conn.Close()
+	<-upstreamStarted
+
+	key := selectacct.ScoreKey(accounts.ProviderCodex, "a@example.com")
+	if got := ref.InflightCounts()[key]; got != 1 {
+		t.Fatalf("websocket inflight = %d, want 1", got)
+	}
+
+	close(upstreamRelease)
+	_ = conn.Close()
+	deadline := time.Now().Add(time.Second)
+	for len(ref.InflightCounts()) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := ref.InflightCounts(); got != nil {
+		t.Fatalf("websocket inflight after close = %v, want nil", got)
 	}
 }
 

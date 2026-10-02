@@ -21,6 +21,14 @@
 # generation, rolls a regression back and pins the previous release, and only
 # records the new worker as last-good once the bake passes.
 #
+# When an install went out as a supervisor canary (RFC #444), the canary
+# replaces the bake: while canary-rollout.json names a pending rollout this job
+# never records the binary on disk (the candidate) as last-good, and when the
+# supervisor reports the rollout over it records the outcome. A promotion
+# advances last-good; an abort puts last-good back at the worker path without
+# a restart, pins autoupdate with the reason and resets the version marker
+# (canary_reconcile in release-bake-lib.sh).
+#
 # It runs every 60 seconds and acts on the second consecutive failure, which
 # bounds a bad-worker outage at about two minutes without reacting to a single
 # transient probe failure.
@@ -66,6 +74,10 @@ if [ -f "$BAKE_LIB" ]; then
   # shellcheck disable=SC1090
   . "$BAKE_LIB" && BAKE_GATE=1
 fi
+CANARY=0
+if [ "$BAKE_GATE" -eq 1 ] && declare -F canary_reconcile >/dev/null; then
+  CANARY=1
+fi
 
 mkdir -p "$STATE"
 now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -76,6 +88,8 @@ emit() { # level msg...
   echo "SUBROUTER-GUARD $line"
   echo "guard $line" >>"$ALERTS" 2>/dev/null || true
 }
+
+canary_log() { emit "$1" "canary: $2"; }
 
 probe_health() { curl -fsS --max-time "$PROBE_TIMEOUT_SECS" "$HEALTH" >/dev/null 2>&1; }
 
@@ -254,6 +268,19 @@ fi
 
 if probe_health; then
   rm -f "$STRIKES_FILE"
+  if [ "$CANARY" -eq 1 ] && canary_rollout_pending; then
+    canary_reconcile
+    case "$CANARY_OUTCOME" in
+      running)
+        emit INFO "canary: $(canary_rollout_field label) is rolling out; last-good stays on the incumbent"
+        ;;
+      unknown)
+        emit ALERT "canary: the supervisor control socket did not answer GET /_subrouter/canary; last-good left unchanged"
+        ;;
+    esac
+    # Promoted and aborted rollouts were recorded by canary_reconcile.
+    exit 0
+  fi
   if [ "$BAKE_GATE" -eq 1 ] && bake_is_baking; then
     decision="$(bake_evaluate "$(bake_fetch_traffic)" 2>/dev/null || true)"
     action="${decision%%$'\t'*}"
@@ -324,6 +351,29 @@ fi
 if [ "$strikes" -lt "$STRIKE_THRESHOLD" ]; then
   emit ALERT "health down (strike ${strikes}/${STRIKE_THRESHOLD}); acting next cycle if it persists"
   exit 0
+fi
+
+# Health probes carry no session key, so while a canary holds 25% or 100% of
+# new connections they reach the candidate. A hung candidate must not turn
+# into a restart, which closes the port while the incumbent generation is
+# still alive and serving. Abort the canary first: that is instant, needs no
+# restart, and gives every new connection back to the incumbent. It waits
+# for the same strike threshold as a restart, so one transient probe failure
+# neither aborts nor pins a rollout.
+if [ "$CANARY" -eq 1 ] && canary_rollout_pending; then
+  canary_body="$(canary_query "$(bake_control_socket)" 2>/dev/null || true)"
+  if [ "$(canary_json "$canary_body" state)" = "canary" ]; then
+    emit ALERT "canary: health is down during the rollout of $(canary_rollout_field label); aborting the canary before any restart"
+    canary_post "$(bake_control_socket)" "/_subrouter/canary/abort?reason=health+down" >/dev/null 2>&1 ||
+      emit ALERT "canary: the supervisor refused the abort"
+    canary_reconcile
+    if wait_health; then
+      emit INFO "canary: health answers again on the incumbent; no restart needed"
+      rm -f "$STRIKES_FILE"
+      exit 0
+    fi
+    emit ALERT "canary: health is still down after the abort; the outage path takes over"
+  fi
 fi
 
 live_sha="$(sha_of "$BIN")"

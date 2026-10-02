@@ -933,9 +933,10 @@ type azureCodexFallbackTransport struct {
 	// stream mark the account exhausted, the way a 429 status would have.
 	accountID string
 	poolModel string
-	// replayBody returns the original request body for the Azure call. The
-	// pool's retry layers have already consumed the reader by this point.
-	replayBody func() ([]byte, bool)
+	// attempt is the request's shared state; see replayablePostRetryTransport.
+	// Its buffered body feeds the Azure call: the pool's retry layers have
+	// already consumed the reader by this point.
+	attempt *upstreamAttempt
 }
 
 // azureCodexWebSocketDivert pins a Codex websocket session to Azure when an
@@ -969,7 +970,10 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	response, err := base.RoundTrip(req)
+	if t.attempt == nil {
+		t.attempt = standaloneUpstreamAttempt(req, t.server, accounts.Account{ID: t.accountID, Provider: accounts.ProviderCodex}, nil)
+	}
+	response, err := t.attempt.send(base, req, t.attempt.current())
 	if req.Context().Err() != nil {
 		return response, err
 	}
@@ -1005,7 +1009,7 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 			reason = fmt.Sprintf("pool_status_%d", response.StatusCode)
 		}
 	}
-	body, ok := t.replayBody()
+	body, ok := t.attempt.body()
 	if !ok {
 		return response, err
 	}
@@ -1015,7 +1019,16 @@ func (t azureCodexFallbackTransport) RoundTrip(req *http.Request) (*http.Respons
 	}
 	fallback, endpoint, served := t.server.azureCodexResponse(req, body, t.sessionKey, preferred, reason)
 	if !served {
+		if retry, ok := t.server.codexFallbackRetryRequest(req, t.attempt, response); ok {
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			return base.RoundTrip(retry)
+		}
 		return response, err
+	}
+	if t.server.recoveryCounters != nil {
+		t.server.recoveryCounters.add(accounts.ProviderCodex, "handoff_503", time.Now())
 	}
 	t.server.azureCodexSessions.pin(t.sessionKey, endpoint)
 	if t.server.Logger != nil {

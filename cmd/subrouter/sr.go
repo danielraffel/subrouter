@@ -67,13 +67,17 @@ Usage:
                         opencode-zen, grok, qwen, qwen-token,
                         qwen-anthropic, claude)
   sr import             Import current ~/.codex/auth.json account
-  sr list               List all Codex accounts
+  sr list [--ids]        List accounts; --ids adds exact identifiers
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
   sr g [email]          Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
-  sr status             Show usage across all configured providers (non-interactive)
+  sr status [--json]    Show usage across all configured providers (non-interactive)
+  sr recover list [--json] [--query TEXT] [--limit N]
+                        Find interrupted local Claude sessions and task artifacts
+  sr recover show --session ID [--json]
+  sr recover prompt --session ID [--task ID]
   sr sessions [--all] [--json]
                         List pooled Claude/Codex sessions, the account serving each
                         one now with its 5h/weekly limits, and past account switches
@@ -289,7 +293,11 @@ type srUsageRow struct {
 	keyFingerprint    string
 	assignedSessions  int
 	sessionsKnown     bool
-	email             string
+	// email retains the saved selector; displayAccount is the human account name.
+	email string
+	// loginEmail is the account's login email when the server reports one;
+	// email may instead hold a stable ID or profile name.
+	loginEmail string
 	// accountID is the server's routing ID for the row, when known.
 	accountID          string
 	active             bool
@@ -359,6 +367,11 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 
 func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	args = normalizeProviderAddArgs(args)
+	// Bare sr prints the status table when a server answers, so `sr --json`
+	// is the machine-readable form of that same view.
+	if len(args) == 1 && args[0] == "--json" {
+		args = []string{"status", "--json"}
+	}
 	// Keep recovery commands available when cloud.json is malformed. Login can
 	// replace it after a successful device flow, while help, doctor, and cleanup
 	// need no valid cloud state to explain or remove the broken installation.
@@ -510,7 +523,7 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	case "import":
 		return r.importActive(ctx)
 	case "list", "ls":
-		return r.list()
+		return r.list(args[1:])
 	case "switch", "use":
 		selector, opts, err := parseSRSwitchArgs(args[1:], srSwitchOptions{})
 		if err != nil {
@@ -535,9 +548,15 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		}
 		return r.remove(ctx, args[1])
 	case "status":
-		return r.status(ctx)
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		return r.status(ctx, opts)
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])
+	case "recover":
+		return runRecoveryCommand(args[1:], r.out)
 	case "codex":
 		return r.codexAccount(ctx, args[1:])
 	case "qwen":
@@ -697,7 +716,7 @@ func (r srRunner) runSelectedRemoteAccountCommand(ctx context.Context, args []st
 
 func shouldRouteSRCommand(command string) bool {
 	switch command {
-	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "help", "-h", "--help":
+	case "server", "servers", "remote", "remotes", "tenant", "tenants", "codex", "claude", "claude-aws", "claude-direct", "spend", "cost", "gemini", "az", "azure", "oai", "openai", "recover", "help", "-h", "--help":
 		return false
 	// Setup, cleanup and doctor act on this machine, never the remote server.
 	case "setup", "cleanup", "daemon", "doctor", "login", "logout", "team", "account", "accounts", "storage", "host", "hosts":
@@ -712,7 +731,25 @@ func (r srRunner) runTeamCredentialCommand(
 	args []string,
 ) (bool, error) {
 	switch args[0] {
-	case "list", "ls", "status", "usage":
+	case "list", "ls":
+		showIDs, err := r.accountListIDs(args[1:])
+		if err != nil {
+			return true, err
+		}
+		if showIDs {
+			return true, r.cloudAccount(ctx, []string{"list"})
+		}
+		return true, r.cloudStatus(ctx)
+	case "status":
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return true, err
+		}
+		if opts.json {
+			return true, r.cloudStatusJSON(ctx)
+		}
+		return true, r.cloudStatus(ctx)
+	case "usage":
 		return true, r.cloudStatus(ctx)
 	case "add":
 		_, _, client, err := loadCloudClient(true)
@@ -789,8 +826,15 @@ func (r srRunner) runRemoteAccountCommand(ctx context.Context, server srServerCo
 	case "add-key", "add-api-key":
 		return r.addKeyToServer(ctx, server, args[1:])
 	case "list", "ls":
-		return r.listServerAccounts(ctx, server)
+		return r.listServerAccounts(ctx, server, args[1:])
 	case "status":
+		opts, err := r.parseStatusArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		if opts.json {
+			return r.serverStatusJSONFor(ctx, server)
+		}
 		return r.serverStatusFor(ctx, server)
 	case "usage":
 		if len(args) > 1 {
@@ -961,9 +1005,9 @@ func (r srRunner) addCodex(ctx context.Context, deviceAuth bool) error {
 		return err
 	}
 	if existed {
-		fmt.Fprintf(r.out, "\nUpdated account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "\nUpdated account: %s\n", account.DisplayName())
 	} else {
-		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "\nAdded account: %s\n", account.DisplayName())
 	}
 	fmt.Fprintln(r.out, "Local Codex auth was left unchanged.")
 	return nil
@@ -1055,9 +1099,9 @@ func (r srRunner) importActive(ctx context.Context) error {
 		return err
 	}
 	if existed {
-		fmt.Fprintf(r.out, "Updated existing account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Updated existing account: %s\n", account.DisplayName())
 	} else {
-		fmt.Fprintf(r.out, "Imported account: %s\n", account.Email)
+		fmt.Fprintf(r.out, "Imported account: %s\n", account.DisplayName())
 	}
 	return nil
 }
@@ -1103,7 +1147,7 @@ func (r srRunner) autoImportIfEmpty(ctx context.Context) error {
 		return imported, importErr
 	})
 	if err == nil && imported {
-		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.Email)
+		fmt.Fprintf(r.out, "Auto-imported active account: %s\n\n", account.DisplayName())
 	}
 	return nil
 }
@@ -1138,7 +1182,21 @@ func (r srRunner) publishActiveSync(ctx context.Context) error {
 	})
 }
 
-func (r srRunner) list() error {
+func (r srRunner) accountListIDs(args []string) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	if len(args) == 1 && args[0] == "--ids" {
+		return true, nil
+	}
+	return false, fmt.Errorf("usage: %s list [--ids]", r.programOrSubrouter())
+}
+
+func (r srRunner) list(args []string) error {
+	showIDs, err := r.accountListIDs(args)
+	if err != nil {
+		return err
+	}
 	all, err := r.store.ListStored()
 	if err != nil {
 		return err
@@ -1151,21 +1209,48 @@ func (r srRunner) list() error {
 		fmt.Fprintln(r.out, "No accounts configured. Run 'subrouter add' to add one.")
 		return nil
 	}
+	duplicateNames := map[string]int{}
+	for _, account := range all {
+		duplicateNames[localAccountNameKey(account)]++
+	}
+	needsIDsHint := false
 	fmt.Fprintln(r.out)
 	for _, account := range all {
 		marker := ""
 		if account.Email == active {
 			marker = " *"
 		}
-		name := displayAccountName(account.Email)
-		if display := account.DisplayName(); display != account.Email {
-			name = display
+		name := localAccountDisplayName(account, showIDs)
+		if duplicateNames[localAccountNameKey(account)] > 1 && !showIDs {
+			needsIDsHint = true
 		}
-		fmt.Fprintf(r.out, "  %s%s (added %s)\n", name, marker, formatDate(account.AddedAt))
+		plan := ""
+		if planType := account.PlanType(); planType != "" {
+			plan = "  " + planType
+		}
+		fmt.Fprintf(r.out, "  %s%s%s (added %s)\n", name, marker, plan, formatDate(account.AddedAt))
 	}
 	fmt.Fprintln(r.out)
+	if needsIDsHint {
+		fmt.Fprintf(r.out, "Some accounts share a display name. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
+	}
 	fmt.Fprintln(r.out, "* = currently active in ~/.codex/auth.json")
 	return nil
+}
+
+func localAccountDisplayName(account accounts.StoredCodexAccount, showID bool) string {
+	name := displayAccountName(account.Email)
+	if display := account.DisplayName(); display != "" && display != account.Email {
+		name = display
+	}
+	if showID && account.Email != "" && account.Email != name {
+		name += " [" + account.Email + "]"
+	}
+	return name
+}
+
+func localAccountNameKey(account accounts.StoredCodexAccount) string {
+	return string(account.ProviderOrDefault()) + "\x00" + strings.ToLower(localAccountDisplayName(account, false))
 }
 
 func (r srRunner) trace(selector string) error {
@@ -1176,7 +1261,7 @@ func (r srRunner) trace(selector string) error {
 	if !ok {
 		return fmt.Errorf("no account found matching %q", selector)
 	}
-	fmt.Fprintf(r.out, "\nOAuth breadcrumbs for %s\n\n", displayAccountName(account.Email))
+	fmt.Fprintf(r.out, "\nOAuth breadcrumbs for %s\n\n", account.DisplayName())
 	if len(account.Breadcrumbs) == 0 {
 		fmt.Fprintln(r.out, "  none")
 		return nil
@@ -1261,14 +1346,21 @@ func appendKV(parts *[]string, key, value string) {
 	*parts = append(*parts, key+"="+strconv.Quote(value))
 }
 
-func (r srRunner) status(ctx context.Context) error {
+func (r srRunner) status(ctx context.Context, opts srStatusOptions) error {
 	config, err := cloudModeConfig()
 	if err != nil {
 		return err
 	}
+	serverStatus := r.serverStatusFor
+	if opts.json {
+		serverStatus = r.serverStatusJSONFor
+	}
 	source := config.EffectiveCredentialSource()
 	switch source {
 	case broker.CredentialSourceTeam:
+		if opts.json {
+			return r.cloudStatusJSON(ctx)
+		}
 		return r.cloudStatus(ctx)
 	case broker.CredentialSourceLegacy:
 		if explicitLocalStateAuthority() {
@@ -1277,7 +1369,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
 		} else if ok {
-			return r.serverStatusFor(ctx, server)
+			return serverStatus(ctx, server)
 		}
 		if !r.useServingAPI {
 			break
@@ -1286,7 +1378,7 @@ func (r srRunner) status(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return r.serverStatusFor(ctx, server)
+		return serverStatus(ctx, server)
 	case broker.CredentialSourceLocal:
 		if explicitLocalStateAuthority() || !r.useServingAPI {
 			break
@@ -1295,7 +1387,10 @@ func (r srRunner) status(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return r.serverStatusFor(ctx, server)
+		return serverStatus(ctx, server)
+	}
+	if opts.json {
+		return r.localStatusJSON(ctx)
 	}
 	if err := printCodexIsolationStatus(r.out, r.store); err != nil {
 		return err
@@ -1353,7 +1448,8 @@ func (r srRunner) statusOne(ctx context.Context, selector string) error {
 	var matches []srUsageRow
 	lower := strings.ToLower(selector)
 	for _, row := range all {
-		if strings.Contains(strings.ToLower(row.email), lower) {
+		if strings.Contains(strings.ToLower(row.email), lower) ||
+			strings.Contains(strings.ToLower(displayUsageAccountName(row)), lower) {
 			matches = append(matches, row)
 		}
 	}
@@ -1382,7 +1478,7 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 	}
 	if target.active {
 		displayUsageRows(r.out, []srUsageRow{*target}, false)
-		fmt.Fprintf(r.out, "Already using recommended account: %s\n", target.email)
+		fmt.Fprintf(r.out, "Already using recommended account: %s\n", displayUsageAccountName(*target))
 		return nil
 	}
 	if err := ensureUsageRowSwitchable(*target); err != nil {
@@ -1392,7 +1488,7 @@ func (r srRunner) pick(ctx context.Context, opts srSwitchOptions) error {
 	if err := r.switchAccount(ctx, target.email, opts); err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Picked recommended account: %s\n", target.email)
+	fmt.Fprintf(r.out, "Picked recommended account: %s\n", displayUsageAccountName(*target))
 	return nil
 }
 
@@ -1404,6 +1500,10 @@ func (r srRunner) defaultInteractive(ctx context.Context, opts srSwitchOptions) 
 	switch config.EffectiveCredentialSource() {
 	case broker.CredentialSourceTeam:
 		return r.cloudStatus(ctx)
+	case broker.CredentialSourceHosted:
+		if !explicitLocalServerTarget() {
+			return r.cloudStatus(ctx)
+		}
 	case broker.CredentialSourceLegacy:
 		if server, ok, err := r.defaultRemoteServer(); err != nil {
 			return err
@@ -1515,7 +1615,7 @@ func (r srRunner) autoSwitchExhaustedActive(ctx context.Context, rows []srUsageR
 	if err := r.switchAccount(ctx, target.email, opts); err != nil {
 		return false, err
 	}
-	fmt.Fprintf(r.out, "Auto-switched to %s because active account %s is exhausted.\n", target.email, active.email)
+	fmt.Fprintf(r.out, "Auto-switched to %s because active account %s is exhausted.\n", displayUsageAccountName(*target), displayUsageAccountName(*active))
 	return true, nil
 }
 
@@ -1568,7 +1668,11 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	var wg sync.WaitGroup
 	for i, account := range all {
 		i, account := i, account
-		rows[i] = srUsageRow{email: account.Email, active: account.Email == active, provider: account.ProviderOrDefault()}
+		display := ""
+		if !account.IsAPIKey() {
+			display = strings.TrimSpace(account.LoginEmail())
+		}
+		rows[i] = srUsageRow{email: account.Email, displayAccount: display, active: account.Email == active, provider: account.ProviderOrDefault()}
 		if account.IsAPIKey() {
 			rowProvider := rows[i].provider
 			rows[i].authMode = accounts.AuthModeAPIKey
@@ -1658,6 +1762,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				rows[i].score = selectacct.Score{AccountID: account.Email, Headroom: 0, ShortHeadroom: 0}
 				return
 			}
+			rows[i].displayAccount = refreshed.LoginEmail()
 			acct := accountFromStored(refreshed)
 			details, err := accounts.FetchCodexUsageDetails(ctx, r.client, acct)
 			if err != nil {
@@ -1970,7 +2075,7 @@ func (r srRunner) switchAccount(ctx context.Context, selector string, opts srSwi
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.out, "Switched to %s\n", activated.Email)
+	fmt.Fprintf(r.out, "Switched to %s\n", activated.DisplayName())
 	for _, result := range syncCodexCompatibleAuth(activated) {
 		if result.Err != nil {
 			fmt.Fprintf(r.errOut, "Warning: %s auth sync failed: %s\n", result.Tool, result.Err)
@@ -2091,7 +2196,7 @@ func (r srRunner) remove(ctx context.Context, selector string) error {
 	if !ok {
 		return fmt.Errorf("account %q changed while it was being removed", accountID)
 	}
-	fmt.Fprintf(r.out, "Removed account: %s\n", account.Email)
+	fmt.Fprintf(r.out, "Removed account: %s\n", account.DisplayName())
 	return nil
 }
 
@@ -2546,6 +2651,7 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			window.Feature = agentclaude.FableFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
+			window.ResetAt = reset
 			seconds := int64(time.Until(reset).Seconds())
 			if seconds < 0 {
 				seconds = 0
@@ -2649,11 +2755,11 @@ func (r srRunner) ensureSwitchableForFreshUsage(ctx context.Context, account acc
 	}
 	cooked, reason := cookedFromWindows(details.Windows)
 	if cooked {
-		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", account.Email, reason)
+		return fmt.Errorf("cannot switch to %s: account is cooked (%s)", account.DisplayName(), reason)
 	}
 	tempCooked, reason := tempCookedFromWindows(details.Windows)
 	if tempCooked {
-		return fmt.Errorf("cannot switch to %s: account is temporarily cooked (%s)", account.Email, reason)
+		return fmt.Errorf("cannot switch to %s: account is temporarily cooked (%s)", account.DisplayName(), reason)
 	}
 	return nil
 }
@@ -2994,7 +3100,7 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		for _, row := range rows {
 			if row.err != nil {
 				fmt.Fprintf(out, "  %s %s: %s%s\n",
-					style(colored, ansiBold+ansiWhite, displayAccountName(row.email)),
+					style(colored, ansiBold+ansiWhite, displayUsageAccountName(row)),
 					style(colored, ansiDim, "["+string(usageProvider(row))+"]"),
 					style(colored, ansiRed, row.err.Error()),
 					style(colored, ansiDim, usageRowErrorHint(row)))
@@ -3098,7 +3204,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	pickWidth := 22
 	windowWidth := 9
 	creditsWidth := 7
-	sparkWidth := 8
 	if termWidth < 100 {
 		accountWidth = 20
 		planWidth = 6
@@ -3199,9 +3304,9 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 			usageGridColumn{Key: "7d", Title: "7d", Width: windowWidth},
 		)
 		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Reset", Title: "1x reset", Width: 8}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Credits", Title: "$", Width: creditsWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark", Title: "Spark", Width: sparkWidth}, termWidth)
-		columns = appendUsageGridColumnIfFits(columns, usageGridColumn{Key: "Spark wk", Title: "Spark wk", Width: sparkWidth}, termWidth)
+		// Codex's credits payload is a provider credit count, not a dollar
+		// amount. Keep it out of the quota table so values such as 62500 are
+		// not presented as "$62500". Use `sr usage` for spend data.
 	}
 
 	extra := termWidth - usageGridWidth(columns)
@@ -3218,7 +3323,6 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 	extra = widenUsageGridColumnForRows(columns, rows, "Opus wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Sonnet wk", extra, 12)
 	extra = widenUsageGridColumnForRows(columns, rows, "Extra", extra, 12)
-	extra = widenUsageGridColumn(columns, "Spark wk", extra, 10)
 	_ = widenUsageGridColumn(columns, "7d", extra, 12)
 	return columns
 }
@@ -3331,8 +3435,6 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"5h":              usageGridProviderShortWindowCell(row),
 		"7d":              usageGridProviderLongWindowCell(row),
 		"Reset":           usageGridResetCell(row),
-		"Spark":           usageGridShortNamedWindowCell(row),
-		"Spark wk":        usageGridNamedWindowCell(row.windows, true),
 		"Credits":         usageGridCreditsCell(row),
 		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
@@ -3534,7 +3636,7 @@ func usageGridProviderShortWindowCell(row srUsageRow) usageGridCell {
 }
 
 func usageGridProviderLongWindowCell(row srUsageRow) usageGridCell {
-	return usageGridWindowCell(row.windows, isLongQuotaWindow)
+	return usageGridWindowCell(row.windows, accountWideWindow(isLongQuotaWindow))
 }
 
 func usageGridResetCell(row srUsageRow) usageGridCell {
@@ -3996,36 +4098,22 @@ func modelScopedWindowLabel(window accounts.UsageWindow) string {
 }
 
 func usageGridShortWindowCell(row srUsageRow) usageGridCell {
-	if longQuotaSaturatedMatching(row.windows, func(window accounts.UsageWindow) bool {
-		return !isSparkWindow(window)
-	}) {
+	if longQuotaSaturated(row.windows) {
 		return usageGridCell{}
 	}
-	return usageGridWindowCell(row.windows, isShortQuotaWindow)
+	return usageGridWindowCell(row.windows, accountWideWindow(isShortQuotaWindow))
 }
 
-func usageGridShortNamedWindowCell(row srUsageRow) usageGridCell {
-	if longQuotaSaturatedMatching(row.windows, isSparkWindow) {
-		return usageGridCell{}
+func accountWideWindow(match func(accounts.UsageWindow) bool) func(accounts.UsageWindow) bool {
+	return func(window accounts.UsageWindow) bool {
+		retiredSpark := strings.Contains(strings.ToLower(windowLabel(window)), "codex-spark")
+		return !isModelScopedWindow(window) && !retiredSpark && match(window)
 	}
-	return usageGridNamedWindowCell(row.windows, false)
-}
-
-func longQuotaSaturatedMatching(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) bool {
-	for _, window := range windows {
-		if isModelScopedWindow(window) {
-			continue
-		}
-		if match(window) && isLongQuotaWindow(window) && clampUsagePercent(window.UsedPercent) >= 100 {
-			return true
-		}
-	}
-	return false
 }
 
 func usageGridWindowCell(windows []accounts.UsageWindow, match func(accounts.UsageWindow) bool) usageGridCell {
 	for _, window := range windows {
-		if match(window) && !isSparkWindow(window) {
+		if match(window) {
 			return usageGridWindowStatusCell(window)
 		}
 	}
@@ -4036,7 +4124,7 @@ func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match fu
 	var selected *accounts.UsageWindow
 	for i := range windows {
 		window := &windows[i]
-		if !match(*window) || isSparkWindow(*window) {
+		if !match(*window) {
 			continue
 		}
 		if selected == nil || window.UsedPercent > selected.UsedPercent ||
@@ -4049,24 +4137,6 @@ func usageGridMostConstrainedWindowCell(windows []accounts.UsageWindow, match fu
 		return usageGridCell{}
 	}
 	return usageGridWindowStatusCell(*selected)
-}
-
-func usageGridNamedWindowCell(windows []accounts.UsageWindow, weekly bool) usageGridCell {
-	for _, window := range windows {
-		name := strings.ToLower(windowLabel(window))
-		if !isSparkWindow(window) {
-			continue
-		}
-		isWeekly := strings.Contains(name, "weekly")
-		if isWeekly == weekly {
-			return usageGridWindowStatusCell(window)
-		}
-	}
-	return usageGridCell{}
-}
-
-func isSparkWindow(window accounts.UsageWindow) bool {
-	return strings.Contains(strings.ToLower(windowLabel(window)), "codex-spark")
 }
 
 func usageGridWindowStatusCell(window accounts.UsageWindow) usageGridCell {
@@ -4095,6 +4165,14 @@ func usageGridCreditsCell(row srUsageRow) usageGridCell {
 			return usageGridCell{Text: "unlimited", Style: ansiGreen}
 		}
 		if row.credits.Balance != "" {
+			// Subscription accounts commonly expose a zero-valued credits
+			// object even though they are billed through their included quota.
+			// Rendering that placeholder as "$0" makes the status table look
+			// like it is reporting spend when it is not. Keep real balances,
+			// including non-zero values from a provider that omits HasCredits.
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(row.credits.Balance), 64); err == nil && parsed == 0 && !row.credits.HasCredits {
+				return usageGridCell{}
+			}
 			return usageGridCell{Text: "$" + row.credits.Balance}
 		}
 	}

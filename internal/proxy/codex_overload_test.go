@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -116,8 +117,8 @@ func TestCodexOverloadFailoverBoundedWhenAllAccountsFail(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-c")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
-		t.Fatalf("status=%d body=%s, want the pool failure passed through", status, body)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("status=%d body=%s, want a retryable capacity failure", status, body)
 	}
 	if got := seen(); len(got) != 4 {
 		t.Fatalf("pool saw %d attempts %v, want first account, one same-account retry, plus 2 switches", len(got), got)
@@ -168,7 +169,7 @@ func TestCodexOverloadFailoverOffByDefault(t *testing.T) {
 	defer proxy.Close()
 
 	status, body := codexEgressPost(t, proxy.URL, "session-e")
-	if status != http.StatusOK || !strings.Contains(body, "server_is_overloaded") {
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "subrouter_capacity_retry") || strings.Contains(body, "server_is_overloaded") {
 		t.Fatalf("status=%d body=%s", status, body)
 	}
 	got := seen()
@@ -245,32 +246,25 @@ func TestCodexOverloadSwitchChargesUsageFailureToSelectedAccount(t *testing.T) {
 		}
 		return recorder.Result()
 	}}
-	transport := codexOverloadFailoverTransport{
-		base: usageLimitRetryTransport{
-			base:              stub,
-			server:            &server,
-			provider:          accounts.ProviderCodex,
-			agent:             "codex",
-			session:           "session-g",
-			account:           "codex-a",
-			accountCredential: "tok-a",
-			method:            http.MethodPost,
-			path:              "/responses",
-			maxAttempts:       3,
-			poolModel:         "gpt-6-astra",
-		},
-		server:    &server,
-		agent:     "codex",
-		session:   "session-g",
-		account:   "codex-a",
-		poolModel: "gpt-6-astra",
-	}
 	body := `{"model":"gpt-6-astra","input":[]}`
 	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.example/backend-api/codex/responses", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Bearer tok-a")
+	transport := upstreamLayers{
+		usageLimit:    &usageLimitRetryTransport{method: http.MethodPost, maxAttempts: 3},
+		codexOverload: &codexOverloadFailoverTransport{},
+	}.build(stub, &upstreamAttempt{
+		server:    &server,
+		provider:  accounts.ProviderCodex,
+		agent:     "codex",
+		session:   "session-g",
+		path:      "/responses",
+		poolModel: "gpt-6-astra",
+		account:   accounts.Account{ID: "codex-a", Provider: accounts.ProviderCodex, CredentialVersion: "tok-a"},
+		getBody:   req.GetBody,
+	})
 	response, err := transport.RoundTrip(req)
 	if err != nil {
 		t.Fatal(err)
@@ -336,6 +330,7 @@ func TestCodexCapacityClassifierRecognizesBodiesOnAnyStatus(t *testing.T) {
 		{"429 json server_overloaded type", 429, "application/json", `{"error":{"type":"server_overloaded","message":"busy"}}`, true},
 		{"400 json at-capacity message", 400, "application/json", `{"error":{"message":"Selected model is at capacity. Please try a different model.","code":null}}`, true},
 		{"400 json temporarily overloaded", 400, "application/json; charset=utf-8", `{"error":{"message":"The engine is temporarily overloaded"}}`, true},
+		{"400 plain at-capacity message", 400, "text/plain", `Selected model is at capacity. Please try a different model.`, true},
 		{"429 json slow_down", 429, "application/json", `{"error":{"code":"slow_down"}}`, true},
 		{"2xx json error body", 200, "application/json", `{"error":{"code":"server_is_overloaded","message":"busy"}}`, true},
 		{"2xx json failed response object", 200, "application/json", `{"object":"response","status":"failed","error":{"code":"slow_down","message":"x"}}`, true},
@@ -620,5 +615,17 @@ func TestCodexEgressReplaysJSONCapacityBody(t *testing.T) {
 	status, body := codexEgressPost(t, proxy.URL, "session-json")
 	if status != http.StatusOK || !strings.Contains(body, "served-from-fra") {
 		t.Fatalf("status=%d body=%s, want the egress to serve after a JSON capacity body", status, body)
+	}
+}
+
+func TestCodexRetryableCapacityWebSocketRerouteUsesBudget(t *testing.T) {
+	server := Server{codexOverloadRerouteCounts: newCodexOverloadReroutes()}
+	for i := 0; i < codexOverloadMaxWebSocketReroutes; i++ {
+		if !server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+			t.Fatalf("retryable reroute %d refused inside budget", i+1)
+		}
+	}
+	if server.codexRetryableCapacityWebSocketReroute(context.Background(), "codex", "session", false) {
+		t.Fatal("retryable reroute allowed past budget")
 	}
 }

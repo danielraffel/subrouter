@@ -69,16 +69,29 @@ type SchedulerRef struct {
 	// by LiveDebitPerRequest per routed request so concurrent traffic spreads
 	// instead of herding onto the snapshot's best account until it cooks.
 	routedSinceRefresh map[string]int
+	// inflight counts physical upstream attempts whose response is still open,
+	// keyed by ScoreKey. Unlike routedSinceRefresh it is instantaneous and is
+	// never cleared by a usage refresh.
+	inflight map[string]int
+	// lastDemand is when a request for each provider was last routed or
+	// turned away for lack of a usable account. Unlike routedSinceRefresh it
+	// survives refreshes, so it answers "is anyone asking right now?".
+	lastDemand map[account.Provider]time.Time
 	// capacityUntil holds capacity (load-shedding) marks per account and
 	// (model, service tier). They are deliberately not an exhaustion overlay:
 	// see capacity.go.
 	capacityUntil map[capacityMarkKey]capacityMark
+	// placement counts where work actually went since process start; it has
+	// its own lock (see placement_stats.go).
+	placement placementStats
 }
 
 func NewSchedulerRef(scheduler Scheduler) *SchedulerRef {
+	now := time.Now()
 	return &SchedulerRef{
 		scheduler: scheduler,
-		updatedAt: time.Now(),
+		updatedAt: now,
+		placement: placementStats{since: now},
 	}
 }
 
@@ -1366,17 +1379,96 @@ func (r *SchedulerRef) finishRefreshLocked(scheduler Scheduler, update bool) {
 }
 
 // NoteRouted records that one request was routed to the account, debiting its
-// live score until the next successful usage refresh.
+// live score until the next successful usage refresh. It also feeds the
+// cumulative routed-request count in PlacementStats.
 func (r *SchedulerRef) NoteRouted(provider account.Provider, accountID string) {
 	if r == nil || accountID == "" {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.routedSinceRefresh == nil {
 		r.routedSinceRefresh = make(map[string]int)
 	}
 	r.routedSinceRefresh[ScoreKey(provider, accountID)]++
+	r.noteDemandLocked(provider, time.Now())
+	r.mu.Unlock()
+	r.noteRoutedStat(provider, accountID)
+}
+
+// NoteUnserved records a request for provider that no account could take.
+// It counts as demand (LastDemand) without debiting any account.
+func (r *SchedulerRef) NoteUnserved(provider account.Provider) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.noteDemandLocked(provider, time.Now())
+}
+
+func (r *SchedulerRef) noteDemandLocked(provider account.Provider, now time.Time) {
+	if r.lastDemand == nil {
+		r.lastDemand = make(map[account.Provider]time.Time)
+	}
+	r.lastDemand[provider] = now
+}
+
+// LastDemand is when a request for provider was last routed (NoteRouted) or
+// turned away (NoteUnserved) by this process; zero if never.
+func (r *SchedulerRef) LastDemand(provider account.Provider) time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastDemand[provider]
+}
+
+// BeginInflight records one physical upstream attempt against an account and
+// returns an idempotent release function. The count spans response-body
+// lifetime, so streamed requests remain visible until EOF or Close.
+func (r *SchedulerRef) BeginInflight(provider account.Provider, accountID string) func() {
+	if r == nil || accountID == "" {
+		return func() {}
+	}
+	key := ScoreKey(provider, accountID)
+	r.mu.Lock()
+	if r.inflight == nil {
+		r.inflight = make(map[string]int)
+	}
+	r.inflight[key]++
+	r.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.inflight[key] <= 1 {
+				delete(r.inflight, key)
+				return
+			}
+			r.inflight[key]--
+		})
+	}
+}
+
+// InflightCounts returns a snapshot of live physical upstream attempts by
+// ScoreKey for Scheduler.WithInflightCounts.
+func (r *SchedulerRef) InflightCounts() map[string]int {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.inflight) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(r.inflight))
+	for key, count := range r.inflight {
+		out[key] = count
+	}
+	return out
 }
 
 // LiveDebits returns the per-account routed-request counts since the last

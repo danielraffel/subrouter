@@ -25,6 +25,7 @@ func codexCapacityPostBody(t *testing.T, proxyURL, body string) (int, string) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(CodexCapacityRetryableHeader, "1")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -122,6 +123,13 @@ func TestCodexCapacityMarkKeepsStickySessionUntilRepeatedFailure(t *testing.T) {
 	}
 	if got := tokens(seen()); got[len(got)-1] != "oauth-token-1" {
 		t.Fatalf("sticky session stayed on an account that kept failing: %v", got)
+	}
+	marked := placementCountersFor(server.SchedulerRef, accounts.ProviderCodex, "codex-account-0")
+	if marked.Evictions != 1 || marked.Placements != 0 || marked.CapacityMarks != 3 {
+		t.Fatalf("account 0 counters = %+v, want 1 eviction, 0 placements, 3 capacity marks", marked)
+	}
+	if got := placementCountersFor(server.SchedulerRef, accounts.ProviderCodex, "codex-account-1"); got.Placements != 8 {
+		t.Fatalf("account 1 placements = %d, want the 8 new sessions", got.Placements)
 	}
 }
 

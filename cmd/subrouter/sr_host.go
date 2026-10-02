@@ -760,6 +760,20 @@ func (r srRunner) hostStatus(ctx context.Context, args []string) error {
 	return nil
 }
 
+func parseHostVisibility(out string) (version, rollout string) {
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch {
+		case strings.HasPrefix(line, "version="):
+			version = strings.TrimPrefix(line, "version=")
+		case strings.HasPrefix(line, "rollout="):
+			rollout = strings.TrimPrefix(line, "rollout=")
+		}
+	}
+	return version, rollout
+}
+
 func parseHostStatus(out string) (installed, health string) {
 	health = "down"
 	scanner := bufio.NewScanner(strings.NewReader(out))
@@ -928,6 +942,8 @@ func hostStatusScript(root string) string {
 		`marker="` + hostVersionMarker + `"`,
 		`if [ -f "$marker" ]; then echo "installed=$(cat "$marker")"; fi`,
 		hostProbeScript(root, 1),
+		`health_json=$(curl -fsS --connect-timeout 5 -m 30 "` + root + `/_subrouter/health" 2>/dev/null || true)`,
+		`if [ -n "$health_json" ]; then printf '%s\n' "$health_json" | sed -n 's/.*"version":"\([^" ]*\)".*/version=\1/p; s/.*"state":"\([^" ]*\)".*"weight":\([0-9][0-9]*\).*/rollout=\1 \2%/p'; fi`,
 	}, "\n")
 }
 
@@ -1009,14 +1025,18 @@ func withHostRoute(line string, view sessionStatusView, marker hostAttachMarker,
 	if !ok || marker.Route != hostRouteTunnel {
 		return line
 	}
-	down := "tunnel from " + marker.Via + " is down (asleep or offline?)"
+	// A working tunnel is the normal case and needs no mention; a failed
+	// lookup behind one is most likely that tunnel's machine asleep or
+	// offline. Data that is merely old (the session sat idle) or a refused
+	// lookup says nothing about the tunnel.
+	down := marker.Via + " tunnel down"
 	switch {
-	case view.Stale && view.AccountID == "":
+	case view.Unreachable && view.AccountID == "":
 		return "sr: pool unreachable · " + down
-	case view.Stale:
+	case view.Unreachable:
 		return line + " · " + down
 	default:
-		return line + " · via " + marker.Via + " tunnel"
+		return line
 	}
 }
 

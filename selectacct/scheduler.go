@@ -32,6 +32,12 @@ type Score struct {
 	ExpiryPressure         float64
 	Sessions               int
 	ModelScores            map[string]Score
+	// MissingModelSupport describes what an omitted model quota bucket means
+	// for this account. The zero value defers to the provider default (see
+	// DefaultMissingModelSupport), so seed, fallback, and exhaustion-mark
+	// scores built without usage telemetry keep the provider's safe meaning.
+	// Adapters with better evidence set Unsupported or Unknown explicitly.
+	MissingModelSupport ModelSupport
 	// Fresh marks a score computed from a successful, current usage fetch, as
 	// opposed to a seed carried forward from the previous scheduler (fetch
 	// failed/stale) or a request-time exhaustion mark. Expiry reconciliation
@@ -46,16 +52,52 @@ type Score struct {
 	ClaudeExtraUsageRemaining float64
 }
 
+// ModelSupport is the provider-normalized meaning of an omitted model quota
+// bucket.
+type ModelSupport uint8
+
+const (
+	// ModelSupportProviderDefault resolves through DefaultMissingModelSupport.
+	ModelSupportProviderDefault ModelSupport = iota
+	// ModelSupportUnsupported excludes the account from a pool it lacks.
+	ModelSupportUnsupported
+	// ModelSupportUnknown keeps the account eligible on its account-level score.
+	ModelSupportUnknown
+)
+
+// DefaultMissingModelSupport is the provider table for scores that do not
+// declare MissingModelSupport. Antigravity omits disabled, unavailable, and
+// sometimes merely unreported buckets, so absence is unknown rather than proof
+// the account cannot serve a pool another account exposed. Other providers
+// treat absence as unsupported.
+func DefaultMissingModelSupport(provider account.Provider) ModelSupport {
+	if provider == account.ProviderAntigravity {
+		return ModelSupportUnknown
+	}
+	return ModelSupportUnsupported
+}
+
+func (s Score) missingModelSupport() ModelSupport {
+	if s.MissingModelSupport != ModelSupportProviderDefault {
+		return s.MissingModelSupport
+	}
+	return DefaultMissingModelSupport(s.Provider)
+}
+
 type Scheduler struct {
 	scores        map[string]Score
 	sessionCounts map[string]int
 	liveDebits    map[string]int
+	inflight      map[string]int
 	// capacity is one (model, tier) pool's consecutive capacity failures per
 	// ScoreKey (WithCapacityMarks). It only reorders candidates.
 	capacity map[string]int
 }
 
-const MinNewSessionHeadroom = 0.40
+const (
+	MinNewSessionHeadroom     = 0.40
+	InflightPenaltyPerRequest = 0.15
+)
 
 // MinStickyRetentionHeadroom is the headroom an account must still have for an
 // idle session to stay on it. It sits far below MinNewSessionHeadroom on
@@ -93,6 +135,7 @@ func (s Scheduler) WithScore(score Score) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)+1),
 		sessionCounts: s.sessionCounts,
 		liveDebits:    s.liveDebits,
+		inflight:      s.inflight,
 		capacity:      s.capacity,
 	}
 	for key, existing := range s.scores {
@@ -107,6 +150,7 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 		scores:        s.scores,
 		sessionCounts: map[string]int{},
 		liveDebits:    s.liveDebits,
+		inflight:      s.inflight,
 		capacity:      s.capacity,
 	}
 	for accountKey, count := range counts {
@@ -129,15 +173,15 @@ func (s Scheduler) ForModel(model string) Scheduler {
 		scores:        make(map[string]Score, len(s.scores)),
 		sessionCounts: s.sessionCounts,
 		liveDebits:    s.liveDebits,
+		inflight:      s.inflight,
 		capacity:      s.capacity,
 	}
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			if score.Provider == account.ProviderAntigravity {
-				// Antigravity omits disabled, unavailable, and sometimes merely
-				// unreported buckets. Absence is unknown, not proof that this
-				// account cannot serve a pool another account happened to expose.
+			if score.missingModelSupport() == ModelSupportUnknown {
+				// Some providers omit unmeasured buckets. Absence is unknown,
+				// not proof that this account cannot serve the pool.
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {
@@ -314,8 +358,8 @@ const spreadWeightFloor = 0.01
 // surplus above the new-session threshold and damped by the number of
 // sessions already assigned there. Surplus weighting drains roomy accounts
 // faster, so the pool converges toward even headroom instead of even request
-// counts; the session damping keeps a lagging snapshot (which still reports
-// a busy account as roomy) from overloading it between refreshes.
+// counts; live in-flight pressure adds a direct short-horizon signal while
+// the existing assignment damping remains unchanged.
 func (s Scheduler) spreadIndex(pool []account.Account) int {
 	weights := make([]float64, len(pool))
 	total := 0.0
@@ -429,32 +473,49 @@ func (s Scheduler) ScoreFor(provider account.Provider, accountID string) Score {
 // draining the snapshot instead of herding every pick onto the same account.
 // Keys are ScoreKey(provider, accountID).
 func (s Scheduler) WithLiveDebits(debits map[string]int) Scheduler {
-	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits, capacity: s.capacity}
+	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: debits, inflight: s.inflight, capacity: s.capacity}
+}
+
+// WithInflightCounts attaches the number of physical upstream attempts whose
+// response is still open for each account. It is a placement-only signal:
+// measured quota still controls exhaustion, sticky retention and paid-fallback
+// tiering.
+func (s Scheduler) WithInflightCounts(counts map[string]int) Scheduler {
+	return Scheduler{scores: s.scores, sessionCounts: s.sessionCounts, liveDebits: s.liveDebits, inflight: counts, capacity: s.capacity}
 }
 
 func (s Scheduler) score(provider account.Provider, accountID string) Score {
 	score := s.measuredScore(provider, accountID)
-	if count := s.liveDebits[ScoreKey(provider, accountID)]; count > 0 {
-		// A soft, self-correcting signal: it reorders picks and can push an
-		// account below the new-session threshold, but never onto (or off of)
-		// the exhaustion floor: routing our own optimism into an account is
-		// recoverable; falsely marking it exhausted, or resurrecting a
-		// genuinely exhausted one, is not.
-		debit := LiveDebitPerRequest * float64(count)
-		if score.Headroom > 0.01 {
-			score.Headroom = math.Max(0.01, score.Headroom-debit)
-		}
-		if score.ShortHeadroom > 0.01 {
-			score.ShortHeadroom = math.Max(0.01, score.ShortHeadroom-debit)
-		}
-		score.WeeklySurplus = math.Max(0, score.WeeklySurplus-debit)
-		// Surplus only admits an account whose short window is above the
-		// floor; re-check it after the debit. A reported short window
-		// always has a reset time once it is in use; Codex's weekly-only
-		// shape has none, and there ShortHeadroom is the weekly reading.
-		if score.ShortResetAfterSeconds > 0 && score.ShortHeadroom < MinNewSessionHeadroom {
-			score.WeeklySurplus = 0
-		}
+	key := ScoreKey(provider, accountID)
+	if count := s.liveDebits[key]; count > 0 {
+		score = applyPlacementPenalty(score, LiveDebitPerRequest*float64(count))
+	}
+	if count := s.inflight[key]; count > 0 {
+		score = applyPlacementPenalty(score, InflightPenaltyPerRequest*float64(count))
+	}
+	return score
+}
+
+// applyPlacementPenalty is deliberately soft. Live load may steer a new pick
+// below the admission threshold, but it cannot create or clear exhaustion.
+// Those decisions require measured quota or an authoritative upstream mark.
+func applyPlacementPenalty(score Score, penalty float64) Score {
+	if penalty <= 0 {
+		return score
+	}
+	if score.Headroom > 0.01 {
+		score.Headroom = math.Max(0.01, score.Headroom-penalty)
+	}
+	if score.ShortHeadroom > 0.01 {
+		score.ShortHeadroom = math.Max(0.01, score.ShortHeadroom-penalty)
+	}
+	score.WeeklySurplus = math.Max(0, score.WeeklySurplus-penalty)
+	// Surplus only admits an account whose short window is above the floor;
+	// re-check it after a live-load penalty. A reported short window always
+	// has a reset time once it is in use; Codex's weekly-only shape has none,
+	// and there ShortHeadroom is the weekly reading.
+	if score.ShortResetAfterSeconds > 0 && score.ShortHeadroom < MinNewSessionHeadroom {
+		score.WeeklySurplus = 0
 	}
 	return score
 }

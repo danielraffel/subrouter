@@ -25,7 +25,9 @@ type hostFakeHost struct {
 	reachable map[string]bool // pool roots the host reaches directly
 	portBusy  bool            // something already answers on the host port
 	loaded    bool            // the tunnel LaunchAgent is loaded
-	cmuxList  string          // cmux workspace list --json output
+	cmuxList  string          // workspace list --json for the one default window
+	// cmuxWindows maps window id -> workspace list --json; overrides cmuxList.
+	cmuxWindows map[string]string
 }
 
 func (h *hostFakeHost) Run(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -84,7 +86,18 @@ func (h *hostFakeHost) Output(_ context.Context, name string, args []string) ([]
 	h.calls = append(h.calls, append([]string{name}, args...))
 	h.stdins = append(h.stdins, "")
 	if name == "cmux" {
-		return []byte(h.cmuxList), nil
+		windows := h.cmuxWindows
+		if windows == nil {
+			windows = map[string]string{"w1": h.cmuxList}
+		}
+		if args[0] == "list-windows" {
+			ids := make([]string, 0, len(windows))
+			for id := range windows {
+				ids = append(ids, `{"id":"`+id+`"}`)
+			}
+			return []byte("[" + strings.Join(ids, ",") + "]"), nil
+		}
+		return []byte(windows[args[len(args)-1]]), nil
 	}
 	if name == "launchctl" && args[0] == "print" && h.loaded {
 		return []byte("state = running"), nil
@@ -143,6 +156,13 @@ func setupHostTest(t *testing.T, serverURL string) (srRunner, *hostFakeHost, *by
 	fake := &hostFakeHost{reachable: map[string]bool{}}
 	var out bytes.Buffer
 	return srRunner{store: store, out: &out, errOut: &out, cmd: fake}, fake, &out, agents
+}
+
+func TestParseHostVisibility(t *testing.T) {
+	version, rollout := parseHostVisibility("health=ok\nversion=v0.1.141\nrollout=canary 25%\n")
+	if version != "v0.1.141" || rollout != "canary 25%" {
+		t.Fatalf("visibility = %q, %q", version, rollout)
+	}
 }
 
 func TestHostAttachFallsBackToTunnelForLoopbackPool(t *testing.T) {
@@ -439,16 +459,26 @@ func TestWithHostRouteNamesTheTunnel(t *testing.T) {
 	marker := hostAttachMarker{Pool: "lawrence", Route: hostRouteTunnel, Via: "Air-Blue"}
 	live := sessionStatusView{AccountID: "a1", Label: "bob@example.com"}
 	line := renderSessionStatus(live, time.Now())
-	if got := withHostRoute(line, live, marker, true); got != line+" · via Air-Blue tunnel" {
+	if got := withHostRoute(line, live, marker, true); got != line {
 		t.Fatalf("live = %q", got)
 	}
-	down := sessionStatusView{Stale: true}
-	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · tunnel from Air-Blue is down (asleep or offline?)" {
+	down := sessionStatusView{Stale: true, Unreachable: true}
+	if got := withHostRoute(renderSessionStatus(down, time.Now()), down, marker, true); got != "sr: pool unreachable · Air-Blue tunnel down" {
 		t.Fatalf("down = %q", got)
 	}
-	stale := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true}
-	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); !strings.HasSuffix(got, "tunnel from Air-Blue is down (asleep or offline?)") {
+	stale := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true, Unreachable: true}
+	if got := withHostRoute("sr: bob@example.com · (stale)", stale, marker, true); got != "sr: bob@example.com · (stale) · Air-Blue tunnel down" {
 		t.Fatalf("stale = %q", got)
+	}
+	// Data that is only old because the session sat idle, or a lookup the
+	// server refused, says nothing about the tunnel.
+	idle := sessionStatusView{AccountID: "a1", Label: "bob@example.com", Stale: true, StaleNote: "account 6m old"}
+	if got := withHostRoute("sr: bob@example.com · account 6m old", idle, marker, true); got != "sr: bob@example.com · account 6m old" {
+		t.Fatalf("idle = %q", got)
+	}
+	refused := sessionStatusView{Stale: true, Denied: true}
+	if got := withHostRoute("sr: account unknown (server refused the session lookup)", refused, marker, true); got != "sr: account unknown (server refused the session lookup)" {
+		t.Fatalf("refused = %q", got)
 	}
 	direct := hostAttachMarker{Route: hostRouteDirect, Via: "Air-Blue"}
 	if got := withHostRoute(line, live, direct, true); got != line {

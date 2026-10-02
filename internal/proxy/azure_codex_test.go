@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -313,11 +314,8 @@ func TestAzureCodexFallbackResponseIsNotAttributedToPoolAccount(t *testing.T) {
 		server:     &server,
 		sessionKey: "codex\x00session-1",
 		accountID:  "pool@example.com",
-		replayBody: func() ([]byte, bool) {
-			return []byte(`{"model":"gpt-5.6-codex","input":[]}`), true
-		},
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{}`))
+	req, err := http.NewRequest(http.MethodPost, "https://pool.example/responses", strings.NewReader(`{"model":"gpt-5.6-codex","input":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1468,7 +1466,6 @@ func TestAzureCodexStreamQuotaMarksTheAccountThatProducedTheResponse(t *testing.
 		server:     &server,
 		sessionKey: "codex\x00session-routed-quota",
 		accountID:  "initial-account",
-		replayBody: func() ([]byte, bool) { return body, true },
 	}
 
 	response, err := transport.RoundTrip(request)
@@ -1802,6 +1799,83 @@ func TestAzureCodexStreamFailureIgnoresNon2xxStreams(t *testing.T) {
 		got, _ := io.ReadAll(replaced.Body)
 		if string(got) != body {
 			t.Fatalf("status %d: body not preserved: %q", status, got)
+		}
+	}
+}
+
+// After the sealed items are dropped, a usage-limit failover to another
+// account must carry the repaired body. It used to rebuild from the
+// client's original request, send the sealed blob again, and hand the
+// client a 400 while a healthy account remained.
+func TestFailoverAfterSealedRepairKeepsRepairedBody(t *testing.T) {
+	var mu sync.Mutex
+	type attempt struct{ auth, body string }
+	var attempts []attempt
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		attempts = append(attempts, attempt{auth: r.Header.Get("Authorization"), body: string(body)})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(string(body), `"encrypted_content":"`):
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"The encrypted content for item rs_1 could not be verified.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}`)
+		case strings.Contains(r.Header.Get("Authorization"), "oauth-token-0"):
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)
+		default:
+			_, _ = io.WriteString(w, `{"id":"resp_second_account"}`)
+		}
+	}))
+	defer pool.Close()
+	poolURL, err := url.Parse(pool.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, azureURL := azureCodexTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the request went to Azure instead of another pool account")
+	})
+	server := azureCodexFallbackServer(t, azureURL, poolURL, 2)
+	// Start on account 0 so the repair happens before the failover. Account 1
+	// sits below MinNewSessionHeadroom: at 0.5 both accounts shared the
+	// placement spread band and the first pick was random, so the request
+	// sometimes started on account 1 and never failed over. It is still a
+	// failover candidate.
+	server.Scheduler = selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: "codex-account-0", Headroom: 1, ShortHeadroom: 1},
+		{AccountID: "codex-account-1", Headroom: 0.2, ShortHeadroom: 0.2},
+	})
+	proxy := httptest.NewServer(server.Handler())
+	defer proxy.Close()
+
+	conversation := `{"model":"gpt-5.6-codex","session_id":"returned-then-limited","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"carry on"}]},` +
+		`{"type":"reasoning","id":"rs_1","encrypted_content":"sealed-by-azure","summary":[]}` +
+		`]}`
+	response, err := http.Post(proxy.URL+"/responses", "application/json", strings.NewReader(conversation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	mu.Lock()
+	seen := append([]attempt(nil), attempts...)
+	mu.Unlock()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp_second_account") {
+		t.Fatalf("status = %d, body = %s, want the second account to serve the repaired request; attempts = %+v", response.StatusCode, body, seen)
+	}
+	// Sealed on account 0, repaired on account 0, then failed over to account 1.
+	wantAuth := []string{"oauth-token-0", "oauth-token-0", "oauth-token-1"}
+	if len(seen) != len(wantAuth) {
+		t.Fatalf("attempts = %+v, want %d", seen, len(wantAuth))
+	}
+	for i, a := range seen {
+		if !strings.Contains(a.auth, wantAuth[i]) {
+			t.Fatalf("attempt %d auth = %q, want %s", i, a.auth, wantAuth[i])
+		}
+		if i > 0 && strings.Contains(a.body, `"encrypted_content":"`) {
+			t.Fatalf("a retry after the repair resent the sealed item (auth %q)", a.auth)
 		}
 	}
 }
