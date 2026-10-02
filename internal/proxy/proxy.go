@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -9827,10 +9828,16 @@ func (t usageLimitRetryTransport) logCodexUnusableResponse(response *http.Respon
 
 // codexRateLimitHeaderFields returns the x-codex-* rate-limit headers, which
 // carry only usage percentages, window lengths, reset times, and limit names.
+// codexRateLimitHeaderPattern matches the documented Codex rate-limit headers
+// (x-codex-primary-used-percent, x-codex-secondary-reset-after-seconds, ...).
+// Any other x-codex-* header is left out of logs: its value is not known to
+// be safe to record.
+var codexRateLimitHeaderPattern = regexp.MustCompile(`^x-codex-(primary|secondary)-(used-percent|window-minutes|reset-after-seconds|reset-at|over-secondary-limit-percent)$`)
+
 func codexRateLimitHeaderFields(header http.Header) []any {
 	var keys []string
 	for key := range header {
-		if strings.HasPrefix(strings.ToLower(key), "x-codex-") {
+		if codexRateLimitHeaderPattern.MatchString(strings.ToLower(key)) {
 			keys = append(keys, key)
 		}
 	}

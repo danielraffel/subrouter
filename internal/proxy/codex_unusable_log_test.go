@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -78,5 +79,26 @@ func TestCodexUnusableResponseLogsReasonWithoutConsumingBody(t *testing.T) {
 				t.Fatalf("diagnostic log includes credentials: %s", got)
 			}
 		})
+	}
+}
+
+// Only the documented rate-limit headers reach the log; any other x-codex-*
+// header could carry a session or credential value.
+func TestCodexRateLimitHeaderFieldsLogsOnlyRateLimitHeaders(t *testing.T) {
+	header := http.Header{}
+	header.Set("X-Codex-Primary-Used-Percent", "100")
+	header.Set("X-Codex-Secondary-Reset-After-Seconds", "3600")
+	header.Set("X-Codex-Session-Token", "secret-value")
+	header.Set("X-Codex-Turn-State", "opaque-state")
+	got := fmt.Sprint(codexRateLimitHeaderFields(header))
+	for _, want := range []string{"x-codex-primary-used-percent", "100", "x-codex-secondary-reset-after-seconds", "3600"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fields %s missing %q", got, want)
+		}
+	}
+	for _, leaked := range []string{"secret-value", "opaque-state", "session-token", "turn-state"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("fields %s include %q", got, leaked)
+		}
 	}
 }
