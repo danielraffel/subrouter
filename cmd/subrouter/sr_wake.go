@@ -171,7 +171,7 @@ func printLocalWakeSummary(out interface{ Write([]byte) (int, error) }, serverUR
 	if scheduled == 0 {
 		fmt.Fprintln(out, "Wake alarms: none scheduled")
 	} else {
-		fmt.Fprintf(out, "Wake alarms: %d scheduled or firing (use 'sr wake list' for details)\n", scheduled)
+		fmt.Fprintf(out, "Wake alarms: %d scheduled or firing (use 'sr auto-resume list' for details)\n", scheduled)
 	}
 }
 

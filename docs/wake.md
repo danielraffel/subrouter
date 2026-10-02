@@ -5,9 +5,10 @@ resumes. `sr wake` remains a backward-compatible alias. The worker schedules
 durable alarms internally, but the user-facing behavior is auto-resume after a
 quota reset or temporary provider-capacity failure.
 
-The worker, alarm store, policy commands, proxy handoff, automatic scheduling, and the
-launchd worker are available on this branch. Fleet enablement remains an
-explicit rollout step after the upgraded proxy is deployed.
+Auto-resume is made of the worker, the alarm store, policy commands, the proxy
+handoff, automatic scheduling, and the launchd worker. On a machine that uses a
+remote pool, the proxy on that pool host must run a version with the recovery
+handoff (`/_subrouter/recovery-status`) for automatic scheduling to work.
 It is disabled by default and must be enabled independently for Codex and
 Claude. The existing cmux/session watcher remains the only component that
 reads a terminal surface or sends a resume action; Subrouter owns quota
