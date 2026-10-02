@@ -590,3 +590,18 @@ func TestClaudeBareResumeOfPooledSession(t *testing.T) {
 		}
 	}
 }
+
+// `sr claude login` must take the same route as `sr add claude --oauth`, so
+// a browser login reaches the pool server instead of only the CLI's store.
+func TestClaudeLoginRoutesLikeAddOAuth(t *testing.T) {
+	for _, tc := range []struct{ in, want []string }{
+		{[]string{"claude", "login", "a@example.com"}, []string{"add", "claude", "a@example.com", "--oauth"}},
+		{[]string{"claude", "login"}, []string{"add", "claude", "--oauth"}},
+		{[]string{"claude", "login", "a@example.com", "--oauth"}, []string{"add", "claude", "a@example.com", "--oauth"}},
+		{[]string{"claude", "list"}, []string{"claude", "list"}},
+	} {
+		if got := normalizeProviderAddArgs(tc.in); strings.Join(got, " ") != strings.Join(tc.want, " ") {
+			t.Fatalf("normalizeProviderAddArgs(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
