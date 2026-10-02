@@ -55,6 +55,10 @@ func (l *localAPIWhois) whois(ctx context.Context, host string) ([]byte, error) 
 	if err == nil || errors.Is(err, errNotTailnetPeer) {
 		return body, err
 	}
+	if ctx.Err() != nil {
+		// A timed-out lookup says nothing about the endpoint; keep it.
+		return nil, err
+	}
 	// Tailscale restarts on a new port with a new token; rediscover once.
 	l.forget()
 	endpoint, discoverErr := l.currentEndpoint(ctx)
