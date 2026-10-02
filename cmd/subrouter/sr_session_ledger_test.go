@@ -796,3 +796,32 @@ func TestUsageRowsReanchorResetsToNow(t *testing.T) {
 		t.Fatalf("ResetAfterSeconds = %d, want about 3600 from ResetAt", got)
 	}
 }
+
+// A pooled session resumed with bare flags goes back through the pool even
+// when a local profile is active: the active profile may be another account
+// whose login has expired.
+func TestClaudeBareResumeOfPooledSession(t *testing.T) {
+	ledger, _ := testLedger(t)
+	if _, _, err := ledger.observe(sessionObservation{
+		Agent: "claude", SessionID: "cfc73f94-128a-4c3d-8e69-2f278ff4fd8b", Server: "local",
+		AccountID: "acct-a", Label: "alice@example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"--resume", "cfc73f94-128a-4c3d-8e69-2f278ff4fd8b"}, true},
+		{[]string{"-r", "cfc73f94-128a-4c3d-8e69-2f278ff4fd8b"}, true},
+		{[]string{"--resume=cfc73f94-128a-4c3d-8e69-2f278ff4fd8b"}, true},
+		{[]string{"--resume", "11111111-2222-3333-4444-555555555555"}, false},
+		{[]string{"--resume"}, false},
+		{[]string{"proxy", "--resume", "cfc73f94-128a-4c3d-8e69-2f278ff4fd8b"}, false},
+		{nil, false},
+	} {
+		if got := claudeBareResumeOfPooledSession(tc.args, ledger); got != tc.want {
+			t.Fatalf("claudeBareResumeOfPooledSession(%v) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
