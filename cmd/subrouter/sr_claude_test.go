@@ -196,6 +196,53 @@ exit 1
 	}
 }
 
+// A re-login where Claude exits cleanly without writing a new credential must
+// fail: auth status still reports the old setup token as logged in, so only a
+// changed credential proves the browser login completed.
+func TestClaudeReloginExitWithoutNewCredentialFails(t *testing.T) {
+	root := t.TempDir()
+	store := claude.Store{Dir: root}
+	if _, err := store.CreateProfile("work@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	configDir := store.ClaudeConfigDir("work@example.com")
+	setupToken := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-setup","expiresAt":4102444800000,"scopes":["user:inference"]}}`
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte(setupToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+if [ "$1" = "/login" ]; then
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"loggedIn":true,"email":"work@example.com"}'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var out bytes.Buffer
+	runner := claudeRunner{store: store, in: strings.NewReader(""), out: &out, errOut: &out}
+	err := runner.run(t.Context(), []string{"login", "work@example.com"})
+	if err == nil || !strings.Contains(err.Error(), "without replacing the existing credential") {
+		t.Fatalf("re-login without a new credential should fail, got %v\n%s", err, out.String())
+	}
+	credential, readErr := store.ReadCredential(t.Context(), configDir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if credential == nil || credential.AccessToken != "sk-ant-oat01-setup" {
+		t.Fatalf("failed re-login must keep the existing credential: %+v", credential)
+	}
+}
+
 func TestClaudeFailedLoginKeepsExistingProfile(t *testing.T) {
 	root := t.TempDir()
 	store := claude.Store{Dir: root}

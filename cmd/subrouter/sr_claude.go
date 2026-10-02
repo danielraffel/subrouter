@@ -1782,8 +1782,14 @@ func (r claudeRunner) env() error {
 // otherwise the pre-existing token would close Claude before the browser flow
 // ran and be re-published unchanged.
 func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string) (error, bool) {
+	// A failed baseline read must not leave the baseline empty: the unchanged
+	// existing token would then look like a fresh login on the first poll.
+	existing, err := r.store.ReadCredential(ctx, claudeConfigDir)
+	if err != nil {
+		return fmt.Errorf("read existing Claude credential: %w", err), false
+	}
 	baselineToken := ""
-	if existing, _ := r.store.ReadCredential(ctx, claudeConfigDir); existing != nil {
+	if existing != nil {
 		baselineToken = existing.AccessToken
 	}
 	if err := cmd.Start(); err != nil {
@@ -1796,6 +1802,18 @@ func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cm
 	for {
 		select {
 		case err := <-done:
+			if err == nil && baselineToken != "" {
+				// Claude exited on its own during a re-login. The profile still
+				// reports logged in with the old credential, so require that the
+				// credential actually changed before treating the login as done.
+				credential, readErr := r.store.ReadCredential(ctx, claudeConfigDir)
+				if readErr != nil {
+					return fmt.Errorf("read Claude credential after login: %w", readErr), false
+				}
+				if credential == nil || credential.AccessToken == "" || credential.AccessToken == baselineToken {
+					return errors.New("Claude exited without replacing the existing credential"), false
+				}
+			}
 			return err, false
 		case <-ctx.Done():
 			err := closeInteractiveProcess(cmd, done)
