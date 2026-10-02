@@ -62,7 +62,7 @@ func (r srRunner) wake(args []string) error {
 	case "worker":
 		return runWakeWorker(args[1:], store, r.out)
 	case "install":
-		return installWakeLaunchd(r.out)
+		return installWakeLaunchd(r.out, r.wakeServerURL())
 	case "uninstall":
 		return uninstallWakeLaunchd(r.out)
 	case "now":
@@ -81,7 +81,7 @@ func (r srRunner) wake(args []string) error {
 			return err
 		}
 		if args[0] == "enable" {
-			if err := ensureWakeLaunchd(r.out); err != nil {
+			if err := ensureWakeLaunchd(r.out, r.wakeServerURL()); err != nil {
 				return err
 			}
 		} else {
@@ -239,7 +239,7 @@ func wakeLaunchdPath() (string, error) {
 	return filepath.Join(home, "Library", "LaunchAgents", wakeLaunchdLabel+".plist"), nil
 }
 
-func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
+func installWakeLaunchd(out interface{ Write([]byte) (int, error) }, serverURL string) error {
 	path, err := wakeLaunchdPath()
 	if err != nil {
 		return err
@@ -259,7 +259,7 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return err
 	}
-	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath)
+	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath, serverURL)
 	if err := os.WriteFile(path, []byte(plist), 0o600); err != nil {
 		return err
 	}
@@ -271,25 +271,39 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	return nil
 }
 
-func ensureWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
+func ensureWakeLaunchd(out interface{ Write([]byte) (int, error) }, serverURL string) error {
 	uid := strconv.Itoa(os.Getuid())
 	if exec.Command("launchctl", "print", "gui/"+uid+"/"+wakeLaunchdLabel).Run() == nil {
 		return nil
 	}
-	return installWakeLaunchd(out)
+	return installWakeLaunchd(out, serverURL)
 }
 
-func wakeLaunchdPlist(executable, stateDir, logDir, cmuxPath string) string {
+// defaultWakeServerURL is the proxy a machine that hosts its own pool serves.
+const defaultWakeServerURL = "http://127.0.0.1:31415"
+
+// wakeServerURL is the pool server whose recovery status the worker follows.
+// A client machine's pool runs on another host; following loopback there
+// would leave its worker waiting on a proxy that does not exist.
+func (r srRunner) wakeServerURL() string {
+	server, ok, err := r.selectedRemoteServer()
+	if err != nil || !ok || strings.TrimSpace(server.URL) == "" {
+		return defaultWakeServerURL
+	}
+	return strings.TrimSuffix(strings.TrimRight(server.URL, "/"), "/v1")
+}
+
+func wakeLaunchdPlist(executable, stateDir, logDir, cmuxPath, serverURL string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>%s</string>
-<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string><string>--cmux</string><string>%s</string></array>
+<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string><string>--cmux</string><string>%s</string><string>--server</string><string>%s</string></array>
 <key>EnvironmentVariables</key><dict><key>SUBROUTER_STATE_DIR</key><string>%s</string></dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
 <key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
 </dict></plist>
-`, wakeLaunchdLabel, plistXMLString(executable), plistXMLString(cmuxPath), plistXMLString(stateDir), plistXMLString(filepath.Join(logDir, "wake-worker.log")), plistXMLString(filepath.Join(logDir, "wake-worker.err.log")))
+`, wakeLaunchdLabel, plistXMLString(executable), plistXMLString(cmuxPath), plistXMLString(serverURL), plistXMLString(stateDir), plistXMLString(filepath.Join(logDir, "wake-worker.log")), plistXMLString(filepath.Join(logDir, "wake-worker.err.log")))
 }
 
 func plistXMLString(value string) string {
@@ -315,7 +329,7 @@ func uninstallWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 }
 
 func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte) (int, error) }) error {
-	once, interval, spacing, cmuxPath, serverURL := false, 15*time.Second, 5*time.Second, "cmux", "http://127.0.0.1:31415"
+	once, interval, spacing, cmuxPath, serverURL := false, 15*time.Second, 5*time.Second, "cmux", defaultWakeServerURL
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--once":
