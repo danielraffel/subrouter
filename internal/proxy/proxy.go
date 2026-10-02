@@ -5279,8 +5279,25 @@ func (s Server) localProxyAuthorized(r *http.Request) bool {
 		return false
 	}
 	got := strings.TrimSpace(authorization[len("Bearer "):])
-	return len(got) == len(token) &&
-		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	if len(got) == len(token) &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
+		return true
+	}
+	return s.tailnetPeerSkipsLocalProxyToken(r)
+}
+
+// tailnetPeerSkipsLocalProxyToken admits a verified tailnet peer that does not
+// carry the local proxy secret. Clients only send that secret to a loopback
+// base URL, so requiring it from a remote peer rejects every one of them; when
+// tailnet authentication is on, the peer's tailnet identity is its credential.
+// A loopback caller never takes this path: it must present the secret, which is
+// what keeps other local processes and web pages off the pool.
+func (s Server) tailnetPeerSkipsLocalProxyToken(r *http.Request) bool {
+	if s.TailnetAuth == nil || r == nil || isLoopbackRemote(r.RemoteAddr) {
+		return false
+	}
+	_, ok := s.authorizeTailnet(r)
+	return ok
 }
 
 func proxyMethodAllowed(method string) bool {

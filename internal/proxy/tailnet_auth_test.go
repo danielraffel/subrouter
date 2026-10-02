@@ -119,3 +119,43 @@ func TestHealthReportsTailnetAuthMode(t *testing.T) {
 		t.Fatalf("account_import = %q, want %q", body.AccountImport, AccountImportEnabled)
 	}
 }
+
+// A server whose cloud config carries a local proxy secret still serves its
+// tailnet peers: clients send that secret only to a loopback base URL, so a
+// remote peer can never present it. A loopback caller and an unverified remote
+// caller must still present it.
+func TestLocalProxyTokenAdmitsVerifiedTailnetPeerOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		remoteAddr string
+		allow      bool
+		bearer     string
+		wantAuth   bool
+	}{
+		{name: "verified tailnet peer", remoteAddr: "100.120.161.125:51000", allow: true, bearer: "subrouter", wantAuth: true},
+		{name: "unverified remote peer", remoteAddr: "192.168.86.60:51000", allow: false, bearer: "subrouter", wantAuth: false},
+		{name: "loopback without secret", remoteAddr: "127.0.0.1:51000", allow: true, bearer: "subrouter", wantAuth: false},
+		{name: "loopback with secret", remoteAddr: "127.0.0.1:51000", allow: false, bearer: "local-secret", wantAuth: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &stubTailnetAuth{identity: tailnet.Identity{LoginName: "daniel@example.com"}, allow: tc.allow}
+			server := Server{LocalProxyToken: "local-secret", TailnetAuth: auth}
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			req.RemoteAddr = tc.remoteAddr
+			req.Header.Set("Authorization", "Bearer "+tc.bearer)
+			if got := server.localProxyAuthorized(req); got != tc.wantAuth {
+				t.Fatalf("localProxyAuthorized = %v, want %v", got, tc.wantAuth)
+			}
+		})
+	}
+}
+
+func TestLocalProxyTokenStillRequiredWithoutTailnetAuth(t *testing.T) {
+	server := Server{LocalProxyToken: "local-secret"}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.RemoteAddr = "100.120.161.125:51000"
+	req.Header.Set("Authorization", "Bearer subrouter")
+	if server.localProxyAuthorized(req) {
+		t.Fatal("a remote caller without the secret was admitted with tailnet auth off")
+	}
+}
