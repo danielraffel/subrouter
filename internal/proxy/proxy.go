@@ -4573,7 +4573,7 @@ func (s Server) proxyHandler() http.Handler {
 				// server log shows nothing at all.
 				s.Logger.Warn("proxy request rejected: missing or stale local proxy secret",
 					"agent", session.ExtractAgentType(r),
-					"session", session.ExtractRoutingID(r),
+					"session", liveSessionHeaderID(r),
 					"path", r.URL.Path,
 					"remote_addr", r.RemoteAddr)
 			}
@@ -5313,7 +5313,7 @@ func (s Server) knownSessionSkipsLocalProxyToken(r *http.Request, presented stri
 		presented != legacyLocalProxyPlaceholder {
 		return false
 	}
-	sessionID := session.ExtractRoutingID(r)
+	sessionID := liveSessionHeaderID(r)
 	if sessionID == "" {
 		return false
 	}
@@ -10694,3 +10694,14 @@ var (
 	outboundWebSocketDialerOnce  sync.Once
 	outboundWebSocketDialerValue *websocket.Dialer
 )
+
+// liveSessionHeaderID reads the session id a request names in its headers,
+// without the body. Live-build stand-in for session.ExtractRoutingID.
+func liveSessionHeaderID(r *http.Request) string {
+	for _, header := range []string{"X-Claude-Code-Session-Id", "X-Claude-Session-ID", "X-Codex-Session-ID", "X-Session-ID", "X-Subrouter-Session"} {
+		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
