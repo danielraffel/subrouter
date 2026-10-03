@@ -62,7 +62,11 @@ func (r srRunner) wake(args []string) error {
 	case "worker":
 		return runWakeWorker(args[1:], store, r.out)
 	case "install":
-		return installWakeLaunchd(r.out, r.wakeServerURL())
+		serverURL, err := r.wakeServerURL()
+		if err != nil {
+			return err
+		}
+		return installWakeLaunchd(r.out, serverURL)
 	case "uninstall":
 		return uninstallWakeLaunchd(r.out)
 	case "now":
@@ -81,7 +85,11 @@ func (r srRunner) wake(args []string) error {
 			return err
 		}
 		if args[0] == "enable" {
-			if err := ensureWakeLaunchd(r.out, r.wakeServerURL()); err != nil {
+			serverURL, err := r.wakeServerURL()
+			if err != nil {
+				return err
+			}
+			if err := ensureWakeLaunchd(r.out, serverURL); err != nil {
 				return err
 			}
 		} else {
@@ -239,31 +247,42 @@ func wakeLaunchdPath() (string, error) {
 	return filepath.Join(home, "Library", "LaunchAgents", wakeLaunchdLabel+".plist"), nil
 }
 
-func installWakeLaunchd(out interface{ Write([]byte) (int, error) }, serverURL string) error {
-	path, err := wakeLaunchdPath()
+// desiredWakeLaunchd returns the worker plist this sr would install.
+func desiredWakeLaunchd(serverURL string) (path, plist string, err error) {
+	path, err = wakeLaunchdPath()
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	cmuxPath, err := exec.LookPath("cmux")
 	if err != nil {
-		return fmt.Errorf("cannot install wake worker: cmux is not executable: %w", err)
+		return "", "", fmt.Errorf("cannot install wake worker: cmux is not executable: %w", err)
 	}
 	logDir := storepath.StateDir()
+	return path, wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath, serverURL), nil
+}
+
+func installWakeLaunchd(out interface{ Write([]byte) (int, error) }, serverURL string) error {
+	path, plist, err := desiredWakeLaunchd(serverURL)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(logDir, 0o700); err != nil {
+	if err := os.MkdirAll(storepath.StateDir(), 0o700); err != nil {
 		return err
 	}
-	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath, serverURL)
 	if err := os.WriteFile(path, []byte(plist), 0o600); err != nil {
 		return err
 	}
 	uid := strconv.Itoa(os.Getuid())
+	// A worker already loaded from an older plist keeps its old arguments
+	// until it is booted out; bootstrap alone would fail on the loaded label.
+	_ = exec.Command("launchctl", "bootout", wakeLaunchdServiceTarget()).Run()
 	if err := exec.Command("launchctl", "bootstrap", "gui/"+uid, path).Run(); err != nil {
 		return fmt.Errorf("wrote %s but launchctl bootstrap failed: %w", path, err)
 	}
@@ -271,12 +290,26 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }, serverURL s
 	return nil
 }
 
+// ensureWakeLaunchd installs the worker unless one is already loaded from
+// exactly the plist this sr would write. A worker installed with other
+// arguments, such as a stale --server, is replaced.
 func ensureWakeLaunchd(out interface{ Write([]byte) (int, error) }, serverURL string) error {
-	uid := strconv.Itoa(os.Getuid())
-	if exec.Command("launchctl", "print", "gui/"+uid+"/"+wakeLaunchdLabel).Run() == nil {
+	path, plist, err := desiredWakeLaunchd(serverURL)
+	if err != nil {
+		return err
+	}
+	current, readErr := os.ReadFile(path)
+	if readErr == nil && string(current) == plist &&
+		exec.Command("launchctl", "print", wakeLaunchdServiceTarget()).Run() == nil {
 		return nil
 	}
 	return installWakeLaunchd(out, serverURL)
+}
+
+// wakeLaunchdServiceTarget names the worker for launchctl print and bootout,
+// which take the domain and label as one gui/<uid>/<label> argument.
+func wakeLaunchdServiceTarget() string {
+	return "gui/" + strconv.Itoa(os.Getuid()) + "/" + wakeLaunchdLabel
 }
 
 // defaultWakeServerURL is the proxy a machine that hosts its own pool serves.
@@ -285,12 +318,17 @@ const defaultWakeServerURL = "http://127.0.0.1:31415"
 // wakeServerURL is the pool server whose recovery status the worker follows.
 // A client machine's pool runs on another host; following loopback there
 // would leave its worker waiting on a proxy that does not exist.
-func (r srRunner) wakeServerURL() string {
+func (r srRunner) wakeServerURL() (string, error) {
 	server, ok, err := r.selectedRemoteServer()
-	if err != nil || !ok || strings.TrimSpace(server.URL) == "" {
-		return defaultWakeServerURL
+	if err != nil {
+		// Falling back to loopback here would install a worker that waits on a
+		// proxy this machine does not run.
+		return "", fmt.Errorf("resolve the pool server for the wake worker: %w", err)
 	}
-	return strings.TrimSuffix(strings.TrimRight(server.URL, "/"), "/v1")
+	if !ok || strings.TrimSpace(server.URL) == "" {
+		return defaultWakeServerURL, nil
+	}
+	return strings.TrimSuffix(strings.TrimRight(server.URL, "/"), "/v1"), nil
 }
 
 func wakeLaunchdPlist(executable, stateDir, logDir, cmuxPath, serverURL string) string {
@@ -319,8 +357,7 @@ func uninstallWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	if err != nil {
 		return err
 	}
-	uid := strconv.Itoa(os.Getuid())
-	_ = exec.Command("launchctl", "bootout", "gui/"+uid, wakeLaunchdLabel).Run()
+	_ = exec.Command("launchctl", "bootout", wakeLaunchdServiceTarget()).Run()
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}

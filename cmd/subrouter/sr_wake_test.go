@@ -12,6 +12,9 @@ import (
 
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/wake"
+	"strconv"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
 
 func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
@@ -386,5 +389,31 @@ func TestLaterSuccessfulRequestCancelsQuotaAlarmWithinFirstMinute(t *testing.T) 
 	}
 	if len(alarms) != 1 || alarms[0].Status != wake.StatusStale {
 		t.Fatalf("resumed session alarm=%+v", alarms)
+	}
+}
+
+// launchctl print and bootout take one gui/<uid>/<label> argument; passing
+// the label separately makes bootout fail and leaves a disabled worker running.
+func TestWakeLaunchdServiceTargetIsOneArgument(t *testing.T) {
+	want := "gui/" + strconv.Itoa(os.Getuid()) + "/" + wakeLaunchdLabel
+	if got := wakeLaunchdServiceTarget(); got != want {
+		t.Fatalf("service target = %q, want %q", got, want)
+	}
+}
+
+// A configured pool server that cannot be resolved is an error, not a reason
+// to install a worker that waits on a loopback proxy this machine lacks.
+func TestWakeServerURLRefusesUnresolvableServer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	t.Setenv("SUBROUTER_SERVER", "no-such-pool")
+	runner := srRunner{program: "sr", store: accounts.DefaultCodexStore()}
+	if url, err := runner.wakeServerURL(); err == nil {
+		t.Fatalf("wakeServerURL = %q, want an error for an unknown server", url)
+	}
+	t.Setenv("SUBROUTER_SERVER", "")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "")
+	if url, err := runner.wakeServerURL(); err != nil || url != defaultWakeServerURL {
+		t.Fatalf("with no server configured: url=%q err=%v, want the local proxy", url, err)
 	}
 }

@@ -358,7 +358,9 @@ func srForProgram(program string, args []string) error {
 }
 
 func srWakeForProgram(args []string) error {
-	runner := srRunner{program: "sr", in: os.Stdin, out: os.Stdout, errOut: os.Stderr}
+	// The store locates the configured pool server, which the wake worker
+	// follows; without it every client fell back to a loopback proxy.
+	runner := srRunner{program: "sr", store: accounts.DefaultCodexStore(), in: os.Stdin, out: os.Stdout, errOut: os.Stderr}
 	return runner.wake(args)
 }
 
