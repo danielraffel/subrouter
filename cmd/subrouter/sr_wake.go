@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -257,9 +258,9 @@ func desiredWakeLaunchd(serverURL string) (path, plist string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	cmuxPath, err := exec.LookPath("cmux")
+	cmuxPath, err := wakeCmuxPath()
 	if err != nil {
-		return "", "", fmt.Errorf("cannot install wake worker: cmux is not executable: %w", err)
+		return "", "", err
 	}
 	logDir := storepath.StateDir()
 	return path, wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath, serverURL), nil
@@ -1028,4 +1029,23 @@ func cancelWake(store *wake.Store, args []string, now time.Time, out interface{ 
 	}
 	fmt.Fprintf(out, "cancelled %s\n", args[0])
 	return nil
+}
+
+// wakeCmuxPath finds the cmux CLI the worker drives. A shell, or a GUI app,
+// often lacks it on PATH, so the standard install locations are tried too.
+func wakeCmuxPath() (string, error) {
+	if path, err := exec.LookPath("cmux"); err == nil {
+		return path, nil
+	}
+	home, _ := os.UserHomeDir()
+	for _, candidate := range []string{
+		filepath.Join(home, ".local", "bin", "cmux"),
+		"/Applications/cmux.app/Contents/Resources/bin/cmux",
+		filepath.Join(home, "Applications", "cmux.app", "Contents", "Resources", "bin", "cmux"),
+	} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("cannot install wake worker: cmux was not found on PATH or in /Applications/cmux.app; install cmux first")
 }
