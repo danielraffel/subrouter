@@ -35,6 +35,11 @@ func (s Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Analytics:   analytics,
 		Enabled:     s.Transcripts != nil && s.Transcripts.Enabled(),
 	}
+	if s.AutoResumeSettingPath != "" {
+		if setting, err := ReadAutoResumeSetting(s.AutoResumeSettingPath); err == nil {
+			data.AutoResume = &setting
+		}
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplate.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -128,6 +133,7 @@ type dashboardData struct {
 	Transcripts []transcript.Summary
 	Analytics   transcript.Analytics
 	Enabled     bool
+	AutoResume  *AutoResumeSetting
 }
 
 var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.FuncMap{
@@ -226,6 +232,20 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       <div class="metric">{{fmtInt .Analytics.Totals.Requests}}</div>
     </div>
   </section>
+  {{with .AutoResume}}
+  <h2 id="auto-resume">Auto-resume</h2>
+  <div class="muted">Types <code>continue</code> or <code>/goal resume</code> into a session after its pool has quota again (Codex also after a temporary provider failure). Applies to every machine using this pool.</div>
+  <form method="post" action="/_subrouter/auto-resume" style="display:inline">
+    <input type="hidden" name="agent" value="claude"><input type="hidden" name="enabled" value="{{if .Claude}}false{{else}}true{{end}}">
+    Claude: <strong>{{if .Claude}}on{{else}}off{{end}}</strong> <button type="submit">Turn {{if .Claude}}off{{else}}on{{end}}</button>
+  </form>
+  &nbsp;&nbsp;
+  <form method="post" action="/_subrouter/auto-resume" style="display:inline">
+    <input type="hidden" name="agent" value="codex"><input type="hidden" name="enabled" value="{{if .Codex}}false{{else}}true{{end}}">
+    Codex: <strong>{{if .Codex}}on{{else}}off{{end}}</strong> <button type="submit">Turn {{if .Codex}}off{{else}}on{{end}}</button>
+  </form>
+  {{end}}
+
   <h2>Usage</h2>
   <section class="charts">
     <div class="panel">

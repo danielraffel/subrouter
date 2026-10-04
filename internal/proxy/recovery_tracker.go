@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"encoding/json"
+	"os"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/manaflow-ai/subrouter/internal/fsutil"
 	"github.com/manaflow-ai/subrouter/wake"
 )
 
@@ -36,10 +39,60 @@ type RecoveryState struct {
 type RecoveryTracker struct {
 	mu    sync.Mutex
 	state map[string]RecoveryState
+	// path, when set, keeps failures and dispatched resumes across a proxy
+	// restart, so a session waiting for quota is still resumed afterwards.
+	path string
 }
 
 func NewRecoveryTracker() *RecoveryTracker {
 	return &RecoveryTracker{state: make(map[string]RecoveryState)}
+}
+
+// recoveryStateRetention bounds what is reloaded: an older failure can no
+// longer schedule a resume.
+const recoveryStateRetention = 8 * time.Hour
+
+// NewRecoveryTrackerAt returns a tracker saved at path. A missing or
+// unreadable file starts empty.
+func NewRecoveryTrackerAt(path string) *RecoveryTracker {
+	t := &RecoveryTracker{state: make(map[string]RecoveryState), path: path}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return t
+	}
+	var saved []RecoveryState
+	if json.Unmarshal(body, &saved) != nil {
+		return t
+	}
+	cutoff := time.Now().UTC().Add(-recoveryStateRetention)
+	for _, s := range saved {
+		if s.Agent == "" || s.SessionID == "" || s.LastActivityAt.Before(cutoff) {
+			continue
+		}
+		t.state[recoveryKey(s.Agent, s.SessionID)] = s
+	}
+	return t
+}
+
+// persistLocked writes the retained state. Errors only cost persistence.
+func (t *RecoveryTracker) persistLocked() {
+	if t.path == "" {
+		return
+	}
+	cutoff := time.Now().UTC().Add(-recoveryStateRetention)
+	out := make([]RecoveryState, 0, len(t.state))
+	for key, s := range t.state {
+		if s.LastActivityAt.Before(cutoff) {
+			delete(t.state, key)
+			continue
+		}
+		out = append(out, s)
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	_ = fsutil.WriteFileAtomic(t.path, body, 0o600)
 }
 
 func (t *RecoveryTracker) RecordCapacityFailure(agent, session, pool string, at time.Time) {
@@ -72,8 +125,14 @@ func (t *RecoveryTracker) RecordSessionSuccess(agent, session string, at time.Ti
 	key := recoveryKey(agent, session)
 	s := t.state[key]
 	s.Agent, s.SessionID = agent, session
+	recovered := !s.LastFailureAt.IsZero() && !s.LastSuccessAt.After(s.LastFailureAt)
 	s.LastActivityAt, s.LastSuccessAt = at.UTC(), at.UTC()
 	t.state[key] = s
+	if recovered {
+		// The first success after a failure cancels its pending resume; a
+		// restart must not forget it. Later successes are not saved.
+		t.persistLocked()
+	}
 }
 
 func (t *RecoveryTracker) RecordGeneration(agent, session string, began bool, requestTokens, responseTokens int64) {
@@ -117,6 +176,7 @@ func (t *RecoveryTracker) RecordReplayDispatch(agent, session, action string, at
 		s.ContinueSent = true
 	}
 	t.state[recoveryKey(agent, session)] = s
+	t.persistLocked()
 }
 
 // RecordReplayResponse closes the pending replay observation window. A
@@ -182,6 +242,7 @@ func (t *RecoveryTracker) record(agent, session, kind, pool string, at, resetAt 
 	}
 	s.Failures++
 	t.state[key] = s
+	t.persistLocked()
 }
 
 func recoveryKey(agent, session string) string { return agent + "\x00" + session }
