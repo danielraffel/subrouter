@@ -45,7 +45,7 @@ import (
 // (sr_auto_resume_prompts.go). Bump it when
 // the resumer gains an ability rules depend on; a newer resumer then takes a
 // Mac over from an older one still running inside a long-lived session.
-const resumerProtocolVersion = 3
+const resumerProtocolVersion = 4
 
 // resumerInterval is how often a resumer checks the proxy and cmux.
 const resumerInterval = 15 * time.Second
@@ -562,6 +562,24 @@ func (r srRunner) autoResumeWhyAt(serverURL string) error {
 		fmt.Fprintln(r.out, "Nothing automatic has happened recently, and nothing is waiting on you.")
 		return nil
 	}
+	// A scorecard first, so how well this is working shows at a glance.
+	answered, resumed, failed := 0, 0, 0
+	for _, p := range reports {
+		switch {
+		case strings.HasPrefix(p.Question, "could not submit"):
+			failed += p.Count
+		case strings.HasPrefix(p.AnsweredBy, "typed "):
+			resumed += p.Count
+		case p.AnsweredBy != "":
+			answered += p.Count
+		}
+	}
+	for _, s := range states {
+		if !s.LastReplayAt.IsZero() && !strings.HasPrefix(s.SessionID, "sr-auto-resume-test-") {
+			resumed++
+		}
+	}
+	fmt.Fprintf(r.out, "Since the pool started: %d prompts answered, %d sessions resumed, %d resumes that failed to submit, %d prompts waiting on you now.\n\n", answered, resumed, failed, waiting)
 	sort.Slice(events, func(i, j int) bool { return events[i].at.After(events[j].at) })
 	if len(events) > 20 {
 		events = events[:20]

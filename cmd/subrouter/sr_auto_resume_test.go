@@ -23,6 +23,7 @@ case "$1" in
   read-screen) echo '$ sr auto-resume test' ;;
   sessions) echo '{"sessions":[]}' ;;
   send) printf '%s' "$4" > "` + fifo + `" ;;
+  send-key) [ "$4" = enter ] && printf '\n' > "` + fifo + `" ;;
 esac
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
