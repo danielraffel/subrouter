@@ -110,10 +110,10 @@ func isClaudeMemoryFile(prompt pendingPrompt) bool {
 	if prompt.File == "MEMORY.md" {
 		return true
 	}
-	for _, line := range prompt.Header {
-		if strings.Contains(line, "/.claude/projects/") && strings.Contains(line, "/memory/") && strings.Contains(line, prompt.File) {
-			return true
-		}
+	// A long path wraps across screen lines, so look at the header joined.
+	joined := unwrapHeader(prompt.Header)
+	if strings.Contains(joined, "/.claude/projects/") && strings.Contains(joined, "/memory/"+prompt.File) {
+		return true
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -354,7 +354,7 @@ func answerPromptAndConfirm(cmuxPath, surface, answer string, prompt pendingProm
 // headerRequestsMemoryEdit reports whether Claude's prompt header asks to edit
 // or write a markdown file in a memory folder, and nothing else.
 func headerRequestsMemoryEdit(header []string) bool {
-	text := strings.Join(header, " ")
+	text := unwrapHeader(header)
 	at := strings.LastIndex(text, "requested permissions to ")
 	if at < 0 {
 		return false
@@ -369,4 +369,33 @@ func headerRequestsMemoryEdit(header []string) bool {
 		}
 	}
 	return false
+}
+
+// unwrapHeader rejoins a prompt header that the terminal wrapped: a line
+// ending in the middle of a path continues on the next. Box-drawing borders
+// and indentation are dropped, words stay separated by spaces.
+func unwrapHeader(header []string) string {
+	var b strings.Builder
+	for _, raw := range header {
+		line := strings.TrimSpace(strings.Trim(strings.TrimSpace(raw), "│|"))
+		if line == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			prev := b.String()
+			// A wrapped path breaks mid-token: no space at the break.
+			if strings.ContainsAny(prev[len(prev)-1:], "/-_.") || strings.HasPrefix(line, "/") && !strings.HasSuffix(prev, " ") && strings.Count(prev[max(0, strings.LastIndex(prev, " ")):], "/") > 0 {
+				b.WriteString(line)
+				continue
+			}
+			lastSpace := strings.LastIndex(prev, " ")
+			if lastSpace < len(prev)-1 && strings.Contains(prev[lastSpace+1:], "/") && !strings.HasSuffix(prev, ".md") {
+				b.WriteString(line)
+				continue
+			}
+			b.WriteString(" ")
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }
