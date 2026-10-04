@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,7 +41,7 @@ import (
 // process on that Mac does.
 
 // resumerProtocolVersion identifies what this resumer can do. Version 2
-// answers Claude memory-file prompts (sr_auto_resume_prompts.go). Bump it when
+// answers permission prompts by the proxy's rules (sr_auto_resume_prompts.go). Bump it when
 // the resumer gains an ability rules depend on; a newer resumer then takes a
 // Mac over from an older one still running inside a long-lived session.
 const resumerProtocolVersion = 2
@@ -108,11 +109,11 @@ func postAutoResume(serverURL, path string, body any, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		message, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return fmt.Errorf("%s: %s %s", path, resp.Status, strings.TrimSpace(string(message)))
 	}
-	if out == nil {
+	if out == nil || resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
@@ -185,7 +186,9 @@ func runResumer(ctx context.Context, serverURL string, out io.Writer) {
 			if err := dispatchDueWakeAlarms(store, serverURL, cmuxPath, 5*time.Second, startedAt, out, scope); err != nil {
 				slog.Debug("auto-resume dispatch", "error", err)
 			}
-			answerClaudeMemoryPrompts(cmuxPath, scope, out)
+			if setting, err := fetchAutoResumeSetting(serverURL); err == nil {
+				answerPrompts(serverURL, cmuxPath, setting, out)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -382,4 +385,199 @@ func (r srRunner) runAutoResumeTest(serverURL, cmuxPath, surface, agent string) 
 	case <-time.After(30 * time.Second):
 		return errors.New("FAIL: nothing was typed into this tab within 30 seconds")
 	}
+}
+
+// autoResumeRules lists, adds, removes or resets the pool's prompt rules:
+//
+//	sr auto-resume rules
+//	sr auto-resume rules add --agent claude --question REGEX --answer 1 [--files claude-memory|GLOB] --note TEXT
+//	sr auto-resume rules remove N
+//	sr auto-resume rules reset
+func (r srRunner) autoResumeRules(args []string) error {
+	serverURL, err := r.wakeServerURL()
+	if err != nil {
+		return err
+	}
+	return r.autoResumeRulesAt(serverURL, args)
+}
+
+func (r srRunner) autoResumeRulesAt(serverURL string, args []string) error {
+	setting, err := fetchAutoResumeSetting(serverURL)
+	if err != nil {
+		return err
+	}
+	rules := setting.EffectivePromptRules()
+	put := func(next []proxy.PromptRule) error {
+		payload, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequest(http.MethodPut, strings.TrimRight(serverURL, "/")+"/_subrouter/auto-resume/rules", bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := autoResumeHTTPClient().Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			message, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			return fmt.Errorf("rules: %s %s", resp.Status, strings.TrimSpace(string(message)))
+		}
+		return nil
+	}
+	if len(args) == 0 {
+		if len(rules) == 0 {
+			fmt.Fprintln(r.out, "No prompt rules: every permission prompt waits for you.")
+			return nil
+		}
+		fmt.Fprintf(r.out, "Prompt rules for the pool at %s (first match wins; anything else waits for you):\n", serverURL)
+		for i, rule := range rules {
+			files := rule.Files
+			if files == "" {
+				files = "any file"
+			}
+			fmt.Fprintf(r.out, "%d. %s: when asked %q about %s, answer %q\n   why: %s\n", i+1, rule.Agent, rule.Question, files, rule.Answer, rule.Note)
+		}
+		return nil
+	}
+	switch args[0] {
+	case "add":
+		var rule proxy.PromptRule
+		for i := 1; i < len(args); i++ {
+			if i+1 >= len(args) {
+				return fmt.Errorf("%s needs a value", args[i])
+			}
+			value := args[i+1]
+			switch args[i] {
+			case "--agent":
+				rule.Agent = value
+			case "--question":
+				rule.Question = value
+			case "--files":
+				rule.Files = value
+			case "--answer":
+				rule.Answer = value
+			case "--note":
+				rule.Note = value
+			default:
+				return fmt.Errorf("unknown option %q", args[i])
+			}
+			i++
+		}
+		if rule.Note == "" {
+			return errors.New("give the rule a --note saying why, so 'sr auto-resume why' can explain what it did")
+		}
+		if err := put(append(rules, rule)); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "added rule %d for every machine using %s\n", len(rules)+1, serverURL)
+	case "remove":
+		n := 0
+		if len(args) == 2 {
+			n, _ = strconv.Atoi(args[1])
+		}
+		if n < 1 || n > len(rules) {
+			return fmt.Errorf("usage: sr auto-resume rules remove N (1-%d)", len(rules))
+		}
+		if err := put(append(append([]proxy.PromptRule{}, rules[:n-1]...), rules[n:]...)); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "removed rule %d\n", n)
+	case "reset":
+		req, err := http.NewRequest(http.MethodDelete, strings.TrimRight(serverURL, "/")+"/_subrouter/auto-resume/rules", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := autoResumeHTTPClient().Do(req)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		fmt.Fprintln(r.out, "prompt rules reset to the defaults")
+	default:
+		return errors.New("usage: sr auto-resume rules [add ...|remove N|reset]")
+	}
+	return nil
+}
+
+// autoResumeWhy explains recent automatic actions across the pool, newest
+// first: each prompt answered and the rule that answered it, each session
+// resumed and the failure that caused it, and each prompt still waiting.
+func (r srRunner) autoResumeWhy() error {
+	serverURL, err := r.wakeServerURL()
+	if err != nil {
+		return err
+	}
+	return r.autoResumeWhyAt(serverURL)
+}
+
+func (r srRunner) autoResumeWhyAt(serverURL string) error {
+	type event struct {
+		at   time.Time
+		text string
+	}
+	var events []event
+	var reports []proxy.PromptReport
+	if err := getAutoResumeJSON(serverURL, "/_subrouter/auto-resume/prompts", &reports); err != nil {
+		return err
+	}
+	waiting := 0
+	for _, p := range reports {
+		where := p.Host + " " + p.Agent + " tab " + p.SurfaceID
+		if p.AnsweredBy != "" {
+			events = append(events, event{p.LastSeen, fmt.Sprintf("answered %q in %s\n    because: %s", p.Question, where, p.AnsweredBy)})
+		} else if time.Since(p.LastSeen) < 2*time.Minute {
+			waiting++
+			events = append(events, event{p.LastSeen, fmt.Sprintf("WAITING ON YOU: %q in %s\n    no rule matches; answer it, or add one with sr auto-resume rules add", p.Question, where)})
+		}
+	}
+	var states []recoveryWireState
+	if err := getAutoResumeJSON(serverURL, "/_subrouter/recovery-status", &states); err == nil {
+		for _, s := range states {
+			if s.LastReplayAt.IsZero() || strings.HasPrefix(s.SessionID, "sr-auto-resume-test-") {
+				continue
+			}
+			cause := "a quota failure"
+			if s.Kind == wake.KindCodexProvider {
+				cause = "a temporary provider failure"
+			}
+			reset := ""
+			if !s.ResetAt.IsZero() {
+				reset = ", quota reset " + s.ResetAt.Local().Format("Jan 2 15:04")
+			}
+			events = append(events, event{s.LastReplayAt, fmt.Sprintf("typed %q into %s session %s\n    because: %s at %s%s, and the session had not run since",
+				s.LastReplayAction, s.Agent, s.SessionID, cause, s.LastFailureAt.Local().Format("Jan 2 15:04"), reset)})
+		}
+	}
+	if len(events) == 0 {
+		fmt.Fprintln(r.out, "Nothing automatic has happened recently, and nothing is waiting on you.")
+		return nil
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].at.After(events[j].at) })
+	if len(events) > 20 {
+		events = events[:20]
+	}
+	for _, e := range events {
+		fmt.Fprintf(r.out, "%s  %s\n", e.at.Local().Format("Jan 2 15:04:05"), e.text)
+	}
+	if waiting == 0 {
+		fmt.Fprintln(r.out, "\nNothing is waiting on you right now.")
+	}
+	fmt.Fprintln(r.out, "Rules: sr auto-resume rules")
+	return nil
+}
+
+func getAutoResumeJSON(serverURL, path string, out any) error {
+	resp, err := autoResumeHTTPClient().Get(strings.TrimRight(serverURL, "/") + path)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: %s", path, resp.Status)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }

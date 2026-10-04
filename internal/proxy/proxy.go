@@ -2233,6 +2233,8 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/recovery-status", s.requireAdmin(s.handleRecoveryStatus))
 	mux.HandleFunc("/_subrouter/auto-resume", s.requireAdmin(s.handleAutoResume))
 	mux.HandleFunc("/_subrouter/auto-resume/test", s.requireAdmin(s.handleAutoResumeTest))
+	mux.HandleFunc("/_subrouter/auto-resume/rules", s.requireAdmin(s.handleAutoResumeRules))
+	mux.HandleFunc("/_subrouter/auto-resume/prompts", s.requireAdmin(s.handleAutoResumePrompts))
 	mux.HandleFunc("/_subrouter/recovery-readiness", s.requireAdmin(s.handleRecoveryReadiness))
 	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))

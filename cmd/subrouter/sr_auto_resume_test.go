@@ -121,3 +121,34 @@ func TestResumerYieldsOnlyToALiveNewerVersion(t *testing.T) {
 		t.Fatalf("claim = %d %d, want this process", v, pid)
 	}
 }
+
+// "Why did that happen?" has an answer: rules list their reasons, and why
+// names the rule behind each answered prompt and flags prompts still waiting.
+func TestAutoResumeRulesAndWhyExplainActions(t *testing.T) {
+	server := autoResumeTestServer(t)
+	t.Setenv("SUBROUTER_SERVER", "")
+	t.Setenv("SUBROUTER_CODEX_SERVER", "")
+	var out bytes.Buffer
+	runner := srRunner{program: "sr", out: &out, errOut: &out}
+	if err := postAutoResume(server.URL, "/_subrouter/auto-resume/prompts", proxy.PromptReport{Host: "m1", Agent: "claude", SurfaceID: "s1", Question: "Do you want to overwrite notes.md?", AnsweredBy: "Claude saving its own memory notes"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := postAutoResume(server.URL, "/_subrouter/auto-resume/prompts", proxy.PromptReport{Host: "m5", Agent: "claude", SurfaceID: "s2", Question: "Do you want to proceed?"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.autoResumeWhyAt(server.URL); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`answered "Do you want to overwrite notes.md?" in m1`, "because: Claude saving its own memory notes", `WAITING ON YOU: "Do you want to proceed?" in m5`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("why output lacks %q:\n%s", want, out.String())
+		}
+	}
+	out.Reset()
+	if err := runner.autoResumeRulesAt(server.URL, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "why: Claude saving its own memory notes") {
+		t.Fatalf("rules output:\n%s", out.String())
+	}
+}

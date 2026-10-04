@@ -23,7 +23,7 @@ import (
 
 func (r srRunner) wake(args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprintln(r.out, "usage: sr auto-resume status|enable <claude|codex>|disable <claude|codex>|watch|test [claude|codex]|list|show <id>|cancel <id>|cancel --all")
+		fmt.Fprintln(r.out, "usage: sr auto-resume status|why|rules|enable <claude|codex>|disable <claude|codex>|watch|test [claude|codex]|list|show <id>|cancel <id>|cancel --all")
 		return nil
 	}
 	// The same alarm file the Mac's resumer uses, so list, show, cancel and
@@ -93,6 +93,10 @@ func (r srRunner) wake(args []string) error {
 		return r.autoResumeWatch()
 	case "test":
 		return r.autoResumeTest(args[1:])
+	case "rules":
+		return r.autoResumeRules(args[1:])
+	case "why":
+		return r.autoResumeWhy()
 	case "policy":
 		return updateWakePolicy(args[1:], r.out)
 	case "early":

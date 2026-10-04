@@ -1081,7 +1081,18 @@ The proxy reports a test session that ran out of quota and has recovered, and th
 
 **Where the rules live.** The proxy decides: it records each session's quota and provider failures, their reset times, and whether the session has since recovered (`internal/proxy/recovery_tracker.go`, served at `/_subrouter/recovery-status`), and it holds the switch (`internal/proxy/auto_resume_setting.go`). The resumer applies the timing rules to that state — how long to wait after a failure, when a reset has passed, when to choose `/goal resume`, the Codex provider backoff — in `syncRecoveryAlarms` in `cmd/subrouter/sr_wake.go`, and types the result in `dispatchDueWakeAlarms`. A new rule that only needs what the proxy already sees belongs in those two places. A rule that needs a new ability on the Mac, such as reading a prompt on screen, also bumps `resumerProtocolVersion` in `cmd/subrouter/sr_auto_resume.go`, so the newer resumer takes over a Mac from an older one still running in a long-lived session.
 
-**Prompt rules.** While Claude auto-resume is on, the resumer also answers one Claude permission prompt: creating or editing a file in Claude's own memory folder (`~/.claude/projects/<project>/memory/`, or `MEMORY.md`). Pooled sessions reach that folder through a symlink, so Claude would otherwise ask every time. Every other prompt still waits for you. Prompt rules live in `cmd/subrouter/sr_auto_resume_prompts.go`; adding one bumps `resumerProtocolVersion`.
+**Prompt rules.** The resumer also answers permission prompts an agent tab is waiting on, by rules kept on the pool's proxy. The default rule answers Claude creating or editing a file in its own memory folder (`~/.claude/projects/<project>/memory/`, or `MEMORY.md`). Pooled sessions reach that folder through a symlink, so Claude would otherwise ask every time. Any prompt no rule matches keeps waiting for you, and it is reported to the proxy so you can see it.
+
+```sh
+sr auto-resume rules                 # the rules in force, each with why it exists
+sr auto-resume rules add --agent claude --question '^Do you want to proceed\?$' --answer 1 --note "why"
+sr auto-resume rules remove 2
+sr auto-resume rules reset           # back to the default rule
+```
+
+A rule matches the prompt's question line (a regular expression), optionally the file it is about (`--files claude-memory`, or a path glob), and sends `--answer`, such as `1` for the first option. Rules change for every machine at once, with no sr update.
+
+**Why did that happen?** `sr auto-resume why` lists recent automatic actions across the pool, newest first. Each shows what was typed or answered, on which machine and tab, and the rule or failure that caused it. Prompts still waiting on you are listed too. The dashboard shows the same under **Auto-resume**.
 
 See [docs/wake.md](docs/wake.md) for more detail.
 

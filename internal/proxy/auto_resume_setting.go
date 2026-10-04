@@ -3,8 +3,11 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +21,46 @@ import (
 type AutoResumeSetting struct {
 	Claude bool `json:"claude"`
 	Codex  bool `json:"codex"`
+	// PromptRules answer permission prompts an agent would otherwise wait on.
+	// Nil means DefaultPromptRules; an empty list means none.
+	PromptRules []PromptRule `json:"prompt_rules,omitempty"`
+}
+
+// PromptRule answers one kind of permission prompt. A prompt that no rule
+// matches keeps waiting for a person, and is reported to the dashboard.
+type PromptRule struct {
+	// Agent is "claude" or "codex".
+	Agent string `json:"agent"`
+	// Question is a regular expression matched against the prompt's question
+	// line, for example `^Do you want to (create|overwrite|make this edit to) .+\.md\?$`.
+	Question string `json:"question"`
+	// Files, when set, also requires the prompt's file to be in that place:
+	// "claude-memory" for ~/.claude/projects/<project>/memory/ (or MEMORY.md),
+	// or a glob matched against the file's full path.
+	Files string `json:"files,omitempty"`
+	// Answer is the key sent to the tab, such as "1" for the first option.
+	Answer string `json:"answer"`
+	// Note says why the rule exists.
+	Note string `json:"note,omitempty"`
+}
+
+// DefaultPromptRules are the rules a pool has before anyone changes them.
+func DefaultPromptRules() []PromptRule {
+	return []PromptRule{{
+		Agent:    "claude",
+		Question: `^Do you want to (create|overwrite|make this edit to|make these edits to) \S+\?$`,
+		Files:    "claude-memory",
+		Answer:   "1",
+		Note:     "Claude saving its own memory notes; pooled sessions reach that folder through a symlink, so Claude asks every time.",
+	}}
+}
+
+// EffectivePromptRules returns the rules in force.
+func (s AutoResumeSetting) EffectivePromptRules() []PromptRule {
+	if s.PromptRules == nil {
+		return DefaultPromptRules()
+	}
+	return s.PromptRules
 }
 
 // Enabled reports the switch for an agent ("claude" or "codex").
@@ -88,6 +131,7 @@ func (s Server) handleAutoResume(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		setting.PromptRules = setting.EffectivePromptRules()
 		writeJSON(w, setting)
 	case http.MethodPost:
 		agent, enabled, form := "", false, false
@@ -154,4 +198,141 @@ func (s Server) handleAutoResumeTest(w http.ResponseWriter, r *http.Request) {
 	// Failed two minutes ago and already reset, so the resume is due now.
 	s.Recovery.RecordQuotaFailure(body.Agent, body.SessionID, kind, "test", now.Add(-2*time.Minute), now.Add(-3*time.Minute))
 	writeJSON(w, map[string]string{"agent": body.Agent, "session_id": body.SessionID, "kind": kind})
+}
+
+func writeAutoResumeRules(path string, rules []PromptRule) (AutoResumeSetting, error) {
+	autoResumeSettingMu.Lock()
+	defer autoResumeSettingMu.Unlock()
+	setting, err := ReadAutoResumeSetting(path)
+	if err != nil {
+		return setting, err
+	}
+	for _, rule := range rules {
+		if rule.Agent != "claude" && rule.Agent != "codex" {
+			return setting, errors.New("each rule needs agent claude or codex")
+		}
+		if _, err := regexp.Compile(rule.Question); err != nil || rule.Question == "" {
+			return setting, fmt.Errorf("rule question %q is not a valid regular expression", rule.Question)
+		}
+		if rule.Answer == "" {
+			return setting, errors.New("each rule needs an answer")
+		}
+	}
+	if rules == nil {
+		rules = []PromptRule{}
+	}
+	setting.PromptRules = rules
+	body, err := json.MarshalIndent(setting, "", "  ")
+	if err != nil {
+		return setting, err
+	}
+	return setting, fsutil.WriteFileAtomic(path, append(body, '\n'), 0o600)
+}
+
+// handleAutoResumeRules replaces the prompt rules (PUT, JSON list), or
+// restores the defaults (DELETE).
+func (s Server) handleAutoResumeRules(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(s.AutoResumeSettingPath) == "" {
+		http.Error(w, "auto-resume is not configured on this server", http.StatusNotFound)
+		return
+	}
+	var rules []PromptRule
+	switch r.Method {
+	case http.MethodPut:
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&rules); err != nil {
+			http.Error(w, "invalid rules", http.StatusBadRequest)
+			return
+		}
+	case http.MethodDelete:
+		rules = DefaultPromptRules()
+	default:
+		w.Header().Set("Allow", "PUT, DELETE")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	setting, err := writeAutoResumeRules(s.AutoResumeSettingPath, rules)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, setting.EffectivePromptRules())
+}
+
+// PromptReport is one permission prompt a resumer saw in an agent tab.
+type PromptReport struct {
+	Host      string `json:"host"`
+	Agent     string `json:"agent"`
+	SurfaceID string `json:"surface_id"`
+	Question  string `json:"question"`
+	File      string `json:"file,omitempty"`
+	// AnsweredBy is the note of the rule that answered it; empty while the
+	// prompt is waiting for a person.
+	AnsweredBy string    `json:"answered_by,omitempty"`
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
+	Count      int       `json:"count"`
+}
+
+// promptReports keeps the most recent reports for the dashboard.
+type promptReports struct {
+	mu      sync.Mutex
+	reports []PromptReport
+}
+
+var recentPrompts = &promptReports{}
+
+const maxPromptReports = 200
+
+func (p *promptReports) add(report PromptReport) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now().UTC()
+	for i := range p.reports {
+		r := &p.reports[i]
+		if r.Host == report.Host && r.SurfaceID == report.SurfaceID && r.Question == report.Question && r.AnsweredBy == report.AnsweredBy {
+			r.LastSeen, r.Count = now, r.Count+1
+			return
+		}
+	}
+	report.FirstSeen, report.LastSeen, report.Count = now, now, 1
+	p.reports = append(p.reports, report)
+	if len(p.reports) > maxPromptReports {
+		p.reports = p.reports[len(p.reports)-maxPromptReports:]
+	}
+}
+
+func (p *promptReports) list() []PromptReport {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := append([]PromptReport(nil), p.reports...)
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
+	return out
+}
+
+// handleAutoResumePrompts takes a resumer's report (POST) or lists recent
+// reports (GET), so prompts blocking any tab on any machine show up in one
+// place.
+func (s Server) handleAutoResumePrompts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, recentPrompts.list())
+	case http.MethodPost:
+		var report PromptReport
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&report); err != nil || report.Question == "" {
+			http.Error(w, "invalid prompt report", http.StatusBadRequest)
+			return
+		}
+		recentPrompts.add(report)
+		if s.Logger != nil {
+			if report.AnsweredBy == "" {
+				s.Logger.Warn("agent waiting on a prompt no rule answers", "host", report.Host, "agent", report.Agent, "surface", report.SurfaceID, "question", report.Question)
+			} else {
+				s.Logger.Info("prompt answered by rule", "host", report.Host, "agent", report.Agent, "question", report.Question, "rule", report.AnsweredBy)
+			}
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
