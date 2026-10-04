@@ -1,0 +1,383 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/proxy"
+	"github.com/manaflow-ai/subrouter/wake"
+)
+
+// Auto-resume runs in two places:
+//
+//   - The pool's proxy decides. It records quota and provider failures per
+//     session (internal/proxy/recovery_tracker.go), serves them at
+//     /_subrouter/recovery-status, and holds the pool-wide on/off switch at
+//     /_subrouter/auto-resume.
+//   - One resumer per Mac acts. It runs inside any `sr claude`, `sr codex` or
+//     `sr auto-resume watch` process, finds each session's cmux tab, and types
+//     `continue` or `/goal resume` when the proxy's state says the session can
+//     go on (the timing rules are in syncRecoveryAlarms in sr_wake.go).
+//
+// No LaunchAgent is involved: a resumer lives exactly as long as some sr
+// process on that Mac does.
+
+// resumerProtocolVersion identifies what this resumer can do. Bump it when
+// the resumer gains an ability rules depend on; a newer resumer then takes a
+// Mac over from an older one still running inside a long-lived session.
+const resumerProtocolVersion = 1
+
+// resumerInterval is how often a resumer checks the proxy and cmux.
+const resumerInterval = 15 * time.Second
+
+// wakeScope supplies what a resume pass needs beyond the alarm store.
+type wakeScope struct {
+	// enabled reports the pool-wide switch for an agent.
+	enabled func(agent string) (bool, error)
+	// testBinding, when set, ties one test session to a cmux tab directly,
+	// so `sr auto-resume test` needs no live agent.
+	testBinding *cmuxSessionWire
+}
+
+func (s wakeScope) boundSession(agent, sessionID string) (cmuxSessionWire, bool) {
+	if s.testBinding != nil && s.testBinding.Agent == agent && s.testBinding.SessionID == sessionID {
+		return *s.testBinding, true
+	}
+	return cmuxSessionWire{}, false
+}
+
+// fleetWakeScope reads the pool-wide switch from the proxy once per pass.
+func fleetWakeScope(serverURL string) wakeScope {
+	var (
+		loaded  bool
+		setting proxy.AutoResumeSetting
+		loadErr error
+	)
+	return wakeScope{enabled: func(agent string) (bool, error) {
+		if !loaded {
+			setting, loadErr = fetchAutoResumeSetting(serverURL)
+			loaded = true
+		}
+		return setting.Enabled(agent), loadErr
+	}}
+}
+
+func autoResumeHTTPClient() *http.Client { return &http.Client{Timeout: 5 * time.Second} }
+
+func fetchAutoResumeSetting(serverURL string) (proxy.AutoResumeSetting, error) {
+	var setting proxy.AutoResumeSetting
+	resp, err := autoResumeHTTPClient().Get(strings.TrimRight(serverURL, "/") + "/_subrouter/auto-resume")
+	if err != nil {
+		return setting, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return setting, fmt.Errorf("the pool server at %s has no auto-resume support; update it", serverURL)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return setting, fmt.Errorf("auto-resume setting: %s", resp.Status)
+	}
+	return setting, json.NewDecoder(resp.Body).Decode(&setting)
+}
+
+func postAutoResume(serverURL, path string, body any, out any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := autoResumeHTTPClient().Post(strings.TrimRight(serverURL, "/")+path, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s: %s %s", path, resp.Status, strings.TrimSpace(string(message)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// autoResumeDir holds the per-Mac resumer's lock and alarms. It is fixed
+// under the home directory, so every sr on the Mac agrees on it whatever
+// SUBROUTER_STATE_DIR each process was given.
+func autoResumeDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".subrouter", "auto-resume")
+	return dir, os.MkdirAll(dir, 0o700)
+}
+
+// runResumer acts as this Mac's resumer while ctx lasts. Only one process
+// per Mac acts at a time: the holder of an exclusive lock. A process with a
+// newer resumerProtocolVersion records itself as wanted, and an older holder
+// then steps aside.
+func runResumer(ctx context.Context, serverURL string, out io.Writer) {
+	dir, err := autoResumeDir()
+	if err != nil {
+		slog.Warn("auto-resume: no state directory", "error", err)
+		return
+	}
+	cmuxPath, err := wakeCmuxPath()
+	if err != nil {
+		slog.Debug("auto-resume: cmux not found; this process will not resume sessions", "error", err)
+		return
+	}
+	store := wake.NewStore(filepath.Join(dir, "alarms.json"))
+	lockPath := filepath.Join(dir, "resumer.lock")
+	wantPath := filepath.Join(dir, "resumer.want")
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	startedAt := time.Now().UTC()
+	initial := true
+	lastReadiness := time.Time{}
+	ticker := time.NewTicker(resumerInterval)
+	defer ticker.Stop()
+	for {
+		claimResumerWant(wantPath)
+		if release != nil && newerResumerWanted(wantPath) {
+			release()
+			release = nil
+		}
+		if release == nil && !newerResumerWanted(wantPath) {
+			if unlock, err := wake.AcquireWorkerLock(lockPath); err == nil {
+				release = unlock
+				initial = true
+			}
+		}
+		if release != nil {
+			scope := fleetWakeScope(serverURL)
+			if err := syncRecoveryAlarms(store, serverURL, cmuxPath, startedAt, initial, scope); err != nil {
+				slog.Debug("auto-resume pass", "error", err)
+			} else {
+				initial = false
+			}
+			if time.Since(lastReadiness) >= time.Minute {
+				lastReadiness = time.Now()
+				_ = accelerateRecoveredQuotaAlarms(store, serverURL, lastReadiness, scope)
+			}
+			if err := dispatchDueWakeAlarms(store, serverURL, cmuxPath, 5*time.Second, startedAt, out, scope); err != nil {
+				slog.Debug("auto-resume dispatch", "error", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// claimResumerWant records this process when it is newer than the one
+// recorded, or when the recorded process has exited.
+func claimResumerWant(path string) {
+	version, pid := readResumerWant(path)
+	if version > resumerProtocolVersion && processAlive(pid) {
+		return
+	}
+	if version == resumerProtocolVersion && processAlive(pid) {
+		return
+	}
+	_ = os.WriteFile(path, []byte(fmt.Sprintf("%d %d\n", resumerProtocolVersion, os.Getpid())), 0o600)
+}
+
+func newerResumerWanted(path string) bool {
+	version, pid := readResumerWant(path)
+	return version > resumerProtocolVersion && pid != os.Getpid() && processAlive(pid)
+}
+
+func readResumerWant(path string) (version, pid int) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0
+	}
+	fields := strings.Fields(string(body))
+	if len(fields) != 2 {
+		return 0, 0
+	}
+	version, _ = strconv.Atoi(fields[0])
+	pid, _ = strconv.Atoi(fields[1])
+	return version, pid
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// startSessionResumer runs this Mac's resumer alongside an sr agent session.
+// An empty serverURL means this Mac's selected pool server. It does nothing
+// outside cmux, and stops when the session ends.
+func startSessionResumer(serverURL string) func() {
+	if strings.TrimSpace(os.Getenv("CMUX_SURFACE_ID")) == "" {
+		return func() {}
+	}
+	if strings.TrimSpace(serverURL) == "" {
+		resolved, err := srRunner{program: "sr", store: accounts.DefaultCodexStore()}.wakeServerURL()
+		if err != nil {
+			slog.Debug("auto-resume: no pool server", "error", err)
+			return func() {}
+		}
+		serverURL = resolved
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runResumer(ctx, strings.TrimSuffix(strings.TrimRight(serverURL, "/"), "/v1"), io.Discard)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// autoResumeWatch runs the resumer in the foreground until Ctrl-C.
+func (r srRunner) autoResumeWatch() error {
+	serverURL, err := r.wakeServerURL()
+	if err != nil {
+		return err
+	}
+	if _, err := wakeCmuxPath(); err != nil {
+		return err
+	}
+	if _, err := fetchAutoResumeSetting(serverURL); err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "Watching every cmux tab on this Mac for auto-resume (pool %s).\nLeave this open while sessions started before the sr update are still running. Ctrl-C stops it.\n", serverURL)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	runResumer(ctx, serverURL, r.out)
+	fmt.Fprintln(r.out, "Stopped.")
+	return nil
+}
+
+// autoResumeStatus prints the pool-wide switch.
+func (r srRunner) autoResumeFleetStatus() error {
+	serverURL, err := r.wakeServerURL()
+	if err != nil {
+		return err
+	}
+	setting, err := fetchAutoResumeSetting(serverURL)
+	if err != nil {
+		return err
+	}
+	onOff := map[bool]string{true: "enabled", false: "disabled"}
+	fmt.Fprintf(r.out, "claude auto-resume: %s\ncodex auto-resume: %s\npool: %s (applies to every machine using it)\n", onOff[setting.Claude], onOff[setting.Codex], serverURL)
+	return nil
+}
+
+func (r srRunner) autoResumeSet(agent string, enabled bool) error {
+	if agent != "claude" && agent != "codex" {
+		return fmt.Errorf("usage: sr auto-resume %s claude|codex", map[bool]string{true: "enable", false: "disable"}[enabled])
+	}
+	serverURL, err := r.wakeServerURL()
+	if err != nil {
+		return err
+	}
+	if err := postAutoResume(serverURL, "/_subrouter/auto-resume", map[string]any{"agent": agent, "enabled": enabled}, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(r.out, "%s auto-resume %s for every machine using %s\n", agent, map[bool]string{true: "enabled", false: "disabled"}[enabled], serverURL)
+	return nil
+}
+
+// autoResumeTest checks this Mac end to end without a model request: the
+// proxy records a test session as out of quota and already reset, the
+// resumer binds it to this tab, and this command reads what gets typed.
+func (r srRunner) autoResumeTest(args []string) error {
+	agent := "claude"
+	if len(args) > 0 {
+		agent = args[0]
+	}
+	if agent != "claude" && agent != "codex" {
+		return errors.New("usage: sr auto-resume test [claude|codex]")
+	}
+	surface := strings.TrimSpace(os.Getenv("CMUX_SURFACE_ID"))
+	if surface == "" {
+		return errors.New("run sr auto-resume test inside a cmux tab")
+	}
+	serverURL, err := r.wakeServerURL()
+	if err != nil {
+		return err
+	}
+	cmuxPath, err := wakeCmuxPath()
+	if err != nil {
+		return err
+	}
+	return r.runAutoResumeTest(serverURL, cmuxPath, surface, agent)
+}
+
+func (r srRunner) runAutoResumeTest(serverURL, cmuxPath, surface, agent string) error {
+	setting, err := fetchAutoResumeSetting(serverURL)
+	if err != nil {
+		return err
+	}
+	if !setting.Enabled(agent) {
+		return fmt.Errorf("%s auto-resume is off for this pool; turn it on first (sr auto-resume enable %s)", agent, agent)
+	}
+	var suffix [6]byte
+	_, _ = rand.Read(suffix[:])
+	session := "sr-auto-resume-test-" + hex.EncodeToString(suffix[:])
+	if err := postAutoResume(serverURL, "/_subrouter/auto-resume/test", map[string]string{"agent": agent, "session_id": session}, nil); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "sr-auto-resume-test-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	store := wake.NewStore(filepath.Join(dir, "alarms.json"))
+	scope := fleetWakeScope(serverURL)
+	scope.testBinding = &cmuxSessionWire{Agent: agent, SessionID: session, SurfaceID: surface}
+	fmt.Fprintf(r.out, "Testing %s auto-resume in this tab against %s.\nThe proxy now reports a test session that ran out of quota and has recovered;\nthe resumer should type into this tab within a few seconds.\n", agent, serverURL)
+	if err := syncRecoveryAlarms(store, serverURL, cmuxPath, time.Now().UTC(), true, scope); err != nil {
+		return err
+	}
+	if err := dispatchDueWakeAlarms(store, serverURL, cmuxPath, 0, time.Now().UTC(), io.Discard, scope); err != nil {
+		return err
+	}
+	line := make(chan string, 1)
+	go func() {
+		text, _ := bufio.NewReader(r.in).ReadString('\n')
+		line <- strings.TrimSpace(text)
+	}()
+	select {
+	case got := <-line:
+		if got == "continue" || got == "/goal resume" {
+			fmt.Fprintf(r.out, "PASS: this tab received %q.\n", got)
+			return nil
+		}
+		return fmt.Errorf("FAIL: this tab received %q, want continue", got)
+	case <-time.After(30 * time.Second):
+		return errors.New("FAIL: nothing was typed into this tab within 30 seconds")
+	}
+}

@@ -1060,15 +1060,33 @@ Rows are written to `token-usage.jsonl` next to the session store every few minu
 
 ## Auto-resume
 
-When an agent stops because its pool is out of quota, auto-resume waits for the quota to come back and then types `continue` or `/goal resume` into that agent's cmux tab. For Codex it also resumes after a temporary model-provider failure. It is off by default and set per agent:
+When a Claude or Codex session stops because its pool ran out of quota, auto-resume waits for the quota to come back and then types `continue` (or `/goal resume` for a goal session) into that session's cmux tab. Codex sessions are also resumed after a temporary model-provider failure, with backoff. It works with the regular cmux app; nothing needs to change in cmux.
+
+**Turn it on or off for the whole pool.** The switch lives on the pool's proxy, so one change applies to every machine that uses the pool:
 
 ```sh
-sr auto-resume enable claude    # or codex; installs the launchd worker if needed
-sr auto-resume disable codex    # the worker stops once both agents are disabled
-sr auto-resume status           # agent flags, worker state, pending alarms
+sr auto-resume enable claude      # or codex
+sr auto-resume disable codex
+sr auto-resume status
 ```
 
-cmux Settings > Automation > Subrouter Auto-Resume controls the same switches. `sr wake` is an alias. See [docs/wake.md](docs/wake.md) for the details.
+The same two switches are on the proxy's web dashboard, `http://<pool>:31415/_subrouter/dashboard`, under **Auto-resume**.
+
+**What does the resuming on each Mac.** Every `sr claude` and `sr codex` session started in cmux carries a small resumer. One of them at a time acts for the whole Mac and watches every Claude and Codex tab on it, including sessions started before the update. Nothing is installed: no LaunchAgent, no daemon.
+
+**`sr auto-resume watch`** runs that resumer by itself in a tab, with no agent attached. You only need it on a Mac where sessions started with an older `sr` are still running and no new `sr claude` or `sr codex` session is open. Leave it open until those old sessions have ended, then stop it with Ctrl-C or by closing the tab. Sessions started after the update cover their Mac on their own.
+
+**Check a Mac without using any quota.** In a cmux tab, with auto-resume on:
+
+```sh
+sr auto-resume test        # or: sr auto-resume test codex
+```
+
+The proxy reports a test session that ran out of quota and has recovered, and the resumer types into that tab. It prints `PASS: this tab received "continue".`
+
+**Where the rules live.** The proxy decides: it records each session's quota and provider failures, their reset times, and whether the session has since recovered (`internal/proxy/recovery_tracker.go`, served at `/_subrouter/recovery-status`), and it holds the switch (`internal/proxy/auto_resume_setting.go`). The resumer applies the timing rules to that state — how long to wait after a failure, when a reset has passed, when to choose `/goal resume`, the Codex provider backoff — in `syncRecoveryAlarms` in `cmd/subrouter/sr_wake.go`, and types the result in `dispatchDueWakeAlarms`. A new rule that only needs what the proxy already sees belongs in those two places. A rule that needs a new ability on the Mac, such as reading a prompt on screen, also bumps `resumerProtocolVersion` in `cmd/subrouter/sr_auto_resume.go`, so the newer resumer takes over a Mac from an older one still running in a long-lived session.
+
+See [docs/wake.md](docs/wake.md) for more detail.
 
 ## Security defaults
 
