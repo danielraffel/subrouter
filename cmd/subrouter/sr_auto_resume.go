@@ -40,12 +40,12 @@ import (
 // No LaunchAgent is involved: a resumer lives exactly as long as some sr
 // process on that Mac does.
 
-// resumerProtocolVersion identifies what this resumer can do. Version 2
+// resumerProtocolVersion identifies what this resumer can do. Version 3
 // answers permission prompts and resumes stalled tabs by the proxy's rules
 // (sr_auto_resume_prompts.go). Bump it when
 // the resumer gains an ability rules depend on; a newer resumer then takes a
 // Mac over from an older one still running inside a long-lived session.
-const resumerProtocolVersion = 2
+const resumerProtocolVersion = 3
 
 // resumerInterval is how often a resumer checks the proxy and cmux.
 const resumerInterval = 15 * time.Second
