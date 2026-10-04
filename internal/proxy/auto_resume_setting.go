@@ -24,6 +24,36 @@ type AutoResumeSetting struct {
 	// PromptRules answer permission prompts an agent would otherwise wait on.
 	// Nil means DefaultPromptRules; an empty list means none.
 	PromptRules []PromptRule `json:"prompt_rules,omitempty"`
+	// StallRules resume a tab whose agent stopped on a temporary failure the
+	// proxy cannot see, such as a capacity error inside a successful stream.
+	// Nil means DefaultStallRules; an empty list means none.
+	StallRules []StallRule `json:"stall_rules,omitempty"`
+}
+
+// StallRule recognizes an agent tab stopped on a temporary failure: Screen,
+// a regular expression, matches one of the last lines of a quiet tab. The
+// resumer then types continue (or /goal resume for a goal session), with
+// backoff, until the tab moves on.
+type StallRule struct {
+	Agent  string `json:"agent"`
+	Screen string `json:"screen"`
+	Note   string `json:"note,omitempty"`
+}
+
+// DefaultStallRules are the stall rules a pool has before anyone changes them.
+func DefaultStallRules() []StallRule {
+	return []StallRule{
+		{Agent: "codex", Screen: `(?i)(model is at capacity|server_is_overloaded|servers are currently overloaded|try a different model)`, Note: "Codex stopped on a temporary model-provider capacity error."},
+		{Agent: "claude", Screen: `(?i)API Error: (5\d\d|Overloaded)|overloaded_error`, Note: "Claude stopped on a temporary provider overload."},
+	}
+}
+
+// EffectiveStallRules returns the stall rules in force.
+func (s AutoResumeSetting) EffectiveStallRules() []StallRule {
+	if s.StallRules == nil {
+		return DefaultStallRules()
+	}
+	return s.StallRules
 }
 
 // PromptRule answers one kind of permission prompt. A prompt that no rule
@@ -132,6 +162,7 @@ func (s Server) handleAutoResume(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setting.PromptRules = setting.EffectivePromptRules()
+		setting.StallRules = setting.EffectiveStallRules()
 		writeJSON(w, setting)
 	case http.MethodPost:
 		agent, enabled, form := "", false, false

@@ -41,7 +41,8 @@ import (
 // process on that Mac does.
 
 // resumerProtocolVersion identifies what this resumer can do. Version 2
-// answers permission prompts by the proxy's rules (sr_auto_resume_prompts.go). Bump it when
+// answers permission prompts and resumes stalled tabs by the proxy's rules
+// (sr_auto_resume_prompts.go). Bump it when
 // the resumer gains an ability rules depend on; a newer resumer then takes a
 // Mac over from an older one still running inside a long-lived session.
 const resumerProtocolVersion = 2
@@ -158,6 +159,7 @@ func runResumer(ctx context.Context, serverURL string, out io.Writer) {
 	startedAt := time.Now().UTC()
 	initial := true
 	lastReadiness := time.Time{}
+	stalls := newStallTracker()
 	ticker := time.NewTicker(resumerInterval)
 	defer ticker.Stop()
 	for {
@@ -187,7 +189,7 @@ func runResumer(ctx context.Context, serverURL string, out io.Writer) {
 				slog.Debug("auto-resume dispatch", "error", err)
 			}
 			if setting, err := fetchAutoResumeSetting(serverURL); err == nil {
-				answerPrompts(serverURL, cmuxPath, setting, out)
+				answerPrompts(serverURL, cmuxPath, setting, stalls, out)
 			}
 		}
 		select {
@@ -440,6 +442,10 @@ func (r srRunner) autoResumeRulesAt(serverURL string, args []string) error {
 				files = "any file"
 			}
 			fmt.Fprintf(r.out, "%d. %s: when asked %q about %s, answer %q\n   why: %s\n", i+1, rule.Agent, rule.Question, files, rule.Answer, rule.Note)
+		}
+		fmt.Fprintln(r.out, "\nStall rules (a quiet tab whose last lines match is resumed with continue or /goal resume, with backoff):")
+		for _, rule := range setting.EffectiveStallRules() {
+			fmt.Fprintf(r.out, "- %s: screen matches %q\n   why: %s\n", rule.Agent, rule.Screen, rule.Note)
 		}
 		return nil
 	}

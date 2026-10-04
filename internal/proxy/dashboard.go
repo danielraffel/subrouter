@@ -47,6 +47,7 @@ func (s Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if s.AutoResumeSettingPath != "" {
 		if setting, err := ReadAutoResumeSetting(s.AutoResumeSettingPath); err == nil {
 			setting.PromptRules = setting.EffectivePromptRules()
+			setting.StallRules = setting.EffectiveStallRules()
 			data.AutoResume = &setting
 		}
 		data.Prompts = recentPrompts.list()
@@ -273,6 +274,7 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
   <h3>Rules</h3>
   <table><tr><th>Agent</th><th>Question</th><th>Files</th><th>Answer</th><th>Why</th></tr>
   {{range .PromptRules}}<tr><td>{{.Agent}}</td><td><code>{{.Question}}</code></td><td>{{.Files}}</td><td>{{.Answer}}</td><td>{{.Note}}</td></tr>{{end}}
+  {{range .StallRules}}<tr><td>{{.Agent}}</td><td><code>{{.Screen}}</code></td><td>stalled tab</td><td>continue or /goal resume</td><td>{{.Note}}</td></tr>{{end}}
   </table>
   {{end}}
 
