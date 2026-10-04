@@ -200,3 +200,25 @@ func TestMemoryShellEditPromptIsAnsweredButOtherProceedPromptsWait(t *testing.T)
 		t.Fatal("an ordinary Bash proceed prompt was answered")
 	}
 }
+
+// The m3 prompt from 2026-10-04 13:07: the memory path wrapped mid-name and
+// the file does not exist yet.
+func TestWrappedMemoryPathIsRecognized(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	screen := " This will modify /Users/me/.claude/projects/-Volumes-Workshop-Code-pulp/memory/m5s-boot-disk-fil\n" +
+		" ls-with-build-cov-and-stalls-the-queue.md (outside working directory) via a symlink\n" +
+		"   1 ---\n   2 name: m5s-boot-disk\n" +
+		" Do you want to create m5s-boot-disk-fills-with-build-cov-and-stalls-the-queue.md?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n"
+	prompt, ok := findPendingPrompt(screen)
+	if !ok {
+		t.Fatal("prompt not found")
+	}
+	if !isClaudeMemoryFile(prompt) {
+		t.Fatalf("wrapped memory path not recognized; joined header: %q", unwrapHeader(prompt.Header))
+	}
+	// Wrapping must not make an ordinary file look like a memory note.
+	other := strings.Replace(screen, "/Users/me/.claude/projects/-Volumes-Workshop-Code-pulp/memory/m5s-boot-disk-fil", "/Users/me/Code/pulp/docs/m5s-boot-disk-fil", 1)
+	if prompt, _ := findPendingPrompt(other); isClaudeMemoryFile(prompt) {
+		t.Fatal("a wrapped path outside the memory folder was treated as a memory note")
+	}
+}
