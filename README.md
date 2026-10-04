@@ -1081,6 +1081,8 @@ The proxy reports a test session that ran out of quota and has recovered, and th
 
 **Where the rules live.** The proxy decides: it records each session's quota and provider failures, their reset times, and whether the session has since recovered (`internal/proxy/recovery_tracker.go`, served at `/_subrouter/recovery-status`), and it holds the switch (`internal/proxy/auto_resume_setting.go`). The resumer applies the timing rules to that state — how long to wait after a failure, when a reset has passed, when to choose `/goal resume`, the Codex provider backoff — in `syncRecoveryAlarms` in `cmd/subrouter/sr_wake.go`, and types the result in `dispatchDueWakeAlarms`. A new rule that only needs what the proxy already sees belongs in those two places. A rule that needs a new ability on the Mac, such as reading a prompt on screen, also bumps `resumerProtocolVersion` in `cmd/subrouter/sr_auto_resume.go`, so the newer resumer takes over a Mac from an older one still running in a long-lived session.
 
+**Prompt rules.** While Claude auto-resume is on, the resumer also answers one Claude permission prompt: creating or editing a file in Claude's own memory folder (`~/.claude/projects/<project>/memory/`, or `MEMORY.md`). Pooled sessions reach that folder through a symlink, so Claude would otherwise ask every time. Every other prompt still waits for you. Prompt rules live in `cmd/subrouter/sr_auto_resume_prompts.go`; adding one bumps `resumerProtocolVersion`.
+
 See [docs/wake.md](docs/wake.md) for more detail.
 
 ## Security defaults
