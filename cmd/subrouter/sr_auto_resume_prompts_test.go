@@ -222,3 +222,24 @@ func TestWrappedMemoryPathIsRecognized(t *testing.T) {
 		t.Fatal("a wrapped path outside the memory folder was treated as a memory note")
 	}
 }
+
+// The 14:02 prompt: path scrolled off, file not created yet, but the preview
+// is a memory note named after the file.
+func TestMemoryNotePreviewIsRecognized(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	screen := "   1 ---\n   2 name: pr-macos-leg-tests-the-merge-ref-not-your-head\n   3 description: x\n   4 metadata:\n   5   type: feedback\n   6 ---\n" +
+		" Do you want to create pr-macos-leg-tests-the-merge-ref-not-your-head.md?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n"
+	prompt, ok := findPendingPrompt(screen)
+	if !ok || !isClaudeMemoryFile(prompt) {
+		t.Fatalf("memory-note preview not recognized: %+v %v", prompt.Question, ok)
+	}
+	// Front matter for a different name, or without a memory type, is not enough.
+	for _, other := range []string{
+		strings.Replace(screen, "name: pr-macos-leg-tests-the-merge-ref-not-your-head", "name: something-else", 1),
+		strings.Replace(screen, "type: feedback", "type: guide", 1),
+	} {
+		if prompt, _ := findPendingPrompt(other); isClaudeMemoryFile(prompt) {
+			t.Fatalf("not a memory note, but recognized:\n%s", other)
+		}
+	}
+}

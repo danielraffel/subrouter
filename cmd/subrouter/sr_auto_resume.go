@@ -45,7 +45,7 @@ import (
 // (sr_auto_resume_prompts.go). Bump it when
 // the resumer gains an ability rules depend on; a newer resumer then takes a
 // Mac over from an older one still running inside a long-lived session.
-const resumerProtocolVersion = 6
+const resumerProtocolVersion = 7
 
 // resumerInterval is how often a resumer checks the proxy and cmux.
 const resumerInterval = 15 * time.Second

@@ -116,11 +116,37 @@ func isClaudeMemoryFile(prompt pendingPrompt) bool {
 		return true
 	}
 	home, err := os.UserHomeDir()
-	if err != nil {
-		return false
+	if err == nil {
+		matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", "memory", prompt.File))
+		if len(matches) > 0 {
+			return true
+		}
 	}
-	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", "memory", prompt.File))
-	return len(matches) > 0
+	// A long preview can push the path off the screen, and a new note does
+	// not exist yet. Claude's memory notes carry front matter whose name is
+	// the file name and whose type is one of four memory types.
+	return previewIsMemoryNote(prompt.Header, strings.TrimSuffix(prompt.File, ".md"))
+}
+
+var (
+	memoryNameLine = regexp.MustCompile(`^\s*\d+\s+name:\s*(\S+)\s*$`)
+	memoryTypeLine = regexp.MustCompile(`^\s*\d+\s+type:\s*(user|feedback|project|reference)\s*$`)
+)
+
+// previewIsMemoryNote reports whether the file preview in a prompt is a
+// Claude memory note named stem.
+func previewIsMemoryNote(header []string, stem string) bool {
+	named, typed := false, false
+	for _, line := range header {
+		line = strings.Trim(strings.TrimSpace(line), "│|")
+		if m := memoryNameLine.FindStringSubmatch(line); m != nil && m[1] == stem {
+			named = true
+		}
+		if memoryTypeLine.MatchString(line) {
+			typed = true
+		}
+	}
+	return named && typed
 }
 
 // promptQuietFor is how long a tab must be unchanged before it is read: a
