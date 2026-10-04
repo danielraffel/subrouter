@@ -308,9 +308,38 @@ type PromptReport struct {
 type promptReports struct {
 	mu      sync.Mutex
 	reports []PromptReport
+	// path, when set, keeps the reports across a proxy restart or upgrade.
+	path   string
+	loaded bool
 }
 
 var recentPrompts = &promptReports{}
+
+// usePath points the reports at a file next to the session store and loads
+// what an earlier run saved.
+func (p *promptReports) usePath(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.loaded && p.path == path {
+		return
+	}
+	p.path, p.loaded = path, true
+	if body, err := os.ReadFile(path); err == nil {
+		var saved []PromptReport
+		if json.Unmarshal(body, &saved) == nil {
+			p.reports = saved
+		}
+	}
+}
+
+func (p *promptReports) saveLocked() {
+	if p.path == "" {
+		return
+	}
+	if body, err := json.Marshal(p.reports); err == nil {
+		_ = fsutil.WriteFileAtomic(p.path, body, 0o600)
+	}
+}
 
 const maxPromptReports = 200
 
@@ -322,6 +351,7 @@ func (p *promptReports) add(report PromptReport) {
 		r := &p.reports[i]
 		if r.Host == report.Host && r.SurfaceID == report.SurfaceID && r.Question == report.Question && r.AnsweredBy == report.AnsweredBy {
 			r.LastSeen, r.Count = now, r.Count+1
+			p.saveLocked()
 			return
 		}
 	}
@@ -330,6 +360,7 @@ func (p *promptReports) add(report PromptReport) {
 	if len(p.reports) > maxPromptReports {
 		p.reports = p.reports[len(p.reports)-maxPromptReports:]
 	}
+	p.saveLocked()
 }
 
 func (p *promptReports) list() []PromptReport {
