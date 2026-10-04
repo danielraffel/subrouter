@@ -45,7 +45,7 @@ import (
 // (sr_auto_resume_prompts.go). Bump it when
 // the resumer gains an ability rules depend on; a newer resumer then takes a
 // Mac over from an older one still running inside a long-lived session.
-const resumerProtocolVersion = 7
+const resumerProtocolVersion = 8
 
 // resumerInterval is how often a resumer checks the proxy and cmux.
 const resumerInterval = 15 * time.Second
@@ -57,6 +57,15 @@ type wakeScope struct {
 	// testBinding, when set, ties one test session to a cmux tab directly,
 	// so `sr auto-resume test` needs no live agent.
 	testBinding *cmuxSessionWire
+	// onDecision, when set, hears why a stopped session on this Mac was or
+	// was not scheduled for a resume.
+	onDecision func(state recoveryWireState, surface, decision string)
+}
+
+func (s wakeScope) decide(state recoveryWireState, surface, decision string) {
+	if s.onDecision != nil {
+		s.onDecision(state, surface, decision)
+	}
 }
 
 func (s wakeScope) boundSession(agent, sessionID string) (cmuxSessionWire, bool) {
@@ -160,6 +169,7 @@ func runResumer(ctx context.Context, serverURL string, out io.Writer) {
 	initial := true
 	lastReadiness := time.Time{}
 	stalls := newStallTracker()
+	decisions := newDecisionReporter(serverURL, out)
 	ticker := time.NewTicker(resumerInterval)
 	defer ticker.Stop()
 	for {
@@ -176,6 +186,7 @@ func runResumer(ctx context.Context, serverURL string, out io.Writer) {
 		}
 		if release != nil {
 			scope := fleetWakeScope(serverURL)
+			scope.onDecision = decisions.report
 			if err := syncRecoveryAlarms(store, serverURL, cmuxPath, startedAt, initial, scope); err != nil {
 				slog.Debug("auto-resume pass", "error", err)
 			} else {
@@ -533,7 +544,9 @@ func (r srRunner) autoResumeWhyAt(serverURL string) error {
 	waiting := 0
 	for _, p := range reports {
 		where := p.Host + " " + p.Agent + " tab " + p.SurfaceID
-		if p.AnsweredBy != "" {
+		if strings.HasPrefix(p.Question, "resume decision for session ") {
+			events = append(events, event{p.LastSeen, fmt.Sprintf("%s %s: %s", where, strings.TrimPrefix(p.Question, "resume decision for "), p.AnsweredBy)})
+		} else if p.AnsweredBy != "" {
 			events = append(events, event{p.LastSeen, fmt.Sprintf("answered %q in %s\n    because: %s", p.Question, where, p.AnsweredBy)})
 		} else if time.Since(p.LastSeen) < 2*time.Minute {
 			waiting++
@@ -566,6 +579,7 @@ func (r srRunner) autoResumeWhyAt(serverURL string) error {
 	answered, resumed, failed := 0, 0, 0
 	for _, p := range reports {
 		switch {
+		case strings.HasPrefix(p.Question, "resume decision for session "):
 		case strings.HasPrefix(p.Question, "could not submit"):
 			failed += p.Count
 		case strings.HasPrefix(p.AnsweredBy, "typed "):
@@ -604,4 +618,33 @@ func getAutoResumeJSON(serverURL, path string, out any) error {
 		return fmt.Errorf("%s: %s", path, resp.Status)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// decisionReporter tells the proxy, once per session and decision, why a
+// stopped session on this Mac was or was not scheduled, so
+// `sr auto-resume why` can answer "why didn't it resume?".
+type decisionReporter struct {
+	serverURL string
+	out       io.Writer
+	host      string
+	last      map[string]string
+}
+
+func newDecisionReporter(serverURL string, out io.Writer) *decisionReporter {
+	host, _ := os.Hostname()
+	return &decisionReporter{serverURL: serverURL, out: out, host: strings.Split(host, ".")[0], last: map[string]string{}}
+}
+
+func (d *decisionReporter) report(state recoveryWireState, surface, decision string) {
+	key := state.Agent + "\x00" + state.SessionID
+	if d.last[key] == decision {
+		return
+	}
+	d.last[key] = decision
+	fmt.Fprintf(d.out, "%s %s session %s: %s\n", time.Now().Format("15:04:05"), state.Agent, state.SessionID, decision)
+	_ = postAutoResume(d.serverURL, "/_subrouter/auto-resume/prompts", proxy.PromptReport{
+		Host: d.host, Agent: state.Agent, SurfaceID: surface,
+		Question:   "resume decision for session " + state.SessionID,
+		AnsweredBy: decision,
+	}, nil)
 }
