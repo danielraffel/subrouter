@@ -2201,6 +2201,9 @@ func (s Server) Handler() http.Handler {
 	if s.Recovery == nil {
 		s.Recovery = NewRecoveryTracker()
 	}
+	if s.AutoResumeSettingPath != "" {
+		recentPrompts.usePath(filepath.Join(filepath.Dir(s.AutoResumeSettingPath), "auto-resume-prompts.json"))
+	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
 	}

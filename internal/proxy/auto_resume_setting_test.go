@@ -42,3 +42,17 @@ func TestAutoResumeDashboardFormSwitchesOneAgent(t *testing.T) {
 		t.Fatalf("setting = %+v, %v", setting, err)
 	}
 }
+
+// Prompt reports survive a proxy restart, so why still explains what
+// happened before an upgrade.
+func TestPromptReportsSurviveRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auto-resume-prompts.json")
+	first := &promptReports{}
+	first.usePath(path)
+	first.add(PromptReport{Host: "m5s", Agent: "codex", SurfaceID: "s", Question: "stalled on: at capacity", AnsweredBy: "typed continue"})
+	second := &promptReports{}
+	second.usePath(path)
+	if got := second.list(); len(got) != 1 || got[0].Host != "m5s" {
+		t.Fatalf("after restart: %+v", got)
+	}
+}
