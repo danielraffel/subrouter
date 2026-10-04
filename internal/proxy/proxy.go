@@ -7488,7 +7488,54 @@ func (s Server) accountForSession(agentType, sessionID string, r *http.Request) 
 }
 
 func (s Server) accountForSessionProvider(provider accounts.Provider, agentType, sessionID string, r *http.Request) (accounts.Account, string, string, error) {
-	return s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
+	account, id, email, err := s.accountForSessionProviderWithOptions(provider, agentType, sessionID, r, accountSelectionOptions{})
+	if err != nil && strings.Contains(err.Error(), "no non-exhausted") {
+		s.recordPoolExhausted(provider, agentType, id, r)
+	}
+	return account, id, email, err
+}
+
+// recordPoolExhausted records a quota failure for a session the proxy turned
+// away because every account of its provider is used up. No upstream request
+// was made, so nothing else records it; without this the session never gets
+// a scheduled resume when quota returns. The reset is the earliest one the
+// proxy knows across the pool, or an hour out when it knows none.
+func (s Server) recordPoolExhausted(provider accounts.Provider, agentType, sessionID string, r *http.Request) {
+	if s.Recovery == nil || sessionID == "" || (provider != accounts.ProviderClaude && provider != accounts.ProviderCodex) {
+		return
+	}
+	kind := wake.KindClaudeQuota
+	if provider == accounts.ProviderCodex {
+		kind = wake.KindCodexQuota
+	}
+	now := time.Now().UTC()
+	resetAt := s.earliestPoolReset(provider, r)
+	if resetAt.IsZero() {
+		resetAt = now.Add(time.Hour)
+	}
+	s.Recovery.RecordQuotaFailure(agentType, sessionID, kind, "pool", now, resetAt)
+	if s.Logger != nil {
+		s.Logger.Warn("pool exhausted; recorded for auto-resume", "agent", agentType, "session", sessionID, "provider", provider, "resume_after", resetAt)
+	}
+}
+
+// earliestPoolReset is the soonest time any account of provider is marked
+// usable again.
+func (s Server) earliestPoolReset(provider accounts.Provider, r *http.Request) time.Time {
+	if s.SchedulerRef == nil {
+		return time.Time{}
+	}
+	var earliest time.Time
+	for _, account := range filterAccountsForProvider(s.accountListContext(r.Context()), provider) {
+		for _, pool := range []string{"", claudePoolModel(session.ExtractModel(r, s.MaxBodyBytes))} {
+			if until, ok := s.SchedulerRef.ExhaustedUntilFor(schedulerAccountProvider(account.Provider), account.ID, pool); ok && until.After(time.Now()) {
+				if earliest.IsZero() || until.Before(earliest) {
+					earliest = until
+				}
+			}
+		}
+	}
+	return earliest
 }
 
 type accountSelectionOptions struct {
