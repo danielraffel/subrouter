@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,14 +23,21 @@ import (
 
 func (r srRunner) wake(args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprintln(r.out, "usage: sr auto-resume status|list|show <id>|schedule [options]|now [codex|claude|all]|cancel <id>|cancel --agent <agent>|cancel --all|enable|disable <agent>|early <agent> <enable|disable>")
+		fmt.Fprintln(r.out, "usage: sr auto-resume status|enable <claude|codex>|disable <claude|codex>|watch|test [claude|codex]|list|show <id>|cancel <id>|cancel --all")
 		return nil
 	}
-	store := wake.NewStore(storepath.StateDir() + "/wake.json")
+	// The same alarm file the Mac's resumer uses, so list, show, cancel and
+	// now act on what it will actually do.
+	dir, err := autoResumeDir()
+	if err != nil {
+		return err
+	}
+	store := wake.NewStore(filepath.Join(dir, "alarms.json"))
 	now := time.Now().UTC()
 	switch args[0] {
 	case "status":
-		return autoResumeStatus(store, r.out)
+		removeLegacyWakeWorker(r.out)
+		return r.autoResumeFleetStatus()
 	case "list":
 		alarms, err := store.List(now)
 		if err != nil {
@@ -76,40 +84,15 @@ func (r srRunner) wake(args []string) error {
 		return cancelWake(store, args[1:], now, r.out)
 	case "enable", "disable":
 		if len(args) != 2 || (args[1] != "codex" && args[1] != "claude") {
-			return fmt.Errorf("usage: sr wake %s <codex|claude>", args[0])
+			return fmt.Errorf("usage: sr auto-resume %s <codex|claude>", args[0])
 		}
-		// Configuration wiring is intentionally separate from the durable alarm
-		// queue; this command currently records the requested policy in the same
-		// state root for the shared watcher to consume.
-		cfg := wake.NewConfig(storepath.StateDir() + "/wake-config.json")
-		if err := cfg.SetEnabled(args[1], args[0] == "enable"); err != nil {
-			return err
-		}
-		if args[0] == "enable" {
-			serverURL, err := r.wakeServerURL()
-			if err != nil {
-				return err
-			}
-			if err := ensureWakeLaunchd(r.out, serverURL); err != nil {
-				return err
-			}
-		} else {
-			claudeEnabled, err := cfg.Enabled("claude")
-			if err != nil {
-				return err
-			}
-			codexEnabled, err := cfg.Enabled("codex")
-			if err != nil {
-				return err
-			}
-			if !claudeEnabled && !codexEnabled {
-				if err := uninstallWakeLaunchd(r.out); err != nil {
-					return err
-				}
-			}
-		}
-		fmt.Fprintf(r.out, "%s auto-resume %s\n", args[1], map[bool]string{true: "enabled", false: "disabled"}[args[0] == "enable"])
-		return nil
+		removeLegacyWakeWorker(r.out)
+		return r.autoResumeSet(args[1], args[0] == "enable")
+	case "watch":
+		removeLegacyWakeWorker(r.out)
+		return r.autoResumeWatch()
+	case "test":
+		return r.autoResumeTest(args[1:])
 	case "policy":
 		return updateWakePolicy(args[1:], r.out)
 	case "early":
@@ -411,17 +394,18 @@ func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte
 	initial := true
 	lastReadinessCheck := time.Time{}
 	pass := func() error {
-		if err := syncRecoveryAlarms(store, serverURL, cmuxPath, startedAt, initial); err != nil {
+		scope := fleetWakeScope(serverURL)
+		if err := syncRecoveryAlarms(store, serverURL, cmuxPath, startedAt, initial, scope); err != nil {
 			return err
 		}
 		initial = false
 		if lastReadinessCheck.IsZero() || time.Since(lastReadinessCheck) >= time.Minute {
 			lastReadinessCheck = time.Now()
-			if err := accelerateRecoveredQuotaAlarms(store, serverURL, lastReadinessCheck); err != nil {
+			if err := accelerateRecoveredQuotaAlarms(store, serverURL, lastReadinessCheck, scope); err != nil {
 				fmt.Fprintf(out, "wake worker early auto-resume: %v\n", err)
 			}
 		}
-		return dispatchDueWakeAlarms(store, serverURL, cmuxPath, spacing, startedAt, out)
+		return dispatchDueWakeAlarms(store, serverURL, cmuxPath, spacing, startedAt, out, scope)
 	}
 	if once {
 		return pass()
@@ -442,7 +426,7 @@ func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte
 // accelerateRecoveredQuotaAlarms uses the proxy's fresh subscription evidence
 // to move only matching automatic quota alarms earlier. The shared worker
 // remains the sole component that ultimately sends a terminal command.
-func accelerateRecoveredQuotaAlarms(store *wake.Store, serverURL string, now time.Time) error {
+func accelerateRecoveredQuotaAlarms(store *wake.Store, serverURL string, now time.Time, scope wakeScope) error {
 	alarms, err := store.List(now)
 	if err != nil {
 		return err
@@ -455,7 +439,7 @@ func accelerateRecoveredQuotaAlarms(store *wake.Store, serverURL string, now tim
 			!alarm.WakeAt.After(now.Add(time.Minute)) {
 			continue
 		}
-		enabled, err := cfg.Enabled(alarm.Agent)
+		enabled, err := scope.enabled(alarm.Agent)
 		if err != nil {
 			return err
 		}
@@ -546,7 +530,7 @@ type cmuxSessionsWire struct {
 	Sessions []cmuxSessionWire `json:"sessions"`
 }
 
-func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Time, initial bool) error {
+func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Time, initial bool, scope wakeScope) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(serverURL, "/")+"/_subrouter/recovery-status", nil)
@@ -612,7 +596,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 		if (state.Kind == wake.KindCodexQuota || state.Kind == wake.KindClaudeQuota) && state.LastSuccessAt.After(state.LastFailureAt) {
 			continue
 		}
-		enabled, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Enabled(state.Agent)
+		enabled, err := scope.enabled(state.Agent)
 		if err != nil {
 			return err
 		}
@@ -621,12 +605,13 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 			// a later enable. Explicit schedule commands remain usable.
 			continue
 		}
-		var matched cmuxSessionWire
-		found := false
+		matched, found := scope.boundSession(state.Agent, state.SessionID)
 		for _, candidate := range sessions {
+			if found {
+				break
+			}
 			if candidate.Agent == state.Agent && candidate.SessionID == state.SessionID {
 				matched, found = candidate, true
-				break
 			}
 		}
 		if !found || matched.SurfaceID == "" {
@@ -718,7 +703,7 @@ func storePath(store *wake.Store) string {
 	return storepath.StateDir() + "/wake.json"
 }
 
-func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacing time.Duration, workerStartedAt time.Time, out interface{ Write([]byte) (int, error) }) error {
+func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacing time.Duration, workerStartedAt time.Time, out interface{ Write([]byte) (int, error) }, scope wakeScope) error {
 	now := time.Now().UTC()
 	alarms, err := store.List(now)
 	if err != nil {
@@ -732,7 +717,7 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 			continue
 		}
 		if alarm.Automatic {
-			enabled, err := wake.NewConfig(storepath.StateDir() + "/wake-config.json").Enabled(alarm.Agent)
+			enabled, err := scope.enabled(alarm.Agent)
 			if err != nil {
 				return err
 			}
@@ -740,7 +725,7 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 				continue
 			}
 		}
-		if alarm.Automatic {
+		if _, bound := scope.boundSession(alarm.Agent, alarm.SessionID); alarm.Automatic && !bound {
 			if alarm.Kind == wake.KindCodexProvider && alarm.SessionLastActiveAt.Before(now.Add(-8*time.Hour)) {
 				_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
 					a.Status = wake.StatusStale
@@ -1048,4 +1033,19 @@ func wakeCmuxPath() (string, error) {
 		}
 	}
 	return "", errors.New("cannot install wake worker: cmux was not found on PATH or in /Applications/cmux.app; install cmux first")
+}
+
+// removeLegacyWakeWorker removes the per-Mac LaunchAgent that earlier builds
+// installed. The resumer now runs inside sr processes instead.
+func removeLegacyWakeWorker(out interface{ Write([]byte) (int, error) }) {
+	path, err := wakeLaunchdPath()
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(path); err != nil && exec.Command("launchctl", "print", wakeLaunchdServiceTarget()).Run() != nil {
+		return
+	}
+	if err := uninstallWakeLaunchd(io.Discard); err == nil {
+		fmt.Fprintln(out, "removed the old per-Mac auto-resume LaunchAgent; sr sessions and sr auto-resume watch now do its job")
+	}
 }

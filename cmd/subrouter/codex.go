@@ -167,11 +167,13 @@ func codex(args []string) error {
 			}
 		}
 	}
+	stopResumer := startSessionResumer("")
 	runErr := runCodexCommand(
 		bin,
 		childArgs,
 		directPlainHTTPEnvironment(codexChildEnv(os.Environ(), childProxyToken, programBase()), childBaseURL),
 	)
+	stopResumer()
 	if launchID != "" {
 		ledger := newSessionLedger(accounts.DefaultCodexStore().StoreDir())
 		// Codex runs notify asynchronously, so a one-turn `codex exec` can

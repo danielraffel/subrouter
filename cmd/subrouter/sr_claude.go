@@ -917,7 +917,9 @@ func (r srRunner) launchProxyClaude(ctx context.Context, args []string, baseURL,
 	// child environment credential-free so tenant URLs and keys cannot be read
 	// through process inspection or inherited by subprocesses.
 	cmd.Env = claudeProxyChildEnvironment(os.Environ(), baseURL, configDir, programBase(), accountID)
+	stopResumer := startSessionResumer("")
 	runErr := cmd.Run()
+	stopResumer()
 	if r.sessionLaunchID != "" {
 		ledger := newSessionLedger(r.store.StoreDir())
 		_, _ = ledger.finishLaunch(r.sessionLaunchID, runErr)

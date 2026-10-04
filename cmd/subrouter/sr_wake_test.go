@@ -41,7 +41,7 @@ func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 	if err := wake.NewConfig(filepath.Join(storepath.StateDir(), "wake-config.json")).SetEnabled("claude", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncRecoveryAlarms(store, server.URL, cmux, now.Add(-time.Minute), true); err != nil {
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now.Add(-time.Minute), true, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(now)
@@ -88,7 +88,7 @@ func TestSyncRecoveryAlarmsUsesGoalResumeForCodexQuota(t *testing.T) {
 	if err := wake.NewConfig(filepath.Join(storepath.StateDir(), "wake-config.json")).SetEnabled("codex", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncRecoveryAlarms(store, server.URL, cmux, now.Add(-time.Minute), true); err != nil {
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now.Add(-time.Minute), true, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(now)
@@ -113,7 +113,7 @@ func TestSyncRecoveryAlarmsDoesNotEnqueueWhenDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := wake.NewStore(filepath.Join(storepath.StateDir(), "wake.json"))
-	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true); err != nil {
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(now)
@@ -145,7 +145,7 @@ func TestDispatchManualAlarmIgnoresAutomaticDisabledSetting(t *testing.T) {
 	if _, err := store.Put(wake.Alarm{Kind: wake.KindClaudeQuota, Agent: "claude", SessionID: "manual", SurfaceID: "surface", Action: "continue", WakeAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour), SessionLastActiveAt: now}, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now.Add(-time.Minute), &strings.Builder{}); err != nil {
+	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now.Add(-time.Minute), &strings.Builder{}, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(now)
@@ -171,7 +171,7 @@ func TestSyncRecoveryAlarmsRejectsStaleInitialSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := wake.NewStore(filepath.Join(storepath.StateDir(), "wake.json"))
-	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true); err != nil {
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(now)
@@ -243,7 +243,7 @@ func TestEarlyRecoveryAdvancesOnlyMatchingAutomaticQuotaAlarm(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ready": r.URL.Query().Get("agent") == "codex" && r.URL.Query().Get("pool") == ""})
 	}))
 	defer server.Close()
-	if err := accelerateRecoveredQuotaAlarms(store, server.URL, now); err != nil {
+	if err := accelerateRecoveredQuotaAlarms(store, server.URL, now, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.List(now)
@@ -262,7 +262,7 @@ func TestEarlyRecoveryAdvancesOnlyMatchingAutomaticQuotaAlarm(t *testing.T) {
 	if err := cfg.SetEarlyOnRecovery("codex", false); err != nil {
 		t.Fatal(err)
 	}
-	if err := accelerateRecoveredQuotaAlarms(store, server.URL, now.Add(time.Minute)); err != nil {
+	if err := accelerateRecoveredQuotaAlarms(store, server.URL, now.Add(time.Minute), testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -288,7 +288,7 @@ func TestOldScheduledAlarmCanFireWhenExactSessionStillExists(t *testing.T) {
 	if err := os.WriteFile(cmux, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now, &strings.Builder{}); err != nil {
+	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now, &strings.Builder{}, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(time.Now())
@@ -321,7 +321,7 @@ func TestOldScheduledAlarmDoesNotInterruptManuallyResumedSession(t *testing.T) {
 	if err := os.WriteFile(cmux, []byte(strings.Replace(script, "%s", sessions, 1)), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now, &strings.Builder{}); err != nil {
+	if err := dispatchDueWakeAlarms(store, server.URL, cmux, 0, now, &strings.Builder{}, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(time.Now())
@@ -348,7 +348,7 @@ func TestOldProviderAlarmDoesNotReplayAfterEightHours(t *testing.T) {
 	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := dispatchDueWakeAlarms(store, "http://127.0.0.1:1", cmux, 0, now, &strings.Builder{}); err != nil {
+	if err := dispatchDueWakeAlarms(store, "http://127.0.0.1:1", cmux, 0, now, &strings.Builder{}, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(time.Now())
@@ -380,7 +380,7 @@ func TestLaterSuccessfulRequestCancelsQuotaAlarmWithinFirstMinute(t *testing.T) 
 	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nprintf '{\"sessions\":[]}'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true); err != nil {
+	if err := syncRecoveryAlarms(store, server.URL, cmux, now, true, testConfigScope()); err != nil {
 		t.Fatal(err)
 	}
 	alarms, err := store.List(now)
@@ -416,4 +416,12 @@ func TestWakeServerURLRefusesUnresolvableServer(t *testing.T) {
 	if url, err := runner.wakeServerURL(); err != nil || url != defaultWakeServerURL {
 		t.Fatalf("with no server configured: url=%q err=%v, want the local proxy", url, err)
 	}
+}
+
+// testConfigScope reads the switch from the local wake config, which these
+// tests write; production passes read it from the proxy.
+func testConfigScope() wakeScope {
+	return wakeScope{enabled: func(agent string) (bool, error) {
+		return wake.NewConfig(filepath.Join(storepath.StateDir(), "wake-config.json")).Enabled(agent)
+	}}
 }

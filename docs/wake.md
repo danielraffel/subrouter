@@ -1,17 +1,27 @@
 # Subrouter auto-resume
 
-The `sr auto-resume` command is the local control surface for automatic agent
-resumes. `sr wake` remains a backward-compatible alias. The worker schedules
-durable alarms internally, but the user-facing behavior is auto-resume after a
-quota reset or temporary provider-capacity failure.
+`sr auto-resume` controls automatic agent resumes after a quota reset or a
+temporary provider-capacity failure. `sr wake` remains an alias.
 
-The worker, alarm store, policy commands, proxy handoff, automatic scheduling, and the
-launchd worker are available on this branch. Fleet enablement remains an
-explicit rollout step after the upgraded proxy is deployed.
-It is disabled by default and must be enabled independently for Codex and
-Claude. The existing cmux/session watcher remains the only component that
-reads a terminal surface or sends a resume action; Subrouter owns quota
-classification, reset selection, and durable alarm state.
+There are two parts:
+
+- **The pool's proxy** records quota and provider failures per session, their
+  reset times and later recoveries (`/_subrouter/recovery-status`, saved in
+  `recovery-state.json` next to the session store so a restart keeps them),
+  and holds the pool-wide on/off switch per agent (`/_subrouter/auto-resume`,
+  saved in `auto-resume.json`). `sr auto-resume enable|disable|status` and the
+  dashboard read and write that switch.
+- **One resumer per Mac** runs inside any `sr claude`, `sr codex` or
+  `sr auto-resume watch` process started in cmux. The process holding
+  `~/.subrouter/auto-resume/resumer.lock` acts for the whole Mac: it reads the
+  proxy's state every 15 seconds, matches each session to its cmux tab, keeps
+  durable alarms in `~/.subrouter/auto-resume/alarms.json`, and types the
+  resume command when an alarm is due. When that process exits, another sr
+  process on the Mac takes the lock. A resumer with a higher
+  `resumerProtocolVersion` takes over from an older one.
+
+No LaunchAgent is used; the per-Mac LaunchAgent from earlier builds is removed
+the next time `sr auto-resume` runs.
 
 ## Behavior
 
@@ -92,14 +102,17 @@ permissions and remains disabled until changed.
 
 ## Configuration and controls
 
-Auto-resume is disabled by default for each agent. Early auto-resume is enabled
-by default for both agents, but only has an effect when auto-resume is
-enabled. Settings persist in the local `wake-config.json` state file.
+Auto-resume is disabled by default for each agent. The on/off switch is
+pool-wide and lives on the proxy. Early auto-resume and the Codex replay
+policy are per-Mac settings in the local `wake-config.json`; early auto-resume
+is on by default and only matters while auto-resume is enabled.
 
 Controls are:
 
 ```text
 sr auto-resume status
+sr auto-resume watch
+sr auto-resume test [claude|codex]
 sr auto-resume list
 sr auto-resume show <id>
 sr auto-resume enable <claude|codex>
@@ -110,16 +123,13 @@ sr auto-resume now <claude|codex|all>
 sr auto-resume cancel <id>
 sr auto-resume cancel --agent <claude|codex>
 sr auto-resume cancel --all
-sr auto-resume worker --once
-sr auto-resume install
-sr auto-resume uninstall
 sr auto-resume policy codex --no-continue --max-goal-attempts 2 --cooldown 1m
 ```
 
 Durations accept days, hours, and minutes (`2d4h15m`). They are converted to
 absolute UTC timestamps when stored so alarms survive reboot. Each record has
 `wake_at`, `expires_at`, the exact cmux surface and session identity, the
-provider/model pool, action, launchd label, and status (`scheduled`, `fired`,
+provider/model pool, action, and status (`scheduled`, `fired`,
 `completed`, `stale`, `cancelled`, `expired`, or `failed`).
 
 `auto-resume now` revalidates and dispatches existing alarms immediately. It uses the

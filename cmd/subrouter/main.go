@@ -852,8 +852,12 @@ func serve(args []string) error {
 	tokenUsage.RunFlushLoop(tokenUsageCtx)
 
 	server := proxy.Server{
-		StreamDrops:              &proxy.StreamDropStats{},
-		TokenUsage:               tokenUsage,
+		StreamDrops: &proxy.StreamDropStats{},
+		TokenUsage:  tokenUsage,
+		// Pool-wide auto-resume state sits next to the session store, so it
+		// survives restarts and upgrades of this server.
+		Recovery:                 proxy.NewRecoveryTrackerAt(filepath.Join(filepath.Dir(*sessionPath), "recovery-state.json")),
+		AutoResumeSettingPath:    filepath.Join(filepath.Dir(*sessionPath), "auto-resume.json"),
 		Traffic:                  proxy.NewTrafficStats(time.Now()),
 		ReleaseStatePath:         strings.TrimSpace(*releaseStatePath),
 		Upstream:                 upstream,
