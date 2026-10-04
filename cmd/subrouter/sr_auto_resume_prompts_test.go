@@ -3,7 +3,9 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
@@ -69,5 +71,63 @@ func TestFindPendingPromptReportsUnmatchedQuestions(t *testing.T) {
 	prompt, ok := findPendingPrompt(" Bash command\n curl example.com\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n   3. No\n Esc to cancel\n")
 	if !ok || prompt.Question != "Do you want to proceed?" {
 		t.Fatalf("prompt = %+v, %v", prompt, ok)
+	}
+}
+
+// The screen of a real m5s tab stopped on a capacity error (2026-10-04).
+const codexCapacityStall = `  I'll accept each receipt only after green validation, commit/merge it, then update the roadmap serially.
+  Worked for 1h 20m 59s • 10:16 AM
+• Ran ~/.local/bin/pulp-worktree-lineage-session --plain
+    + 33 lines (ctrl+t to expand)
+■ Selected model is at capacity. Please try a different model.
+› Ask Codex to do anything
+  GPT-6.1-Sol medium · ~/Code/pulp · Main [default]
+  ? for shortcuts
+`
+
+func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
+	var codexRule proxy.StallRule
+	for _, rule := range proxy.DefaultStallRules() {
+		if rule.Agent == "codex" {
+			codexRule = rule
+		}
+	}
+	line, ok := findStall(codexCapacityStall, codexRule)
+	if !ok || line != "■ Selected model is at capacity. Please try a different model." {
+		t.Fatalf("stall = %q, %v", line, ok)
+	}
+	// An error that has scrolled up is history, not a stall.
+	if _, ok := findStall(codexCapacityStall+strings.Repeat("• more output\n", 10), codexRule); ok {
+		t.Fatal("an old error above newer output was treated as a stall")
+	}
+	sent := filepath.Join(t.TempDir(), "sent")
+	cmux := filepath.Join(t.TempDir(), "cmux")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\n[ \"$1\" = send ] && printf '%s' \"$4\" >> \""+sent+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stalls := newStallTracker()
+	start := time.Unix(1_800_000_000, 0)
+	if _, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start); did {
+		t.Fatal("resumed before the first backoff passed")
+	}
+	if action, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start.Add(31*time.Second)); !did || action != "continue" {
+		t.Fatalf("first resume = %q, %v", action, did)
+	}
+	if _, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start.Add(61*time.Second)); did {
+		t.Fatal("second resume came before its one-minute backoff")
+	}
+	if _, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start.Add(92*time.Second)); !did {
+		t.Fatal("second resume did not come after its backoff")
+	}
+	body, _ := os.ReadFile(sent)
+	if string(body) != "continue\ncontinue\n" {
+		t.Fatalf("typed %q", body)
+	}
+	// A goal session gets /goal resume instead.
+	goal := newStallTracker()
+	goalScreen := "Pursuing goal: ship it\n" + codexCapacityStall
+	goal.resumeStalledTab(cmux, "s2", line, goalScreen, start)
+	if action, _ := goal.resumeStalledTab(cmux, "s2", line, goalScreen, start.Add(31*time.Second)); action != "/goal resume" {
+		t.Fatalf("goal session action = %q", action)
 	}
 }

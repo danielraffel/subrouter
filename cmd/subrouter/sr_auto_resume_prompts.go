@@ -122,7 +122,7 @@ func isClaudeMemoryFile(prompt pendingPrompt) bool {
 const promptQuietFor = 5 * time.Second
 
 // answerPrompts applies the pool's prompt rules to every quiet agent tab.
-func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, out io.Writer) {
+func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, stalls *stallTracker, out io.Writer) {
 	sessions, err := readCMUXSessions(cmuxPath)
 	if err != nil {
 		return
@@ -147,6 +147,7 @@ func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, 
 		}
 		prompt, ok := findPendingPrompt(screen)
 		if !ok {
+			resumeIfStalled(serverURL, cmuxPath, host, session, screen, setting, stalls, now, out)
 			continue
 		}
 		report := proxy.PromptReport{Host: host, Agent: session.Agent, SurfaceID: session.SurfaceID, Question: prompt.Question, File: prompt.File}
@@ -168,4 +169,105 @@ func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, 
 		}
 		_ = postAutoResume(serverURL, "/_subrouter/auto-resume/prompts", report, nil)
 	}
+}
+
+// stallTracker remembers, per tab, how often a stall rule has resumed it, so
+// a tab that keeps stopping is retried with backoff rather than hammered.
+type stallTracker struct {
+	tabs map[string]*stalledTab
+}
+
+type stalledTab struct {
+	firstSeen time.Time
+	lastSent  time.Time
+	attempts  int
+	line      string
+}
+
+func newStallTracker() *stallTracker { return &stallTracker{tabs: map[string]*stalledTab{}} }
+
+// stallBackoff is how long to wait before each resume of a stalled tab.
+var stallBackoff = []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
+
+// maxStallAttempts stops retrying a tab that never recovers (about 2 hours).
+const maxStallAttempts = 14
+
+// findStall returns the screen line a stall rule matches, when it is among
+// the last lines of the tab, so an error that has scrolled up is ignored.
+func findStall(screen string, rule proxy.StallRule) (string, bool) {
+	pattern, err := regexp.Compile(rule.Screen)
+	if err != nil {
+		return "", false
+	}
+	lines := strings.Split(strings.TrimRight(screen, "\n"), "\n")
+	var recent []string
+	for i := len(lines) - 1; i >= 0 && len(recent) < 8; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			recent = append(recent, line)
+		}
+	}
+	for _, line := range recent {
+		if pattern.MatchString(line) {
+			return line, true
+		}
+	}
+	return "", false
+}
+
+// resumeStalledTab types continue or /goal resume into a tab stopped on a
+// temporary failure, once its backoff has passed. It reports whether it sent.
+func (t *stallTracker) resumeStalledTab(cmuxPath, surface, line, screen string, now time.Time) (string, bool) {
+	tab := t.tabs[surface]
+	if tab == nil || tab.line != line {
+		tab = &stalledTab{firstSeen: now, line: line}
+		t.tabs[surface] = tab
+	}
+	if tab.attempts >= maxStallAttempts {
+		return "", false
+	}
+	wait := stallBackoff[min(tab.attempts, len(stallBackoff)-1)]
+	since := tab.firstSeen
+	if !tab.lastSent.IsZero() {
+		since = tab.lastSent
+	}
+	if now.Sub(since) < wait {
+		return "", false
+	}
+	action := resumeActionForSurface(screen)
+	if exec.Command(cmuxPath, "send", "--surface", surface, action+"\n").Run() != nil {
+		return "", false
+	}
+	tab.attempts++
+	tab.lastSent = now
+	return action, true
+}
+
+// forget drops tabs that are no longer stalled.
+func (t *stallTracker) forget(surface string) { delete(t.tabs, surface) }
+
+// resumeIfStalled applies the stall rules to a quiet tab with no prompt.
+func resumeIfStalled(serverURL, cmuxPath, host string, session cmuxSessionWire, screen string, setting proxy.AutoResumeSetting, stalls *stallTracker, now time.Time, out io.Writer) {
+	if stalls == nil {
+		return
+	}
+	for _, rule := range setting.EffectiveStallRules() {
+		if rule.Agent != session.Agent {
+			continue
+		}
+		line, stalled := findStall(screen, rule)
+		if !stalled {
+			continue
+		}
+		action, sent := stalls.resumeStalledTab(cmuxPath, session.SurfaceID, line, screen, now)
+		if !sent {
+			return
+		}
+		io.WriteString(out, now.Format("15:04:05")+" typed "+action+" into "+session.Agent+" tab "+session.SurfaceID+" after: "+line+"\n")
+		_ = postAutoResume(serverURL, "/_subrouter/auto-resume/prompts", proxy.PromptReport{
+			Host: host, Agent: session.Agent, SurfaceID: session.SurfaceID,
+			Question: "stalled on: " + line, AnsweredBy: "typed " + action + " — " + rule.Note,
+		}, nil)
+		return
+	}
+	stalls.forget(session.SurfaceID)
 }
