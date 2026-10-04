@@ -226,6 +226,9 @@ type Server struct {
 	// Recovery records classified provider/quota evidence for the shared cmux
 	// watcher. It never owns terminal reads or writes.
 	Recovery *RecoveryTracker
+	// AutoResumeSettingPath holds the pool-wide auto-resume switch that
+	// every machine's resumer follows. Empty disables the endpoint.
+	AutoResumeSettingPath string
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -2271,6 +2274,8 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/account-import", s.requireAccountImportAuth(s.handleAccountImport))
 	mux.HandleFunc("/_subrouter/sessions", s.requireAdmin(s.handleSessions))
 	mux.HandleFunc("/_subrouter/recovery-status", s.requireAdmin(s.handleRecoveryStatus))
+	mux.HandleFunc("/_subrouter/auto-resume", s.requireAdmin(s.handleAutoResume))
+	mux.HandleFunc("/_subrouter/auto-resume/test", s.requireAdmin(s.handleAutoResumeTest))
 	mux.HandleFunc("/_subrouter/recovery-readiness", s.requireAdmin(s.handleRecoveryReadiness))
 	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
 	mux.HandleFunc("/_subrouter/dashboard", s.requireAdmin(s.handleDashboard))
