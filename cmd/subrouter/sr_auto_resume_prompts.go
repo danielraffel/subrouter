@@ -99,7 +99,12 @@ func promptRuleMatches(rule proxy.PromptRule, agent string, prompt pendingPrompt
 // memory folder, from the path Claude shows or, when a long diff pushed that
 // off the screen, from the file existing in a memory folder.
 func isClaudeMemoryFile(prompt pendingPrompt) bool {
-	if prompt.File == "" || !strings.HasSuffix(prompt.File, ".md") {
+	if prompt.File == "" {
+		// A shell command that writes a memory note asks a generic "Do you
+		// want to proceed?"; the header names the file instead.
+		return headerRequestsMemoryEdit(prompt.Header)
+	}
+	if !strings.HasSuffix(prompt.File, ".md") {
 		return false
 	}
 	if prompt.File == "MEMORY.md" {
@@ -344,4 +349,24 @@ func answerPromptAndConfirm(cmuxPath, surface, answer string, prompt pendingProm
 		}
 	}
 	return errNotSubmitted
+}
+
+// headerRequestsMemoryEdit reports whether Claude's prompt header asks to edit
+// or write a markdown file in a memory folder, and nothing else.
+func headerRequestsMemoryEdit(header []string) bool {
+	text := strings.Join(header, " ")
+	at := strings.LastIndex(text, "requested permissions to ")
+	if at < 0 {
+		return false
+	}
+	request := text[at:]
+	if !strings.HasPrefix(request, "requested permissions to edit") && !strings.HasPrefix(request, "requested permissions to write") {
+		return false
+	}
+	for _, field := range strings.Fields(request) {
+		if strings.Contains(field, "/.claude/projects/") && strings.Contains(field, "/memory/") && strings.HasSuffix(strings.TrimRight(field, ".,"), ".md") {
+			return true
+		}
+	}
+	return false
 }

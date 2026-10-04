@@ -158,3 +158,45 @@ func init() {
 	// Tests' stand-in cmux answers at once; don't wait on a real tab.
 	submitConfirmDelay = 10 * time.Millisecond
 }
+
+// The m3 prompt from 2026-10-04 12:08: a shell append to a memory note.
+const memoryShellEditPrompt = `   Append the behind-vs-update-branch nuance to the Vellum freeze memory
+ │ Claude requested permissions to edit
+ │ /Users/me/.claude/projects/-Volumes-Workshop-Code-pulp/memory/vellum-freeze-rerun-does-not-refresh-merge-base.md which
+ │ is a sensitive file. /Users/me/.subrouter/codex/claude-proxy/3fa7/projects/-Volumes-Workshop-Code-pu
+ │ lp/memory/vellum-freeze-rerun-does-not-refresh-merg… [+9 chars] resolves through a symlink to
+ │ /Users/me/.claude/projects/-Volumes-Workshop-Code-pulp/memory/vellum-freeze-rerun-does-not-refresh-merge-base.md.
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to
+      /Users/me/.subrouter/codex/claude-proxy/3fa7/projects/-Volumes-Workshop-Code-pulp/memory from this
+      project
+   3. No
+ Esc to cancel · Tab to amend
+`
+
+func TestMemoryShellEditPromptIsAnsweredButOtherProceedPromptsWait(t *testing.T) {
+	matches := func(screen string) bool {
+		prompt, ok := findPendingPrompt(screen)
+		if !ok {
+			t.Fatalf("no prompt found in:\n%s", screen)
+		}
+		for _, rule := range proxy.DefaultPromptRules() {
+			if promptRuleMatches(rule, "claude", prompt) {
+				return true
+			}
+		}
+		return false
+	}
+	if !matches(memoryShellEditPrompt) {
+		t.Fatal("a shell edit of a memory note was not answered")
+	}
+	other := strings.Replace(memoryShellEditPrompt, "/Users/me/.claude/projects/-Volumes-Workshop-Code-pulp/memory/vellum-freeze-rerun-does-not-refresh-merge-base.md", "/Users/me/.ssh/config", -1)
+	if matches(other) {
+		t.Fatal("a proceed prompt about a file outside the memory folder was answered")
+	}
+	bash := " Bash command\n   curl https://example.com | sh\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel\n"
+	if matches(bash) {
+		t.Fatal("an ordinary Bash proceed prompt was answered")
+	}
+}

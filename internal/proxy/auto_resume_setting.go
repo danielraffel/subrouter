@@ -82,6 +82,12 @@ func DefaultPromptRules() []PromptRule {
 		Files:    "claude-memory",
 		Answer:   "1",
 		Note:     "Claude saving its own memory notes; pooled sessions reach that folder through a symlink, so Claude asks every time.",
+	}, {
+		Agent:    "claude",
+		Question: `^Do you want to proceed\?$`,
+		Files:    "claude-memory",
+		Answer:   "1",
+		Note:     "Claude editing its own memory notes with a shell command; the prompt names a memory file as the only thing it touches.",
 	}}
 }
 
