@@ -102,7 +102,7 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 	}
 	sent := filepath.Join(t.TempDir(), "sent")
 	cmux := filepath.Join(t.TempDir(), "cmux")
-	if err := os.WriteFile(cmux, []byte("#!/bin/sh\n[ \"$1\" = send ] && printf '%s' \"$4\" >> \""+sent+"\"\n"), 0o755); err != nil {
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\n[ \"$1\" = send ] && printf '%s' \"$4\" >> \""+sent+"\"\n[ \"$1\" = send-key ] && [ \"$4\" = enter ] && printf '<enter>' >> \""+sent+"\"\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	stalls := newStallTracker()
@@ -120,7 +120,7 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 		t.Fatal("second resume did not come after its backoff")
 	}
 	body, _ := os.ReadFile(sent)
-	if string(body) != "continue\ncontinue\n" {
+	if string(body) != "continue<enter>continue<enter>" {
 		t.Fatalf("typed %q", body)
 	}
 	// A goal session gets /goal resume instead.
@@ -130,4 +130,31 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 	if action, _ := goal.resumeStalledTab(cmux, "s2", line, goalScreen, start.Add(31*time.Second)); action != "/goal resume" {
 		t.Fatalf("goal session action = %q", action)
 	}
+}
+
+// A command left in Codex's or Claude's input box is detected, so the resumer
+// presses Enter again or reports the tab instead of assuming it resumed.
+func TestStillInInputBox(t *testing.T) {
+	codexUnsent := "■ Selected model is at capacity.\n› /goal resume\n  GPT-6.1-Sol medium · ~/Code/pulp · Main [default]\n"
+	codexSent := "› /goal resume\n• Working (3s)\n› Ask Codex to do anything\n  GPT-6.1-Sol medium · ~/Code/pulp\n"
+	claudeUnsent := "────\n❯ continue\n────\n  status line\n"
+	claudeSent := "> continue\n⏺ Picking up where I left off\n────\n❯ \n────\n  status line\n"
+	for name, tc := range map[string]struct {
+		screen, text string
+		want         bool
+	}{
+		"codex unsent":  {codexUnsent, "/goal resume", true},
+		"codex sent":    {codexSent, "/goal resume", false},
+		"claude unsent": {claudeUnsent, "continue", true},
+		"claude sent":   {claudeSent, "continue", false},
+	} {
+		if got := stillInInputBox(tc.screen, tc.text); got != tc.want {
+			t.Errorf("%s: stillInInputBox = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func init() {
+	// Tests' stand-in cmux answers at once; don't wait on a real tab.
+	submitConfirmDelay = 10 * time.Millisecond
 }

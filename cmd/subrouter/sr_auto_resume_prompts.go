@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -155,7 +156,7 @@ func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, 
 			if !promptRuleMatches(rule, session.Agent, prompt) {
 				continue
 			}
-			if exec.Command(cmuxPath, "send", "--surface", session.SurfaceID, rule.Answer).Run() == nil {
+			if answerPromptAndConfirm(cmuxPath, session.SurfaceID, rule.Answer, prompt) == nil {
 				report.AnsweredBy = rule.Note
 				if report.AnsweredBy == "" {
 					report.AnsweredBy = rule.Question
@@ -182,6 +183,8 @@ type stalledTab struct {
 	lastSent  time.Time
 	attempts  int
 	line      string
+	// failed is set when the last resume never left the input box.
+	failed bool
 }
 
 func newStallTracker() *stallTracker { return &stallTracker{tabs: map[string]*stalledTab{}} }
@@ -234,11 +237,13 @@ func (t *stallTracker) resumeStalledTab(cmuxPath, surface, line, screen string, 
 		return "", false
 	}
 	action := resumeActionForSurface(screen)
-	if exec.Command(cmuxPath, "send", "--surface", surface, action+"\n").Run() != nil {
+	err := typeIntoTab(cmuxPath, surface, action)
+	if err != nil && !errors.Is(err, errNotSubmitted) {
 		return "", false
 	}
 	tab.attempts++
 	tab.lastSent = now
+	tab.failed = err != nil
 	return action, true
 }
 
@@ -262,12 +267,81 @@ func resumeIfStalled(serverURL, cmuxPath, host string, session cmuxSessionWire, 
 		if !sent {
 			return
 		}
-		io.WriteString(out, now.Format("15:04:05")+" typed "+action+" into "+session.Agent+" tab "+session.SurfaceID+" after: "+line+"\n")
-		_ = postAutoResume(serverURL, "/_subrouter/auto-resume/prompts", proxy.PromptReport{
+		report := proxy.PromptReport{
 			Host: host, Agent: session.Agent, SurfaceID: session.SurfaceID,
 			Question: "stalled on: " + line, AnsweredBy: "typed " + action + " — " + rule.Note,
-		}, nil)
+		}
+		if tab := stalls.tabs[session.SurfaceID]; tab != nil && tab.failed {
+			// Reported as waiting, so why and the dashboard flag it.
+			report.Question, report.AnsweredBy = "could not submit "+action+" after: "+line, ""
+			io.WriteString(out, now.Format("15:04:05")+" FAILED to submit "+action+" in "+session.Agent+" tab "+session.SurfaceID+"\n")
+		} else {
+			io.WriteString(out, now.Format("15:04:05")+" typed "+action+" into "+session.Agent+" tab "+session.SurfaceID+" after: "+line+"\n")
+		}
+		_ = postAutoResume(serverURL, "/_subrouter/auto-resume/prompts", report, nil)
 		return
 	}
 	stalls.forget(session.SurfaceID)
+}
+
+// typeIntoTab types text into a cmux tab, presses Enter, and confirms the
+// command left the input box. A trailing newline in the text is not enough:
+// Codex's composer treats it as a new line rather than a submit, so the
+// command once sat unsent. If it is still in the input box after a second
+// Enter, typeIntoTab returns errNotSubmitted for the caller to report.
+func typeIntoTab(cmuxPath, surface, text string) error {
+	text = strings.TrimRight(text, "\n")
+	if err := exec.Command(cmuxPath, "send", "--surface", surface, text).Run(); err != nil {
+		return err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := exec.Command(cmuxPath, "send-key", "--surface", surface, "enter").Run(); err != nil {
+			return err
+		}
+		time.Sleep(submitConfirmDelay)
+		screen, err := readSurface(cmuxPath, surface)
+		if err != nil || !stillInInputBox(screen, text) {
+			return nil
+		}
+	}
+	return errNotSubmitted
+}
+
+// submitConfirmDelay is how long a tab gets to take a submitted command.
+var submitConfirmDelay = 2 * time.Second
+
+var errNotSubmitted = errors.New("typed into the tab, but it is still in the input box after two Enter presses")
+
+// stillInInputBox reports whether text is still waiting in the tab's input
+// box: the lowest line starting with a prompt marker (Codex ›, Claude ❯).
+func stillInInputBox(screen, text string) bool {
+	lines := strings.Split(strings.TrimRight(screen, "\n"), "\n")
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-12; i-- {
+		line := strings.TrimSpace(lines[i])
+		for _, marker := range []string{"›", "❯", ">"} {
+			if strings.HasPrefix(line, marker) {
+				return strings.TrimSpace(strings.TrimPrefix(line, marker)) == text
+			}
+		}
+	}
+	return false
+}
+
+// answerPromptAndConfirm sends a rule's answer and confirms the prompt is
+// gone, trying once more before giving up.
+func answerPromptAndConfirm(cmuxPath, surface, answer string, prompt pendingPrompt) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := exec.Command(cmuxPath, "send", "--surface", surface, answer).Run(); err != nil {
+			return err
+		}
+		time.Sleep(submitConfirmDelay)
+		screen, err := readSurface(cmuxPath, surface)
+		if err != nil {
+			return nil
+		}
+		if still, ok := findPendingPrompt(screen); !ok || still.Question != prompt.Question {
+			return nil
+		}
+	}
+	return errNotSubmitted
 }
