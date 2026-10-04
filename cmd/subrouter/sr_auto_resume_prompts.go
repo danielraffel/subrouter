@@ -240,6 +240,10 @@ func findStall(screen string, rule proxy.StallRule) (string, bool) {
 			recent = append(recent, line)
 		}
 	}
+	// Claude can draw a long background-agents panel below its input box,
+	// pushing the error out of the last lines; also read what sits just
+	// above the input box, which is the last thing the agent printed.
+	recent = append(recent, linesAboveInputBox(lines, 8)...)
 	for _, line := range recent {
 		if pattern.MatchString(line) {
 			return line, true
@@ -424,4 +428,26 @@ func unwrapHeader(header []string) string {
 		b.WriteString(line)
 	}
 	return b.String()
+}
+
+// linesAboveInputBox returns up to n content lines just above the tab's
+// input box (the lowest line starting with ❯ or ›), skipping separators.
+func linesAboveInputBox(lines []string, n int) []string {
+	box := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "❯") || strings.HasPrefix(line, "›") {
+			box = i
+			break
+		}
+	}
+	var out []string
+	for i := box - 1; box > 0 && i >= 0 && len(out) < n; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || strings.Trim(line, "─━-") == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }

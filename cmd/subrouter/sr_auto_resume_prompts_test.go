@@ -97,7 +97,9 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 		t.Fatalf("stall = %q, %v", line, ok)
 	}
 	// An error that has scrolled up is history, not a stall.
-	if _, ok := findStall(codexCapacityStall+strings.Repeat("• more output\n", 10), codexRule); ok {
+	// Newer output appears above the input box and pushes the old error up.
+	scrolled := strings.Replace(codexCapacityStall, "› Ask Codex to do anything", strings.Repeat("• more output\n", 10)+"› Ask Codex to do anything", 1)
+	if _, ok := findStall(scrolled, codexRule); ok {
 		t.Fatal("an old error above newer output was treated as a stall")
 	}
 	sent := filepath.Join(t.TempDir(), "sent")
@@ -241,5 +243,22 @@ func TestMemoryNotePreviewIsRecognized(t *testing.T) {
 		if prompt, _ := findPendingPrompt(other); isClaudeMemoryFile(prompt) {
 			t.Fatalf("not a memory note, but recognized:\n%s", other)
 		}
+	}
+}
+
+// The m5 tab from 2026-10-04: the 503 sits above the input box and a long
+// background-agents panel fills the lines below it.
+func TestStallFoundAboveAgentsPanel(t *testing.T) {
+	screen := "⏺ API Error: 503 no non-exhausted claude accounts available. This is a server-side issue, usually temporary\n\n" +
+		"────────\n❯ \n────────\n  ⏵⏵ auto mode on · 39 shells · ← for agents\n  ⏺ main\n" +
+		strings.Repeat("  ◯ general-purpose  some agent task    9h 47m · ↓ 416.7k tokens\n", 6) + "  ↓ 5 more\n"
+	var claudeRule proxy.StallRule
+	for _, rule := range proxy.DefaultStallRules() {
+		if rule.Agent == "claude" {
+			claudeRule = rule
+		}
+	}
+	if _, ok := findStall(screen, claudeRule); !ok {
+		t.Fatal("a 503 above the input box was missed behind the agents panel")
 	}
 }

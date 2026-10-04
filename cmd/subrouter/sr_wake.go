@@ -600,15 +600,6 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 		if (state.Kind == wake.KindCodexQuota || state.Kind == wake.KindClaudeQuota) && state.LastSuccessAt.After(state.LastFailureAt) {
 			continue
 		}
-		enabled, err := scope.enabled(state.Agent)
-		if err != nil {
-			return err
-		}
-		if !enabled {
-			// Disabled auto-resume must not enqueue alarms that wait for
-			// a later enable. Explicit schedule commands remain usable.
-			continue
-		}
 		matched, found := scope.boundSession(state.Agent, state.SessionID)
 		for _, candidate := range sessions {
 			if found {
@@ -619,6 +610,17 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 			}
 		}
 		if !found || matched.SurfaceID == "" {
+			// Not a tab on this Mac; another Mac's resumer decides.
+			continue
+		}
+		enabled, err := scope.enabled(state.Agent)
+		if err != nil {
+			return err
+		}
+		if !enabled {
+			// Disabled auto-resume must not enqueue alarms that wait for
+			// a later enable. Explicit schedule commands remain usable.
+			scope.decide(state, matched.SurfaceID, "not resumed: "+state.Agent+" auto-resume is off")
 			continue
 		}
 		lastActive := state.LastActivityAt
@@ -626,6 +628,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 			lastActive = parsed
 		}
 		if !wake.EligibleForAutomatic(lastActive, now, initial, !initial) {
+			scope.decide(state, matched.SurfaceID, "not resumed: the session was last active "+lastActive.Local().Format("Jan 2 15:04")+", too long ago to resume automatically")
 			continue
 		}
 		already := false
@@ -644,6 +647,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 		}
 		screen, err := readSurface(cmuxPath, matched.SurfaceID)
 		if err != nil {
+			scope.decide(state, matched.SurfaceID, "not resumed: cannot read its tab ("+err.Error()+")")
 			continue
 		}
 		action := resumeActionForSurface(screen)
@@ -657,7 +661,11 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 			}
 			next := policy.Next(wake.ResumeState{Failures: state.Failures, GoalAttempts: state.GoalAttempts, ContinueSent: state.ContinueSent, LastFailureAt: state.LastFailureAt, GenerationBegan: false}, now, !state.ProviderHealthyAt.IsZero() && state.ProviderHealthyAt.After(state.LastFailureAt))
 			switch next {
-			case wake.ResumeWait, wake.ResumeStop:
+			case wake.ResumeWait:
+				scope.decide(state, matched.SurfaceID, "waiting: provider backoff before the next attempt")
+				continue
+			case wake.ResumeStop:
+				scope.decide(state, matched.SurfaceID, "not resumed: provider retry limit reached; resume it by hand")
 				continue
 			case wake.ResumeProbe:
 				// A probe is deliberately terminally cheap: validate the exact
@@ -682,6 +690,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 		if err != nil {
 			return err
 		}
+		scope.decide(state, matched.SurfaceID, "scheduled: will type "+action+" at "+wakeAt.Local().Format("15:04")+" (quota or provider back by then)")
 		existing, _ = store.List(now)
 	}
 	return nil
