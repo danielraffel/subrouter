@@ -634,6 +634,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 		return runDaemonCommand(ctx, args[1:], r.store, r.out, r.errOut)
 	case "setup":
 		return r.cloudSetup(ctx, args[1:])
+	case "drain-first":
+		return r.drainFirst(args[1:])
 	case "claude":
 		return r.claude(ctx, args[1:])
 	case "claude-aws":

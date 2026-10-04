@@ -198,6 +198,10 @@ func runForProgram(program string, args []string) error {
 	if args[0] == "wake" || args[0] == "auto-resume" {
 		return srWakeForProgram(args[1:])
 	}
+	if args[0] == "drain-first" {
+		runner := srRunner{program: "sr", store: accounts.DefaultCodexStore(), in: os.Stdin, out: os.Stdout, errOut: os.Stderr}
+		return runner.drainFirst(args[1:])
+	}
 	if program == "sr" &&
 		(isDirectSRCommand(args[0]) || strings.Contains(args[0], "@")) {
 		return srForProgram(program, args)
@@ -858,6 +862,7 @@ func serve(args []string) error {
 		// survives restarts and upgrades of this server.
 		Recovery:                 proxy.NewRecoveryTrackerAt(filepath.Join(filepath.Dir(*sessionPath), "recovery-state.json")),
 		AutoResumeSettingPath:    filepath.Join(filepath.Dir(*sessionPath), "auto-resume.json"),
+		DrainFirstPath:           filepath.Join(filepath.Dir(*sessionPath), "drain-first.json"),
 		Traffic:                  proxy.NewTrafficStats(time.Now()),
 		ReleaseStatePath:         strings.TrimSpace(*releaseStatePath),
 		Upstream:                 upstream,

@@ -228,6 +228,8 @@ type Server struct {
 	// AutoResumeSettingPath holds the pool-wide auto-resume switch that
 	// every machine's resumer follows. Empty disables the endpoint.
 	AutoResumeSettingPath string
+	// DrainFirstPath holds the Codex accounts to use before any other.
+	DrainFirstPath string
 	// azureCodexRejects remembers request fields an Azure deployment refused.
 	azureCodexRejects *azureCodexFieldMemory
 	// claudeWebBalances holds CLI-pushed Claude prepaid balances for the
@@ -2237,6 +2239,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/auto-resume", s.requireAdmin(s.handleAutoResume))
 	mux.HandleFunc("/_subrouter/auto-resume/test", s.requireAdmin(s.handleAutoResumeTest))
 	mux.HandleFunc("/_subrouter/auto-resume/rules", s.requireAdmin(s.handleAutoResumeRules))
+	mux.HandleFunc("/_subrouter/drain-first", s.requireAdmin(s.handleDrainFirst))
 	mux.HandleFunc("/_subrouter/auto-resume/prompts", s.requireAdmin(s.handleAutoResumePrompts))
 	mux.HandleFunc("/_subrouter/recovery-readiness", s.requireAdmin(s.handleRecoveryReadiness))
 	mux.HandleFunc("/_subrouter/cutover-challenge", s.requireAdmin(s.handleCutoverChallenge))
@@ -7419,6 +7422,29 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	if provider == accounts.ProviderCodex && s.SchedulerRef != nil && s.SchedulerRef.HasCapacityMarks() {
 		scheduler = s.withCapacityMarks(scheduler, provider, model, codexCapacitySelectionTier(r, s.MaxBodyBytes))
+	}
+	// A drain-first list overrides placement for running and new sessions
+	// alike: spending those accounts down before their reset credits expire
+	// is worth one uncached prompt per moved session.
+	if account, ok := s.drainFirstAccount(provider, availableAccounts, scheduler); ok {
+		if previousAccountID == account.ID {
+			s.touchSessionBestEffort(agentType, sessionID)
+			if userEmail == "" {
+				if assignment, ok := s.Sessions.Get(agentType, sessionID); ok {
+					userEmail = assignment.UserEmail
+				}
+			}
+			return account, sessionID, userEmail, nil
+		}
+		s.logAccountMove(agentType, sessionID, model, previousAccountID, account.ID, provider, nil)
+		if s.Logger != nil {
+			s.Logger.Info("drain-first placed session", "agent", agentType, "session", sessionID, "from", previousAccountID, "account", account.ID)
+		}
+		assignment, err := s.Sessions.Put(agentType, sessionID, account.ID, userEmail)
+		if err != nil {
+			return accounts.Account{}, sessionID, userEmail, err
+		}
+		return account, sessionID, assignment.UserEmail, nil
 	}
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
