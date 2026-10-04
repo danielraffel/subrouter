@@ -39,10 +39,11 @@ import (
 // No LaunchAgent is involved: a resumer lives exactly as long as some sr
 // process on that Mac does.
 
-// resumerProtocolVersion identifies what this resumer can do. Bump it when
+// resumerProtocolVersion identifies what this resumer can do. Version 2
+// answers Claude memory-file prompts (sr_auto_resume_prompts.go). Bump it when
 // the resumer gains an ability rules depend on; a newer resumer then takes a
 // Mac over from an older one still running inside a long-lived session.
-const resumerProtocolVersion = 1
+const resumerProtocolVersion = 2
 
 // resumerInterval is how often a resumer checks the proxy and cmux.
 const resumerInterval = 15 * time.Second
@@ -184,6 +185,7 @@ func runResumer(ctx context.Context, serverURL string, out io.Writer) {
 			if err := dispatchDueWakeAlarms(store, serverURL, cmuxPath, 5*time.Second, startedAt, out, scope); err != nil {
 				slog.Debug("auto-resume dispatch", "error", err)
 			}
+			answerClaudeMemoryPrompts(cmuxPath, scope, out)
 		}
 		select {
 		case <-ctx.Done():
