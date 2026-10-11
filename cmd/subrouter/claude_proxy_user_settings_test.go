@@ -201,7 +201,11 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 }
 
 func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
-	root := t.TempDir()
+	// The code resolves symlinks; on macOS t.TempDir is under the /var link.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	projects := filepath.Join(root, "projects")
 	if err := os.MkdirAll(projects, 0o700); err != nil {
 		t.Fatal(err)
