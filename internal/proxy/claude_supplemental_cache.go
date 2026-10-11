@@ -1,0 +1,277 @@
+package proxy
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/manaflow-ai/subrouter/internal/accounts"
+	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
+)
+
+// The ordinary OAuth usage endpoint is still checked at its existing cadence.
+// Only the supplementary Messages probe is reused: its extra weekly windows
+// change on a slower schedule, and a real quota rejection is handled on the
+// inference path independently of this cache.
+const claudeSupplementalProbeTTL = 10 * time.Minute
+
+type claudeSupplementalUsage struct {
+	windows []accounts.UsageWindow
+	at      time.Time
+	// Request start orders overlapping model observations independently of
+	// when their headers arrive. The at field controls cache freshness.
+	requestStarted time.Time
+}
+
+func claudeSupplementalCacheKey(account accounts.Account) string {
+	// A re-login or access-token rotation bypasses the prior probe result.
+	digest := sha256.Sum256([]byte(account.CredentialIdentity()))
+	return string(account.Provider) + "\x00" + account.ID + "\x00" + hex.EncodeToString(digest[:])
+}
+
+// errClaudeUsageProbeEmpty is returned when a credential that cannot read the
+// usage endpoint also got no limits from the Messages probe. The probe comes
+// back empty on a transient overload, so this must not read as an
+// authentication failure: its text is neither auth-like nor throttle-like,
+// which keeps the last known usage and routing score in place.
+var errClaudeUsageProbeEmpty = errors.New("Claude usage unavailable: the Messages probe returned no limits")
+
+// claudeUsageScopeDeniedFor reports whether this exact credential cannot read
+// the usage endpoint: either the endpoint already refused it for scope, or its
+// recorded scopes rule the endpoint out. The recorded scopes are read once per
+// credential, so a setup token never reaches the endpoint, on either the
+// status sweep or the routing-score sweep, including right after a restart.
+// The key includes the credential, so a re-login that carries the scope is
+// asked afresh.
+func (r *AccountRef) claudeUsageScopeDeniedFor(ctx context.Context, account accounts.Account) bool {
+	key := claudeSupplementalCacheKey(account)
+	r.usageWindowsMu.Lock()
+	_, denied := r.claudeUsageScopeDenied[key]
+	_, checked := r.claudeUsageScopeChecked[key]
+	r.usageWindowsMu.Unlock()
+	if denied || checked || account.Source == "" {
+		return denied
+	}
+	credential, err := r.claudeStore.ReadCredential(ctx, account.Source)
+	if err != nil || credential == nil || credential.AccessToken != account.Token {
+		// Unreadable, or the store has moved on to another credential. Leave
+		// it unknown; the endpoint's own answer still teaches the denial.
+		return false
+	}
+	r.usageWindowsMu.Lock()
+	if r.claudeUsageScopeChecked == nil {
+		r.claudeUsageScopeChecked = map[string]struct{}{}
+	}
+	r.claudeUsageScopeChecked[key] = struct{}{}
+	r.usageWindowsMu.Unlock()
+	if !credential.LacksUsageScope() {
+		return false
+	}
+	r.rememberClaudeUsageScopeDenied(account)
+	return true
+}
+
+func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	if r.claudeUsageScopeDenied == nil {
+		r.claudeUsageScopeDenied = map[string]struct{}{}
+	}
+	r.claudeUsageScopeDenied[claudeSupplementalCacheKey(account)] = struct{}{}
+	// A throttle recorded for this credential came from that same endpoint.
+	// It says nothing about the Messages probe, so it must not hold the
+	// probe back for the rest of its retry window.
+	cacheKey := account.ID + "\x00" + string(account.Provider)
+	delete(r.usageWindowsFailures, usageWindowsFailureKey(cacheKey, account.CredentialIdentity()))
+}
+
+func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageWindow {
+	out := make([]accounts.UsageWindow, 0, len(windows))
+	for _, window := range windows {
+		// Only model-specific quota buckets belong in the supplemental cache.
+		// Global 5h/7d and extra-usage balance must come from the current
+		// ordinary status response; caching them would resurrect stale spend
+		// or balance information on later incomplete responses.
+		if window.Feature == "" {
+			continue
+		}
+		out = append(out, window)
+	}
+	return out
+}
+
+// An authoritative exhausted model bucket needs no synthetic Messages probe
+// before its reported reset. Healthy/unknown buckets keep a short freshness
+// TTL because their utilization may continue changing.
+func claudeSupplementalFreshEnough(cached claudeSupplementalUsage, now time.Time) bool {
+	if now.Sub(cached.at) < claudeSupplementalProbeTTL {
+		return true
+	}
+	if len(cached.windows) == 0 {
+		return false
+	}
+	for _, window := range cached.windows {
+		if window.UsedPercent < 100 || window.ResetAt.IsZero() || !now.Before(window.ResetAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *AccountRef) cachedClaudeSupplemental(account accounts.Account, now time.Time) ([]accounts.UsageWindow, bool) {
+	windows, _, ok := r.cachedClaudeSupplementalWithObservation(account, now)
+	return windows, ok
+}
+
+func (r *AccountRef) cachedClaudeSupplementalWithObservation(account accounts.Account, now time.Time) ([]accounts.UsageWindow, time.Time, bool) {
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	cached, ok := r.claudeSupplemental[claudeSupplementalCacheKey(account)]
+	if !ok || !claudeSupplementalFreshEnough(cached, now) {
+		return nil, time.Time{}, false
+	}
+	for _, window := range cached.windows {
+		if window.UsedPercent >= 100 && window.ResetAt.IsZero() {
+			// Exhaustion with an unknown reset has no defensible cache lifetime.
+			// Request fresh evidence at the next ordinary quota refresh.
+			return nil, time.Time{}, false
+		}
+		if !window.ResetAt.IsZero() && !now.Before(window.ResetAt) {
+			// A quota reset invalidates previously observed utilization.
+			return nil, time.Time{}, false
+		}
+	}
+	// A successful empty probe also counts; it prevents needless periodic
+	// retries when Anthropic returned no supplementary headers.
+	copyOfWindows := append([]accounts.UsageWindow(nil), cached.windows...)
+	for i := range copyOfWindows {
+		if !copyOfWindows[i].ResetAt.IsZero() {
+			remaining := int64(copyOfWindows[i].ResetAt.Sub(now).Seconds())
+			if remaining < 0 {
+				remaining = 0
+			}
+			copyOfWindows[i].ResetAfterSeconds = remaining
+		}
+	}
+	return copyOfWindows, cached.at, true
+}
+
+func (r *AccountRef) rememberClaudeSupplemental(account accounts.Account, windows []accounts.UsageWindow) {
+	supplemental := supplementalClaudeWindows(windows)
+	for _, window := range supplemental {
+		if window.UsedPercent >= 100 && window.ResetAt.IsZero() {
+			// This authoritative result supersedes any older cached bucket.
+			// Since its reset is unknown, keep no cache entry for this token.
+			r.usageWindowsMu.Lock()
+			delete(r.claudeSupplemental, claudeSupplementalCacheKey(account))
+			r.usageWindowsMu.Unlock()
+			return
+		}
+	}
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	if r.claudeSupplemental == nil {
+		r.claudeSupplemental = map[string]claudeSupplementalUsage{}
+	}
+	now := time.Now()
+	for key, value := range r.claudeSupplemental {
+		if !claudeSupplementalFreshEnough(value, now) {
+			delete(r.claudeSupplemental, key)
+		}
+	}
+	r.claudeSupplemental[claudeSupplementalCacheKey(account)] = claudeSupplementalUsage{
+		windows: append([]accounts.UsageWindow(nil), supplemental...),
+		at:      now,
+	}
+}
+
+// fetchClaudeUsageWindowsReusingSupplemental keeps normal usage checks fresh
+// while avoiding a second synthetic Messages request at every cache expiry.
+// It never delays inference, and keeps the preexisting error/fallback behavior
+// if the ordinary usage endpoint fails.
+func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
+	ctx context.Context, client *http.Client, account accounts.Account,
+) ([]accounts.UsageWindow, error) {
+	windows, _, err := r.fetchClaudeUsageWindowsReusingSupplementalWithFreshness(ctx, client, account)
+	return windows, err
+}
+
+func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
+	ctx context.Context, client *http.Client, account accounts.Account,
+) ([]accounts.UsageWindow, bool, error) {
+	var usage *agentclaude.UsageResponse
+	var err error
+	if r.claudeUsageScopeDeniedFor(ctx, account) {
+		// This credential cannot read the usage endpoint. Asking again only
+		// earns a 429 that would mark a healthy account throttled, so go
+		// straight to the Messages probe, whose headers are its usage source.
+		err = &agentclaude.UsageScopeError{Status: "403 Forbidden"}
+	} else {
+		usage, err = agentclaude.FetchUsage(ctx, client, account.Token)
+		var scope *agentclaude.UsageScopeError
+		if errors.As(err, &scope) {
+			r.rememberClaudeUsageScopeDenied(account)
+		}
+	}
+	windows := claudeUsageWindows(usage)
+	var throttle *agentclaude.UsageThrottleError
+	if errors.As(err, &throttle) {
+		// The provider's usage endpoint supplied an explicit retry deadline.
+		// Do not immediately issue the synthetic Messages probe as a fallback;
+		// that would double traffic while the account is already throttled.
+		// Keep any unified reset headers from that same response for status.
+		return append([]accounts.UsageWindow(nil), throttle.Windows...), false, err
+	}
+	if usageWindowNamed(windows, agentclaude.FableWindowName) {
+		// The ordinary endpoint's model bucket is newer than our probe cache.
+		// Save it so a later ordinary response that omits the bucket does not
+		// resurrect older supplemental evidence.
+		r.rememberClaudeSupplemental(account, windows)
+		return windows, true, nil
+	}
+
+	// A successful primary fetch can use prior supplementary evidence without
+	// another model request. On primary errors, leave the normal recovery
+	// probe intact so its primary windows may recover a usable status.
+	if err == nil && len(windows) > 0 {
+		if supplemental, observedAt, ok := r.cachedClaudeSupplementalWithObservation(account, time.Now()); ok {
+			// The primary endpoint is fresh, but the model-specific values may
+			// predate it. Do not let the scheduler treat old headroom as a live
+			// routing signal; keep the last score until a new probe observes it.
+			supplementalFresh := len(supplemental) == 0 || time.Since(observedAt) < usageWindowsTTL
+			windows = mergeUsageWindows(windows, supplemental)
+			// Passive replies can supply only one model family's bucket. Keep
+			// that evidence, but still probe the missing Fable/OAuth-app bucket;
+			// otherwise a fresh Opus-only observation makes Fable look unsupported
+			// and suppresses the only probe that can discover its quota.
+			if len(supplemental) == 0 || usageWindowNamed(windows, agentclaude.FableWindowName) {
+				return windows, supplementalFresh, nil
+			}
+		}
+	}
+
+	fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, account.Token)
+	if probeErr == nil {
+		if err == nil {
+			r.rememberClaudeSupplemental(account, fableWindows)
+		}
+		if len(fableWindows) > 0 && (err == nil || fableProbeHasPrimaryWindows(fableWindows)) {
+			windows = mergeUsageWindows(windows, fableWindows)
+		}
+	} else if err != nil {
+		return nil, true, probeErr
+	}
+	if err != nil && len(windows) == 0 {
+		var scope *agentclaude.UsageScopeError
+		if errors.As(err, &scope) {
+			// The token works for inference; only its usage reading is
+			// missing this time. That is not a bad credential.
+			return nil, true, errClaudeUsageProbeEmpty
+		}
+		return nil, true, err
+	}
+	return windows, true, nil
+}

@@ -1429,12 +1429,20 @@ type remoteServerUsageStatus struct {
 	ProviderModels     *int                             `json:"provider_models,omitempty"`
 	ProviderEndpoints  []string                         `json:"provider_endpoints,omitempty"`
 	QuotaStatus        string                           `json:"quota_status,omitempty"`
+	UsageThrottled     bool                             `json:"usage_throttled,omitempty"`
 	AccountIdentity    string                           `json:"account_identity,omitempty"`
 	QuotaUsageKnown    bool                             `json:"quota_usage_known,omitempty"`
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
+	UsageFetchedAt     time.Time                        `json:"usage_fetched_at,omitzero"`
+	// Claude cost tier (see proxy.ClaudeCostOrder); absent on older servers.
+	CostTier              string                    `json:"cost_tier,omitempty"`
+	CostTierRank          int                       `json:"cost_tier_rank,omitempty"`
+	CreditsExhaustedUntil time.Time                 `json:"credits_exhausted_until,omitzero"`
+	Credit                *proxy.ClaudeCreditStatus `json:"credit,omitempty"`
+	RevokedSince          time.Time                 `json:"revoked_since,omitzero"`
 }
 
 func (r srRunner) fetchServerAccountsResponse(ctx context.Context, server srServerConfig) (*http.Response, error) {
@@ -1541,18 +1549,33 @@ func (r srRunner) fetchServerAccountStatuses(ctx context.Context, server srServe
 }
 
 func (r srRunner) fetchServerUsageStatuses(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
+	return r.fetchServerUsageStatusesQuery(ctx, server, "refresh=1")
+}
+
+// fetchServerUsageSnapshot reads the controller's last usage sweep. The
+// server seeds the snapshot once when none exists, then serves it without
+// starting another provider sweep or changing routing scores.
+func (r srRunner) fetchServerUsageSnapshot(ctx context.Context, server srServerConfig) ([]remoteServerUsageStatus, bool, error) {
+	return r.fetchServerUsageStatusesQuery(ctx, server, "snapshot=1")
+}
+
+func (r srRunner) fetchServerUsageStatusesQuery(ctx context.Context, server srServerConfig, query string) ([]remoteServerUsageStatus, bool, error) {
 	baseURL, err := serverControlBaseURL(server)
 	if err != nil {
 		return nil, false, err
 	}
-	// `sr status` is an interactive read; bypass the daemon's short shared
-	// usage cache so quota changes are visible immediately after a request.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status?refresh=1", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/usage-status?"+query, nil)
 	if err != nil {
 		return nil, false, redactServerRequestError(err, server)
 	}
 	addServerAdminAuth(req, server)
-	secured, err := r.securedRequestClientForServer(server, baseURL, 15*time.Second)
+	timeout := 15 * time.Second
+	if query == "refresh=1" {
+		// The controller gets up to 30 seconds to check the whole pool.
+		// Allow a large usage response to finish on the client side.
+		timeout = 40 * time.Second
+	}
+	secured, err := r.securedRequestClientForServer(server, baseURL, timeout)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1594,6 +1617,11 @@ func serverUsageDisplayAccount(status remoteServerUsageStatus) string {
 	return ""
 }
 
+func serverUsageThrottleError(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "429") || strings.Contains(lower, "too many requests")
+}
+
 func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUsageRow {
 	rows := make([]srUsageRow, 0, len(statuses))
 	now := time.Now()
@@ -1612,29 +1640,36 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			email = "server"
 		}
 		row := srUsageRow{
-			email:              email,
-			accountID:          status.ID,
-			loginEmail:         strings.TrimSpace(status.Email),
-			displayAccount:     serverUsageDisplayAccount(status),
-			active:             status.Active,
-			authMode:           status.AuthMode,
-			planType:           status.PlanType,
-			quotaStatus:        status.QuotaStatus,
-			accountIdentity:    status.AccountIdentity,
-			quotaUsageKnown:    status.QuotaUsageKnown,
-			windows:            status.Windows,
-			credits:            status.Credits,
-			complimentaryReset: status.ComplimentaryReset,
-			extraUsage:         status.ExtraUsage,
-			provider:           status.Provider,
-			providerHealth:     status.ProviderHealth,
-			authChecked:        status.AuthChecked,
-			authValid:          status.AuthValid,
-			providerModels:     -1,
-			providerEndpoints:  append([]string(nil), status.ProviderEndpoints...),
-			keyFingerprint:     status.KeyFingerprint,
-			assignedSessions:   status.AssignedSessions,
-			sessionsKnown:      status.SessionsKnown,
+			email:                 email,
+			accountID:             status.ID,
+			loginEmail:            strings.TrimSpace(status.Email),
+			displayAccount:        serverUsageDisplayAccount(status),
+			active:                status.Active,
+			authMode:              status.AuthMode,
+			planType:              status.PlanType,
+			quotaStatus:           status.QuotaStatus,
+			accountIdentity:       status.AccountIdentity,
+			quotaUsageKnown:       status.QuotaUsageKnown,
+			usageFetchedAt:        status.UsageFetchedAt,
+			windows:               status.Windows,
+			credits:               status.Credits,
+			complimentaryReset:    status.ComplimentaryReset,
+			extraUsage:            status.ExtraUsage,
+			costTier:              status.CostTier,
+			costTierRank:          status.CostTierRank,
+			creditsExhaustedUntil: status.CreditsExhaustedUntil,
+			credit:                status.Credit,
+			revokedSince:          status.RevokedSince,
+			provider:              status.Provider,
+			usageThrottled:        status.UsageThrottled || status.QuotaStatus == "throttled" || serverUsageThrottleError(status.Error),
+			providerHealth:        status.ProviderHealth,
+			authChecked:           status.AuthChecked,
+			authValid:             status.AuthValid,
+			providerModels:        -1,
+			providerEndpoints:     append([]string(nil), status.ProviderEndpoints...),
+			keyFingerprint:        status.KeyFingerprint,
+			assignedSessions:      status.AssignedSessions,
+			sessionsKnown:         status.SessionsKnown,
 		}
 		if status.ProviderModels != nil {
 			row.providerModels = *status.ProviderModels
@@ -1656,7 +1691,29 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 		}
 		if status.Error != "" {
 			row.err = errors.New(status.Error)
-			row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+			// Keep a last-known usage snapshot useful to the display even when
+			// the provider rejected this refresh. The error still makes the row
+			// ineligible for routing (recommendedForNewSession checks row.err),
+			// while the score lets the hourly/weekly columns and stale-use text
+			// show the reset countdown the server supplied.
+			if len(status.Windows) > 0 {
+				row.score = scoreFromWindows(email, status.Windows)
+				row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			} else {
+				row.score = selectacct.Score{AccountID: email, Headroom: 0, ShortHeadroom: 0}
+			}
+		} else if status.UsageThrottled || status.QuotaStatus == "throttled" {
+			// A telemetry 429 has no quota meaning. Preserve authoritative reset
+			// windows when supplied; only headerless throttles get an optimistic
+			// display score while the controller suppresses another poll.
+			if len(status.Windows) > 0 {
+				row.score = scoreFromWindows(email, status.Windows)
+				row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
+				row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+			} else {
+				row.score = selectacct.Score{AccountID: email, Headroom: 1, ShortHeadroom: 1}
+			}
 		} else if status.AuthMode == accounts.AuthModeAPIKey && status.QuotaUsageKnown {
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
@@ -1676,6 +1733,12 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			row.score = scoreFromWindows(email, status.Windows)
 			row.cooked, row.cookedReason = cookedFromWindows(status.Windows)
 			row.tempCooked, row.tempCookedReason = tempCookedFromWindows(status.Windows)
+		}
+		if !status.RevokedSince.IsZero() {
+			// The server excludes a revoked credential from routing; the
+			// last usage reading it still carries is not capacity.
+			row.cooked = true
+			row.cookedReason = "OAuth credential revoked"
 		}
 		rows = append(rows, row)
 	}

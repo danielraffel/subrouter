@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -288,24 +289,108 @@ type ProfileInfo struct {
 }
 
 func DefaultStore() Store {
-	home, _ := os.UserHomeDir()
-	shared := ""
-	if home != "" {
-		shared = filepath.Join(home, ".claude")
-	}
-	return Store{Dir: storepath.CodexDir(), SharedStateDir: shared}
+	dir := storepath.CodexDir()
+	return Store{Dir: dir, SharedStateDir: callerClaudeConfigDir(dir)}
 }
 
 // DefaultStoreForReadOnlyInspection uses the same effective account root as
 // DefaultStore without importing the legacy Codex store. Serving processes use
 // this constructor so daemon startup cannot copy interactive credentials.
 func DefaultStoreForReadOnlyInspection() Store {
+	dir := storepath.CodexDirForReadOnlyInspection()
+	return Store{Dir: dir, SharedStateDir: callerClaudeConfigDir(dir)}
+}
+
+// DefaultClaudeConfigDir is the directory Claude Code uses when
+// CLAUDE_CONFIG_DIR is unset, or "" without a home directory.
+func DefaultClaudeConfigDir() string {
 	home, _ := os.UserHomeDir()
-	shared := ""
-	if home != "" {
-		shared = filepath.Join(home, ".claude")
+	if home == "" {
+		return ""
 	}
-	return Store{Dir: storepath.CodexDirForReadOnlyInspection(), SharedStateDir: shared}
+	return filepath.Join(home, ".claude")
+}
+
+// callerClaudeConfigDir is the Claude config directory the caller's own
+// `claude` would use: $CLAUDE_CONFIG_DIR when set, else ~/.claude. Subrouter
+// shares history, user config and settings with that directory, so a caller
+// with a custom config dir keeps it under sr.
+//
+// A CLAUDE_CONFIG_DIR inside Subrouter's account store is a proxy or profile
+// directory inherited from an sr launch, never a user directory. A pooled
+// launch exports the shared root it attached to as
+// CLAUDE_CODE_REMOTE_MEMORY_DIR, so a nested sr resolves the same root; other
+// managed launches fall back to ~/.claude.
+func callerClaudeConfigDir(storeDir string) string {
+	fallback := DefaultClaudeConfigDir()
+	dir := absClaudeConfigDir(os.Getenv("CLAUDE_CONFIG_DIR"))
+	if dir == "" {
+		return fallback
+	}
+	if !isManagedClaudeConfigDir(storeDir, dir) {
+		return dir
+	}
+	if inherited := absClaudeConfigDir(os.Getenv("CLAUDE_CODE_REMOTE_MEMORY_DIR")); inherited != "" && !isManagedClaudeConfigDir(storeDir, inherited) {
+		return inherited
+	}
+	return fallback
+}
+
+func absClaudeConfigDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	return abs
+}
+
+// isManagedClaudeConfigDir reports whether dir lies inside the account store
+// or its legacy ~/.codex-accounts spelling, under either path spelling.
+func isManagedClaudeConfigDir(storeDir, dir string) bool {
+	roots := []string{storeDir, storepath.LegacyCodexDir()}
+	for _, root := range roots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		root = absClaudeConfigDir(root)
+		if pathWithinDir(dir, root) {
+			return true
+		}
+		resolvedRoot, rootErr := filepath.EvalSymlinks(root)
+		resolvedDir, dirErr := evalExistingPrefix(dir)
+		if rootErr == nil && dirErr == nil && pathWithinDir(resolvedDir, resolvedRoot) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithinDir(path, dir string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
+}
+
+// evalExistingPrefix resolves symlinks in the longest existing prefix of path
+// and appends the missing remainder, so a not-yet-created proxy directory
+// still compares by its physical location.
+func evalExistingPrefix(path string) (string, error) {
+	path = filepath.Clean(path)
+	rest := ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return filepath.Join(resolved, rest), nil
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", os.ErrNotExist
+		}
+		rest = filepath.Join(filepath.Base(path), rest)
+		path = parent
+	}
 }
 
 func (s Store) ProfilesPath() string {
@@ -4181,6 +4266,53 @@ func keychainHash(instancePath string) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
+// UsageThrottleError preserves the provider's requested retry deadline so
+// quota collectors can stop querying an already-throttled endpoint. It is
+// intentionally limited to telemetry; ordinary model-request routing is
+// managed separately.
+type UsageThrottleError struct {
+	Status  string
+	RetryAt time.Time
+	Windows []accounts.UsageWindow
+}
+
+func (e *UsageThrottleError) Error() string { return "usage fetch failed: " + e.Status }
+
+const usageThrottleFallbackWait = 5 * time.Minute
+
+func usageThrottleRetryAt(raw string, now time.Time) time.Time {
+	raw = strings.TrimSpace(raw)
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 {
+		// Bound the arithmetic while preserving long provider holds.
+		if seconds < int64((30*24*time.Hour)/time.Second) {
+			return now.Add(time.Duration(seconds) * time.Second)
+		}
+		return now.Add(30 * 24 * time.Hour)
+	}
+	if deadline, err := http.ParseTime(raw); err == nil && deadline.After(now) {
+		maxDeadline := now.Add(30 * 24 * time.Hour)
+		if deadline.After(maxDeadline) {
+			return maxDeadline
+		}
+		return deadline
+	}
+	// Retry-After: 0 and absent/malformed hints do not mean that a
+	// saturated usage endpoint has recovered. Give its budget room to clear.
+	return now.Add(usageThrottleFallbackWait)
+}
+
+// UsageScopeError means the token lacks the scope the usage endpoint requires.
+// A setup token carries only user:inference, so for it this is permanent: no
+// later call with the same token can succeed. Its message matches the generic
+// usage failure so existing error classification is unchanged.
+type UsageScopeError struct {
+	Status string
+}
+
+func (e *UsageScopeError) Error() string {
+	return "usage fetch failed: " + e.Status
+}
+
 func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*UsageResponse, error) {
 	if accessToken == "" {
 		return nil, nil
@@ -4200,6 +4332,20 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 		return nil, err
 	}
 	defer res.Body.Close()
+	if res.StatusCode == http.StatusTooManyRequests {
+		now := time.Now()
+		return nil, &UsageThrottleError{
+			Status:  res.Status,
+			RetryAt: usageThrottleRetryAt(res.Header.Get("Retry-After"), now),
+			Windows: usageWindowsFromFableHeaders(res.Header, now),
+		}
+	}
+	if res.StatusCode == http.StatusForbidden {
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 8<<10))
+		if bytes.Contains(body, []byte("oauth_scope_insufficient")) {
+			return nil, &UsageScopeError{Status: res.Status}
+		}
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("usage fetch failed: %s", res.Status)
 	}
@@ -4264,11 +4410,12 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 		if status == "" && rawUtil == "" && rawReset == "" {
 			return
 		}
-		used := 0.0
-		if rawUtil != "" {
-			if parsed, err := strconv.ParseFloat(rawUtil, 64); err == nil {
-				used = parsed * 100
-			}
+		used, utilizationOK := parseFableUtilization(rawUtil)
+		if !utilizationOK && status != "rejected" {
+			// A status or reset header without a valid utilization is not a
+			// quota observation. Treating it as zero used would advertise 100%
+			// availability and can route into an unknown pool.
+			return
 		}
 		if status == "rejected" && used < 100 {
 			used = 100
@@ -4297,4 +4444,26 @@ func usageWindowsFromFableHeaders(header http.Header, now time.Time) []accounts.
 	add("7d_opus", "opus-weekly", sevenDaySeconds, "claude-opus")
 	add("7d_sonnet", "sonnet-weekly", sevenDaySeconds, "claude-sonnet")
 	return windows
+}
+
+// parseFableUtilization accepts Anthropic's current fractional header form
+// (0..1) and the percentage form used by some gateway responses (0..100).
+// Invalid, non-finite, and out-of-range values are unknown rather than zero.
+func parseFableUtilization(raw string) (float64, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 || parsed > 100 {
+		return 0, false
+	}
+	// Anthropic reports unified utilization as a fraction in [0, 1].
+	// Some intermediaries also emit percentage values in (1, 100]; retain
+	// those for compatibility. In particular, a bare "1" must be treated as
+	// FULL utilization, not 1%: underestimating an exhausted bucket would
+	// route requests into an account that cannot serve them.
+	if parsed <= 1 {
+		parsed *= 100
+	}
+	return parsed, true
 }

@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3959,6 +3960,102 @@ func TestSRRankRowsGroupsProvidersSeparately(t *testing.T) {
 	}
 }
 
+func TestSRRankRowsMovesClaudeTelemetryThrottlesToBottom(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "throttled@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth, usageThrottled: true,
+			score: selectacct.Score{AccountID: "throttled@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+		{
+			email: "healthy@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth,
+			score:    selectacct.Score{AccountID: "healthy@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		},
+	}
+
+	rankUsageRows(rows)
+	got := []string{rows[0].email, rows[1].email}
+	want := []string{"healthy@example.com", "throttled@example.com"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ranked rows = %#v, want %#v", got, want)
+	}
+}
+
+func TestSRRankRowsPutsClaudeTelemetryThrottlesAfterCookedRows(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "cooked@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth, usageThrottled: true, cooked: true,
+			score: selectacct.Score{AccountID: "cooked@example.com", Headroom: 0, ShortHeadroom: 0},
+		},
+		{
+			email: "throttled@example.com", provider: accounts.ProviderClaude,
+			authMode: accounts.AuthModeOAuth, usageThrottled: true,
+			score: selectacct.Score{AccountID: "throttled@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+	}
+
+	rankUsageRows(rows)
+	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"cooked@example.com", "throttled@example.com"}) {
+		t.Fatalf("ranked rows = %#v, want cooked then telemetry-throttled", got)
+	}
+	if got := usageGridState(rows[0]); got != "cooked" {
+		t.Fatalf("cooked Claude state = %q, want cooked", got)
+	}
+}
+
+func TestSRRankRowsMovesCheckedAuthFailureRowsToLowSignalGroup(t *testing.T) {
+	rows := []srUsageRow{
+		{email: "auth-failed", provider: accounts.ProviderCodex, authMode: accounts.AuthModeOAuth, authChecked: true, authValid: false,
+			score: selectacct.Score{AccountID: "auth-failed", Headroom: 1, ShortHeadroom: 1}},
+		{email: "healthy", provider: accounts.ProviderCodex, authMode: accounts.AuthModeOAuth, authChecked: true, authValid: true,
+			score: selectacct.Score{AccountID: "healthy", Headroom: 0.5, ShortHeadroom: 0.5}},
+	}
+
+	rankUsageRows(rows)
+	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"healthy", "auth-failed"}) {
+		t.Fatalf("ranked rows = %#v, want healthy then auth-failed", got)
+	}
+}
+
+func TestSRRankRowsMovesProviderFailureRowsToLowSignalGroup(t *testing.T) {
+	rows := []srUsageRow{
+		{email: "bad-key", provider: accounts.ProviderCodex, authMode: accounts.AuthModeAPIKey, providerHealth: "invalid key",
+			score: selectacct.Score{AccountID: "bad-key", Headroom: 1, ShortHeadroom: 1}},
+		{email: "healthy", provider: accounts.ProviderCodex, authMode: accounts.AuthModeAPIKey, providerHealth: "auth ok",
+			score: selectacct.Score{AccountID: "healthy", Headroom: 0.5, ShortHeadroom: 0.5}},
+	}
+
+	rankUsageRows(rows)
+	if got := []string{rows[0].email, rows[1].email}; !slices.Equal(got, []string{"healthy", "bad-key"}) {
+		t.Fatalf("ranked rows = %#v, want healthy then bad-key", got)
+	}
+}
+
+func TestSRRankRowsMovesReauthRowsToLowSignalGroup(t *testing.T) {
+	rows := []srUsageRow{
+		{
+			email: "needs-reauth@example.com", provider: accounts.ProviderCodex,
+			authMode: accounts.AuthModeOAuth, err: errors.New("401 Unauthorized"),
+			score: selectacct.Score{AccountID: "needs-reauth@example.com", Headroom: 1, ShortHeadroom: 1},
+		},
+		{
+			email: "healthy@example.com", provider: accounts.ProviderCodex,
+			authMode: accounts.AuthModeOAuth,
+			score:    selectacct.Score{AccountID: "healthy@example.com", Headroom: 0.5, ShortHeadroom: 0.5},
+		},
+	}
+
+	rankUsageRows(rows)
+	if rows[0].email != "healthy@example.com" || rows[1].email != "needs-reauth@example.com" {
+		t.Fatalf("ranked rows = %#v, want healthy then reauth", rows)
+	}
+	if usageRowStatusTier(rows[1]) <= usageRowStatusTier((srUsageRow{usageThrottled: true})) {
+		t.Fatal("reauth rows should remain below telemetry-throttled rows")
+	}
+}
+
 func TestScoreFromWindowsUsesAllDisplayedRateLimits(t *testing.T) {
 	score := scoreFromWindows("a@example.com", []accounts.UsageWindow{
 		{Name: "primary", UsedPercent: 10, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: int64((3 * time.Hour) / time.Second)},
@@ -4040,6 +4137,34 @@ func TestUsageGridCreditsHidesPlaceholderZero(t *testing.T) {
 	}
 	if got := usageGridCreditsCell(srUsageRow{credits: &accounts.CreditsInfo{Balance: "12.50"}}); got.Text != "$12.50" {
 		t.Fatalf("non-zero balance = %q, want $12.50", got.Text)
+	}
+}
+
+func TestUsageRowStaleAgeUsesProviderObservationTime(t *testing.T) {
+	row := srUsageRow{displayAccount: "stale@example.com", usageFetchedAt: time.Now().Add(-3 * time.Minute)}
+	age, ok := usageRowStaleAge(row)
+	if !ok || age != "3m ago" {
+		t.Fatalf("stale age = %q, %v; want 3m ago, true", age, ok)
+	}
+	row.usageFetchedAt = time.Now().Add(-time.Minute)
+	if _, ok := usageRowStaleAge(row); ok {
+		t.Fatal("recent provider observation was marked stale")
+	}
+}
+
+func TestDisplayUsageRowsDoesNotPrintStaleUsageNote(t *testing.T) {
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{{
+		displayAccount: "stale@example.com",
+		provider:       accounts.ProviderCodex,
+		authMode:       accounts.AuthModeOAuth,
+		usageFetchedAt: time.Now().Add(-3 * time.Minute),
+		windows: []accounts.UsageWindow{{
+			Name: "primary", UsedPercent: 50, LimitWindowSeconds: 7 * 24 * 60 * 60,
+		}},
+	}}, false)
+	if got := out.String(); strings.Contains(got, "usage last fetched") || strings.Contains(got, "showing last known values") {
+		t.Fatalf("stale usage note should be omitted:\n%s", got)
 	}
 }
 
@@ -4461,6 +4586,30 @@ func TestClaudeUsageWindowsIncludeOAuthAppsWeekly(t *testing.T) {
 	}
 	if suffix := exhaustedModelSuffix(windows); !strings.Contains(suffix, "Fable") {
 		t.Fatalf("Use suffix = %q, want it to note Fable is out", suffix)
+	}
+}
+
+func TestClaudeUsageWindowsTagModelWeeklyBuckets(t *testing.T) {
+	windows := claudeUsageWindows(&agentclaude.UsageResponse{
+		SevenDayOpus:   &agentclaude.RateLimit{Utilization: srFloatPtr(80)},
+		SevenDaySonnet: &agentclaude.RateLimit{Utilization: srFloatPtr(20)},
+	})
+	byName := make(map[string]accounts.UsageWindow, len(windows))
+	for _, window := range windows {
+		byName[window.Name] = window
+	}
+	if got := byName["opus-weekly"].Feature; got != agentclaude.OpusFeature {
+		t.Fatalf("opus-weekly Feature = %q, want %q", got, agentclaude.OpusFeature)
+	}
+	if got := byName["sonnet-weekly"].Feature; got != agentclaude.SonnetFeature {
+		t.Fatalf("sonnet-weekly Feature = %q, want %q", got, agentclaude.SonnetFeature)
+	}
+	score := scoreFromWindows("claude@example.com", windows)
+	if got := score.ModelScores[selectacct.ModelKey(agentclaude.OpusFeature)].Headroom; math.Abs(got-0.2) > 1e-9 {
+		t.Fatalf("Opus headroom = %.2f, want 0.20", got)
+	}
+	if got := score.ModelScores[selectacct.ModelKey(agentclaude.SonnetFeature)].Headroom; math.Abs(got-0.8) > 1e-9 {
+		t.Fatalf("Sonnet headroom = %.2f, want 0.80", got)
 	}
 }
 
@@ -5130,6 +5279,33 @@ func TestAntigravityLegacyModelQuotaUseDoesNotClaimBaseHundredPercent(t *testing
 	}
 }
 
+func TestCompactPickReasonUsesCachedWindowsWhenUsageRefreshFails(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
+		err: errors.New("usage fetch failed: 429 Too Many Requests"),
+		windows: []accounts.UsageWindow{{
+			Name: "5h", UsedPercent: 26, ResetAfterSeconds: 3600,
+		}},
+		score: selectacct.Score{
+			AccountID: "claude@example.com", Headroom: .74, ShortHeadroom: .74,
+			ShortResetAfterSeconds: 3600,
+		},
+	}
+	if got := compactPickReason(row); got != "74% left, session reset 1h" {
+		t.Fatalf("cached quota Use = %q, want reset-aware value", got)
+	}
+}
+
+func TestCompactPickReasonKeepsUnavailableWithoutCachedWindows(t *testing.T) {
+	row := srUsageRow{
+		provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth,
+		err: errors.New("usage fetch failed: 429 Too Many Requests"),
+	}
+	if got := compactPickReason(row); got != "usage throttled" {
+		t.Fatalf("missing quota Use = %q, want usage throttled", got)
+	}
+}
+
 func TestAntigravityUnknownModelQuotaDoesNotPrintPlaceholderLabel(t *testing.T) {
 	row := srUsageRow{
 		provider: accounts.ProviderAntigravity, authMode: accounts.AuthModeOAuth,
@@ -5311,7 +5487,8 @@ func TestQwenValidatedKeyStaysReadyWhenConsoleLoginExpires(t *testing.T) {
 	row := srUsageRow{
 		provider: accounts.ProviderQwenToken, authMode: accounts.AuthModeAPIKey,
 		providerHealth: "auth ok", quotaStatus: "login needed",
-		err: errors.New("Qwen console login needed"),
+		err:     errors.New("Qwen console login needed"),
+		windows: []accounts.UsageWindow{{Name: "7d", UsedPercent: 20, ResetAfterSeconds: 3600}},
 	}
 	if !displayRecommendedForNewSession(row) {
 		t.Fatal("valid Qwen routing key became ineligible when optional telemetry expired")

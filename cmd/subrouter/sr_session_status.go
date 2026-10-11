@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -314,10 +315,10 @@ func formatSessionResetTime(reset, now time.Time) string {
 	return local.Format("Mon 15:04")
 }
 
-// compactQuotaResetPercent is where the compact status line starts naming a
-// window's reset time: below it the reset is noise, near the limit it is the
-// one thing worth knowing.
-const compactQuotaResetPercent = 80
+// compactQuotaResetLeftPercent is where the compact status line starts naming
+// a window's reset time: with more left the reset is noise, near the limit it
+// is the one thing worth knowing.
+const compactQuotaResetLeftPercent = 20
 
 func formatQuotaWindow(name string, window *accounts.UsageWindow, fetchedAt, now time.Time) string {
 	return formatQuotaWindowWith(name, window, fetchedAt, now, false)
@@ -327,13 +328,17 @@ func formatQuotaWindowWith(name string, window *accounts.UsageWindow, fetchedAt,
 	if window == nil {
 		return ""
 	}
-	text := fmt.Sprintf("%s %.0f%%", name, window.UsedPercent)
-	if compact && window.UsedPercent < compactQuotaResetPercent {
+	// Percent left, the convention sr status uses: an untouched account
+	// reads "100% left" in both places.
+	// Rounded first so the threshold agrees with the number shown.
+	left := math.Round(100 - clampUsagePercent(window.UsedPercent))
+	text := fmt.Sprintf("%s %.0f%% left", name, left)
+	if compact && left > compactQuotaResetLeftPercent {
 		return text
 	}
 	if reset := window.ResetTime(fetchedAt); !reset.IsZero() {
 		if reset.After(now) {
-			text += " resets " + formatSessionResetTime(reset, now)
+			text += ", resets " + formatSessionResetTime(reset, now)
 		}
 	}
 	return text
@@ -486,7 +491,10 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 		}
 		var fresh bool
 		statuses, fetchedAt, fresh = r.cachedServerUsage(ctx, ledger, server)
-		if !fresh && len(statuses) == 0 {
+		if !fresh {
+			// A failed or contended refresh may still return a non-empty last
+			// good snapshot. Keep rendering it, but mark the session view stale
+			// so the quota numbers are not mistaken for a live observation.
 			stale = true
 		}
 	}
@@ -514,8 +522,19 @@ func (r srRunner) observeSession(ctx context.Context, ledger sessionLedger, laun
 		if status, ok := usageStatusForAccount(statuses, provider, view.AccountID); ok {
 			view.Plan = status.PlanType
 			view.Windows = status.Windows
-			view.UsageFetchedAt = fetchedAt
+			view.UsageFetchedAt = status.UsageFetchedAt
+			if view.UsageFetchedAt.IsZero() {
+				view.UsageFetchedAt = fetchedAt
+			}
 		}
+	}
+	now := ledger.clock()
+	if !view.UsageFetchedAt.IsZero() && now.Sub(view.UsageFetchedAt) > sessionStaleAfter {
+		view.Stale = true
+		view.StaleNote = "usage " + formatStatusAge(now.Sub(view.UsageFetchedAt)) + " old"
+	}
+	if view.Stale && view.StaleNote == "" && !view.Unreachable && !view.Denied {
+		view.StaleNote = "usage refresh pending"
 	}
 	return view, event
 }
@@ -554,7 +573,10 @@ func localSessionView(ledger sessionLedger, launch sessionLaunchRecord, agent, s
 		if status, ok := usageStatusForAccount(cache.Statuses, ledgerProvider(agent), view.AccountID); ok {
 			view.Plan = status.PlanType
 			view.Windows = status.Windows
-			view.UsageFetchedAt = cache.FetchedAt
+			view.UsageFetchedAt = status.UsageFetchedAt
+			if view.UsageFetchedAt.IsZero() {
+				view.UsageFetchedAt = cache.FetchedAt
+			}
 			if view.Label == "" {
 				view.Label = accountDisplayLabel(status, view.AccountID)
 			}

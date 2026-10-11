@@ -45,19 +45,19 @@ func TestRecoveryReadinessRequiresFreshMatchingSubscriptionQuota(t *testing.T) {
 func TestRecoveryReadinessRequiresMeasurementAfterFailure(t *testing.T) {
 	now := time.Now().UTC()
 	ref := &AccountRef{usageStatusAt: now}
-	status := AccountUsageStatus{AccountStatus: AccountStatus{ID: "claude-a", Provider: accounts.ProviderClaude}, UsageMeasuredAt: now.Add(-time.Minute)}
+	status := AccountUsageStatus{AccountStatus: AccountStatus{ID: "claude-a", Provider: accounts.ProviderClaude}, UsageFetchedAt: now.Add(-time.Minute)}
 	if ref.usageEvidenceAfter(status, now.Add(-time.Second)) {
 		t.Fatal("old per-account measurement accepted after failure")
 	}
-	status.UsageMeasuredAt = now.Add(time.Second)
+	status.UsageFetchedAt = now.Add(time.Second)
 	if !ref.usageEvidenceAfter(status, now.Add(-time.Second)) {
 		t.Fatal("new status and account measurement should be accepted")
 	}
-	codexStatus := AccountUsageStatus{AccountStatus: AccountStatus{ID: "codex-a", Provider: accounts.ProviderCodex}, UsageMeasuredAt: now}
+	codexStatus := AccountUsageStatus{AccountStatus: AccountStatus{ID: "codex-a", Provider: accounts.ProviderCodex}, UsageFetchedAt: now}
 	if !ref.usageEvidenceAfter(codexStatus, now.Add(-time.Second)) {
 		t.Fatal("Codex direct status measurement should be accepted without window cache")
 	}
-	codexStatus.UsageMeasuredAt = now.Add(-time.Minute)
+	codexStatus.UsageFetchedAt = now.Add(-time.Minute)
 	if ref.usageEvidenceAfter(codexStatus, now.Add(-time.Second)) {
 		t.Fatal("old Codex direct measurement accepted after failure")
 	}

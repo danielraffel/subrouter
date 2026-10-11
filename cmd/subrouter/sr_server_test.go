@@ -385,6 +385,9 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusNotFound)
 			return
 		}
+		if req.URL.Query().Get("refresh") != "1" {
+			t.Errorf("usage status query = %q, want refresh=1", req.URL.RawQuery)
+		}
 		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
 			ID: "acct@example.com", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth,
 			Email: "acct@example.com", AuthValid: true, PlanType: "pro",
@@ -417,6 +420,30 @@ func TestSRServerStatusSendsAdminToken(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "avail") {
 		t.Fatalf("status did not render complimentary reset status:\n%s", out.String())
+	}
+}
+
+func TestRemoteSingleAccountStatusChecksLiveUsage(t *testing.T) {
+	serverHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/_subrouter/usage-status" || req.URL.Query().Get("refresh") != "1" {
+			t.Errorf("single-account status requested %s?%s instead of live quota", req.URL.Path, req.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode([]remoteServerUsageStatus{{
+			ID: "acct@example.com", Email: "acct@example.com",
+			Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth,
+			AuthValid: true, PlanType: "max",
+			Windows: []accounts.UsageWindow{{Name: "5h", UsedPercent: 20, LimitWindowSeconds: 18000}},
+		}})
+	}))
+	defer serverHTTP.Close()
+	var out bytes.Buffer
+	runner := srRunner{out: &out, errOut: &out, client: serverHTTP.Client()}
+	server := srServerConfig{Name: "team", URL: serverHTTP.URL}
+	if err := runner.statusOneRemote(context.Background(), server, "acct@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "acct@example.com") || !strings.Contains(out.String(), "80%") {
+		t.Fatalf("single-account status failed to show live quota: %s", out.String())
 	}
 }
 
@@ -1111,6 +1138,44 @@ func TestUsageRowsFromServerUsageStatusesPreservesComplimentaryReset(t *testing.
 	}
 	if rows[0].complimentaryReset == nil || !rows[0].complimentaryReset.Consumed {
 		t.Fatalf("complimentary reset not preserved: %+v", rows[0].complimentaryReset)
+	}
+}
+
+func TestUsageRowsFromServerUsageStatusesKeepsStaleWindowsOnError(t *testing.T) {
+	for _, providerError := range []string{
+		"usage fetch failed: 401 Unauthorized",
+		"usage fetch failed: 429 Too Many Requests",
+	} {
+		t.Run(providerError, func(t *testing.T) {
+			rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{
+				ID:          "claude@example.com",
+				Provider:    accounts.ProviderClaude,
+				AuthMode:    accounts.AuthModeOAuth,
+				AuthChecked: true,
+				AuthValid:   true,
+				Error:       providerError,
+				Windows: []accounts.UsageWindow{
+					{Name: "5h", UsedPercent: 25, LimitWindowSeconds: int64((5 * time.Hour) / time.Second), ResetAfterSeconds: 3600},
+					{Name: "7d", UsedPercent: 40, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: 3 * 24 * 3600},
+				},
+			}})
+			if len(rows) != 1 {
+				t.Fatalf("rows = %+v, want one row", rows)
+			}
+			row := rows[0]
+			if row.err == nil {
+				t.Fatal("provider error was dropped")
+			}
+			if row.score.Headroom <= 0 || row.score.ShortHeadroom <= 0 {
+				t.Fatalf("stale usage score = %+v, want preserved headroom", row.score)
+			}
+			if row.score.ShortResetAfterSeconds <= 0 {
+				t.Fatalf("stale usage score = %+v, want preserved hourly reset", row.score)
+			}
+			if row.gtoRecommended {
+				t.Fatal("errored row must not be recommended for routing")
+			}
+		})
 	}
 }
 

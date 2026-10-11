@@ -66,6 +66,8 @@ Usage:
                         (kimi, zai, openrouter, deepseek, together, fireworks,
                         opencode-zen, grok, qwen, qwen-token,
                         qwen-anthropic, claude)
+  sr key-credit         List Claude API-key credit grants (remaining, expiry, pace)
+  sr key-credit set <label> --amount 200 --expires YYYY-MM-DD [--spent N]
   sr import             Import current ~/.codex/auth.json account
   sr list [--ids]        List accounts; --ids adds exact identifiers
   sr switch [email]     Switch active Codex account and sync OpenCode/pi
@@ -321,22 +323,33 @@ type srUsageRow struct {
 	showShortWindow    bool
 	showLongWindow     bool
 	quotaUsageKnown    bool
+	usageFetchedAt     time.Time
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
 	extraUsage         *accounts.ExtraUsageInfo
-	apiKeySpend        *accounts.APIKeyUsageSnapshot
-	apiKeyHint         string
-	err                error
-	score              selectacct.Score
-	gtoReason          string
-	gtoRecommended     bool
-	cooked             bool
-	cookedReason       string
-	tempCooked         bool
-	tempCookedReason   string
-	authMode           accounts.AuthMode
-	provider           accounts.Provider
+	// costTier and costTierRank are the server's Claude cost tier for this
+	// account (see proxy.ClaudeCostOrder); empty when the server predates it.
+	costTier              string
+	costTierRank          int
+	creditsExhaustedUntil time.Time
+	// credit is a Claude API key's grant state; revokedSince marks a Claude
+	// OAuth credential Anthropic revoked.
+	credit           *proxy.ClaudeCreditStatus
+	revokedSince     time.Time
+	apiKeySpend      *accounts.APIKeyUsageSnapshot
+	apiKeyHint       string
+	usageThrottled   bool
+	err              error
+	score            selectacct.Score
+	gtoReason        string
+	gtoRecommended   bool
+	cooked           bool
+	cookedReason     string
+	tempCooked       bool
+	tempCookedReason string
+	authMode         accounts.AuthMode
+	provider         accounts.Provider
 }
 
 func cxAlias(args []string) error {
@@ -451,6 +464,9 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 	}
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
+	}
+	if args[0] == "key-credit" || args[0] == "key-credits" {
+		return r.keyCredit(ctx, args[1:])
 	}
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
@@ -1743,6 +1759,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 					}
 					if usageErr == nil {
 						rows[idx].quotaUsageKnown = true
+						rows[idx].usageFetchedAt = time.Now().UTC()
 						if usage.FiveHour != nil {
 							rows[idx].windows = append(rows[idx].windows, *usage.FiveHour)
 						}
@@ -1796,6 +1813,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 			}
 			rows[i].planType = details.PlanType
 			rows[i].windows = details.Windows
+			rows[i].usageFetchedAt = time.Now().UTC()
 			rows[i].credits = details.Credits
 			rows[i].complimentaryReset = details.ComplimentaryReset
 			rows[i].score = scoreFromWindows(account.Email, details.Windows)
@@ -1851,6 +1869,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				return
 			}
 			rows[idx].windows = windows
+			rows[idx].usageFetchedAt = time.Now().UTC()
 			rows[idx].score = scoreFromWindows(rows[idx].email, windows)
 			rows[idx].cooked, rows[idx].cookedReason = cookedFromWindows(windows)
 			rows[idx].tempCooked, rows[idx].tempCookedReason = tempCookedFromWindows(windows)
@@ -2671,8 +2690,13 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 			return
 		}
 		window := accounts.UsageWindow{Name: name, UsedPercent: *limit.Utilization, LimitWindowSeconds: windowSeconds}
-		if name == agentclaude.FableWindowName {
+		switch name {
+		case agentclaude.FableWindowName:
 			window.Feature = agentclaude.FableFeature
+		case "opus-weekly":
+			window.Feature = agentclaude.OpusFeature
+		case "sonnet-weekly":
+			window.Feature = agentclaude.SonnetFeature
 		}
 		if reset, err := time.Parse(time.RFC3339, limit.ResetsAt); err == nil {
 			window.ResetAt = reset
@@ -2845,8 +2869,8 @@ func displayRecommendedForNewSession(row srUsageRow) bool {
 }
 
 func codexUsageRowLess(a, b srUsageRow) bool {
-	if (a.err != nil) != (b.err != nil) {
-		return a.err == nil
+	if at, bt := usageRowStatusTier(a), usageRowStatusTier(b); at != bt {
+		return at < bt
 	}
 	at, bt := usageRowTier(a), usageRowTier(b)
 	if at != bt {
@@ -2875,8 +2899,8 @@ func codexUsageRowLess(a, b srUsageRow) bool {
 }
 
 func claudeUsageRowLess(a, b srUsageRow) bool {
-	if (a.err != nil) != (b.err != nil) {
-		return a.err == nil
+	if at, bt := usageRowStatusTier(a), usageRowStatusTier(b); at != bt {
+		return at < bt
 	}
 	if a.active != b.active {
 		return a.active
@@ -3096,7 +3120,11 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			if currentGroup != "" {
 				fmt.Fprintln(out)
 			}
-			printUsageGridGroup(out, columns, group, colored)
+			groupLabel := group
+			if usageGridRowsHaveValue(rows[i:end], "Tier") {
+				groupLabel += " · spend order: " + proxy.ClaudeCostOrder
+			}
+			printUsageGridGroup(out, columns, groupLabel, colored)
 			printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 				return usageGridCell{Text: col.Title, Style: ansiDim}
 			}, colored, "")
@@ -3132,6 +3160,36 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		}
 		fmt.Fprintln(out)
 	}
+}
+
+const srStatusStaleAfter = 2 * time.Minute
+
+func usageRowsHaveStaleUsage(rows []srUsageRow) bool {
+	for _, row := range rows {
+		if _, ok := usageRowStaleAge(row); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func usageRowStaleAge(row srUsageRow) (string, bool) {
+	observedAt := row.usageFetchedAt
+	staleAfter := srStatusStaleAfter
+	if observedAt.IsZero() && row.apiKeySpend != nil {
+		if parsed, err := time.Parse(time.RFC3339, row.apiKeySpend.FetchedAt); err == nil {
+			observedAt = parsed
+			staleAfter = srUsageCacheTTL
+		}
+	}
+	if observedAt.IsZero() {
+		return "", false
+	}
+	age := time.Since(observedAt)
+	if age < staleAfter {
+		return "", false
+	}
+	return formatAge(observedAt.UTC().Format(time.RFC3339)), true
 }
 
 // printAccountCountSummary prints a one-line total across providers so the user
@@ -3195,6 +3253,9 @@ func providerReaddCommand(provider accounts.Provider) string {
 }
 
 func authErrorNeedsReadd(err error) bool {
+	if err == nil {
+		return false
+	}
 	msg := strings.ToLower(err.Error())
 	for _, marker := range []string{"401", "unauthorized", "invalid_grant", "reauth", "refresh failed", "access_expired", "setup token expired"} {
 		if strings.Contains(msg, marker) {
@@ -3202,6 +3263,41 @@ func authErrorNeedsReadd(err error) bool {
 		}
 	}
 	return false
+}
+
+// usageRowStatusTier keeps rows that need human attention out of the usable
+// portion of the table. A headerless 429 is a telemetry throttle, not proof
+// that quota is exhausted, so it belongs in the low-signal tail after rows
+// with authoritative quota state. Authentication failures remain last because
+// they require re-verification before the account can be considered usable.
+func usageRowStatusTier(row srUsageRow) int {
+	if !row.revokedSince.IsZero() {
+		return 6
+	}
+	if row.tempCooked {
+		return 3
+	}
+	if row.cooked {
+		return 4
+	}
+	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
+		return 5
+	}
+	if row.err != nil || (row.authChecked && !row.authValid) || usageRowProviderFailure(row) {
+		return 6
+	}
+	return 0
+}
+
+// usageRowProviderFailure recognizes an explicit provider/key failure even
+// when the status probe recorded it as providerHealth rather than err.
+func usageRowProviderFailure(row srUsageRow) bool {
+	switch strings.ToLower(strings.TrimSpace(row.providerHealth)) {
+	case "", "auth ok", "ok", "ready", "stored", "not checked":
+		return false
+	default:
+		return true
+	}
 }
 
 func printUsageGridGroup(out io.Writer, columns []usageGridColumn, label string, colored bool) {
@@ -3364,6 +3460,12 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 	} {
 		columns = append(columns, column)
 	}
+	if usageGridRowsHaveValue(rows, "Tier") {
+		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 36)})
+	}
+	if usageGridRowsHaveValue(rows, "Credit") {
+		columns = append(columns, usageGridColumn{Key: "Credit", Title: "Credit", Width: usageGridDesiredWidth(rows, "Credit", "Credit", 56)})
+	}
 	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"State", "Account", "Plan", "Pick"})
 	for _, candidate := range []usageGridColumn{
 		{Key: "Session", Title: "Session"},
@@ -3372,7 +3474,6 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		{Key: "Opus wk", Title: "Opus wk"},
 		{Key: "Sonnet wk", Title: "Sonnet wk"},
 		{Key: "Extra", Title: "Extra usage"},
-		{Key: "ExtraSpend", Title: "$"},
 		{Key: "ExtraAutoReload", Title: "Auto-reload"},
 	} {
 		if !usageGridRowsHaveValue(rows, candidate.Key) {
@@ -3381,11 +3482,10 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 		capWidth := 12
 		switch candidate.Key {
 		case "Extra":
-			// "off · out of credits" is the widest cell.
-			capWidth = 20
-		case "ExtraSpend":
-			// "$21.99/$50.00" is the widest cell.
-			capWidth = 13
+			// "off · spend limit reached" is the widest cell Anthropic's
+			// known reasons produce; dollar cells such as "$21.99/$50.00"
+			// are narrower.
+			capWidth = runewidth.StringWidth("off · spend limit reached")
 		case "ExtraAutoReload":
 			capWidth = 11
 		}
@@ -3466,7 +3566,8 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"Opus wk":         usageGridWindowCell(row.windows, isClaudeOpusWeeklyWindow),
 		"Sonnet wk":       usageGridWindowCell(row.windows, isClaudeSonnetWeeklyWindow),
 		"Extra":           usageGridClaudeExtraCell(row),
-		"ExtraSpend":      usageGridClaudeExtraSpendCell(row),
+		"Tier":            usageGridClaudeTierCell(row),
+		"Credit":          usageGridClaudeCreditCell(row),
 		"ExtraAutoReload": usageGridClaudeExtraAutoReloadCell(row),
 		"AG Gemini 5h": usageGridWindowCell(row.windows, func(window accounts.UsageWindow) bool {
 			return isAntigravityFamilyWindow(window, "gemini", false)
@@ -3489,6 +3590,52 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 	}
 }
 
+// usageGridClaudeCreditCell shows a Claude API key's free credit:
+// "$187.20/$200 left, exp 10-24, behind, promoted" (expiry date in UTC). A "~" marks a defaulted
+// grant or expiry (set the real one with `sr key-credit set`).
+func usageGridClaudeCreditCell(row srUsageRow) usageGridCell {
+	credit := row.credit
+	if credit == nil {
+		return usageGridCell{}
+	}
+	text := fmt.Sprintf("$%.2f/$%.0f left, exp %s", credit.RemainingUSD, credit.GrantUSD, credit.ExpiresAt.UTC().Format("01-02"))
+	if credit.Defaulted {
+		text += "~"
+	}
+	if credit.Pace != "" {
+		text += ", " + credit.Pace
+	}
+	style := ansiDim
+	if credit.Promoted {
+		style = ansiYellow
+	}
+	return usageGridCell{Text: text, Style: style}
+}
+
+// usageGridClaudeTierCell shows the server's Claude cost tier: "1 plan",
+// "2 api credits", "3 extra usage", and for a key whose credit balance is
+// spent, when one request will probe it again.
+func usageGridClaudeTierCell(row srUsageRow) usageGridCell {
+	if row.costTier == "" {
+		return usageGridCell{}
+	}
+	text := strings.ReplaceAll(row.costTier, "-", " ")
+	if row.costTierRank > 0 {
+		text = strconv.Itoa(row.costTierRank) + " " + text
+	} else if row.credit != nil && row.credit.Promoted {
+		text = "0 " + text + " (deadline)"
+	}
+	if !row.creditsExhaustedUntil.IsZero() {
+		wait := time.Until(row.creditsExhaustedUntil)
+		if wait < 0 {
+			wait = 0
+		}
+		text += ", spent, probe in " + formatDuration(int64(wait.Seconds()))
+		return usageGridCell{Text: text, Style: ansiYellow}
+	}
+	return usageGridCell{Text: text, Style: ansiDim}
+}
+
 // claudeExtraUsageForRow finds the account's paid-usage metadata, whether the
 // server exposed it directly or on the synthetic "extra" window.
 func claudeExtraUsageForRow(row srUsageRow) *accounts.ExtraUsageInfo {
@@ -3503,6 +3650,13 @@ func claudeExtraUsageForRow(row srUsageRow) *accounts.ExtraUsageInfo {
 	return nil
 }
 
+// usageGridClaudeExtraCell is the Claude table's one "Extra usage" cell. A
+// known-off account says so (with Anthropic's reason). Otherwise the cell
+// shows the most useful dollar figure sr knows: the prepaid balance the local
+// claude.ai web enrichment resolved, over the monthly cap when known
+// ("$3.74/$50.00"; the OAuth usage API never returns a balance), or Claude's
+// "Monthly spend limit: $X of $Y" metered spend. "on" means enabled with no
+// figures, and "?" is reserved for knowing nothing at all.
 func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 	extra := claudeExtraUsageForRow(row)
 	if extra == nil {
@@ -3515,28 +3669,12 @@ func usageGridClaudeExtraCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{}
 	}
-	if extra.EnablementUnknown {
-		return usageGridCell{Text: "?", Style: ansiYellow}
-	}
-	if !extra.IsEnabled {
+	if !extra.EnablementUnknown && !extra.IsEnabled {
 		text := "off"
 		if reason := humanizeClaudeExtraDisabledReason(extra.DisabledReason); reason != "" {
 			text = "off · " + reason
 		}
 		return usageGridCell{Text: text, Style: ansiDim}
-	}
-	return usageGridCell{Text: "on", Style: ansiGreen}
-}
-
-// usageGridClaudeExtraSpendCell renders the prepaid extra-usage balance over
-// the monthly cap ("$3.74/$50.00") when the local claude.ai web enrichment
-// resolved a balance; the OAuth usage API never returns one. Without a known
-// balance it falls back to Claude's "Monthly spend limit: $X of $Y" line:
-// metered spend used over the cap.
-func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
-	extra := claudeExtraUsageForRow(row)
-	if extra == nil || (!extra.IsEnabled && extra.CreditsBalance == nil) {
-		return usageGridCell{}
 	}
 	if extra.CreditsBalance != nil {
 		balance := *extra.CreditsBalance / 100
@@ -3549,19 +3687,19 @@ func usageGridClaudeExtraSpendCell(row srUsageRow) usageGridCell {
 		}
 		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", balance, *extra.MonthlyLimit/100), Style: styleName}
 	}
-	if extra.MonthlyLimit == nil {
-		return usageGridCell{Text: "?", Style: ansiYellow}
+	if extra.MonthlyLimit != nil && extra.UsedCredits != nil {
+		limit := *extra.MonthlyLimit / 100
+		used := *extra.UsedCredits / 100
+		styleName := ansiGreen
+		if limit-used <= 0 {
+			styleName = ansiYellow
+		}
+		return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
 	}
-	limit := *extra.MonthlyLimit / 100
-	if extra.UsedCredits == nil {
-		return usageGridCell{Text: "?", Style: ansiYellow}
+	if extra.IsEnabled {
+		return usageGridCell{Text: "on", Style: ansiGreen}
 	}
-	used := *extra.UsedCredits / 100
-	styleName := ansiGreen
-	if limit-used <= 0 {
-		styleName = ansiYellow
-	}
-	return usageGridCell{Text: fmt.Sprintf("$%.2f/$%.2f", used, limit), Style: styleName}
+	return usageGridCell{Text: "?", Style: ansiYellow}
 }
 
 func usageGridClaudeExtraAutoReloadCell(row srUsageRow) usageGridCell {
@@ -3783,6 +3921,32 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if usageProvider(row) == accounts.ProviderClaude && !row.revokedSince.IsZero() {
+		return "revoked"
+	}
+	if usageProvider(row) == accounts.ProviderClaude {
+		if row.cooked {
+			if row.active {
+				return "active, cooked"
+			}
+			return "cooked"
+		}
+		if row.tempCooked {
+			if row.active {
+				return "active, temp"
+			}
+			return "temp"
+		}
+	}
+	if row.usageThrottled {
+		if row.err != nil {
+			return "error"
+		}
+		if row.active {
+			return "active, throttled"
+		}
+		return "throttled"
+	}
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		active := row.active || (row.sessionsKnown && row.assignedSessions > 0)
 		failed := row.err != nil || (row.authChecked && !row.authValid)
@@ -3918,6 +4082,8 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
+	case !row.revokedSince.IsZero():
+		return ansiRed
 	case qwenTelemetryOnlyFailure(row) && row.gtoRecommended:
 		return ansiGreen
 	case qwenTelemetryOnlyFailure(row) && (row.active || (row.sessionsKnown && row.assignedSessions > 0)):
@@ -3930,6 +4096,8 @@ func usageGridStateColor(row srUsageRow) string {
 		return ansiDim
 	case usageProvider(row) == accounts.ProviderGrok && row.authMode == accounts.AuthModeOAuth && row.providerHealth == "stored" && row.err == nil:
 		return ansiDim
+	case row.usageThrottled:
+		return ansiYellow
 	case row.providerHealth != "" && row.providerHealth != "auth ok" && row.providerHealth != "ok" && row.providerHealth != "not checked":
 		return ansiRed
 	case row.err != nil || row.cooked:
@@ -3947,6 +4115,8 @@ func usageGridStateColor(row srUsageRow) string {
 
 func usageGridPickColor(row srUsageRow) string {
 	switch {
+	case row.usageThrottled:
+		return ansiYellow
 	case (row.err != nil && !qwenTelemetryOnlyFailure(row)) || row.cooked:
 		return ansiRed
 	case row.tempCooked || !displayRecommendedForNewSession(row):
@@ -3969,6 +4139,9 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if !row.revokedSince.IsZero() {
+		return "revoked since " + row.revokedSince.Local().Format("01-02 15:04") + ", re-add"
+	}
 	if qwenTelemetryOnlyFailure(row) {
 		switch row.quotaStatus {
 		case "login needed":
@@ -3976,6 +4149,30 @@ func compactPickReason(row srUsageRow) string {
 		case "error":
 			return "quota unavailable"
 		}
+	}
+	if row.usageThrottled || (row.err != nil && serverUsageThrottleError(row.err.Error())) {
+		// Model-scoped headers (for example Fable's weekly bucket) can be
+		// present on a plain telemetry 429. They are useful in their own
+		// column, but they do not prove that the account-wide subscription
+		// quota is exhausted or that the account is otherwise unavailable.
+		// Keep the high-signal Use text as "usage throttled" until an
+		// account-wide window or a successful usage read supplies routing
+		// evidence.
+		if len(row.windows) > 0 && hasAccountWideQuotaEvidence(row.windows) {
+			row.err = nil
+			row.usageThrottled = false
+			return compactPickReason(row)
+		}
+		return "usage throttled"
+	}
+	// A usage refresh can fail after the server has retained a last-known-good
+	// quota snapshot. Keep the reset-aware Use text in that case; State and the
+	// error footer still make the failed refresh visible. Returning only
+	// "usage unavailable" discarded the hourly/weekly reset evidence that the
+	// table already had.
+	if row.err != nil && len(row.windows) > 0 {
+		row.err = nil
+		return compactPickReason(row)
 	}
 	if row.err != nil {
 		return "usage unavailable"
@@ -4029,6 +4226,15 @@ func compactPickReason(row srUsageRow) string {
 		return fmt.Sprintf("%s, 5h reset %s%s", left, formatDuration(row.score.ShortResetAfterSeconds), suffix)
 	}
 	return left + suffix
+}
+
+func hasAccountWideQuotaEvidence(windows []accounts.UsageWindow) bool {
+	for _, window := range windows {
+		if window.Feature == "" && (isShortQuotaWindow(window) || isLongQuotaWindow(window)) {
+			return true
+		}
+	}
+	return false
 }
 
 func compactAntigravityQuota(windows []accounts.UsageWindow) string {
@@ -4170,6 +4376,12 @@ func usageGridWindowStatusCell(window accounts.UsageWindow) usageGridCell {
 func compactWindowStatus(window accounts.UsageWindow) string {
 	left := compactPercentLeft(window.UsedPercent)
 	if window.ResetAfterSeconds <= 0 {
+		if window.UsedPercent >= 100 && !window.ResetAt.IsZero() {
+			// A provider reset timestamp in the past is stale evidence, not
+			// proof that the subscription is banned. Keep that distinction
+			// visible until a fresh response supplies the next reset.
+			return left + "/stale"
+		}
 		return left
 	}
 	return left + "/" + strings.ReplaceAll(formatDuration(window.ResetAfterSeconds), " ", "")

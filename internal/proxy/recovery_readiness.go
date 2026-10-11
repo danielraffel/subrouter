@@ -68,7 +68,7 @@ func (r *AccountRef) usageEvidenceAfter(status AccountUsageStatus, failureAt tim
 	if !statusAt.After(failureAt) {
 		return false
 	}
-	return status.UsageMeasuredAt.After(failureAt)
+	return status.UsageFetchedAt.After(failureAt)
 }
 
 func (s Server) handleRecoveryReadiness(w http.ResponseWriter, r *http.Request) {

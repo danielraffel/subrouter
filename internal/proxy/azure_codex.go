@@ -190,14 +190,27 @@ const (
 // retry loops cannot multiply into one full allowance per layer.
 type attemptBudget struct {
 	remaining atomic.Int64
+	// quotaRemaining is the Claude subscription quota failover allowance.
+	// Header-confirmed quota 429s are cheap account switches and may use the
+	// whole pool, while transport and overload retries keep the request-wide
+	// bounded budget above.
+	quotaRemaining atomic.Int64
+	// quotaPerPass is restored only after the outer autonomous loop starts
+	// another pass. A reset wake must get the full, bounded pool allowance.
+	quotaPerPass int64
 	// claudeOverload is the request's same-account Claude overload ladder,
 	// bounded on its own (see claudeOverloadHold).
 	claudeOverload claudeOverloadHold
 }
 
 func newAttemptBudget(retries int) *attemptBudget {
-	budget := &attemptBudget{}
+	return newAttemptBudgetWithQuota(retries, retries)
+}
+
+func newAttemptBudgetWithQuota(retries, quotaRetries int) *attemptBudget {
+	budget := &attemptBudget{quotaPerPass: int64(quotaRetries)}
 	budget.remaining.Store(int64(retries))
+	budget.quotaRemaining.Store(int64(quotaRetries))
 	return budget
 }
 
@@ -218,6 +231,34 @@ func (b *attemptBudget) consume() bool {
 			return true
 		}
 	}
+}
+
+func (b *attemptBudget) consumeQuota() bool {
+	if b == nil {
+		return true
+	}
+	for {
+		remaining := b.quotaRemaining.Load()
+		if remaining <= 0 {
+			return false
+		}
+		if b.quotaRemaining.CompareAndSwap(remaining, remaining-1) {
+			return true
+		}
+	}
+}
+
+// replenish restores both retry allowances for the outer autonomous loop.
+// A Claude quota pass uses its separate pool-sized budget; without restoring it,
+// a pass after a provider-reset wait could not fail over to another account.
+// Reset instead of adding quota allowance, so unused slots cannot accumulate
+// into unbounded failover attempts across repeated autonomous passes.
+func (b *attemptBudget) replenish(retries int) {
+	if b == nil || retries <= 0 {
+		return
+	}
+	b.remaining.Add(int64(retries))
+	b.quotaRemaining.Store(b.quotaPerPass)
 }
 
 // azureCodexSticky pins a Codex session to an Azure endpoint. Prompt caching is

@@ -301,6 +301,8 @@ var directSRCommands = map[string]struct{}{
 	"cost":             {},
 	"daemon":           {},
 	"doctor":           {},
+	"key-credit":       {},
+	"key-credits":      {},
 	"g":                {},
 	"az":               {},
 	"azure":            {},
@@ -1766,6 +1768,7 @@ func fetchCodexScoresWithRefresh(
 						UsedPercent:        window.UsedPercent,
 						LimitWindowSeconds: window.LimitWindowSeconds,
 						ResetAfterSeconds:  window.ResetAfterSeconds,
+						ResetAt:            window.ResetAt,
 						Feature:            window.Feature,
 					})
 				}

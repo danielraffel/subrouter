@@ -26,8 +26,8 @@ type SchedulerRef struct {
 	// hours, leaving real quota unroutable while clients got 429s.
 	exhaustedUntil map[string]time.Time
 	// weeklyExhaustedUntil is the subset of marks whose upstream response
-	// proved the weekly window cooked (7d status rejected). Paid Claude
-	// fallback reads it: session-only marks never authorize paid spend.
+	// proved the weekly window cooked (7d status rejected). Status views and
+	// WeeklyCooked read it.
 	// Entries are always paired with an exhaustedUntil mark and share its
 	// expiry.
 	weeklyExhaustedUntil map[string]time.Time
@@ -56,6 +56,10 @@ type SchedulerRef struct {
 	// rotation proves that account state recovered, so those events must not
 	// clear this overlay.
 	accountUnavailableUntil map[string]time.Time
+	// creditExhaustedUntil labels the accountUnavailableUntil entries that
+	// came from a spent API credit balance, so status views can say why a
+	// key is held out. It never affects routing on its own.
+	creditExhaustedUntil map[string]time.Time
 	// incompatibleUntil records account/model exclusions learned from upstream
 	// entitlement errors. Usage refreshes cannot supersede these marks because
 	// quota headroom says nothing about whether an account supports a model.
@@ -403,6 +407,11 @@ func (r *SchedulerRef) pruneExpired(now time.Time) {
 			delete(r.accountUnavailableUntil, key)
 		}
 	}
+	for key, until := range r.creditExhaustedUntil {
+		if !until.After(now) {
+			delete(r.creditExhaustedUntil, key)
+		}
+	}
 	for key, until := range r.incompatibleUntil {
 		if until.After(now) {
 			continue
@@ -551,9 +560,43 @@ func (r *SchedulerRef) AdvanceAccountGenerationWithAccounts(generation, credenti
 	}
 	r.advanceAccountGenerationLocked(generation)
 	r.credentialRevision = credentialRevision
+	r.pruneExhaustedMarksForAccountsLocked(accounts)
 	r.credentialFingerprints = make(map[string]string, len(accounts))
 	for _, candidate := range accounts {
 		r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
+	}
+}
+
+// pruneExhaustedMarksForAccountsLocked removes quota marks for accounts that
+// disappeared from the latest account snapshot. Marks for accounts that remain
+// present are intentionally left untouched so a stale or missing usage refresh
+// cannot make a recently rejected account eligible again.
+func (r *SchedulerRef) pruneExhaustedMarksForAccountsLocked(accounts []account.Account) {
+	present := make(map[string]struct{}, len(accounts))
+	for _, candidate := range accounts {
+		present[ScoreKey(candidate.Provider, candidate.ID)] = struct{}{}
+	}
+	for _, marks := range []map[string]time.Time{r.exhaustedUntil, r.weeklyExhaustedUntil} {
+		for key := range marks {
+			scoreKey, _, _, ok := exhaustionKeyParts(key)
+			if !ok {
+				delete(marks, key)
+				continue
+			}
+			if _, exists := present[scoreKey]; !exists {
+				delete(marks, key)
+			}
+		}
+	}
+	for key := range r.exhaustedMarkSeq {
+		scoreKey, _, _, ok := exhaustionKeyParts(key)
+		if !ok {
+			delete(r.exhaustedMarkSeq, key)
+			continue
+		}
+		if _, exists := present[scoreKey]; !exists {
+			delete(r.exhaustedMarkSeq, key)
+		}
 	}
 }
 
@@ -771,7 +814,13 @@ func (r *SchedulerRef) retainExhaustedExpiriesForScoreKeysLocked(scoreKeys map[s
 			delete(r.weeklyExhaustedUntil, key)
 		}
 		switch {
-		case !ok || !score.exhausted():
+		case !ok || !score.Fresh:
+			// A missing or stale refresh did not measure this account's
+			// recovery. Keep an upstream rejection mark until a fresh score
+			// proves headroom, otherwise a throttled usage endpoint can make a
+			// cooked account immediately eligible again.
+			continue
+		case !score.exhausted():
 			dropMark(key)
 		case score.Fresh:
 			until := now.Add(DefaultExhaustedTTL)
@@ -837,7 +886,7 @@ func (r *SchedulerRef) markExhaustedUntilLocked(provider account.Provider, accou
 // MarkWeeklyExhaustedUntil records an exhaustion mark whose upstream response
 // proved the WEEKLY window is cooked (anthropic-ratelimit-unified-7d-status:
 // rejected), not merely the 5h session window. Only weekly-cooked evidence
-// authorizes paid Claude fallback; a session-level 429 is a temporary wait.
+// keeps the hold through the weekly reset.
 func (r *SchedulerRef) MarkWeeklyExhaustedUntil(provider account.Provider, accountID, poolKey string, until time.Time) {
 	if accountID == "" {
 		return
@@ -908,15 +957,20 @@ func (r *SchedulerRef) MarkCredentialExhaustedForSnapshot(
 		(accountGeneration == r.accountGeneration && credentialRevision < r.credentialRevision) {
 		return false
 	}
+	publishesSnapshot := accountGeneration > r.accountGeneration
 	if accountGeneration > r.accountGeneration {
 		r.advanceAccountGenerationLocked(accountGeneration)
 	}
 	if credentialRevision > r.credentialRevision || r.credentialFingerprints == nil {
+		publishesSnapshot = true
 		r.credentialRevision = credentialRevision
 		r.credentialFingerprints = make(map[string]string, len(accounts))
 		for _, candidate := range accounts {
 			r.credentialFingerprints[ScoreKey(candidate.Provider, candidate.ID)] = credentialFingerprint(candidate.CredentialIdentity())
 		}
+	}
+	if publishesSnapshot {
+		r.pruneExhaustedMarksForAccountsLocked(accounts)
 	}
 
 	fingerprint := credentialFingerprint(credentialIdentity)
@@ -967,6 +1021,39 @@ func (r *SchedulerRef) MarkAccountUnavailableUntil(provider account.Provider, ac
 	}
 	r.accountUnavailableUntil[poolScopedExhaustionKey(provider, accountID, "")] = until
 	r.updatedAt = time.Now()
+}
+
+// MarkCreditExhaustedUntil holds an API-key account out of routing because
+// its prepaid credit balance is spent. The balance belongs to the provider
+// organization, not to the key string or a quota window, so neither a usage
+// refresh nor a key rotation clears it; only expiry does, after which one
+// request probes the key again.
+func (r *SchedulerRef) MarkCreditExhaustedUntil(provider account.Provider, accountID string, until time.Time) {
+	if r == nil || accountID == "" {
+		return
+	}
+	r.MarkAccountUnavailableUntil(provider, accountID, until)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.creditExhaustedUntil == nil {
+		r.creditExhaustedUntil = make(map[string]time.Time)
+	}
+	r.creditExhaustedUntil[poolScopedExhaustionKey(provider, accountID, "")] = until
+}
+
+// CreditExhaustedUntil reports a live MarkCreditExhaustedUntil hold.
+func (r *SchedulerRef) CreditExhaustedUntil(provider account.Provider, accountID string, now time.Time) (time.Time, bool) {
+	if r == nil {
+		return time.Time{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	key := poolScopedExhaustionKey(provider, accountID, "")
+	until := r.creditExhaustedUntil[key]
+	if !until.After(now) || !r.accountUnavailableUntil[key].After(now) {
+		return time.Time{}, false
+	}
+	return until, true
 }
 
 // MarkModelIncompatibleUntil excludes one account from one model until the
@@ -1145,7 +1232,7 @@ func applyExhaustionMarks(base Scheduler, exhaustedUntil map[string]time.Time, n
 // applyWeeklyExhaustionMarks zeroes WeeklyHeadroom for accounts (or model
 // pools) whose upstream response proved the weekly window cooked. Ordinary
 // exhaustion marks leave WeeklyHeadroom untouched: a session-level 429 must
-// never read as weekly evidence, because paid Claude fallback gates on it.
+// never read as weekly evidence.
 func applyWeeklyExhaustionMarks(base Scheduler, weeklyUntil map[string]time.Time, now time.Time) Scheduler {
 	if len(weeklyUntil) == 0 {
 		return base

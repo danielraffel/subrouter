@@ -201,13 +201,13 @@ func TestWithClaudeUserSettingsKeepsProxyConfigChoicesAndRoutingCase(t *testing.
 }
 
 func TestWithClaudeUserSettingsAllowsSharedProjectMemory(t *testing.T) {
-	// The code resolves symlinks; on macOS t.TempDir is under the /var link.
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	root := t.TempDir()
 	projects := filepath.Join(root, "projects")
 	if err := os.MkdirAll(projects, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	projects, err := filepath.EvalSymlinks(projects)
+	if err != nil {
 		t.Fatal(err)
 	}
 	settings := filepath.Join(root, "settings.json")
@@ -339,7 +339,7 @@ func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 		{name: "unrouted", body: nil, baseURL: "https://not-the-router.example"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body, err := withManagedClaudeUserSettings(tc.body, userPath)
+			body, err := withManagedClaudeUserSettings(tc.body, userPath, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -362,7 +362,7 @@ func TestManagedClaudeLaunchCarriesUserSettings(t *testing.T) {
 			}
 		})
 	}
-	if body, err := withManagedClaudeUserSettings(nil, ""); err != nil || body != nil {
+	if body, err := withManagedClaudeUserSettings(nil, "", nil); err != nil || body != nil {
 		t.Fatalf("disabled merge must leave an unrouted launch without settings, got %s, %v", body, err)
 	}
 }
