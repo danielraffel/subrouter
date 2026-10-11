@@ -249,7 +249,7 @@ func TestMemoryNotePreviewIsRecognized(t *testing.T) {
 // The m5 tab from 2026-10-04: the 503 sits above the input box and a long
 // background-agents panel fills the lines below it.
 func TestStallFoundAboveAgentsPanel(t *testing.T) {
-	screen := "⏺ API Error: 503 no non-exhausted claude accounts available. This is a server-side issue, usually temporary\n\n" +
+	screen := "⏺ API Error: 529 Overloaded. This is a server-side issue, usually temporary\n\n" +
 		"────────\n❯ \n────────\n  ⏵⏵ auto mode on · 39 shells · ← for agents\n  ⏺ main\n" +
 		strings.Repeat("  ◯ general-purpose  some agent task    9h 47m · ↓ 416.7k tokens\n", 6) + "  ↓ 5 more\n"
 	var claudeRule proxy.StallRule
@@ -259,6 +259,75 @@ func TestStallFoundAboveAgentsPanel(t *testing.T) {
 		}
 	}
 	if _, ok := findStall(screen, claudeRule); !ok {
-		t.Fatal("a 503 above the input box was missed behind the agents panel")
+		t.Fatal("a 529 above the input box was missed behind the agents panel")
+	}
+	// A spent pool is not a stall: retrying cannot help, and the quota alarm
+	// resumes the tab at the reset.
+	spent := strings.Replace(screen, "API Error: 529 Overloaded.", "API Error: 503 no non-exhausted claude accounts available.", 1)
+	if line, ok := findStall(spent, claudeRule); ok {
+		t.Fatalf("pool-exhausted 503 was treated as a stall: %q", line)
+	}
+}
+
+// A resume that runs briefly and stalls again must keep backing off. The
+// tracker once forgot a tab on its first healthy poll, so every retry started
+// over at 30s and one tab got continue over a thousand times.
+func TestStallBackoffSurvivesBriefRecovery(t *testing.T) {
+	cmux := filepath.Join(t.TempDir(), "cmux")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stalls := newStallTracker()
+	now := time.Unix(1_800_000_000, 0)
+	sent := 0
+	// The resumer polls every 15s. After each resume the tab looks healthy
+	// for one poll, then shows the error again for three.
+	for cycle := 0; cycle < 120; cycle++ {
+		now = now.Add(15 * time.Second)
+		stalls.forget("s1", now)
+		for poll := 0; poll < 3; poll++ {
+			now = now.Add(15 * time.Second)
+			if _, did := stalls.resumeStalledTab(cmux, "s1", "■ Selected model is at capacity.", codexCapacityStall, now); did {
+				sent++
+			}
+		}
+	}
+	if sent > maxStallAttempts {
+		t.Fatalf("sent %d resumes in two hours, want at most %d", sent, maxStallAttempts)
+	}
+	if sent < 5 {
+		t.Fatalf("sent only %d resumes in two hours", sent)
+	}
+	// After a real recovery the tab starts fresh.
+	stalls.forget("s1", now.Add(stallHealthyReset))
+	if _, ok := stalls.tabs["s1"]; ok {
+		t.Fatal("a tab healthy for 15 minutes kept its old attempts")
+	}
+}
+
+// Claude wraps a question whose file name is long, leaving only the name on
+// the line ending in "?". A memory note on m3 waited ten hours this way.
+func TestWrappedQuestionIsJoined(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	name := "a-new-python-import-is-an-undeclared-checkout-read-for-every-test-that-shells-the-script.md"
+	dir := filepath.Join(home, ".claude", "projects", "-Volumes-x", "memory")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	screen := "╭──\n Create file\n " + filepath.Join(dir, name) + "\n╌╌╌╌\n 1 ---\n 2 name: x\n╌╌╌╌\n" +
+		" Do you want to create\n " + name + "?\n ❯ 1. Yes\n   2. Yes, allow all edits during this session (shift+tab)\n   3. No\n\n Esc to cancel · Tab to amend\n"
+	prompt, ok := findPendingPrompt(screen)
+	if !ok || !strings.HasPrefix(prompt.Question, "Do you want to create a-new-python") || prompt.File != name {
+		t.Fatalf("prompt = %+v, %v", prompt, ok)
+	}
+	answered := false
+	for _, rule := range proxy.DefaultPromptRules() {
+		if promptRuleMatches(rule, "claude", prompt) {
+			answered = true
+		}
+	}
+	if !answered {
+		t.Fatalf("no default rule answers the wrapped memory prompt %q", prompt.Question)
 	}
 }

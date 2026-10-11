@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/manaflow-ai/subrouter/internal/proxy"
 )
@@ -59,7 +60,19 @@ func findPendingPrompt(screen string) (pendingPrompt, bool) {
 	for i := option - 1; i >= 0 && i >= option-4; i-- {
 		question := strings.TrimSpace(lines[i])
 		if strings.HasSuffix(question, "?") {
-			prompt := pendingPrompt{Question: question, Header: lines[max(0, i-60):i]}
+			// A long file name wraps the question, leaving only the name on
+			// the last line; join the lines it continues. A question starts
+			// with a capital ("Do you want…"), a wrapped remainder does not.
+			start := i
+			for start > 0 && i-start < 2 && !startsWithUpper(question) {
+				prev := strings.TrimSpace(lines[start-1])
+				if prev == "" || strings.Trim(prev, "─━-╌") == "" || strings.HasSuffix(prev, "?") {
+					break
+				}
+				start--
+				question = prev + " " + question
+			}
+			prompt := pendingPrompt{Question: question, Header: lines[max(0, start-60):start]}
 			if m := promptFileToken.FindStringSubmatch(question); m != nil {
 				prompt.File = filepath.Base(m[1])
 			}
@@ -211,9 +224,11 @@ type stallTracker struct {
 
 type stalledTab struct {
 	firstSeen time.Time
-	lastSent  time.Time
-	attempts  int
-	line      string
+	// lastStalled is the last poll that saw the tab stalled.
+	lastStalled time.Time
+	lastSent    time.Time
+	attempts    int
+	line        string
 	// failed is set when the last resume never left the input box.
 	failed bool
 }
@@ -225,6 +240,18 @@ var stallBackoff = []time.Duration{30 * time.Second, time.Minute, 2 * time.Minut
 
 // maxStallAttempts stops retrying a tab that never recovers (about 2 hours).
 const maxStallAttempts = 14
+
+// stallHealthyReset is how long a tab must go without stalling before its
+// attempts start over. A resume that runs for a moment and fails again is
+// still the same outage: resetting on the first healthy poll once made the
+// backoff restart at 30s every time, typing continue into one tab over a
+// thousand times while the pool stayed exhausted.
+const stallHealthyReset = 15 * time.Minute
+
+// notAStall matches errors a stall rule may catch but a retry cannot fix.
+// "no non-exhausted accounts" means the whole pool is out of quota; the
+// proxy records it and the quota alarm resumes the tab at the reset.
+var notAStall = regexp.MustCompile(`no non-exhausted`)
 
 // findStall returns the screen line a stall rule matches, when it is among
 // the last lines of the tab, so an error that has scrolled up is ignored.
@@ -245,7 +272,7 @@ func findStall(screen string, rule proxy.StallRule) (string, bool) {
 	// above the input box, which is the last thing the agent printed.
 	recent = append(recent, linesAboveInputBox(lines, 8)...)
 	for _, line := range recent {
-		if pattern.MatchString(line) {
+		if pattern.MatchString(line) && !notAStall.MatchString(line) {
 			return line, true
 		}
 	}
@@ -256,10 +283,11 @@ func findStall(screen string, rule proxy.StallRule) (string, bool) {
 // temporary failure, once its backoff has passed. It reports whether it sent.
 func (t *stallTracker) resumeStalledTab(cmuxPath, surface, line, screen string, now time.Time) (string, bool) {
 	tab := t.tabs[surface]
-	if tab == nil || tab.line != line {
-		tab = &stalledTab{firstSeen: now, line: line}
+	if tab == nil {
+		tab = &stalledTab{firstSeen: now}
 		t.tabs[surface] = tab
 	}
+	tab.line, tab.lastStalled = line, now
 	if tab.attempts >= maxStallAttempts {
 		return "", false
 	}
@@ -282,8 +310,12 @@ func (t *stallTracker) resumeStalledTab(cmuxPath, surface, line, screen string, 
 	return action, true
 }
 
-// forget drops tabs that are no longer stalled.
-func (t *stallTracker) forget(surface string) { delete(t.tabs, surface) }
+// forget drops a tab once it has gone stallHealthyReset without stalling.
+func (t *stallTracker) forget(surface string, now time.Time) {
+	if tab := t.tabs[surface]; tab != nil && now.Sub(tab.lastStalled) >= stallHealthyReset {
+		delete(t.tabs, surface)
+	}
+}
 
 // resumeIfStalled applies the stall rules to a quiet tab with no prompt.
 func resumeIfStalled(serverURL, cmuxPath, host string, session cmuxSessionWire, screen string, setting proxy.AutoResumeSetting, stalls *stallTracker, now time.Time, out io.Writer) {
@@ -316,7 +348,7 @@ func resumeIfStalled(serverURL, cmuxPath, host string, session cmuxSessionWire, 
 		_ = postAutoResume(serverURL, "/_subrouter/auto-resume/prompts", report, nil)
 		return
 	}
-	stalls.forget(session.SurfaceID)
+	stalls.forget(session.SurfaceID, now)
 }
 
 // typeIntoTab types text into a cmux tab, presses Enter, and confirms the
@@ -450,4 +482,11 @@ func linesAboveInputBox(lines []string, n int) []string {
 		out = append(out, line)
 	}
 	return out
+}
+
+func startsWithUpper(s string) bool {
+	for _, r := range s {
+		return unicode.IsUpper(r)
+	}
+	return false
 }
