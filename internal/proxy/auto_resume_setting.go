@@ -43,7 +43,7 @@ type StallRule struct {
 // DefaultStallRules are the stall rules a pool has before anyone changes them.
 func DefaultStallRules() []StallRule {
 	return []StallRule{
-		{Agent: "codex", Screen: `(?i)(model is at capacity|server_is_overloaded|servers are currently overloaded|try a different model)`, Note: "Codex stopped on a temporary model-provider capacity error."},
+		{Agent: "codex", Screen: `(?i)(model is at capacity|server_is_overloaded|servers are currently overloaded|try a different model|provider retry limit reached)`, Note: "Codex stopped on a temporary model-provider capacity error."},
 		{Agent: "claude", Screen: `(?i)API Error: (5\d\d|Overloaded)|overloaded_error`, Note: "Claude stopped on a temporary provider overload."},
 	}
 }

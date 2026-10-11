@@ -74,6 +74,55 @@ func TestFindPendingPromptReportsUnmatchedQuestions(t *testing.T) {
 	}
 }
 
+func TestLongMemoryCreatePromptKeepsPathForRetryClassification(t *testing.T) {
+	lines := strings.Repeat("old output\n", 120) +
+		"Create file\n This will modify /Users/me/.claude/projects/p/memory/index-review-ops.md\n" +
+		" Do you want to create index-review-ops.md?\n ❯ 1. Yes\n   2. No\n Esc to cancel\n"
+	prompt, ok := findPendingPrompt(lines)
+	if !ok || !isClaudeMemoryFile(prompt) {
+		t.Fatalf("long memory prompt was not classified: %+v, found=%v header=%q", prompt, ok, unwrapHeader(prompt.Header))
+	}
+}
+
+func TestRetryPromptClassificationReadsPastInitialScreen(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	cmux := filepath.Join(root, "cmux")
+	full := strings.Repeat("old output\n", 120) + "Create file\n This will modify /Users/me/.claude/projects/p/memory/index-review-ops.md\n" +
+		" Do you want to create index-review-ops.md?\n ❯ 1. Yes\n   2. No\n Esc to cancel\n"
+	narrow := "old output\n" + " Do you want to create index-review-ops.md?\n ❯ 1. Yes\n   2. No\n Esc to cancel\n"
+	script := "#!/bin/sh\nif [ \"$5\" = 2000 ]; then printf '%s' '" + strings.ReplaceAll(full, "'", "'\\''") + "'; else printf '%s' '" + strings.ReplaceAll(narrow, "'", "'\\''") + "'; fi\n"
+	if err := os.WriteFile(cmux, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prompt, ok := findPendingPrompt(narrow)
+	if !ok || isClaudeMemoryFile(prompt) {
+		t.Fatalf("initial screen unexpectedly classified: %+v %v", prompt, ok)
+	}
+	got := retryPromptClassification(cmux, "claude", "surface-1", prompt)
+	if !isClaudeMemoryFile(got) {
+		t.Fatalf("retry did not recover memory path: %+v", got)
+	}
+}
+
+func TestWaitingPromptEscalatesOnceAfterFifteenMinutes(t *testing.T) {
+	called := filepath.Join(t.TempDir(), "notify")
+	cmux := filepath.Join(t.TempDir(), "cmux")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nprintf '%s' notify >> \""+called+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tc := newStallTracker()
+	start := time.Unix(1_800_000_000, 0)
+	var out strings.Builder
+	tc.notifyWaitingPrompt(cmux, "surface-1", "Do you want to proceed?", start, &out)
+	tc.notifyWaitingPrompt(cmux, "surface-1", "Do you want to proceed?", start.Add(16*time.Minute), &out)
+	tc.notifyWaitingPrompt(cmux, "surface-1", "Do you want to proceed?", start.Add(17*time.Minute), &out)
+	body, err := os.ReadFile(called)
+	if err != nil || string(body) != "notify" {
+		t.Fatalf("notification calls=%q err=%v, want one call", body, err)
+	}
+}
+
 // The screen of a real m5s tab stopped on a capacity error (2026-10-04).
 const codexCapacityStall = `  I'll accept each receipt only after green validation, commit/merge it, then update the roadmap serially.
   Worked for 1h 20m 59s • 10:16 AM
@@ -132,6 +181,18 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 	if action, _ := goal.resumeStalledTab(cmux, "s2", line, goalScreen, start.Add(31*time.Second)); action != "/goal resume" {
 		t.Fatalf("goal session action = %q", action)
 	}
+}
+
+func TestStallRulesRecognizeCodexProviderRetryLimit(t *testing.T) {
+	for _, rule := range proxy.DefaultStallRules() {
+		if rule.Agent == "codex" {
+			if _, ok := findStall("provider retry limit reached", rule); !ok {
+				t.Fatal("provider retry limit was not classified as a Codex stall")
+			}
+			return
+		}
+	}
+	t.Fatal("missing Codex stall rule")
 }
 
 // A command left in Codex's or Claude's input box is detected, so the resumer

@@ -849,9 +849,13 @@ func alarmDueAt(alarm wake.Alarm) time.Time {
 }
 
 func readSurface(cmuxPath, surface string) (string, error) {
+	return readSurfaceLines(cmuxPath, surface, 80)
+}
+
+func readSurfaceLines(cmuxPath, surface string, lines int) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, cmuxPath, "read-screen", "--surface", surface, "--lines", "80")
+	cmd := exec.CommandContext(ctx, cmuxPath, "read-screen", "--surface", surface, "--lines", strconv.Itoa(lines))
 	body, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("surface validation failed: %w", err)

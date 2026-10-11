@@ -72,7 +72,16 @@ func findPendingPrompt(screen string) (pendingPrompt, bool) {
 				start--
 				question = prev + " " + question
 			}
-			prompt := pendingPrompt{Question: question, Header: lines[max(0, start-60):start]}
+			headerStart := max(0, start-60)
+			// Keep the whole current file preview when a large write pushed
+			// its path away. A prior prompt must not supply a false path.
+			for j := start - 1; j >= 0; j-- {
+				if strings.HasPrefix(strings.TrimSpace(lines[j]), "Create file") || strings.HasPrefix(strings.TrimSpace(lines[j]), "Edit file") {
+					headerStart = j
+					break
+				}
+			}
+			prompt := pendingPrompt{Question: question, Header: lines[headerStart:start]}
 			if m := promptFileToken.FindStringSubmatch(question); m != nil {
 				prompt.File = filepath.Base(m[1])
 			}
@@ -192,10 +201,18 @@ func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, 
 		}
 		prompt, ok := findPendingPrompt(screen)
 		if !ok {
+			if stalls != nil {
+				delete(stalls.waiting, session.SurfaceID)
+			}
 			resumeIfStalled(serverURL, cmuxPath, host, session, screen, setting, stalls, now, out)
 			continue
 		}
 		report := proxy.PromptReport{Host: host, Agent: session.Agent, SurfaceID: session.SurfaceID, Question: prompt.Question, File: prompt.File}
+		// A large new file can push its path above the normal screen read.
+		// Retry classification with the full prompt before deciding it needs a
+		// human. Never infer memory ownership from a bare .md name.
+		prompt = retryPromptClassification(cmuxPath, session.Agent, session.SurfaceID, prompt)
+		report.File = prompt.File
 		for _, rule := range rules {
 			if !promptRuleMatches(rule, session.Agent, prompt) {
 				continue
@@ -211,15 +228,39 @@ func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, 
 		}
 		if report.AnsweredBy == "" {
 			io.WriteString(out, now.Format("15:04:05")+" waiting on you: "+session.Agent+" in "+session.SurfaceID+": "+prompt.Question+"\n")
+			if stalls != nil {
+				stalls.notifyWaitingPrompt(cmuxPath, session.SurfaceID, prompt.Question, now, out)
+			}
+		} else if stalls != nil {
+			delete(stalls.waiting, session.SurfaceID)
 		}
 		_ = postAutoResume(serverURL, "/_subrouter/auto-resume/prompts", report, nil)
 	}
 }
 
+func retryPromptClassification(cmuxPath, agent, surface string, prompt pendingPrompt) pendingPrompt {
+	if agent != "claude" || prompt.File == "" || isClaudeMemoryFile(prompt) {
+		return prompt
+	}
+	if wider, err := readSurfaceLines(cmuxPath, surface, 2000); err == nil {
+		if expanded, found := findPendingPrompt(wider); found && expanded.Question == prompt.Question {
+			return expanded
+		}
+	}
+	return prompt
+}
+
 // stallTracker remembers, per tab, how often a stall rule has resumed it, so
 // a tab that keeps stopping is retried with backoff rather than hammered.
 type stallTracker struct {
-	tabs map[string]*stalledTab
+	tabs    map[string]*stalledTab
+	waiting map[string]*waitingPrompt
+}
+
+type waitingPrompt struct {
+	question  string
+	firstSeen time.Time
+	notified  bool
 }
 
 type stalledTab struct {
@@ -233,7 +274,25 @@ type stalledTab struct {
 	failed bool
 }
 
-func newStallTracker() *stallTracker { return &stallTracker{tabs: map[string]*stalledTab{}} }
+func newStallTracker() *stallTracker {
+	return &stallTracker{tabs: map[string]*stalledTab{}, waiting: map[string]*waitingPrompt{}}
+}
+
+func (t *stallTracker) notifyWaitingPrompt(cmuxPath, surface, question string, now time.Time, out io.Writer) {
+	current := t.waiting[surface]
+	if current == nil || current.question != question {
+		current = &waitingPrompt{question: question, firstSeen: now}
+		t.waiting[surface] = current
+	}
+	if current.notified || now.Sub(current.firstSeen) < 15*time.Minute {
+		return
+	}
+	if err := exec.Command(cmuxPath, "notify", "--surface", surface, "--title", "Agent waiting for permission", "--body", question).Run(); err != nil {
+		io.WriteString(out, "auto-resume notification failed: "+err.Error()+"\n")
+		return
+	}
+	current.notified = true
+}
 
 // stallBackoff is how long to wait before each resume of a stalled tab.
 var stallBackoff = []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
