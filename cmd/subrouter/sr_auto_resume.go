@@ -287,8 +287,10 @@ func (r srRunner) autoResumeWatch() error {
 	if _, err := wakeCmuxPath(); err != nil {
 		return err
 	}
+	// A pool that is briefly unreachable must not end the watch: on m1 one
+	// startup timeout left the Mac with no resumer. The loop retries.
 	if _, err := fetchAutoResumeSetting(serverURL); err != nil {
-		return err
+		fmt.Fprintf(r.out, "Cannot reach the pool yet (%v); retrying every 15s.\n", err)
 	}
 	fmt.Fprintf(r.out, "Watching every cmux tab on this Mac for auto-resume (pool %s).\nLeave this open while sessions started before the sr update are still running. Ctrl-C stops it.\n", serverURL)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
