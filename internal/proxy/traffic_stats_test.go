@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -269,6 +271,37 @@ func TestTrafficCountsHandlerGeneratedFailuresAsProxy(t *testing.T) {
 	got := stats.Snapshot(nil, time.Now())
 	if got.Requests != 4 || got.Responses.Class2xx != 2 || got.Proxy5xx != 1 || got.Upstream5xx != 1 {
 		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+// TestTrafficFailureReportIncludesRouteAccountAndRetryPath verifies the
+// supervisor-facing failure sample at the HTTP traffic boundary.
+func TestTrafficFailureReportIncludesRouteAccountAndRetryPath(t *testing.T) {
+	stats := NewTrafficStats(time.Now())
+	handler := stats.trafficCounted(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markTrafficAccount(r.Context(), "claude-account@example.com")
+		markTrafficRetryPath(r.Context(), "account_failover")
+		markTrafficUpstreamStatus(r.Context(), http.StatusBadGateway)
+		markTrafficErrorClass(r.Context(), "proxy_error")
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	snapshot := stats.Snapshot(nil, time.Now())
+	if len(snapshot.Failures) != 1 {
+		t.Fatalf("failures = %+v, want one sample", snapshot.Failures)
+	}
+	failure := snapshot.Failures[0]
+	digest := sha256.Sum256([]byte("claude-account@example.com"))
+	wantAccountHash := "sha256:" + hex.EncodeToString(digest[:8])
+	if failure.Status != http.StatusBadGateway || failure.UpstreamStatus != http.StatusBadGateway ||
+		failure.Method != http.MethodPost || failure.Path != "/v1/messages" ||
+		failure.AccountHash != wantAccountHash || failure.RetryPath != "account_failover" ||
+		failure.ErrorClass != "proxy_error" {
+		t.Fatalf("failure = %+v, want route/account/retry classification", failure)
 	}
 }
 
