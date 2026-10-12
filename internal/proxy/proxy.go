@@ -636,8 +636,11 @@ func irreparableClaudeRefreshFailure(err error) bool {
 }
 
 type usageWindowsEntry struct {
-	windows           []accounts.UsageWindow
-	at                time.Time
+	windows []accounts.UsageWindow
+	at      time.Time
+	// orderAt is the request start of the newest accepted response. It is
+	// separate from at because partial headers may retain an older bucket age.
+	orderAt           time.Time
 	supplementalFresh bool
 	// credentialKey binds an observation to the credential that produced it.
 	// Account IDs survive re-login, so ID-only quota data cannot cross a
@@ -851,7 +854,15 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	failure, throttled := r.usageWindowsFailures[failureKey]
 	r.usageWindowsMu.Unlock()
 	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
-		return append([]accounts.UsageWindow(nil), entry.windows...), entry.supplementalFresh, entry.at, false, nil
+		windows := append([]accounts.UsageWindow(nil), entry.windows...)
+		supplementalFresh := entry.supplementalFresh
+		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
+			if supplemental, _, ok := r.cachedClaudeSupplementalWithObservation(account, now); ok {
+				windows = mergeUsageWindows(windows, supplemental)
+				supplementalFresh = true
+			}
+		}
+		return windows, supplementalFresh, entry.at, false, nil
 	}
 	// A quota-status poll should never turn one upstream 429 into a storm of
 	// identical follow-up 429s. No waiting: serve last-good or return the
@@ -5361,6 +5372,8 @@ func (s Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// proxyHandler builds the routing handler and publishes successful quota
+// response evidence before the response is written to the client.
 func (s Server) proxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Token usage latency runs from here, when the request arrived.
@@ -5926,7 +5939,10 @@ func (s Server) proxyHandler() http.Handler {
 				!claudeResponseRejected(response.Header) {
 				// Learn usable model quota from an ordinary response. No
 				// additional upstream request is made at this boundary.
-				s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
+				observed, ok, generation, orderAt := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
+				if ok {
+					s.mergeClaudeResponseQuotaScore(responseAccount, observed, generation, responseAccount.CredentialIdentity(), orderAt)
+				}
 			}
 			s.captureResponseBodyForAccount(response, r.Context(), sessionAgentType, sessionID, responseAccount, requestPoolModel, retryPoolModel, proxyRequest.URL.Path)
 			usageSessionKey := ""
