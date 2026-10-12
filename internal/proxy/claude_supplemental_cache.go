@@ -74,9 +74,10 @@ func (r *AccountRef) claudeUsageScopeDeniedFor(ctx context.Context, account acco
 	return true
 }
 
+// rememberClaudeUsageScopeDenied records that this credential cannot use the
+// ordinary usage endpoint and releases any persisted hold for that endpoint.
 func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
 	r.usageWindowsMu.Lock()
-	defer r.usageWindowsMu.Unlock()
 	if r.claudeUsageScopeDenied == nil {
 		r.claudeUsageScopeDenied = map[string]struct{}{}
 	}
@@ -85,7 +86,16 @@ func (r *AccountRef) rememberClaudeUsageScopeDenied(account accounts.Account) {
 	// It says nothing about the Messages probe, so it must not hold the
 	// probe back for the rest of its retry window.
 	cacheKey := account.ID + "\x00" + string(account.Provider)
-	delete(r.usageWindowsFailures, usageWindowsFailureKey(cacheKey, account.CredentialIdentity()))
+	clearPersisted := false
+	if failure, ok := r.usageWindowsFailures[usageWindowsFailureKey(cacheKey)]; ok &&
+		(failure.credentialKey == "" || failure.credentialKey == usageWindowsCredentialKey(account)) {
+		delete(r.usageWindowsFailures, usageWindowsFailureKey(cacheKey))
+		clearPersisted = true
+	}
+	r.usageWindowsMu.Unlock()
+	if clearPersisted {
+		r.clearUsageThrottleState(cacheKey)
+	}
 }
 
 func supplementalClaudeWindows(windows []accounts.UsageWindow) []accounts.UsageWindow {
