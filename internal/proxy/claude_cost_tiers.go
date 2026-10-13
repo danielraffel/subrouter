@@ -54,7 +54,49 @@ const claudeCreditExhaustionHold = time.Hour
 // "Your credit balance is too low to access the Anthropic API. Please go to
 // Plans & Billing to upgrade or purchase credits."
 func claudeCreditExhaustedMessage(body []byte) bool {
-	return strings.Contains(normalizedProviderErrorMessage(body), "credit balance is too low")
+	message := normalizedProviderErrorMessage(body)
+	if strings.Contains(message, "credit balance") &&
+		(strings.Contains(message, "too low") || strings.Contains(message, "insufficient") || strings.Contains(message, "not enough")) {
+		return true
+	}
+	if strings.Contains(message, "insufficient credits") || strings.Contains(message, "credits exhausted") {
+		return true
+	}
+	return claudeBillingErrorType(body)
+}
+
+func claudeBillingErrorType(body []byte) bool {
+	var value any
+	if json.Unmarshal(body, &value) != nil {
+		return false
+	}
+	var visit func(any) bool
+	visit = func(current any) bool {
+		switch node := current.(type) {
+		case map[string]any:
+			for key, child := range node {
+				if key == "type" || key == "code" || key == "error_code" {
+					if text, ok := child.(string); ok {
+						normalized := strings.ToLower(strings.TrimSpace(text))
+						if normalized == "billing_error" || normalized == "insufficient_credits" || normalized == "credit_balance_exhausted" {
+							return true
+						}
+					}
+				}
+				if visit(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if visit(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return visit(value)
 }
 
 func claudeCreditExhaustedStatus(code int) bool {
