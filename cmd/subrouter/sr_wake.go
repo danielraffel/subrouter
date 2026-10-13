@@ -796,8 +796,20 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusStale; a.LastError = err.Error(); return nil })
 			continue
 		}
-		_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusFired; a.Attempt++; return nil })
 		text := alarm.Action
+		if text == legacyContinueAction {
+			decision := continuePrompt(runCMUXContinuePrompt, cmuxPath, alarm.Agent, alarm.SessionID, continueReasonForAlarm(alarm.Kind))
+			if decision.Skip {
+				_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+					a.Status = wake.StatusCompleted
+					a.LastError = decision.Note
+					return nil
+				})
+				continue
+			}
+			text = decision.Text
+		}
+		_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusFired; a.Attempt++; return nil })
 		if !strings.HasSuffix(text, "\n") {
 			text += "\n"
 		}

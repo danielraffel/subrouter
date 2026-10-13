@@ -220,6 +220,15 @@ func answerPrompts(serverURL, cmuxPath string, setting proxy.AutoResumeSetting, 
 // a tab that keeps stopping is retried with backoff rather than hammered.
 type stallTracker struct {
 	tabs map[string]*stalledTab
+	// runPrompt asks cmux for the shared continue prompt; nil runs cmux.
+	runPrompt continuePromptRunner
+}
+
+func (t *stallTracker) promptRunner() continuePromptRunner {
+	if t.runPrompt != nil {
+		return t.runPrompt
+	}
+	return runCMUXContinuePrompt
 }
 
 type stalledTab struct {
@@ -281,7 +290,7 @@ func findStall(screen string, rule proxy.StallRule) (string, bool) {
 
 // resumeStalledTab types continue or /goal resume into a tab stopped on a
 // temporary failure, once its backoff has passed. It reports whether it sent.
-func (t *stallTracker) resumeStalledTab(cmuxPath, surface, line, screen string, now time.Time) (string, bool) {
+func (t *stallTracker) resumeStalledTab(cmuxPath, agent, sessionID, surface, line, screen string, now time.Time) (string, bool) {
 	tab := t.tabs[surface]
 	if tab == nil {
 		tab = &stalledTab{firstSeen: now}
@@ -300,6 +309,14 @@ func (t *stallTracker) resumeStalledTab(cmuxPath, surface, line, screen string, 
 		return "", false
 	}
 	action := resumeActionForSurface(screen)
+	if action == legacyContinueAction {
+		decision := continuePrompt(t.promptRunner(), cmuxPath, agent, sessionID, "provider")
+		if decision.Skip {
+			tab.attempts = maxStallAttempts
+			return "", false
+		}
+		action = decision.Text
+	}
 	err := typeIntoTab(cmuxPath, surface, action)
 	if err != nil && !errors.Is(err, errNotSubmitted) {
 		return "", false
@@ -330,7 +347,7 @@ func resumeIfStalled(serverURL, cmuxPath, host string, session cmuxSessionWire, 
 		if !stalled {
 			continue
 		}
-		action, sent := stalls.resumeStalledTab(cmuxPath, session.SurfaceID, line, screen, now)
+		action, sent := stalls.resumeStalledTab(cmuxPath, session.Agent, session.SessionID, session.SurfaceID, line, screen, now)
 		if !sent {
 			return
 		}

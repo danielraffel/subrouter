@@ -109,16 +109,16 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 	}
 	stalls := newStallTracker()
 	start := time.Unix(1_800_000_000, 0)
-	if _, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start); did {
+	if _, did := stalls.resumeStalledTab(cmux, "codex", "", "s1", line, codexCapacityStall, start); did {
 		t.Fatal("resumed before the first backoff passed")
 	}
-	if action, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start.Add(31*time.Second)); !did || action != "continue" {
+	if action, did := stalls.resumeStalledTab(cmux, "codex", "", "s1", line, codexCapacityStall, start.Add(31*time.Second)); !did || action != "continue" {
 		t.Fatalf("first resume = %q, %v", action, did)
 	}
-	if _, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start.Add(61*time.Second)); did {
+	if _, did := stalls.resumeStalledTab(cmux, "codex", "", "s1", line, codexCapacityStall, start.Add(61*time.Second)); did {
 		t.Fatal("second resume came before its one-minute backoff")
 	}
-	if _, did := stalls.resumeStalledTab(cmux, "s1", line, codexCapacityStall, start.Add(92*time.Second)); !did {
+	if _, did := stalls.resumeStalledTab(cmux, "codex", "", "s1", line, codexCapacityStall, start.Add(92*time.Second)); !did {
 		t.Fatal("second resume did not come after its backoff")
 	}
 	body, _ := os.ReadFile(sent)
@@ -128,8 +128,8 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 	// A goal session gets /goal resume instead.
 	goal := newStallTracker()
 	goalScreen := "Pursuing goal: ship it\n" + codexCapacityStall
-	goal.resumeStalledTab(cmux, "s2", line, goalScreen, start)
-	if action, _ := goal.resumeStalledTab(cmux, "s2", line, goalScreen, start.Add(31*time.Second)); action != "/goal resume" {
+	goal.resumeStalledTab(cmux, "codex", "", "s2", line, goalScreen, start)
+	if action, _ := goal.resumeStalledTab(cmux, "codex", "", "s2", line, goalScreen, start.Add(31*time.Second)); action != "/goal resume" {
 		t.Fatalf("goal session action = %q", action)
 	}
 }
@@ -287,7 +287,7 @@ func TestStallBackoffSurvivesBriefRecovery(t *testing.T) {
 		stalls.forget("s1", now)
 		for poll := 0; poll < 3; poll++ {
 			now = now.Add(15 * time.Second)
-			if _, did := stalls.resumeStalledTab(cmux, "s1", "■ Selected model is at capacity.", codexCapacityStall, now); did {
+			if _, did := stalls.resumeStalledTab(cmux, "codex", "", "s1", "■ Selected model is at capacity.", codexCapacityStall, now); did {
 				sent++
 			}
 		}
