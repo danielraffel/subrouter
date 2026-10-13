@@ -168,3 +168,12 @@ func TestCodexRolloutModelProviderRequiresTheSessionsOwnMetadata(t *testing.T) {
 		t.Fatalf("provider = %q, want subrouter", got)
 	}
 }
+
+func TestRunForProgramDispatchesResume(t *testing.T) {
+	for _, program := range []string{"sr", "subrouter"} {
+		err := runForProgram(program, []string{"resume", "not-a-session-id"})
+		if err == nil || !strings.Contains(err.Error(), "is not a session id") {
+			t.Fatalf("%s resume: err = %v; want the resume command's session-id error", program, err)
+		}
+	}
+}
