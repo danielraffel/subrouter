@@ -47,6 +47,14 @@ also exports `SUBROUTER_CODEX_LAUNCHER="<launcher> codex"` and
 that persist a resume command. The launcher name follows the invoked `sr`,
 `subrouter`, or `cx` alias; unrelated clients can ignore these variables.
 
+A session created through `sr codex` records the `subrouter` model provider in
+its rollout, so a plain `codex resume <id>` fails with "Model provider
+`subrouter` not found" unless your own Codex config defines that provider.
+`sr resume <session-id>` finds the session by id and resumes it through the
+right launcher: a Codex rollout under `CODEX_HOME` resumes as
+`sr codex resume <id>`, and a Claude transcript resumes as
+`sr claude proxy --resume <id>`. Extra arguments are passed to the agent.
+
 ## Server Switching
 
 Register and select a remote server:

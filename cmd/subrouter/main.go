@@ -224,6 +224,8 @@ func runForProgram(program string, args []string) error {
 		return listAccounts()
 	case "codex":
 		return codex(args[1:])
+	case "resume":
+		return resumeSession(program, args[1:], defaultSessionSearchRoots(), os.Stderr, codex, srForProgram)
 	case "cx":
 		return cxAlias(args[1:])
 	case "install-daemon":
@@ -1949,6 +1951,7 @@ Usage:
   %[1]s probe [--url http://127.0.0.1:31415]
   %[1]s accounts
   %[1]s codex [codex args...]
+  %[1]s resume <session-id> [agent args...]   Resume a Codex or Claude session through Subrouter
   %[1]s install-daemon [--start=true]       macOS LaunchAgent
   %[1]s install-systemd [--start=true]      Linux systemd service
   %[1]s install-launchd [--start=true]      macOS shared-server credentials
