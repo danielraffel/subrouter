@@ -309,10 +309,16 @@ func (t *stallTracker) resumeStalledTab(cmuxPath, agent, sessionID, surface, lin
 		return "", false
 	}
 	action := resumeActionForSurface(screen)
+	var decision continuePromptDecision
 	if action == legacyContinueAction {
-		decision := continuePrompt(t.promptRunner(), cmuxPath, agent, sessionID, "provider")
+		decision = continuePrompt(t.promptRunner(), cmuxPath, agent, sessionID, "provider")
 		if decision.Skip {
-			tab.attempts = maxStallAttempts
+			// Another sender already continued this interruption: not an
+			// attempt of ours, so the tab keeps its remaining attempts. An idle
+			// or unreadable session is never continued.
+			if !decision.AlreadySent {
+				tab.attempts = maxStallAttempts
+			}
 			return "", false
 		}
 		action = decision.Text
@@ -320,6 +326,9 @@ func (t *stallTracker) resumeStalledTab(cmuxPath, agent, sessionID, surface, lin
 	err := typeIntoTab(cmuxPath, surface, action)
 	if err != nil && !errors.Is(err, errNotSubmitted) {
 		return "", false
+	}
+	if err == nil {
+		commitContinuePrompt(t.promptRunner(), cmuxPath, agent, sessionID, decision)
 	}
 	tab.attempts++
 	tab.lastSent = now

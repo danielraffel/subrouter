@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -12,52 +14,100 @@ import (
 	"github.com/manaflow-ai/subrouter/wake"
 )
 
-const sharedPrompt = "Your session stopped at 2026-10-13 10:00:01 PDT (2026-10-13T17:00:01Z) when its account ran out of quota; quota is available again. Your last action may not have completed. Before doing anything else, check the real state..."
+const (
+	sharedPrompt      = "Your session stopped at 2026-10-13 10:00:01 PDT (2026-10-13T17:00:01Z) when its account ran out of quota; quota is available again. Your last action may not have completed. Before doing anything else, check the real state..."
+	sharedClaimToken  = "eyJmaW5nZXJwcmludCI6ImYifQ=="
+	testCodexSession  = "01a10852-5eed-7993-bee8-c40693a36dc3"
+	testClaudeSession = "64823d4f-2711-4ce5-8cf4-2842fa7d3358"
+)
 
-func fakePromptRunner(out string, code int, err error, seen *[]string) continuePromptRunner {
-	return func(cmuxPath string, args ...string) (string, int, error) {
-		if seen != nil {
-			*seen = append([]string{cmuxPath}, args...)
-		}
-		return out, code, err
-	}
+// fakeCMUX answers agent-continue-prompt like cmux: a dry run replies with
+// dryOut and dryCode, a commit with commitCode. Every call is recorded.
+type fakeCMUX struct {
+	dryOut     string
+	dryCode    int
+	dryErr     error
+	commitCode int
+	calls      [][]string
 }
 
-func TestContinuePromptUsesTheSharedCmuxPrompt(t *testing.T) {
-	var seen []string
-	got := continuePrompt(fakePromptRunner(sharedPrompt+"\n", 0, nil, &seen), "/bin/cmux", "codex", "01a10852-5eed-7993-bee8-c40693a36dc3", "quota")
-	if got.Skip || got.Text != sharedPrompt {
+func sharedPromptJSON() string {
+	body, _ := json.Marshal(map[string]string{"prompt": sharedPrompt, "claim_token": sharedClaimToken})
+	return string(body) + "\n"
+}
+
+func (f *fakeCMUX) run(cmuxPath string, args ...string) (string, int, error) {
+	f.calls = append(f.calls, append([]string{cmuxPath}, args...))
+	if slices.Contains(args, "--commit") {
+		return "", f.commitCode, nil
+	}
+	return f.dryOut, f.dryCode, f.dryErr
+}
+
+func (f *fakeCMUX) commits() [][]string {
+	var out [][]string
+	for _, call := range f.calls {
+		if slices.Contains(call, "--commit") {
+			out = append(out, call)
+		}
+	}
+	return out
+}
+
+func TestContinuePromptAsksForADryRunOfTheSharedCmuxPrompt(t *testing.T) {
+	cmux := &fakeCMUX{dryOut: sharedPromptJSON()}
+	got := continuePrompt(cmux.run, "/bin/cmux", "codex", testCodexSession, "quota")
+	if got.Skip || got.Text != sharedPrompt || got.ClaimToken != sharedClaimToken {
 		t.Fatalf("decision = %+v", got)
 	}
-	want := []string{"/bin/cmux", "agent-continue-prompt", "--kind", "codex", "--session", "01a10852-5eed-7993-bee8-c40693a36dc3", "--reason", "quota"}
-	if !reflect.DeepEqual(seen, want) {
-		t.Fatalf("cmux args = %q, want %q", seen, want)
+	want := [][]string{{"/bin/cmux", "agent-continue-prompt", "--kind", "codex", "--session", testCodexSession, "--reason", "quota", "--dry-run", "--json"}}
+	if !reflect.DeepEqual(cmux.calls, want) {
+		t.Fatalf("cmux calls = %q, want %q", cmux.calls, want)
 	}
 }
 
 func TestContinuePromptNeverContinuesAnIdleOrAlreadyContinuedSession(t *testing.T) {
 	for _, code := range []int{3, 4, 5} {
-		got := continuePrompt(fakePromptRunner("", code, nil, nil), "/bin/cmux", "claude", "64823d4f-2711-4ce5-8cf4-2842fa7d3358", "quota")
+		got := continuePrompt((&fakeCMUX{dryCode: code}).run, "/bin/cmux", "claude", testClaudeSession, "quota")
 		if !got.Skip || got.Text != "" {
 			t.Fatalf("exit %d: decision = %+v; want skip with no text", code, got)
+		}
+		if got.AlreadySent != (code == 4) {
+			t.Fatalf("exit %d: AlreadySent = %v", code, got.AlreadySent)
 		}
 	}
 }
 
 func TestContinuePromptFallsBackForAnOlderCmux(t *testing.T) {
-	for _, runner := range []continuePromptRunner{
-		fakePromptRunner("", 1, nil, nil),
-		fakePromptRunner("", -1, errors.New("exec: not found"), nil),
-		fakePromptRunner("", 0, nil, nil),
+	for _, cmux := range []*fakeCMUX{
+		{dryCode: 1},
+		{dryCode: -1, dryErr: errors.New("exec: not found")},
+		{dryCode: 0},
+		{dryCode: 0, dryOut: sharedPrompt + "\n"},
 	} {
-		got := continuePrompt(runner, "/bin/cmux", "codex", "01a10852-5eed-7993-bee8-c40693a36dc3", "provider")
-		if got.Skip || got.Text != legacyContinueAction {
+		got := continuePrompt(cmux.run, "/bin/cmux", "codex", testCodexSession, "provider")
+		if got.Skip || got.Text != legacyContinueAction || got.ClaimToken != "" {
 			t.Fatalf("decision = %+v; want the legacy continue", got)
 		}
 	}
-	var seen []string
-	if got := continuePrompt(fakePromptRunner(sharedPrompt, 0, nil, &seen), "/bin/cmux", "codex", "", "provider"); got.Text != legacyContinueAction || seen != nil {
-		t.Fatalf("no session id: decision = %+v, cmux called with %q", got, seen)
+	cmux := &fakeCMUX{dryOut: sharedPromptJSON()}
+	if got := continuePrompt(cmux.run, "/bin/cmux", "codex", "", "provider"); got.Text != legacyContinueAction || cmux.calls != nil {
+		t.Fatalf("no session id: decision = %+v, cmux called with %q", got, cmux.calls)
+	}
+}
+
+func TestCommitContinuePromptClaimsWithTheDryRunToken(t *testing.T) {
+	cmux := &fakeCMUX{}
+	if !commitContinuePrompt(cmux.run, "/bin/cmux", "codex", testCodexSession, continuePromptDecision{Text: sharedPrompt, ClaimToken: sharedClaimToken}) {
+		t.Fatal("commit did not report the claim")
+	}
+	want := [][]string{{"/bin/cmux", "agent-continue-prompt", "--kind", "codex", "--session", testCodexSession, "--commit", sharedClaimToken}}
+	if !reflect.DeepEqual(cmux.calls, want) {
+		t.Fatalf("cmux calls = %q, want %q", cmux.calls, want)
+	}
+	cmux = &fakeCMUX{}
+	if commitContinuePrompt(cmux.run, "/bin/cmux", "codex", testCodexSession, continuePromptDecision{Text: legacyContinueAction}) || cmux.calls != nil {
+		t.Fatalf("a legacy continue was committed: %q", cmux.calls)
 	}
 }
 
@@ -70,10 +120,14 @@ func TestContinueReasonForAlarm(t *testing.T) {
 	}
 }
 
-func TestResumeStalledTabTypesTheSharedPromptAndSkipsAnIdleSession(t *testing.T) {
-	sent := filepath.Join(t.TempDir(), "sent")
-	cmux := filepath.Join(t.TempDir(), "cmux")
-	if err := os.WriteFile(cmux, []byte("#!/bin/sh\n[ \"$1\" = send ] && printf '%s' \"$4\" >> \""+sent+"\"\n[ \"$1\" = send-key ] && [ \"$4\" = enter ] && printf '<enter>' >> \""+sent+"\"\nexit 0\n"), 0o755); err != nil {
+func stallFixture(t *testing.T, sendExit int) (cmuxPath, sentPath, line string) {
+	t.Helper()
+	sentPath = filepath.Join(t.TempDir(), "sent")
+	cmuxPath = filepath.Join(t.TempDir(), "cmux")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = send ]; then printf '%s' \"$4\" >> \"" + sentPath + "\"; exit " + string(rune('0'+sendExit)) + "; fi\n" +
+		"[ \"$1\" = send-key ] && [ \"$4\" = enter ] && printf '<enter>' >> \"" + sentPath + "\"\nexit 0\n"
+	if err := os.WriteFile(cmuxPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	var codexRule proxy.StallRule
@@ -86,46 +140,98 @@ func TestResumeStalledTabTypesTheSharedPromptAndSkipsAnIdleSession(t *testing.T)
 	if !ok {
 		t.Fatal("fixture screen is not a stall")
 	}
-	start := time.Unix(1_800_000_000, 0)
+	return cmuxPath, sentPath, line
+}
 
+func TestResumeStalledTabTypesTheSharedPromptThenClaimsIt(t *testing.T) {
+	cmuxPath, sent, line := stallFixture(t, 0)
+	start := time.Unix(1_800_000_000, 0)
+	cmux := &fakeCMUX{dryOut: sharedPromptJSON()}
 	stalls := newStallTracker()
-	stalls.runPrompt = fakePromptRunner(sharedPrompt, 0, nil, nil)
-	stalls.resumeStalledTab(cmux, "codex", "01a10852-5eed-7993-bee8-c40693a36dc3", "s1", line, codexCapacityStall, start)
-	if action, did := stalls.resumeStalledTab(cmux, "codex", "01a10852-5eed-7993-bee8-c40693a36dc3", "s1", line, codexCapacityStall, start.Add(31*time.Second)); !did || action != sharedPrompt {
+	stalls.runPrompt = cmux.run
+	stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start)
+	if action, did := stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start.Add(31*time.Second)); !did || action != sharedPrompt {
 		t.Fatalf("resume = %q, %v", action, did)
 	}
 	if body, _ := os.ReadFile(sent); string(body) != sharedPrompt+"<enter>" {
 		t.Fatalf("typed %q", body)
 	}
+	if commits := cmux.commits(); len(commits) != 1 || commits[0][len(commits[0])-1] != sharedClaimToken {
+		t.Fatalf("commits = %q; want one with the dry-run token", commits)
+	}
+}
 
+func TestResumeStalledTabDoesNotClaimWhenTypingFails(t *testing.T) {
+	cmuxPath, _, line := stallFixture(t, 1)
+	start := time.Unix(1_800_000_000, 0)
+	cmux := &fakeCMUX{dryOut: sharedPromptJSON()}
+	stalls := newStallTracker()
+	stalls.runPrompt = cmux.run
+	stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start)
+	if _, did := stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start.Add(31*time.Second)); did {
+		t.Fatal("a failed send was reported as a resume")
+	}
+	if commits := cmux.commits(); len(commits) != 0 {
+		t.Fatalf("claimed after a failed send: %q", commits)
+	}
+}
+
+func TestResumeStalledTabAlreadyContinuedDoesNotUseAnAttempt(t *testing.T) {
+	cmuxPath, sent, line := stallFixture(t, 0)
+	start := time.Unix(1_800_000_000, 0)
+	cmux := &fakeCMUX{dryCode: 4}
+	stalls := newStallTracker()
+	stalls.runPrompt = cmux.run
+	stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start)
+	for i := 1; i <= maxStallAttempts+2; i++ {
+		if _, did := stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start.Add(time.Duration(i)*time.Hour)); did {
+			t.Fatal("typed into a tab whose interruption was already continued")
+		}
+	}
+	if got := stalls.tabs["s1"].attempts; got != 0 {
+		t.Fatalf("already-continued skips used %d attempts", got)
+	}
+	// A later, different interruption on the same tab is still resumed.
+	cmux.dryCode, cmux.dryOut = 0, sharedPromptJSON()
+	if action, did := stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start.Add(10*time.Hour)); !did || action != sharedPrompt {
+		t.Fatalf("resume after the skips = %q, %v", action, did)
+	}
+	if body, _ := os.ReadFile(sent); string(body) != sharedPrompt+"<enter>" {
+		t.Fatalf("typed %q", body)
+	}
+}
+
+func TestResumeStalledTabNeverContinuesAnIdleSession(t *testing.T) {
+	cmuxPath, sent, line := stallFixture(t, 0)
+	start := time.Unix(1_800_000_000, 0)
 	idle := newStallTracker()
-	idle.runPrompt = fakePromptRunner("", 3, nil, nil)
-	idle.resumeStalledTab(cmux, "codex", "01a10852-5eed-7993-bee8-c40693a36dc3", "s2", line, codexCapacityStall, start)
+	idle.runPrompt = (&fakeCMUX{dryCode: 3}).run
+	idle.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s2", line, codexCapacityStall, start)
 	for _, at := range []time.Duration{31 * time.Second, 5 * time.Minute, time.Hour} {
-		if _, did := idle.resumeStalledTab(cmux, "codex", "01a10852-5eed-7993-bee8-c40693a36dc3", "s2", line, codexCapacityStall, start.Add(at)); did {
+		if _, did := idle.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s2", line, codexCapacityStall, start.Add(at)); did {
 			t.Fatalf("an idle session was continued at +%s", at)
 		}
 	}
-	if body, _ := os.ReadFile(sent); string(body) != sharedPrompt+"<enter>" {
+	if body, _ := os.ReadFile(sent); len(body) != 0 {
 		t.Fatalf("typed into an idle session: %q", body)
 	}
 }
 
 func TestAlarmInputReplacesContinueAndKeepsOtherActions(t *testing.T) {
-	alarm := wake.Alarm{Agent: "codex", SessionID: "01a10852-5eed-7993-bee8-c40693a36dc3", Kind: wake.KindCodexProvider, Action: "continue"}
-	var seen []string
-	if got := alarmInput(fakePromptRunner(sharedPrompt, 0, nil, &seen), "/bin/cmux", alarm); got.Skip || got.Text != sharedPrompt {
+	alarm := wake.Alarm{Agent: "codex", SessionID: testCodexSession, Kind: wake.KindCodexProvider, Action: "continue"}
+	cmux := &fakeCMUX{dryOut: sharedPromptJSON()}
+	if got := alarmInput(cmux.run, "/bin/cmux", alarm); got.Skip || got.Text != sharedPrompt || got.ClaimToken != sharedClaimToken {
 		t.Fatalf("continue alarm = %+v", got)
 	}
-	if seen[len(seen)-1] != "provider" {
-		t.Fatalf("provider alarm asked for reason %q", seen[len(seen)-1])
+	if !slices.Contains(cmux.calls[0], "provider") {
+		t.Fatalf("provider alarm asked with %q", cmux.calls[0])
 	}
-	if got := alarmInput(fakePromptRunner("", 3, nil, nil), "/bin/cmux", alarm); !got.Skip {
+	if got := alarmInput((&fakeCMUX{dryCode: 3}).run, "/bin/cmux", alarm); !got.Skip {
 		t.Fatalf("idle session alarm = %+v; want skip", got)
 	}
 	alarm.Action = "/goal resume"
-	seen = nil
-	if got := alarmInput(fakePromptRunner(sharedPrompt, 0, nil, &seen), "/bin/cmux", alarm); got.Text != "/goal resume" || seen != nil {
-		t.Fatalf("goal alarm = %+v, cmux called with %q", got, seen)
+	cmux = &fakeCMUX{dryOut: sharedPromptJSON()}
+	if got := alarmInput(cmux.run, "/bin/cmux", alarm); got.Text != "/goal resume" || cmux.calls != nil {
+		t.Fatalf("goal alarm = %+v, cmux called with %q", got, cmux.calls)
 	}
 }

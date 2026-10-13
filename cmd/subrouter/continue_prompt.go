@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os/exec"
 	"strings"
@@ -23,6 +24,11 @@ type continuePromptDecision struct {
 	Text string
 	Skip bool
 	Note string
+	// AlreadySent marks a skip because another sender continued this
+	// interruption; it is not a failed attempt.
+	AlreadySent bool
+	// ClaimToken, when set, must be committed once the text is submitted.
+	ClaimToken string
 }
 
 // continuePromptRunner runs cmux and returns its stdout and exit code.
@@ -50,28 +56,46 @@ func continueReasonForAlarm(kind string) string {
 	return "quota"
 }
 
-// continuePrompt asks cmux for the shared continue prompt for one session.
-// cmux exits 3 when the session is idle, 4 when this interruption was
-// already continued, and 5 when it cannot read the transcript; all three
-// mean type nothing. Any other failure means an
-// older cmux, which keeps the legacy "continue".
+// continuePrompt asks cmux for the shared continue prompt for one session,
+// without claiming it: the caller types the text and then calls
+// commitContinuePrompt, so a delivery that fails never consumes the
+// interruption. cmux exits 3 when the session is idle, 4 when this
+// interruption was already continued, and 5 when it cannot read the
+// transcript; all three mean type nothing. Any other failure means an older
+// cmux, which keeps the legacy "continue".
 func continuePrompt(run continuePromptRunner, cmuxPath, agent, sessionID, reason string) continuePromptDecision {
 	if strings.TrimSpace(sessionID) == "" {
 		return continuePromptDecision{Text: legacyContinueAction, Note: "no session id; typed the legacy continue"}
 	}
-	out, code, err := run(cmuxPath, "agent-continue-prompt", "--kind", agent, "--session", sessionID, "--reason", reason)
+	out, code, err := run(cmuxPath, "agent-continue-prompt", "--kind", agent, "--session", sessionID, "--reason", reason, "--dry-run", "--json")
 	switch {
-	case err == nil && code == 0 && strings.TrimSpace(out) != "":
-		return continuePromptDecision{Text: strings.TrimSpace(out)}
+	case err == nil && code == 0:
+		var reply struct {
+			Prompt     string `json:"prompt"`
+			ClaimToken string `json:"claim_token"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(out)), &reply) == nil && strings.TrimSpace(reply.Prompt) != "" && reply.ClaimToken != "" {
+			return continuePromptDecision{Text: strings.TrimSpace(reply.Prompt), ClaimToken: reply.ClaimToken}
+		}
 	case err == nil && code == 3:
 		return continuePromptDecision{Skip: true, Note: "session is idle at its prompt; not continued"}
 	case err == nil && code == 4:
-		return continuePromptDecision{Skip: true, Note: "this interruption was already continued"}
+		return continuePromptDecision{Skip: true, AlreadySent: true, Note: "this interruption was already continued"}
 	case err == nil && code == 5:
 		return continuePromptDecision{Skip: true, Note: "cmux cannot read this session's transcript; not continued"}
-	default:
-		return continuePromptDecision{Text: legacyContinueAction, Note: "cmux has no agent-continue-prompt; typed the legacy continue"}
 	}
+	return continuePromptDecision{Text: legacyContinueAction, Note: "cmux has no agent-continue-prompt; typed the legacy continue"}
+}
+
+// commitContinuePrompt claims the interruption after its prompt was
+// submitted. It reports whether this sender holds the claim; false means
+// another sender claimed it first, which is not an error for the tab.
+func commitContinuePrompt(run continuePromptRunner, cmuxPath, agent, sessionID string, decision continuePromptDecision) bool {
+	if decision.ClaimToken == "" {
+		return false
+	}
+	_, code, err := run(cmuxPath, "agent-continue-prompt", "--kind", agent, "--session", sessionID, "--commit", decision.ClaimToken)
+	return err == nil && code == 0
 }
 
 // alarmInput is what a due wake alarm types: its action, with "continue"
