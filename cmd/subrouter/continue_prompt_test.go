@@ -36,7 +36,7 @@ func TestContinuePromptUsesTheSharedCmuxPrompt(t *testing.T) {
 }
 
 func TestContinuePromptNeverContinuesAnIdleOrAlreadyContinuedSession(t *testing.T) {
-	for _, code := range []int{3, 4} {
+	for _, code := range []int{3, 4, 5} {
 		got := continuePrompt(fakePromptRunner("", code, nil, nil), "/bin/cmux", "claude", "64823d4f-2711-4ce5-8cf4-2842fa7d3358", "quota")
 		if !got.Skip || got.Text != "" {
 			t.Fatalf("exit %d: decision = %+v; want skip with no text", code, got)

@@ -51,8 +51,9 @@ func continueReasonForAlarm(kind string) string {
 }
 
 // continuePrompt asks cmux for the shared continue prompt for one session.
-// cmux exits 3 when the session is idle and 4 when this interruption was
-// already continued; both mean type nothing. Any other failure means an
+// cmux exits 3 when the session is idle, 4 when this interruption was
+// already continued, and 5 when it cannot read the transcript; all three
+// mean type nothing. Any other failure means an
 // older cmux, which keeps the legacy "continue".
 func continuePrompt(run continuePromptRunner, cmuxPath, agent, sessionID, reason string) continuePromptDecision {
 	if strings.TrimSpace(sessionID) == "" {
@@ -66,6 +67,8 @@ func continuePrompt(run continuePromptRunner, cmuxPath, agent, sessionID, reason
 		return continuePromptDecision{Skip: true, Note: "session is idle at its prompt; not continued"}
 	case err == nil && code == 4:
 		return continuePromptDecision{Skip: true, Note: "this interruption was already continued"}
+	case err == nil && code == 5:
+		return continuePromptDecision{Skip: true, Note: "cmux cannot read this session's transcript; not continued"}
 	default:
 		return continuePromptDecision{Text: legacyContinueAction, Note: "cmux has no agent-continue-prompt; typed the legacy continue"}
 	}
