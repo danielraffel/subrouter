@@ -9611,14 +9611,11 @@ const replayablePostMaxConcurrentUploads = 4
 // replayablePostLimiterMinBytes exempts ordinary requests from the upload
 // limiter. The limiter exists to keep a few concurrent huge uploads from
 // saturating the uplink; the body is already buffered in memory before the
-// transport runs, so the limiter bounds bandwidth, not memory. Holding a slot
-// is expensive: one slot spans the entire nested retry chain — account
-// failover, overload backoff sleeps, the Fable fallback including Bedrock's
-// commit-window peek, and the wait for response headers — so gating every
-// POST serialized all message traffic proxy-wide behind 4 slots. Under a
-// long-thinking model that looked like the proxy hanging: at most 4 requests
-// made progress and everything else queued in the limiter until the client
-// gave up. Requests below this size skip the limiter entirely.
+// transport runs, so the limiter bounds bandwidth, not memory. Release each
+// slot when its request body reaches EOF. Holding a slot through a long
+// response made later large requests wait behind four unrelated turns and
+// inflated their proxy-side time to first byte. Requests below this size skip
+// the limiter entirely.
 const replayablePostLimiterMinBytes = 8 << 20
 
 var replayablePostUploadLimiter = make(chan struct{}, replayablePostMaxConcurrentUploads)
@@ -12064,11 +12061,52 @@ func (t replayablePostRetryTransport) roundTrip(a *upstreamAttempt, req *http.Re
 	}
 	select {
 	case t.limiter <- struct{}{}:
-		defer func() { <-t.limiter }()
 	case <-req.Context().Done():
 		return nil, req.Context().Err()
 	}
-	return a.send(t.base, req, addressed)
+	release := sync.OnceFunc(func() { <-t.limiter })
+	// A response may stream for minutes after the body is uploaded. Do not
+	// block unrelated requests from uploading their own body during that time.
+	if req.Body == nil || req.Body == http.NoBody {
+		release()
+	} else {
+		copy := new(http.Request)
+		*copy = *req
+		copy.Body = &uploadLimiterBody{ReadCloser: req.Body, release: release}
+		req = copy
+	}
+	response, err := a.send(t.base, req, addressed)
+	// On an early transport error, close the wrapped body so it releases the
+	// slot. A successful response may be returned before the transport has
+	// finished reading the request body, so leave that slot to the wrapper's
+	// EOF or Close callback.
+	if err != nil && req.Body != nil && req.Body != http.NoBody {
+		_ = req.Body.Close()
+	}
+	return response, err
+}
+
+// uploadLimiterBody releases the upload slot when the transport finishes with
+// the request body rather than when response headers arrive.
+type uploadLimiterBody struct {
+	io.ReadCloser
+	release func()
+}
+
+// Read forwards body data and releases the slot at EOF or on a read error.
+func (b *uploadLimiterBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.release()
+	}
+	return n, err
+}
+
+// Close releases the slot when the transport abandons the request body.
+func (b *uploadLimiterBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.release()
+	return err
 }
 
 func retryablePostUpstreamStatus(response *http.Response) bool {
