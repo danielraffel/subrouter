@@ -110,3 +110,22 @@ func TestResumeStalledTabTypesTheSharedPromptAndSkipsAnIdleSession(t *testing.T)
 		t.Fatalf("typed into an idle session: %q", body)
 	}
 }
+
+func TestAlarmInputReplacesContinueAndKeepsOtherActions(t *testing.T) {
+	alarm := wake.Alarm{Agent: "codex", SessionID: "01a10852-5eed-7993-bee8-c40693a36dc3", Kind: wake.KindCodexProvider, Action: "continue"}
+	var seen []string
+	if got := alarmInput(fakePromptRunner(sharedPrompt, 0, nil, &seen), "/bin/cmux", alarm); got.Skip || got.Text != sharedPrompt {
+		t.Fatalf("continue alarm = %+v", got)
+	}
+	if seen[len(seen)-1] != "provider" {
+		t.Fatalf("provider alarm asked for reason %q", seen[len(seen)-1])
+	}
+	if got := alarmInput(fakePromptRunner("", 3, nil, nil), "/bin/cmux", alarm); !got.Skip {
+		t.Fatalf("idle session alarm = %+v; want skip", got)
+	}
+	alarm.Action = "/goal resume"
+	seen = nil
+	if got := alarmInput(fakePromptRunner(sharedPrompt, 0, nil, &seen), "/bin/cmux", alarm); got.Text != "/goal resume" || seen != nil {
+		t.Fatalf("goal alarm = %+v, cmux called with %q", got, seen)
+	}
+}

@@ -70,3 +70,13 @@ func continuePrompt(run continuePromptRunner, cmuxPath, agent, sessionID, reason
 		return continuePromptDecision{Text: legacyContinueAction, Note: "cmux has no agent-continue-prompt; typed the legacy continue"}
 	}
 }
+
+// alarmInput is what a due wake alarm types: its action, with "continue"
+// replaced by the shared prompt, or a skip for an idle or already continued
+// session.
+func alarmInput(run continuePromptRunner, cmuxPath string, alarm wake.Alarm) continuePromptDecision {
+	if alarm.Action != legacyContinueAction {
+		return continuePromptDecision{Text: alarm.Action}
+	}
+	return continuePrompt(run, cmuxPath, alarm.Agent, alarm.SessionID, continueReasonForAlarm(alarm.Kind))
+}
