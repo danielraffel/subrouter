@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +136,11 @@ func TestFailedLookupIsCachedBriefly(t *testing.T) {
 }
 
 func TestLocalAPIRediscoversAfterTailscaleRestart(t *testing.T) {
+	// Rediscovery reads the restarted extension's credential through lsof,
+	// which is the darwin path; linux rediscovers the fixed tailscaled socket.
+	if runtime.GOOS != "darwin" {
+		t.Skip("lsof rediscovery is the darwin LocalAPI path")
+	}
 	live := localAPIServer(t, "abc123")
 	port := live.address[strings.LastIndex(live.address, ":")+1:]
 	lsof := &fakeRunner{output: "n/x/sameuserproof-" + port + "-abc123\n"}

@@ -796,8 +796,17 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusStale; a.LastError = err.Error(); return nil })
 			continue
 		}
+		decision := alarmInput(wakeContinuePromptRun, cmuxPath, alarm)
+		if decision.Skip {
+			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+				a.Status = wake.StatusCompleted
+				a.LastError = decision.Note
+				return nil
+			})
+			continue
+		}
+		text := decision.Text
 		_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusFired; a.Attempt++; return nil })
-		text := alarm.Action
 		if !strings.HasSuffix(text, "\n") {
 			text += "\n"
 		}
@@ -805,6 +814,7 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusFailed; a.LastError = err.Error(); return nil })
 			continue
 		}
+		commitContinuePrompt(wakeContinuePromptRun, cmuxPath, alarm.Agent, alarm.SessionID, decision)
 		_ = postRecoveryGeneration(serverURL, alarm)
 		_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusCompleted; return nil })
 		fmt.Fprintf(out, "woke %s on %s\n", alarm.ID, alarm.Agent)
