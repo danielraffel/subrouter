@@ -243,14 +243,6 @@ func readResumerWant(path string) (version, pid int) {
 	return version, pid
 }
 
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}
-
 // startSessionResumer runs this Mac's resumer alongside an sr agent session.
 // An empty serverURL means this Mac's selected pool server. It does nothing
 // outside cmux, and stops when the session ends.
