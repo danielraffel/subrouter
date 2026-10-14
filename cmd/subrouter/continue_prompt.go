@@ -34,6 +34,9 @@ type continuePromptDecision struct {
 // continuePromptRunner runs cmux and returns its stdout and exit code.
 type continuePromptRunner func(cmuxPath string, args ...string) (string, int, error)
 
+// wakeContinuePromptRun is how wake alarms reach cmux; tests replace it.
+var wakeContinuePromptRun continuePromptRunner = runCMUXContinuePrompt
+
 func runCMUXContinuePrompt(cmuxPath string, args ...string) (string, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

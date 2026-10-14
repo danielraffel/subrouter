@@ -3,10 +3,13 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,5 +236,79 @@ func TestAlarmInputReplacesContinueAndKeepsOtherActions(t *testing.T) {
 	cmux = &fakeCMUX{dryOut: sharedPromptJSON()}
 	if got := alarmInput(cmux.run, "/bin/cmux", alarm); got.Text != "/goal resume" || cmux.calls != nil {
 		t.Fatalf("goal alarm = %+v, cmux called with %q", got, cmux.calls)
+	}
+}
+
+func TestResumeStalledTabDoesNotClaimAnUnsubmittedPrompt(t *testing.T) {
+	root := t.TempDir()
+	screen := filepath.Join(root, "screen")
+	if err := os.WriteFile(screen, []byte("› "+sharedPrompt+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmuxPath := filepath.Join(root, "cmux")
+	script := "#!/bin/sh\nif [ \"$1\" = read-screen ]; then cat \"" + screen + "\"; fi\nexit 0\n"
+	if err := os.WriteFile(cmuxPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, _, line := stallFixture(t, 0)
+	previous := submitConfirmDelay
+	submitConfirmDelay = time.Millisecond
+	t.Cleanup(func() { submitConfirmDelay = previous })
+	start := time.Unix(1_800_000_000, 0)
+	cmux := &fakeCMUX{dryOut: sharedPromptJSON()}
+	stalls := newStallTracker()
+	stalls.runPrompt = cmux.run
+	stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start)
+	if _, did := stalls.resumeStalledTab(cmuxPath, "codex", testCodexSession, "s1", line, codexCapacityStall, start.Add(31*time.Second)); !did {
+		t.Fatal("an unsubmitted send was not counted as an attempt")
+	}
+	if !stalls.tabs["s1"].failed {
+		t.Fatal("the unsubmitted send was not recorded as failed")
+	}
+	if commits := cmux.commits(); len(commits) != 0 {
+		t.Fatalf("claimed a prompt still sitting in the input box: %q", commits)
+	}
+}
+
+func TestWakeAlarmCommitsTheClaimAfterASuccessfulSubmit(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	now := time.Now().UTC()
+	store := wake.NewStore(filepath.Join(root, "wake.json"))
+	if _, err := store.Put(wake.Alarm{Agent: "codex", Kind: wake.KindCodexProvider, SessionID: testCodexSession, SurfaceID: "surface-1", Action: "continue", WakeAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour)}, now); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer server.Close()
+	sent := filepath.Join(root, "sent")
+	cmuxPath := filepath.Join(root, "cmux-fake")
+	script := "#!/bin/sh\nif [ \"$1\" = read-screen ]; then printf prompt; elif [ \"$1\" = send ]; then printf '%s' \"$4\" >> \"" + sent + "\"; fi\nexit 0\n"
+	if err := os.WriteFile(cmuxPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previousDelay := submitConfirmDelay
+	submitConfirmDelay = time.Millisecond
+	t.Cleanup(func() { submitConfirmDelay = previousDelay })
+	cmux := &fakeCMUX{dryOut: sharedPromptJSON()}
+	previousRun := wakeContinuePromptRun
+	wakeContinuePromptRun = cmux.run
+	t.Cleanup(func() { wakeContinuePromptRun = previousRun })
+
+	if err := dispatchDueWakeAlarms(store, server.URL, cmuxPath, 0, now, &strings.Builder{}, testConfigScope()); err != nil {
+		t.Fatal(err)
+	}
+	if body, _ := os.ReadFile(sent); string(body) != sharedPrompt {
+		t.Fatalf("typed %q", body)
+	}
+	commits := cmux.commits()
+	if len(commits) != 1 || commits[0][len(commits[0])-1] != sharedClaimToken {
+		t.Fatalf("commits = %q; want one with the dry-run token", commits)
+	}
+	alarms, err := store.List(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alarms) != 1 || alarms[0].Status != wake.StatusCompleted {
+		t.Fatalf("alarm = %+v", alarms)
 	}
 }
