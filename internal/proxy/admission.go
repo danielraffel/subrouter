@@ -19,6 +19,26 @@ const (
 
 var errAdmissionQueueFull = errors.New("upstream admission queue is full")
 
+// errAdmissionPaused rejects a new attempt on an account whose bucket is
+// paused for longer than admissionPauseWaitMax. A Claude 429 pauses the
+// bucket until the quota reset, which can be hours away: queueing behind that
+// held requests until the client gave up and then answered 503 for every
+// request once the queue filled (2026-10-14: 1,393 rejections in 19 minutes
+// on one account while other accounts had room). Rejecting fast lets the
+// caller fail over to another account instead.
+var errAdmissionPaused = errors.New("upstream account is paused after a rate limit")
+
+// admissionPauseWaitMax is the longest pause a new attempt still waits out in
+// the queue. A bare 429 without a reset pauses for a second; that is cheaper
+// to wait than to move a session and lose its prompt cache.
+const admissionPauseWaitMax = 5 * time.Second
+
+// admissionRejected reports a limiter rejection that another account could
+// serve: the queue is full or the account is paused.
+func admissionRejected(err error) bool {
+	return errors.Is(err, errAdmissionQueueFull) || errors.Is(err, errAdmissionPaused)
+}
+
 type admissionKey struct {
 	provider accounts.Provider
 	account  string
@@ -27,6 +47,9 @@ type admissionKey struct {
 
 type admissionWaiter struct {
 	ready chan struct{}
+	// rejected is set under the control mutex before ready is closed when a
+	// long pause turns the waiter away instead of granting it a slot.
+	rejected bool
 }
 
 type admissionBucket struct {
@@ -119,6 +142,11 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			return &admissionLease{control: a, key: key}, nil
 		}
 		if waiter == nil {
+			if bucket.pausedTil.Sub(now) > admissionPauseWaitMax {
+				bucket.blocked++
+				a.mu.Unlock()
+				return nil, errAdmissionPaused
+			}
 			if len(bucket.waiters) >= a.queueCap {
 				bucket.blocked++
 				a.mu.Unlock()
@@ -143,15 +171,23 @@ func (a *admissionControl) acquire(ctx context.Context, key admissionKey) (*admi
 			if stop != nil {
 				stop()
 			}
+			if waiter.rejected {
+				return nil, errAdmissionPaused
+			}
 			return &admissionLease{control: a, key: key}, nil
 		case <-ctx.Done():
 			if stop != nil {
 				stop()
 			}
 			if !a.cancelWaiter(key, waiter) {
-				// A release won the race and already granted this waiter.
-				// Return that slot before reporting cancellation.
-				a.release(key)
+				// A release or a long pause already took this waiter. Return the
+				// slot only if it was granted; a rejected waiter holds none.
+				a.mu.Lock()
+				rejected := waiter.rejected
+				a.mu.Unlock()
+				if !rejected {
+					a.release(key)
+				}
 			}
 			return nil, ctx.Err()
 		case <-timer:
@@ -212,6 +248,16 @@ func (a *admissionControl) pause(key admissionKey, until time.Time) {
 	bucket.throttled++
 	if until.After(bucket.pausedTil) {
 		bucket.pausedTil = until
+	}
+	// Requests already queued would otherwise sit out the whole pause. Turn
+	// them away like new attempts so their callers can fail over.
+	if bucket.pausedTil.Sub(time.Now()) > admissionPauseWaitMax {
+		for _, waiter := range bucket.waiters {
+			waiter.rejected = true
+			close(waiter.ready)
+		}
+		bucket.blocked += uint64(len(bucket.waiters))
+		bucket.waiters = nil
 	}
 	a.mu.Unlock()
 }
