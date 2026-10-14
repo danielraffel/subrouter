@@ -5515,7 +5515,11 @@ func (s Server) proxyHandler() http.Handler {
 		}
 		routingRequest := r
 		if modelCatalogRequest && boundLease == nil {
-			routingRequest = codexModelCatalogRoutingRequest(r)
+			var pinnedCatalogAccount string
+			routingRequest, pinnedCatalogAccount = s.codexModelCatalogRoutingRequest(r)
+			if pinnedCatalogAccount != "" {
+				sessionID = codexPinnedModelCatalogSessionID(pinnedCatalogAccount)
+			}
 		}
 		// A caller-supplied account selector is a strict per-request binding, not
 		// a preference. Session leases install the same header internally but are
@@ -7999,7 +8003,7 @@ func websocketMessageType(messageType int) string {
 // saturated the upload, and filled the disk. Nothing about it is useful for
 // debugging an agent.
 func transcriptWorthRecording(sessionID string) bool {
-	return sessionID != codexModelCatalogSessionID
+	return sessionID != codexModelCatalogSessionID && !strings.HasPrefix(sessionID, codexPinnedModelCatalogSessionPrefix)
 }
 
 func (s Server) recordHTTPMeta(r *http.Request, agentType, sessionID, userEmail string, account accounts.Account, upstream *url.URL) {
@@ -9463,6 +9467,16 @@ func chatGPTBackendPath(path string) bool {
 
 const codexModelCatalogSessionID = "internal:codex-model-catalog"
 
+// Codex sticky keys keep only the text before the first ':'
+// (session.BaseSessionID), so a pinned catalog session must not share the
+// "internal:" prefix, and the account ID's own ':' is replaced, or every
+// pinned catalog would collapse into the shared catalog session.
+const codexPinnedModelCatalogSessionPrefix = "internal-codex-model-catalog-pin."
+
+func codexPinnedModelCatalogSessionID(accountID string) string {
+	return codexPinnedModelCatalogSessionPrefix + strings.ReplaceAll(accountID, ":", "_")
+}
+
 // Codex asks its provider for richer runtime metadata using client_version.
 // The OpenAI API-key /models response has a different schema, so this request
 // must use the ChatGPT OAuth upstream even when response traffic is pinned to
@@ -9474,7 +9488,25 @@ func codexModelCatalogRequest(r *http.Request) bool {
 	return r.URL.Path == "/models" || r.URL.Path == "/v1/models"
 }
 
-func codexModelCatalogRoutingRequest(r *http.Request) *http.Request {
+// Entitlements differ per subscription (only some plans list the Ultrafast
+// tier), so a caller pinned to an OAuth account gets that account's catalog
+// under its own catalog session. The pin resolves among OAuth records only, so
+// an API-key pin that shares a label with an OAuth record uses that record;
+// any other API-key pin is dropped and the shared catalog session picks an
+// OAuth account. A pinned refresh failure is final, like pinned /responses
+// traffic, and Codex falls back to its bundled catalog. The second result is
+// the pinned OAuth account ID, or empty.
+func (s Server) codexModelCatalogRoutingRequest(r *http.Request) (*http.Request, string) {
+	if forced, present, err := session.ExtractAccountIDWithPresence(r); err == nil && present && forced != "" {
+		available := oauthAccounts(filterAccountsForProvider(s.accountListContext(r.Context()), accounts.ProviderCodex))
+		if account, ok := findAccount(available, forced); ok {
+			request := r.Clone(r.Context())
+			request.Header = r.Header.Clone()
+			request.Header.Del("X-Subrouter-Model")
+			request.Header.Del("X-Model")
+			return request, account.ID
+		}
+	}
 	request := r.Clone(r.Context())
 	request.Header = r.Header.Clone()
 	for _, header := range []string{
@@ -9485,7 +9517,7 @@ func codexModelCatalogRoutingRequest(r *http.Request) *http.Request {
 	} {
 		request.Header.Del(header)
 	}
-	return request
+	return request, ""
 }
 
 func oauthAccounts(all []accounts.Account) []accounts.Account {
