@@ -744,6 +744,13 @@ func serve(args []string) error {
 	// window before fresh scores land.
 	schedulerRef := selectacct.NewSchedulerRef(selectacct.NewScheduler(fallbackScores(codexAccounts)))
 	schedulerRef.AdvanceAccountGenerationWithAccounts(accountGeneration, credentialRevision, initialSchedulerCredentialAccounts(initialAccounts))
+	// Route Claude on the previous worker's saved windows until the first live
+	// sweep; without them every Claude account reads as fully healthy at
+	// start. This runs before the Codex startup score tasks begin, so it can
+	// neither overwrite their fresh scores nor invalidate their publication.
+	if seeded := (proxy.Server{AccountRef: accountRef, SchedulerRef: schedulerRef, Logger: slog.Default()}).SeedScoresFromRestoredUsage(time.Now()); seeded > 0 {
+		slog.Info("seeded Claude usage scores from the saved snapshot", "accounts", seeded)
+	}
 	activeGenerationCtx, stopActiveGenerationTasks := context.WithCancel(context.Background())
 	defer stopActiveGenerationTasks()
 	autoSwitchScoresEnabled := srSwitchInterval > 0 && *fetchUsage && credentialBroker == nil
