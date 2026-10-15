@@ -2892,6 +2892,15 @@ func claudeUsageRowLess(a, b srUsageRow) bool {
 	if au != bu {
 		return au
 	}
+	if !au && !bu {
+		if ar, aok := claudeAvailabilityReset(a); aok {
+			if br, bok := claudeAvailabilityReset(b); !bok || ar != br {
+				return !bok || ar < br
+			}
+		} else if _, bok := claudeAvailabilityReset(b); bok {
+			return false
+		}
+	}
 	if a.score.Headroom != b.score.Headroom {
 		return a.score.Headroom > b.score.Headroom
 	}
@@ -2905,6 +2914,60 @@ func claudeUsageRowLess(a, b srUsageRow) bool {
 		return a.score.ShortResetAfterSeconds < b.score.ShortResetAfterSeconds
 	}
 	return a.email < b.email
+}
+
+// claudeAvailabilityReset returns the reset that can make an unavailable row
+// usable. A remaining weekly quota means the session window is the relevant
+// bottleneck; once weekly quota is exhausted, every account-wide weekly window
+// must reset, so the latest such reset is the earliest time the account can
+// actually become usable.
+func claudeAvailabilityReset(row srUsageRow) (int64, bool) {
+	if row.creditsExhaustedUntil.After(time.Now()) {
+		seconds := int64(time.Until(row.creditsExhaustedUntil).Seconds())
+		if seconds < 1 {
+			seconds = 1
+		}
+		return seconds, true
+	}
+	if claudeWeeklyCapacityRemaining(row) {
+		if row.score.ShortResetAfterSeconds > 0 {
+			return row.score.ShortResetAfterSeconds, true
+		}
+		return 0, false
+	}
+	var reset int64
+	found := false
+	for _, window := range row.windows {
+		if !accountWideWindow(isLongQuotaWindow)(window) || window.ResetAfterSeconds <= 0 {
+			continue
+		}
+		if window.ResetAfterSeconds > reset {
+			reset = window.ResetAfterSeconds
+		}
+		found = true
+	}
+	return reset, found
+}
+
+// claudeCreditCooldownActive reports whether a Claude API-credit row is held
+// out until its next bounded probe.
+func claudeCreditCooldownActive(row srUsageRow) bool {
+	return usageProvider(row) == accounts.ProviderClaude && row.creditsExhaustedUntil.After(time.Now())
+}
+
+func claudeWeeklyCapacityRemaining(row srUsageRow) bool {
+	if row.score.WeeklyHeadroomKnown {
+		return row.score.WeeklyHeadroom > 0
+	}
+	for _, window := range row.windows {
+		if !accountWideWindow(isLongQuotaWindow)(window) {
+			continue
+		}
+		if window.UsedPercent >= 100 {
+			return false
+		}
+	}
+	return true
 }
 
 func usageProvider(row srUsageRow) accounts.Provider {
@@ -2984,7 +3047,7 @@ func recommendedForNewSession(row srUsageRow) bool {
 	if row.provider != "" && row.provider != accounts.ProviderCodex {
 		return false
 	}
-	if row.err != nil || row.cooked || row.tempCooked {
+	if row.err != nil || row.cooked || row.tempCooked || claudeCreditCooldownActive(row) {
 		return false
 	}
 	if row.authMode == accounts.AuthModeAPIKey {
@@ -3256,6 +3319,9 @@ func authErrorNeedsReadd(err error) bool {
 func usageRowStatusTier(row srUsageRow) int {
 	if !row.revokedSince.IsZero() {
 		return 6
+	}
+	if claudeCreditCooldownActive(row) {
+		return 3
 	}
 	if row.tempCooked {
 		return 3
@@ -3979,6 +4045,9 @@ func usageGridState(row srUsageRow) string {
 		return revokedLabel(row)
 	}
 	if usageProvider(row) == accounts.ProviderClaude {
+		if claudeCreditCooldownActive(row) {
+			return "temp, credit cooldown"
+		}
 		if row.cooked {
 			if row.active {
 				return "active, cooked"
@@ -4144,6 +4213,8 @@ func usageGridStateColor(row srUsageRow) string {
 	switch {
 	case !row.revokedSince.IsZero():
 		return ansiRed
+	case claudeCreditCooldownActive(row):
+		return ansiYellow
 	case qwenTelemetryOnlyFailure(row) && row.gtoRecommended:
 		return ansiGreen
 	case qwenTelemetryOnlyFailure(row) && (row.active || (row.sessionsKnown && row.assignedSessions > 0)):
@@ -4175,6 +4246,8 @@ func usageGridStateColor(row srUsageRow) string {
 
 func usageGridPickColor(row srUsageRow) string {
 	switch {
+	case claudeCreditCooldownActive(row):
+		return ansiYellow
 	case row.usageThrottled:
 		return ansiYellow
 	case (row.err != nil && !qwenTelemetryOnlyFailure(row)) || row.cooked:
@@ -4201,6 +4274,9 @@ func usageGridError(row srUsageRow) string {
 func compactPickReason(row srUsageRow) string {
 	if !row.revokedSince.IsZero() {
 		return "re-add"
+	}
+	if claudeCreditCooldownActive(row) {
+		return "credit cooldown, probe in " + formatDuration(int64(time.Until(row.creditsExhaustedUntil).Seconds()))
 	}
 	if qwenTelemetryOnlyFailure(row) {
 		switch row.quotaStatus {
