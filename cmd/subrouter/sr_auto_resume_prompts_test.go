@@ -74,6 +74,27 @@ func TestFindPendingPromptReportsUnmatchedQuestions(t *testing.T) {
 	}
 }
 
+func TestAnswerPromptForcesSendIntoPermissionDialog(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "cmux")
+	argsFile := filepath.Join(t.TempDir(), "args")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" >> \""+argsFile+"\"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	submitConfirmDelay = 0
+	defer func() { submitConfirmDelay = 2 * time.Second }()
+	prompt := pendingPrompt{Question: "Do you want to create notes.md?"}
+	if err := answerPromptAndConfirm(script, "surface-1", "1", prompt); err != nil {
+		t.Fatalf("answer prompt: %v", err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--force\n") {
+		t.Fatalf("cmux send did not use --force; args:\n%s", args)
+	}
+}
+
 // The screen of a real m5s tab stopped on a capacity error (2026-10-04).
 const codexCapacityStall = `  I'll accept each receipt only after green validation, commit/merge it, then update the roadmap serially.
   Worked for 1h 20m 59s • 10:16 AM
@@ -104,7 +125,7 @@ func TestStallRulesResumeCodexCapacityWithBackoff(t *testing.T) {
 	}
 	sent := filepath.Join(t.TempDir(), "sent")
 	cmux := filepath.Join(t.TempDir(), "cmux")
-	if err := os.WriteFile(cmux, []byte("#!/bin/sh\n[ \"$1\" = send ] && printf '%s' \"$4\" >> \""+sent+"\"\n[ \"$1\" = send-key ] && [ \"$4\" = enter ] && printf '<enter>' >> \""+sent+"\"\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\n[ \"$1\" = send ] && printf '%s' \"$5\" >> \""+sent+"\"\n[ \"$1\" = send-key ] && printf '<enter>' >> \""+sent+"\"\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	stalls := newStallTracker()

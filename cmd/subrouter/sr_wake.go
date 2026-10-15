@@ -810,7 +810,7 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 		if !strings.HasSuffix(text, "\n") {
 			text += "\n"
 		}
-		if err := typeIntoTab(cmuxPath, alarm.SurfaceID, text); err != nil {
+		if err := typeIntoTab(cmuxPath, alarm.Agent, alarm.SurfaceID, text); err != nil {
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusFailed; a.LastError = err.Error(); return nil })
 			continue
 		}

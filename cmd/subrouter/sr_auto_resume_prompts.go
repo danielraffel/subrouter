@@ -323,7 +323,7 @@ func (t *stallTracker) resumeStalledTab(cmuxPath, agent, sessionID, surface, lin
 		}
 		action = decision.Text
 	}
-	err := typeIntoTab(cmuxPath, surface, action)
+	err := typeIntoTab(cmuxPath, agent, surface, action)
 	if err != nil && !errors.Is(err, errNotSubmitted) {
 		return "", false
 	}
@@ -382,13 +382,19 @@ func resumeIfStalled(serverURL, cmuxPath, host string, session cmuxSessionWire, 
 // Codex's composer treats it as a new line rather than a submit, so the
 // command once sat unsent. If it is still in the input box after a second
 // Enter, typeIntoTab returns errNotSubmitted for the caller to report.
-func typeIntoTab(cmuxPath, surface, text string) error {
+func typeIntoTab(cmuxPath, agent, surface, text string) error {
 	text = strings.TrimRight(text, "\n")
-	if err := exec.Command(cmuxPath, "send", "--surface", surface, text).Run(); err != nil {
+	if err := exec.Command(cmuxPath, "send", "--force", "--surface", surface, text).Run(); err != nil {
 		return err
 	}
+	key := "enter"
+	if agent == "claude" {
+		// Claude's queued-message composer uses ctrl+enter to submit while it
+		// is showing a provider error; plain Enter leaves a draft in the box.
+		key = "ctrl+enter"
+	}
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := exec.Command(cmuxPath, "send-key", "--surface", surface, "enter").Run(); err != nil {
+		if err := exec.Command(cmuxPath, "send-key", "--force", "--surface", surface, key).Run(); err != nil {
 			return err
 		}
 		time.Sleep(submitConfirmDelay)
@@ -424,7 +430,9 @@ func stillInInputBox(screen, text string) bool {
 // gone, trying once more before giving up.
 func answerPromptAndConfirm(cmuxPath, surface, answer string, prompt pendingPrompt) error {
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := exec.Command(cmuxPath, "send", "--surface", surface, answer).Run(); err != nil {
+		// cmux deliberately refuses ordinary sends while a permission dialog is
+		// open. This is the dialog we are handling, so force the keystroke.
+		if err := exec.Command(cmuxPath, "send", "--force", "--surface", surface, answer).Run(); err != nil {
 			return err
 		}
 		time.Sleep(submitConfirmDelay)
