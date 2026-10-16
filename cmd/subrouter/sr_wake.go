@@ -259,7 +259,7 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return err
 	}
-	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath)
+	plist := wakeLaunchdPlist(executable, storepath.StateDir(), logDir, cmuxPath, configuredWakeServerURL())
 	if err := os.WriteFile(path, []byte(plist), 0o600); err != nil {
 		return err
 	}
@@ -279,17 +279,21 @@ func ensureWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	return installWakeLaunchd(out)
 }
 
-func wakeLaunchdPlist(executable, stateDir, logDir, cmuxPath string) string {
+func wakeLaunchdPlist(executable, stateDir, logDir, cmuxPath string, serverURLs ...string) string {
+	serverURL := "http://127.0.0.1:31415"
+	if len(serverURLs) > 0 && strings.TrimSpace(serverURLs[0]) != "" {
+		serverURL = strings.TrimRight(strings.TrimSpace(serverURLs[0]), "/")
+	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>%s</string>
-<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string><string>--cmux</string><string>%s</string></array>
+<key>ProgramArguments</key><array><string>%s</string><string>wake</string><string>worker</string><string>--cmux</string><string>%s</string><string>--server</string><string>%s</string></array>
 <key>EnvironmentVariables</key><dict><key>SUBROUTER_STATE_DIR</key><string>%s</string></dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
 <key>StandardOutPath</key><string>%s</string><key>StandardErrorPath</key><string>%s</string>
 </dict></plist>
-`, wakeLaunchdLabel, plistXMLString(executable), plistXMLString(cmuxPath), plistXMLString(stateDir), plistXMLString(filepath.Join(logDir, "wake-worker.log")), plistXMLString(filepath.Join(logDir, "wake-worker.err.log")))
+`, wakeLaunchdLabel, plistXMLString(executable), plistXMLString(cmuxPath), plistXMLString(serverURL), plistXMLString(stateDir), plistXMLString(filepath.Join(logDir, "wake-worker.log")), plistXMLString(filepath.Join(logDir, "wake-worker.err.log")))
 }
 
 func plistXMLString(value string) string {
@@ -314,8 +318,39 @@ func uninstallWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 	return nil
 }
 
+// configuredWakeServerURL follows the same server registry used by Codex.
+// This keeps a client worker from silently trying its own loopback address.
+// SUBROUTER_WAKE_SERVER_URL is an explicit override for managed deployments.
+func configuredWakeServerURL() string {
+	if value := strings.TrimSpace(os.Getenv("SUBROUTER_WAKE_SERVER_URL")); value != "" {
+		return strings.TrimRight(value, "/")
+	}
+	type server struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	var registry struct {
+		Servers []server `json:"servers"`
+		Default string   `json:"default"`
+	}
+	body, err := os.ReadFile(filepath.Join(storepath.StateDir(), "codex", "servers.json"))
+	if err == nil && json.Unmarshal(body, &registry) == nil {
+		for _, candidate := range registry.Servers {
+			if candidate.Name == registry.Default && strings.TrimSpace(candidate.URL) != "" {
+				return strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
+			}
+		}
+		for _, candidate := range registry.Servers {
+			if strings.TrimSpace(candidate.URL) != "" {
+				return strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
+			}
+		}
+	}
+	return "http://127.0.0.1:31415"
+}
+
 func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte) (int, error) }) error {
-	once, interval, spacing, cmuxPath, serverURL := false, 15*time.Second, 5*time.Second, "cmux", "http://127.0.0.1:31415"
+	once, interval, spacing, cmuxPath, serverURL := false, 15*time.Second, 5*time.Second, "cmux", configuredWakeServerURL()
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--once":

@@ -80,15 +80,13 @@ dispatch, pending state, and the next matching POST outcome
 fields are retained when the caller supplies usage counts; the watcher itself
 does not parse or persist request bodies.
 
-The default policy permits two goal attempts and does not send a fallback
-`continue`. Fallback is an explicit policy choice and is sent at most once
-after the configured failure threshold; otherwise the state becomes `stop`
-until a fresh provider event. This keeps repeated capacity failures from
-burning replay tokens.
-
-Enable the opt-in fallback explicitly with `sr auto-resume policy codex
---allow-continue --continue-after 2`. The policy is persisted with restrictive
-permissions and remains disabled until changed.
+The default policy permits two goal attempts, then sends `continue` after the
+configured failure threshold. If the provider is still unavailable, it keeps
+retrying `continue` with capped exponential backoff until the recovery alarm
+expires. This makes temporary capacity failures hands-off while retaining a
+bounded request rate. Set `--no-continue` to stop after the goal-attempt
+budget when manual intervention is preferred. The policy is persisted with
+restrictive permissions.
 
 ## Configuration and controls
 

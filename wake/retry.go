@@ -14,10 +14,10 @@ const (
 	ResumeStop     ResumeAction = "stop"
 )
 
-// GoalResumePolicy bounds costly Codex /goal resume replays after a provider
-// capacity failure. A lightweight probe is required after cooldown; repeated
-// failures may use one optional continue fallback, then stop until a fresh
-// provider event is observed.
+// GoalResumePolicy controls Codex recovery after a provider capacity failure.
+// A lightweight probe is required after cooldown. When the fallback is enabled,
+// continue is retried with capped exponential backoff until the alarm expires;
+// this avoids turning a temporary provider outage into a manual intervention.
 type GoalResumePolicy struct {
 	Cooldown        time.Duration
 	MaxGoalAttempts int
@@ -28,7 +28,7 @@ type GoalResumePolicy struct {
 const maxProviderCooldown = 15 * time.Minute
 
 func DefaultGoalResumePolicy() GoalResumePolicy {
-	return GoalResumePolicy{Cooldown: 60 * time.Second, MaxGoalAttempts: 2, ContinueAfter: 2, AllowContinue: false}
+	return GoalResumePolicy{Cooldown: 60 * time.Second, MaxGoalAttempts: 2, ContinueAfter: 2, AllowContinue: true}
 }
 
 // CooldownFor returns an exponentially increasing delay for repeated provider
@@ -82,7 +82,7 @@ func (p GoalResumePolicy) Next(state ResumeState, now time.Time, probeHealthy bo
 	if state.GoalAttempts < p.MaxGoalAttempts {
 		return ResumeGoal
 	}
-	if p.AllowContinue && !state.ContinueSent && state.Failures >= p.ContinueAfter {
+	if p.AllowContinue && state.Failures >= p.ContinueAfter {
 		return ResumeContinue
 	}
 	return ResumeStop

@@ -106,7 +106,7 @@ func TestConfigDisabledByDefaultAndPersists(t *testing.T) {
 		t.Fatalf("codex enabled=%v err=%v, want false", enabled, err)
 	}
 	policy, err := cfg.Policy("codex")
-	if err != nil || policy.AllowContinue || policy.MaxGoalAttempts != 2 {
+	if err != nil || !policy.AllowContinue || policy.MaxGoalAttempts != 2 {
 		t.Fatalf("default policy=%+v err=%v", policy, err)
 	}
 	policy.AllowContinue = true

@@ -26,7 +26,10 @@ type configFile struct {
 func NewConfig(path string) *Config { return &Config{path: path} }
 
 func defaultConfig() configFile {
-	return configFile{Version: 1, Enabled: map[string]bool{"codex": false, "claude": false}, EarlyOnRecovery: map[string]bool{"codex": true, "claude": true}, Policies: map[string]Policy{"codex": {MaxGoalAttempts: 2, ContinueAfter: 2, CooldownSeconds: 60}}}
+	return configFile{Version: 1, Enabled: map[string]bool{"codex": false, "claude": false}, EarlyOnRecovery: map[string]bool{"codex": true, "claude": true}, Policies: map[string]Policy{
+		"codex":  {AllowContinue: true, MaxGoalAttempts: 2, ContinueAfter: 2, CooldownSeconds: 60},
+		"claude": {AllowContinue: true, MaxGoalAttempts: 2, ContinueAfter: 2, CooldownSeconds: 60},
+	}}
 }
 
 func (c *Config) load() (configFile, error) {
