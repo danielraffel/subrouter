@@ -9230,7 +9230,7 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 	candidates []accounts.Account,
 	poolModel string,
 ) (accounts.Account, bool) {
-	if s.SchedulerRef == nil {
+	if s.SchedulerRef == nil && s.admission == nil {
 		return pickClaudeExtraUsageFallback(scheduler, candidates)
 	}
 	now := time.Now()
@@ -9238,6 +9238,15 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 	for _, candidate := range candidates {
 		provider := schedulerAccountProvider(candidate.Provider)
 		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
+			continue
+		}
+		if s.admission.paused(admissionKeyFor(provider, candidate.ID, poolModel), now) {
+			// A transient pause is not proof that plan quota is cooked. Keep
+			// a paused healthy subscription from unlocking paid extra usage,
+			// while allowing another funded account when quotas really are out.
+			if !scheduler.Exhausted(provider, candidate.ID) {
+				return accounts.Account{}, false
+			}
 			continue
 		}
 		eligible = append(eligible, candidate)
@@ -10415,13 +10424,13 @@ func (t usageLimitRetryTransport) headerConfirmedClaudeQuota429(response *http.R
 // overload reroute (SUBROUTER_CLAUDE_OVERLOAD_REROUTE=1).
 const providerOverloadMaxRetries = 2
 
-// A healthy Claude account can return a headerless 429 during a short request
+// A healthy Claude account can return a non-quota 429 during a short request
 // burst. Keep the session on that account for a couple of quick retries so a
 // transient throttle does not discard its warm prompt cache.
 const claudeTransient429MaxRetries = 2
 
 // claudeTransient429Backoff returns the short delay before a same-account
-// retry after a headerless Claude 429.
+// retry after a transient Claude 429 without a longer provider hint.
 func claudeTransient429Backoff(retry int) time.Duration {
 	if retry <= 0 {
 		return 250 * time.Millisecond
@@ -11131,6 +11140,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	failoverReason := accountMoveUsageLimit
 	claudeExtraUsageRetried := false
 	claudeTransient429Retries := 0
+	claudeTransient429Rerouted := a.budget != nil && a.budget.claudeTransient429Rerouted.Load()
 	sealedStripped := false
 	// replayReq is what later attempts rebuild from. It starts as the client's
 	// request and becomes the stripped one once sealed reasoning is dropped,
@@ -11217,6 +11227,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
 			if pickErr == nil {
 				if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
+					if t.provider == accounts.ProviderClaude && claudeTransient429Retries > 0 {
+						claudeTransient429Rerouted = true
+						if a.budget != nil {
+							a.budget.claudeTransient429Rerouted.Store(true)
+						}
+					}
 					if t.logger != nil {
 						t.logger.Warn("admission rejected the account; failing over",
 							"agent", t.agent, "session", t.session, "from_account", accountID,
@@ -11509,16 +11525,24 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				usageLimited, exhausted = true, true
 			}
 		}
-		if t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusTooManyRequests &&
-			usageLimited && !exhausted && !credentialFailure && claudeUnifiedStatus(response.Header) == "" &&
+		claudeTransient429 := t.provider == accounts.ProviderClaude && response.StatusCode == http.StatusTooManyRequests &&
+			usageLimited && !exhausted && !credentialFailure && !modelUnsupported
+		transientWait := claudeTransient429Backoff(claudeTransient429Retries)
+		if claudeTransient429 {
+			now := t.clock()
+			if retryAt := retryAfterExpiry(response.Header, now); !retryAt.IsZero() {
+				transientWait = max(transientWait, retryAt.Sub(now))
+			}
+		}
+		if claudeTransient429 && !claudeTransient429Rerouted &&
+			transientWait <= admissionPauseWaitMax &&
 			claudeTransient429Retries < claudeTransient429MaxRetries && attempt < maxAttempts && a.consume() {
 			markTrafficRetryPath(attemptReq.Context(), "same_account_transient_429")
-			wait := claudeTransient429Backoff(claudeTransient429Retries)
 			claudeTransient429Retries++
 			if response.Body != nil {
 				_ = response.Body.Close()
 			}
-			if sleepErr := t.sleepCtx(req.Context(), wait); sleepErr != nil {
+			if sleepErr := t.sleepCtx(req.Context(), transientWait); sleepErr != nil {
 				return nil, sleepErr
 			}
 			nextReq, replayErr := a.replay(replayReq, nil)
@@ -11621,6 +11645,15 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				ID: accountID, Provider: t.provider, CredentialVersion: accountCredential,
 			}, exhaustionPool, response.StatusCode, response.Header, peekResponseBodyPrefix(response))
 		}
+		if claudeTransient429 && claudeTransient429Rerouted {
+			// One alternate is enough for a request-scoped throttle. Returning
+			// here lets the client/upstream retry policy provide the next backoff
+			// instead of fanning this burst through every account.
+			if fallback, ok := t.fableFallbackResponse(response, accountID, "transient_throttle"); ok {
+				return fallback, nil
+			}
+			return response, nil
+		}
 		budgetExhausted := false
 		if attempt < maxAttempts && t.server != nil {
 			if quota429 {
@@ -11711,6 +11744,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// one revisit after the pool-wide guard becomes true; remember that
 			// distinct paid attempt so another rejection cannot loop back again.
 			claudeExtraUsageRetried = true
+		}
+		if claudeTransient429 {
+			claudeTransient429Rerouted = true
+			if a.budget != nil {
+				a.budget.claudeTransient429Rerouted.Store(true)
+			}
 		}
 		quotaFailedOver = true
 		failoverReason = accountMoveUsageLimit
@@ -12490,6 +12529,10 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 				continue
 			}
 			if oauthOnly && account.AuthMode != accounts.AuthModeOAuth {
+				continue
+			}
+			if provider == accounts.ProviderClaude && s.admission != nil &&
+				s.admission.paused(admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, poolModel), time.Now()) {
 				continue
 			}
 			candidates = append(candidates, account)
