@@ -3,13 +3,17 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	"github.com/manaflow-ai/subrouter/internal/tailnet"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 type stubTailnetAuth struct {
@@ -117,5 +121,33 @@ func TestHealthReportsTailnetAuthMode(t *testing.T) {
 	// Import works in this mode, so health must not report it as disabled.
 	if body.AccountImport != AccountImportEnabled {
 		t.Fatalf("account_import = %q, want %q", body.AccountImport, AccountImportEnabled)
+	}
+}
+
+func TestTailnetIdentityAuthorizesProviderProxyWithLocalToken(t *testing.T) {
+	auth := &stubTailnetAuth{identity: tailnet.Identity{LoginName: "lawrence@manaflow.ai"}, allow: true}
+	server := tailnetTestServer(t, auth)
+	server.LocalProxyToken = "private-local-token"
+	server.Sessions, _ = session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+	server.Upstream, _ = url.Parse(upstream.URL)
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, tailnetRequest(http.MethodHead, "/"))
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("provider proxy status = %d, want 204: %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestNonTailnetPeerStillRequiresLocalProxyToken(t *testing.T) {
+	server := tailnetTestServer(t, &stubTailnetAuth{allow: false})
+	server.LocalProxyToken = "private-local-token"
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, tailnetRequest(http.MethodGet, "/v1/models"))
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("provider proxy status = %d, want 401", resp.Code)
 	}
 }

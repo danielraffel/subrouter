@@ -6385,6 +6385,12 @@ func azureCodexUpgradeShouldFallBack(s Server, boundLease *sessionLease, provide
 }
 
 func (s Server) localProxyAuthorized(r *http.Request) bool {
+	// A self-hosted tailnet server authenticates the peer with Tailscale. Keep
+	// the dedicated local proxy token for loopback/cloud deployments, but do
+	// not make tailnet clients present a second unrelated bearer secret.
+	if _, ok := s.authorizeTailnet(r); ok {
+		return true
+	}
 	token := strings.TrimSpace(s.LocalProxyToken)
 	if token == "" {
 		return true
