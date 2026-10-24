@@ -343,12 +343,28 @@ func uninstallWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 // This keeps a client worker from silently trying its own loopback address.
 // SUBROUTER_WAKE_SERVER_URL is an explicit override for managed deployments.
 func configuredWakeServerURL() string {
+	return configuredWakeServer().URL
+}
+
+// configuredWakeServer returns the selected server's control endpoint and its
+// already-provisioned administrator credential. The wake worker must use the
+// same registry as sr status for protected recovery endpoints; keeping the
+// credential out of the LaunchAgent arguments avoids exposing it through
+// launchctl or the process list.
+type wakeServerConfig struct {
+	URL        string
+	AdminToken string
+}
+
+func configuredWakeServer() (target wakeServerConfig) {
 	if value := strings.TrimSpace(os.Getenv("SUBROUTER_WAKE_SERVER_URL")); value != "" {
-		return strings.TrimRight(value, "/")
+		target.URL = strings.TrimRight(value, "/")
+		return target
 	}
 	type server struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
+		Name       string `json:"name"`
+		URL        string `json:"url"`
+		AdminToken string `json:"adminToken"`
 	}
 	var registry struct {
 		Servers []server `json:"servers"`
@@ -358,16 +374,59 @@ func configuredWakeServerURL() string {
 	if err == nil && json.Unmarshal(body, &registry) == nil {
 		for _, candidate := range registry.Servers {
 			if candidate.Name == registry.Default && strings.TrimSpace(candidate.URL) != "" {
-				return strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
+				target.URL = strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
+				target.AdminToken = strings.TrimSpace(candidate.AdminToken)
+				return target
 			}
 		}
 		for _, candidate := range registry.Servers {
 			if strings.TrimSpace(candidate.URL) != "" {
-				return strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
+				target.URL = strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
+				target.AdminToken = strings.TrimSpace(candidate.AdminToken)
+				return target
 			}
 		}
 	}
-	return "http://127.0.0.1:31415"
+	target.URL = "http://127.0.0.1:31415"
+	return target
+}
+
+// wakeServerAdminToken resolves the token for a LaunchAgent that was
+// installed with an explicit --server URL. The worker cannot rely on the
+// install-time environment, so match that URL against the same registry at
+// request time. An explicit SUBROUTER_WAKE_SERVER_URL intentionally has no
+// implicit credential lookup by URL.
+func wakeServerAdminToken(serverURL string) string {
+	if strings.TrimSpace(os.Getenv("SUBROUTER_WAKE_SERVER_URL")) != "" {
+		return ""
+	}
+	type server struct {
+		URL        string `json:"url"`
+		AdminToken string `json:"adminToken"`
+	}
+	var registry struct {
+		Servers []server `json:"servers"`
+	}
+	body, err := os.ReadFile(filepath.Join(storepath.StateDir(), "codex", "servers.json"))
+	if err != nil || json.Unmarshal(body, &registry) != nil {
+		return ""
+	}
+	want := strings.TrimRight(strings.TrimSpace(serverURL), "/")
+	for _, candidate := range registry.Servers {
+		if strings.TrimRight(strings.TrimSpace(candidate.URL), "/") == want {
+			return strings.TrimSpace(candidate.AdminToken)
+		}
+	}
+	return ""
+}
+
+func addWakeServerAdminAuth(req *http.Request, serverURL string) {
+	if req == nil {
+		return
+	}
+	if token := wakeServerAdminToken(serverURL); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte) (int, error) }) error {
@@ -505,6 +564,7 @@ func fetchRecoveryReadiness(serverURL, agent, pool string, observedAt time.Time)
 	if err != nil {
 		return false, err
 	}
+	addWakeServerAdminAuth(req, serverURL)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return false, err
@@ -557,6 +617,7 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 	if err != nil {
 		return err
 	}
+	addWakeServerAdminAuth(req, serverURL)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -907,6 +968,7 @@ func postRecoveryGeneration(serverURL string, alarm wake.Alarm) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	addWakeServerAdminAuth(req, serverURL)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err

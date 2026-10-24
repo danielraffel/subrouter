@@ -61,6 +61,9 @@ tailnet or server is still unavailable, the alarm remains scheduled for the
 next worker pass. A post-dispatch acknowledgement failure is recorded on the
 completed alarm and in the worker output; it is not replayed automatically
 because the cmux command may already have been delivered.
+The protected recovery handoff requests use the selected server's existing
+administrator token from the local server registry when one is configured;
+`/_subrouter/ready` being reachable alone does not authorize the handoff.
 During the first two minutes after the worker starts, an automatic alarm whose
 exact cmux session or surface is not visible yet remains scheduled while cmux
 restores its sessions. After that startup grace, a missing binding is treated as

@@ -44,6 +44,60 @@ func TestEnsureWakeServerReadyLeavesLoopbackToRecoveryProbe(t *testing.T) {
 	}
 }
 
+func TestWakeRecoveryRequestsUseConfiguredAdminToken(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("SUBROUTER_STATE_DIR", root)
+	if err := os.MkdirAll(filepath.Join(root, "codex"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registry := `{"default":"team","servers":[{"name":"team","url":"http://127.0.0.1:31415","adminToken":"registry-secret"}]}`
+	if err := os.WriteFile(filepath.Join(root, "codex", "servers.json"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var checked int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer registry-secret" {
+			t.Errorf("%s Authorization = %q, want configured bearer", r.URL.Path, got)
+		}
+		checked++
+		switch r.URL.Path {
+		case "/_subrouter/recovery-readiness":
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ready": true})
+		case "/_subrouter/recovery-status":
+			if r.Method == http.MethodGet {
+				_ = json.NewEncoder(w).Encode([]recoveryWireState{})
+			} else {
+				w.WriteHeader(http.StatusNoContent)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	registry = strings.Replace(registry, "http://127.0.0.1:31415", server.URL, 1)
+	if err := os.WriteFile(filepath.Join(root, "codex", "servers.json"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := fetchRecoveryReadiness(server.URL, "claude", "", time.Now().UTC())
+	if err != nil || !ready {
+		t.Fatalf("fetchRecoveryReadiness = %t, %v", ready, err)
+	}
+	cmux := filepath.Join(root, "cmux-fake")
+	if err := os.WriteFile(cmux, []byte("#!/bin/sh\nprintf '{\"sessions\":[]}'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := wake.NewStore(filepath.Join(root, "wake.json"))
+	if err := syncRecoveryAlarms(store, server.URL, cmux, time.Now().UTC(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := postRecoveryGeneration(server.URL, wake.Alarm{Agent: "claude", SessionID: "session", Action: "continue"}); err != nil {
+		t.Fatal(err)
+	}
+	if checked != 3 {
+		t.Fatalf("checked %d protected requests, want 3", checked)
+	}
+}
+
 func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 	stateRoot := t.TempDir()
 	t.Setenv("SUBROUTER_STATE_DIR", stateRoot)
