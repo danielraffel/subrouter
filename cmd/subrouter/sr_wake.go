@@ -723,6 +723,10 @@ func storePath(store *wake.Store) string {
 }
 
 func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacing time.Duration, workerStartedAt time.Time, out interface{ Write([]byte) (int, error) }) error {
+	return dispatchDueWakeAlarmsWithReadiness(store, serverURL, cmuxPath, spacing, workerStartedAt, out, ensureWakeServerReady)
+}
+
+func dispatchDueWakeAlarmsWithReadiness(store *wake.Store, serverURL, cmuxPath string, spacing time.Duration, workerStartedAt time.Time, out interface{ Write([]byte) (int, error) }, ready func(string) error) error {
 	now := time.Now().UTC()
 	alarms, err := store.List(now)
 	if err != nil {
@@ -799,7 +803,7 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 				continue
 			}
 			if !remoteServerReady {
-				if err := ensureWakeServerReady(serverURL); err != nil {
+				if err := ready(serverURL); err != nil {
 					return err
 				}
 				remoteServerReady = true
@@ -818,9 +822,19 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusFailed; a.LastError = err.Error(); return nil })
 			continue
 		}
-		_ = postRecoveryGeneration(serverURL, alarm)
-		_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusCompleted; return nil })
-		fmt.Fprintf(out, "woke %s on %s\n", alarm.ID, alarm.Agent)
+		postErr := postRecoveryGeneration(serverURL, alarm)
+		_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
+			a.Status = wake.StatusCompleted
+			if postErr != nil {
+				a.LastError = "recovery dispatch acknowledgement failed: " + postErr.Error()
+			}
+			return nil
+		})
+		if postErr != nil {
+			fmt.Fprintf(out, "woke %s on %s (recovery acknowledgement failed: %v)\n", alarm.ID, alarm.Agent, postErr)
+		} else {
+			fmt.Fprintf(out, "woke %s on %s\n", alarm.ID, alarm.Agent)
+		}
 		sent++
 		if sent > 0 {
 			time.Sleep(spacing)
@@ -852,7 +866,7 @@ func ensureWakeServerReadyWithClient(serverURL string, client *http.Client) erro
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(serverURL, "/")+"/_subrouter/health", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(serverURL, "/")+"/_subrouter/ready", nil)
 	if err != nil {
 		return err
 	}
