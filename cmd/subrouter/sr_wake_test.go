@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -201,6 +202,28 @@ func TestWakeLaunchdPlistPinsStateRoot(t *testing.T) {
 		if !strings.Contains(plist, want) {
 			t.Fatalf("plist missing %q:\n%s", want, plist)
 		}
+	}
+}
+
+func TestBootstrapWakeLaunchdReenablesDisabledAgent(t *testing.T) {
+	var calls []string
+	run := func(name string, args ...string) error {
+		call := name + " " + strings.Join(args, " ")
+		calls = append(calls, call)
+		switch {
+		case strings.Contains(call, " bootstrap "):
+			return errors.New("Bootstrap failed: 5: Input/output error")
+		case strings.Contains(call, " print "):
+			return nil
+		default:
+			return nil
+		}
+	}
+	if err := bootstrapWakeLaunchd("501", "/Users/daniel/Library/LaunchAgents/ai.manaflow.subrouter.wake.plist", run); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 4 || calls[0] != "launchctl enable gui/501/ai.manaflow.subrouter.wake" || calls[1] != "launchctl bootstrap gui/501 /Users/daniel/Library/LaunchAgents/ai.manaflow.subrouter.wake.plist" || calls[3] != "launchctl kickstart gui/501/ai.manaflow.subrouter.wake" {
+		t.Fatalf("launchctl calls = %v", calls)
 	}
 }
 

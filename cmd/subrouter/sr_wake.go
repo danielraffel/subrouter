@@ -264,10 +264,30 @@ func installWakeLaunchd(out interface{ Write([]byte) (int, error) }) error {
 		return err
 	}
 	uid := strconv.Itoa(os.Getuid())
-	if err := exec.Command("launchctl", "bootstrap", "gui/"+uid, path).Run(); err != nil {
+	if err := bootstrapWakeLaunchd(uid, path, func(name string, args ...string) error {
+		return exec.Command(name, args...).Run()
+	}); err != nil {
 		return fmt.Errorf("wrote %s but launchctl bootstrap failed: %w", path, err)
 	}
 	fmt.Fprintf(out, "installed %s\n", path)
+	return nil
+}
+
+func bootstrapWakeLaunchd(uid, path string, run func(string, ...string) error) error {
+	domain := "gui/" + uid
+	service := domain + "/" + wakeLaunchdLabel
+	// `launchctl disable` persists across logins. Re-enabling before bootstrap
+	// makes `sr auto-resume install` converge after a previous disable instead
+	// of leaving a valid plist unloaded with the opaque exit status 5.
+	_ = run("launchctl", "enable", service)
+	if err := run("launchctl", "bootstrap", domain, path); err != nil {
+		// Bootstrap is not idempotent. If another invocation loaded the agent
+		// between the enable and bootstrap calls, kickstart the existing job.
+		if run("launchctl", "print", service) == nil {
+			return run("launchctl", "kickstart", service)
+		}
+		return err
+	}
 	return nil
 }
 
