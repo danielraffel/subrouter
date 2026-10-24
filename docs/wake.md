@@ -47,6 +47,15 @@ The worker uses a 30-second deterministic per-alarm jitter and a five-second
 default spacing between sends; use `--interval` and `--spacing` to tune the
 monitor without changing alarm times.
 
+On macOS this worker and the local credential daemon are per-user GUI
+LaunchAgents, so they become available at login rather than before login. A
+supervisor that is already starting at login may briefly refuse connections or
+return 502/503 while its worker is draining; agent launches wait up to 15
+seconds for that transition before attempting the per-user daemon. Set
+`SUBROUTER_LOCAL_RESTART_WAIT=0` only for a deliberately fail-fast client.
+Tailnet supervisors owned by the same user are recognized by their LaunchAgent
+label and are never confused with the wake worker or a system daemon.
+
 The queue keeps three recovery kinds separate: `codex-provider` is a temporary
 model-provider capacity event and requires a cooldown plus a lightweight health
 check; `codex-quota` is an account reset and uses `/goal resume` after reset and

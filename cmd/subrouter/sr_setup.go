@@ -351,6 +351,12 @@ func runDoctorWith(ctx context.Context, controller serviceController, controller
 	case err != nil:
 		checks = append(checks, doctorCheck{"warn", "supervisor", err.Error()})
 	case !controller.installed():
+		if launchd, ok := controller.(launchdController); ok {
+			if supervisor, found := launchd.managedSupervisor(); found {
+				checks = append(checks, doctorCheck{"ok", "daemon installed", fmt.Sprintf("managed supervisor %s", supervisor.label)})
+				break
+			}
+		}
 		checks = append(checks, doctorCheck{"warn", "daemon installed", fmt.Sprintf("no local daemon; run '%s setup'", programBase())})
 	default:
 		checks = append(checks, doctorCheck{"ok", "daemon installed", controller.describe()})
