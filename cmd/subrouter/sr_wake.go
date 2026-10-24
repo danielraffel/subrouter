@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -730,6 +731,7 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 	sent := 0
 	var sessions []cmuxSessionWire
 	sessionsLoaded := false
+	remoteServerReady := false
 	for _, alarm := range alarms {
 		if alarm.Status != wake.StatusScheduled || alarmDueAt(alarm).After(now) {
 			continue
@@ -796,6 +798,12 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 				})
 				continue
 			}
+			if !remoteServerReady {
+				if err := ensureWakeServerReady(serverURL); err != nil {
+					return err
+				}
+				remoteServerReady = true
+			}
 		}
 		if err := validateSurface(cmuxPath, alarm.SurfaceID); err != nil {
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusStale; a.LastError = err.Error(); return nil })
@@ -817,6 +825,44 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 		if sent > 0 {
 			time.Sleep(spacing)
 		}
+	}
+	return nil
+}
+
+// ensureWakeServerReady closes the small race between the worker's recovery
+// sync and the cmux send. A remote automatic alarm must not be consumed while
+// the tailnet or Subrouter listener is unavailable. Loopback workers already
+// have the recovery-status probe as their readiness check, so avoid an extra
+// request for them and for the manual-alarm path.
+func ensureWakeServerReady(serverURL string) error {
+	return ensureWakeServerReadyWithClient(serverURL, http.DefaultClient)
+}
+
+func ensureWakeServerReadyWithClient(serverURL string, client *http.Client) error {
+	u, err := url.Parse(strings.TrimSpace(serverURL))
+	if err != nil || u.Hostname() == "" {
+		return fmt.Errorf("invalid wake server URL %q", serverURL)
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "localhost.localdomain" {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(serverURL, "/")+"/_subrouter/health", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("wake server readiness: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("wake server readiness returned %s", resp.Status)
 	}
 	return nil
 }

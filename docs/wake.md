@@ -55,6 +55,9 @@ seconds for that transition before attempting the per-user daemon. Set
 `SUBROUTER_LOCAL_RESTART_WAIT=0` only for a deliberately fail-fast client.
 Tailnet supervisors owned by the same user are recognized by their LaunchAgent
 label and are never confused with the wake worker or a system daemon.
+For a remote server URL, the worker also requires a successful health probe
+immediately before dispatching an automatic alarm. If the tailnet or server is
+still unavailable, the alarm remains scheduled for the next worker pass.
 
 The queue keeps three recovery kinds separate: `codex-provider` is a temporary
 model-provider capacity event and requires a cooldown plus a lightweight health

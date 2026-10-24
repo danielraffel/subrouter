@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,34 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/storepath"
 	"github.com/manaflow-ai/subrouter/wake"
 )
+
+func TestEnsureWakeServerReadyChecksRemoteHealth(t *testing.T) {
+	var paths []string
+	client := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		paths = append(paths, req.URL.Path)
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Header: make(http.Header)}, nil
+	})}
+	if err := ensureWakeServerReadyWithClient("http://100.92.167.122:31415", client); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != "/_subrouter/health" {
+		t.Fatalf("health paths=%v", paths)
+	}
+}
+
+func TestEnsureWakeServerReadyLeavesLoopbackToRecoveryProbe(t *testing.T) {
+	called := false
+	client := &http.Client{Transport: testRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		called = true
+		return nil, errors.New("unexpected request")
+	})}
+	if err := ensureWakeServerReadyWithClient("http://127.0.0.1:31415", client); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("loopback readiness made an extra request")
+	}
+}
 
 func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 	stateRoot := t.TempDir()
