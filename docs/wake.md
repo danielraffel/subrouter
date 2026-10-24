@@ -61,6 +61,10 @@ tailnet or server is still unavailable, the alarm remains scheduled for the
 next worker pass. A post-dispatch acknowledgement failure is recorded on the
 completed alarm and in the worker output; it is not replayed automatically
 because the cmux command may already have been delivered.
+During the first two minutes after the worker starts, an automatic alarm whose
+exact cmux session or surface is not visible yet remains scheduled while cmux
+restores its sessions. After that startup grace, a missing binding is treated as
+stale as usual.
 
 The queue keeps three recovery kinds separate: `codex-provider` is a temporary
 model-provider capacity event and requires a cooldown plus a lightweight health

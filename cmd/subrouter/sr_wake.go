@@ -726,8 +726,19 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 	return dispatchDueWakeAlarmsWithReadiness(store, serverURL, cmuxPath, spacing, workerStartedAt, out, ensureWakeServerReady)
 }
 
+// wakeStartupGrace keeps automatic alarms durable while cmux is restoring its
+// sessions after login. During that window a successful `cmux sessions` call
+// can still return an incomplete list; treating a missing binding as stale
+// would lose the alarm before the surface becomes available.
+const wakeStartupGrace = 2 * time.Minute
+
+func wakeStartupGraceActive(workerStartedAt, now time.Time) bool {
+	return !workerStartedAt.IsZero() && now.Before(workerStartedAt.Add(wakeStartupGrace))
+}
+
 func dispatchDueWakeAlarmsWithReadiness(store *wake.Store, serverURL, cmuxPath string, spacing time.Duration, workerStartedAt time.Time, out interface{ Write([]byte) (int, error) }, ready func(string) error) error {
 	now := time.Now().UTC()
+	startupGrace := wakeStartupGraceActive(workerStartedAt, now)
 	alarms, err := store.List(now)
 	if err != nil {
 		return err
@@ -777,6 +788,9 @@ func dispatchDueWakeAlarmsWithReadiness(store *wake.Store, serverURL, cmuxPath s
 				}
 			}
 			if !matched {
+				if startupGrace {
+					continue
+				}
 				_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error {
 					a.Status = wake.StatusStale
 					a.LastError = "exact cmux session binding is missing"
@@ -810,6 +824,9 @@ func dispatchDueWakeAlarmsWithReadiness(store *wake.Store, serverURL, cmuxPath s
 			}
 		}
 		if err := validateSurface(cmuxPath, alarm.SurfaceID); err != nil {
+			if startupGrace && alarm.Automatic {
+				continue
+			}
 			_, _ = store.Update(alarm.ID, now, func(a *wake.Alarm) error { a.Status = wake.StatusStale; a.LastError = err.Error(); return nil })
 			continue
 		}
