@@ -11356,6 +11356,14 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	overloadRerouted, quotaFailedOver := false, false
 	failoverReason := accountMoveUsageLimit
 	claudeExtraUsageRetried := false
+	// claudeThirdPartyKeyOnly: Anthropic refused this client on a
+	// subscription account (claude_third_party.go), so every later move of
+	// this request goes to another API key, never back to an OAuth account.
+	claudeThirdPartyKeyOnly := a.budget != nil && a.budget.claudeThirdPartyKeyOnly.Load()
+	// claudeThirdPartyRedirected: this pass moved a key-only request off the
+	// OAuth account it was addressed to before its first send, so a success
+	// on its first attempt must still move the session to the key.
+	claudeThirdPartyRedirected := false
 	claudeTransient429Retries := 0
 	claudeTransient429Rerouted := a.budget != nil && a.budget.claudeTransient429Rerouted.Load()
 	sealedStripped := false
@@ -11381,7 +11389,16 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				schedulerAccountProvider(t.provider), accountID, t.poolModel, time.Now(),
 			); blocked {
 				tried[accountID] = struct{}{}
-				next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+				var next accounts.Account
+				var pickErr error
+				if claudeThirdPartyKeyOnly {
+					var ok bool
+					if next, ok = t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); !ok {
+						return claudeThirdPartyExtraUsageResponse(nil, attemptReq), nil
+					}
+				} else {
+					next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+				}
 				if pickErr != nil {
 					return nil, pickErr
 				}
@@ -11397,6 +11414,28 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				failoverReason = accountMoveCredential
 				continue
 			}
+		}
+		// An outer layer (transport replay) re-sends its own input, addressed
+		// to the subscription account that refused this client. Keep a
+		// key-only request on API keys before anything is sent.
+		if claudeThirdPartyKeyOnly && t.server != nil &&
+			t.server.claudeAuthMode(accounts.Account{ID: accountID}) != accounts.AuthModeAPIKey {
+			tried[accountID] = struct{}{}
+			next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried)
+			if !ok {
+				return claudeThirdPartyExtraUsageResponse(nil, attemptReq), nil
+			}
+			nextReq, replayErr := a.replay(replayReq, &next)
+			if replayErr != nil {
+				return nil, replayErr
+			}
+			accountID = next.ID
+			accountCredential = next.CredentialIdentity()
+			tried[accountID] = struct{}{}
+			attemptReq = nextReq
+			quotaFailedOver = true
+			failoverReason = accountMoveCredential
+			claudeThirdPartyRedirected = true
 		}
 		// A session fanning out (subagents, workflows) shares one sticky
 		// account, so its requests queue behind that account's admission
@@ -11441,7 +11480,16 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if admissionRejected(err) && a.replayable() && req.Context().Err() == nil &&
 			attempt < maxAttempts && t.server != nil {
 			tried[accountID] = struct{}{}
-			next, pickErr := t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+			var next accounts.Account
+			var pickErr error
+			if claudeThirdPartyKeyOnly {
+				var ok bool
+				if next, ok = t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); !ok {
+					return claudeThirdPartyExtraUsageResponse(nil, attemptReq), nil
+				}
+			} else {
+				next, pickErr = t.server.oauthRetryCandidate(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, false)
+			}
 			if pickErr == nil {
 				if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
 					if t.provider == accounts.ProviderClaude && claudeTransient429Retries > 0 {
@@ -11529,7 +11577,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				}
 				return response, nil
 			}
-			if claudeOverload && t.claudeOverloadRerouteEnabled() && !claudeHold.reroutedOnce() &&
+			if claudeOverload && !claudeThirdPartyKeyOnly && t.claudeOverloadRerouteEnabled() && !claudeHold.reroutedOnce() &&
 				claudeHold.spent() >= providerOverloadMaxRetries && attempt < maxAttempts {
 				// Opt-in: after the short same-account retries, try exactly one
 				// other account with headroom: a single extra request, not a
@@ -11677,6 +11725,57 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			return response, nil
 		}
+		if t.provider == accounts.ProviderClaude && !modelUnsupported && t.server != nil &&
+			t.server.claudeAuthMode(accounts.Account{ID: accountID}) != accounts.AuthModeAPIKey {
+			// Anthropic refuses a non-Claude-Code client on a subscription
+			// credential (claude_third_party.go). Every OAuth account answers the
+			// same, and the account is fine, so neither retry another OAuth
+			// account nor mark this one: move to an API key or explain.
+			thirdParty, thirdPartyErr := responseClaudeThirdPartyExtraUsage(response)
+			if thirdPartyErr != nil {
+				if t.logger != nil {
+					t.logger.Warn("third-party extra-usage response inspection failed", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", thirdPartyErr)
+				}
+				return response, nil
+			}
+			if thirdParty {
+				claudeThirdPartyKeyOnly = true
+				if a.budget != nil {
+					a.budget.claudeThirdPartyKeyOnly.Store(true)
+				}
+				if attempt < maxAttempts {
+					if next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); ok && a.consume() {
+						if nextReq, replayErr := a.replay(replayReq, &next); replayErr == nil {
+							if t.logger != nil {
+								t.logger.Warn("claude refused a third-party client on a subscription account; routing it to an API key",
+									"agent", t.agent, "session", t.session, "from_account", accountID, "to_account", next.ID, "status", response.StatusCode)
+							}
+							if response.Body != nil {
+								_ = response.Body.Close()
+							}
+							markTrafficRetryPath(attemptReq.Context(), "claude_third_party_api_key")
+							accountID = next.ID
+							accountCredential = next.CredentialIdentity()
+							markTrafficAccount(attemptReq.Context(), accountID)
+							tried[accountID] = struct{}{}
+							if t.server.SchedulerRef != nil {
+								t.server.SchedulerRef.NoteRouted(schedulerAccountProvider(t.provider), accountID)
+							}
+							quotaFailedOver = true
+							failoverReason = accountMoveCredential
+							attemptReq = nextReq
+							continue
+						}
+					}
+				}
+				if t.logger != nil {
+					t.logger.Warn("claude refused a third-party client on a subscription account and no API key can take it",
+						"agent", t.agent, "session", t.session, "account", accountID, "status", response.StatusCode)
+				}
+				markTrafficErrorClass(attemptReq.Context(), "claude_third_party_extra_usage")
+				return claudeThirdPartyExtraUsageResponse(response, attemptReq), nil
+			}
+		}
 		usageLimited, exhausted, credentialFailure := false, false, false
 		persistentAuthorizationDenial := claudeStreamDenial
 		claudeCreditExhausted := claudeStreamCredit
@@ -11786,7 +11885,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if spilledFrom != "" {
 				return response, nil
 			}
-			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
+			commitAttempt := attempt
+			if claudeThirdPartyRedirected && commitAttempt < 2 {
+				commitAttempt = 2
+			}
+			if err := t.commitSuccessfulFailover(response, commitAttempt, accountID, commitReason); err != nil {
 				if response.Body != nil {
 					_ = response.Body.Close()
 				}
@@ -11879,6 +11982,11 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				budgetExhausted = !a.consume()
 			}
 		}
+		if claudeThirdPartyKeyOnly && !claudeTransient429 && (attempt == maxAttempts || t.server == nil || budgetExhausted) {
+			// Every API key this request may use is spent: the client needs the
+			// third-party explanation, not the last key's own error.
+			return claudeThirdPartyExtraUsageResponse(response, attemptReq), nil
+		}
 		if attempt == maxAttempts || t.server == nil || budgetExhausted {
 			reason := "max_attempts"
 			switch {
@@ -11901,7 +12009,13 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		nextAccount, pickErr := compatibilityNext, compatibilityPickErr
 		var nextReservation *selectacct.PlacementReservation
-		if !modelUnsupported {
+		if !modelUnsupported && claudeThirdPartyKeyOnly {
+			if next, ok := t.server.claudeAPIKeyRetryCandidate(req.Context(), t.poolModel, tried); ok {
+				nextAccount = next
+			} else {
+				pickErr = errors.New("no untried Claude API-key account can take a third-party client")
+			}
+		} else if !modelUnsupported {
 			if t.provider == accounts.ProviderClaude {
 				nextAccount, nextReservation, pickErr = t.server.oauthRetryCandidateWithReservation(req.Context(), t.provider, t.agent, t.session, t.userEmail, t.poolModel, tried, t.fableFallback != nil, !claudeExtraUsageRetried)
 			} else {
@@ -11914,6 +12028,10 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			}
 			if t.logger != nil {
 				t.logger.Warn("usage-limit retry has no alternate account", "agent", t.agent, "session", t.session, "account", accountID, "method", t.method, "path", t.path, "upstream", t.upstream, "error", pickErr)
+			}
+			if claudeThirdPartyKeyOnly && !claudeTransient429 {
+				// A transient key throttle passes through as retryable below.
+				return claudeThirdPartyExtraUsageResponse(response, attemptReq), nil
 			}
 			var poolErr *poolExhaustedError
 			if (quota429 && errors.As(pickErr, &poolErr)) || claudeCreditExhausted {
