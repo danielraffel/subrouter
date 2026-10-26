@@ -151,6 +151,44 @@ type daemonStarter func() error
 // started. Longer than a healthy start needs, shorter than a user will tolerate.
 const autostartTimeout = 10 * time.Second
 
+// localRestartWait is the bounded grace period for a per-user supervisor that
+// is already being launched at login.
+const localRestartWait = 15 * time.Second
+
+func configuredLocalRestartWait() time.Duration {
+	value := strings.TrimSpace(os.Getenv("SUBROUTER_LOCAL_RESTART_WAIT"))
+	if value == "" {
+		return localRestartWait
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < 0 {
+		return localRestartWait
+	}
+	return duration
+}
+
+func waitForRestartingHealth(ctx context.Context, client *http.Client, local string, grace time.Duration) bool {
+	if grace <= 0 {
+		return false
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		healthy, restarting := probeServerHealth(ctx, client, local)
+		if healthy {
+			return true
+		}
+		if !restarting {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	return false
+}
+
 // defaultDaemonStarter starts the installed daemon, or reports why it cannot.
 func defaultDaemonStarter() daemonStarter {
 	return func() error {
@@ -159,6 +197,13 @@ func defaultDaemonStarter() daemonStarter {
 			return err
 		}
 		if !controller.installed() {
+			if launchd, ok := controller.(launchdController); ok {
+				if label, startErr := launchd.startManagedSupervisor(); startErr == nil {
+					return nil
+				} else if label != "" {
+					return fmt.Errorf("start managed supervisor %s: %w", label, startErr)
+				}
+			}
 			return fmt.Errorf("no local daemon installed; run '%s setup'", programBase())
 		}
 		return controller.start()
@@ -168,11 +213,15 @@ func defaultDaemonStarter() daemonStarter {
 // ensureLocalHealthy probes the local daemon and starts it if nothing answers,
 // so `sr codex` works on a cold machine without a separate `sr server up`.
 func ensureLocalHealthy(ctx context.Context, client *http.Client, local string, start daemonStarter, warn io.Writer) bool {
-	if serverHealthy(ctx, client, local) {
+	healthy, restarting := probeServerHealth(ctx, client, local)
+	if healthy {
 		return true
 	}
 	if start == nil {
 		return false
+	}
+	if restarting && waitForRestartingHealth(ctx, client, local, configuredLocalRestartWait()) {
+		return true
 	}
 	if warn != nil {
 		fmt.Fprintln(warn, "subrouter: local daemon is not running, starting it...")

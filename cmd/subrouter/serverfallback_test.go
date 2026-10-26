@@ -219,6 +219,7 @@ func TestCodexBaseURLWithFallbackHonoursExplicitPin(t *testing.T) {
 }
 
 func TestEnsureLocalHealthyStartsDeadDaemon(t *testing.T) {
+	t.Setenv("SUBROUTER_LOCAL_RESTART_WAIT", "0")
 	// The daemon is "started" by flipping the handler to healthy.
 	var healthy atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +260,7 @@ func TestEnsureLocalHealthySkipsStartWhenAlreadyUp(t *testing.T) {
 }
 
 func TestEnsureLocalHealthyReportsStartFailure(t *testing.T) {
+	t.Setenv("SUBROUTER_LOCAL_RESTART_WAIT", "0")
 	dead := healthServer(t, http.StatusServiceUnavailable)
 	start := func() error { return errors.New("launchctl exploded") }
 
@@ -272,6 +274,7 @@ func TestEnsureLocalHealthyReportsStartFailure(t *testing.T) {
 }
 
 func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
+	t.Setenv("SUBROUTER_LOCAL_RESTART_WAIT", "0")
 	t.Setenv("SUBROUTER_DISABLE_FALLBACK", "1")
 	var healthy atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -292,6 +295,28 @@ func TestAutostartRunsForLocalPinEvenWhenFallbackDisabled(t *testing.T) {
 	}
 	if started != 1 {
 		t.Fatalf("start called %d times, want 1", started)
+	}
+}
+
+func TestEnsureLocalHealthyWaitsForLateSupervisor(t *testing.T) {
+	t.Setenv("SUBROUTER_LOCAL_RESTART_WAIT", "2s")
+	var probes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if probes.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	started := 0
+	start := func() error { started++; return errors.New("starter must not run while supervisor is becoming ready") }
+	if !ensureLocalHealthy(context.Background(), fallbackHTTPClient(), srv.URL+"/v1", start, nil) {
+		t.Fatal("expected late supervisor readiness to succeed")
+	}
+	if started != 0 {
+		t.Fatalf("starter called %d times while supervisor was recovering", started)
 	}
 }
 

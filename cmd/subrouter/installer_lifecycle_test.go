@@ -160,6 +160,49 @@ func TestLaunchdStartReportsBootstrapFailureWhenNotLoaded(t *testing.T) {
 	}
 }
 
+func TestLaunchdDiscoversAndStartsTailnetSupervisor(t *testing.T) {
+	home := t.TempDir()
+	agents := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(agents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(agents, "ai.manaflow.subrouter-tailnet.plist")
+	writeTestFile(t, path, `<plist><dict><key>Label</key><string>ai.manaflow.subrouter-tailnet</string><key>ProgramArguments</key><array><string>subrouter-supervisor</string><string>supervise</string></array></dict></plist>`)
+	runner := &recordingRunner{fail: map[string]error{
+		"launchctl print": errors.New("Could not find service"),
+	}}
+	controller := launchdController{label: defaultDaemonLabel, home: home, runner: runner}
+	label, err := controller.startManagedSupervisor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if label != "ai.manaflow.subrouter-tailnet" {
+		t.Fatalf("label = %q", label)
+	}
+	if !runner.sawContaining("launchctl bootstrap gui/") {
+		t.Fatalf("tailnet supervisor was not bootstrapped: %v", runner.calls)
+	}
+}
+
+func TestLaunchdDoesNotDiscoverWakeOrTransactionFiles(t *testing.T) {
+	home := t.TempDir()
+	agents := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(agents, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"ai.manaflow.subrouter.wake.plist",
+		"ai.manaflow.subrouter-tailnet.plist.supervised",
+		"ai.manaflow.subrouter-tailnet.plist.supervisor-mutation.lock",
+	} {
+		writeTestFile(t, filepath.Join(agents, name), `<plist><dict><string>subrouter-supervisor</string></dict></plist>`)
+	}
+	controller := launchdController{label: defaultDaemonLabel, home: home, runner: &recordingRunner{}}
+	if _, found := controller.managedSupervisor(); found {
+		t.Fatal("stale wake or transaction file was treated as a supervisor")
+	}
+}
+
 // For the socket-activated system install, stopping only the service leaves
 // subrouter.socket listening (and it restarts the service on the next
 // connection); removing only the service leaves the socket unit behind, which

@@ -4827,7 +4827,7 @@ func TestUsageGridPreservesShortWindowsByQuotaFamily(t *testing.T) {
 		{Name: "GPT-5.3-Codex-Spark/secondary", Feature: "GPT-5.3-Codex-Spark", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second)},
 	}}
 	if cell := usageGridShortWindowCell(sparkWeeklyCooked); cell.Text == "" {
-		t.Fatal("general short window should remain visible when only Spark weekly quota is cooked")
+		t.Fatal("general short window should remain visible when only a per-model pool's weekly quota is cooked")
 	}
 }
 

@@ -546,6 +546,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 				t.server.noteCodexCapacitySuccess(accountID, azureCodexSessionKeyFor(t.agent, t.session))
 				t.server.noteCodexSessionCapacitySuccess(t.agent, t.session, accountID)
 				t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, false)
+				if t.server.Recovery != nil {
+					t.server.Recovery.RecordProviderHealthy(t.agent, t.session, time.Now().UTC())
+				}
 			}
 			if t.account != "" && accountID != t.account &&
 				codexSuccessStatus(response.StatusCode) && t.server.Sessions != nil {
@@ -573,6 +576,9 @@ func (t codexOverloadFailoverTransport) RoundTrip(req *http.Request) (*http.Resp
 			// repeated failures evict its sticky sessions. That is a switch,
 			// so it belongs to the opt-in failover only.
 			_ = t.server.noteCodexCapacityFailure(accountID, azureCodexSessionKeyFor(t.agent, t.session), t.poolModel, t.serviceTier, reason, config.capacityMarkTTL(codexCapacityRetryHint(response)))
+		}
+		if t.server.Recovery != nil {
+			t.server.Recovery.RecordCapacityFailure(t.agent, t.session, t.poolModel, time.Now().UTC())
 		}
 		t.server.recordCodexCapacityOutcome(t.poolModel, t.serviceTier, true)
 

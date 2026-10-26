@@ -532,7 +532,7 @@ func TestSRServerUseSetsExplicitDefault(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.run(context.Background(), []string{"server", "use", "community"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "use", "community", "--codex-config"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -599,7 +599,7 @@ func TestSRServerUseLocalClearsDefaultAndWritesLocalCodexConfig(t *testing.T) {
 
 	var out bytes.Buffer
 	runner := srRunner{program: "sr", store: store, out: &out, errOut: &out}
-	if err := runner.run(context.Background(), []string{"server", "use", "local"}); err != nil {
+	if err := runner.run(context.Background(), []string{"server", "use", "local", "--codex-config"}); err != nil {
 		t.Fatal(err)
 	}
 	file, err := serverStore.load()
@@ -663,7 +663,7 @@ func TestSRRemoteUseCMUXLocalSelectsSharedCredentialsWithLocalEgress(t *testing.
 	}
 	if err := runner.run(
 		context.Background(),
-		[]string{"remote", "use", "cmux-local"},
+		[]string{"remote", "use", "cmux-local", "--codex-config"},
 	); err != nil {
 		t.Fatal(err)
 	}

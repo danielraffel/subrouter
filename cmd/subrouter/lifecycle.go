@@ -35,11 +35,60 @@ type launchdController struct {
 	runner taskRunner
 }
 
+type managedSupervisor struct {
+	label string
+	path  string
+}
+
+const wakeLaunchAgentLabel = "ai.manaflow.subrouter.wake"
+
 func (c launchdController) plist() string { return launchAgentPath(c.home, c.label) }
 
 func (c launchdController) installed() bool {
 	_, err := os.Stat(c.plist())
 	return err == nil
+}
+
+func (c launchdController) managedSupervisor() (managedSupervisor, bool) {
+	pattern := filepath.Join(c.home, "Library", "LaunchAgents", "ai.manaflow.subrouter-*.plist")
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		return managedSupervisor{}, false
+	}
+	for _, path := range paths {
+		label := strings.TrimSuffix(filepath.Base(path), ".plist")
+		if label == c.label || label == wakeLaunchAgentLabel || !strings.HasPrefix(label, "ai.manaflow.subrouter-") {
+			continue
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		text := string(body)
+		if !strings.Contains(text, "subrouter-supervisor") && !strings.Contains(text, "<string>supervise</string>") {
+			continue
+		}
+		return managedSupervisor{label: label, path: path}, true
+	}
+	return managedSupervisor{}, false
+}
+
+func (c launchdController) startManagedSupervisor() (string, error) {
+	supervisor, ok := c.managedSupervisor()
+	if !ok {
+		return "", fmt.Errorf("no managed Subrouter supervisor found")
+	}
+	service := c.domain() + "/" + supervisor.label
+	if c.runner.Run("launchctl", "print", service) == nil {
+		if err := c.runner.Run("launchctl", "kickstart", service); err != nil {
+			return supervisor.label, err
+		}
+		return supervisor.label, nil
+	}
+	if err := c.runner.Run("launchctl", "bootstrap", c.domain(), supervisor.path); err != nil {
+		return supervisor.label, err
+	}
+	return supervisor.label, nil
 }
 
 func (c launchdController) describe() string { return c.label }
