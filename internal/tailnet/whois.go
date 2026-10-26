@@ -138,7 +138,12 @@ func (r *Resolver) Lookup(ctx context.Context, remoteAddr string) (Identity, boo
 		return identity, ok
 	}
 	identity, ok := r.lookupUncached(ctx, host)
-	r.store(host, identity, ok)
+	// A failed whois is usually a transient tailscaled/route problem. Do not
+	// cache that negative result: doing so turns one lookup hiccup into a full
+	// authorization outage for the TTL, even after the peer is reachable again.
+	if ok {
+		r.store(host, identity, true)
+	}
 	return identity, ok
 }
 
