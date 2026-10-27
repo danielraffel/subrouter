@@ -50,6 +50,25 @@ func TestSyncRecoveryAlarmsBindsRecentCMUXSession(t *testing.T) {
 	}
 }
 
+func TestPostRecoveryGenerationEscapesActionJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Action string `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode recovery update: %v", err)
+		}
+		if payload.Action != "continue \"now\"\n" {
+			t.Fatalf("action = %q", payload.Action)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	if err := postRecoveryGeneration(server.URL, wake.Alarm{Agent: "codex", SessionID: "session", Action: "continue \"now\"\n"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestResumeActionForSurfaceChoosesGoalOrRegularSession(t *testing.T) {
 	if got := resumeActionForSurface("ready for the next prompt"); got != "continue" {
 		t.Fatalf("regular session action=%q, want continue", got)

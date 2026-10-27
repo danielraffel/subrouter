@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -81,8 +82,12 @@ func (r srRunner) wake(args []string) error {
 			return err
 		}
 		if args[0] == "enable" {
-			if err := ensureWakeLaunchd(r.out); err != nil {
-				return err
+			if runtime.GOOS == "darwin" {
+				if err := ensureWakeLaunchd(r.out); err != nil {
+					return err
+				}
+			} else {
+				fmt.Fprintln(r.out, "LaunchAgent installation is only available on macOS; run sr wake worker manually")
 			}
 		} else {
 			claudeEnabled, err := cfg.Enabled("claude")
@@ -433,7 +438,8 @@ func runWakeWorker(args []string, store *wake.Store, out interface{ Write([]byte
 			return err
 		}
 		if err := syncRecoveryAlarms(store, serverURL, activeCMUXPath, startedAt, initial); err != nil {
-			return err
+			fmt.Fprintf(out, "wake worker: %v\n", err)
+			return nil
 		}
 		initial = false
 		if lastReadinessCheck.IsZero() || time.Since(lastReadinessCheck) >= time.Minute {
@@ -687,11 +693,17 @@ func syncRecoveryAlarms(store *wake.Store, serverURL, cmuxPath string, _ time.Ti
 				policy.ContinueAfter = configured.ContinueAfter
 				policy.Cooldown = time.Duration(configured.CooldownSeconds) * time.Second
 			}
-			next := policy.Next(wake.ResumeState{Failures: state.Failures, GoalAttempts: state.GoalAttempts, ContinueSent: state.ContinueSent, LastFailureAt: state.LastFailureAt, GenerationBegan: false}, now, !state.ProviderHealthyAt.IsZero() && state.ProviderHealthyAt.After(state.LastFailureAt))
+			healthy := !state.ProviderHealthyAt.IsZero() && state.ProviderHealthyAt.After(state.LastFailureAt)
+			next := policy.Next(wake.ResumeState{Failures: state.Failures, GoalAttempts: state.GoalAttempts, ContinueSent: state.ContinueSent, LastFailureAt: state.LastFailureAt, GenerationBegan: false}, now, healthy)
 			switch next {
 			case wake.ResumeWait, wake.ResumeStop:
 				continue
 			case wake.ResumeProbe:
+				// Do not schedule a replay while the provider is still unhealthy.
+				// The next worker pass will re-evaluate after fresh health evidence.
+				if !healthy {
+					continue
+				}
 				// A probe is deliberately terminally cheap: validate the exact
 				// surface before allowing the expensive replay. The provider's
 				// next response records whether generation actually began.
@@ -840,7 +852,16 @@ func dispatchDueWakeAlarms(store *wake.Store, serverURL, cmuxPath string, spacin
 }
 
 func postRecoveryGeneration(serverURL string, alarm wake.Alarm) error {
-	body := strings.NewReader(fmt.Sprintf(`{"agent":%q,"session_id":%q,"action":%q,"dispatched_at":%q}`, alarm.Agent, alarm.SessionID, alarm.Action, time.Now().UTC().Format(time.RFC3339Nano)))
+	payload, err := json.Marshal(struct {
+		Agent        string    `json:"agent"`
+		SessionID    string    `json:"session_id"`
+		Action       string    `json:"action"`
+		DispatchedAt time.Time `json:"dispatched_at"`
+	}{alarm.Agent, alarm.SessionID, alarm.Action, time.Now().UTC()})
+	if err != nil {
+		return fmt.Errorf("marshal recovery update: %w", err)
+	}
+	body := strings.NewReader(string(payload))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(serverURL, "/")+"/_subrouter/recovery-status", body)

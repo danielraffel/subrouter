@@ -120,9 +120,9 @@ absolute UTC timestamps when stored so alarms survive reboot. Each record has
 provider/model pool, action, launchd label, and status (`scheduled`, `fired`,
 `completed`, `stale`, `cancelled`, `expired`, or `failed`).
 
-`auto-resume now` revalidates and dispatches existing alarms immediately. It uses the
-same writer checks and throttling as automatic dispatch, which makes it safe
-after a manual quota reset.
+`auto-resume now` makes existing scheduled alarms due immediately. A running worker
+dispatches them on its next pass, applying the same writer checks and throttling as
+automatic dispatch. This is useful after a manual quota reset.
 
 ## Provider signals
 
