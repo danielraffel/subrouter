@@ -76,6 +76,8 @@ Usage:
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
   sr status [--json]    Show usage across all configured providers (non-interactive)
+  sr auto-resume ...    Configure or run automatic Codex/Claude recovery
+  sr wake ...           Backward-compatible alias for sr auto-resume
   sr recover list [--json] [--query TEXT] [--limit N]
                         Find interrupted local Claude sessions and task artifacts
   sr recover show --session ID [--json]
@@ -574,6 +576,8 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 			return err
 		}
 		return r.status(ctx, opts)
+	case "wake", "auto-resume":
+		return r.wake(args[1:])
 	case "sessions", "whoami":
 		return r.sessions(ctx, args[1:])
 	case "recover":
