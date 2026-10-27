@@ -600,6 +600,14 @@ func TestDirectSRCommandNames(t *testing.T) {
 	}
 }
 
+func TestWakeCommandDoesNotRequireCloudConfig(t *testing.T) {
+	t.Setenv("SUBROUTER_STATE_DIR", t.TempDir())
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", filepath.Join(t.TempDir(), "missing-cloud.json"))
+	if err := runForProgram("sr", []string{"wake", "help"}); err != nil {
+		t.Fatalf("wake help should not load cloud config: %v", err)
+	}
+}
+
 func TestKimiNamespaceDispatchesThroughExecutableEntrypoints(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	for _, program := range []string{"sr", "subrouter"} {

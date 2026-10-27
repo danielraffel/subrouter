@@ -351,7 +351,13 @@ func cxAlias(args []string) error {
 }
 
 func srForProgram(program string, args []string) error {
-	store := codexStoreForCommand(args)
+	// Wake management is local and does not need to open the Codex credential
+	// store. Avoid touching Keychain on worker startup so recovery remains
+	// usable during login, migration, or a locked credential store.
+	var store accounts.CodexStore
+	if len(args) == 0 || (args[0] != "wake" && args[0] != "auto-resume") {
+		store = codexStoreForCommand(args)
+	}
 	runner := srRunner{
 		program:       program,
 		store:         store,
@@ -412,6 +418,11 @@ func (r srRunner) runCommand(ctx context.Context, args []string) error {
 			return runCleanup(r.store, args[1:], r.out)
 		case "doctor":
 			return runDoctor(ctx, r.store, r.out)
+		case "wake", "auto-resume":
+			// Auto-resume is a local worker command. Keep it independent of
+			// cloud credential configuration so a fresh or partially migrated
+			// install can still inspect and run the durable wake queue.
+			return r.wake(args[1:])
 		case "codex":
 			if isCodexAccountCommand(args) {
 				return r.codexAccount(ctx, args[1:])
