@@ -145,6 +145,32 @@ codex exec \
 - `OPENAI_ORGANIZATION` and `OPENAI_PROJECT`: Codex forwards these as OpenAI headers for the built-in OpenAI provider.
 - `CODEX_OSS_BASE_URL` and `CODEX_OSS_PORT`: only affect OSS providers such as Ollama or LM Studio, not the OpenAI provider.
 
+## Unattended reviewer launch contract
+
+For a Shipyard reviewer, run the `sr` wrapper from the authenticated host shell; do not
+construct a native Codex command and prepend `sr`. The wrapper owns provider, WebSocket,
+account-pool, and retry configuration. A safe cold-launch probe is:
+
+```bash
+sr doctor
+sr status
+curl -fsS http://127.0.0.1:31415/_subrouter/health
+mkdir -p .shipyard-review-tmp
+TMPDIR="$PWD/.shipyard-review-tmp" sr codex exec \
+  --sandbox read-only --skip-git-repo-check \
+  "Review the exact requested head and return the authenticated verdict."
+```
+
+A capacity response is a live logical request: keep that session alive and let the
+autonomous retry policy work. Do not turn it into a series of new sessions. If the process
+exits with a classified retry-after response, continue the same session with `sr codex
+resume --last` when available. Start a new session only after the old process is gone and
+the failure is classified as launcher, authentication, or transport initialization.
+
+Reviewer acceptance requires a complete model response and an authenticated exact-head
+verdict. Daemon health, quota tables, or a successful launcher dispatch alone are not
+acceptance.
+
 ## "Selected model is at capacity"
 
 That message is OpenAI shedding load for one model and service tier; pressing retry usually gets through. Subrouter retries it for you, but only before any output reached Codex, so nothing is ever duplicated:
