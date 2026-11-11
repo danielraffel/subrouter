@@ -85,7 +85,7 @@ func runStampedeSim(t *testing.T) stampedeSimResult {
 			if used[i] >= 1 {
 				headroom = 0
 			}
-			if headroom >= MinNewSessionHeadroom {
+			if headroom >= MinNewSessionHeadroom() {
 				usableAccounts++
 			}
 			scores[i] = Score{AccountID: ids[i], Provider: account.ProviderCodex, Headroom: headroom, ShortHeadroom: headroom, Fresh: true}

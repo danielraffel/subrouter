@@ -47,16 +47,13 @@ type Scheduler struct {
 	liveDebits    map[string]int
 }
 
-const MinNewSessionHeadroom = 0.40
-
-// MinStickyRetentionHeadroom is the headroom an account must still have for an
-// idle session to stay on it. It sits far below MinNewSessionHeadroom on
+// MinStickyRetentionHeadroom returns the headroom an account must still have for an
+// idle session to stay on it. It sits far below MinNewSessionHeadroom() on
 // purpose. Placing a NEW session on an account needs room for a whole
 // conversation, but a session that is already running built the upstream
 // prompt cache on that account, and the cache is per account: moving the
 // session re-bills its entire conversation prefix as uncached input. Holding
 // the session until its account is nearly empty costs less than moving it.
-const MinStickyRetentionHeadroom = 0.05
 
 // ScoreKey is the scheduler's identity for an account. A Codex account's ID is
 // its bare email and a Claude account's ID is its profile name, which can also
@@ -300,7 +297,7 @@ func (s Scheduler) spreadIndex(pool []account.Account) int {
 	total := 0.0
 	for i, candidate := range pool {
 		score := s.score(candidate.Provider, candidate.ID)
-		surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom
+		surplus := math.Min(score.Headroom, score.ShortHeadroom) - MinNewSessionHeadroom()
 		if surplus < spreadWeightFloor {
 			surplus = spreadWeightFloor
 		}
@@ -419,11 +416,11 @@ func (s Scheduler) measuredScore(provider account.Provider, accountID string) Sc
 }
 
 func (s Score) usableForNewSession() bool {
-	return s.Headroom >= MinNewSessionHeadroom && s.ShortHeadroom >= MinNewSessionHeadroom
+	return s.Headroom >= MinNewSessionHeadroom() && s.ShortHeadroom >= MinNewSessionHeadroom()
 }
 
 func (s Score) usableForStickySession() bool {
-	return s.Headroom >= MinStickyRetentionHeadroom && s.ShortHeadroom >= MinStickyRetentionHeadroom
+	return s.Headroom >= MinStickyRetentionHeadroom() && s.ShortHeadroom >= MinStickyRetentionHeadroom()
 }
 
 func (s Score) exhausted() bool {

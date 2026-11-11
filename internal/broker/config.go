@@ -27,21 +27,22 @@ const (
 )
 
 type Config struct {
-	Version            int              `json:"version"`
-	BaseURL            string           `json:"baseUrl"`
-	AccessToken        string           `json:"accessToken"`
-	RefreshToken       string           `json:"refreshToken"`
-	LocalProxyToken    string           `json:"localProxyToken,omitempty"`
-	TeamID             string           `json:"teamId,omitempty"`
-	TeamName           string           `json:"teamName,omitempty"`
-	CredentialSource   CredentialSource `json:"credentialSource,omitempty"`
-	HostedURL          string           `json:"hostedUrl,omitempty"`
-	HostedExchangeURL  string           `json:"hostedExchangeUrl,omitempty"`
-	TenantKey          string           `json:"tenantKey,omitempty"`
-	TenantCapabilities []string         `json:"tenantCapabilities,omitempty"`
-	StackAPIURL        string           `json:"stackApiUrl,omitempty"`
-	StackProjectID     string           `json:"stackProjectId,omitempty"`
-	StackPublishable   string           `json:"stackPublishableClientKey,omitempty"`
+	Version               int              `json:"version"`
+	BaseURL               string           `json:"baseUrl"`
+	AccessToken           string           `json:"accessToken"`
+	RefreshToken          string           `json:"refreshToken"`
+	LocalProxyToken       string           `json:"localProxyToken,omitempty"`
+	TeamID                string           `json:"teamId,omitempty"`
+	TeamName              string           `json:"teamName,omitempty"`
+	CredentialSource      CredentialSource `json:"credentialSource,omitempty"`
+	HostedURL             string           `json:"hostedUrl,omitempty"`
+	HostedExchangeURL     string           `json:"hostedExchangeUrl,omitempty"`
+	TenantKey             string           `json:"tenantKey,omitempty"`
+	TenantCapabilities    []string         `json:"tenantCapabilities,omitempty"`
+	StackAPIURL           string           `json:"stackApiUrl,omitempty"`
+	StackProjectID        string           `json:"stackProjectId,omitempty"`
+	StackPublishable      string           `json:"stackPublishableClientKey,omitempty"`
+	MinNewSessionHeadroom *float64         `json:"minNewSessionHeadroom,omitempty"`
 }
 
 func (c Config) LoggedIn() bool {

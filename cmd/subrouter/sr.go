@@ -2788,7 +2788,7 @@ func recommendedForNewSession(row srUsageRow) bool {
 }
 
 func usableForNewSession(score selectacct.Score) bool {
-	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
+	return score.Headroom >= selectacct.MinNewSessionHeadroom() && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom()
 }
 
 func exhaustedForNewSession(score selectacct.Score) bool {
@@ -2810,7 +2810,7 @@ func gtoReason(row srUsageRow) string {
 	}
 	left := fmt.Sprintf("%d%% bottleneck left", int(row.score.Headroom*100+0.5))
 	if !usableForNewSession(row.score) {
-		return fmt.Sprintf("%s, protected below %d%%", left, int(selectacct.MinNewSessionHeadroom*100))
+		return fmt.Sprintf("%s, protected below %d%%", left, int(selectacct.MinNewSessionHeadroom()*100))
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		return fmt.Sprintf("%s, 5h resets in %s", left, formatDuration(row.score.ShortResetAfterSeconds))
@@ -3803,7 +3803,7 @@ func compactPickReason(row srUsageRow) string {
 	left := fmt.Sprintf("%d%% left", int(row.score.Headroom*100+0.5))
 	suffix := exhaustedModelSuffix(row.windows)
 	if !usableForNewSession(row.score) {
-		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom*100), suffix)
+		return fmt.Sprintf("%s, protected < %d%%%s", left, int(selectacct.MinNewSessionHeadroom()*100), suffix)
 	}
 	if row.score.ShortResetAfterSeconds > 0 {
 		if usageProvider(row) == accounts.ProviderClaude {
