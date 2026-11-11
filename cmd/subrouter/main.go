@@ -43,6 +43,7 @@ import (
 func main() {
 	program := filepath.Base(os.Args[0])
 	configureDefaultLogger(program, os.Args[1:])
+	configureNewSessionHeadroomFromEnv()
 	if program == "cx" {
 		if err := cxAlias(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "cx:", err)
@@ -83,6 +84,14 @@ func newCLIFileLogHandler(path string) slog.Handler {
 		return slog.NewTextHandler(io.Discard, opts)
 	}
 	return slog.NewTextHandler(file, opts)
+}
+
+func configureNewSessionHeadroomFromEnv() {
+	value, warning, _ := selectacct.ConfigureMinNewSessionHeadroom(os.Getenv("SUBROUTER_MIN_NEW_SESSION_HEADROOM"), nil)
+	if warning != "" {
+		slog.Warn(warning, "env", "SUBROUTER_MIN_NEW_SESSION_HEADROOM")
+	}
+	slog.Info("new-session headroom configured", "threshold", value, "source", "environment/default")
 }
 
 // envTrue reports whether an environment variable is set to a truthy value
@@ -565,6 +574,13 @@ func serve(args []string) error {
 		cloudConfig.CredentialSource = broker.CredentialSource(*cloudCredentialSource)
 	}
 	cloudConfig = cloudConfig.Normalized()
+	if strings.TrimSpace(os.Getenv("SUBROUTER_MIN_NEW_SESSION_HEADROOM")) == "" {
+		value, warning, source := selectacct.ConfigureMinNewSessionHeadroom("", cloudConfig.MinNewSessionHeadroom)
+		if warning != "" {
+			slog.Warn(warning, "source", source)
+		}
+		slog.Info("new-session headroom configured", "threshold", value, "source", source)
+	}
 	if err := cloudConfig.Validate(); err != nil {
 		return fmt.Errorf("configure cmux.com client: %w", err)
 	}

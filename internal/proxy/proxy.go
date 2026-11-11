@@ -1701,7 +1701,7 @@ func betterClaudeActiveCandidate(left, right selectacct.Score) bool {
 }
 
 func scoreUsableForNewSession(score selectacct.Score) bool {
-	return score.Headroom >= selectacct.MinNewSessionHeadroom && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom
+	return score.Headroom >= selectacct.MinNewSessionHeadroom() && score.ShortHeadroom >= selectacct.MinNewSessionHeadroom()
 }
 
 func scoreFromUsageWindows(provider accounts.Provider, accountID string, windows []accounts.UsageWindow) selectacct.Score {
@@ -6345,7 +6345,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			"provider", provider,
 			"account", account.ID,
 			"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
-			"threshold", selectacct.MinNewSessionHeadroom)
+			"threshold", selectacct.MinNewSessionHeadroom())
 	}
 	if options.pendingSessionCommit != nil && previousAccountID != "" && previousAccountID != account.ID {
 		*options.pendingSessionCommit = true
@@ -6379,7 +6379,7 @@ func (s Server) logAccountMove(agentType, sessionID, model, fromAccountID, toAcc
 		fields = append(fields,
 			"from_exhausted", scheduler.Exhausted(schedulerAccountProvider(provider), fromAccountID),
 			"from_usable_for_sticky_session", scheduler.UsableForStickySession(schedulerAccountProvider(provider), fromAccountID),
-			"retention_threshold", selectacct.MinStickyRetentionHeadroom,
+			"retention_threshold", selectacct.MinStickyRetentionHeadroom(),
 		)
 	}
 	s.Logger.Warn("session moved to another account; upstream prompt cache is cold", fields...)
@@ -6426,7 +6426,7 @@ func (s Server) touchSessionBestEffort(agentType, sessionID string) {
 // band gets.
 type providerSelectionPolicy struct {
 	// retentionFloorGated: an idle session leaves its account once the
-	// account's measured headroom falls below MinStickyRetentionHeadroom.
+	// account's measured headroom falls below MinStickyRetentionHeadroom().
 	// Codex sets this (#216): its per-account prompt cache makes moving
 	// expensive, but holding a session on a truly empty account is worse.
 	retentionFloorGated bool
@@ -6505,7 +6505,7 @@ func (s Server) keepConstrainedStickyAssignment(scheduler selectacct.Scheduler, 
 	pickedScore := scheduler.ScoreFor(schedulerAccountProvider(picked.Provider), picked.ID)
 	currentMin := math.Min(currentScore.Headroom, currentScore.ShortHeadroom)
 	pickedMin := math.Min(pickedScore.Headroom, pickedScore.ShortHeadroom)
-	if pickedMin < selectacct.MinStickyRetentionHeadroom {
+	if pickedMin < selectacct.MinStickyRetentionHeadroom() {
 		return true
 	}
 	return pickedMin < currentMin+minStickyMoveHeadroomGain
@@ -8428,7 +8428,7 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 				"provider", provider,
 				"account", account.ID,
 				"exhausted", scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID),
-				"threshold", selectacct.MinNewSessionHeadroom)
+				"threshold", selectacct.MinNewSessionHeadroom())
 		}
 		refreshed, err := s.refreshAccount(ctx, account)
 		if err != nil {

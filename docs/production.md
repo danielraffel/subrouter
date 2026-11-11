@@ -76,6 +76,21 @@ Current production-safe behavior:
 
 The macOS updater and one-time LaunchDaemon migration scripts live in `deploy/macos/`. Run the migration without `--activate` first to prepare and validate the supervised plist. Activation is the last upgrade that replaces the public listener; later worker upgrades do not restart the supervisor.
 
+## New-session headroom reserve
+
+Subrouter reads `SUBROUTER_MIN_NEW_SESSION_HEADROOM` once when each process starts. The value must be a float in `(0,1]` and is clamped to `[0.05,0.90]`; invalid values use the default `0.40` and log a warning. If the existing `~/.config/subrouter/cloud.json` is used, its optional `minNewSessionHeadroom` number is used when the environment variable is unset. The effective value is logged at startup, and values below `0.40` log a warning.
+
+For a macOS LaunchAgent, launchd does not inherit the shell environment. Add the variable to the existing plist's `EnvironmentVariables` dictionary, for example:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables:SUBROUTER_MIN_NEW_SESSION_HEADROOM string 0.15' \
+  "$HOME/Library/LaunchAgents/ai.manaflow.subrouter.plist"
+```
+
+Then deploy the new worker with `deploy/macos/subrouter-deploy.sh install <candidate-binary>` and request the supervisor upgrade through its control socket. The supervisor inherits the LaunchAgent environment for replacement workers, health-checks the candidate, routes new connections to it, and lets existing connections finish on the old worker. Do not restart the supervisor just to change this value. To revert, set the variable to `0.40` (or remove it and remove `minNewSessionHeadroom` from `cloud.json`), then perform the same worker upgrade.
+
+For the Linux systemd deployment, set `SUBROUTER_MIN_NEW_SESSION_HEADROOM=0.15` in `/etc/default/subrouter` (or the unit's environment source), run the normal worker deployment/upgrade path, and let the supervisor replace the worker. A plain `systemctl restart subrouter` drains/restarts the service and is not connection-preserving.
+
 ## Launch checks
 
 Run these before announcing a shared server:
