@@ -1137,6 +1137,18 @@ func (r srRunner) serverStatusFor(ctx context.Context, server srServerConfig) er
 	return err
 }
 
+func (r srRunner) serverStatusJSON(ctx context.Context, server srServerConfig) error {
+	usage, available, err := r.fetchServerUsageStatuses(ctx, server)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return fmt.Errorf("server %s does not support usage status; upgrade the server to use sr status --json", server.Name)
+	}
+	rows := usageRowsFromServerUsageStatuses(usage)
+	return r.writeClaudePoolJSON(rows)
+}
+
 func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig) error {
 	remoteAccounts, err := r.fetchServerAccounts(ctx, server)
 	if err != nil {

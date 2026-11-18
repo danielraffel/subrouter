@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -73,7 +74,7 @@ Usage:
   sr gui [email]        Switch active account, sync OpenCode/pi, and restart Codex.app
   sr gui-switch [email] Switch active account, sync OpenCode/pi, and restart Codex.app
   sr remove <account>   Remove from explicit local state; selected-server removal is not yet supported
-  sr status             Show usage across all configured providers (non-interactive)
+  sr status [--json]    Show usage across all configured providers (non-interactive)
   sr qwen login [--console-account <email-or-label>] <account>
                         Authorize live Lite/Pro and quota status for one Token Plan
   sr qwen [args]        Run Qwen Code through the selected Token Plan pool
@@ -372,6 +373,9 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return r.defaultInteractive(ctx, srSwitchOptions{})
 	}
+	if args[0] == "status" && len(args) == 2 && args[1] == "--json" {
+		return r.statusJSON(ctx)
+	}
 	var source broker.CredentialSource
 	// A named server in the environment is an explicit, one-command target.
 	// Honor it before the persisted credential source so wrappers such as
@@ -488,6 +492,12 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 		}
 		return r.remove(ctx, args[1])
 	case "status":
+		if len(args) == 2 && args[1] == "--json" {
+			return r.statusJSON(ctx)
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("usage: sr status [--json]")
+		}
 		return r.status(ctx)
 	case "codex":
 		return r.codexAccount(ctx, args[1:])
@@ -1257,6 +1267,117 @@ func (r srRunner) status(ctx context.Context) error {
 	displayUsageRows(r.out, rows, false)
 	printKimiCLIOnlyStatusHint(r.out, rows)
 	return nil
+}
+
+type srClaudePoolStatus struct {
+	AllExhausted   bool    `json:"all_exhausted"`
+	UsableProfiles int     `json:"usable_profiles"`
+	ResumeAt       *string `json:"resume_at"`
+	CheckedAt      string  `json:"checked_at"`
+}
+
+func claudePoolStatus(rows []srUsageRow, checkedAt time.Time) srClaudePoolStatus {
+	status := srClaudePoolStatus{CheckedAt: checkedAt.UTC().Format(time.RFC3339)}
+	profiles := 0
+	var soonest time.Time
+	for _, row := range rows {
+		if usageProvider(row) != accounts.ProviderClaude || row.authMode != accounts.AuthModeOAuth {
+			continue
+		}
+		profiles++
+		cooked, _ := cookedFromWindows(row.windows)
+		tempCooked, _ := tempCookedFromWindows(row.windows)
+		if row.err == nil && !row.cooked && !row.tempCooked && !cooked && !tempCooked && usableForNewSession(row.score) {
+			status.UsableProfiles++
+			continue
+		}
+		// A profile recovers only after every exhausted account-wide window resets.
+		var recovery time.Time
+		unknownReset := false
+		for _, window := range row.windows {
+			if isModelScopedWindow(window) || window.ExtraUsage != nil || clampUsagePercent(window.UsedPercent) < 100 {
+				continue
+			}
+			if window.ResetAfterSeconds <= 0 {
+				unknownReset = true
+				break
+			}
+			reset := checkedAt.Add(time.Duration(window.ResetAfterSeconds) * time.Second)
+			if reset.After(recovery) {
+				recovery = reset
+			}
+		}
+		if !unknownReset && !recovery.IsZero() && (soonest.IsZero() || recovery.Before(soonest)) {
+			soonest = recovery
+		}
+	}
+	status.AllExhausted = profiles > 0 && status.UsableProfiles == 0
+	if !soonest.IsZero() {
+		value := soonest.UTC().Format(time.RFC3339)
+		status.ResumeAt = &value
+	}
+	return status
+}
+
+func (r srRunner) statusJSON(ctx context.Context) error {
+	if target := strings.TrimSpace(os.Getenv("SUBROUTER_CODEX_SERVER")); target != "" {
+		if server, ok, err := r.selectedRemoteServer(); err != nil {
+			return err
+		} else if ok {
+			return r.serverStatusJSON(ctx, server)
+		}
+		// An explicit local target takes precedence over hosted storage.
+		rows, err := r.fetchUsageRows(ctx)
+		if err != nil {
+			return err
+		}
+		return r.writeClaudePoolJSON(rows)
+	}
+	config, err := cloudModeConfig()
+	if err != nil {
+		return err
+	}
+	var rows []srUsageRow
+	switch config.EffectiveCredentialSource() {
+	case broker.CredentialSourceTeam:
+		_, _, client, err := loadCloudClient(true)
+		if err != nil {
+			return err
+		}
+		statuses, err := client.UsageStatuses(ctx)
+		if err != nil {
+			return err
+		}
+		rows = usageRowsFromHostedStatuses(statuses)
+	case broker.CredentialSourceLegacy, broker.CredentialSourceLocal:
+		if !explicitLocalStateAuthority() {
+			if config.EffectiveCredentialSource() == broker.CredentialSourceLegacy {
+				if server, ok, err := r.defaultRemoteServer(); err != nil {
+					return err
+				} else if ok {
+					return r.serverStatusJSON(ctx, server)
+				}
+			}
+			if r.useServingAPI {
+				server, err := r.readyLocalServingServer(ctx, defaultDaemonStarter())
+				if err != nil {
+					return err
+				}
+				return r.serverStatusJSON(ctx, server)
+			}
+		}
+		rows, err = r.fetchUsageRows(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return r.writeClaudePoolJSON(rows)
+}
+
+func (r srRunner) writeClaudePoolJSON(rows []srUsageRow) error {
+	return json.NewEncoder(r.out).Encode(struct {
+		ClaudePool srClaudePoolStatus `json:"claude_pool"`
+	}{ClaudePool: claudePoolStatus(rows, time.Now())})
 }
 
 func explicitLocalStateAuthority() bool {
